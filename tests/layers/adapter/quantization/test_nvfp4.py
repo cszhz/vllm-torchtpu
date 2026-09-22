@@ -715,3 +715,93 @@ class TestNvfp4MoEMethod:
             out = method.apply_monolithic(layer, x, router_logits)
             assert torch.equal(out, torch.ones(4, 64))
             mock_pipe.assert_called_once()
+
+
+class TestNvfp4DummyInitialization:
+    @staticmethod
+    def initialize(
+        load_format="dummy",
+        layer_name="model.layers.0.mlp.experts",
+        ep_rank=0,
+        tp_size=1,
+    ):
+        layer = torch.nn.Module()
+        layer.layer_name = layer_name
+        for name, shape in (("w13", (2, 128, 64)), ("w2", (2, 128, 32))):
+            for suffix, tensor in (
+                ("weight", torch.full(shape, 0, dtype=torch.uint8)),
+                (
+                    "weight_scale",
+                    torch.zeros(*shape[:-1], shape[-1] // 8, dtype=torch.float8_e4m3fn),
+                ),
+                ("weight_scale_2", torch.zeros((2, 2) if name == "w13" else (2,))),
+            ):
+                layer.register_parameter(
+                    f"{name}_{suffix}", torch.nn.Parameter(tensor, requires_grad=False)
+                )
+        method = VllmNvfp4MoEMethod(
+            MagicMock(group_size=16),
+            MagicMock(ep_rank=ep_rank, tp_rank=0, tp_size=tp_size),
+        )
+        config = MagicMock()
+        config.load_config.load_format = load_format
+        config.model_config.seed = 42
+        with patch(
+            "vllm_torchtpu.layers.adapter.quantization.nvfp4."
+            "get_current_vllm_config_or_none",
+            return_value=config,
+        ):
+            method._initialize_dummy_quantized_weights(layer)
+        return layer
+
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    def test_nonzero_finite_fan_in_scaled_weights(self, tp_size):
+        layer = self.initialize(tp_size=tp_size)
+        for name in ("w13", "w2"):
+            packed = getattr(layer, f"{name}_weight")
+            nibbles = torch.stack((packed & 15, packed >> 4), dim=-1)
+            assert set(nibbles.unique().tolist()) == {1, 9}
+            assert 0.48 < (nibbles == 1).float().mean().item() < 0.52
+            block_scale = getattr(layer, f"{name}_weight_scale").float()
+            global_scale = getattr(layer, f"{name}_weight_scale_2")
+            assert torch.all(block_scale == 1)
+            assert torch.isfinite(global_scale).all() and (global_scale > 0).all()
+            fan_in = packed.shape[-1] * 2 * (tp_size if name == "w2" else 1)
+            # Both signs have the same E2M1 magnitude, so effective RMS is exact.
+            torch.testing.assert_close(
+                global_scale * 0.5, torch.full_like(global_scale, fan_in**-0.5)
+            )
+
+    def test_requantization_preserves_nonzero_weights(self):
+        from vllm_torchtpu.layers.core.quantization import unpack_uint8_to_fp4
+
+        layer = self.initialize()
+        s13 = (
+            layer.w13_weight_scale.float() * layer.w13_weight_scale_2[:, 0, None, None]
+        )
+        s2 = layer.w2_weight_scale.float() * layer.w2_weight_scale_2[:, None, None]
+        w13, scale13, w2, scale2 = _requant_moe_w4a8(
+            layer.w13_weight, s13, layer.w2_weight, s2, block=64
+        )
+        for packed, scale, fan_in in ((w13, scale13, 128), (w2, scale2, 64)):
+            values = unpack_uint8_to_fp4(packed)
+            assert torch.count_nonzero(values) == values.numel()
+            assert torch.isfinite(scale).all() and (scale > 0).all()
+            # Requantization changes codes, but preserves their effective magnitude.
+            expected = torch.full_like(scale, fan_in**-0.5)
+            torch.testing.assert_close(values.abs().max() * scale, expected)
+
+    def test_reproducible_but_distinct_layer_and_expert_shards(self):
+        first = self.initialize()
+        same = self.initialize()
+        other_layer = self.initialize(layer_name="model.layers.1.mlp.experts")
+        other_shard = self.initialize(ep_rank=1)
+        for name in ("w13_weight", "w2_weight"):
+            assert torch.equal(getattr(first, name), getattr(same, name))
+            assert not torch.equal(getattr(first, name), getattr(other_layer, name))
+            assert not torch.equal(getattr(first, name), getattr(other_shard, name))
+
+    @pytest.mark.parametrize("load_format", ["auto", "safetensors"])
+    def test_real_loading_untouched(self, load_format):
+        layer = self.initialize(load_format=load_format)
+        assert all(torch.count_nonzero(p.float()) == 0 for p in layer.parameters())

@@ -41,9 +41,12 @@ Requires torch_tpu's native `torch.float4_e2m1fn_x2` dtype
 
 from __future__ import annotations
 
+import math
+import zlib
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
@@ -363,6 +366,53 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             )
         return activation_str
 
+    def _initialize_dummy_quantized_weights(self, layer: RoutedExperts) -> None:
+        """Initialize the checkpoint representation before TPU requantization.
+
+        Generic dummy loading skips uint8 packed weights and rounds nearly all
+        of its small random FP8 scales to zero. Use random signed FP4 half-units
+        with positive scales instead, giving effective weights RMS 1/sqrt(K).
+        Generate on CPU so initialization does not need a second TPU weight
+        buffer. Layer and expert/TP shard seeds keep replicas reproducible.
+        """
+        config = get_current_vllm_config_or_none()
+        if config is None:
+            return
+        load_format = config.load_config.load_format
+        if getattr(load_format, "value", load_format) != "dummy":
+            return
+        seed = zlib.crc32(str(layer.layer_name).encode())
+        seed += (
+            config.model_config.seed
+            + int(self.moe.ep_rank) * 104729
+            + int(self.moe.tp_rank)
+        )
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        for name, fan_in_multiplier in (("w13", 1), ("w2", self.moe.tp_size)):
+            packed = getattr(layer, f"{name}_weight").data
+            values = torch.randint(
+                0,
+                256,
+                packed.shape,
+                dtype=torch.uint8,
+                device="cpu",
+                generator=generator,
+            )
+            # Each E2M1 nibble is independently +0.5 (1) or -0.5 (9).
+            values.bitwise_and_(0x88).bitwise_or_(0x11)
+            packed.copy_(values)
+            block_scale = getattr(layer, f"{name}_weight_scale").data
+            global_scale = getattr(layer, f"{name}_weight_scale_2").data
+            block_scale.fill_(1.0)
+            fan_in = packed.shape[-1] * 2 * int(fan_in_multiplier)
+            global_scale.fill_(2.0 / math.sqrt(fan_in))
+            if packed.device.type == "tpu":
+                synchronize_tensors([packed, block_scale, global_scale])
+        logger.info_once(
+            "Initialized NVFP4 dummy experts with signed FP4 "
+            "half-units and positive fan-in scales."
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU NVFP4 MoE does not support bias."
@@ -372,6 +422,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         )
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
+
+        self._initialize_dummy_quantized_weights(layer)
 
         # --- fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
         # w13: global is [E, 2] (separate w1/w3 per-tensor scales); apply to the
