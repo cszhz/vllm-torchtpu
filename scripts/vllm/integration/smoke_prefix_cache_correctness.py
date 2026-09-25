@@ -177,7 +177,9 @@ def run_quick_probe(url: str, model: str, timeout: int) -> int:
     return 0 if ok else 1
 
 
-def run_short_qa(url: str, model: str, timeout: int) -> tuple[int, int]:
+def run_short_qa(
+    url: str, model: str, timeout: int, pd_interleave_size: int | None = None
+) -> tuple[int, int]:
     failures = 0
     requests = 0
     print("\n=== SHORT QA ===", flush=True)
@@ -190,6 +192,18 @@ def run_short_qa(url: str, model: str, timeout: int) -> tuple[int, int]:
             and normalize(text) == normalize(expected)
             and all(marker not in text for marker in BAD_MARKERS)
         )
+        if pd_interleave_size is not None:
+            prompt_tokens = result.get("prompt_tokens")
+            # Below one interleave chunk, only PCP rank 0 has FA tokens.
+            # D must reuse P's partial prefix, leaving just the last prompt
+            # token to compute. Local full-block cache hits cannot satisfy
+            # this check in the hybrid PCP suite.
+            ok = (
+                ok
+                and isinstance(prompt_tokens, int)
+                and 1 < prompt_tokens < pd_interleave_size
+                and result.get("cached_tokens") == prompt_tokens - 1
+            )
         requests += 1
         failures += int(not ok)
         print(
@@ -201,6 +215,7 @@ def run_short_qa(url: str, model: str, timeout: int) -> tuple[int, int]:
                     "status": result.get("status"),
                     "finish": result.get("finish"),
                     "elapsed_s": result.get("elapsed_s"),
+                    "prompt_tokens": result.get("prompt_tokens"),
                     "cached_tokens": result.get("cached_tokens"),
                     "text": text,
                     "ok": ok,
@@ -211,6 +226,8 @@ def run_short_qa(url: str, model: str, timeout: int) -> tuple[int, int]:
         )
     print(f"SHORT_QA_REQUESTS {requests}")
     print(f"SHORT_QA_FAILURES {failures}")
+    if pd_interleave_size is not None:
+        print(f"SHORT_PD_TRANSFER_OK {int(failures == 0)}")
     return requests, failures
 
 
@@ -679,6 +696,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-short-qa", action="store_true")
     parser.add_argument(
+        "--short-pd-interleave-size",
+        type=int,
+        help="Require short QA to transfer prompt_tokens - 1 tokens via PD "
+        "below one PCP interleave chunk (hybrid models).",
+    )
+    parser.add_argument(
         "--short-repeat-lines", type=int, default=env_int("P4D2_SHORT_REPEAT_LINES", 48)
     )
     parser.add_argument(
@@ -743,7 +766,9 @@ def main() -> int:
     failures = 0
 
     if not args.skip_short_qa:
-        requests, suite_failures = run_short_qa(url, args.model, args.timeout)
+        requests, suite_failures = run_short_qa(
+            url, args.model, args.timeout, args.short_pd_interleave_size
+        )
         total_requests += requests
         failures += suite_failures
 

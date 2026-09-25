@@ -75,6 +75,12 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     SendMeta,
     TPUConnectorMetadata,
 )
+from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+    RaidenLoadFailures,
+    RaidenSendOutcome,
+    RaidenSendResults,
+    raiden_pd_completion_modes,
+)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics,
     TpuKVConnectorStats,
@@ -1016,6 +1022,24 @@ class TPURaidenConnector(TPUConnector):
 
     force_raiden_connector = True
 
+    def get_block_ids_with_load_errors_group_index(self) -> int | None:
+        assert self.connector_worker is not None
+        if self.connector_worker._pd_load_failures is not None:
+            # This child reports no invalid block IDs, including when another
+            # MultiConnector child does. Do not attach Raiden's FA group to them.
+            return None
+        return super().get_block_ids_with_load_errors_group_index()
+
+    def build_connector_worker_meta(
+        self,
+    ) -> RaidenSendResults | RaidenLoadFailures | None:
+        assert self.connector_worker is not None, (
+            "Raiden worker metadata must be collected from the worker role"
+        )
+        if self.connector_worker._pd_load_failures is not None:
+            return self.connector_worker.take_pd_load_failures()
+        return self.connector_worker.take_pd_send_results()
+
 
 class TPUConnectorScheduler:
     def __init__(self, vllm_config: "VllmConfig"):
@@ -1269,9 +1293,12 @@ class TPUConnectorScheduler:
         if not self.is_producer:
             return False, None
 
-        # max_tokens is forced to 1 by the proxy on P, so the only way the
-        # prefill finishes cleanly is length cap.
-        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
+        # EOS/stop tokens can finish prefill even with max_tokens=1. Both
+        # successful finish statuses must publish KV transfer metadata.
+        if request.status not in (
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ):
             return False, None
 
         # Only transfer full blocks; let D re-prefill the trailing partial
@@ -1645,6 +1672,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return
 
         if _use_raiden_stage3_transport():
+            if request.kv_transfer_params.get("_remote_kv_processed"):
+                return
             self._update_stage3_state_after_alloc(request, blocks, num_external_tokens)
             return
 
@@ -1739,8 +1768,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 and int(request.num_computed_tokens) == 0
             ):
                 self._enqueue_stage3_release(request)
-                if request.kv_transfer_params is not None:
-                    request.kv_transfer_params["_remote_kv_processed"] = True
+            if request.kv_transfer_params is not None:
+                request.kv_transfer_params["_remote_kv_processed"] = True
             return
         params = request.kv_transfer_params
         assert params is not None
@@ -2282,6 +2311,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             "src_parallelism": src_parallelism,
             "dst_tp_size": _raiden_dst_shards(),
             "dst_dcp_size": _raiden_dst_dcp_size(self.vllm_config),
+            "kv_transfer_pending": True,
         }
         self._stage3_finished_sends[request.request_id] = (
             uuid,
@@ -2334,6 +2364,9 @@ class TPURaidenConnectorWorker:
         self.config = vllm_config.kv_transfer_config
         self.is_producer = self.config.is_kv_producer
         self._stage3_kimi = _is_kimi(vllm_config)
+        send_completion, decode_fail = raiden_pd_completion_modes(vllm_config)
+        self._pd_send_results = RaidenSendResults() if send_completion else None
+        self._pd_load_failures = RaidenLoadFailures() if decode_fail else None
         self.runner: TPUModelRunner | None = None
         self.node_id = dist_utils.get_node_id()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -4443,6 +4476,8 @@ class TPURaidenConnectorWorker:
         ]
 
     def _record_stage3_load_failure(self, req_id: str, block_ids: list[int]) -> None:
+        if self._pd_load_failures is not None:
+            self._pd_load_failures.failed_req_ids.add(req_id)
         self._failed_recving.add(req_id)
         self._failed_block_ids.update(block_ids)
         self._stage3_terminal_loads.add(req_id)
@@ -4725,6 +4760,19 @@ class TPURaidenConnectorWorker:
     ) -> tuple[set[str], set[str], set[str]]:
         """Returns terminal base requests (T3.1: no sibling aggregation)."""
         outcomes, self._stage3_send_outcomes = self._stage3_send_outcomes, {}
+        if self._pd_send_results is not None:
+            result_by_native_outcome = {
+                "done": RaidenSendOutcome.SUCCESS,
+                "failed": RaidenSendOutcome.SEND_FAILURE,
+                "cancelled": RaidenSendOutcome.UNCLAIMED_TIMEOUT,
+            }
+            self._pd_send_results.outcomes.update(
+                {
+                    req_id: result_by_native_outcome[outcome]
+                    for req_id, outcome in outcomes.items()
+                    if req_id not in self._stage3_reported_sends
+                }
+            )
         done = {r for r, outcome in outcomes.items() if outcome == "done"}
         failed = {r for r, outcome in outcomes.items() if outcome == "failed"}
         cancelled = {r for r, outcome in outcomes.items() if outcome == "cancelled"}
@@ -4805,6 +4853,20 @@ class TPURaidenConnectorWorker:
                     sort_keys=True,
                 ),
             )
+
+    def take_pd_send_results(self) -> RaidenSendResults | None:
+        results = self._pd_send_results
+        if results is None or not results.outcomes:
+            return None
+        self._pd_send_results = RaidenSendResults()
+        return results
+
+    def take_pd_load_failures(self) -> RaidenLoadFailures | None:
+        results = self._pd_load_failures
+        if results is None or not results.failed_req_ids:
+            return None
+        self._pd_load_failures = RaidenLoadFailures()
+        return results
 
     @staticmethod
     def _start_stage3_transfer_with_d5_retry(facade: Any, **kwargs: Any) -> bool:
@@ -5441,9 +5503,6 @@ class TPURaidenConnectorWorker:
         if outcome.error is not None:
             exc = outcome.error
             missing_registration = "Missing producer block registration" in str(exc)
-            cancelled_registration = "Request block registration was cancelled" in str(
-                exc
-            )
             aborted = destination_req_id in self._stage3_finished_loads_pending_cleanup
             if (
                 missing_registration
@@ -5469,11 +5528,23 @@ class TPURaidenConnectorWorker:
                     )
                 self._stage3_pending_submits[destination_req_id] = pending
                 return
+            cancelled_registration = (
+                str(exc)
+                == (
+                    "Remote Controller Server execution failed: Request block "
+                    "registration was cancelled for "
+                    f"req_id={source_req_id}, uuid={uuid}"
+                )
+                and destination_req_id not in self._stage3_controller_accepted
+                and destination_req_id not in self._stage3_pending_controller_failures
+            )
             if missing_registration or cancelled_registration:
-                # The FA registration lookup fails before receiver arming,
-                # so no late H2D is possible. A request the scheduler already
-                # finished resolves here as well, so its delayed block-free
-                # path completes.
+                # These registration lookup replies precede receiver arming
+                # for this submission. Match cancellation exactly: nested
+                # worker errors or a prior uncertain attempt cannot prove
+                # that destination blocks are safe to release. Unlike a
+                # missing registration, a cancelled one must not be retried.
+                # A scheduler-finished request also resolves its delayed free.
                 self._record_stage3_load_failure(
                     destination_req_id, pending.local_blocks
                 )
@@ -6058,6 +6129,8 @@ class TPURaidenConnectorWorker:
         self._done_sending.update(terminal_sends)
         self._done_recving.update(done_recving)
         newly_failed = set(failed_recving) - self._failed_recving
+        if self._pd_load_failures is not None:
+            self._pd_load_failures.failed_req_ids.update(newly_failed)
         self._failed_recving.update(failed_recving)
         # Stage the affected device blocks so get_block_ids_with_load_errors()
         # can report them no later than the pass that reports the req finished.
@@ -6210,6 +6283,10 @@ class TPURaidenConnectorWorker:
         # with reporting the req as finished in get_finished() in the same pass.
         failed = self._failed_block_ids
         self._failed_block_ids = set()
+        if self._pd_load_failures is not None:
+            # The selected D scheduler terminates these requests by identity,
+            # including state-only failures that have no FA block IDs.
+            return set()
         return failed
 
     def _wait_for_recving(self, req_ids: set[str]) -> None:
@@ -6434,8 +6511,7 @@ class TPURaidenConnectorWorker:
     def _register_raiden_pools(
         self, engine: Any, manifest: Any, kv_cache_groups: Any
     ) -> dict:
-        """Registers the manifest's pools, with bounded host staging when the
-        installed tpu_sync supports it (TPU_RAIDEN_POOL_STAGING_LEASES > 0).
+        """Registers pools with bounded staging for positive lease counts.
 
         The full host shadow of the device KV pool does not fit libtpu's
         premapped (pinned) pool once the pool is auto-sized, which silently
@@ -6447,21 +6523,13 @@ class TPURaidenConnectorWorker:
         summary: dict
         if leases > 0:
             hints = self._raiden_staging_blocks_per_pool(manifest, kv_cache_groups)
-            try:
-                summary = dict(
-                    engine.register_pools(
-                        pool_dicts, staging_leases=leases, staging_blocks_per_pool=hints
-                    )
+            summary = dict(
+                engine.register_pools(
+                    pool_dicts,
+                    staging_leases=leases,
+                    staging_blocks_per_pool=hints,
                 )
-            except TypeError as exc:
-                # Older tpu_sync wheels predate bounded staging.
-                logger.warning(
-                    "Raiden bounded host staging unavailable in the installed "
-                    "tpu_sync (%s); falling back to the full host mirror "
-                    "(make sure TPU_PREMAPPED_BUFFER_SIZE covers it)",
-                    exc,
-                )
-                summary = dict(engine.register_pools(pool_dicts))
+            )
         else:
             summary = dict(engine.register_pools(pool_dicts))
         staging = summary.get("host_staging")

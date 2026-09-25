@@ -2464,7 +2464,9 @@ class TPUModelRunner(GPUModelRunner):
             # accepted. Now that the true acceptance is known, drop the entire
             # optimistic guess and append the actual sampled tokens.
             n_placeholder = 1 + (
-                pre_num_draft_per_req.get(pre_req_idx, 0)
+                pre_num_draft_per_req.get(
+                    pre_req_idx, pre_num_draft_per_req.get(req_id, 0)
+                )
                 if pre_num_draft_per_req
                 else 0
             )

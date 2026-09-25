@@ -10,7 +10,20 @@ on its own, for one) does not call the entry point on a half-initialized
 package.
 """
 
+from pathlib import Path
+
 _tpu_info_logged = False
+
+
+def _has_local_tpu_device() -> bool:
+    if any(Path("/dev").glob("accel*")):
+        return True
+
+    vfio_root = Path("/dev/vfio")
+    try:
+        return any(entry.name.isdigit() for entry in vfio_root.iterdir())
+    except OSError:
+        return False
 
 
 def _log_tpu_info() -> None:
@@ -41,6 +54,9 @@ def _log_tpu_info() -> None:
 
 def register_tpu_platform() -> str:
     """vLLM out-of-tree platform plugin entry point."""
+    if not _has_local_tpu_device():
+        return "vllm.platforms.cpu.CpuPlatform"
+
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
     _log_tpu_info()
@@ -49,4 +65,5 @@ def register_tpu_platform() -> str:
 
 import vllm  # noqa: E402,F401  # isort: skip
 
-from vllm_torchtpu.platforms.tpu_platform import TpuPlatform  # noqa: E402
+if _has_local_tpu_device():
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform  # noqa: E402

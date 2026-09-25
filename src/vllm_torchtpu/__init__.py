@@ -8,6 +8,18 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _patch_vllm_raiden_pd_completion() -> None:
+    from vllm_torchtpu.core.raiden_pd import patch_scheduler_init
+
+    patch_scheduler_init()
+
+
+def _patch_vllm_abort_on_preemption() -> None:
+    from vllm_torchtpu.core.abort_on_preemption import patch_scheduler_init
+
+    patch_scheduler_init()
+
+
 def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
     """Backport hybrid KV cache load failure recovery from vLLM #50388.
 
@@ -1611,12 +1623,19 @@ def _patch_vllm_same_step_prefix_hits() -> None:
             return None
         return blocks
 
-    @functools.wraps(original_schedule)
-    def schedule(self, *args, **kwargs):
-        unwritten_block_ids(self.kv_cache_manager.block_pool).clear()
-        return original_schedule(self, *args, **kwargs)
+    def wrap_schedule(schedule_impl):
+        @functools.wraps(schedule_impl)
+        def schedule(self, *args, **kwargs):
+            unwritten_block_ids(self.kv_cache_manager.block_pool).clear()
+            return schedule_impl(self, *args, **kwargs)
 
-    for wrapper in (_insert_block_hash, get_cached_block, schedule):
+        schedule._tpu_same_step_prefix_hit_patch = True
+        schedule._tpu_wrap_same_step_prefix_hits = wrap_schedule
+        return schedule
+
+    schedule = wrap_schedule(original_schedule)
+
+    for wrapper in (_insert_block_hash, get_cached_block):
         wrapper._tpu_same_step_prefix_hit_patch = True
     BlockPool._insert_block_hash = _insert_block_hash
     BlockPool.get_cached_block = get_cached_block
