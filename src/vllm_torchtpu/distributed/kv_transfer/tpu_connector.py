@@ -5856,6 +5856,7 @@ class TPURaidenConnectorWorker:
                 clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
                     len(transfer_tags) - fa_tag_count
                 )
+            dst_mem_type = self._raiden_hbm_memory_type()
             start_submit = time.perf_counter()
             controller_contacted = True
             accepted = self._start_stage3_transfer_with_d5_retry(
@@ -5867,7 +5868,7 @@ class TPURaidenConnectorWorker:
                 # local scheduler lifecycle key.
                 req_id=source_req_id,
                 dst_device_block_ids=dst_blocks,
-                dst_mem_type=self._raiden_hbm_memory_type(),
+                dst_mem_type=dst_mem_type,
                 use_block_chunks=True,
                 src_controller_address=src_controller_address,
                 dst_controller_address=dst_controller_address,

@@ -4047,6 +4047,43 @@ class TestTPURaidenConnectorWorker:
             [50, 51, 52, 53, 11, 11] if hybrid else [50, 51, 52, 53]
         )
 
+    @pytest.mark.parametrize(
+        ("failure_at", "expected_status"),
+        [("prefix", "failed"), ("memory_type", "failed"), ("rpc", "uncertain")],
+    )
+    def test_stage3_local_failure_does_not_wait_for_transfer(
+        self, failure_at, expected_status
+    ):
+        worker = _make_raiden_worker(is_producer=False, tp_size=2)
+        facade = MagicMock()
+        worker._stage3_source_facades["source"] = facade
+        worker._stage3_source_work_units = MagicMock(return_value=[])
+        worker._raiden_hbm_memory_type = MagicMock(return_value=3)
+        failure = RuntimeError("injected submission failure")
+        if failure_at == "rpc":
+            facade.start_transfer.side_effect = failure
+        else:
+            method = (
+                "_stage3_fa_token_bytes"
+                if failure_at == "prefix"
+                else "_raiden_hbm_memory_type"
+            )
+            setattr(worker, method, MagicMock(side_effect=failure))
+
+        result = worker._submit_stage3_load_as_leader(
+            req_meta=SimpleNamespace(src_controller_address="source", skip_tokens=256),
+            source_req_id="src",
+            destination_req_id="dst",
+            uuid=1,
+            num_tokens=4095,
+            local_blocks=[9, 10],
+            dst_controller_address="destination",
+            dst_units=[],
+        )
+
+        assert result == (expected_status, None, str(failure), 0, 0)
+        assert facade.start_transfer.call_count == (failure_at == "rpc")
+
     @pytest.mark.parametrize(("tp_rank", "tp_size"), [(0, 1), (0, 2), (1, 2)])
     @pytest.mark.parametrize("report_completion", [False, True])
     def test_stage3_release_only_meta_cancels_producer_registration(
