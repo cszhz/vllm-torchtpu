@@ -1393,11 +1393,14 @@ class TestInitializeAttentionKernelsThreshold:
         assert runner.reorder_batch_threshold == 1
 
     def test_replicated_draft_relocated_and_pinned_to_one_token(self):
+        from vllm_torchtpu.layers.adapter.attention import _pallas_rpa_kernel_local
+
         runner, layers = self._make_runner(
             {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=1
         )
         self._run(runner, layers)
         assert layers["draft"].impl.decode_query_size == 1
+        assert layers["draft"].impl._kernel_entry is _pallas_rpa_kernel_local
         assert layers["target"].impl.decode_query_size == 4
         # The drafter's first pass attends with the target's distribution, so
         # a 1-wide draft must hold the threshold at 1: K+1-token verify windows
@@ -1416,6 +1419,67 @@ class TestInitializeAttentionKernelsThreshold:
         assert layers["draft"].impl.decode_query_size == 4
         assert layers["target"].impl.decode_query_size == 4
         assert runner.reorder_batch_threshold == 4
+
+    @pytest.mark.parametrize("num_speculative_tokens", [1, 3, 7])
+    @pytest.mark.parametrize("head_size", [64, 256])
+    @pytest.mark.usefixtures("vllm_config_context")
+    def test_sharded_mtp_retains_backend_query_width_at_kernel_initialization(
+        self, num_speculative_tokens, head_size
+    ):
+        """Step 0 inherits verify queries: width 1 can lose cross-page KV writes.
+
+        Exercise the real backend constructor and runner boundary, without
+        compiling a TPU kernel. The separate head-size-64 path stays width 1.
+        """
+        from vllm.config import get_current_vllm_config
+
+        from vllm_torchtpu.layers.adapter.attention import (
+            PallasBatchedRPAAttentionBackendImpl,
+        )
+
+        spec = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=num_speculative_tokens,
+            draft_tensor_parallel_size=2,
+        )
+        config = get_current_vllm_config()
+        config.speculative_config = spec
+        runner, _ = self._make_runner({}, draft_names=("draft",), draft_tp=2)
+        runner.vllm_config = config
+        runner.speculative_config = spec
+        layers = {
+            name: SimpleNamespace(
+                impl=PallasBatchedRPAAttentionBackendImpl(
+                    num_heads=16,
+                    head_size=head_size,
+                    scale=head_size**-0.5,
+                    num_kv_heads=1,
+                    alibi_slopes=None,
+                    sliding_window=None,
+                    kv_cache_dtype="fp8",
+                )
+            )
+            for name in ("target", "draft")
+        }
+        initialized_widths = {}
+
+        def initialize(impl, layer):
+            name = next(
+                name for name, candidate in layers.items() if candidate is layer
+            )
+            initialized_widths[name] = impl.decode_query_size
+
+        with patch.object(
+            PallasBatchedRPAAttentionBackendImpl,
+            "initialize_kernel",
+            autospec=True,
+            side_effect=initialize,
+        ):
+            self._run(runner, layers)
+
+        expected_width = 1 if head_size == 64 else num_speculative_tokens + 1
+        assert initialized_widths == {"target": expected_width, "draft": expected_width}
+        assert runner.reorder_batch_threshold == expected_width
 
     def test_narrow_draft_caps_threshold(self):
         """A draft whose tile is narrower than the target's (e.g. an impl that
