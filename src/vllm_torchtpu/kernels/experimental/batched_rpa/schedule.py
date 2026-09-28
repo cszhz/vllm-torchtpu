@@ -211,6 +211,7 @@ class RpaSchedule:
     total_wait_o_out: SmemWrapper  # [steps]
     total_wait_lse_out: SmemWrapper  # [steps]
     actual_steps: Any  # [1]
+    chunk_steps: Any | None  # [128], only for page-table streaming
 
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
@@ -256,6 +257,14 @@ class RpaSchedule:
             total_wait_o_out=steps_wrapper,
             total_wait_lse_out=steps_wrapper,
             actual_steps=jax.ShapeDtypeStruct((1,), jnp.int32),
+            chunk_steps=(
+                jax.ShapeDtypeStruct(
+                    (utils.align_to(cfgs.serve.max_schedule_size_multiplier, 128),),
+                    jnp.int32,
+                )
+                if cfgs.serve.stream_page_indices
+                else None
+            ),
             cfgs=cfgs,
         )
 
@@ -360,8 +369,12 @@ def _write_schedule_to_hbm(
     hbm_offset_aligned = pl.multiple_of(
         hbm_offset, 128
     )  # pytype: disable=bad-argument-type
-    flat_hbm = jax.tree_util.tree_leaves(schedule_hbm)
-    flat_smem = jax.tree_util.tree_leaves(schedule_smem)
+    flat_hbm = jax.tree_util.tree_leaves(
+        dataclasses.replace(schedule_hbm, chunk_steps=None)
+    )
+    flat_smem = jax.tree_util.tree_leaves(
+        dataclasses.replace(schedule_smem, chunk_steps=None)
+    )
     dma_list = []
     for h, s in zip(flat_hbm, flat_smem):
         element_size = s.shape[0] // cfgs.max_steps_ub
@@ -499,6 +512,10 @@ def flush_to_hbm(
         _mask_out_steps(step, b_idx=b_idx, schedule_smem=schedule)
 
     _compute_waits(schedule, 0, last_step // cfgs.batch_size, cfgs=cfgs)
+    if cfgs.serve.stream_page_indices:
+        schedule.chunk_steps[hbm_offset // cfgs.max_steps_ub] = (
+            last_step // cfgs.batch_size
+        )
     _write_schedule_to_hbm(
         schedule,
         schedule_hbm_ref,
@@ -811,6 +828,22 @@ class BaseMetadataComputer:
             distribution_ref
         )  # pytype: disable=bad-argument-type
         init_carry = LoopCarry(0, 0)
+        if self.cfgs.serve.stream_page_indices:
+            group_size = self.cfgs.serve.page_table_group_size
+            base_seq_loop = seq_loop_fn
+
+            def grouped_seq_loop(s_idx, carry):
+                carry = jax.lax.cond(
+                    (s_idx > start_seq_idx)
+                    & (s_idx % group_size == 0)
+                    & (carry.count > 0),
+                    self.flush_carry,
+                    lambda value: value,
+                    carry,
+                )
+                return base_seq_loop(s_idx, carry)
+
+            seq_loop_fn = grouped_seq_loop
         return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop_fn, init_carry)
 
 
@@ -891,6 +924,14 @@ def rpa_metadata_schedule_kernel(
         dma_sem,
         cfgs=cfgs,
     )
+    if cfgs.serve.stream_page_indices:
+        chunk_copy = pltpu.make_async_copy(
+            schedule_ref.chunk_steps,
+            schedule_hbm_ref.chunk_steps,
+            dma_sem.at[0],
+        )
+        chunk_copy.start()
+        chunk_copy.wait()
 
 
 def generate_rpa_metadata(

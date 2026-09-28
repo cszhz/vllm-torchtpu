@@ -733,6 +733,34 @@ def rpa_kernel(
             final_allocs=(q_alloc, kv_cache_alloc, o_alloc, lse_alloc),
             schedule_ref=computer_cls.get_rpa_schedule(cfgs).scratch_shapes(),
             dma_sem=pltpu.SemaphoreType.DMA((1,)),
+            page_windows=(
+                pltpu.SMEM((2, cfgs.serve.page_table_window_entries), dtype=jnp.int32)
+                if cfgs.serve.stream_page_indices
+                else None
+            ),
+            page_dma_sem=(
+                pltpu.SemaphoreType.DMA((2,))
+                if cfgs.serve.stream_page_indices
+                else None
+            ),
+            loaded_groups=(
+                pltpu.SMEM((2,), dtype=jnp.int32)
+                if cfgs.serve.stream_page_indices
+                else None
+            ),
+            chunk_lengths=(
+                pltpu.SMEM(
+                    (utils.align_to(cfgs.serve.max_schedule_size_multiplier, 128),),
+                    dtype=jnp.int32,
+                )
+                if cfgs.serve.stream_page_indices
+                else None
+            ),
+            chunk_dma_sem=(
+                pltpu.SemaphoreType.DMA((1,))
+                if cfgs.serve.stream_page_indices
+                else None
+            ),
             scratches=(
                 pltpu.VMEM(
                     cfgs.lm_scratch_shape,
@@ -748,7 +776,46 @@ def rpa_kernel(
                 ),  # acc
             ),
         )
-        def _run(final_allocs, schedule_ref, dma_sem, scratches):
+        def _run(
+            final_allocs,
+            schedule_ref,
+            dma_sem,
+            page_windows,
+            page_dma_sem,
+            loaded_groups,
+            chunk_lengths,
+            chunk_dma_sem,
+            scratches,
+        ):
+            if cfgs.serve.stream_page_indices:
+                chunk_copy = pltpu.make_async_copy(
+                    schedule_hbm_ref.chunk_steps,
+                    chunk_lengths,
+                    chunk_dma_sem.at[0],
+                )
+                chunk_copy.start()
+                chunk_copy.wait()
+
+                page_count = cfgs.serve.page_table_window_entries
+                loaded_groups[0] = -1
+                loaded_groups[1] = -1
+                first_copy = pltpu.make_async_copy(
+                    page_indices_ref.at[pl.ds(0, page_count)],
+                    page_windows.at[0, pl.ds(0, page_count)],
+                    page_dma_sem.at[0],
+                )
+                first_copy.start()
+                if cfgs.serve.num_seqs > cfgs.serve.page_table_group_size:
+                    second_copy = pltpu.make_async_copy(
+                        page_indices_ref.at[pl.ds(page_count, page_count)],
+                        page_windows.at[1, pl.ds(0, page_count)],
+                        page_dma_sem.at[1],
+                    )
+                    second_copy.start()
+                    second_copy.wait()
+                    loaded_groups[1] = 1
+                first_copy.wait()
+                loaded_groups[0] = 0
             # Initialize Q to zeros to prevent NaN pollution.
             #
             # When a query block is partially filled, tail slots in uninitialized VMEM
@@ -787,8 +854,12 @@ def rpa_kernel(
                 aligned_start_step = (start_step // 128) * 128
                 prefix_steps = start_step - aligned_start_step
 
-                flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
-                flat_smem = jax.tree_util.tree_leaves(schedule_ref)
+                flat_hbm = jax.tree_util.tree_leaves(
+                    dataclasses.replace(schedule_hbm_ref, chunk_steps=None)
+                )
+                flat_smem = jax.tree_util.tree_leaves(
+                    dataclasses.replace(schedule_ref, chunk_steps=None)
+                )
                 dma_list = []
                 for h, s in zip(flat_hbm, flat_smem):
                     if jax.typeof(h).memory_space == pltpu.HBM:
@@ -809,6 +880,51 @@ def rpa_kernel(
                         dma_list.append(copy)
                 jax.tree.map(lambda x: x.wait(), dma_list)
 
+                if cfgs.serve.stream_page_indices:
+                    group = schedule_ref.s_idx[0, 0] // cfgs.serve.page_table_group_size
+                    slot = group % 2
+                    page_count = cfgs.serve.page_table_window_entries
+
+                    def stage_missing():
+                        start = pl.multiple_of(group * page_count, 128)
+                        page_copy = pltpu.make_async_copy(
+                            page_indices_ref.at[pl.ds(start, page_count)],
+                            page_windows.at[slot, pl.ds(0, page_count)],
+                            page_dma_sem.at[slot],
+                        )
+                        page_copy.start()
+                        page_copy.wait()
+                        loaded_groups[slot] = group
+
+                    jax.lax.cond(
+                        loaded_groups[slot] != group,
+                        stage_missing,
+                        lambda: None,
+                    )
+                    page_ref = page_windows
+                    next_group = group + 1
+                    next_slot = next_group % 2
+                    do_prefetch = (
+                        next_group
+                        < pl.cdiv(
+                            cfgs.serve.num_seqs,
+                            cfgs.serve.page_table_group_size,
+                        )
+                    ) & (loaded_groups[next_slot] != next_group)
+                    next_start = pl.multiple_of(next_group * page_count, 128)
+                    next_copy = pltpu.make_async_copy(
+                        page_indices_ref.at[pl.ds(next_start, page_count)],
+                        page_windows.at[next_slot, pl.ds(0, page_count)],
+                        page_dma_sem.at[next_slot],
+                    )
+                    jax.lax.cond(
+                        do_prefetch,
+                        lambda: next_copy.start(),
+                        lambda: None,
+                    )
+                else:
+                    page_ref = page_indices_ref
+
                 pipeline_func = pltpu.emit_pipeline(
                     body=functools.partial(
                         rpa_body,
@@ -824,20 +940,34 @@ def rpa_kernel(
                 )
                 pipeline_func(
                     (q_hbm_ref, schedule_ref),
-                    (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref, page_indices_ref),
+                    (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref, page_ref),
                     (o_hbm_ref, schedule_ref),
                     (lse_hbm_ref, schedule_ref) if return_lse else None,
                     scratches=(schedule_ref,) + scratches,
                     allocations=final_allocs,
                 )
+                if cfgs.serve.stream_page_indices:
+
+                    def finish_prefetch():
+                        next_copy.wait()
+                        loaded_groups[next_slot] = next_group
+
+                    jax.lax.cond(
+                        do_prefetch,
+                        finish_prefetch,
+                        lambda: None,
+                    )
 
             @pl.loop(0, num_safe_step_iterations)
             def loop_body(step_idx):
                 start = step_idx * cfgs.max_steps_ub
-                rem = actual_steps % cfgs.max_steps_ub
-                last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
-                is_last_step = step_idx == num_safe_step_iterations - 1
-                size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
+                if cfgs.serve.stream_page_indices:
+                    size = chunk_lengths[step_idx]
+                else:
+                    rem = actual_steps % cfgs.max_steps_ub
+                    last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
+                    is_last_step = step_idx == num_safe_step_iterations - 1
+                    size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
                 execute_schedule_chunk(start, size)
 
         _run()
@@ -847,18 +977,19 @@ def rpa_kernel(
         q_offsets,
         kv_cache_lens,
         kv_new_lens,
-        page_indices,
     )
+    if not cfgs.serve.stream_page_indices:
+        scalar_prefetches += (page_indices,)
     num_scalar_prefetch = len(scalar_prefetches)
-    num_active_scalers = len(scalar_prefetches)
+    num_inputs_before_schedule = 5
     out_shape = [q_hbm, kv_cache_hbm, lse_hbm if return_lse else None]
     schedule_leaves = len(jax.tree_util.tree_leaves(schedule_hbm))
     input_output_aliases = {
-        num_active_scalers + schedule_leaves: 0,
-        num_active_scalers + schedule_leaves + 2: 1,
+        num_inputs_before_schedule + schedule_leaves: 0,
+        num_inputs_before_schedule + schedule_leaves + 2: 1,
     }
     if return_lse:
-        input_output_aliases[num_active_scalers + schedule_leaves + 3] = (
+        input_output_aliases[num_inputs_before_schedule + schedule_leaves + 3] = (
             2  # lse_hbm -> out[2]
         )
     return pl.pallas_call(
@@ -866,7 +997,12 @@ def rpa_kernel(
         out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=num_scalar_prefetch,
-            in_specs=[
+            in_specs=(
+                [pl.BlockSpec(memory_space=pltpu.HBM)]
+                if cfgs.serve.stream_page_indices
+                else []
+            )
+            + [
                 schedule_hbm.in_specs(),
                 pl.BlockSpec(memory_space=pltpu.HBM),  # q_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_hbm_ref

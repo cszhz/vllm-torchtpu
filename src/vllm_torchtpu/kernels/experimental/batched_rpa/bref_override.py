@@ -22,6 +22,14 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule
 
 
+def _page_id(page_indices_ref, logical_page, cfgs):
+    if cfgs.serve.stream_page_indices:
+        group = logical_page // cfgs.serve.page_table_window_entries
+        offset = logical_page % cfgs.serve.page_table_window_entries
+        return page_indices_ref[group % 2, offset]
+    return page_indices_ref[logical_page]
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class _BypassRef(pltpu.BufferedRef):
@@ -85,7 +93,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 p_idx, dst_off, dma_valid = schedule_ref.get_dma_kv_cache(
                     block_idx, b, i
                 )
-                hbm_p_idx = page_indices_ref[p_idx]
+                hbm_p_idx = _page_id(page_indices_ref, p_idx, self.cfgs)
                 sz = dma_valid * self.cfgs.serve.page_size
                 num_lanes = pltpu.get_tpu_info().num_lanes
                 dst_off = pl.multiple_of(dst_off, num_lanes)
@@ -137,15 +145,28 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 dst_hbm_p = dma_entry.wb_hbm[...]
                 src_vmem_off = dma_entry.wb_vmem[...]
                 dma_valid = dma_entry.wb_val
-                hbm_p_idx = page_indices_ref[dst_hbm_p]
+                hbm_p_idx = _page_id(page_indices_ref, dst_hbm_p, self.cfgs)
                 sz = jnp.where(do_writeback, dma_valid * self.cfgs.serve.page_size, 0)
                 src_vmem_off = pl.multiple_of(src_vmem_off, 128)
                 sz = pl.multiple_of(sz, 128)
-                pltpu.make_async_copy(
-                    vmem_src_lane.at[b, :, :, :, pl.ds(src_vmem_off, sz)],
-                    kv_out_ref.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
-                    sem,
-                ).start()
+
+                def write_page(
+                    *,
+                    b=b,
+                    src_vmem_off=src_vmem_off,
+                    sz=sz,
+                    hbm_p_idx=hbm_p_idx,
+                ):
+                    pltpu.make_async_copy(
+                        vmem_src_lane.at[b, :, :, :, pl.ds(src_vmem_off, sz)],
+                        kv_out_ref.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
+                        sem,
+                    ).start()
+
+                if self.cfgs.serve.stream_page_indices:
+                    jax.lax.cond(sz > 0, write_page, lambda: None)
+                else:
+                    write_page()
 
     def wait_in(
         self,
@@ -248,7 +269,10 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         for b in range(self.cfgs.batch_size):
             for i in range(self.cfgs.bkv_p_cache):
                 p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
-                src_off = page_indices_ref[p_idx] * self.cfgs.serve.page_size
+                src_off = (
+                    _page_id(page_indices_ref, p_idx, self.cfgs)
+                    * self.cfgs.serve.page_size
+                )
                 dma_list_cache.append((src_off, dst_off, sz, b))
 
             # Contiguous fetch for new KV
@@ -300,14 +324,28 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                 global_p_idx = encoded_dst_hbm_off >> self.cfgs.serve.page_size_log2
                 p_off = encoded_dst_hbm_off & self.cfgs.serve.page_size_mask
                 dst_hbm_off = (
-                    page_indices_ref[global_p_idx] << self.cfgs.serve.page_size_log2
+                    _page_id(page_indices_ref, global_p_idx, self.cfgs)
+                    << self.cfgs.serve.page_size_log2
                 ) | p_off
                 sz = jnp.where(do_writeback, new_sz, 0)
-                pltpu.make_async_copy(
-                    vmem_src.at[b, pl.ds(src_vmem_off, sz)],
-                    kv_out_ref_flat.at[pl.ds(dst_hbm_off, sz)],
-                    sem,
-                ).start()
+
+                def write_page(
+                    *,
+                    b=b,
+                    src_vmem_off=src_vmem_off,
+                    sz=sz,
+                    dst_hbm_off=dst_hbm_off,
+                ):
+                    pltpu.make_async_copy(
+                        vmem_src.at[b, pl.ds(src_vmem_off, sz)],
+                        kv_out_ref_flat.at[pl.ds(dst_hbm_off, sz)],
+                        sem,
+                    ).start()
+
+                if self.cfgs.serve.stream_page_indices:
+                    jax.lax.cond(sz > 0, write_page, lambda: None)
+                else:
+                    write_page()
 
     def wait_in(
         self,

@@ -14,6 +14,7 @@
 
 import dataclasses
 import enum
+import math
 
 import jax
 import jax.numpy as jnp
@@ -106,6 +107,21 @@ class ServingConfigs:
     attention_scope: AttentionScope = AttentionScope.FULL
     return_lse: bool = False
     skip_kv_update: bool = False
+    stream_page_indices: bool = False
+
+    @property
+    def page_table_group_size(self) -> int:
+        """Largest DMA-aligned group fitting one 256 KiB page-table buffer."""
+        alignment = 128 // math.gcd(128, self.pages_per_seq)
+        rows = (256 * 1024 // 4) // self.pages_per_seq
+        group_size = rows // alignment * alignment
+        if group_size < 1:
+            raise ValueError("One page-table group exceeds the SMEM window")
+        return group_size
+
+    @property
+    def page_table_window_entries(self) -> int:
+        return self.page_table_group_size * self.pages_per_seq
 
     @property
     def max_decode_bkv_p_new(self) -> int:
@@ -215,7 +231,8 @@ class RpaConfigs:
         fixed_bytes = 0
         fixed_bytes += self.serve.num_seqs  # kv_lens
         fixed_bytes += self.serve.num_seqs + 1  # cu_q_lens
-        fixed_bytes += self.serve.num_seqs * self.serve.pages_per_seq  # page_indices
+        if not self.serve.stream_page_indices:
+            fixed_bytes += self.serve.num_seqs * self.serve.pages_per_seq
         fixed_bytes += 3  # distribution
         fixed_bytes += self.block.batch_size  # lane_lengths
         fixed_bytes += 1  # actual_steps

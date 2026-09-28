@@ -31,6 +31,8 @@ layers in a model.
 Note: batched_rpa is build on top / derived from RPA3.
 """
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -501,6 +503,7 @@ def calculate_block_sizes(
         "cp_group_size",
         "attention_scope",
         "return_lse",
+        "stream_page_indices",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -542,6 +545,7 @@ def ragged_paged_attention(
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
+    stream_page_indices: bool | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
     Args:
@@ -622,6 +626,13 @@ def ragged_paged_attention(
     head_dim = queries.shape[2]
     num_kv_heads = keys.shape[1]
     num_page_indices = page_indices.shape[0]
+    pages_per_seq = num_page_indices // max_num_seqs
+    # Keep scalar prefetch for buckets that fit the original SMEM path. At a
+    # 1 Mi-token page table, the Qwen FP8/HND geometry runs with ten rows
+    # (160 KiB) and fails with eleven (176 KiB) in the old scheduler.
+    if stream_page_indices is None:
+        legacy_limit = 160 * 1024 if pages_per_seq >= 4096 else 512 * 1024
+        stream_page_indices = num_page_indices * 4 > legacy_limit
     model_cfgs = configs.ModelConfigs(
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
@@ -667,7 +678,16 @@ def ragged_paged_attention(
         attention_scope=attention_scope,
         return_lse=return_lse,
         skip_kv_update=skip_kv_update,
+        stream_page_indices=stream_page_indices,
     )
+    schedule_chunks = 40 if serve_cfgs.pages_per_seq >= 4096 else 16
+    if stream_page_indices:
+        groups = pl.cdiv(max_num_seqs, serve_cfgs.page_table_group_size)
+        schedule_chunks = max(schedule_chunks, groups + 16)
+    if schedule_chunks != 16:
+        serve_cfgs = dataclasses.replace(
+            serve_cfgs, max_schedule_size_multiplier=schedule_chunks
+        )
     q_hbm, new_kv_hbm = prepare_inputs(
         queries,
         keys,
@@ -772,12 +792,19 @@ def ragged_paged_attention(
             computer_cls=computer_cls,
             extra_scalars=extra_scalars,
         )
+        kernel_page_indices = page_indices
+        if stream_page_indices:
+            group_size = serve_cfgs.page_table_group_size
+            extra_rows = pl.cdiv(max_num_seqs, group_size) * group_size - max_num_seqs
+            kernel_page_indices = jnp.pad(
+                page_indices, (0, extra_rows * serve_cfgs.pages_per_seq)
+            )
         result = kernel.rpa_kernel(
             cu_q_lens,
             q_offsets,
             kv_cache_lens,
             kv_new_lens,
-            page_indices,
+            kernel_page_indices,
             schedule_hbm,
             o_hbm_alias_q_hbm,
             new_kv_hbm,
