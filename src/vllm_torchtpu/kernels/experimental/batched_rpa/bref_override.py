@@ -24,8 +24,16 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule
 
 def _page_id(page_indices_ref, logical_page, cfgs):
     if cfgs.serve.stream_page_indices:
-        group = logical_page // cfgs.serve.page_table_window_entries
-        offset = logical_page % cfgs.serve.page_table_window_entries
+        if cfgs.serve.page_table_row_stride != cfgs.serve.pages_per_seq:
+            seq = logical_page // cfgs.serve.pages_per_seq
+            page = logical_page % cfgs.serve.pages_per_seq
+            group = seq // cfgs.serve.page_table_group_size
+            offset = (
+                seq % cfgs.serve.page_table_group_size
+            ) * cfgs.serve.page_table_row_stride + page
+        else:
+            group = logical_page // cfgs.serve.page_table_window_entries
+            offset = logical_page % cfgs.serve.page_table_window_entries
         return page_indices_ref[group % 2, offset]
     return page_indices_ref[logical_page]
 

@@ -796,9 +796,21 @@ def ragged_paged_attention(
         if stream_page_indices:
             group_size = serve_cfgs.page_table_group_size
             extra_rows = pl.cdiv(max_num_seqs, group_size) * group_size - max_num_seqs
-            kernel_page_indices = jnp.pad(
-                page_indices, (0, extra_rows * serve_cfgs.pages_per_seq)
-            )
+            if serve_cfgs.page_table_row_stride == serve_cfgs.pages_per_seq:
+                kernel_page_indices = jnp.pad(
+                    page_indices, (0, extra_rows * serve_cfgs.pages_per_seq)
+                )
+            else:
+                kernel_page_indices = jnp.pad(
+                    page_indices.reshape(max_num_seqs, serve_cfgs.pages_per_seq),
+                    (
+                        (0, extra_rows),
+                        (
+                            0,
+                            serve_cfgs.page_table_row_stride - serve_cfgs.pages_per_seq,
+                        ),
+                    ),
+                ).reshape(-1)
         result = kernel.rpa_kernel(
             cu_q_lens,
             q_offsets,

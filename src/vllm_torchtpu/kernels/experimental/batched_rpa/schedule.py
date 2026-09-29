@@ -510,6 +510,10 @@ def flush_to_hbm(
     def body(idx):
         step, b_idx = divmod(idx, cfgs.batch_size)
         _mask_out_steps(step, b_idx=b_idx, schedule_smem=schedule)
+        if cfgs.serve.stream_page_indices:
+            # Empty lanes end the accumulator chain before the next chunk.
+            # Their zero-length query DMA still suppresses output writes.
+            schedule.is_last_k[step, b_idx] = 1
 
     _compute_waits(schedule, 0, last_step // cfgs.batch_size, cfgs=cfgs)
     if cfgs.serve.stream_page_indices:

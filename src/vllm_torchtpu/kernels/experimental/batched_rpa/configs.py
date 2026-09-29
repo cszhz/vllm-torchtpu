@@ -110,10 +110,18 @@ class ServingConfigs:
     stream_page_indices: bool = False
 
     @property
+    def page_table_row_stride(self) -> int:
+        """Preserve existing groups; pad rows only if no aligned group fits."""
+        alignment = 128 // math.gcd(128, self.pages_per_seq)
+        if alignment * self.pages_per_seq <= 256 * 1024 // 4:
+            return self.pages_per_seq
+        return (self.pages_per_seq + 127) // 128 * 128
+
+    @property
     def page_table_group_size(self) -> int:
         """Largest DMA-aligned group fitting one 256 KiB page-table buffer."""
-        alignment = 128 // math.gcd(128, self.pages_per_seq)
-        rows = (256 * 1024 // 4) // self.pages_per_seq
+        alignment = 128 // math.gcd(128, self.page_table_row_stride)
+        rows = (256 * 1024 // 4) // self.page_table_row_stride
         group_size = rows // alignment * alignment
         if group_size < 1:
             raise ValueError("One page-table group exceeds the SMEM window")
@@ -121,7 +129,7 @@ class ServingConfigs:
 
     @property
     def page_table_window_entries(self) -> int:
-        return self.page_table_group_size * self.pages_per_seq
+        return self.page_table_group_size * self.page_table_row_stride
 
     @property
     def max_decode_bkv_p_new(self) -> int:
