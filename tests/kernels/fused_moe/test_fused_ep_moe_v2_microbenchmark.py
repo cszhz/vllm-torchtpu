@@ -15,6 +15,10 @@
 inference workload.
 """
 
+import glob
+import os
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -41,6 +45,8 @@ FP4 = jnp.float4_e2m1fn
 QB4 = host.QB4
 # The serving adapter's _TILE_M, which every build name repeats as c128.
 CAPACITY = 128
+# Kernel runs captured by the profiler after warmup.
+PROFILE_STEPS = 10
 
 
 def _operands(case, mesh):
@@ -54,44 +60,42 @@ def _operands(case, mesh):
     sharded_ep = NamedSharding(mesh, P(AXIS))
     replicated = NamedSharding(mesh, P())
 
-    w1 = jax.device_put(
-        # e2m1 spans +-6 with two mantissa steps a binade, so a unit normal
-        # would round most of the draw onto 0 and +-0.5.
-        (jax.random.normal(keys[0], (e_total, hidden, 2 * inter)) * 2).astype(FP4),
-        sharded_ep,
-    )
-    w2 = jax.device_put(
-        (jax.random.normal(keys[1], (e_total, inter, hidden)) * 2).astype(FP4),
-        sharded_ep,
-    )
-    w1_scale = jax.device_put(
-        jax.random.uniform(keys[2], (e_total, hidden // QB4, 2 * inter)) / 64,
-        sharded_ep,
-    )
-    w2_scale = jax.device_put(
-        jax.random.uniform(keys[3], (e_total, inter // QB4, hidden)) / 64,
-        sharded_ep,
-    )
-    x = jax.device_put(
-        (jax.random.normal(keys[4], (tokens, hidden)) / 10).astype(jnp.bfloat16),
-        sharded_ep,
-    )
-    gating = jax.device_put(
-        jax.random.normal(keys[5], (tokens, e_total)),
-        sharded_ep,
-    )
-    score_bias = jax.device_put(
-        jax.random.normal(keys[6], (e_total,)) / 10,
-        replicated,
-    )
-    # This rank's mesh index as an explicit device tensor, matching serving's
-    # `_RANK_BUFFER`. Prevents XLA from generating a dynamic slice on a
-    # constant partition-id.
-    rank = jax.device_put(
-        jnp.arange(ep, dtype=jnp.int32).reshape(ep, 1),
-        sharded_ep,
-    )
-    return w1, w2, w1_scale, w2_scale, x, gating, score_bias, rank
+    # Generated under jit with out_shardings so each device materializes only
+    # its own shard; the full float32 weights do not fit on one device.
+    @partial(jax.jit, out_shardings=(sharded_ep,) * 6 + (replicated, sharded_ep))
+    def make():
+        w1 = (jax.random.normal(keys[0], (e_total, hidden, 2 * inter)) * 2).astype(FP4)
+        w2 = (jax.random.normal(keys[1], (e_total, inter, hidden)) * 2).astype(FP4)
+        w1_scale = jax.random.uniform(keys[2], (e_total, hidden // QB4, 2 * inter)) / 64
+        w2_scale = jax.random.uniform(keys[3], (e_total, inter // QB4, hidden)) / 64
+        x = (jax.random.normal(keys[4], (tokens, hidden)) / 10).astype(jnp.bfloat16)
+        gating = jax.random.normal(keys[5], (tokens, e_total))
+        score_bias = jax.random.normal(keys[6], (e_total,)) / 10
+        # This rank's mesh index as an explicit device tensor, matching
+        # serving's `_RANK_BUFFER`. Prevents XLA from generating a dynamic
+        # slice on a constant partition-id.
+        rank = jnp.arange(ep, dtype=jnp.int32).reshape(ep, 1)
+        return w1, w2, w1_scale, w2_scale, x, gating, score_bias, rank
+
+    return make()
+
+
+def _kernel_times_ms(profile_dir):
+    """Device durations of every KERNEL_NAME run in this process's profile."""
+    times = []
+    for path in glob.glob(f"{profile_dir}/**/*.xplane.pb", recursive=True):
+        for plane in jax.profiler.ProfileData.from_file(path).planes:
+            if not plane.name.startswith("/device:TPU:") or "SparseCore" in plane.name:
+                continue
+            for line in plane.lines:
+                if line.name != "XLA Ops":
+                    continue
+                times += [
+                    event.duration_ns / 1e6
+                    for event in line.events
+                    if KERNEL_NAME in event.name
+                ]
+    return times
 
 
 class FusedEpMoeV2MicrobenchmarkTest(parameterized.TestCase):
@@ -171,8 +175,27 @@ class FusedEpMoeV2MicrobenchmarkTest(parameterized.TestCase):
         out = run_kernel(x, w1, w2, w1_scale, w2_scale, gating, score_bias, rank)
         out.block_until_ready()
 
-        out = run_kernel(x, w1, w2, w1_scale, w2_scale, gating, score_bias, rank)
-        out.block_until_ready()
+        profile_dir = os.path.join(
+            os.environ.get("PROFILE_DIR") or self.create_tempdir().full_path,
+            case["name"],
+        )
+        with jax.profiler.trace(profile_dir):
+            for _ in range(PROFILE_STEPS):
+                out = run_kernel(
+                    x, w1, w2, w1_scale, w2_scale, gating, score_bias, rank
+                )
+            out.block_until_ready()
+
+        kernel_ms = _kernel_times_ms(profile_dir)
+        self.assertNotEmpty(kernel_ms, f"no {KERNEL_NAME} events in {profile_dir}")
+        print(
+            f"{case['name']}: process {jax.process_index()} {KERNEL_NAME} "
+            f"device time over {len(kernel_ms)} kernel runs on "
+            f"{jax.local_device_count()} local devices: "
+            f"median {np.median(kernel_ms):.3f} ms, min {min(kernel_ms):.3f} ms, "
+            f"max {max(kernel_ms):.3f} ms; profile: {profile_dir}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
