@@ -3185,6 +3185,25 @@ class TestTPURaidenConnectorWorker:
             assert worker._stage3_inflight_submits == set()
             assert worker._stage3_controller_accepted == {"dst"}
 
+    @pytest.mark.parametrize(
+        "pcp,dcp,block_size,max_model_len,expected",
+        [
+            (8, 1, 768, 262144, 43),
+            (8, 1, 768, 6144, 1),
+            (8, 1, 768, 6145, 2),
+            (1, 4, 16, 127, 2),
+            (1, 1, 2304, 262144, 114),
+            (1, 1, 768, 262144, 342),
+        ],
+    )
+    def test_raiden_request_capacity_uses_context_parallel_pages(
+        self, pcp, dcp, block_size, max_model_len, expected
+    ):
+        worker = _make_raiden_worker(pcp_size=pcp, block_size=block_size)
+        worker.vllm_config.parallel_config.decode_context_parallel_size = dcp
+        worker.vllm_config.model_config.max_model_len = max_model_len
+        assert worker._max_request_blocks() == expected
+
     def test_raiden_staging_hints_cover_every_block_table_on_a_storage(self):
         worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
         fa_pages = worker._max_request_blocks()
