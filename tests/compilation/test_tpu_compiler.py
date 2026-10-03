@@ -406,6 +406,34 @@ class TestTpuCompilerCache:
         assert loaded.signature == (("torch.int32", (16,)),)
         assert loaded.was_wrapped is True
 
+    def test_bundled_replay_releases_the_reserialization_copy(self):
+        """The runtime callable must not keep an extra executable for saving."""
+        import gc
+        import weakref
+
+        from vllm_torchtpu.compilation.tpu_compiler import _deserialize_entry
+
+        copies = []
+
+        class Entry:
+            guards_expr = None
+            sanitized_aot_config = None
+
+            def __deepcopy__(self, memo):
+                clone = Entry()
+                copies.append(weakref.ref(clone))
+                return clone
+
+            def wrap_post_compile(self, example_inputs, aot_config, options):
+                return lambda boxed_args: sum(boxed_args)
+
+        # Use Torch's real deserializer and wrapper, without initializing TPU.
+        runtime = _deserialize_entry(Entry())
+        gc.collect()
+        assert len(copies) == 1
+        assert copies[0]() is None
+        assert runtime(2, 3, 7) == 12
+
     def test_replay_refuses_artifacts_it_cannot_vouch_for(self, tmp_path):
         """Stale or damaged artifacts recompile instead of being replayed.
 
