@@ -434,6 +434,44 @@ class TestTpuCompilerCache:
         assert copies[0]() is None
         assert runtime(2, 3, 7) == 12
 
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize("reuse_caller_mode", [False, True])
+    def test_replay_retraces_factory_ops_without_allocating_real_tensors(
+        self, monkeypatch, tmp_path, reuse_caller_mode
+    ):
+        import pickle
+        from contextlib import nullcontext
+
+        import torch
+        from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+        from vllm_torchtpu.compilation import shape_variants, tpu_compiler
+
+        graph = torch.fx.Graph()
+        value = graph.call_function(
+            torch.empty, args=((2, 2),), kwargs={"device": "cpu"}
+        )
+        graph.output(value)
+        module = torch.fx.GraphModule(torch.nn.Module(), graph)
+        handle = tpu_compiler.TpuCompilationHandle(
+            key="factory",
+            entry=module,
+            signature=shape_variants.graph_signature(module),
+        )
+        path = tmp_path / "artifact.pkl"
+        path.write_bytes(pickle.dumps(handle))
+        monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda entry: entry)
+        compiler = tpu_compiler.TpuCompilerAdaptor()
+        caller_mode = FakeTensorMode() if reuse_caller_mode else None
+
+        with caller_mode if caller_mode is not None else nullcontext():
+            runtime = compiler._replay(str(path), module, was_wrapped=False)
+            assert runtime is not None
+            result = runtime()
+            assert isinstance(result, FakeTensor)
+            if caller_mode is not None:
+                assert result.fake_mode is caller_mode
+
     def test_replay_refuses_artifacts_it_cannot_vouch_for(self, tmp_path):
         """Stale or damaged artifacts recompile instead of being replayed.
 

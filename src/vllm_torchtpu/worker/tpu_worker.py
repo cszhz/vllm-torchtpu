@@ -6,12 +6,16 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, cast
 from urllib.parse import urlparse
 
 import torch
 import torch.profiler
 import torch_tpu  # noqa: F401
+from torch.compiler._cache import CacheArtifactManager
+from torch_tpu._internal.compile import resolve_compilations
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import (
@@ -40,6 +44,23 @@ from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _startup_compilation_artifacts() -> Iterator[None]:
+    # These serving workers use disk caches, not torch.compiler artifact export.
+    # Scope startup serialization payloads without changing callers' cache state.
+    with CacheArtifactManager.with_fresh_cache():
+        try:
+            yield
+        finally:
+            # Background AOT saves must finish before the scoped state is dropped.
+            release_start = time.perf_counter()
+            resolve_compilations(())
+    logger.info(
+        "Released startup compilation artifacts in %.3f s",
+        time.perf_counter() - release_start,
+    )
 
 
 def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
@@ -491,7 +512,8 @@ class TPUWorker(WorkerBase):
             return kv_cache_memory_bytes
 
         # VLLM directive of the percentage of HBM memory the model executor can use
-        self.model_runner.profile_run(self.model_runner.max_num_tokens)
+        with _startup_compilation_artifacts():
+            self.model_runner.profile_run(self.model_runner.max_num_tokens)
 
         gpu_memory_utilization = self.cache_config.gpu_memory_utilization
         budget = utils.compute_hbm_budget(self.devices, gpu_memory_utilization)
@@ -697,7 +719,8 @@ class TPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
-        self.model_runner.capture_model()
+        with _startup_compilation_artifacts():
+            self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()

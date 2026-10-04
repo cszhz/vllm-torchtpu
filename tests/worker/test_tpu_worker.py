@@ -15,7 +15,10 @@
 
 import multiprocessing
 import os
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -26,7 +29,63 @@ from vllm.v1.engine.core import EngineCoreProc
 
 import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry
-from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_env
+from vllm_torchtpu.worker.tpu_worker import (
+    TPUWorker,
+    _configure_tpu_process_env,
+    _startup_compilation_artifacts,
+)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("startup_fails", [False, True])
+def test_startup_artifacts_finish_disk_saves_and_restore_caller_cache(
+    monkeypatch, tmp_path, startup_fails
+):
+    from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCacheArtifact
+    from torch.compiler._cache import CacheArtifactManager
+
+    release_save = Event()
+    cache_path = tmp_path / "compiled-artifact"
+    artifact_type = AOTAutogradCacheArtifact.type()
+    flushes = []
+
+    def save_in_background():
+        assert release_save.wait(timeout=5), "startup did not drain its pending save"
+        CacheArtifactManager.record_artifact(artifact_type, "async", b"disk-payload")
+        cache_path.write_bytes(b"disk-payload")
+
+    with CacheArtifactManager.with_fresh_cache(), ThreadPoolExecutor() as executor:
+        CacheArtifactManager.record_artifact(artifact_type, "caller", b"keep")
+        caller_cache = CacheArtifactManager.serialize()
+        pending_save = executor.submit(save_in_background)
+
+        def resolve_compilations(compiled):
+            flushes.append(compiled)
+            release_save.set()
+            pending_save.result(timeout=5)
+
+        monkeypatch.setattr(
+            "vllm_torchtpu.worker.tpu_worker.resolve_compilations", resolve_compilations
+        )
+        expectation = (
+            pytest.raises(RuntimeError, match="startup failed")
+            if startup_fails
+            else nullcontext()
+        )
+        try:
+            with expectation, _startup_compilation_artifacts():
+                CacheArtifactManager.record_artifact(artifact_type, "startup", b"drop")
+                if startup_fails:
+                    raise RuntimeError("startup failed")
+        finally:
+            release_save.set()
+            pending_save.result(timeout=5)
+
+        assert flushes == [()]
+        assert cache_path.read_bytes() == b"disk-payload"
+        restored_cache = CacheArtifactManager.serialize()
+        assert caller_cache is not None and restored_cache is not None
+        assert restored_cache[0] == caller_cache[0]
 
 
 def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(monkeypatch):

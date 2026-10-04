@@ -520,7 +520,14 @@ class TpuCompilerAdaptor(CompilerInterface):
         format and was built from a graph with this one's input signature.
         """
         try:
-            with open(path, "rb") as f:
+            # GraphModule unpickling retraces its generated forward. Factory
+            # ops with literal TPU devices otherwise allocate real tensors,
+            # which bundled-entry deepcopy then clones into HBM. Reuse the
+            # caller's fake mode so deepcopy does not mix modes after loading.
+            fake_mode = (
+                torch._guards.detect_fake_mode() or torch._subclasses.FakeTensorMode()
+            )
+            with fake_mode, open(path, "rb") as f:
                 payload = pickle.load(f)
         except Exception as e:
             logger.warning("[TpuCompilerAdaptor] Unreadable artifact %s: %s", path, e)
