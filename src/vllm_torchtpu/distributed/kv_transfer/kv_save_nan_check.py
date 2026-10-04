@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Step-owned NaN checks consumed by asynchronous KV stores."""
 
-from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 import torch
@@ -77,14 +77,13 @@ class KVSaveNanCheck:
         return self._bad_req_ids
 
 
-class SupportsKVSaveNanCheck(ABC):
+@runtime_checkable
+class SupportsKVSaveNanCheck(Protocol):
     """Opt-in store interface; ordinary KV connectors keep their original API."""
 
     @property
-    @abstractmethod
     def needs_kv_save_nan_check(self) -> bool: ...
 
-    @abstractmethod
     def wait_for_save(self, nan_check: KVSaveNanCheck | None = None) -> None: ...
 
 

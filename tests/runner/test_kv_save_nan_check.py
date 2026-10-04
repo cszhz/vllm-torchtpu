@@ -9,7 +9,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiCo
 from vllm_torchtpu.distributed.kv_transfer import kv_save_nan_check
 from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
     KVSaveNanCheck,
-    SupportsKVSaveNanCheck,
     begin_kv_save_nan_check,
     wait_for_save_with_nan_check,
 )
@@ -106,7 +105,7 @@ def test_multi_connector_only_passes_snapshot_to_opted_in_stores():
         def wait_for_save(self):
             self.calls += 1
 
-    class Checking(SupportsKVSaveNanCheck):
+    class Checking:
         needs_kv_save_nan_check = False
         snapshot = None
         calls = 0
