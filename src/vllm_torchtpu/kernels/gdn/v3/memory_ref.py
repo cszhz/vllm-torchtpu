@@ -14,7 +14,7 @@
 
 import dataclasses
 import functools
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -261,6 +261,40 @@ class StateBufferedRef(BaseBufferedRef):
 
     # --- source-layout hooks; overridden for an external (pooled) source ---
 
+    def _wait_before_slot_reuse(
+        self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]
+    ) -> None:
+        """Drain the previous output before overwriting its shared VMEM slot.
+
+        emit_pipeline starts input prefetch before its normal output wait.
+        For an INOUT ref, prefetch can therefore overwrite a slot while an
+        earlier output DMA still reads it. Each grid tile uses a new window
+        (no lookahead); tile p reuses the slot last used by p-buffer_count.
+        """
+        assert not self.use_lookahead
+        p_id = grid_indices[0]
+
+        @pl.when(p_id >= self.buffer_count)
+        def _wait() -> None:
+            previous = cast(
+                StateBufferedRef,
+                self.with_slot_index(wait_out_slot=self.cumulative_copy_in),
+            )
+            previous._wait_out_dma(src_ref, (p_id - self.buffer_count,))
+
+    def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        """Drain trailing outputs whose slots are not reused by another input.
+
+        Earlier outputs were already consumed by _wait_before_slot_reuse.
+        Waiting for them again would consume the same DMA semaphore twice.
+        Keep emit_pipeline's slot advancement, but only wait for the tail.
+        """
+        tail_start = self.metadata_ref.num_tiles[...] - self.buffer_count
+
+        @pl.when(grid_indices[0] >= tail_start)
+        def _wait() -> None:
+            self._wait_out_dma(dst_ref, grid_indices)
+
     def _src_slice(self, ref: jax.Ref, state_idx, count):
         """One slot's source window: `count` states at the slot's index."""
         return ref.at[pl.ds(state_idx, count)]
@@ -283,6 +317,7 @@ class StateBufferedRef(BaseBufferedRef):
         return self.metadata_ref.s_idx_to_read_offset[s_idx]
 
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        self._wait_before_slot_reuse(src_ref, grid_indices)
         assert self.sem_recvs is not None
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
@@ -355,7 +390,7 @@ class StateBufferedRef(BaseBufferedRef):
                 sem,
             ).start()
 
-    def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+    def _wait_out_dma(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
@@ -437,6 +472,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         ]
 
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        self._wait_before_slot_reuse(src_ref, grid_indices)
         assert self.sem_recvs is not None
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
@@ -546,7 +582,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
-    def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+    def _wait_out_dma(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
         slot = self.current_wait_out_slot

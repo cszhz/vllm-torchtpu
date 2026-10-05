@@ -562,7 +562,7 @@ def fused_conv1d_gdn(
             1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
         )
 
-        if is_kda:
+        if is_kda and num_spec_tokens > 0:
             # Keep exactly one KDA sequence in each window tile.  The state
             # pipeline issues one async recurrent-state DMA per sequence but
             # shares a semaphore and drains the tile with one aggregate wait.
