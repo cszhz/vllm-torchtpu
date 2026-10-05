@@ -216,6 +216,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_hybrid_kv_load_failure_recovery",
         "_patch_vllm_raiden_pd_completion",
         "_patch_vllm_abort_on_preemption",
+        "patch_scheduler_init",
         "_patch_vllm_same_step_prefix_hits",
         "_patch_vllm_merge_multimodal_embeddings",
     ]

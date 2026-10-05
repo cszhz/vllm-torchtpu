@@ -372,6 +372,7 @@ class TpuPlatform(Platform):
         "TPU_CHIPS_PER_HOST_BOUNDS",
         "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND",
+        "TPU_MTP_ZERO_ACCEPTANCE_LOG",
         "VLLM_MLA_DISABLE",
         "TPU_BACKEND_TYPE",
         "MIXED_Q_SPLIT",

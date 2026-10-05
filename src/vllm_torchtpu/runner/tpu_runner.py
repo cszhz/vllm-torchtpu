@@ -132,6 +132,7 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
+from vllm_torchtpu.runner.mtp_diagnostic_output import maybe_wrap_mtp_output
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -4656,6 +4657,13 @@ class TPUModelRunner(GPUModelRunner):
                 model_runner_output=model_runner_output,
                 copy_state=copy_state,
                 discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+            )
+            async_output = maybe_wrap_mtp_output(
+                async_output,
+                self.vllm_config,
+                req_ids,
+                state.spec_decode_metadata_list,
+                state.num_reqs_list,
             )
 
         if not self.scheduler_config.async_scheduling:

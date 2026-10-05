@@ -31,6 +31,7 @@ from vllm.config import (
 )
 from vllm.config.compilation import DynamicShapesType
 from vllm.model_executor.layers.attention import Attention
+from vllm.ray.ray_env import get_env_vars_to_copy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine.core import EngineCoreProc
 
@@ -1095,3 +1096,10 @@ class TestQwen3VLModelPatches:
         finally:
             if hasattr(torch, "_orig_cumsum_ref"):
                 delattr(torch, "_orig_cumsum_ref")
+
+
+def test_mtp_diagnostic_env_reaches_ray_workers(monkeypatch):
+    monkeypatch.setenv("TPU_MTP_ZERO_ACCEPTANCE_LOG", "1")
+    names = get_env_vars_to_copy(additional_vars=set(TpuPlatform.additional_env_vars))
+    worker_env = {name: os.environ[name] for name in names if name in os.environ}
+    assert worker_env["TPU_MTP_ZERO_ACCEPTANCE_LOG"] == "1"

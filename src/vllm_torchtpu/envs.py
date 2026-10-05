@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
     SPEC_WARMUP: bool = True
+    TPU_MTP_ZERO_ACCEPTANCE_LOG: bool = False
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
@@ -790,6 +791,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run the real spec-decode dispatch once at startup so the first request
     # does not pay for those compiles. Off skips that warmup.
     "SPEC_WARMUP": env_bool("SPEC_WARMUP", default=True),
+    "TPU_MTP_ZERO_ACCEPTANCE_LOG": env_bool("TPU_MTP_ZERO_ACCEPTANCE_LOG"),
     # Raiden library switch, on by default. The TPU offloading connector
     # cannot run next to the raiden singleton worker, so it rejects an
     # explicit off and exports the variable as on for the raiden library.
