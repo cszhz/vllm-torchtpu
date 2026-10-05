@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Batch zero-acceptance logging contracts; no model or TPU execution."""
+"""Batch low-acceptance logging contracts; no model or TPU execution."""
 
 import json
 import logging
@@ -46,7 +46,7 @@ def scheduler(monkeypatch, caplog):
         return scheduler.result
 
     scheduler.update_from_output = consume
-    hook._BatchZeroAcceptance(scheduler)
+    hook._BatchLowAcceptance(scheduler)
     return scheduler
 
 
@@ -65,7 +65,7 @@ def test_zero_batch_logs_all_effective_request_ids(scheduler, caplog, log_stats)
     assert result is scheduler.result
     assert len(caplog.records) == 1
     message = caplog.records[0].getMessage()
-    assert "MTP_ZERO_ACCEPTANCE" in message
+    assert "MTP_LOW_ACCEPTANCE" in message
     assert "scope=batch" in message
     assert "dp_index=2" in message
     assert "num_draft_tokens=4" in message
@@ -91,7 +91,7 @@ def test_zero_batch_logs_all_effective_request_ids(scheduler, caplog, log_stats)
         [("zero", 3, 0, None), ("accepted", 3, 1, None)],
     ],
 )
-def test_nonzero_or_empty_batch_does_not_log(scheduler, caplog, rows):
+def test_healthy_or_empty_batch_does_not_log(scheduler, caplog, rows):
     scheduler.update_from_output(rows, None)
     assert not caplog.records
 
@@ -166,3 +166,40 @@ def test_hook_only_installs_when_enabled(
     )
     if not enabled:
         assert Scheduler.__init__ is init
+
+
+@pytest.mark.parametrize("log_stats", [True, False])
+@pytest.mark.parametrize(
+    "accepted,invalid_last,should_log",
+    [(0, 0, True), (1, 0, True), (1, 1, True), (1, 2, False), (1, 3, False)],
+)
+def test_batch_dump_threshold_uses_effective_drafts(
+    scheduler, caplog, log_stats, accepted, invalid_last, should_log
+):
+    scheduler.log_stats = log_stats
+    rows = [
+        ("a", 3, accepted, None),
+        ("b", 3, 0, None),
+        ("c", 3, 0, None),
+        ("d", 3, 0, {"d": invalid_last}),
+    ]
+    output = diagnostic_output("a", "b", "c", "d")
+    result = scheduler.update_from_output(rows, output)
+    assert result is scheduler.result
+    assert len(caplog.records) == int(should_log)
+    if should_log:
+        message = caplog.messages[0]
+        assert f"num_draft_tokens={12 - invalid_last} " in message
+        assert f"num_accepted_tokens={accepted} " in message
+        rate = float(message.split("acceptance_rate=", 1)[1].split()[0])
+        assert rate == pytest.approx(accepted / (12 - invalid_last))
+        drafts = message.split("verified_draft_token_ids=", 1)[1].split(
+            " request_ids=", 1
+        )[0]
+        assert json.loads(drafts) == output.verified_draft_token_ids
+        assert json.loads(message.split("request_ids=", 1)[1]) == ["a", "b", "c", "d"]
+    if log_stats:
+        assert scheduler.stats.num_draft_tokens == 12 - invalid_last
+        assert scheduler.stats.num_accepted_tokens == accepted
+    else:
+        assert scheduler.stats is None

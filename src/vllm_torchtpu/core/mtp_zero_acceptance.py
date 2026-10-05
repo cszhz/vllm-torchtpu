@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in request attribution for batches that reject all effective drafts."""
+"""Opt-in request attribution for batches with draft acceptance below 10%."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class _BatchZeroAcceptance:
+class _BatchLowAcceptance:
     def __init__(self, scheduler: Scheduler) -> None:
         self.original_update = scheduler.update_from_output
         self.original_stats = scheduler.make_spec_decoding_stats
@@ -64,7 +64,11 @@ class _BatchZeroAcceptance:
         self.batch_index += 1
         try:
             outputs = self.original_update(scheduler_output, model_runner_output)
-            if self.num_draft_tokens > 0 and self.num_accepted_tokens == 0:
+            # Integer comparison keeps exactly 10% outside the trigger.
+            if (
+                self.num_draft_tokens > 0
+                and self.num_accepted_tokens * 10 < self.num_draft_tokens
+            ):
                 from vllm_torchtpu.runner.mtp_diagnostic_output import (
                     MtpDiagnosticModelRunnerOutput,
                 )
@@ -73,14 +77,17 @@ class _BatchZeroAcceptance:
                     model_runner_output, MtpDiagnosticModelRunnerOutput
                 ), "MTP diagnostic runner output must carry the verified draft snapshot"
                 logger.warning(
-                    "[MTP_ZERO_ACCEPTANCE] scope=batch "
-                    "reason=all_effective_drafts_rejected "
+                    "[MTP_LOW_ACCEPTANCE] scope=batch "
+                    "reason=acceptance_rate_below_threshold "
                     "dp_index=%s batch_index=%d num_draft_tokens=%d "
-                    "num_accepted_tokens=0 acceptance_rate=0 "
+                    "num_accepted_tokens=%d acceptance_rate=%s "
+                    "acceptance_threshold=0.1 "
                     "verified_draft_token_ids=%s request_ids=%s",
                     self.dp_index,
                     self.batch_index,
                     self.num_draft_tokens,
+                    self.num_accepted_tokens,
+                    self.num_accepted_tokens / self.num_draft_tokens,
                     json.dumps(model_runner_output.verified_draft_token_ids),
                     json.dumps(self.request_ids),
                 )
@@ -114,7 +121,7 @@ def patch_scheduler_init() -> None:
     def init(self, vllm_config, *args, **kwargs):
         original_init(self, vllm_config, *args, **kwargs)
         if is_mtp_diagnostic_enabled(vllm_config):
-            _BatchZeroAcceptance(self)
-            logger.info("Enabled batch MTP zero-acceptance request logging")
+            _BatchLowAcceptance(self)
+            logger.info("Enabled batch MTP request logging for acceptance below 10%")
 
     Scheduler.__init__ = init
