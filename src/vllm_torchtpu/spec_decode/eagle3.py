@@ -23,6 +23,9 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.spec_decode.qwen3_next_mtp_loader import (
+    maybe_use_qwen3_next_mtp_loader,
+)
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
@@ -814,6 +817,9 @@ class Eagle3Proposer:
             set_current_vllm_config(self.draft_vllm_config),
             draft_tp1_ctx,
         ):
+            model_loader = maybe_use_qwen3_next_mtp_loader(
+                model_loader, draft_model_config
+            )
             self.draft_model = model_loader.load_model(
                 vllm_config=self.draft_vllm_config,
                 model_config=draft_model_config,
