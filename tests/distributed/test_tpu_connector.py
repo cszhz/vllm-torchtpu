@@ -3154,15 +3154,23 @@ class TestTPURaidenConnectorWorker:
         assert len(facade.complete_request_blocks_calls) == 1
 
     @pytest.mark.parametrize("architecture", [None, "KimiK3ForConditionalGeneration"])
-    def test_tp_follower_waits_for_leader_at_step_boundary(self, architecture):
+    @pytest.mark.parametrize("state", ["accepted", "uncertain"])
+    @pytest.mark.parametrize("policy", ["fail", "recompute"])
+    def test_tp_follower_waits_for_leader_at_step_boundary(
+        self, architecture, state, policy, monkeypatch
+    ):
+        monkeypatch.setattr(tpu_envs, "TPU_KV_RESHARD_TRANSPORT", "raiden")
         worker = _make_raiden_worker(
             tp_rank=1,
             tp_size=2,
             is_producer=False,
             architecture=architecture,
+            load_failure_policy=policy,
         )
         engine = _FakeRaidenEngine()
         engine.poll_results = []
+        worker._raiden_transfer_engine = engine
+        worker._load_block_ids["dst"] = [41]
         pending = SimpleNamespace(destination_req_id="dst", task=object())
         group = MagicMock()
         with (
@@ -3179,11 +3187,21 @@ class TestTPURaidenConnectorWorker:
             group.broadcast_object.return_value = {}
             worker._drain_stage3_submit_outcomes()
             assert worker._stage3_tp_submits == {"dst"}
-            group.broadcast_object.return_value = {"dst": "accepted"}
+            group.broadcast_object.return_value = {"dst": state}
             worker._drain_stage3_submit_outcomes()
             assert worker._stage3_tp_submits == set()
             assert worker._stage3_inflight_submits == set()
             assert worker._stage3_controller_accepted == {"dst"}
+            metadata = worker.take_pd_load_failures()
+            if policy == "fail" and state == "uncertain":
+                assert metadata is not None
+                assert metadata.failed_req_ids == {"dst"}
+            else:
+                assert metadata is None
+            assert worker.take_pd_load_failures() is None
+            assert worker.get_finished() == (set(), set())
+            assert worker.get_block_ids_with_load_errors() == set()
+            assert worker._load_block_ids == {"dst": [41]}
 
     @pytest.mark.parametrize(
         "pcp,dcp,block_size,max_model_len,expected",
@@ -5075,9 +5093,11 @@ class TestTPURaidenConnectorWorker:
         assert worker.get_block_ids_with_load_errors() == set()
 
     @pytest.mark.parametrize("terminal_result", ("failure", "success"))
-    def test_v4_stage3_post_arm_rpc_error_waits_for_native_terminal(
-        self, terminal_result
+    @pytest.mark.parametrize("policy", ("fail", "recompute"))
+    def test_v4_stage3_post_arm_error_feedback_preserves_receive_barrier(
+        self, terminal_result, policy, monkeypatch
     ):
+        monkeypatch.setattr(tpu_envs, "TPU_KV_RESHARD_TRANSPORT", "raiden")
         scheduler = _make_raiden_scheduler(is_producer=False, block_size=1024)
         req = MagicMock()
         req.request_id = "uncertain-load"
@@ -5101,7 +5121,12 @@ class TestTPURaidenConnectorWorker:
             meta = scheduler.build_connector_meta()
 
         worker = _make_raiden_worker(
-            tp_rank=0, tp_size=1, is_producer=False, dp_size=8, pcp_size=1
+            tp_rank=0,
+            tp_size=1,
+            is_producer=False,
+            dp_size=8,
+            pcp_size=1,
+            load_failure_policy=policy,
         )
         engine = _FakeRaidenEngine()
         terminal_poll = (
@@ -5109,7 +5134,7 @@ class TestTPURaidenConnectorWorker:
             if terminal_result == "failure"
             else ([], ["uncertain-load"], [])
         )
-        engine.poll_results = [([], [], []), terminal_poll]
+        engine.poll_results = [([], [], []), ([], [], []), terminal_poll]
         facade = _FakeRaidenControllerFacade()
         facade.start_transfer = MagicMock(
             side_effect=RuntimeError("sender dispatch failed after arm")
@@ -5141,9 +5166,24 @@ class TestTPURaidenConnectorWorker:
             _flush_stage3_submits(worker)
             assert worker.get_finished() == (set(), set())
             assert worker.get_block_ids_with_load_errors() == set()
+            metadata = worker.take_pd_load_failures()
+            if policy == "fail":
+                assert metadata is not None
+                assert metadata.failed_req_ids == {"uncertain-load"}
+            else:
+                assert metadata is None
+            assert worker.take_pd_load_failures() is None
+            finished = {"uncertain-load"} if policy == "fail" else None
+            assert worker.get_finished(finished) == (set(), set())
+            assert worker._load_block_ids == {"uncertain-load": [41, 43]}
             assert worker.get_finished() == (set(), {"uncertain-load"})
+            assert worker.get_finished() == (set(), set())
 
-        expected_errors = {41, 43} if terminal_result == "failure" else set()
+        expected_errors = (
+            {41, 43}
+            if policy == "recompute" and terminal_result == "failure"
+            else set()
+        )
         assert worker.get_block_ids_with_load_errors() == expected_errors
 
     def test_v4_stage3_uncertain_rpc_times_out_before_recompute(self):

@@ -5576,14 +5576,16 @@ class TPURaidenConnectorWorker:
                 )
                 return
             # Generic RPC rejection can occur after receiver arming.
-            # Keep the request blocked and accept native terminal
-            # records; only surface recompute after manager failure or
-            # a full post-RPC manager timeout.
+            # Fail-policy feedback can end the request immediately, but its
+            # receive buffers remain pinned until native completion or the
+            # existing manager timeout. Recompute still waits for that terminal.
             self._stage3_controller_accepted.add(destination_req_id)
             deadline = time.perf_counter() + float(
                 dist_utils.get_p2p_wait_pull_timeout()
             )
             self._stage3_pending_controller_failures[destination_req_id] = deadline
+            if self._pd_load_failures is not None:
+                self._pd_load_failures.failed_req_ids.add(destination_req_id)
             logger.error(
                 "Stage-3 controller transfer outcome uncertain; "
                 "waiting for native terminal state req_id=%s "
@@ -5682,6 +5684,8 @@ class TPURaidenConnectorWorker:
                         time.perf_counter()
                         + float(dist_utils.get_p2p_wait_pull_timeout())
                     )
+                    if self._pd_load_failures is not None:
+                        self._pd_load_failures.failed_req_ids.add(req_id)
 
     def _drain_stage3_pending_submits(self, finished_req_ids: set[str] | None) -> None:
         """Re-attempts parked Stage-3 loads once per scheduler step, paced
