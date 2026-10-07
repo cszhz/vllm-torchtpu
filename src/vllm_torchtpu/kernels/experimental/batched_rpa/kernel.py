@@ -490,7 +490,7 @@ def rpa_body(
             step_meta=step_meta,
             cfgs=cfgs,
         )
-        p, alpha_list, m_next, l_next, m_carry = (
+        p, alpha_list, m_next, l_next, m_carry, l_carry = (
             flash_attention.flash_attention_qk_softmax(
                 step,
                 q[:, :, q_slice],
@@ -505,21 +505,23 @@ def rpa_body(
             )
         )
         m_scratch_ref[:, q_slice] = m_carry
-        l_scratch_ref[:, q_slice] = l_next[-1]
+        l_scratch_ref[:, q_slice] = l_carry
         if cfgs.serve.return_lse:
             m_new_list.append(m_next)
         l_new_list.append(l_next)
 
         if prev_p is not None:
-            o_next = flash_attention.flash_attention_pv(
+            o_next, o_carry = flash_attention.flash_attention_pv(
                 prev_p,
                 v,
                 prev_alpha_list,
                 acc_val[:, prev_q_slice],
+                step,
+                schedule_ref.is_last_k,
                 cfgs=cfgs,
                 v_scale=v_scale,
             )
-            acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+            acc_scratch_ref[:, prev_q_slice] = o_carry
             acc_new_list.append(o_next)
 
         prev_p = p
@@ -527,15 +529,17 @@ def rpa_body(
         prev_q_slice = q_slice
 
     assert prev_p is not None
-    o_next = flash_attention.flash_attention_pv(
+    o_next, o_carry = flash_attention.flash_attention_pv(
         prev_p,
         v,
         prev_alpha_list,
         acc_val[:, prev_q_slice],
+        step,
+        schedule_ref.is_last_k,
         cfgs=cfgs,
         v_scale=v_scale,
     )
-    acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+    acc_scratch_ref[:, prev_q_slice] = o_carry
     acc_new_list.append(o_next)
     if cfgs.serve.return_lse:
         m_next = jnp.concatenate(m_new_list, axis=2)
