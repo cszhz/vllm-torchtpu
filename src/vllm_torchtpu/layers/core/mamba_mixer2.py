@@ -45,29 +45,34 @@ def jax_gated_rms_norm(
     eps: float,
     shard_groups: bool,
     tp_size: int,
+    n_groups: int = 1,
     head_axis_name: str | None = _HEAD_SHARDING_AXIS,
 ) -> jnp.ndarray:
     input_dtype = x.dtype
 
     # 1. Apply Gate (SiLU)
-    x_gated = x * jax.nn.silu(gate.astype(jnp.float32))
+    x_gated = x.astype(jnp.float32) * jax.nn.silu(gate.astype(jnp.float32))
+    if weight is None:
+        return x_gated.astype(input_dtype)
 
-    # 2. Compute Variance
+    # 2. Compute Variance and Normalize
     if shard_groups or tp_size <= 1 or head_axis_name is None:
+        orig_shape = x_gated.shape
+        if n_groups > 1:
+            x_gated = x_gated.reshape(
+                *orig_shape[:-1], n_groups, orig_shape[-1] // n_groups
+            )
         variance = jnp.mean(jnp.square(x_gated), axis=-1, keepdims=True)
+        x_norm = (x_gated * jax.lax.rsqrt(variance + eps)).reshape(orig_shape)
     else:
         local_sum = jnp.sum(jnp.square(x_gated), axis=-1, keepdims=True)
         global_sum = jax.lax.psum(local_sum, axis_name=head_axis_name)
         count = tp_size * x.shape[-1]
         variance = global_sum / count
+        x_norm = x_gated * jax.lax.rsqrt(variance + eps)
 
-    # 3. Normalize
-    x_norm = x_gated * jax.lax.rsqrt(variance + eps)
-
-    # 4. Apply weight
-    if weight is not None:
-        return (weight * x_norm).astype(input_dtype)
-    return x_norm.astype(input_dtype)
+    # 3. Apply weight
+    return (weight.astype(jnp.float32) * x_norm).astype(input_dtype)
 
 
 def pack_inputs_mamba(
@@ -87,8 +92,9 @@ def pack_inputs_mamba(
     jnp.ndarray,
     jnp.ndarray,
     jnp.ndarray,
+    jnp.ndarray,
 ]:
-    """Pads each sequence to a multiple of chunk_size and packs them into a continuous stream."""
+    """Pads each sequence to a multiple of chunk_size and packs into a stream."""
     num_tokens = X.shape[0]
     num_seqs = len(query_start_loc) - 1
 
@@ -104,21 +110,29 @@ def pack_inputs_mamba(
     num_chunks = (seq_lengths + chunk_size - 1) // chunk_size
     padded_lengths = num_chunks * chunk_size
 
-    new_query_start_loc = jnp.cumsum(jnp.concatenate([jnp.array([0]), padded_lengths]))
+    new_query_start_loc = jnp.cumsum(
+        jnp.concatenate([jnp.array([0], dtype=jnp.int32), padded_lengths])
+    )
 
     # Map each original token index to its sequence ID
+    token_indices = jnp.arange(num_tokens)
+    valid_token_mask = token_indices < last_valid_loc
     seq_id = (
-        jnp.searchsorted(
-            effective_query_start_loc, jnp.arange(num_tokens), side="right"
-        )
-        - 1
+        jnp.searchsorted(effective_query_start_loc, token_indices, side="right") - 1
     )
+    seq_id = jnp.clip(seq_id, 0, num_seqs - 1)
     original_start = effective_query_start_loc[seq_id]
     new_start = new_query_start_loc[seq_id]
-    padded_indices_valid = new_start + (jnp.arange(num_tokens) - original_start)
 
     max_packed_tokens = num_tokens + num_seqs * chunk_size
     max_packed_tokens = (max_packed_tokens + chunk_size - 1) // chunk_size * chunk_size
+
+    padded_indices_valid = jnp.clip(
+        new_start + (token_indices - original_start), 0, max_packed_tokens - 1
+    )
+    scatter_token_indices = jnp.where(
+        valid_token_mask, padded_indices_valid, max_packed_tokens
+    )
 
     # Flatten last dimensions to concatenate for single scatter
     n_heads = X.shape[1]
@@ -140,7 +154,9 @@ def pack_inputs_mamba(
 
     output_shape = (max_packed_tokens,) + combined.shape[1:]
     packed_combined = jnp.zeros(output_shape, dtype=compute_dtype)
-    packed_combined = packed_combined.at[padded_indices_valid].set(combined)
+    packed_combined = packed_combined.at[scatter_token_indices].set(
+        combined, mode="drop"
+    )
 
     # Split back
     dim_X = n_heads * d_head
@@ -165,17 +181,29 @@ def pack_inputs_mamba(
     # For decay (float32, shape (num_tokens, n_heads))
     output_shape_f32 = (max_packed_tokens, n_heads)
     packed_decay = jnp.zeros(output_shape_f32, dtype=jnp.float32)
-    packed_decay = packed_decay.at[padded_indices_valid].set(decay.astype(jnp.float32))
+    packed_decay = packed_decay.at[scatter_token_indices].set(
+        decay.astype(jnp.float32), mode="drop"
+    )
 
     decay_c = packed_decay.reshape(num_chunks_total, chunk_size, n_heads).transpose(
         0, 2, 1
     )
 
-    reset_mask = jnp.zeros((num_chunks_total,), dtype=bool)
-    start_chunk_indices = new_query_start_loc[:-1] // chunk_size
-    reset_mask = reset_mask.at[start_chunk_indices].set(True)
+    active_nonempty_seq = (jnp.arange(num_seqs) < num_valid_seqs) & (seq_lengths > 0)
+    start_chunk_indices = jnp.where(
+        active_nonempty_seq,
+        new_query_start_loc[:-1] // chunk_size,
+        num_chunks_total,
+    )
+    reset_mask = (
+        jnp.zeros((num_chunks_total,), dtype=bool)
+        .at[start_chunk_indices]
+        .set(True, mode="drop")
+    )
 
-    last_chunk_indices = (new_query_start_loc[1:] // chunk_size) - 1
+    last_chunk_indices = jnp.clip(
+        (new_query_start_loc[1:] // chunk_size) - 1, 0, num_chunks_total - 1
+    )
 
     return (
         X_c,
@@ -184,6 +212,7 @@ def pack_inputs_mamba(
         decay_c,
         reset_mask,
         last_chunk_indices,
+        start_chunk_indices,
         padded_indices_valid,
     )
 
@@ -216,6 +245,7 @@ def run_jax_mamba_mixer_local(
     tp_size: int,
     rms_norm_eps: float,
     apply_rms_norm: bool = True,
+    has_silu_activation: bool = True,
     head_axis_name: str | None = _HEAD_SHARDING_AXIS,
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the local device execution of Mamba-2 Mixer."""
@@ -354,6 +384,8 @@ def run_jax_mamba_mixer_local(
         has_initial_state,
         kernel_size=kernel_size,
     )
+    if has_silu_activation:
+        out_conv = jax.nn.silu(out_conv)
 
     local_groups_ssm = n_groups * d_state
 
@@ -373,8 +405,8 @@ def run_jax_mamba_mixer_local(
     B = broadcast_groups_to_heads(B_raw, num_heads)
     C = broadcast_groups_to_heads(C_raw, num_heads)
 
-    dt = jax.nn.softplus(dt_raw + j_dt_bias)
-    decay = dt * j_A
+    dt = jax.nn.softplus(dt_raw.astype(jnp.float32) + j_dt_bias.astype(jnp.float32))
+    decay = dt * j_A.astype(jnp.float32)
 
     (
         X_c,
@@ -383,6 +415,7 @@ def run_jax_mamba_mixer_local(
         decay_c,
         reset_mask,
         last_chunk_indices,
+        start_chunk_indices,
         padded_indices_valid,
     ) = pack_inputs_mamba(
         X,
@@ -402,7 +435,6 @@ def run_jax_mamba_mixer_local(
         (num_chunks_total, num_heads, head_dim, d_state),
         dtype=recurrent_state.dtype,
     )
-    start_chunk_indices = query_start_loc[:-1] // chunk_size
 
     init_states_for_seqs = jnp.where(
         has_initial_state[:, None, None, None],
@@ -410,7 +442,7 @@ def run_jax_mamba_mixer_local(
         0.0,
     )
     init_h_per_chunk = init_h_per_chunk.at[start_chunk_indices].set(
-        init_states_for_seqs
+        init_states_for_seqs, mode="drop"
     )
 
     Y_c, new_recurrent_states = ssd_minimal_discrete_hybrid(
@@ -425,20 +457,19 @@ def run_jax_mamba_mixer_local(
 
     Y_flat = Y_c.transpose(0, 2, 1, 3).reshape(-1, num_heads * head_dim)
     Y_final = (
-        Y_flat[padded_indices_valid]
-        + X.reshape(-1, num_heads * head_dim) * jnp.repeat(j_D, head_dim)[None, :]
-    )
+        Y_flat[padded_indices_valid].astype(jnp.float32)
+        + X.reshape(-1, num_heads * head_dim).astype(jnp.float32)
+        * jnp.repeat(j_D.astype(jnp.float32), head_dim)[None, :]
+    ).astype(j_projected_states.dtype)
 
     num_seqs = last_chunk_indices.shape[0]
-    valid_seq_mask = jnp.arange(num_seqs) < distribution[2]
-    current_states = recurrent_state[state_indices]
-
-    states_to_set = jnp.where(
-        valid_seq_mask[:, None, None, None],
-        new_recurrent_states.astype(recurrent_state.dtype),
-        current_states,
+    valid_seq_mask = (jnp.arange(num_seqs) < distribution[2]) & (query_lens > 0)
+    scatter_state_indices = jnp.where(
+        valid_seq_mask, state_indices, recurrent_state.shape[0]
     )
-    updated_recurrent_state = recurrent_state.at[state_indices].set(states_to_set)
+    updated_recurrent_state = recurrent_state.at[scatter_state_indices].set(
+        new_recurrent_states.astype(recurrent_state.dtype), mode="drop"
+    )
 
     if apply_rms_norm:
         Y_out = jax_gated_rms_norm(
@@ -448,10 +479,11 @@ def run_jax_mamba_mixer_local(
             eps=rms_norm_eps,
             shard_groups=shard_groups,
             tp_size=tp_size,
+            n_groups=n_groups,
             head_axis_name=head_axis_name,
         )
     else:
-        Y_out = Y_final
+        Y_out = Y_final.astype(j_projected_states.dtype)
 
     if not shard_groups and tp_size > 1 and head_axis_name is not None:
         global_groups_ssm = n_groups * d_state
@@ -504,8 +536,12 @@ def run_jax_mamba_mixer(
     shard_groups: bool = True,
     rms_norm_eps: float = 1e-5,
     apply_rms_norm: bool = True,
+    has_silu_activation: bool = True,
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the sharded JAX Mamba-2 Mixer over the given TPU mesh."""
+    if j_conv_weight.ndim == 2:
+        j_conv_weight = jnp.expand_dims(j_conv_weight, axis=1)
+
     data_axis = "attn_dp" if "attn_dp" in mesh.axis_names else None
     head_axis = _HEAD_SHARDING_AXIS if _HEAD_SHARDING_AXIS in mesh.axis_names else None
     tp_size = get_mesh_shape_product(mesh, head_axis) if head_axis else 1
@@ -564,6 +600,7 @@ def run_jax_mamba_mixer(
         tp_size=tp_size,
         rms_norm_eps=rms_norm_eps,
         apply_rms_norm=apply_rms_norm,
+        has_silu_activation=has_silu_activation,
         head_axis_name=head_axis,
     )
 

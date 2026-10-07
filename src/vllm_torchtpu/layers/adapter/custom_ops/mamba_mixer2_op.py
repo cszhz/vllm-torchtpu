@@ -56,10 +56,18 @@ def mamba_mixer2_core_tpu(
     shard_groups: bool,
     rms_norm_eps: float,
     apply_rms_norm: bool,
+    has_silu_activation: bool = True,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    state_len = conv_state.shape[1]
+    target_state_len = kernel_size - 1
+    if state_len > target_state_len:
+        conv_state_in = conv_state[:, :target_state_len, :]
+    else:
+        conv_state_in = conv_state
+
     (new_conv_state, new_recurrent_state), output = run_jax_mamba_mixer(
         projected_states,
-        conv_state,
+        conv_state_in,
         recurrent_state,
         conv_weight,
         conv_bias,
@@ -84,7 +92,10 @@ def mamba_mixer2_core_tpu(
         shard_groups=shard_groups,
         rms_norm_eps=rms_norm_eps,
         apply_rms_norm=apply_rms_norm,
+        has_silu_activation=has_silu_activation,
     )
+    if state_len > target_state_len:
+        new_conv_state = conv_state.at[:, :target_state_len, :].set(new_conv_state)
     return new_conv_state, new_recurrent_state, output
 
 
@@ -92,7 +103,23 @@ def mamba_mixer2_core_tpu(
 class VllmMambaMixer2(MambaMixer2):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._apply_py_norm = False
         self.mamba_op = self._build_mamba_op()
+
+    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
+        _, ssm_state_dtype = super().get_state_dtype()
+        # Per-layer conv_state is stored in float32 to match the Pallas causal
+        # conv1d kernel's VMEM layout without per-step full-pool dtype casts.
+        return torch.float32, ssm_state_dtype
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        del act_dtype
+        w = self.conv1d.weight
+        if w.ndim == 2:
+            w = w.unsqueeze(1)
+        self.conv1d.weight.data = torch.empty(
+            w.shape, dtype=w.dtype, device=w.device
+        ).copy_(w)
 
     def _use_fused_jax_rms_norm(self, jax_tp_size: int) -> bool:
         # When PyTorch runs multiprocess TP (self.tp_size > 1) over a single-chip
@@ -131,6 +158,8 @@ class VllmMambaMixer2(MambaMixer2):
         chunk_size = 32 if dp_enabled else 64
         rms_norm_eps = getattr(self.norm, "variance_epsilon", 1e-5)
         apply_rms_norm = self._use_fused_jax_rms_norm(jax_tp_size)
+        self._apply_py_norm = not apply_rms_norm
+        has_silu_activation = getattr(self, "has_silu_activation", True)
 
         op_name = f"pallas::mamba_mixer2_{self.prefix.replace('.', '_')}"
         wrapped_fn = functools.partial(
@@ -148,6 +177,7 @@ class VllmMambaMixer2(MambaMixer2):
             shard_groups=shard_groups,
             rms_norm_eps=rms_norm_eps,
             apply_rms_norm=apply_rms_norm,
+            has_silu_activation=has_silu_activation,
         )
 
         mamba_jax_op = pallas.jax_op(
@@ -193,16 +223,9 @@ class VllmMambaMixer2(MambaMixer2):
             request_distribution: torch.Tensor,
             seq_lens: torch.Tensor,
         ) -> torch.Tensor:
-            state_len = conv_state.size(1)
-            target_state_len = self.conv_kernel_size - 1
-            if state_len > target_state_len:
-                conv_state_in = conv_state[:, :target_state_len, :]
-            else:
-                conv_state_in = conv_state
-
             new_conv, new_rec, outputs = mamba_jax_op(
                 projected_states,
-                conv_state_in,
+                conv_state,
                 recurrent_state,
                 conv_weight,
                 conv_bias,
@@ -216,10 +239,7 @@ class VllmMambaMixer2(MambaMixer2):
                 seq_lens,
             )
 
-            if state_len > target_state_len:
-                conv_state[:, :target_state_len, :].copy_(new_conv)
-            else:
-                conv_state.copy_(new_conv)
+            conv_state.copy_(new_conv)
             recurrent_state.copy_(new_rec)
 
             return outputs
@@ -264,11 +284,14 @@ class VllmMambaMixer2(MambaMixer2):
                 )
                 state_indices = block_tables_2d[:, 0].to(torch.int32)
 
-            vllm_context = get_vllm_model_wrapper_context()
-            mesh = vllm_context.mesh
-            head_axis = "model" if "model" in mesh.axis_names else None
-            jax_tp_size = get_mesh_shape_product(mesh, head_axis) if head_axis else 1
-            apply_py_norm = not self._use_fused_jax_rms_norm(jax_tp_size)
+            request_distribution = attn_metadata.request_distribution
+            mamba_request_distribution = getattr(
+                attn_metadata, "mamba_request_distribution", None
+            )
+            if mamba_request_distribution is not None:
+                request_distribution = mamba_request_distribution
+
+            apply_py_norm = getattr(self, "_apply_py_norm", False)
 
             norm_weight = getattr(self.norm, "weight", None)
             ssm_output = self.mamba_op(
@@ -283,7 +306,7 @@ class VllmMambaMixer2(MambaMixer2):
                 norm_weight,
                 state_indices,
                 attn_metadata.query_start_loc,
-                attn_metadata.request_distribution,
+                request_distribution,
                 attn_metadata.seq_lens,
             )
 

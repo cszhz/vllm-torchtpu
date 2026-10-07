@@ -343,12 +343,13 @@ def main_kernel(
 
     recv_sem = sem_ref.at[0]
     send_sem = sem_ref.at[1]
-
-    # Prologue: Start DMA read of the first tile.
-    x_buffer.copy_in(0, 0, recv_sem)
-    conv_state_buffer.copy_in(0, 0, recv_sem)
-
     num_tiles = metadata_ref.num_tiles[...]
+
+    @pl.when(num_tiles > 0)
+    def _prologue():
+        # Prologue: Start DMA read of the first tile.
+        x_buffer.copy_in(0, 0, recv_sem)
+        conv_state_buffer.copy_in(0, 0, recv_sem)
 
     @pl.loop(0, num_tiles)
     def loop_wrapper(p_id):
@@ -363,10 +364,12 @@ def main_kernel(
             cfgs=cfgs,
         )
 
-    # Epilogue: Wait DMA write of the last tile.
-    last_b_start = (num_tiles - 1) * cfgs.tile_size
-    x_buffer.wait_out(last_b_start, 0, send_sem)
-    conv_state_buffer.wait_out(last_b_start, 0, send_sem)
+    @pl.when(num_tiles > 0)
+    def _epilogue():
+        # Epilogue: Wait DMA write of the last tile.
+        last_b_start = (num_tiles - 1) * cfgs.tile_size
+        x_buffer.wait_out(last_b_start, 0, send_sem)
+        conv_state_buffer.wait_out(last_b_start, 0, send_sem)
 
 
 def preprocess_metadata(
@@ -456,6 +459,7 @@ def ragged_causal_conv1d(
     # Step 1: Validate inputs.
     num_seqs = state_indices.size
     batch_size, dim = x.shape
+    assert conv_state.shape == (conv_state.shape[0], kernel_size - 1, dim)
     assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)

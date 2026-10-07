@@ -58,7 +58,7 @@ def chunk_state_pallas(B_c, decay_states, X_c):
         X_scaled = X_val * decay_val  # (block_len, d_head)
         X_scaled_T = jnp.transpose(X_scaled, (1, 0))  # (d_head, block_len)
 
-        # Matmul: (d_head, block_len) @ (block_len, d_state) -> (d_head, d_state) in float32
+        # Matmul: (d_head, block_len) @ (block_len, d_state) -> (d_head, d_state)
         out = jax.lax.dot_general(
             X_scaled_T,
             B_val,
@@ -141,7 +141,7 @@ def chunk_scan_pallas(C_c, states, decay_states):
         # Transpose states for contraction over d_state
         states_T = jnp.transpose(states_val, (1, 0))  # (d_state, d_head)
 
-        # Matmul: (block_len, d_state) @ (d_state, d_head) -> (block_len, d_head) in float32
+        # Matmul: (block_len, d_state) @ (d_state, d_head) -> (block_len, d_head)
         prod = jax.lax.dot_general(
             C_val,
             states_T,
@@ -299,8 +299,9 @@ def ssd_minimal_discrete_hybrid(
     state_decay_out = jnp.exp(A_cumsum)[..., None]
     Y_off = chunk_scan_pallas(C_c, states_incoming, state_decay_out)
 
-    Y = Y_diag + Y_off
+    Y = (Y_diag + Y_off).astype(X_c.dtype)
 
     # Extract final states for each sequence using last_chunk_indices
-    final_states = states_outgoing[last_chunk_indices]
+    safe_last_chunk_indices = jnp.clip(last_chunk_indices, 0, n_chunks - 1)
+    final_states = states_outgoing[safe_last_chunk_indices]
     return Y, final_states
