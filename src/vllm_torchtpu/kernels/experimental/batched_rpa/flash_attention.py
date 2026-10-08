@@ -17,6 +17,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
+from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
 
 
 def flash_attention_qk_softmax(
@@ -25,7 +26,7 @@ def flash_attention_qk_softmax(
     k: jax.Array,  # [B, KV, S, H] or [B, KV, H, S]
     m_prev: jax.Array,  # [KV, TQ, 128]
     l_prev: jax.Array,  # [KV, TQ, 128]
-    is_last_k: jax.Ref,  # [B]
+    is_last_k: SmemWrapper,  # [steps, B]
     *,
     custom_mask: jax.Array,
     cfgs: configs.RpaConfigs,
@@ -118,7 +119,7 @@ def flash_attention_pv(
     alpha_list: list[jax.Array],  # B * [KV, TQ, 128]
     o_prev: jax.Array,  # [KV, TQ, H]
     step: jax.Array,
-    is_last_k: jax.Ref,  # [B]
+    is_last_k: SmemWrapper,  # [steps, B]
     cfgs: configs.RpaConfigs,
     v_scale: jax.Array | None = None,  # [B, KV, S]
 ):
