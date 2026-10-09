@@ -4503,16 +4503,22 @@ class TPUModelRunner(GPUModelRunner):
                 assert not is_spec_step
                 drafter = self._async_drafter
                 assert isinstance(drafter, Eagle3Proposer)
+                from vllm_torchtpu.spec_decode.prefill_only import handoff_seed_tokens
+
                 drafter.prefill_only(
                     scheduler_output,
-                    torch.cat(
-                        [
-                            sel.view(-1)[:n]
-                            for sel, n in zip(
-                                combined_selected_tokens,
-                                combined_selected_tokens_real_lens,
-                            )
-                        ]
+                    handoff_seed_tokens(
+                        torch.cat(
+                            [
+                                sel.view(-1)[:n]
+                                for sel, n in zip(
+                                    combined_selected_tokens,
+                                    combined_selected_tokens_real_lens,
+                                )
+                            ]
+                        ),
+                        req_ids,
+                        scheduler_output.kv_connector_metadata,
                     ),
                     discard_sampled_tokens_req_indices,
                 )

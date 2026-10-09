@@ -31,6 +31,8 @@ class SendMeta:
     # order. Only DSv4 sets it, because its groups page at different sizes;
     # single-group models leave it None and use local_block_ids.
     group_block_ids: list[list[int]] | None = None
+    # The prompt token left for D to recompute; seeds P's final MTP KV row.
+    next_prompt_token_id: int | None = None
 
 
 @dataclass

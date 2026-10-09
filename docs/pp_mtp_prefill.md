@@ -9,19 +9,24 @@ The initial target is two hosts with PP2 + PCP8, one stage per host. The
 last stage loads the complete MTP head and its embedding. Its PCP group runs
 one MTP forward for each scheduled prefill chunk. Intermediate chunks use
 the next known prompt token; the final chunk uses the target's first sampled
-token. Earlier
-stages load no MTP weights. The target hidden states and shifted prompt tokens
-populate the MTP attention cache; there is no draft argmax, acceptance test,
-verification forward or KV transfer.
+token in standalone diagnostics. For PD handoff it uses the last prompt token
+reserved for D, so the transferred MTP cache reflects the real continuation.
+Earlier stages load no MTP weights. The target hidden states and shifted
+prompt tokens populate the MTP attention cache; there is no draft argmax, acceptance test,
+verification forward on P. The Raiden producer path can transfer these caches
+to a separate decoder with ordinary MTP speculative decoding.
 
 ## Supported envelope
 
 - Qwen3.5 MoE, one MTP layer, K=1; target TP1, DP1, DCP1.
-- Synchronous scheduling and text prompts; no multimodal input or KV connector.
+- Synchronous scheduling and text prompts; no multimodal input.
+- KV transfer requires a PP producer using `TPURaidenConnector`, Raiden
+  Stage-3 hybrid admission, and per-layer pool tags (see below).
 - MTP supports chunked prefill with prefix caching either on or off.
   Hybrid prefix caching requires `mamba_cache_mode=align`, the unified pool
   and chunked prefill enabled, as required by upstream vLLM.
-- Requests must use `max_tokens=1`. That token seeds the final MTP input row.
+- P requests must use `max_tokens=1`. Standalone diagnostics use this sampled
+  token for the final MTP input; PD uses the known prompt continuation.
 - Fused EP MoE remains the recommended tested serving kernel. This new
   experimental PP MTP path has the limited hardware validation below.
 
@@ -191,3 +196,54 @@ a given execution pattern, not equivalence across chunking patterns.
 
 These are single-request diagnostic runs. Concurrent-request throughput,
 MTP KV transfer, asynchronous PP and MTP decode remain outside this validation.
+
+## Experimental PD handoff
+
+The producer admits KV transfer with `TPU_MTP_PREFILL_ONLY=1`, PP > 1,
+`kv_role=kv_producer`, `TPU_KV_RESHARD_TRANSPORT=raiden`,
+`TPU_RAIDEN_QWEN35_ADMISSION=1`, and `TPU_RAIDEN_POOL_TAGS_PER_LAYER=1`.
+The decoder uses its existing MTP path with `TPU_MTP_PREFILL_ONLY=0`.
+Both sides must load the same checkpoint and use matching wire pool tags.
+
+The connector reserves the final prompt token for D. P retains that token in
+its send metadata and uses it to construct the final shifted MTP input before
+publishing caches. Draft attention tags use indices after the target layers
+(e.g. `fa.l92` after a 92-layer target), avoiding collisions with target layer
+zero. Aligned prompt tails also retain the preceding attention hash so MTP
+lookahead rollback can reach the saved Mamba checkpoint on a prefix hit.
+Only the last PP stage publishes the draft cache. Existing native pool
+synchronization and transfer completion handle the additional attention pool.
+
+Four-host validation uses PP2PCP8 -> TP16DCP4. With four KV heads, TP16 has
+four replicas per KV head; DCP8 would cross KV-head ownership. The intended
+TP32DCP8 decoder has eight replicas and is covered by the byte-level transfer
+oracle together with PP4PCP8 and the final-stage draft cache.
+
+A reduced Qwen3.8 configuration retains hidden size 8192, 64 attention heads,
+four KV heads, head dimension 256, and GDN head counts 16/128. Eight target
+layers, 32 experts, and dummy weights reduce resource requirements. Actual
+four-host transfers and MTP decoding passed with prompt lengths 127, 128, 129,
+257, 513, 1025, and 8177, FP8 KV, fused MoE v2, and compile bucket 512.
+This verifies execution and transfer boundaries, not numerical correctness:
+dummy initialization is not identical across TP layouts.
+
+A second test uses the first eight layers and original MTP weights from
+Qwen3.5-35B-A3B-FP8, with shared-expert projections dequantized to BF16 for
+TP16 compatibility. It uses a 2K context: the existing attention kernel
+exceeds VMEM for this smaller head configuration at 8K. For prompts of
+129/513/1025 tokens, PD and D-local prefill selected the same first token;
+its logprob differed by 0.125/0.125/0.03125. Only the 1025-token case matched
+all eight generated tokens. MTP drafting ran, but no draft tokens were
+accepted with the truncated backbone. This is not a model-quality or
+speculative-speedup result, and cross-layout numerical equivalence is not
+established.
+
+With producer prefix caching and `prefix_match_unit=128`, a repeated
+1025-token request reused 768 tokens and still transferred the full 1024-token
+producer payload. Cold and warm PD outputs matched in all eight tokens and
+returned logprobs. The decoder kept local prefix caching disabled for this
+test so every PD request exercised remote transfer.
+
+The full 92-layer NVFP4 checkpoint, eight-host simultaneous deployment,
+production concurrency, and transfer performance remain unvalidated.
+Historical standalone diagnostic results above do not establish PD accuracy.

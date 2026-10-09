@@ -1174,3 +1174,26 @@ def test_glm_manifest_per_layer_tags():
         "mla_nope_rows"
     }
     assert set(manifest.geometry_by_tag()) == {"mla.nope", "mla.rope", "dsa.idx"}
+
+
+@pytest.mark.parametrize("target_layers", [8, 92])
+def test_draft_layer_has_distinct_wire_identity(target_layers):
+    target = "model.layers.0.self_attn.attn"
+    draft = "mtp.layers.0.self_attn.attn"
+    named = {
+        name: FakeTensor((16, 128, 1, 4, 128), 1, dtype="torch.float8_e4m3fn")
+        for name in [target, draft]
+    }
+    group = _fa_group(list(named), block_size=128, num_kv_heads=2, head_size=128)
+    manifest = rpm.build_qwen35_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=[group],
+        raw_tensors=(),
+        gdn_geometry=PCP8_GEOMETRY,
+        per_layer_tags=True,
+        layer_index_by_name={draft: target_layers},
+    )
+    assert {p.layer_name: p.tag for p in manifest.pools} == {
+        target: "fa.l0",
+        draft: f"fa.l{target_layers}",
+    }

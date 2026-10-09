@@ -1354,6 +1354,7 @@ class TestTPURaidenConnectorScheduler:
             assert len(req.prompt_token_ids) == 32
             assert req.num_prompt_tokens == 32
             assert req.kv_transfer_params["_p_side_truncated"] is True
+            assert req.kv_transfer_params["_p_side_next_prompt_token_id"] == 32
 
             # Re-admission after preemption must not truncate again.
             producer.on_new_request(req)
@@ -2835,6 +2836,7 @@ class TestTPURaidenConnectorWorker:
                 kv_cache_raw_tensors=raw_tensors,
                 kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
                 bm_pool_layout=None,
+                drafter=None,
             )
             worker.named_kv_caches = named
             engine = _FakeAdmissionRaidenEngine()
@@ -2928,6 +2930,7 @@ class TestTPURaidenConnectorWorker:
             kv_cache_raw_tensors=raw_tensors,
             kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
             bm_pool_layout=None,
+            drafter=None,
         )
         worker.named_kv_caches = named
         engine = _FakeAdmissionRaidenEngine()
@@ -3295,6 +3298,7 @@ class TestTPURaidenConnectorWorker:
                 kv_cache_raw_tensors=[],
                 kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
                 bm_pool_layout=None,
+                drafter=None,
             )
             worker.named_kv_caches = named
             engine = _FakeAdmissionRaidenEngine(
@@ -7060,6 +7064,7 @@ def _block_major_admission_worker():
         kv_cache_raw_tensors=raw_tensors,
         kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
         bm_pool_layout=_BM_LAYOUT,
+        drafter=None,
     )
     worker.named_kv_caches = named
     worker._raiden_stage3_enabled = lambda: False
@@ -7292,6 +7297,8 @@ def test_request_failure_metadata_survives_old_runner_and_rank_aggregation(monke
         "bad",
         "other",
     }
+
+
 # ---------------------------------------------------------------------------
 # Pipeline producer: Stage-3 registration in the prompt-completing step
 # ---------------------------------------------------------------------------
@@ -7782,3 +7789,22 @@ class TestPipelineParallelRegisterAheadWorker:
         ]
         assert worker._stage3_registered_sends == {}
         assert "early" in worker._stage3_terminal_sends
+
+
+def test_pipeline_handoff_preserves_next_prompt_token_in_send_metadata():
+    producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+    req = _stage3_request("mtp-boundary", 33)
+    req.prompt_token_ids = list(range(33))
+    req._all_token_ids = list(range(33))
+    with _stage3_producer_env(777):
+        producer._maybe_truncate_prompt_for_handoff(req)
+        producer.update_state_after_alloc(req, MagicMock(), 0)
+        meta = producer.build_connector_meta(
+            _scheduler_output(
+                new_reqs=[(req.request_id, ([100, 101],), 0)],
+                num_scheduled_tokens={req.request_id: 32},
+            )
+        )
+    send = meta.reqs_to_send[req.request_id]
+    assert send.num_tokens == 32
+    assert send.next_prompt_token_id == 32

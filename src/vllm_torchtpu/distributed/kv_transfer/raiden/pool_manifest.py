@@ -774,6 +774,7 @@ def build_qwen35_pool_manifest(
     per_layer_tags: bool = False,
     fa_layout: FaLayoutHook | None = None,
     block_major: BlockMajorPoolLayout | None = None,
+    layer_index_by_name: Mapping[str, int] | None = None,
 ) -> PoolManifest:
     """Builds the canonical pool manifest from the live materialization.
 
@@ -793,6 +794,9 @@ def build_qwen35_pool_manifest(
     raiden keeps treating tags as opaque. Both peers must configure it
     identically (enforced by the manifest identity check at plan time).
 
+
+    ``layer_index_by_name`` assigns draft layers indices after the target's
+    layers, keeping their wire identities disjoint across pipeline stages.
 
     ``block_major`` specifies the merged pool geometry when block-major
     unified allocation is active; all layer caches must alias the single raw
@@ -862,7 +866,9 @@ def build_qwen35_pool_manifest(
     if per_layer_tags:
         tagged = []
         for tag, layer_name, tensor in flat:
-            layer_index = layer_index_from_name(layer_name)
+            layer_index = (layer_index_by_name or {}).get(
+                layer_name, layer_index_from_name(layer_name)
+            )
             if layer_index is None:
                 raise ManifestError(
                     f"per-layer pool tags need a layer index in {layer_name}"

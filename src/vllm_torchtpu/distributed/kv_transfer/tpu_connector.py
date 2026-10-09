@@ -1115,12 +1115,15 @@ class TPUConnectorScheduler:
             return
         if request.prompt_token_ids is None:
             return
-        request.prompt_token_ids.pop()
+        next_prompt_token_id = request.prompt_token_ids.pop()
         request._all_token_ids.pop()
         request.num_prompt_tokens -= 1
         if request.kv_transfer_params is None:
             request.kv_transfer_params = {}
         request.kv_transfer_params["_p_side_truncated"] = True
+        request.kv_transfer_params["_p_side_next_prompt_token_id"] = (
+            next_prompt_token_id
+        )
 
     def on_new_request(self, request: "Request") -> None:
         """Validates decoder kv_transfer_params once at admission. The Raiden
@@ -2481,6 +2484,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             num_tokens=num_tokens,
             mamba_state_block_ids=mamba_state_block_ids,
             group_block_ids=normalized_group_block_ids,
+            next_prompt_token_id=(
+                request.kv_transfer_params.get("_p_side_next_prompt_token_id")
+                if request.kv_transfer_params is not None
+                else None
+            ),
         )
         params: dict[str, Any] = {
             "req_id": request.request_id,
@@ -2846,6 +2854,20 @@ class TPURaidenConnectorWorker:
                 ),
                 conv_kernel_size=self._model_config_int("linear_conv_kernel_dim", 4),
             )
+            from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+            layer_index_by_name = {}
+            if isinstance(runner.drafter, Eagle3Proposer):
+                assert runner.drafter._draft_attn_layer_names is not None
+                for name in runner.drafter._draft_attn_layer_names:
+                    index = rpm.layer_index_from_name(name)
+                    if index is None:
+                        raise ValueError(f"Draft attention has no layer index: {name}")
+                    layer_index_by_name[name] = (
+                        self.vllm_config.model_config.hf_text_config.num_hidden_layers
+                        + index
+                    )
+            manifest_args["layer_index_by_name"] = layer_index_by_name
             if _raiden_seq_on_lane_layout():
                 if runner.bm_pool_layout is not None:
                     raise NotImplementedError(

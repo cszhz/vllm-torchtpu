@@ -64,6 +64,7 @@ class Topology:
     dst_block: int = 256
     head_dim: int = 32
     qk_pair: bool = True
+    mtp: bool = False
 
     @property
     def units(self) -> int:
@@ -77,14 +78,16 @@ class Topology:
 
     def stage_layers(self, stage: int) -> list[int]:
         first = stage * self.layers_per_stage
-        return list(range(first, first + self.layers_per_stage))
+        layers = list(range(first, first + self.layers_per_stage))
+        if self.mtp and stage == self.pp - 1:
+            layers.append(self.pp * self.layers_per_stage)
+        return layers
 
     def layers(self) -> list[int]:
-        return list(range(self.pp * self.layers_per_stage))
+        return list(range(self.pp * self.layers_per_stage + int(self.mtp)))
 
-
-def is_fa(layer: int) -> bool:
-    return layer % 2 == 1
+    def is_fa(self, layer: int) -> bool:
+        return layer % 2 == 1 or (self.mtp and layer == self.pp * self.layers_per_stage)
 
 
 # A hybrid model with 4 KV heads and 16 key / 128 value GDN heads, and a small
@@ -272,7 +275,7 @@ def _manifest(
 
     pools = []
     for layer in layers:
-        if is_fa(layer):
+        if topo.is_fa(layer):
             pools.append(
                 rpm.PoolEntry(
                     tag("fa", layer),
@@ -499,7 +502,7 @@ def _produce(monkeypatch, topo: Topology, num_tokens: int, per_layer_tags: bool)
                     topo.key_heads, topo.value_heads, gdn_degree, t * topo.pcp + p
                 )
                 for layer in topo.stage_layers(stage):
-                    if not is_fa(layer):
+                    if not topo.is_fa(layer):
                         memory[(unit, layer, "conv", SRC_STATE_BLOCK)] = _conv_state(
                             layer, key_heads, value_heads, topo.qk_pair
                         )
@@ -773,7 +776,7 @@ def _check_destination(
             topo.key_heads, topo.value_heads, topo.dtp, d
         )
         for layer in topo.layers():
-            if not is_fa(layer):
+            if not topo.is_fa(layer):
                 np.testing.assert_array_equal(
                     dst_memory[(d, layer, "conv", DST_STATE_BLOCK)],
                     _conv_state(layer, key_heads, value_heads, topo.qk_pair),
@@ -1066,3 +1069,17 @@ def test_gdn_fanout_fails_closed(overrides, match):
     args.update(overrides)
     with pytest.raises(sol.SeqOnLaneError, match=match):
         sol.lower_gdn_state_shard_spans_sol(**args)
+
+
+@pytest.mark.parametrize("tokens", [127, 128, 129, 8191])
+@pytest.mark.parametrize("pp,dtp", [(2, 16), (4, 32)])
+def test_pipeline_mtp_fans_out_only_from_last_stage(monkeypatch, tokens, pp, dtp):
+    topo = dataclasses.replace(PP4_PCP8, pp=pp, dtp=dtp, dcp=dtp // 4, mtp=True)
+    registrations, _ = _run_oracle(monkeypatch, topo, tokens, True)
+    draft_layer = pp * topo.layers_per_stage
+    for unit, entries in registrations.items():
+        stage = _unit_rank(unit) // topo.pcp
+        for entry in entries:
+            if split_layer_tag(entry.tag)[1] == draft_layer:
+                assert stage == pp - 1
+                assert class_tag(entry.tag) == "fa"

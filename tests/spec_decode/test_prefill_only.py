@@ -93,11 +93,39 @@ def test_chunking_and_prefix_caching_are_orthogonal(chunked, cached):
     validate_prefill_only_config(c)
 
 
-def test_kv_transfer_still_rejected():
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+def test_kv_transfer_admits_only_pipeline_producer(monkeypatch, role):
     c = config()
-    c.kv_transfer_config = object()
-    with pytest.raises(NotImplementedError, match="does not transfer KV"):
+    c.kv_transfer_config = SimpleNamespace(
+        kv_connector="TPURaidenConnector", kv_role=role
+    )
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    monkeypatch.setenv("TPU_RAIDEN_QWEN35_ADMISSION", "1")
+    monkeypatch.setenv("TPU_RAIDEN_POOL_TAGS_PER_LAYER", "1")
+    if role == "kv_producer":
         validate_prefill_only_config(c)
+    else:
+        with pytest.raises(NotImplementedError, match="pipeline Raiden"):
+            validate_prefill_only_config(c)
+
+
+def test_handoff_uses_known_prompt_token_without_mutating_sample():
+    from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
+        SendMeta,
+        TPUConnectorMetadata,
+    )
+    from vllm_torchtpu.spec_decode.prefill_only import handoff_seed_tokens
+
+    meta = TPUConnectorMetadata(
+        reqs_to_send={
+            "finishing": SendMeta(1, [9], 30.0, next_prompt_token_id=0),
+        }
+    )
+    sampled = torch.tensor([123, 456])
+    result = handoff_seed_tokens(sampled, ["partial", "finishing"], meta)
+    assert result.tolist() == [123, 0]
+    assert sampled.tolist() == [123, 456]
+    assert handoff_seed_tokens(sampled, [], None) is sampled
 
 
 class Layer(torch.nn.Module):
@@ -381,7 +409,11 @@ def test_chunk_seed_uses_known_prompt_token_and_final_sample():
     torch.testing.assert_close(positions, chunk.position_ids)
 
 
-def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(monkeypatch):
+@pytest.mark.parametrize("block_size", [16, 32])
+@pytest.mark.parametrize("prompt_tokens", [15, 16])
+def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(
+    monkeypatch, prompt_tokens, block_size
+):
     import inspect
 
     from vllm import SamplingParams
@@ -415,10 +447,10 @@ def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(monkeypatch)
     vllm_torchtpu._patch_vllm_mtp_prefill_cache_groups()
     kv_cache_utils.init_none_hash(sha256)
     attention = FullAttentionSpec(
-        block_size=16, num_kv_heads=1, head_size=4, dtype=torch.float32
+        block_size=block_size, num_kv_heads=1, head_size=4, dtype=torch.float32
     )
     mamba = MambaSpec(
-        block_size=16,
+        block_size=block_size,
         shapes=((4, 4),),
         dtypes=(torch.float32,),
         mamba_cache_mode="align",
@@ -436,7 +468,7 @@ def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(monkeypatch)
         cache,
         max_model_len=32,
         max_in_flight_tokens=16,
-        scheduler_block_size=16,
+        scheduler_block_size=block_size,
         hash_block_size=4,
         enable_caching=True,
         use_eagle=True,
@@ -452,13 +484,12 @@ def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(monkeypatch)
             block_hasher=kv_cache_utils.get_request_block_hasher(4, sha256),
         )
 
-    ids = list(range(15))
+    ids = list(range(prompt_tokens))
     cold = request("cold", ids)
-    for end in (4, 8, 12, 15):
+    for end in (4, 8, 12, prompt_tokens):
         manager.coordinator.new_step_starts()
         assert manager.allocate_slots(cold, end - cold.num_computed_tokens) is not None
         cold.num_computed_tokens = end
-        manager.cache_blocks(cold, end)
         # Model completion releases the CoW endpoints retained by the scheduler.
         _, retained = manager.take_kv_cache_block_copies()
         manager.block_pool.free_blocks(retained)

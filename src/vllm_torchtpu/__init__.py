@@ -219,6 +219,15 @@ def _patch_vllm_mtp_prefill_cache_groups() -> None:
                     view.num_prompt_tokens = boundary
                     extra = original_tail(self, view, num_tokens)
             result = original_tail(self, request, num_tokens)
+            if envs.TPU_MTP_PREFILL_ONLY and isinstance(self, FullAttentionManager):
+                unit = self.block_pool.hash_block_size
+                if request.num_prompt_tokens % unit == 0:
+                    # Lookup leaves one token, then MTP drops one hash unit.
+                    # Register the preceding hash after the longer prompt tail:
+                    # promoting a partial block removes its earlier hash aliases.
+                    view = copy.copy(request)
+                    view.num_prompt_tokens = request.num_prompt_tokens - unit
+                    original_tail(self, view, num_tokens)
             return result if result is not None else extra
 
         return cache_tail

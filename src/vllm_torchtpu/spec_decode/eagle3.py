@@ -1056,7 +1056,8 @@ class Eagle3Proposer:
         """Populate MTP KV for this prefill step, retaining CPU snapshots.
 
         No draft logits or proposals are produced. Intermediate chunks use the
-        next known prompt token; only the prompt boundary uses a sampled token.
+        next known prompt token; the boundary uses the supplied seed, which is
+        the reserved prompt continuation for PD or a standalone sampled token.
         """
         from vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill import (
             Qwen3_5MoeMTPPrefill,
