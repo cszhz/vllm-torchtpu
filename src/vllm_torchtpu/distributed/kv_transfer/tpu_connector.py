@@ -3668,17 +3668,7 @@ class TPURaidenConnectorWorker:
     ) -> None:
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
-            if (
-                metadata.reqs_to_send
-                and self.vllm_config.speculative_config is not None
-            ):
-                # Publishing a source lets Raiden read its pinned buffers
-                # immediately, including on a no-forward scheduler step.
-                # Draft KV writes can still be deferred after forward returns;
-                # materialize the model's typed KV views and wait before
-                # handing them to the external transfer engine. Admission's
-                # raw storage buffers alone do not express those writes.
-                synchronize_tensors(self._flattened_kv_cache_tensors(), wait=True)
+            publish_start_ns = time.perf_counter_ns()
             if self._raiden_stage3_enabled():
                 if _use_raiden_dsv4_admission():
                     self._register_stage3_request_blocks_dsv4(metadata)
@@ -3688,17 +3678,28 @@ class TPURaidenConnectorWorker:
                     self._register_stage3_request_row_spans(metadata)
                 else:
                     self._register_stage3_request_blocks(metadata)
-                return
-            for req_id, req_meta in metadata.reqs_to_send.items():
-                engine.register_read(req_id, req_meta.uuid, req_meta.local_block_ids)
-                self._legacy_registered_sends.add(str(req_id))
-                logger.debug(
-                    "TPURaidenConnectorWorker rank%d --> registered send "
-                    "req_id=%s uuid=%s blocks=%d",
+            else:
+                for req_id, req_meta in metadata.reqs_to_send.items():
+                    engine.register_read(
+                        req_id, req_meta.uuid, req_meta.local_block_ids
+                    )
+                    self._legacy_registered_sends.add(str(req_id))
+                    logger.debug(
+                        "TPURaidenConnectorWorker rank%d --> registered send "
+                        "req_id=%s uuid=%s blocks=%d",
+                        self.tp_rank,
+                        req_id,
+                        req_meta.uuid,
+                        len(req_meta.local_block_ids),
+                    )
+            if metadata.reqs_to_send:
+                logger.info(
+                    "kv_publish_registration_done rank=%d req_ids=%s "
+                    "unix_ns=%d duration_ms=%.3f",
                     self.tp_rank,
-                    req_id,
-                    req_meta.uuid,
-                    len(req_meta.local_block_ids),
+                    list(metadata.reqs_to_send),
+                    time.time_ns(),
+                    (time.perf_counter_ns() - publish_start_ns) / 1e6,
                 )
             return
 

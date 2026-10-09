@@ -46,6 +46,7 @@ class _MtpDiagnosticOutput(AsyncTPUModelRunnerOutput):
             original._model_runner_output,
             original.copy_state,
             original.discard_sampled_tokens_req_indices,
+            kv_ready_event=original.kv_ready_event,
         )
         self.req_ids = req_ids.copy()
         self.draft_lengths = draft_lengths

@@ -1136,12 +1136,6 @@ class TPUModelRunner(GPUModelRunner):
     def kv_connector_no_forward(
         self, scheduler_output, vllm_config
     ) -> ModelRunnerOutput:
-        # Only Raiden inline mode blocks; otherwise the no-forward step returns
-        # immediately and the scheduler re-polls get_finished each step until
-        # the loads land.
-        self.maybe_setup_kv_connector(
-            scheduler_output, wait_for_completion=dist_utils.get_raiden_inline_load()
-        )
         (
             finished_sending,
             finished_recving,
@@ -3465,6 +3459,19 @@ class TPUModelRunner(GPUModelRunner):
         )
         # Update cached state
         self._update_states(scheduler_output)
+        # Publish completed requests before draining the previous batch's CPU
+        # results or issuing this batch's computation. The producer output has
+        # already fenced its main and draft KV before reaching the scheduler.
+        with set_forward_context(None, self.vllm_config):
+            raiden_inline = dist_utils.get_raiden_inline_load()
+            self.maybe_setup_kv_connector(
+                scheduler_output,
+                wait_for_completion=raiden_inline,
+                report_completion=(
+                    scheduler_output.total_num_scheduled_tokens == 0
+                    or not raiden_inline
+                ),
+            )
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
@@ -3591,21 +3598,6 @@ class TPUModelRunner(GPUModelRunner):
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
-
-        # NOTE: setup current batch's metadata for kv connector.
-        # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
-        with set_forward_context(None, self.vllm_config):
-            # Raiden overlap: block the worker main thread on the KV load only
-            # in inline mode. In the default async mode the load (network pull
-            # + DMA H2D into the cache) runs entirely on the Raiden C++
-            # threads while this step's forward computes; the request stays in
-            # WAITING_FOR_REMOTE_KVS until every rank reports done_recving.
-            raiden_inline = dist_utils.get_raiden_inline_load()
-            self.maybe_setup_kv_connector(
-                scheduler_output,
-                wait_for_completion=raiden_inline,
-                report_completion=not raiden_inline,
-            )
 
         nan_check = (
             begin_kv_save_nan_check(get_kv_transfer_group())
@@ -4598,6 +4590,27 @@ class TPUModelRunner(GPUModelRunner):
                         device_seed=device_seed,
                     )
 
+        kv_ready_event = None
+        transfer_config = self.vllm_config.kv_transfer_config
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and combined_selected_tokens
+            and transfer_config is not None
+            and transfer_config.is_kv_producer
+        ):
+            # Scheduler source publication must follow this batch's draft KV.
+            # Keep this separate from the token copy event used by the runner.
+            record_start_ns = time.perf_counter_ns()
+            kv_ready_event = torch.tpu.Event()
+            kv_ready_event.record()
+            logger.info(
+                "kv_publish_event_record req_ids=%s unix_ns=%d duration_ms=%.3f",
+                req_ids,
+                time.time_ns(),
+                (time.perf_counter_ns() - record_start_ns) / 1e6,
+            )
+
         # Save, poll and clear the KV connector only after the drafter. Its
         # forward above writes the draft layers' KV into the blocks the target
         # just filled; a save taken before it, or the save fence
@@ -4758,6 +4771,7 @@ class TPUModelRunner(GPUModelRunner):
                 model_runner_output=model_runner_output,
                 copy_state=copy_state,
                 discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+                kv_ready_event=kv_ready_event,
             )
             async_output = maybe_wrap_mtp_output(
                 async_output,

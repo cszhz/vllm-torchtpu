@@ -49,6 +49,9 @@ def output(monkeypatch):
 
 def test_verified_drafts_survive_padding_reordering_and_transport(output):
     original, base = output
+    kv_event = CopyEvent()
+    kv_event.record()
+    original.kv_ready_event = kv_event
     config = SimpleNamespace(
         speculative_config=object(),
         kv_transfer_config=None,
@@ -69,7 +72,10 @@ def test_verified_drafts_survive_padding_reordering_and_transport(output):
     req_ids.reverse()
     first.draft_lengths_cpu[:] = 0
     first.draft_token_ids = torch.tensor([901, 902, 903])
+    assert wrapped.kv_ready_event is kv_event
+    assert not kv_event.waited
     result = wrapped.get_output()
+    assert kv_event.waited
     assert not wrapped.drafts
     assert result.verified_draft_token_ids == {
         "a": [101, 102],

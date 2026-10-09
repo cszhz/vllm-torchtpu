@@ -13,6 +13,7 @@
 # limitations under the License.
 """Order of the KV connector calls around the drafter in sample_tokens."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -25,6 +26,71 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
 )
+
+
+@pytest.mark.parametrize("num_tokens", [0, 1])
+@pytest.mark.parametrize("inline", [False, True])
+@pytest.mark.parametrize("is_async", [False, True])
+def test_execute_model_starts_transfer_before_draining_previous_results(
+    num_tokens, inline, is_async
+):
+    events = []
+    output = object()
+
+    class ForwardReached(Exception):
+        pass
+
+    def forward(*_args):
+        events.append("forward")
+        raise ForwardReached
+
+    runner = SimpleNamespace(
+        execute_model_state=None,
+        _mtp_diagnostic_step=None,
+        vllm_config=SimpleNamespace(),
+        scheduler_config=SimpleNamespace(async_scheduling=is_async),
+        _update_states=lambda _: events.append("update"),
+        maybe_setup_kv_connector=MagicMock(
+            side_effect=lambda *_args, **_kwargs: events.append("transfer")
+        ),
+        _flush_disjoint_async_results=lambda: events.append("flush"),
+        _pcp_enabled=False,
+        _reorder_batch_for_rpa=forward,
+        kv_connector_no_forward=lambda *_args: output,
+    )
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=num_tokens,
+        scheduled_spec_decode_tokens={},
+    )
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.set_forward_context",
+            return_value=nullcontext(),
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
+            return_value=inline,
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
+    ):
+        if num_tokens:
+            with pytest.raises(ForwardReached):
+                TPUModelRunner.execute_model(runner, scheduler_output)
+        else:
+            assert TPUModelRunner.execute_model(runner, scheduler_output) is output
+
+    runner.maybe_setup_kv_connector.assert_called_once_with(
+        scheduler_output,
+        wait_for_completion=inline,
+        report_completion=num_tokens == 0 or not inline,
+    )
+    assert events == (
+        ["update", "transfer"]
+        + (["flush"] if is_async else [])
+        + (["forward"] if num_tokens else [])
+    )
 
 
 def _recording_connector(events: list[str]) -> MagicMock:
@@ -61,6 +127,7 @@ def _fake_runner(method, is_async, verify, propose):
         num_scheduled_tokens={"r0": 1},
         finished_req_ids=set(),
         has_structured_output_requests=False,
+        num_invalid_spec_tokens={},
     )
     async_source = ([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
     runner = SimpleNamespace(
@@ -72,6 +139,8 @@ def _fake_runner(method, is_async, verify, propose):
             spec_decode_metadata_list=[object() if verify else None],
             mamba_state_indices_list=None,
             pooler_output_list=[],
+            kv_save_nan_check=None,
+            mtp_tensor_diagnostics=[],
         ),
         input_batch=SimpleNamespace(
             max_num_logprobs=None,
@@ -93,6 +162,7 @@ def _fake_runner(method, is_async, verify, propose):
             else SimpleNamespace(method=method, num_speculative_tokens=1)
         ),
         scheduler_config=SimpleNamespace(async_scheduling=is_async),
+        vllm_config=SimpleNamespace(kv_transfer_config=None, speculative_config=None),
         _is_async_drafter=method == "mtp",
         is_pooling_model=False,
         drafter=SimpleNamespace(),
@@ -187,3 +257,33 @@ def test_device_drafter_runs_before_kv_connector_save(
     )
     assert output.kv_connector_output.finished_sending == {"sent"}
     assert output.kv_connector_output.finished_recving == {"loaded"}
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("verify", [False, True])
+def test_mtp_producer_output_waits_for_post_draft_kv(is_async, verify):
+    events = []
+
+    def propose(**kwargs):
+        events.append("draft")
+        return torch.tensor([[8]]) if is_async else None
+
+    runner = _fake_runner("mtp", is_async, verify, propose)
+    runner.vllm_config.kv_transfer_config = SimpleNamespace(is_kv_producer=True)
+    event = MagicMock()
+    event.record.side_effect = lambda: events.append("record")
+    event.synchronize.side_effect = lambda: events.append("wait")
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=False
+        ),
+        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy),
+        patch("vllm_torchtpu.runner.tpu_runner.torch.tpu.Event", return_value=event),
+    ):
+        output = TPUModelRunner.sample_tokens(runner, None)
+        if is_async:
+            assert events == ["draft", "record"]
+            output = output.get_output()
+    events.append("scheduler_output")
+    assert output.sampled_token_ids == [[7]]
+    assert events == ["draft", "record", "wait", "scheduler_output"]

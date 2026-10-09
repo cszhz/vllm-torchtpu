@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +11,10 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
 )
+
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 INVALID_TOKEN_ID = -1
 
@@ -169,12 +174,23 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         copy_state: AsyncTPUCopyState | None,
         discard_sampled_tokens_req_indices: list[int],
+        kv_ready_event: Any | None = None,
     ):
         self._model_runner_output: ModelRunnerOutput = model_runner_output
         self.copy_state = copy_state
         self.discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
+        self.kv_ready_event = kv_ready_event
 
     def get_output(self) -> ModelRunnerOutput:
+        if self.kv_ready_event is not None:
+            wait_start_ns = time.perf_counter_ns()
+            self.kv_ready_event.synchronize()
+            logger.info(
+                "kv_publish_event_wait req_ids=%s unix_ns=%d duration_ms=%.3f",
+                self._model_runner_output.req_ids,
+                time.time_ns(),
+                (time.perf_counter_ns() - wait_start_ns) / 1e6,
+            )
         if self.copy_state is None:
             self._model_runner_output.sampled_token_ids = []
             return self._model_runner_output

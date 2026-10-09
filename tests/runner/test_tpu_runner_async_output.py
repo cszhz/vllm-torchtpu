@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import MagicMock
+
 import numpy as np
+import pytest
 import torch
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 
 from vllm_torchtpu.runner.tpu_runner import _spec_logprob_row_tokens
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
+    AsyncPreResults,
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
@@ -231,3 +235,50 @@ def test_get_output_attaches_spec_logprobs():
         1,
     ]
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
+
+
+@pytest.mark.parametrize("empty_copy", [False, True])
+def test_kv_ready_failure_prevents_output_return(empty_copy):
+    event = MagicMock()
+    event.synchronize.side_effect = RuntimeError("KV write failed")
+    copy_state = (
+        AsyncTPUCopyState(
+            chunks_cpu=[torch.empty(0, dtype=torch.int32)],
+            chunk_real_lens=[0],
+            copy_ready_event=MagicMock(),
+        )
+        if empty_copy
+        else None
+    )
+    out = AsyncTPUModelRunnerOutput(
+        ModelRunnerOutput(req_ids=["r0"], req_id_to_index={"r0": 0}),
+        copy_state,
+        [],
+        kv_ready_event=event,
+    )
+    with pytest.raises(RuntimeError, match="KV write failed"):
+        out.get_output()
+    if copy_state is not None:
+        copy_state.copy_ready_event.synchronize.assert_not_called()
+
+
+def test_previous_token_copy_does_not_wait_for_kv_ready():
+    token_event = MagicMock()
+    kv_event = MagicMock()
+    copy_state = AsyncTPUCopyState(
+        chunks_cpu=[torch.tensor([7])],
+        chunk_real_lens=[1],
+        copy_ready_event=token_event,
+    )
+    out = AsyncTPUModelRunnerOutput(
+        ModelRunnerOutput(req_ids=["r0"], req_id_to_index={"r0": 0}),
+        copy_state,
+        [],
+        kv_ready_event=kv_event,
+    )
+    previous = AsyncPreResults(["r0"], torch.tensor([7]), [], [], {"r0": 0}, copy_state)
+    previous.wait_for_copy()
+    token_event.synchronize.assert_called_once()
+    kv_event.synchronize.assert_not_called()
+    assert out.get_output().sampled_token_ids == [[7]]
+    kv_event.synchronize.assert_called_once()
