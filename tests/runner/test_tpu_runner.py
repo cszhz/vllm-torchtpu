@@ -59,6 +59,51 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("max_logprobs", [0, 3])
+def test_gather_logprobs_preserves_normalization_precision(dtype, max_logprobs):
+    runner = SimpleNamespace(model_config=SimpleNamespace(max_logprobs=max_logprobs))
+    logits = torch.tensor(
+        [
+            [20, 16, 15, 13, 12],
+            [84, 80, 79, 77, 76],
+            [20, -float("inf"), -float("inf"), -float("inf"), -float("inf")],
+        ],
+        dtype=dtype,
+    )
+    original_logits = logits.clone()
+    sampled_tokens = torch.tensor([[0], [4], [0]])
+
+    result = inspect.unwrap(TPUModelRunner.gather_logprobs)(
+        runner, logits, sampled_tokens
+    )
+
+    # log(1 + exp(-4) + exp(-5) + exp(-7) + exp(-8)), independently in FP64.
+    log_normalizer = 0.02596100830585109
+    expected = torch.tensor(
+        [
+            [-log_normalizer - gap for gap in [0, 4, 5, 7, 8]],
+            [-log_normalizer - gap for gap in [0, 4, 5, 7, 8]],
+            [0, -float("inf"), -float("inf"), -float("inf"), -float("inf")],
+        ],
+        dtype=torch.float64,
+    )
+    assert result.logprobs.dtype == torch.float32
+    assert result.logprobs.shape == (3, max_logprobs + 1)
+    assert result.logprob_token_ids[:, 0].tolist() == [0, 4, 0]
+    assert result.selected_token_ranks.tolist() == [1, 5, 1]
+    if max_logprobs:
+        assert result.logprob_token_ids[:2, 1:].tolist() == [[0, 1, 2], [0, 1, 2]]
+    torch.testing.assert_close(
+        result.logprobs.double(),
+        expected.gather(-1, result.logprob_token_ids.long()),
+        rtol=1e-6,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(logits, original_logits, rtol=0, atol=0)
+
+
 def test_idle_dp_rank_encodes_before_decoder_pairing():
     order = []
     runner = SimpleNamespace(
