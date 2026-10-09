@@ -1146,8 +1146,9 @@ class TestQwen3VLModelPatches:
                 delattr(torch, "_orig_cumsum_ref")
 
 
-def test_mtp_diagnostic_env_reaches_ray_workers(monkeypatch):
-    monkeypatch.setenv("TPU_MTP_ZERO_ACCEPTANCE_LOG", "1")
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_mtp_diagnostic_env_reaches_ray_workers(monkeypatch, value):
+    monkeypatch.setenv("TPU_MTP_ZERO_ACCEPTANCE_LOG", value)
     names = get_env_vars_to_copy(additional_vars=set(TpuPlatform.additional_env_vars))
     worker_env = {name: os.environ[name] for name in names if name in os.environ}
-    assert worker_env["TPU_MTP_ZERO_ACCEPTANCE_LOG"] == "1"
+    assert worker_env["TPU_MTP_ZERO_ACCEPTANCE_LOG"] == value

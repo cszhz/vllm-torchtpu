@@ -80,6 +80,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.core.mtp_zero_acceptance import is_mtp_tensor_diagnostic_enabled
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
     KVSaveNanCheck,
@@ -133,6 +134,10 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
 from vllm_torchtpu.runner.mtp_diagnostic_output import maybe_wrap_mtp_output
+from vllm_torchtpu.runner.mtp_tensor_diagnostics import (
+    DeferredMtpChunk,
+    MtpDiagnosticStep,
+)
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -182,6 +187,7 @@ class ExecuteModelState:
         default_factory=list
     )
     kv_save_nan_check: KVSaveNanCheck | None = None
+    mtp_tensor_diagnostics: list[DeferredMtpChunk] = field(default_factory=list)
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -517,6 +523,8 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
+    _mtp_diagnostic_step: MtpDiagnosticStep | None = None
+
     # pyrefly: ignore[bad-override-mutable-attribute]
     drafter: NgramProposer | DFlashProposer | Eagle3Proposer | None
     # pyrefly: ignore[bad-override-mutable-attribute]
@@ -3445,6 +3453,16 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        # Invalidate before any reset/copy/forward can change the old KV pages.
+        # Only a low-acceptance output thread can hold this step's lock.
+        if self._mtp_diagnostic_step is not None:
+            self._mtp_diagnostic_step.invalidate()
+        self._mtp_diagnostic_step = (
+            MtpDiagnosticStep()
+            if scheduler_output.scheduled_spec_decode_tokens
+            and is_mtp_tensor_diagnostic_enabled(self.vllm_config)
+            else None
+        )
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
@@ -3560,6 +3578,16 @@ class TPUModelRunner(GPUModelRunner):
         pooler_output_list = []
         num_reqs_list = []
         spec_decode_metadata_list = []
+        mtp_tensor_diagnostics = []
+        previous_mamba_positions = (
+            {
+                r: self._mamba_state_pos[r]
+                for r in self.input_batch.req_id_to_index
+                if r in self._mamba_state_pos
+            }
+            if self._mtp_diagnostic_step is not None
+            else {}
+        )
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
@@ -3717,6 +3745,28 @@ class TPUModelRunner(GPUModelRunner):
                     f"max={trace_kwargs['max_kv_len']}"
                 )
 
+            mtp_diagnostic = None
+            if self._mtp_diagnostic_step is not None:
+                diagnostic_req_ids = cast(
+                    list[str], self.input_batch.req_ids[start_index:end_index]
+                )
+                mtp_diagnostic = DeferredMtpChunk(
+                    self._mtp_diagnostic_step,
+                    self,
+                    attn_metadata,
+                    diagnostic_req_ids,
+                    [
+                        scheduler_output.num_scheduled_tokens[r]
+                        for r in diagnostic_req_ids
+                    ],
+                    previous_mamba_positions,
+                    {
+                        r: self._mamba_state_pos[r]
+                        for r in diagnostic_req_ids
+                        if r in self._mamba_state_pos
+                    },
+                )
+
             with (
                 TraceAnnotation(
                     name=trace_name,
@@ -3829,8 +3879,25 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states,
                         layout_plan,
                     )
+                    if mtp_diagnostic is not None:
+                        mtp_diagnostic.hidden = hidden_states
+                        mtp_diagnostic.logits_indices = logits_indices
+                        mtp_diagnostic.real_rows = num_reqs + (
+                            int(spec_decode_metadata.draft_lengths_cpu.sum())
+                            if spec_decode_metadata is not None
+                            else 0
+                        )
+                        mtp_tensor_diagnostics.append(mtp_diagnostic)
                     logits = self.compute_selected_logits(hidden_states, logits_indices)
                 else:
+                    if mtp_diagnostic is not None:
+                        mtp_diagnostic.hidden = sample_hidden_states
+                        mtp_diagnostic.real_rows = num_reqs + (
+                            int(spec_decode_metadata.draft_lengths_cpu.sum())
+                            if spec_decode_metadata is not None
+                            else 0
+                        )
+                        mtp_tensor_diagnostics.append(mtp_diagnostic)
                     logits = self.compute_logits_from_hidden_states(
                         sample_hidden_states
                     )
@@ -3892,6 +3959,7 @@ class TPUModelRunner(GPUModelRunner):
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
             kv_save_nan_check=nan_check,
+            mtp_tensor_diagnostics=mtp_tensor_diagnostics,
         )
 
         if self.is_pooling_model:
@@ -4697,6 +4765,8 @@ class TPUModelRunner(GPUModelRunner):
                 req_ids,
                 state.spec_decode_metadata_list,
                 state.num_reqs_list,
+                state.mtp_tensor_diagnostics,
+                scheduler_output.num_invalid_spec_tokens,
             )
 
         if not self.scheduler_config.async_scheduling:

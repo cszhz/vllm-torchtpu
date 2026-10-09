@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in request attribution for batches with draft acceptance below 10%."""
+"""Temporary attribution for batches with draft acceptance below 10%."""
 
 from __future__ import annotations
 
@@ -19,6 +19,11 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 logger = init_logger(__name__)
+
+
+def is_low_mtp_acceptance(drafted: int, accepted: int) -> bool:
+    """Use effective draft counts; exactly 10% is outside the trigger."""
+    return drafted > 0 and accepted * 10 < drafted
 
 
 class _BatchLowAcceptance:
@@ -65,30 +70,38 @@ class _BatchLowAcceptance:
         try:
             outputs = self.original_update(scheduler_output, model_runner_output)
             # Integer comparison keeps exactly 10% outside the trigger.
-            if (
-                self.num_draft_tokens > 0
-                and self.num_accepted_tokens * 10 < self.num_draft_tokens
-            ):
+            if is_low_mtp_acceptance(self.num_draft_tokens, self.num_accepted_tokens):
                 from vllm_torchtpu.runner.mtp_diagnostic_output import (
                     MtpDiagnosticModelRunnerOutput,
                 )
 
-                assert isinstance(
-                    model_runner_output, MtpDiagnosticModelRunnerOutput
-                ), "MTP diagnostic runner output must carry the verified draft snapshot"
+                # Aborts/load failures can remove rows after the worker's
+                # whole-batch gate. Never force a normal worker batch to copy
+                # tensors just because the scheduler later keeps a subset.
+                diagnostics = []
+                drafts = {}
+                diagnostic_status = "worker_batch_not_below_threshold_or_unavailable"
+                if isinstance(model_runner_output, MtpDiagnosticModelRunnerOutput):
+                    diagnostics = model_runner_output.tensor_diagnostics
+                    drafts = model_runner_output.verified_draft_token_ids
+                    diagnostic_status = "worker_low_acceptance_capture"
                 logger.warning(
                     "[MTP_LOW_ACCEPTANCE] scope=batch "
                     "reason=acceptance_rate_below_threshold "
                     "dp_index=%s batch_index=%d num_draft_tokens=%d "
                     "num_accepted_tokens=%d acceptance_rate=%s "
                     "acceptance_threshold=0.1 "
+                    "diagnostic_status=%s "
+                    "tensor_diagnostics=%s "
                     "verified_draft_token_ids=%s request_ids=%s",
                     self.dp_index,
                     self.batch_index,
                     self.num_draft_tokens,
                     self.num_accepted_tokens,
                     self.num_accepted_tokens / self.num_draft_tokens,
-                    json.dumps(model_runner_output.verified_draft_token_ids),
+                    diagnostic_status,
+                    json.dumps(diagnostics),
+                    json.dumps(drafts),
                     json.dumps(self.request_ids),
                 )
             return outputs
@@ -108,8 +121,20 @@ def is_mtp_diagnostic_enabled(config: VllmConfig) -> bool:
     )
 
 
+def is_mtp_tensor_diagnostic_enabled(config: VllmConfig) -> bool:
+    """Keep TPU diagnostic work on the model execution thread.
+
+    Diagnostic D2H on async output threads can fail when TorchTPU creates
+    chained tasks from retained deferred tensors. Keep device work out of
+    that thread; scheduler attribution remains enabled.
+    """
+    return is_mtp_diagnostic_enabled(config) and not (
+        config.scheduler_config.async_scheduling
+    )
+
+
 def patch_scheduler_init() -> None:
-    """Install only at startup; disabled runs keep their original methods."""
+    """Install at startup; disabled runs keep their original scheduler methods."""
     if not envs.TPU_MTP_ZERO_ACCEPTANCE_LOG:
         return
 
@@ -122,6 +147,5 @@ def patch_scheduler_init() -> None:
         original_init(self, vllm_config, *args, **kwargs)
         if is_mtp_diagnostic_enabled(vllm_config):
             _BatchLowAcceptance(self)
-            logger.info("Enabled batch MTP request logging for acceptance below 10%")
 
     Scheduler.__init__ = init

@@ -60,6 +60,13 @@ def test_zero_batch_logs_all_effective_request_ids(scheduler, caplog, log_stats)
     ]
     output = diagnostic_output("req-b", "req-a", "grammar-only", "prefill")
     output.verified_draft_token_ids["prefill"] = []
+    output.tensor_diagnostics = [
+        {
+            "capture_id": "batch-a",
+            "hidden_states": {"has_nan": False},
+            "kv_cache": {"has_nan": False},
+        }
+    ]
     result = scheduler.update_from_output(rows, output)
 
     assert result is scheduler.result
@@ -70,6 +77,10 @@ def test_zero_batch_logs_all_effective_request_ids(scheduler, caplog, log_stats)
     assert "dp_index=2" in message
     assert "num_draft_tokens=4" in message
     assert "num_accepted_tokens=0" in message
+    diagnostics = message.split("tensor_diagnostics=", 1)[1].split(
+        " verified_draft_token_ids=", 1
+    )[0]
+    assert json.loads(diagnostics) == output.tensor_diagnostics
     assert json.loads(message.split("request_ids=", 1)[1]) == ["req-b", "req-a"]
     drafts = message.split("verified_draft_token_ids=", 1)[1].split(" request_ids=", 1)[
         0
@@ -106,6 +117,19 @@ def test_batches_do_not_retain_previous_acceptance_or_request_ids(scheduler, cap
     assert json.loads(caplog.messages[1].split("request_ids=", 1)[1]) == ["zero-b"]
 
 
+def test_scheduler_subset_can_be_low_without_a_worker_snapshot(scheduler, caplog):
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    output = ModelRunnerOutput(
+        req_ids=["aborted-accepted", "remaining"],
+        req_id_to_index={"aborted-accepted": 0, "remaining": 1},
+        sampled_token_ids=[[1, 2, 3], [4]],
+    )
+    scheduler.update_from_output([("remaining", 3, 0, None)], output)
+    assert len(caplog.records) == 1
+    assert "worker_batch_not_below_threshold_or_unavailable" in caplog.text
+
+
 def test_failed_batch_does_not_contaminate_the_next_batch(scheduler, caplog):
     state = scheduler.update_from_output.__self__
     original_update = state.original_update
@@ -126,17 +150,21 @@ def test_failed_batch_does_not_contaminate_the_next_batch(scheduler, caplog):
 @pytest.mark.parametrize(
     "enabled,speculative,kv_consumer",
     [
-        (False, True, None),
-        (True, True, None),
-        (True, False, None),
-        (True, True, False),
-        (True, True, True),
+        ("0", True, None),
+        ("1", True, None),
+        (None, True, None),
+        ("1", False, None),
+        ("1", True, False),
+        ("1", True, True),
     ],
 )
 def test_hook_only_installs_when_enabled(
     monkeypatch, caplog, enabled, speculative, kv_consumer
 ):
-    monkeypatch.setenv("TPU_MTP_ZERO_ACCEPTANCE_LOG", str(int(enabled)))
+    if enabled is None:
+        monkeypatch.delenv("TPU_MTP_ZERO_ACCEPTANCE_LOG", raising=False)
+    else:
+        monkeypatch.setenv("TPU_MTP_ZERO_ACCEPTANCE_LOG", enabled)
     monkeypatch.setattr(hook, "logger", logging.getLogger("mtp_hook_test"))
     caplog.set_level(logging.WARNING, logger="mtp_hook_test")
 
@@ -162,10 +190,9 @@ def test_hook_only_installs_when_enabled(
     assert stats.num_draft_tokens == 3
     assert stats.num_accepted_tokens == 0
     assert len(caplog.records) == int(
-        enabled and speculative and kv_consumer is not False
+        enabled != "0" and speculative and kv_consumer is not False
     )
-    if not enabled:
-        assert Scheduler.__init__ is init
+    assert (Scheduler.__init__ is not init) == (enabled != "0")
 
 
 @pytest.mark.parametrize("log_stats", [True, False])
