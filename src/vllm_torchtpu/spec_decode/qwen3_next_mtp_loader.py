@@ -89,6 +89,6 @@ def maybe_use_qwen3_next_mtp_loader(
     ):
         return loader
     model_cls, _ = get_model_architecture(model_config)
-    if model_cls not in (Qwen3NextMTP, Qwen3_5MoeMTP):
+    if not issubclass(model_cls, (Qwen3NextMTP, Qwen3_5MoeMTP)):
         return loader
     return Qwen3NextMTPLoader(load_config)

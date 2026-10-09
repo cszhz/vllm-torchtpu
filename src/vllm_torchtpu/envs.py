@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_MTP_PREFILL_ONLY: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_ROPE_CACHE_TRUNCATE: bool = False
@@ -671,6 +672,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ],
     # Pipeline parallelism: size prefill chunks by a per-step time budget
     # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
+    # Experimental forward-only validation; never enables speculative decode.
+    "TPU_MTP_PREFILL_ONLY": env_bool("TPU_MTP_PREFILL_ONLY"),
     "TPU_PP_DYNAMIC_CHUNKS": env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),
     # Fraction above the time of a full prefix-free step that a step may
     # take before its chunks are shortened.

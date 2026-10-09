@@ -16,6 +16,7 @@ from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MoeMTP
 from vllm.model_executor.models.qwen3_next_mtp import Qwen3NextMTP
 
 from vllm_torchtpu.model_loader_patches import _should_skip_weight_tpu
+from vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill import Qwen3_5MoeMTPPrefill
 from vllm_torchtpu.spec_decode import qwen3_next_mtp_loader as mtp_loader
 
 pytestmark = pytest.mark.cpu_test
@@ -150,6 +151,7 @@ def test_mtp_still_validates_full_checkpoint_index(checkpoint):
         (Qwen3NextMTP, None, True, True),
         (Qwen3_5MoeMTP, "lazy", True, True),
         (Qwen3_5MoeMTP, None, True, True),
+        (Qwen3_5MoeMTPPrefill, "lazy", True, True),
         (torch.nn.Module, "lazy", True, False),
         (Qwen3NextMTP, "eager", True, False),
         (Qwen3_5MoeMTP, "prefetch", True, False),

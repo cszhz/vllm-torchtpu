@@ -372,6 +372,7 @@ class TpuPlatform(Platform):
         "TPU_CHIPS_PER_HOST_BOUNDS",
         "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND",
+        "TPU_MTP_PREFILL_ONLY",
         "VLLM_MLA_DISABLE",
         "TPU_BACKEND_TYPE",
         "MIXED_Q_SPLIT",
@@ -1072,6 +1073,8 @@ class TpuPlatform(Platform):
 
         del processed_inputs
         if isinstance(params, SamplingParams):
+            if envs.TPU_MTP_PREFILL_ONLY and params.max_tokens != 1:
+                raise ValueError("TPU_MTP_PREFILL_ONLY requires max_tokens=1.")
             if params.sampling_type == SamplingType.RANDOM_SEED:
                 raise ValueError("JAX does not support per-request seed.")
             if params.sampling_type not in (SamplingType.GREEDY, SamplingType.RANDOM):
@@ -1131,7 +1134,7 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     )
 
     scheduler_config = vllm_config.scheduler_config
-    if not envs.TPU_PP_DYNAMIC_CHUNKS:
+    if envs.TPU_MTP_PREFILL_ONLY or not envs.TPU_PP_DYNAMIC_CHUNKS:
         return
     if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
         logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")

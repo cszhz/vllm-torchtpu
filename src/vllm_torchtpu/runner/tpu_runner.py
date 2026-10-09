@@ -534,6 +534,8 @@ class TPUModelRunner(GPUModelRunner):
 
     @property
     def _is_async_drafter(self) -> bool:
+        if envs.TPU_MTP_PREFILL_ONLY and not pp_rank_flags(self.parallel_config)[1]:
+            return False
         if not self.speculative_config:
             return False
         return (
@@ -1150,6 +1152,10 @@ class TPUModelRunner(GPUModelRunner):
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
         self.rejection_sampler = None
+        if envs.TPU_MTP_PREFILL_ONLY:
+            if pp_rank_flags(self.parallel_config)[1]:
+                self.drafter = Eagle3Proposer(self, self.vllm_config)
+            return
         if self.speculative_config:
             self.rejection_sampler = RejectionSampler(
                 self.speculative_config, self.device
@@ -3456,6 +3462,18 @@ class TPUModelRunner(GPUModelRunner):
             # safe to do for a zero-token step since no collectives are
             # triggered.
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+        if envs.TPU_MTP_PREFILL_ONLY:
+            from vllm_torchtpu.spec_decode.prefill_only import validate_prefill_span
+
+            if any(req.mm_features for req in scheduler_output.scheduled_new_reqs):
+                raise NotImplementedError("MTP prefill diagnostic is text-only.")
+            for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+                index = self.input_batch.req_id_to_index[req_id]
+                validate_prefill_span(
+                    int(self.input_batch.num_computed_tokens_cpu[index]),
+                    num_tokens,
+                    int(self.input_batch.num_prompt_tokens[index]),
+                )
         if self._pcp_enabled and self._mtp_enabled:
             # Validate the actual scheduled span before any forward/collective.
             # Ending exactly at the prompt boundary produces the first output;
@@ -4481,7 +4499,23 @@ class TPUModelRunner(GPUModelRunner):
         is_async = bool(self.scheduler_config.async_scheduling)
         eagle3_drafts = None
         if self._is_async_drafter and combined_selected_tokens:
-            if is_spec_step:
+            if envs.TPU_MTP_PREFILL_ONLY:
+                assert not is_spec_step
+                drafter = self._async_drafter
+                assert isinstance(drafter, Eagle3Proposer)
+                drafter.prefill_only(
+                    scheduler_output,
+                    torch.cat(
+                        [
+                            sel.view(-1)[:n]
+                            for sel, n in zip(
+                                combined_selected_tokens,
+                                combined_selected_tokens_real_lens,
+                            )
+                        ]
+                    ),
+                )
+            elif is_spec_step:
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=None,
@@ -5850,7 +5884,7 @@ class TPUModelRunner(GPUModelRunner):
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
-            if self._is_async_drafter:
+            if self._is_async_drafter and not envs.TPU_MTP_PREFILL_ONLY:
                 self._async_drafter.precompile()
                 if self._pcp_enabled and self._mtp_enabled:
                     logger.info(

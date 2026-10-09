@@ -138,3 +138,19 @@ def test_raiden_accepts_stages_of_sparse_attention_layers(monkeypatch):
     validate_pipeline_parallel_config(
         _config(pp=8, kv_transfer=RAIDEN, layer_types=["deepseek_sparse_attention"] * 8)
     )
+
+
+def test_prefill_only_opt_in_keeps_decode_gate_closed(monkeypatch):
+    from vllm_torchtpu.spec_decode.prefill_only import validate_prefill_only_config
+
+    monkeypatch.setenv("TPU_MTP_PREFILL_ONLY", "1")
+    c = _config(speculative=SimpleNamespace(method="mtp", num_speculative_tokens=1))
+    c.parallel_config.data_parallel_size = 1
+    c.parallel_config.decode_context_parallel_size = 1
+    c.scheduler_config.enable_chunked_prefill = False
+    c.cache_config = SimpleNamespace(enable_prefix_caching=False)
+    validate_prefill_only_config(c)
+    validate_pipeline_parallel_config(c)
+    c.speculative_config.num_speculative_tokens = 2
+    with pytest.raises(ValueError, match="K=1"):
+        validate_pipeline_parallel_config(c)

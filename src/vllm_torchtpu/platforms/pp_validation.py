@@ -47,6 +47,11 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
 
     Raises NotImplementedError naming the unsupported feature.
     """
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.spec_decode.prefill_only import validate_prefill_only_config
+
+    if envs.TPU_MTP_PREFILL_ONLY:
+        validate_prefill_only_config(vllm_config)
     parallel_config = vllm_config.parallel_config
     if parallel_config.pipeline_parallel_size <= 1:
         return
@@ -74,7 +79,7 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         # placeholder substitution reads from the device.
         unsupported = "async scheduling"
         remedy = " Pass --no-async-scheduling."
-    elif vllm_config.speculative_config is not None:
+    elif vllm_config.speculative_config is not None and not envs.TPU_MTP_PREFILL_ONLY:
         unsupported = "speculative decoding"
     elif (
         vllm_config.kv_transfer_config is not None

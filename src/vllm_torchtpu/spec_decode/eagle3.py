@@ -110,6 +110,8 @@ def _maybe_pad_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
 
 
 if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
@@ -205,6 +207,7 @@ class Eagle3Proposer:
         # (token ids, positions, attn ctx, aux hidden states) captured
         # during the target verify forward.
         self.draft_chunks: list[DraftChunkInputs] | None = None
+        self.prefill_snapshots: list[dict[str, torch.Tensor]] = []
         # Per-propose-call cache of loop-step draft attention metadata, keyed
         # by id(chunk). Between loop iterations of one step everything in the
         # metadata is constant except seq_lens advancing by +1, so iterations
@@ -261,9 +264,10 @@ class Eagle3Proposer:
         self._validate_dsa_draft(all_attn_layers, draft_attn_layer_names)
 
         assert self.draft_model is not None
-        maybe_share_embeddings(
-            self.draft_model, target_model, self._draft_tp_matches_target
-        )
+        if not envs.TPU_MTP_PREFILL_ONLY:
+            maybe_share_embeddings(
+                self.draft_model, target_model, self._draft_tp_matches_target
+            )
         maybe_share_lm_head(
             self.draft_model,
             target_model,
@@ -1042,6 +1046,63 @@ class Eagle3Proposer:
         return shifted.index_put(
             (last_token_indices,), next_token_ids.to(input_ids.dtype)
         )
+
+    def prefill_only(
+        self, scheduler_output: SchedulerOutput, device_seed: torch.Tensor
+    ) -> None:
+        """Populate MTP KV once, retaining CPU snapshots for offline comparison.
+
+        No draft logits or proposals are produced. Full prompt rows, including
+        the boundary row seeded by the target's first sampled token, are run.
+        """
+        from vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill import (
+            Qwen3_5MoeMTPPrefill,
+        )
+
+        if not isinstance(self.draft_model, Qwen3_5MoeMTPPrefill):
+            raise NotImplementedError("MTP prefill currently supports Qwen3.5 MoE.")
+        snapshots = []
+        assert self.draft_chunks is not None
+        for chunk in self.draft_chunks:
+            assert chunk.hidden_states is not None
+            ids, positions, _, rejected = self._prepare_draft_inputs(
+                chunk, [], [], None, scheduler_output, device_seed=device_seed
+            )
+            assert isinstance(rejected, np.ndarray)
+            output, _ = self._forward_draft(
+                chunk,
+                ids,
+                positions,
+                chunk.hidden_states,
+                step_idx=0,
+                seq_lens_delta=0,
+                num_rejected_np=rejected,
+                num_tokens_padded=ids.shape[0],
+            )
+            rows = int(chunk.query_start_loc_np[-1])
+            logical_indices = []
+            local_indices = []
+            for logical_index in range(rows):
+                local_index = (
+                    chunk.sequence_layout_plan.local_index_for_request_major_token(
+                        logical_index
+                    )
+                )
+                if local_index is not None:
+                    logical_indices.append(logical_index)
+                    local_indices.append(local_index)
+            local = torch.tensor(local_indices, dtype=torch.long)
+            snapshots.append(
+                {
+                    "logical_token_indices": torch.tensor(logical_indices),
+                    "input_ids": ids.cpu()[local],
+                    "positions": positions.cpu()[..., local],
+                    "target_hidden": chunk.hidden_states.cpu()[local],
+                    "mtp_hidden": output.cpu()[local],
+                }
+            )
+        self.prefill_snapshots = snapshots
+        logger.info("MTP prefill completed on final stage: %d chunks", len(snapshots))
 
     def propose(
         self,
