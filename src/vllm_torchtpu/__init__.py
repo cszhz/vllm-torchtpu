@@ -135,6 +135,100 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
     )
 
 
+def _patch_vllm_mtp_prefill_cache_groups() -> None:
+    """Identify MTP groups for upstream prefix-cache boundary protection."""
+    from functools import wraps
+
+    from vllm.v1.core import kv_cache_utils
+
+    original = kv_cache_utils.get_kv_cache_groups
+    if getattr(original, "_tpu_mtp_prefill_groups", False):
+        return
+
+    @wraps(original)
+    def get_groups(vllm_config, kv_cache_spec):
+        groups = original(vllm_config, kv_cache_spec)
+        if envs.TPU_MTP_PREFILL_ONLY:
+            # The pinned vLLM does not identify Qwen MTP groups. Its fallback
+            # marks *all* groups as EAGLE, preventing Mamba prefix-cache hits.
+            # Qwen's complete head is registered under the `mtp` scope.
+            for group in groups:
+                group.is_eagle_group = any(
+                    name.startswith("mtp.") for name in group.layer_names
+                )
+        return groups
+
+    get_groups.__dict__["_tpu_mtp_prefill_groups"] = True
+    kv_cache_utils.get_kv_cache_groups = get_groups
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    original_split = Scheduler._mamba_block_aligned_split
+
+    @wraps(original_split)
+    def split_at_mtp_prefix_boundary(
+        self,
+        request,
+        num_new_tokens,
+        num_new_local_computed_tokens=0,
+        num_external_computed_tokens=0,
+    ):
+        count = original_split(
+            self,
+            request,
+            num_new_tokens,
+            num_new_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+        if envs.TPU_MTP_PREFILL_ONLY and self.cache_config.enable_prefix_caching:
+            # Fine-grained MTP hits drop one hash unit. Preserve the target's
+            # Mamba checkpoint at that same earlier boundary, not only at the
+            # last prompt hash boundary selected by upstream.
+            unit = self.hash_block_size
+            boundary = max(0, ((request.num_prompt_tokens - 1) // unit - 1) * unit)
+            start = (
+                request.num_computed_tokens
+                + num_new_local_computed_tokens
+                + num_external_computed_tokens
+            )
+            if start < boundary < start + count:
+                count = boundary - start
+        return count
+
+    Scheduler._mamba_block_aligned_split = split_at_mtp_prefix_boundary
+
+    import copy
+
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        MambaManager,
+    )
+
+    def wrap_partial_tail(original_tail):
+        @wraps(original_tail)
+        def cache_tail(self, request, num_tokens):
+            extra = None
+            if envs.TPU_MTP_PREFILL_ONLY:
+                unit = self.block_pool.hash_block_size
+                boundary = max(0, ((request.num_prompt_tokens - 1) // unit - 1) * unit)
+                if boundary > 0:
+                    # Reuse upstream registration and Mamba CoW. The view only
+                    # changes which boundary is retained; token hashes, request
+                    # identity and block ownership remain those of the request.
+                    view = copy.copy(request)
+                    view.num_prompt_tokens = boundary
+                    extra = original_tail(self, view, num_tokens)
+            result = original_tail(self, request, num_tokens)
+            return result if result is not None else extra
+
+        return cache_tail
+
+    for manager in (FullAttentionManager, MambaManager):
+        manager._cache_partial_tail_block = wrap_partial_tail(
+            manager._cache_partial_tail_block
+        )
+
+
 def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     """Align Mamba prefill splits to the scheduler block size.
 

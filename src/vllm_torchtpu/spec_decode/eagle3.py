@@ -1048,12 +1048,15 @@ class Eagle3Proposer:
         )
 
     def prefill_only(
-        self, scheduler_output: SchedulerOutput, device_seed: torch.Tensor
+        self,
+        scheduler_output: SchedulerOutput,
+        device_seed: torch.Tensor,
+        discard_sampled_tokens_req_indices: list[int] | None = None,
     ) -> None:
-        """Populate MTP KV once, retaining CPU snapshots for offline comparison.
+        """Populate MTP KV for this prefill step, retaining CPU snapshots.
 
-        No draft logits or proposals are produced. Full prompt rows, including
-        the boundary row seeded by the target's first sampled token, are run.
+        No draft logits or proposals are produced. Intermediate chunks use the
+        next known prompt token; only the prompt boundary uses a sampled token.
         """
         from vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill import (
             Qwen3_5MoeMTPPrefill,
@@ -1066,7 +1069,12 @@ class Eagle3Proposer:
         for chunk in self.draft_chunks:
             assert chunk.hidden_states is not None
             ids, positions, _, rejected = self._prepare_draft_inputs(
-                chunk, [], [], None, scheduler_output, device_seed=device_seed
+                chunk,
+                [],
+                discard_sampled_tokens_req_indices or [],
+                None,
+                scheduler_output,
+                device_seed=device_seed,
             )
             assert isinstance(rejected, np.ndarray)
             output, _ = self._forward_draft(

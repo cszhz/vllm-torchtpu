@@ -11,14 +11,15 @@ def read_snapshot(directory: str) -> dict[str, torch.Tensor]:
     chunks = []
     for path in sorted(Path(directory).glob("rank-*.pt")):
         snapshot = torch.load(path, map_location="cpu", weights_only=True)
-        if len(snapshot["chunks"]) != 1:
-            raise ValueError("Comparison requires one complete prompt per run.")
-        chunks.append(snapshot["chunks"][0])
+        chunks.extend(snapshot["chunks"])
     if not chunks:
         raise ValueError(f"No rank snapshots in {directory}")
-    logical = torch.cat([c["logical_token_indices"] for c in chunks]).long()
+    positions = torch.cat([c["positions"] for c in chunks], dim=-1).long()
+    logical = positions if positions.ndim == 1 else positions[0]
     order = logical.argsort()
-    torch.testing.assert_close(logical[order], torch.arange(logical.numel()))
+    torch.testing.assert_close(
+        logical[order], torch.arange(int(logical.min()), int(logical.max()) + 1)
+    )
     return {
         key: torch.cat([c[key] for c in chunks], dim=axis).index_select(axis, order)
         for key, axis in (
@@ -39,6 +40,18 @@ def main():
     args = parser.parse_args()
     reference = read_snapshot(args.reference)
     candidate = read_snapshot(args.candidate)
+    # A prefix-cache hit only executes the suffix. Compare those same absolute
+    # positions in the cold reference, without pretending cached rows were run.
+    positions = candidate["positions"].long()
+    reference_positions = reference["positions"]
+    if positions.ndim > 1:
+        positions = positions[0]
+        reference_positions = reference_positions[0]
+    offset = int(reference_positions[0])
+    reference = {
+        key: value.index_select(-1 if key == "positions" else 0, positions - offset)
+        for key, value in reference.items()
+    }
     for key in ("input_ids", "positions"):
         torch.testing.assert_close(candidate[key], reference[key], atol=0, rtol=0)
     for key in ("target_hidden", "mtp_hidden"):

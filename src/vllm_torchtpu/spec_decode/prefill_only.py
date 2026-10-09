@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Admission for the experimental, unchunked MTP prefill diagnostic."""
+"""Admission for the experimental MTP prefill producer."""
 
 from typing import TYPE_CHECKING
 
@@ -23,16 +23,12 @@ def validate_prefill_only_config(config: "VllmConfig") -> None:
         raise NotImplementedError("MTP prefill diagnostic does not transfer KV.")
     if config.scheduler_config.async_scheduling:
         raise NotImplementedError("MTP prefill diagnostic requires sync scheduling.")
-    if config.scheduler_config.enable_chunked_prefill:
-        raise NotImplementedError("MTP prefill diagnostic requires unchunked prefill.")
-    if config.cache_config.enable_prefix_caching:
-        raise NotImplementedError("MTP prefill diagnostic requires prefix caching off.")
 
 
 def validate_prefill_span(computed: int, scheduled: int, prompt: int) -> None:
-    """Require a complete fresh prompt; no cache hits, chunks or decode."""
-    if computed != 0 or scheduled != prompt:
+    """Allow fresh, chunked and cache-hit prefill, but never decode."""
+    if computed < 0 or scheduled <= 0 or computed + scheduled > prompt:
         raise NotImplementedError(
-            "MTP prefill diagnostic requires a complete fresh prompt: "
+            "MTP prefill diagnostic requires a span within the prompt: "
             f"computed={computed}, scheduled={scheduled}, prompt={prompt}."
         )

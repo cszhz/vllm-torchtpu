@@ -1134,7 +1134,7 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     )
 
     scheduler_config = vllm_config.scheduler_config
-    if envs.TPU_MTP_PREFILL_ONLY or not envs.TPU_PP_DYNAMIC_CHUNKS:
+    if not envs.TPU_PP_DYNAMIC_CHUNKS:
         return
     if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
         logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")

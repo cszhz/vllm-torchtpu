@@ -56,8 +56,6 @@ def test_unsupported_parallelism_rejected(field, value):
     "section,field,value",
     [
         ("scheduler_config", "async_scheduling", True),
-        ("scheduler_config", "enable_chunked_prefill", True),
-        ("cache_config", "enable_prefix_caching", True),
     ],
 )
 def test_rejects_unimplemented_lifecycles(section, field, value):
@@ -70,19 +68,36 @@ def test_rejects_unimplemented_lifecycles(section, field, value):
 @pytest.mark.parametrize(
     "computed,scheduled,prompt",
     [
-        (0, 3, 4),
-        (1, 3, 4),
+        (-1, 3, 4),
+        (1, 0, 4),
         (4, 1, 4),
         (0, 5, 4),
     ],
 )
-def test_rejects_partial_prompt_cache_hit_or_decode(computed, scheduled, prompt):
-    with pytest.raises(NotImplementedError, match="complete fresh prompt"):
+def test_rejects_invalid_span_or_decode(computed, scheduled, prompt):
+    with pytest.raises(NotImplementedError, match="span within the prompt"):
         validate_prefill_span(computed, scheduled, prompt)
 
 
-def test_complete_prompt_span():
-    validate_prefill_span(0, 4, 4)
+@pytest.mark.parametrize("computed,scheduled", [(0, 4), (0, 2), (2, 2), (1, 2)])
+def test_prefill_spans(computed, scheduled):
+    validate_prefill_span(computed, scheduled, 4)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("cached", [False, True])
+def test_chunking_and_prefix_caching_are_orthogonal(chunked, cached):
+    c = config()
+    c.scheduler_config.enable_chunked_prefill = chunked
+    c.cache_config.enable_prefix_caching = cached
+    validate_prefill_only_config(c)
+
+
+def test_kv_transfer_still_rejected():
+    c = config()
+    c.kv_transfer_config = object()
+    with pytest.raises(NotImplementedError, match="does not transfer KV"):
+        validate_prefill_only_config(c)
 
 
 class Layer(torch.nn.Module):
@@ -235,3 +250,224 @@ def test_only_final_stage_initializes_mtp(monkeypatch, last):
     assert len(created) == int(last)
     assert runner.drafter == ("draft" if last else None)
     assert runner.rejection_sampler is None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_cache_group_marker_excludes_target_mamba(monkeypatch, enabled):
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    import vllm_torchtpu
+
+    monkeypatch.setattr(Scheduler, "_mamba_block_aligned_split", lambda *a: 511)
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        MambaManager,
+    )
+
+    retained = []
+
+    def tail(manager, request, num_tokens):
+        if num_tokens == request.num_prompt_tokens // 128 * 128:
+            retained.append(num_tokens)
+            return num_tokens
+        return None
+
+    for manager in (FullAttentionManager, MambaManager):
+        monkeypatch.setattr(manager, "_cache_partial_tail_block", tail)
+
+    groups = [
+        SimpleNamespace(
+            layer_names=["model.layers.0.linear_attn"], is_eagle_group=False
+        ),
+        SimpleNamespace(
+            layer_names=["model.layers.3.self_attn.attn"], is_eagle_group=False
+        ),
+        SimpleNamespace(
+            layer_names=["mtp.layers.0.self_attn.attn"], is_eagle_group=False
+        ),
+    ]
+    monkeypatch.setenv("TPU_MTP_PREFILL_ONLY", str(int(enabled)))
+    monkeypatch.setattr(kv_cache_utils, "get_kv_cache_groups", lambda *a: groups)
+    vllm_torchtpu._patch_vllm_mtp_prefill_cache_groups()
+    wrapped = kv_cache_utils.get_kv_cache_groups
+    vllm_torchtpu._patch_vllm_mtp_prefill_cache_groups()
+    assert kv_cache_utils.get_kv_cache_groups is wrapped
+    assert [g.is_eagle_group for g in wrapped(config(), {})] == [False, False, enabled]
+
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=True), hash_block_size=128
+    )
+    request = SimpleNamespace(num_prompt_tokens=511, num_computed_tokens=0)
+    assert Scheduler._mamba_block_aligned_split(scheduler, request, 511) == (
+        256 if enabled else 511
+    )
+    request.num_computed_tokens = 256
+    assert Scheduler._mamba_block_aligned_split(scheduler, request, 255) == 511
+    manager = SimpleNamespace(block_pool=SimpleNamespace(hash_block_size=128))
+    MambaManager._cache_partial_tail_block(manager, request, 256)
+    assert retained == ([256] if enabled else [])
+    assert request.num_prompt_tokens == 511
+
+
+def test_intermediate_chunks_forward_discard_indices():
+    """Prefill must override meaningless intermediate samples with prompt tokens."""
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    proposer = Eagle3Proposer.__new__(Eagle3Proposer)
+    proposer.draft_model = make_head()
+    proposer.draft_chunks = [SimpleNamespace(hidden_states=torch.zeros(2, 3))]
+    seen = []
+
+    class StopAfterPrepare(Exception):
+        pass
+
+    def prepare(chunk, sampled, discarded, rejected, scheduler, **kwargs):
+        seen.append(discarded)
+        raise StopAfterPrepare
+
+    proposer._prepare_draft_inputs = prepare
+    with pytest.raises(StopAfterPrepare):
+        proposer.prefill_only(SimpleNamespace(), torch.tensor([5, 6]), [0])
+    assert seen == [[0]]
+
+
+def test_chunk_seed_uses_known_prompt_token_and_final_sample():
+    import numpy as np
+
+    from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    proposer = Eagle3Proposer.__new__(Eagle3Proposer)
+    # Chunk starts at batch row 1: request a is partial, b reaches its end.
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        input_batch=SimpleNamespace(req_ids=["outside", "a", "b"]),
+        requests={
+            "a": SimpleNamespace(
+                num_computed_tokens=2,
+                get_token_id=lambda position: [1, 2, 3, 4, 5][position],
+            ),
+            "b": SimpleNamespace(num_computed_tokens=0),
+        },
+    )
+    proposer._loop_bucket = lambda n: n
+
+    def seed(ids, indices, next_ids):
+        shifted = torch.cat((ids[1:], ids[-1:]))
+        shifted[indices] = next_ids.to(ids.dtype)
+        return shifted
+
+    proposer._draft_seed_input_ids = seed
+    chunk = SimpleNamespace(
+        start_index=1,
+        num_reqs=2,
+        query_start_loc_np=np.array([0, 2, 4]),
+        input_ids=torch.tensor([3, 4, 6, 7]),
+        position_ids=torch.tensor([2, 3, 0, 1]),
+        sequence_layout_plan=AllSequenceLayoutPlanner().prepare_dummy(
+            num_tokens=4, num_reqs=2, kv_cache_initialized=True
+        ),
+    )
+    result, positions, _, _ = proposer._prepare_draft_inputs(
+        chunk,
+        [],
+        [1],
+        None,
+        SimpleNamespace(num_scheduled_tokens={"a": 2, "b": 2}),
+        device_seed=torch.tensor([99, 88, 8]),
+    )
+    torch.testing.assert_close(result, torch.tensor([4, 5, 7, 8]))
+    torch.testing.assert_close(positions, chunk.position_ids)
+
+
+def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(monkeypatch):
+    import inspect
+
+    from vllm import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        MambaManager,
+    )
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.request import Request
+
+    import vllm_torchtpu
+
+    monkeypatch.setenv("TPU_MTP_PREFILL_ONLY", "1")
+    monkeypatch.setattr(kv_cache_utils, "get_kv_cache_groups", lambda *a: [])
+    monkeypatch.setattr(Scheduler, "_mamba_block_aligned_split", lambda *a: 0)
+    for cls in (FullAttentionManager, MambaManager):
+        monkeypatch.setattr(
+            cls,
+            "_cache_partial_tail_block",
+            inspect.unwrap(cls._cache_partial_tail_block),
+        )
+    vllm_torchtpu._patch_vllm_mtp_prefill_cache_groups()
+    kv_cache_utils.init_none_hash(sha256)
+    attention = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=4, dtype=torch.float32
+    )
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((4, 4),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    cache = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target.mamba"], mamba),
+            KVCacheGroupSpec(["target.attention"], attention),
+            KVCacheGroupSpec(["mtp.attention"], attention, is_eagle_group=True),
+        ],
+    )
+    manager = KVCacheManager(
+        cache,
+        max_model_len=32,
+        max_in_flight_tokens=16,
+        scheduler_block_size=16,
+        hash_block_size=4,
+        enable_caching=True,
+        use_eagle=True,
+        num_prefill_lookahead=1,
+    )
+
+    def request(name, ids):
+        return Request(
+            name,
+            ids,
+            SamplingParams(max_tokens=1),
+            None,
+            block_hasher=kv_cache_utils.get_request_block_hasher(4, sha256),
+        )
+
+    ids = list(range(15))
+    cold = request("cold", ids)
+    for end in (4, 8, 12, 15):
+        manager.coordinator.new_step_starts()
+        assert manager.allocate_slots(cold, end - cold.num_computed_tokens) is not None
+        cold.num_computed_tokens = end
+        manager.cache_blocks(cold, end)
+        # Model completion releases the CoW endpoints retained by the scheduler.
+        _, retained = manager.take_kv_cache_block_copies()
+        manager.block_pool.free_blocks(retained)
+    manager.free(cold)
+    manager.coordinator.new_step_starts()
+    assert manager.get_computed_blocks(request("warm", ids))[1] == 8
+    changed = ids.copy()
+    changed[8] = 99
+    # KV at MTP row 7 depends on token 8, outside the otherwise matching prefix.
+    assert manager.get_computed_blocks(request("changed", changed))[1] < 8
+    assert manager.reset_prefix_cache()
+    assert manager.get_computed_blocks(request("reset", ids))[1] == 0

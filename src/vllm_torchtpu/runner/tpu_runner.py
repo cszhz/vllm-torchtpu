@@ -4514,6 +4514,7 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         ]
                     ),
+                    discard_sampled_tokens_req_indices,
                 )
             elif is_spec_step:
                 with self._stage_timing.stage("draft_propose"):
