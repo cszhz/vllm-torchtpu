@@ -220,3 +220,23 @@ def test_ray_executor_raises_on_real_disagreement():
         pytest.raises(ValueError, match="workers disagree"),
     ):
         executor.get_kv_cache_specs()
+
+
+def test_prefill_only_does_not_issue_synchronous_draft_rpc(monkeypatch):
+    monkeypatch.setenv("TPU_MTP_PREFILL_ONLY", "1")
+    executor = _make_executor(None, [], pipeline_parallel_size=4)
+    executor.collective_rpc.side_effect = AssertionError("PP forward is still pending")
+    assert executor.take_draft_token_ids() is None
+    executor.collective_rpc.assert_not_called()
+
+
+def test_decode_still_retrieves_draft_tokens(monkeypatch):
+    monkeypatch.setenv("TPU_MTP_PREFILL_ONLY", "0")
+    executor = _make_executor(None, [])
+    executor.output_rank = 0
+    expected = object()
+    executor.collective_rpc.return_value = expected
+    assert executor.take_draft_token_ids() is expected
+    executor.collective_rpc.assert_called_once_with(
+        "take_draft_token_ids", unique_reply_rank=0
+    )

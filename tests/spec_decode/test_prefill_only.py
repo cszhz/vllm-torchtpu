@@ -6,7 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill import Qwen3_5MoeMTPPrefill
+from vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill import (
+    Qwen3_5MoeMTPPrefill,
+    Qwen3NextMTPPrefill,
+)
 from vllm_torchtpu.spec_decode.prefill_only import (
     validate_prefill_only_config,
     validate_prefill_span,
@@ -142,8 +145,8 @@ class Norm(torch.nn.Module):
         return x + residual, None
 
 
-def make_head():
-    head = Qwen3_5MoeMTPPrefill.__new__(Qwen3_5MoeMTPPrefill)
+def make_head(head_class=Qwen3_5MoeMTPPrefill):
+    head = head_class.__new__(head_class)
     torch.nn.Module.__init__(head)
     model = torch.nn.Module()
     model.embed_tokens = torch.nn.Embedding(7, 3)
@@ -158,13 +161,17 @@ def make_head():
     return head
 
 
-def test_whole_head_projects_every_prompt_row_without_first_rank_branch():
-    head = make_head()
+@pytest.mark.parametrize("head_class", [Qwen3_5MoeMTPPrefill, Qwen3NextMTPPrefill])
+def test_whole_head_projects_every_prompt_row_without_first_rank_branch(head_class):
+    from vllm.model_executor.models.interfaces import supports_pp
+
+    assert supports_pp(head_class)
+    head = make_head(head_class)
     ids = torch.tensor([1, 2, 3, 4])
     positions = torch.arange(4)
     hidden = torch.randn(4, 3)
     expected = head.model.fc(torch.cat([head.model.embed_tokens(ids), hidden], -1)) * 3
-    result = Qwen3_5MoeMTPPrefill.forward(head, ids, positions, hidden)
+    result = head.forward(ids, positions, hidden)
     torch.testing.assert_close(result, expected)
     torch.testing.assert_close(head.model.layers[0].positions, positions)
     assert result.shape == (4, 3)
@@ -182,8 +189,11 @@ def test_prefill_head_rejects_loop_step():
         )
 
 
+@pytest.mark.parametrize("capture", [False, True])
 @pytest.mark.parametrize("partial", [False, True])
-def test_prefill_executes_head_without_producing_draft_tokens(partial):
+def test_prefill_executes_head_without_producing_draft_tokens(
+    partial, capture, monkeypatch
+):
     import numpy as np
 
     from vllm_torchtpu.layers.core.sequence_layout import (
@@ -198,6 +208,7 @@ def test_prefill_executes_head_without_producing_draft_tokens(partial):
     head = make_head()
     proposer = Eagle3Proposer.__new__(Eagle3Proposer)
     proposer.draft_model = head
+    proposer.capture_prefill_snapshots = capture
     hidden = torch.randn(4, 3)
     ids = torch.tensor([2, 3, 4, 5])
     positions = torch.arange(4)
@@ -248,7 +259,16 @@ def test_prefill_executes_head_without_producing_draft_tokens(partial):
         return output, output
 
     proposer._forward_draft = forward
+    if not capture:
+
+        def unexpected_copy(*args, **kwargs):
+            raise AssertionError("Serving MTP prefill must not capture CPU tensors")
+
+        monkeypatch.setattr(torch.Tensor, "cpu", unexpected_copy)
     proposer.prefill_only(SimpleNamespace(), torch.tensor([5]))
+    if not capture:
+        assert proposer.prefill_snapshots == []
+        return
     assert len(proposer.prefill_snapshots) == 1
     snapshot = proposer.prefill_snapshots[0]
     valid_rows = 3 if partial else 4
@@ -502,3 +522,57 @@ def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(
     assert manager.get_computed_blocks(request("changed", changed))[1] < 8
     assert manager.reset_prefix_cache()
     assert manager.get_computed_blocks(request("reset", ids))[1] == 0
+
+
+def test_next_mtp_registered_only_for_prefill(monkeypatch):
+    from vllm.model_executor.models import ModelRegistry
+
+    from vllm_torchtpu.models.vllm import register_models
+
+    registered = {}
+    monkeypatch.setattr(ModelRegistry, "register_model", registered.__setitem__)
+    monkeypatch.setenv("TPU_MTP_PREFILL_ONLY", "1")
+    register_models()
+    assert registered["Qwen3NextMTP"].endswith(":Qwen3NextMTPPrefill")
+    registered.clear()
+    monkeypatch.setenv("TPU_MTP_PREFILL_ONLY", "0")
+    register_models()
+    assert "Qwen3NextMTP" not in registered
+
+
+@pytest.mark.parametrize("block_size, first_bucket", [(384, 1024), (9216, 512)])
+def test_dynamic_pp_buckets_reach_copied_mtp_compilation_config(
+    block_size, first_bucket
+):
+    from unittest.mock import MagicMock
+
+    from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    drafter = MagicMock(spec=Eagle3Proposer)
+    drafter.draft_vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(compile_sizes=[4096])
+    )
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(pipeline_parallel_size=4),
+            scheduler_config=SimpleNamespace(scheduler_cls=SCHEDULER_CLS),
+            compilation_config=SimpleNamespace(compile_sizes=[4096]),
+        ),
+        _pp_chunk_granularity=None,
+        _has_mamba_state=True,
+        _pcp_enabled=True,
+        cache_config=SimpleNamespace(block_size=block_size, mamba_cache_mode='align'),
+        max_num_tokens=4096,
+        num_tokens_paddings=[4096],
+        drafter=drafter,
+    )
+    TPUModelRunner._add_pipeline_chunk_buckets(runner)
+    assert first_bucket in runner.num_tokens_paddings
+    assert drafter.draft_vllm_config.compilation_config.compile_sizes == (
+        runner.num_tokens_paddings
+    )
+    assert drafter.draft_vllm_config.compilation_config.compile_sizes is not (
+        runner.vllm_config.compilation_config.compile_sizes
+    )

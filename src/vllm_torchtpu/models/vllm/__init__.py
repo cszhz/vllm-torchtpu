@@ -21,6 +21,10 @@ def register_models() -> None:
 
     if envs.TPU_MTP_PREFILL_ONLY:
         ModelRegistry.register_model(
+            "Qwen3NextMTP",
+            "vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill:Qwen3NextMTPPrefill",
+        )
+        ModelRegistry.register_model(
             "Qwen3_5MoeMTP",
             "vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill:Qwen3_5MoeMTPPrefill",
         )

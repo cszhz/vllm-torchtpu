@@ -8,7 +8,9 @@ instead of all 14 shapes sharing a single window and timing out.
 
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.outputs import DraftTokenIds
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.executors.kv_block_override import reconcile_num_gpu_blocks_override
 
 
@@ -19,6 +21,15 @@ class TpuMultiprocExecutor(MultiprocExecutor):
 
         _patch_multiproc_worker_global_rank_env()
         super()._init_executor()
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        # Prefill-only MTP fills KV but never proposes tokens. A synchronous
+        # RPC here runs before the batch-queue future is awaited, so it would
+        # wait behind PP forwards whose hand-offs still need the executor's
+        # push/settle. There is no worker result to retrieve in this mode.
+        if envs.TPU_MTP_PREFILL_ONLY:
+            return None
+        return super().take_draft_token_ids()
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         specs = super().get_kv_cache_specs()

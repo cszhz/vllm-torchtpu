@@ -186,6 +186,15 @@ def _assert_outputs_match(actual, reference, rows, groups):
         pytest.param(_TP2_PERMUTED, 24, id="tp2-permuted-padding"),
         pytest.param(_TP4_PERMUTED, 7, id="tp4-permuted-tail"),
         pytest.param(_TP4_PERMUTED, 1, id="tp4-empty-members"),
+        *[
+            pytest.param(
+                tuple(tuple(range(i, i + tp)) for i in range(0, 8, tp)),
+                rows,
+                id=f"bucket-tp{tp}-rows{rows}",
+            )
+            for tp in (1, 8)
+            for rows in (64, 256, 4096)
+        ],
     ],
 )
 def test_single_host_replicas_match_original_layer(

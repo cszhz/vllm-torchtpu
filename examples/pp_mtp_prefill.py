@@ -29,6 +29,7 @@ def begin_snapshot(worker, reference: bytes | None = None):
     if not get_pp_group().is_last_rank:
         return
     drafter = worker.model_runner._async_drafter
+    drafter.capture_prefill_snapshots = True
     if not hasattr(drafter, "diagnostic_chunks"):
         original = drafter.prefill_only
 

@@ -5417,6 +5417,14 @@ class TPUModelRunner(GPUModelRunner):
             self.vllm_config.compilation_config.compile_sizes = list(
                 self.num_tokens_paddings
             )
+            # The draft owns a copied CompilationConfig created at model load,
+            # before final KV geometry expands the dynamic PP chunk buckets.
+            # Prefill-only MTP consumes those same chunks on the last stage.
+            drafter = getattr(self, "drafter", None)
+            if isinstance(drafter, Eagle3Proposer):
+                drafter.draft_vllm_config.compilation_config.compile_sizes = list(
+                    self.num_tokens_paddings
+                )
         logger.info(
             "Pipeline chunks: granularity %d tokens (KV block %d, block "
             "aligned %s), buckets added %s",

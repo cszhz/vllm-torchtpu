@@ -3451,7 +3451,7 @@ class TestTPURaidenConnectorWorker:
             kv_caches=[storage],
             node_id=3,
             local_control_port=9106,
-            max_blocks=4,
+            max_blocks=1,
             num_slots=1,
             timeout_s=12.0,
             listener_port=0,

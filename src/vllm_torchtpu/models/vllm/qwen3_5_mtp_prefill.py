@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Whole Qwen3.5 MoE MTP head on the last pipeline stage.
+"""Whole Qwen3Next / Qwen3.5 MoE MTP head on the last pipeline stage.
 
 Backports the input-projection fix from vllm-project/vllm#46994 for the
 pinned vLLM. This diagnostic only executes whole heads, never intermediate
@@ -9,10 +9,13 @@ MTP tensors, and currently admits TP1 only.
 import torch
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MoeMTP
+from vllm.model_executor.models.qwen3_next_mtp import Qwen3NextMTP
 from vllm.sequence import IntermediateTensors
 
 
-class Qwen3_5MoeMTPPrefill(Qwen3_5MoeMTP, SupportsPP):
+class QwenMTPPrefillMixin:
+    """Run the complete one-layer head on the target's last PP rank."""
+
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
@@ -49,3 +52,11 @@ class Qwen3_5MoeMTPPrefill(Qwen3_5MoeMTP, SupportsPP):
         )
         hidden_states, _ = model.norm(hidden_states, residual)
         return hidden_states
+
+
+class Qwen3_5MoeMTPPrefill(QwenMTPPrefillMixin, Qwen3_5MoeMTP, SupportsPP):
+    """Qwen3.5 MoE head with last-stage prefill execution."""
+
+
+class Qwen3NextMTPPrefill(QwenMTPPrefillMixin, Qwen3NextMTP, SupportsPP):
+    """Qwen3Next head with last-stage prefill execution."""

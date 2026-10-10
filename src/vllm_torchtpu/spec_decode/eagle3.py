@@ -207,6 +207,7 @@ class Eagle3Proposer:
         # (token ids, positions, attn ctx, aux hidden states) captured
         # during the target verify forward.
         self.draft_chunks: list[DraftChunkInputs] | None = None
+        self.capture_prefill_snapshots = False
         self.prefill_snapshots: list[dict[str, torch.Tensor]] = []
         # Per-propose-call cache of loop-step draft attention metadata, keyed
         # by id(chunk). Between loop iterations of one step everything in the
@@ -1053,18 +1054,18 @@ class Eagle3Proposer:
         device_seed: torch.Tensor,
         discard_sampled_tokens_req_indices: list[int] | None = None,
     ) -> None:
-        """Populate MTP KV for this prefill step, retaining CPU snapshots.
+        """Populate MTP KV; capture CPU snapshots only for explicit diagnostics.
 
         No draft logits or proposals are produced. Intermediate chunks use the
         next known prompt token; the boundary uses the supplied seed, which is
         the reserved prompt continuation for PD or a standalone sampled token.
         """
         from vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill import (
-            Qwen3_5MoeMTPPrefill,
+            QwenMTPPrefillMixin,
         )
 
-        if not isinstance(self.draft_model, Qwen3_5MoeMTPPrefill):
-            raise NotImplementedError("MTP prefill currently supports Qwen3.5 MoE.")
+        if not isinstance(self.draft_model, QwenMTPPrefillMixin):
+            raise NotImplementedError("MTP prefill supports Qwen3Next and Qwen3.5 MoE.")
         snapshots = []
         assert self.draft_chunks is not None
         for chunk in self.draft_chunks:
@@ -1088,6 +1089,8 @@ class Eagle3Proposer:
                 num_rejected_np=rejected,
                 num_tokens_padded=ids.shape[0],
             )
+            if not self.capture_prefill_snapshots:
+                continue
             rows = int(chunk.query_start_loc_np[-1])
             logical_indices = []
             local_indices = []
@@ -1111,7 +1114,10 @@ class Eagle3Proposer:
                 }
             )
         self.prefill_snapshots = snapshots
-        logger.info("MTP prefill completed on final stage: %d chunks", len(snapshots))
+        if self.capture_prefill_snapshots:
+            logger.info(
+                "MTP prefill captured on final stage: %d chunks", len(snapshots)
+            )
 
     def propose(
         self,
