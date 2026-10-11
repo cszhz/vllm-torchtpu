@@ -1107,16 +1107,16 @@ def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
 
 
 # The single-slot schedule at a batch whose experts each fit one tile, where
-# the slabs stream in WEIGHT_STREAM_CHUNK column chunks: 256 * 4 / 32 = 32
-# rows an expert, and two chunks per slab on each matmul.
-CHUNKED = dict(hidden=2048, inter=1024, e_total=32, topk=4, tokens=256)
+# the slabs stream in column chunks: 256 * 4 / 32 = 32 rows an expert, and
+# at least two chunks per slab on each matmul.
+CHUNKED = dict(hidden=3584, inter=1024, e_total=32, topk=4, tokens=256)
 
 
 def test_fp4_chunked_stream_agrees_with_the_prefetch_schedule(at_prefetch_depth):
     """Column-chunk refills compute what whole-slab prefetch computes, bit for
     bit: they move only where each DMA starts and is waited."""
-    assert (2 * CHUNKED["inter"]) // kernel.WEIGHT_STREAM_CHUNK == 2
-    assert CHUNKED["hidden"] // kernel.WEIGHT_STREAM_CHUNK == 2
+    assert (2 * CHUNKED["inter"]) % kernel.W1_STREAM_CHUNK == 0
+    assert CHUNKED["hidden"] // kernel.W2_STREAM_CHUNK == 2
     mesh = _mesh()
     weights, scales, decoded = _make_fp4_weights(
         mesh,
