@@ -17,17 +17,14 @@ def register_models() -> None:
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
-    from vllm_torchtpu import envs
-
-    if envs.TPU_MTP_PREFILL_ONLY:
-        ModelRegistry.register_model(
-            "Qwen3NextMTP",
-            "vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill:Qwen3NextMTPPrefill",
-        )
-        ModelRegistry.register_model(
-            "Qwen3_5MoeMTP",
-            "vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill:Qwen3_5MoeMTPPrefill",
-        )
+    ModelRegistry.register_model(
+        "Qwen3NextMTP",
+        "vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill:Qwen3NextMTPPrefill",
+    )
+    ModelRegistry.register_model(
+        "Qwen3_5MoeMTP",
+        "vllm_torchtpu.models.vllm.qwen3_5_mtp_prefill:Qwen3_5MoeMTPPrefill",
+    )
 
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration", _KIMI_K3_MODEL)

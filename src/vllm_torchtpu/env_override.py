@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
 
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 # envs.py imports nothing from this package, so it is safe to load here,
 # while the package's own __init__ is still running.
@@ -252,3 +256,21 @@ def _patch_jax_pallas_fori_lowering() -> None:
 from vllm_torchtpu import patch_registry  # noqa: E402
 
 patch_registry.apply("import")
+
+
+def configure_mtp_prefill_mode(vllm_config: "VllmConfig") -> None:
+    """Derive the PP producer mode before model loading and worker spawning.
+
+    The existing environment entry carries this decision into plugin registration
+    in spawned processes, where VllmConfig is not available yet.
+    """
+    spec = vllm_config.speculative_config
+    transfer = vllm_config.kv_transfer_config
+    if (
+        spec is not None
+        and spec.method == "mtp"
+        and vllm_config.parallel_config.pipeline_parallel_size > 1
+        and transfer is not None
+        and transfer.kv_role == "kv_producer"
+    ):
+        os.environ["TPU_MTP_PREFILL_ONLY"] = "1"

@@ -5899,7 +5899,9 @@ class TPUModelRunner(GPUModelRunner):
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
-            if self._is_async_drafter and not envs.TPU_MTP_PREFILL_ONLY:
+            if envs.TPU_MTP_PREFILL_ONLY:
+                self._warmup_pp_mtp_prefill()
+            elif self._is_async_drafter:
                 self._async_drafter.precompile()
                 if self._pcp_enabled and self._mtp_enabled:
                     logger.info(
@@ -5916,6 +5918,29 @@ class TPUModelRunner(GPUModelRunner):
                     # request would otherwise compile new graphs. Warm those
                     # through the real two-phase spec-decode path.
                     self._warmup_spec_decode()
+
+    def _warmup_pp_mtp_prefill(self) -> None:
+        """Warm the producer path collectively; only the last stage runs MTP."""
+        if not envs.SPEC_WARMUP:
+            return
+        pcp_size = self.parallel_config.prefill_context_parallel_size
+        with (
+            _suspend_kv_transfer_group(),
+            self._precompile_timed("PP MTP real prefill warmup"),
+        ):
+            for bucket in self.num_tokens_paddings:
+                tokens = min(bucket * pcp_size, self.max_model_len)
+                if not self._warmup_one_pcp_mtp_prefill(tokens):
+                    raise RuntimeError(
+                        f"PP MTP prefill warmup failed at bucket={bucket}; "
+                        "refusing to serve with incomplete warmup"
+                    )
+        synchronize_device()
+        logger.info(
+            "PP MTP prefill warmup complete: %d buckets, last_stage=%s",
+            len(self.num_tokens_paddings),
+            self._pp_is_last,
+        )
 
     def _warmup_pcp_mtp_prefill(self) -> None:
         """Warm the real PCP MTP K1 prefill proposal and nothing else.
@@ -5990,8 +6015,11 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output.num_scheduled_tokens = {rid: P}
             scheduler_output.total_num_scheduled_tokens = P
             self.execute_model(scheduler_output)
+            if self._pp_wave is not None:
+                self._pp_wave.settle()
             self.sample_tokens(None)
-            self.take_draft_token_ids()
+            if not envs.TPU_MTP_PREFILL_ONLY:
+                self.take_draft_token_ids()
         except Exception:
             attempt_succeeded = False
             if quiet:

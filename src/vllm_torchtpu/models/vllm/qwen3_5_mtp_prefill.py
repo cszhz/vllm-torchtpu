@@ -7,6 +7,7 @@ MTP tensors, and currently admits TP1 only.
 """
 
 import torch
+from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MoeMTP
 from vllm.model_executor.models.qwen3_next_mtp import Qwen3NextMTP
@@ -15,6 +16,16 @@ from vllm.sequence import IntermediateTensors
 
 class QwenMTPPrefillMixin:
     """Run the complete one-layer head on the target's last PP rank."""
+
+    _prefill_only = True
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        from vllm_torchtpu import envs
+
+        # The next MRO entry is the concrete upstream Qwen MTP, not object.
+        # pyrefly: ignore[unexpected-keyword]
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._prefill_only = envs.TPU_MTP_PREFILL_ONLY
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
@@ -30,6 +41,15 @@ class QwenMTPPrefillMixin:
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        if not self._prefill_only:
+            # pyrefly: ignore[missing-attribute]
+            return super().forward(
+                input_ids=input_ids,
+                positions=positions,
+                hidden_states=hidden_states,
+                inputs_embeds=inputs_embeds,
+                spec_step_idx=spec_step_idx,
+            )
         if intermediate_tensors is not None or spec_step_idx != 0:
             raise NotImplementedError("MTP prefill accepts one complete step-0 head.")
         model = self.model

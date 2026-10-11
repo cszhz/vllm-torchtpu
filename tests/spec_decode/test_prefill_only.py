@@ -524,7 +524,7 @@ def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(
     assert manager.get_computed_blocks(request("reset", ids))[1] == 0
 
 
-def test_next_mtp_registered_only_for_prefill(monkeypatch):
+def test_next_mtp_registered_before_config_resolution(monkeypatch):
     from vllm.model_executor.models import ModelRegistry
 
     from vllm_torchtpu.models.vllm import register_models
@@ -537,7 +537,7 @@ def test_next_mtp_registered_only_for_prefill(monkeypatch):
     registered.clear()
     monkeypatch.setenv("TPU_MTP_PREFILL_ONLY", "0")
     register_models()
-    assert "Qwen3NextMTP" not in registered
+    assert registered["Qwen3NextMTP"].endswith(":Qwen3NextMTPPrefill")
 
 
 @pytest.mark.parametrize("block_size, first_bucket", [(384, 1024), (9216, 512)])
@@ -600,3 +600,102 @@ def test_multi_connector_handoff_uses_raiden_child():
     assert sampled.tolist() == [123]
     with pytest.raises(ValueError, match="exactly one Raiden"):
         handoff_seed_tokens(sampled, ["request"], MultiKVConnectorMetadata((object(),)))
+
+
+@pytest.mark.parametrize(
+    "pp,role,method,enabled",
+    [
+        (4, "kv_producer", "mtp", True),
+        (4, "kv_consumer", "mtp", False),
+        (1, "kv_producer", "mtp", False),
+        (4, "kv_producer", "eagle3", False),
+    ],
+)
+def test_pp_producer_mtp_auto_enabled(monkeypatch, pp, role, method, enabled):
+    from vllm_torchtpu import env_override, envs
+
+    monkeypatch.delenv("TPU_MTP_PREFILL_ONLY", raising=False)
+    c = config()
+    c.parallel_config.pipeline_parallel_size = pp
+    c.speculative_config.method = method
+    c.kv_transfer_config = SimpleNamespace(kv_role=role)
+    env_override.configure_mtp_prefill_mode(c)
+    assert envs.TPU_MTP_PREFILL_ONLY is enabled
+
+
+@pytest.mark.parametrize("last", [False, True])
+def test_pp_mtp_warmup_all_stages_cover_pcp_buckets(monkeypatch, last):
+    from contextlib import nullcontext
+
+    from vllm_torchtpu.runner import tpu_runner
+
+    monkeypatch.setenv("SPEC_WARMUP", "1")
+    monkeypatch.setattr(tpu_runner, "_suspend_kv_transfer_group", nullcontext)
+    monkeypatch.setattr(tpu_runner, "synchronize_device", lambda: None)
+    seen = []
+    runner = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=8),
+        num_tokens_paddings=[512, 1024, 1536, 4096],
+        max_model_len=65536,
+        _pp_is_last=last,
+        _precompile_timed=lambda _: nullcontext(),
+        _warmup_one_pcp_mtp_prefill=lambda n: seen.append(n) or True,
+    )
+    tpu_runner.TPUModelRunner._warmup_pp_mtp_prefill(runner)
+    assert seen == [4096, 8192, 12288, 32768]
+
+    runner._warmup_one_pcp_mtp_prefill = lambda n: False
+    with pytest.raises(RuntimeError, match="refusing to serve"):
+        tpu_runner.TPUModelRunner._warmup_pp_mtp_prefill(runner)
+
+
+def test_non_prefill_mtp_delegates_upstream_forward(monkeypatch):
+    from vllm.model_executor.models.qwen3_next_mtp import Qwen3NextMTP
+
+    head = make_head(Qwen3NextMTPPrefill)
+    head._prefill_only = False
+    seen = []
+
+    def forward(self, **kwargs):
+        seen.append(kwargs)
+        return kwargs["hidden_states"]
+
+    monkeypatch.setattr(Qwen3NextMTP, "forward", forward)
+    hidden = torch.zeros(2, 3)
+    result = head.forward(
+        torch.tensor([1, 2]), torch.tensor([0, 1]), hidden, spec_step_idx=2
+    )
+    assert result is hidden
+    assert seen[0]["spec_step_idx"] == 2
+
+
+def test_pp_prefill_warmup_drains_handoff_before_sampling(monkeypatch):
+    from vllm_torchtpu.runner import tpu_runner
+
+    monkeypatch.setenv("TPU_MTP_PREFILL_ONLY", "1")
+    seen = []
+    runner = SimpleNamespace(
+        max_model_len=65536,
+        kv_cache_config=SimpleNamespace(
+            num_blocks=128,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=384))
+            ],
+        ),
+        _pp_wave=SimpleNamespace(settle=lambda: seen.append("settle")),
+        execute_model=lambda so: seen.append(
+            ("execute", so.total_num_scheduled_tokens)
+        ),
+        sample_tokens=lambda _: seen.append("sample"),
+        _warmup_spec_decode_cleanup=lambda rid: seen.append("cleanup") or True,
+    )
+    assert tpu_runner.TPUModelRunner._warmup_one_pcp_mtp_prefill(runner, 4096)
+    assert seen == [("execute", 4096), "settle", "sample", "cleanup"]
+
+    def fail(_):
+        raise RuntimeError("test sampling failure")
+
+    runner.sample_tokens = fail
+    seen.clear()
+    assert not tpu_runner.TPUModelRunner._warmup_one_pcp_mtp_prefill(runner, 4096)
+    assert seen[-1] == "cleanup"

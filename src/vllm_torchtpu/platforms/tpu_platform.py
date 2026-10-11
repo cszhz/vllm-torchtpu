@@ -604,6 +604,9 @@ class TpuPlatform(Platform):
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
+        from vllm_torchtpu.env_override import configure_mtp_prefill_mode
+
+        configure_mtp_prefill_mode(vllm_config)
         _validate_phased_profiling_config(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
