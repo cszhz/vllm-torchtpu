@@ -1104,3 +1104,50 @@ def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
             deepest,
             err_msg=f"depth {depth} disagrees with the deepest schedule",
         )
+
+
+# The single-slot schedule at a batch whose experts each fit one tile, where
+# the slabs stream in WEIGHT_STREAM_CHUNK column chunks: 256 * 4 / 32 = 32
+# rows an expert, and two chunks per slab on each matmul.
+CHUNKED = dict(hidden=2048, inter=1024, e_total=32, topk=4, tokens=256)
+
+
+def test_fp4_chunked_stream_agrees_with_the_prefetch_schedule(at_prefetch_depth):
+    """Column-chunk refills compute what whole-slab prefetch computes, bit for
+    bit: they move only where each DMA starts and is waited."""
+    assert (2 * CHUNKED["inter"]) // kernel.WEIGHT_STREAM_CHUNK == 2
+    assert CHUNKED["hidden"] // kernel.WEIGHT_STREAM_CHUNK == 2
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        46,
+        hidden=CHUNKED["hidden"],
+        inter=CHUNKED["inter"],
+        e_total=CHUNKED["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        47,
+        tokens=CHUNKED["tokens"],
+        hidden=CHUNKED["hidden"],
+        e_total=CHUNKED["e_total"],
+    )
+    common = dict(
+        topk=CHUNKED["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+        sharded_plan=True,
+    )
+    outs = {}
+    for depth in (2, 0):
+        at_prefetch_depth(depth)
+        outs[depth] = np.asarray(
+            fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+        )
+    ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=CHUNKED["topk"])
+    assert _relative_l2(outs[0], ref) < FP8_RELATIVE_BOUND
+    np.testing.assert_array_equal(outs[0], outs[2])
