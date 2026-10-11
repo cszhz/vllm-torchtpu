@@ -59,6 +59,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.utils import fresh_buffer
 
 logger = init_logger(__name__)
 
@@ -772,8 +773,7 @@ class VllmDeepseekV4MLAAttention(
             f"{list(transposed[::-1])}, got {list(weight.shape)}."
         )
 
-        out = torch.empty(transposed, dtype=weight.dtype, device=weight.device)
-        out.copy_(weight.data.t())
+        out = fresh_buffer(weight.data.t())
         self.wo_a.weight = torch.nn.Parameter(out, requires_grad=False)
 
     def _assert_o_proj_supported(self) -> None:
