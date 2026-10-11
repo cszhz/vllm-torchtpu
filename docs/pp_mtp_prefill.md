@@ -63,6 +63,9 @@ python examples/pp_mtp_prefill.py \
   --output-dir /path/to/snapshots/pp2
 ```
 
+Serving does not copy hidden states to CPU or retain diagnostic snapshots.
+The offline script explicitly enables snapshot capture on its own drafter.
+
 The script clears its own allocated cache before non-prefix-cached requests, saves
 CPU snapshots on the workers' hosts, and asserts earlier stages have no
 drafter. It records each final-stage PCP worker's shifted input IDs, positions,
@@ -244,6 +247,51 @@ producer payload. Cold and warm PD outputs matched in all eight tokens and
 returned logprobs. The decoder kept local prefix caching disabled for this
 test so every PD request exercised remote transfer.
 
-The full 92-layer NVFP4 checkpoint, eight-host simultaneous deployment,
-production concurrency, and transfer performance remain unvalidated.
+At the time of the experiments above, the full 92-layer NVFP4 checkpoint,
+eight-host simultaneous deployment, production concurrency, and transfer
+performance remained unvalidated.
 Historical standalone diagnostic results above do not establish PD accuracy.
+
+The prefill-only model registration supports both `Qwen3NextMTP` and
+`Qwen3_5MoeMTP`. Both execute a complete one-layer head on the last target PP
+stage; the normal Decode registrations remain unchanged. This matters for
+Qwen checkpoints whose `model_type` is `qwen3_next`, even when the deployment
+uses a Qwen3.5/3.8 service name.
+
+Serving with the pipelined batch queue skips the synchronous draft-token RPC
+on a prefill-only producer: it never proposes tokens, and waiting for this RPC
+before draining the batch future prevents pending PP handoffs from advancing.
+When dynamic chunks add smaller token buckets after KV layout initialization,
+the copied draft compilation config must receive the same bucket list as the
+target. Otherwise the first short MTP prefill can select an uncompiled shape.
+
+## Eight-host full-checkpoint serving validation (2026-10-10)
+
+A real 92-layer Qwen3Next-architecture checkpoint ran with PP4PCP8/TP1
+(24/24/24/20 target layers) producing for TP32DCP8, MTP K=1 on both sides.
+P used adaptive fused EP; D used GMM with
+`--xla_enable_hlo_sharding_v3=false`. Prefix caching and V6D were disabled.
+
+Four semantic smoke requests, including 6685-token retrieval, passed with
+finite returned logprobs and all 32 D workers completing KV transfer. The
+full GSM8K test (1319 questions, zero-shot, temperature0, max output2048,
+concurrency16) scored 1269/1319 (96.21%) using strict `####` numeric
+extraction. Supplemental scoring of the same outputs allowing a dollar
+symbol before the number gave1285/1319 (97.42%). There were no request
+errors and one truncated response. MTP accepted93096/105575 draft tokens
+(88.18%); this is not a measured speedup against an MTP-disabled baseline.
+KV cache usage and running/waiting requests returned to zero after the run.
+These results cover ordinary PD serving, not V6D or prefix-hit lifecycle.
+
+## PP + MTP + V6D dependency snapshot (2026-10-11)
+
+The eight-host PP4PCP8 -> TP32DCP8 V6D validation used TorchTPU
+`0.1.1.dev20260928182719` and TPU Sync `0.0.1.dev20261010063503`
+(source `52b0e2fc39a4d87cdcaa4b826f9de30b67f1c6e5`, Torch 2.13 ABI).
+KVS source was `9886b49cfb86bf5c1f4d2e3024088111b210d4a5`.
+P uses a Raiden producer plus V6D `kv_both` child in TPUMultiConnector,
+with prefix caching enabled, P MTP K=1 and D MTP K=3.
+Full GSM8K strict extraction scored 1274/1319 (96.5883%) with no request
+errors. Eight long-prefix math requests also matched their cold token
+sequences after restarting P while retaining the V6D daemons.
+These results do not validate a rebuilt image or external cold-tier storage.

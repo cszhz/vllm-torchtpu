@@ -563,7 +563,7 @@ def test_dynamic_pp_buckets_reach_copied_mtp_compilation_config(
         _pp_chunk_granularity=None,
         _has_mamba_state=True,
         _pcp_enabled=True,
-        cache_config=SimpleNamespace(block_size=block_size, mamba_cache_mode='align'),
+        cache_config=SimpleNamespace(block_size=block_size, mamba_cache_mode="align"),
         max_num_tokens=4096,
         num_tokens_paddings=[4096],
         drafter=drafter,
@@ -576,3 +576,27 @@ def test_dynamic_pp_buckets_reach_copied_mtp_compilation_config(
     assert drafter.draft_vllm_config.compilation_config.compile_sizes is not (
         runner.vllm_config.compilation_config.compile_sizes
     )
+
+
+def test_multi_connector_handoff_uses_raiden_child():
+    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+        MultiKVConnectorMetadata,
+    )
+
+    from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
+        SendMeta,
+        TPUConnectorMetadata,
+    )
+    from vllm_torchtpu.spec_decode.prefill_only import handoff_seed_tokens
+
+    raiden = TPUConnectorMetadata(
+        reqs_to_send={
+            "request": SendMeta(1, [9], 30.0, next_prompt_token_id=42),
+        }
+    )
+    metadata = MultiKVConnectorMetadata((raiden, object()))
+    sampled = torch.tensor([123])
+    assert handoff_seed_tokens(sampled, ["request"], metadata).tolist() == [42]
+    assert sampled.tolist() == [123]
+    with pytest.raises(ValueError, match="exactly one Raiden"):
+        handoff_seed_tokens(sampled, ["request"], MultiKVConnectorMetadata((object(),)))

@@ -24,9 +24,11 @@ def validate_prefill_only_config(config: "VllmConfig") -> None:
     transfer = config.kv_transfer_config
     if transfer is not None:
         from vllm_torchtpu import envs
+        from vllm_torchtpu.platforms.pp_validation import is_supported_pp_transfer
 
         if (
-            transfer.kv_connector != "TPURaidenConnector"
+            not is_supported_pp_transfer(transfer)
+            or transfer.kv_connector == "TPUV6dObjectConnector"
             or transfer.kv_role != "kv_producer"
             or envs.TPU_KV_RESHARD_TRANSPORT != "raiden"
             or not envs.TPU_RAIDEN_QWEN35_ADMISSION
@@ -64,6 +66,17 @@ def handoff_seed_tokens(
 
     if metadata is None:
         return device_seed
+    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+        MultiKVConnectorMetadata,
+    )
+
+    if isinstance(metadata, MultiKVConnectorMetadata):
+        raiden_metadata = [
+            item for item in metadata.metadata if isinstance(item, TPUConnectorMetadata)
+        ]
+        if len(raiden_metadata) != 1:
+            raise ValueError("MTP handoff requires exactly one Raiden metadata child")
+        metadata = raiden_metadata[0]
     assert isinstance(metadata, TPUConnectorMetadata)
     indices, tokens = [], []
     for index, req_id in enumerate(req_ids):

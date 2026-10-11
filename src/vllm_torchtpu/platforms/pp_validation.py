@@ -15,7 +15,30 @@ def _legacy_ray_executor() -> bool:
     )
 
 
+_PP_KV_CONNECTORS = {"TPURaidenConnector", "TPUV6dObjectConnector"}
+
 _FULL_ATTENTION_LAYER_TYPES = ["full_attention", "deepseek_sparse_attention"]
+
+
+def is_supported_pp_transfer(transfer: Any) -> bool:
+    """Admit stage-aware Raiden alone or its explicit V6D composition."""
+    if transfer.kv_connector in _PP_KV_CONNECTORS:
+        return True
+    if transfer.kv_connector != "TPUMultiConnector":
+        return False
+    children = getattr(transfer, "kv_connector_extra_config", {}).get("connectors", [])
+    if len(children) != 2:
+        return False
+    by_name = {child.get("kv_connector"): child for child in children}
+    if set(by_name) != {"TPURaidenConnector", "TPUV6dObjectConnector"}:
+        return False
+    return (
+        by_name["TPURaidenConnector"].get("kv_role", transfer.kv_role)
+        == transfer.kv_role
+        and by_name["TPUV6dObjectConnector"].get("kv_role") == "kv_both"
+        and by_name["TPUV6dObjectConnector"].get("kv_connector_module_path")
+        == "kvs_connector.v6d_object_connector"
+    )
 
 
 def _stage_without_full_attention(vllm_config: Any) -> str | None:
@@ -67,7 +90,7 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     elif (
         parallel_config.prefill_context_parallel_size > 1
         and vllm_config.kv_transfer_config is not None
-        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
+        and not is_supported_pp_transfer(vllm_config.kv_transfer_config)
     ):
         # These connectors pair a stage with its peer through one pool per
         # device; a context-parallel stage spreads a request over several.
@@ -81,15 +104,16 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         remedy = " Pass --no-async-scheduling."
     elif vllm_config.speculative_config is not None and not envs.TPU_MTP_PREFILL_ONLY:
         unsupported = "speculative decoding"
-    elif (
-        vllm_config.kv_transfer_config is not None
-        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
+    elif vllm_config.kv_transfer_config is not None and not is_supported_pp_transfer(
+        vllm_config.kv_transfer_config
     ):
         # The raiden connector transfers each stage's own layers; the
         # other connectors assume every worker holds every layer.
         unsupported = "KV transfer connectors other than TPURaidenConnector"
-    elif vllm_config.kv_transfer_config is not None and (
-        stage := _stage_without_full_attention(vllm_config)
+    elif (
+        vllm_config.kv_transfer_config is not None
+        and (vllm_config.kv_transfer_config.kv_connector != "TPUV6dObjectConnector")
+        and (stage := _stage_without_full_attention(vllm_config))
     ):
         # The raiden connector pairs a stage with its peer through the
         # measured layout of a full-attention KV pool, so a stage made of

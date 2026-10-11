@@ -154,3 +154,38 @@ def test_prefill_only_opt_in_keeps_decode_gate_closed(monkeypatch):
     c.speculative_config.num_speculative_tokens = 2
     with pytest.raises(ValueError, match="K=1"):
         validate_pipeline_parallel_config(c)
+
+
+@pytest.mark.parametrize("pcp", [1, 8])
+def test_accepts_v6d_with_pipeline_parallel(pcp):
+    transfer = SimpleNamespace(kv_connector="TPUV6dObjectConnector")
+    validate_pipeline_parallel_config(_config(pp=4, pcp=pcp, kv_transfer=transfer))
+
+
+def test_v6d_does_not_require_attention_in_every_stage():
+    transfer = SimpleNamespace(kv_connector="TPUV6dObjectConnector")
+    validate_pipeline_parallel_config(
+        _config(pp=8, kv_transfer=transfer, layer_types=HYBRID_24)
+    )
+
+
+@pytest.mark.parametrize("pcp", [1, 8])
+def test_accepts_explicit_raiden_v6d_pipeline_composition(pcp):
+    transfer = SimpleNamespace(
+        kv_connector="TPUMultiConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "TPURaidenConnector", "kv_role": "kv_producer"},
+                {
+                    "kv_connector": "TPUV6dObjectConnector",
+                    "kv_role": "kv_both",
+                    "kv_connector_module_path": "kvs_connector.v6d_object_connector",
+                },
+            ]
+        },
+    )
+    validate_pipeline_parallel_config(_config(pp=4, pcp=pcp, kv_transfer=transfer))
+    transfer.kv_connector_extra_config["connectors"][0]["kv_role"] = "kv_consumer"
+    with pytest.raises(NotImplementedError):
+        validate_pipeline_parallel_config(_config(pp=4, pcp=pcp, kv_transfer=transfer))

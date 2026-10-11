@@ -1,6 +1,17 @@
 """TPU Multi Connector wrapper for combining disagg and offloading."""
 
+from dataclasses import dataclass
+
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+
+
+@dataclass
+class TPUMultiHandshakeMetadata(KVConnectorHandshakeMetadata):
+    metadata: tuple[KVConnectorHandshakeMetadata | None, ...]
+    transfer_rank: int | None = None
 
 
 class TPUMultiConnector(MultiConnector):
@@ -14,6 +25,40 @@ class TPUMultiConnector(MultiConnector):
     the connector is instantiated, so children injected at init time would
     be invisible to them.
     """
+
+    def get_handshake_metadata(self) -> TPUMultiHandshakeMetadata | None:
+        children = tuple(c.get_handshake_metadata() for c in self._connectors)
+        if all(item is None for item in children):
+            return None
+        ranks = {
+            int(item.transfer_rank)
+            for item in children
+            if getattr(item, "transfer_rank", None) is not None
+        }
+        if len(ranks) > 1:
+            raise ValueError("Child connectors disagree on the worker transfer rank")
+        return TPUMultiHandshakeMetadata(children, next(iter(ranks), None))
+
+    def _dispatch_handshake(self, metadata: dict, method: str) -> None:
+        for item in metadata.values():
+            if not isinstance(item, TPUMultiHandshakeMetadata):
+                raise TypeError("Expected TPU multi-connector handshake metadata")
+            if len(item.metadata) != len(self._connectors):
+                raise ValueError("Multi-connector handshake child count mismatch")
+        for index, connector in enumerate(self._connectors):
+            child_metadata = {
+                rank: item.metadata[index]
+                for rank, item in metadata.items()
+                if item.metadata[index] is not None
+            }
+            if child_metadata:
+                getattr(connector, method)(child_metadata)
+
+    def set_xfer_handshake_metadata(self, metadata: dict) -> None:
+        self._dispatch_handshake(metadata, "set_xfer_handshake_metadata")
+
+    def set_xfer_handshake_metadata_pp_aware(self, metadata: dict) -> None:
+        self._dispatch_handshake(metadata, "set_xfer_handshake_metadata_pp_aware")
 
     def register_runner(self, runner) -> None:
         # torchtpu extension unknown to upstream MultiConnector: forward it to

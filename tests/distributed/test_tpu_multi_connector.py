@@ -145,3 +145,36 @@ def test_conflicting_group_indices_across_children_raise():
 
     with pytest.raises(RuntimeError, match="Conflicting"):
         connector.get_block_ids_with_load_errors_group_index()
+
+
+def test_pp_handshake_routes_only_to_its_own_child():
+    from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import (
+        TPUMultiHandshakeMetadata,
+    )
+
+    connector = object.__new__(TPUMultiConnector)
+    raiden, v6d = MagicMock(), MagicMock()
+    raiden.get_handshake_metadata.return_value = None
+    v6d.get_handshake_metadata.return_value = SimpleNamespace(transfer_rank=24)
+    connector._connectors = [raiden, v6d]
+    wrapped = connector.get_handshake_metadata()
+    assert isinstance(wrapped, TPUMultiHandshakeMetadata)
+    assert wrapped.transfer_rank == 24
+    connector.set_xfer_handshake_metadata_pp_aware({(3, 24): wrapped})
+    raiden.set_xfer_handshake_metadata_pp_aware.assert_not_called()
+    v6d.set_xfer_handshake_metadata_pp_aware.assert_called_once_with(
+        {(3, 24): wrapped.metadata[1]}
+    )
+
+
+def test_multi_handshake_rejects_incompatible_child_count():
+    from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import (
+        TPUMultiHandshakeMetadata,
+    )
+
+    connector = object.__new__(TPUMultiConnector)
+    connector._connectors = [MagicMock(), MagicMock()]
+    with pytest.raises(ValueError, match="child count"):
+        connector.set_xfer_handshake_metadata_pp_aware(
+            {(0, 0): TPUMultiHandshakeMetadata((None,), 0)}
+        )
