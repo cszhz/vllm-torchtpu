@@ -127,6 +127,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.hidden_nan_kv_dump import HiddenNanKVDumper
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
@@ -966,6 +967,21 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._hidden_nan_kv_dumper = None
+        if envs.TPU_HIDDEN_NAN_KV_DUMP:
+            from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
+
+            if (
+                self.parallel_config.pipeline_parallel_size != 1
+                or envs.VLLM_TPU_BLOCK_MAJOR_KV
+                or not set(self.model_config.hf_config.architectures)
+                & QWEN_GDN_ARCHITECTURES
+            ):
+                raise NotImplementedError(
+                    "TPU_HIDDEN_NAN_KV_DUMP supports Qwen GDN with PP=1 "
+                    "and layer-major KV pools"
+                )
+            self._hidden_nan_kv_dumper = HiddenNanKVDumper()
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -3787,6 +3803,19 @@ class TPUModelRunner(GPUModelRunner):
                     intermediate_tensors=intermediate_tensors,
                 )
 
+            if self._hidden_nan_kv_dumper is not None:
+                assert isinstance(hidden_states, torch.Tensor)
+                plan = self._last_sequence_layout_plan
+                assert plan is not None, "Real forward must have a sequence layout"
+                self._hidden_nan_kv_dumper.capture(
+                    self,
+                    hidden_states,
+                    tuple(self.input_batch.req_ids[start_index:end_index]),
+                    self.query_start_loc_np[: num_reqs + 1],
+                    plan,
+                    attn_metadata,
+                )
+
             if nan_check is not None:
                 assert isinstance(hidden_states, torch.Tensor), (
                     "KV store NaN checking requires final hidden states"
@@ -5904,7 +5933,12 @@ class TPUModelRunner(GPUModelRunner):
             self._pp_wave.warmup()
         if self.enforce_eager:
             return
-        with self.maybe_setup_dummy_loras(self.lora_config):
+        with (
+            self.maybe_setup_dummy_loras(self.lora_config),
+            self._hidden_nan_kv_dumper.pause()
+            if self._hidden_nan_kv_dumper is not None
+            else contextlib.nullcontext(),
+        ):
             with self._precompile_timed("model backbone"):
                 self._precompile_backbone()
 

@@ -373,6 +373,7 @@ class TpuPlatform(Platform):
         "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND",
         "TPU_MTP_ZERO_ACCEPTANCE_LOG",
+        "TPU_HIDDEN_NAN_KV_DUMP",
         "VLLM_MLA_DISABLE",
         "TPU_BACKEND_TYPE",
         "MIXED_Q_SPLIT",
