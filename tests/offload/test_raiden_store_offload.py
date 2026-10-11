@@ -887,6 +887,20 @@ class TestLoadJobLifecycle(unittest.TestCase):
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.failed_device_block_ids, [10])
 
+    def test_request_is_not_offered_a_load_it_could_not_pin_again(self):
+        # Key 0 is resident, key 5 is gone: the lookup the scheduler made did
+        # not cover key 5 (it checked key 0 only), so prepare_load fails.
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r1")), LookupResult.HIT)
+        spec = self.manager.prepare_load([_key(0), _key(5)], _ctx("r1"))
+        self.assertFalse(spec.pinned)
+        # Rescheduled, r1 now recomputes rather than retrying the same load...
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r1")), LookupResult.MISS)
+        # ...while other requests still hit the resident key.
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r2")), LookupResult.HIT)
+        self.manager.on_request_finished(_ctx("r1"))
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r1")), LookupResult.HIT)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
 
 class TestTouchAndMisc(unittest.TestCase):
     def setUp(self):
