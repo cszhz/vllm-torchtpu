@@ -19,13 +19,15 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 pytestmark = pytest.mark.cpu_test
 
 
-def test_flag_defaults_off_propagates_and_does_not_change_compile_key(monkeypatch):
+def test_flag_defaults_on_propagates_and_does_not_change_compile_key(monkeypatch):
     from vllm_torchtpu import envs
     from vllm_torchtpu.compilation.tpu_compiler import _TPU_COMPILE_ENV_IGNORED
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
     flag = "TPU_HIDDEN_NAN_KV_DUMP"
     monkeypatch.delenv(flag, raising=False)
+    assert envs.environment_variables[flag]()
+    monkeypatch.setenv(flag, "0")
     assert not envs.environment_variables[flag]()
     monkeypatch.setenv(flag, "1")
     assert envs.environment_variables[flag]()
