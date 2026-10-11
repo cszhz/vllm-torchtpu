@@ -425,6 +425,16 @@ class RaidenOffloadingManager(OffloadingManager):
         # probes the directory itself.
         self._inflight_store_keys: set[OffloadKey] = set()
 
+        # Per request: the keys of a load that prepare_load could not pin.
+        # Later lookups for that request answer MISS for them, so the request
+        # recomputes those blocks instead of being offered the same load
+        # again. The scheduler's lookup need not cover every key it loads (a
+        # sliding-window group can load one chunk beyond the window it
+        # checked), and a request offered an unloadable hit retries forever:
+        # one in j-ee9a6ca2-0e32-4583-a32c failed the same load 5205 times
+        # over 17 minutes.
+        self._unloadable: dict[str, set[OffloadKey]] = {}
+
         # Peer and storage-tier location slices cached from lookups and
         # consumed during `prepare_load`.
         self._remote_slices: dict[bytes, object] = {}
@@ -563,7 +573,12 @@ class RaidenOffloadingManager(OffloadingManager):
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
 
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        self._unloadable.pop(req_context.req_id, None)
+
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if key in self._unloadable.get(req_context.req_id, ()):
+            return LookupResult.MISS
         if key in self._inflight_store_keys:
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
@@ -712,13 +727,16 @@ class RaidenOffloadingManager(OffloadingManager):
                 # cleanly and the blocks recompute.
                 if local_hashes:
                     self._store.release(local_hashes)
+                self._unloadable.setdefault(req_context.req_id, set()).update(keys)
                 logger.warning(
                     "TPURaidenOffloadingConnector: prepare_load lost sub-block "
                     "%d of %d for request %s to eviction; the load job will fail "
-                    "cleanly and the blocks recompute",
+                    "cleanly, the blocks recompute, and this request is not "
+                    "offered these %d keys again",
                     idx + 1,
                     len(sub_hashes),
                     req_context.req_id,
+                    len(keys),
                 )
                 return RaidenLoadStoreSpec(keys, pinned=False)
             idx = resolved_to
