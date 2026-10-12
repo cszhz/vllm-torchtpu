@@ -897,3 +897,57 @@ def test_rejection_sampler_ignores_padded_segment_sentinel(device):
 
     expected = torch.tensor([[1, 9], [8, -1]], dtype=torch.int32, device=device)
     assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize("synthetic", [False, True])
+def test_preselected_greedy_targets_match_logits(device, synthetic):
+    sampler = RejectionSampler()
+    if synthetic:
+        sampler.synthetic_conditional_rates = torch.tensor(
+            [0.8, 0.7, 0.6], device=device
+        )
+        sampler.synthetic_mode = True
+    logits = torch.tensor(
+        [
+            [0.0, 2.0, 1.0, 0.0],
+            [3.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 4.0, 0.0],
+            [0.0, 0.0, 0.0, 5.0],
+            [0.0, 6.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+        device=device,
+    )
+    args = dict(
+        draft_token_ids=torch.tensor([1, 2, 2, 3, 1, 0], device=device),
+        num_draft_tokens=torch.tensor([3, 2], device=device),
+        target_logits=logits,
+        bonus_token_ids=torch.tensor([2, 3], device=device),
+        segment_ids=torch.tensor([0, 0, 0, 1, 1, 1], device=device),
+        group_indices=torch.tensor([0, 1, 2, 0, 1, 2], device=device),
+        max_draft_tokens=3,
+        accept_u=torch.tensor([0.1, 0.9, 0.2, 0.3, 0.4, 0.5], device=device),
+    )
+    expected = sampler(**args)
+    # Poison logits so the test detects recomputing argmax instead of using IDs.
+    actual = sampler(
+        **{**args, "target_logits": torch.zeros_like(logits)},
+        target_token_ids=logits.argmax(-1),
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_preselected_targets_reject_random_sampling(device):
+    ids = torch.zeros(1, dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="require greedy sampling"):
+        RejectionSampler()(
+            ids,
+            ids,
+            ids.float().view(1, 1),
+            ids,
+            ids,
+            ids,
+            1,
+            do_sampling=True,
+            target_token_ids=ids,
+        )

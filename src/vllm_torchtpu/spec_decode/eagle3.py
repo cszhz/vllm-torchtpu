@@ -192,6 +192,7 @@ class Eagle3Proposer:
             draft_tp,
         )
         self.draft_model = None
+        self._use_vocab_parallel_argmax = False
         self.draft_vllm_config: VllmConfig
         # Attention-layer names belonging to the draft model. Populated in
         # load_model by diffing the global attention-layer registry before
@@ -276,6 +277,26 @@ class Eagle3Proposer:
             self._draft_tp_matches_target,
             materialize_if_mismatched=False,
         )
+        from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
+        from vllm.model_executor.models.qwen3_next_mtp import Qwen3NextMTP
+
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.runner.utils import relayout_rope_caches
+
+        # These models expose an untransformed shared LM head. Other draft
+        # architectures may normalize/project hidden states in compute_logits.
+        self._use_vocab_parallel_argmax = (
+            isinstance(self.draft_model, (Qwen3NextMTP, Qwen3_5MTP))
+            and self.draft_model.lm_head.org_vocab_size <= 2**24
+            and not self.draft_model.logits_processor.logits_as_input
+            and self.draft_model.lm_head.num_embeddings
+            == self.draft_model.lm_head.org_vocab_size
+        )
+        if envs.TPU_ROPE_CACHE_TRUNCATE:
+            self.runner._truncate_rope_caches(self.draft_model)
+        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
+            relayout_rope_caches(self.draft_model)
+
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
             # checkout shouldn't break unrelated TPU runs at import time.
@@ -969,6 +990,19 @@ class Eagle3Proposer:
         # the K-step propose loop -> a fresh fused program per context. Enclosing
         # them makes a fixed, bucketed program per [n, hidden] shape.
         assert self.draft_model is not None
+        if self._use_vocab_parallel_argmax:
+            from vllm_torchtpu.layers.adapter.sample.vocab_parallel import (
+                vocab_parallel_argmax,
+            )
+
+            head = self.draft_model.lm_head
+            logits = self.draft_model.logits_processor(head, hidden, skip_gather=True)
+            return vocab_parallel_argmax(
+                logits,
+                head.org_vocab_start_index,
+                head.org_vocab_end_index,
+                head.tp_size,
+            ).to(torch.int32)
         d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
         if d2t is None:
             # No draft->target mapping table. Upstream compute_logits then asserts

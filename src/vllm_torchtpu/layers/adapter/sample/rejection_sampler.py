@@ -66,6 +66,7 @@ class RejectionSampler:
         accept_u: torch.Tensor | None = None,
         recover_u: torch.Tensor | None = None,
         do_sampling: bool = False,
+        target_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -81,6 +82,7 @@ class RejectionSampler:
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=do_sampling,
+            target_token_ids=target_token_ids,
         )
 
     def forward(
@@ -98,6 +100,7 @@ class RejectionSampler:
         accept_u: torch.Tensor | None = None,
         recover_u: torch.Tensor | None = None,
         do_sampling: bool = False,
+        target_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -117,6 +120,8 @@ class RejectionSampler:
           top_p: Per-draft-token top-p values, padded to target_logits.
           accept_u: Uniform random values for draft accept/reject decisions.
           recover_u: Uniform random values used to sample recovered tokens.
+          target_token_ids: Optional preselected greedy target IDs; avoids
+            gathering full target-logit rows before verification.
           do_sampling: Whether to use probabilistic rejection sampling. False
             keeps the existing greedy rejection path.
 
@@ -125,6 +130,8 @@ class RejectionSampler:
           accepted tokens and bonus tokens, padded with PLACEHOLDER_TOKEN_ID.
         """
         if do_sampling:
+            if target_token_ids is not None:
+                raise ValueError("Preselected target tokens require greedy sampling.")
             if (
                 temperatures is None
                 or top_k is None
@@ -165,6 +172,7 @@ class RejectionSampler:
             accept_u,
             self.synthetic_conditional_rates,
             self.synthetic_mode,
+            target_token_ids,
         )
 
 
@@ -209,6 +217,7 @@ def _greedy_rejection_sample_with_segment(
     accept_u: torch.Tensor | None,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
+    target_token_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
@@ -216,7 +225,11 @@ def _greedy_rejection_sample_with_segment(
     device = draft_token_ids.device
 
     # Get target argmax
-    target_logits_argmax = torch.argmax(target_logits, dim=-1).to(torch.int32)
+    target_logits_argmax = (
+        torch.argmax(target_logits, dim=-1).to(torch.int32)
+        if target_token_ids is None
+        else target_token_ids.to(torch.int32)
+    )
     draft_token_ids = draft_token_ids.to(torch.int32)
 
     # Find the first mismatch index per segment using matrix masking.

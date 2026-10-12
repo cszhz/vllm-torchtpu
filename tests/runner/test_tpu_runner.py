@@ -2581,3 +2581,76 @@ class TestAsyncSpecDecodeTokenAccounting:
             num_draft_per_req={1: 3},
         )
         assert runner.input_batch.num_tokens_no_spec[1] == 15
+
+
+def test_spec_tokens_reduce_before_selecting_rows():
+    logits = torch.randn(12, 257)
+    bonus = torch.tensor([3, 7, 11])
+    target = torch.tensor([0, 1, 2, 4, 5, 6, 8, 9, 10])
+    fn = TPUModelRunner.spec_bonus_and_target_tokens._torchdynamo_orig_callable
+    bonus_ids, target_ids = fn(None, logits, bonus, target)
+    torch.testing.assert_close(bonus_ids, logits[bonus].argmax(-1))
+    torch.testing.assert_close(target_ids, logits[target].argmax(-1).int())
+
+
+def test_truncate_draft_rope_preserves_position_lookup():
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+
+    rope = RotaryEmbedding(
+        head_size=64,
+        rotary_dim=64,
+        max_position_embeddings=256,
+        base=10000,
+        is_neox_style=True,
+        dtype=torch.float32,
+    )
+    draft = torch.nn.Sequential(rope)
+    before = rope.cos_sin_cache.clone()
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_multimodal_model=False,
+            multimodal_config=None,
+            max_model_len=65,
+        )
+    )
+    TPUModelRunner._truncate_rope_caches(runner, draft)
+    assert rope.cos_sin_cache.shape[0] == 65
+    torch.testing.assert_close(rope.cos_sin_cache[[0, 32, 64]], before[[0, 32, 64]])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("factor", [1.0, 4.0])
+def test_truncate_draft_yarn_preserves_forward(dtype, factor):
+    from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
+        YaRNScalingRotaryEmbedding,
+    )
+
+    rope = YaRNScalingRotaryEmbedding(
+        head_size=64,
+        rotary_dim=16,
+        max_position_embeddings=256,
+        base=10000000,
+        is_neox_style=True,
+        scaling_factor=factor,
+        dtype=dtype,
+    )
+    positions = torch.tensor([0, 32, 64])
+    query = torch.randn(3, 128).to(dtype)
+    key = torch.randn(3, 64).to(dtype)
+    expected = rope.forward_native(positions, query.clone(), key.clone())
+    before = rope.cos_sin_cache.clone()
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_multimodal_model=False,
+            multimodal_config=None,
+            max_model_len=65,
+        )
+    )
+    TPUModelRunner._truncate_rope_caches(runner, torch.nn.Sequential(rope))
+    assert rope.cos_sin_cache.shape[0] == 65
+    assert rope.max_position_embeddings == 256
+    assert rope.scaling_factor == factor
+    torch.testing.assert_close(rope.cos_sin_cache, before[:65], rtol=0, atol=0)
+    actual = rope.forward_native(positions, query.clone(), key.clone())
+    for x, y in zip(actual, expected):
+        torch.testing.assert_close(x, y, rtol=0, atol=0)
