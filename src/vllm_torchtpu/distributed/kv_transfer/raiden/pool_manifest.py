@@ -769,7 +769,7 @@ def build_qwen35_pool_manifest(
     named_kv_caches: Mapping[str, Any],
     kv_cache_groups: Sequence[Any],
     raw_tensors: Sequence[Any],
-    gdn_geometry: GdnHeadGeometry | None = None,
+    gdn_geometry: GdnHeadGeometry,
     mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
     per_layer_tags: bool = False,
     fa_layout: FaLayoutHook | None = None,
@@ -813,8 +813,6 @@ def build_qwen35_pool_manifest(
         if block_major is not None:
             placement = _region_placement(block_major, raw_tensors[0], layer_name)
         if isinstance(cache, (list, tuple)):
-            if gdn_geometry is None:
-                raise ManifestError(f"GDN geometry is required for {layer_name}")
             if len(cache) == 1:
                 spec = _group_spec_for_layer(kv_cache_groups, layer_name)
                 states = _pooled_gdn_state_views(
@@ -936,7 +934,6 @@ def build_qwen35_pool_manifest(
                 )
             live_stride = nbytes // num_blocks
             if class_tag(tag).startswith(TAG_GDN_CONV):
-                assert gdn_geometry is not None
                 regions = _gdn_conv_regions(
                     conv_shape=shape, itemsize=itemsize, geometry=gdn_geometry
                 )

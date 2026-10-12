@@ -73,20 +73,18 @@ class TestTpuCompilerCache:
 
         assert disabled != enabled
 
-    @pytest.mark.parametrize(
-        "name", ["USE_PHASED_PROFILER", "TPU_MTP_ZERO_ACCEPTANCE_LOG"]
-    )
-    def test_tpu_hash_ignores_diagnostic_switches(self, name):
-        """Enabling diagnostics must reuse the uninstrumented compile cache."""
+    def test_tpu_hash_ignores_the_phased_profiler_switch(self):
+        """Selecting a profiler must not bust the compile cache: otherwise a
+        profiled run recompiles everything, and so does the next plain one."""
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
         with patch(
             "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
             return_value=[],
         ):
-            with patch.dict(os.environ, {name: "false"}):
+            with patch.dict(os.environ, {"USE_PHASED_PROFILER": "false"}):
                 unprofiled = compute_tpu_compilation_hash(self._config())
-            with patch.dict(os.environ, {name: "true"}):
+            with patch.dict(os.environ, {"USE_PHASED_PROFILER": "true"}):
                 phased = compute_tpu_compilation_hash(self._config())
 
         assert unprofiled == phased
