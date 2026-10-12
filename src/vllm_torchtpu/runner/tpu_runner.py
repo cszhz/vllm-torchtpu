@@ -15,6 +15,7 @@ from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -126,6 +127,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.decode_nan_dump import DecodeNaNDumper
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
@@ -956,6 +958,30 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._decode_nan_dumper: DecodeNaNDumper | None = None
+        if envs.TPU_DECODE_NAN_DUMP:
+            from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
+
+            spec = self.speculative_config
+            architectures = self.model_config.hf_config.architectures
+            if (
+                self.parallel_config.pipeline_parallel_size != 1
+                or envs.VLLM_TPU_BLOCK_MAJOR_KV
+                or not self._unified_kv_layout
+                or architectures is None
+                or not set(architectures) & QWEN_GDN_ARCHITECTURES
+                or (
+                    spec is not None
+                    and (
+                        spec.method not in ("eagle3", "mtp")
+                        or envs.VLLM_TPU_FUSED_DRAFT_LOOP
+                    )
+                )
+            ):
+                raise NotImplementedError(
+                    "TPU_DECODE_NAN_DUMP supports Qwen GDN with PP=1, "
+                    "unified layer-major KV, and unfused eagle3/mtp drafting"
+                )
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -3707,6 +3733,19 @@ class TPUModelRunner(GPUModelRunner):
                     f"max={trace_kwargs['max_kv_len']}"
                 )
 
+            if self._decode_nan_dumper is not None:
+                self._decode_nan_dumper.record_forward(
+                    self,
+                    start_index,
+                    num_reqs,
+                    {
+                        "input_ids": input_ids,
+                        "positions": self.position_ids,
+                        "inputs_embeds": inputs_embeds,
+                    },
+                    attn_metadata,
+                )
+
             with (
                 TraceAnnotation(
                     name=trace_name,
@@ -3809,6 +3848,7 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 pooler_output_list.append(pooler_output)
             else:
+                hidden_states = cast(torch.Tensor, hidden_states)
                 sample_hidden_states = (
                     sequence_layout_planner.maybe_select_logits_hidden_states(
                         hidden_states, layout_plan, logits_indices
@@ -3819,6 +3859,21 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states,
                         layout_plan,
                     )
+                if self._decode_nan_dumper is not None:
+                    row_counts = (
+                        spec_decode_metadata.draft_lengths_cpu + 1
+                        if spec_decode_metadata is not None
+                        else np.ones(num_reqs, dtype=np.int32)
+                    )
+                    self._decode_nan_dumper.check(
+                        self,
+                        hidden_states
+                        if sample_hidden_states is None
+                        else sample_hidden_states,
+                        np.repeat(np.arange(num_reqs), row_counts),
+                        logits_indices if sample_hidden_states is None else None,
+                    )
+                if sample_hidden_states is None:
                     logits = self.compute_selected_logits(hidden_states, logits_indices)
                 else:
                     logits = self.compute_logits_from_hidden_states(
@@ -4770,6 +4825,13 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        if envs.TPU_DECODE_NAN_DUMP:
+            self._decode_nan_dumper = DecodeNaNDumper(
+                "target",
+                set(get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase))
+                | set(get_layers_from_vllm_config(self.vllm_config, MambaBase)),
+                Path(envs.TPU_DECODE_NAN_DUMP_DIR),
+            )
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
@@ -5825,7 +5887,20 @@ class TPUModelRunner(GPUModelRunner):
             self._pp_wave.warmup()
         if self.enforce_eager:
             return
-        with self.maybe_setup_dummy_loras(self.lora_config):
+        with (
+            self.maybe_setup_dummy_loras(self.lora_config),
+            contextlib.ExitStack() as dump_context,
+        ):
+            if self._decode_nan_dumper is not None:
+                dump_context.enter_context(self._decode_nan_dumper.pause())
+                if self._is_async_drafter:
+                    draft_dumper = cast(
+                        Eagle3Proposer, self._async_drafter
+                    )._decode_nan_dumper
+                    assert draft_dumper is not None, (
+                        "An enabled target NaN dumper requires its loaded draft dumper"
+                    )
+                    dump_context.enter_context(draft_dumper.pause())
             with self._precompile_timed("model backbone"):
                 self._precompile_backbone()
 
