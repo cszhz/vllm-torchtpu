@@ -936,47 +936,60 @@ def mla_ragged_paged_attention(
             swa_m,
         )
 
+    def skip_if_empty(start_seq_idx, end_seq_idx, run):
+        # An empty pass still pays its launch and the page-table copy into
+        # SMEM; with speculative decoding the decode passes are usually empty.
+        return lax.cond(end_seq_idx > start_seq_idx, run, lambda q: q, q)
+
     batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
     # Batched decode
-    q = run_mla_kernel(
-        q,
-        cache_kv,
-        kv_lens,
-        kv_lens_to_attend,
-        page_indices,
-        cu_q_lens,
-        attention_sinks,
-        swa_accumution,
-        swa_l,
-        swa_m,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=jnp.array(0),
-        end_seq_idx=batch_distribution,
-        static_q_len=1,
-        batch_size=decode_batch_size,
-        case=MlaCase.BATCHED_DECODE,
+    q = skip_if_empty(
+        jnp.array(0),
+        batch_distribution,
+        lambda q: run_mla_kernel(
+            q,
+            cache_kv,
+            kv_lens,
+            kv_lens_to_attend,
+            page_indices,
+            cu_q_lens,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=jnp.array(0),
+            end_seq_idx=batch_distribution,
+            static_q_len=1,
+            batch_size=decode_batch_size,
+            case=MlaCase.BATCHED_DECODE,
+        ),
     )
 
     # Decode-only
-    q = run_mla_kernel(
-        q,
-        cache_kv,
-        kv_lens,
-        kv_lens_to_attend,
-        page_indices,
-        cu_q_lens,
-        attention_sinks,
-        swa_accumution,
-        swa_l,
-        swa_m,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=batch_distribution,
-        end_seq_idx=distribution[0],
-        static_q_len=1,
-        batch_size=1,
-        case=MlaCase.DECODE,
+    q = skip_if_empty(
+        batch_distribution,
+        distribution[0],
+        lambda q: run_mla_kernel(
+            q,
+            cache_kv,
+            kv_lens,
+            kv_lens_to_attend,
+            page_indices,
+            cu_q_lens,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=batch_distribution,
+            end_seq_idx=distribution[0],
+            static_q_len=1,
+            batch_size=1,
+            case=MlaCase.DECODE,
+        ),
     )
 
     if chunk_prefill_size is not None:
