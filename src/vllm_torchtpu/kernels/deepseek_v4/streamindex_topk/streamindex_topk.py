@@ -1419,15 +1419,11 @@ def streamindex_topk(
                 ),
             )
         )
+        # Passes write disjoint token rows, so their order is free. The decode
+        # passes go last: with speculative decoding they are usually empty, and
+        # only a pass that receives the buffer can be skipped (see
+        # `_scores_for_chunk`).
         return (
-            *batched_decode,
-            # Handle num_decode_seqs % decode_req_batch_size != 0 case.
-            dict(
-                start_seq_idx=decode_batch_end,
-                end_seq_idx=distribution[0 if uniform else 1],
-                seq_batch_size=1,
-                **decode_cfg,
-            ),
             *uniform,
             dict(
                 num_kv_pages_per_block=num_kv_pages_per_blocks[2],
@@ -1438,6 +1434,14 @@ def streamindex_topk(
                 static_q_len=None,
                 seq_batch_size=1,
                 case=MlaCase.MIXED,
+            ),
+            *batched_decode,
+            # Handle num_decode_seqs % decode_req_batch_size != 0 case.
+            dict(
+                start_seq_idx=decode_batch_end,
+                end_seq_idx=distribution[0 if uniform else 1],
+                seq_batch_size=1,
+                **decode_cfg,
             ),
         )
 
@@ -1482,22 +1486,36 @@ def streamindex_topk(
         # it back out (~370us on 1GB of scores). `row_lengths` bounds the reads.
         scores = None
         for spec, pass_meta in passes:
-            scores = run_scores_kernel(
-                q,
-                prepared_indexer_weights,
-                cache_kv,
-                scores,
-                seq_lens,
-                page_indices,
-                cu_q_lens,
-                pass_meta=pass_meta,
-                chunk_idx=chunk_idx,
-                chunk_token_start=chunk_token_start,
-                chunk_tokens=chunk_tokens,
-                out_dtype=out_dtype,
-                scheduling_group_id=scheduling_group_id,
-                **spec,
-            )
+
+            def run(scores_init, spec=spec, pass_meta=pass_meta):
+                return run_scores_kernel(
+                    q,
+                    prepared_indexer_weights,
+                    cache_kv,
+                    scores_init,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    pass_meta=pass_meta,
+                    chunk_idx=chunk_idx,
+                    chunk_token_start=chunk_token_start,
+                    chunk_tokens=chunk_tokens,
+                    out_dtype=out_dtype,
+                    scheduling_group_id=scheduling_group_id,
+                    **spec,
+                )
+
+            if scores is not None and spec["case"] == MlaCase.DECODE:
+                # An empty pass still pays its launch and the page-table copy
+                # into SMEM; skipping it leaves the buffer as the pass would.
+                scores = jax.lax.cond(
+                    spec["end_seq_idx"] > spec["start_seq_idx"],
+                    run,
+                    lambda scores_init: scores_init,
+                    scores,
+                )
+            else:
+                scores = run(scores)
         assert scores is not None
         return scores
 
