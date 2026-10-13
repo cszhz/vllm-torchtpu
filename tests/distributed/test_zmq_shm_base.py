@@ -482,7 +482,7 @@ def _send_entry(conn, uuid=7, req_id="r0", slot_idx=0, num_blocks=2, ttl=60.0):
         req_id=req_id,
         slot_idx=slot_idx,
         num_blocks=num_blocks,
-        expiration_time=time.perf_counter() + ttl,
+        expiration_time=time.time() + ttl,
         tp_size=conn.tp_size,
     )
     conn._coord_send[uuid] = entry
@@ -916,9 +916,7 @@ class TestCoordSetup:
             patch.object(conn, "_pool_attach", side_effect=FileNotFoundError("shm")),
             patch(
                 f"{_BASE}.time",
-                new=_ModuleStub(
-                    time, sleep=lambda _s: None, perf_counter=lambda: next(clock)
-                ),
+                new=_ModuleStub(time, sleep=lambda _s: None, time=lambda: next(clock)),
             ),
             pytest.raises(RuntimeError, match="could not attach"),
         ):
@@ -1158,7 +1156,7 @@ class TestHandleNewSend:
         conn = _attach_runner(_make_conn(tp_size=2))
         conn._coord_rank_to_identity = {1: b"r1"}
         meta = SendMeta(
-            uuid=42, local_block_ids=[0, 1, 2], expiration_time=time.perf_counter() + 30
+            uuid=42, local_block_ids=[0, 1, 2], expiration_time=time.time() + 30
         )
         conn._coord_rank0_handle_new_send("req-a", meta)
         entry = conn._coord_send[42]
@@ -2224,7 +2222,7 @@ class TestBuildPullResponse:
         entry.staged_events[0].set()
         with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1):
             conn._coord_rank0_build_pull_response(7, b"7", 0, [0])
-        assert entry.expiration_time > time.perf_counter()
+        assert entry.expiration_time > time.time()
 
     def test_stage_timeout_returns_none(self):
         conn = _attach_runner(_make_conn())
@@ -2402,7 +2400,7 @@ class TestCoordinatorWorkerHandoff:
         coord._coord_rank_to_identity = {1: b"tpu_rank_1"}
 
         meta = SendMeta(
-            uuid=42, local_block_ids=[0, 1], expiration_time=time.perf_counter() + 30
+            uuid=42, local_block_ids=[0, 1], expiration_time=time.time() + 30
         )
         coord._coord_rank0_handle_new_send("req-a", meta)
 

@@ -1668,6 +1668,7 @@ class TestTPURaidenConnectorScheduler:
             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
             patch(f"{_MOD}.get_uuid", return_value=777),
             patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0),
+            patch(f"{_MOD}.time.time", return_value=1_700_000_000.0),
         ):
             delay, params = producer.request_finished(req, block_ids)
             first_meta = producer.build_connector_meta()
@@ -1697,6 +1698,9 @@ class TestTPURaidenConnectorScheduler:
         assert "remote_block_ids" not in params
         assert first_meta.reqs_to_send[req.request_id].local_block_ids == (block_ids)
         assert first_meta.reqs_to_send[req.request_id].num_tokens == (65_023)
+        assert (
+            first_meta.reqs_to_send[req.request_id].expiration_time == 1_700_000_030.0
+        )
         assert duplicate_meta.reqs_to_send == {}
         assert req.status == status
 
@@ -3740,7 +3744,7 @@ class TestTPURaidenConnectorWorker:
             uuid=2468,
             local_block_ids=[90, 91],
             num_tokens=65_023,
-            expiration_time=time.perf_counter() - 1.0,
+            expiration_time=time.time() - 1.0,
         )
 
         with (
@@ -3768,7 +3772,7 @@ class TestTPURaidenConnectorWorker:
         assert tombstone.uuid == 2468
         assert tombstone.local_block_ids == (90, 91)
         assert tombstone.num_tokens == 65_023
-        assert tombstone.expiration_time > time.perf_counter()
+        assert tombstone.expiration_time > time.time()
         assert worker._stage3_terminal_cleanup == {}
         assert facade.complete_request_blocks_calls == []
         assert facade.cancel_request_blocks_calls == []
@@ -3898,7 +3902,8 @@ class TestTPURaidenConnectorWorker:
             else []
         )
 
-    def test_v3_stage3_unconsumed_send_cancels_only_if_unclaimed(self):
+    @pytest.mark.parametrize("perf_counter_s", [1.0, 1_700_000_000.0 + 7 * 86400])
+    def test_v3_stage3_unconsumed_send_cancels_only_if_unclaimed(self, perf_counter_s):
         worker = _make_raiden_worker(
             tp_rank=0,
             tp_size=1,
@@ -3915,19 +3920,25 @@ class TestTPURaidenConnectorWorker:
         worker._raiden_controller_address = "prefill-controller.test:27000"
         worker._raiden_work_unit = SimpleNamespace(job_name="prefill")
         worker._local_raiden_transfer_rank = MagicMock(return_value=0)
+        wall_time_s = 1_700_000_000.0
         meta = TPUConnectorMetadata()
         meta.reqs_to_send["unconsumed"] = MagicMock(
             uuid=765,
             local_block_ids=[12],
             num_tokens=1,
-            expiration_time=time.perf_counter() - 1.0,
+            expiration_time=wall_time_s + 10.0,
         )
 
         with (
             patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+            patch(f"{_MOD}.time.time", return_value=wall_time_s) as wall_clock,
+            patch(f"{_MOD}.time.perf_counter", return_value=perf_counter_s),
         ):
             worker.process_send_load(meta)
+            assert worker.get_finished() == (set(), set())
+            assert facade.cancel_request_blocks_calls == []
+            wall_clock.return_value = wall_time_s + 11.0
             assert worker.get_finished() == ({"unconsumed"}, set())
 
         assert facade.cancel_request_blocks_calls == [
@@ -3962,7 +3973,7 @@ class TestTPURaidenConnectorWorker:
             uuid=766,
             local_block_ids=[13],
             num_tokens=1,
-            expiration_time=time.perf_counter() - 1.0,
+            expiration_time=time.time() - 1.0,
         )
 
         with (
@@ -4630,9 +4641,7 @@ class TestTPURaidenConnectorWorker:
         if prior_state == "accepted":
             worker._stage3_controller_accepted.add("dst-late")
         if prior_state == "uncertain":
-            worker._stage3_pending_controller_failures["dst-late"] = (
-                time.perf_counter() + 120
-            )
+            worker._stage3_pending_controller_failures["dst-late"] = time.time() + 120
         _, facade = self._park_missing_registration_load(
             worker,
             [RuntimeError(error_text)],
