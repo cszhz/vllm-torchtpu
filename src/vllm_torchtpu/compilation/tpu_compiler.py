@@ -147,6 +147,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # are keyed by shape inside the same cache.
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
+    # Which thread launches the first stage's hand-off (upstream PR #1910).
+    "TPU_PP_ASYNC_HANDOFF",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, offload retry and drain limits, a weight-load sync cadence, a
     # debug log switch, and the local-rank offsets, which move a worker to a

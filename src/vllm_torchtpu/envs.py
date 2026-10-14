@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_MTP_PREFILL_ONLY: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
+    TPU_PP_ASYNC_HANDOFF: bool = False
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
@@ -674,6 +675,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
     # Experimental forward-only validation; never enables speculative decode.
     "TPU_MTP_PREFILL_ONLY": env_bool("TPU_MTP_PREFILL_ONLY"),
+    "TPU_PP_ASYNC_HANDOFF": env_bool("TPU_PP_ASYNC_HANDOFF", default=False),
     "TPU_PP_DYNAMIC_CHUNKS": env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),
     # Fraction above the time of a full prefix-free step that a step may
     # take before its chunks are shortened.

@@ -48,6 +48,8 @@ from typing import Any, cast
 
 from vllm.logger import init_logger
 
+from vllm_torchtpu import envs
+
 logger = init_logger(__name__)
 
 
@@ -84,7 +86,7 @@ class _WaveState:
         follow."""
         # With one or two stages every launch pairs on its own: stage 1's
         # launch before forward m is stage 0's launch after it.
-        if not self.open or self.stages <= 2:
+        if not self.open or (self.stages <= 2 and not envs.TPU_PP_ASYNC_HANDOFF):
             return
         if real_step == self.real_steps:
             self.open = False

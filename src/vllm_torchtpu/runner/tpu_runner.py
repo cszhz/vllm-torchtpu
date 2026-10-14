@@ -3436,6 +3436,8 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if self._pp_wave is not None:
+            self._pp_wave.before_step(scheduler_output.total_num_scheduled_tokens)
         # Update cached state
         self._update_states(scheduler_output)
         # Publish completed requests before draining the previous batch's CPU

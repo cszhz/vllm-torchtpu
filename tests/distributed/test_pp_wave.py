@@ -45,10 +45,13 @@ class _Ring:
             return tuple(x.clone() for x in self.slots[((rank - 1) % self.size, pos)])
 
 
-def _build_stages(monkeypatch, template, size=8):
+def _build_stages(monkeypatch, template, size=8, async_handoff=False):
     """``size`` PPWave instances on CPU sharing one fake ring."""
     ring = _Ring(size)
     current = {}
+    monkeypatch.setenv("TPU_PP_ASYNC_HANDOFF", "1" if async_handoff else "0")
+    monkeypatch.setattr(pp_wave, "_flush", lambda tensors: None)
+    monkeypatch.setattr(pp_wave, "_wait", lambda tensors: None)
     monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
     monkeypatch.setattr(
         pp_wave,
@@ -89,6 +92,14 @@ def stages(request, monkeypatch):
     return ring, waves
 
 
+@pytest.fixture
+def async_stages(monkeypatch):
+    """Eight stages whose first stage launches from its helper thread."""
+    ring, waves = _build_stages(monkeypatch, _template(True), async_handoff=True)
+    assert waves[0].async_handoff and not any(w.async_handoff for w in waves[1:])
+    return ring, waves
+
+
 SETTLE = "settle"
 
 
@@ -111,6 +122,7 @@ def _run_stage(wave, events, results, errors):
             if rows == SETTLE:
                 wave.settle()
                 continue
+            wave.before_step(rows)
             received = wave.start_forward(rows)
             if wave.rank == 0:
                 h = torch.full((rows, HIDDEN), float(g))
@@ -198,6 +210,123 @@ def test_random_forwards_and_pushes_deliver_every_forward(stages):
     assert len({w.launches for w in waves}) == 1
     assert waves[0].launches == 1 + moves + events.count(SETTLE) * last
     assert all(w.bursts == events.count(SETTLE) for w in waves)
+
+
+def test_async_first_stage_delivers_every_forward(async_stages):
+    ring, waves = async_stages
+    rng = random.Random(11)
+    events = _events(rng, 12, len(waves))
+    results = _run(waves, events)
+    forwards = [e for e in events if e is not None and e != SETTLE]
+    assert len(results) == len(forwards)
+    last = waves[-1].rank
+    for g, rows, h, r, extra in results:
+        assert rows == forwards[g]
+        assert torch.equal(h, torch.full((rows, HIDDEN), g + last + 0.5))
+        assert torch.equal(extra, torch.full((rows, SIDE_WIDTH), g, dtype=torch.int32))
+    moves = len(events) - events.count(SETTLE)
+    assert len({w.launches for w in waves}) == 1
+    assert waves[0].launches == 1 + moves + events.count(SETTLE) * last
+    # The queued launch was issued and its result consumed.
+    assert waves[0]._async_idle() and waves[0]._async_out is None
+
+
+def test_async_first_stage_reports_a_failed_launch(async_stages):
+    _, waves = async_stages
+    w = waves[0]
+
+    def boom(carried):
+        raise ValueError("ring down")
+
+    w._launch_blocking = boom
+    w.burst_open = True
+    w.burst_launches = 1
+    w._launch_async(w.zeros)
+    with pytest.raises(RuntimeError, match="hand-off thread failed") as info:
+        w._async_wait()
+    assert isinstance(info.value.__cause__, ValueError)
+    assert w._async_wait() is None
+
+
+def _first_stage_alone(monkeypatch, size=2):
+    """One first-stage PPWave with the async hand-off, whose launch and
+    whose hand-off completion the test releases separately."""
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setenv("TPU_PP_ASYNC_HANDOFF", "1")
+    launch_gate, done, launched = threading.Event(), threading.Event(), []
+
+    def op(*carried):
+        launch_gate.wait(10)
+        launched.append(tuple(x.clone() for x in carried))
+        return carried
+
+    monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
+    monkeypatch.setattr(pp_wave, "pp_permute_op", lambda mesh, num_tensors=1: op)
+    monkeypatch.setattr(pp_wave, "_launch_now", lambda op, carried: op(*carried))
+    monkeypatch.setattr(pp_wave, "_flush", lambda tensors: None)
+    monkeypatch.setattr(pp_wave, "_wait", lambda tensors: done.wait(10))
+    monkeypatch.setattr(
+        parallel_state,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=size),
+    )
+    wave = pp_wave.PPWave(torch.device("cpu"), MAX_ROWS, _template(False))
+    assert wave.async_handoff
+    return wave, launch_gate, done, launched
+
+
+def test_async_end_forward_returns_before_the_launch_and_the_next_forward_waits(
+    monkeypatch,
+):
+    wave, launch_gate, done, launched = _first_stage_alone(monkeypatch)
+    launch_gate.set()
+    assert wave.start_forward(8) is None  # opens the burst: one prologue launch
+    assert len(launched) == 1
+    launch_gate.clear()
+    outgoing = {
+        "hidden_states": torch.full((8, HIDDEN), 2.0),
+        "residual": torch.full((8, HIDDEN), 0.5),
+    }
+    wave.end_forward(outgoing, 8)
+    # Counted and queued, not issued: the helper is held at the gate.
+    assert wave.launches == 2 and len(launched) == 1
+    nxt = threading.Thread(target=wave.start_forward, args=(8,), daemon=True)
+    nxt.start()
+    nxt.join(0.3)
+    assert nxt.is_alive(), "start_forward ran before the hand-off was launched"
+    launch_gate.set()
+    for _ in range(100):
+        if len(launched) == 2:
+            break
+        threading.Event().wait(0.01)
+    assert len(launched) == 2
+    assert torch.equal(launched[1][0][:8], torch.full((8, HIDDEN), 2.5))
+    nxt.join(0.3)
+    assert nxt.is_alive(), "start_forward ran before the hand-off completed"
+    done.set()
+    nxt.join(5)
+    assert not nxt.is_alive()
+    assert wave._async_idle() and wave._async_out is None
+
+
+def test_async_settle_on_two_stages_reports_a_failed_launch(monkeypatch):
+    wave, launch_gate, done, launched = _first_stage_alone(monkeypatch)
+    launch_gate.set()
+    wave.start_forward(8)
+
+    def boom(carried):
+        raise ValueError("ring down")
+
+    wave._launch_blocking = boom
+    wave.end_forward(
+        {"hidden_states": torch.zeros(8, HIDDEN), "residual": torch.zeros(8, HIDDEN)},
+        8,
+    )
+    # Two stages: the first stage's settle issues no launch of its own.
+    with pytest.raises(RuntimeError, match="hand-off thread failed") as info:
+        wave.settle()
+    assert isinstance(info.value.__cause__, ValueError)
 
 
 def test_pushes_alone_carry_a_lone_forward_to_the_last_stage(stages):
@@ -363,3 +492,40 @@ def test_a_stage_of_several_chips_drains_before_every_hand_off(monkeypatch):
     wave.warmup()
     wave.start_forward(16)
     assert drains == [] and wave.launches == 3
+
+
+def test_before_step_fences_device_preparation_but_not_zero_token_polls(monkeypatch):
+    wave, launch_gate, done, launched = _first_stage_alone(monkeypatch)
+    wave.before_step(8)  # No queued handoff: no prologue or device wait.
+    assert not launched
+    launch_gate.set()
+    wave.start_forward(8)
+    launch_gate.clear()
+    wave.end_forward(
+        {
+            "hidden_states": torch.ones((8, HIDDEN)),
+            "residual": torch.zeros((8, HIDDEN)),
+        },
+        8,
+    )
+    wave.before_step(0)  # Connector-only polling must not drain the pipeline.
+    prepared = threading.Event()
+
+    def prepare():
+        wave.before_step(8)
+        prepared.set()
+
+    thread = threading.Thread(target=prepare, daemon=True)
+    thread.start()
+    try:
+        assert not prepared.wait(0.1)
+        launch_gate.set()
+        assert not prepared.wait(0.1), "must also wait for device completion"
+        done.set()
+        assert prepared.wait(5)
+        wave.start_forward(8)  # The consumed handoff must not be waited twice.
+        assert wave._async_idle() and wave._async_out is None
+    finally:
+        launch_gate.set()
+        done.set()
+        thread.join(5)
