@@ -57,6 +57,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op impo
     MHCOps,
     get_mhc_ops,
     get_mhc_post_op,
+    get_mhc_split_fn_op,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
@@ -151,10 +152,24 @@ class DeepseekV4DecoderLayer(nn.Module):
             object.__setattr__(self, "_mhc_ops_instance", ops)
         return ops
 
+    def split_hc_fns(self) -> None:
+        """Split hc_attn_fn / hc_ffn_fn into the bf16 chunks the mHC ops take.
+
+        The split depends only on the weight; doing it here, once after the
+        weights land, keeps it out of every forward.
+        """
+        split = get_mhc_split_fn_op()
+        for name in ("hc_attn_fn", "hc_ffn_fn"):
+            for suffix, chunk in zip(("hi", "mid", "lo"), split(getattr(self, name))):
+                self.register_buffer(f"{name}_{suffix}", chunk, persistent=False)
+
+    def _fn3(self, name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return tuple(getattr(self, f"{name}_{s}") for s in ("hi", "mid", "lo"))
+
     def hc_pre(
         self,
         x: torch.Tensor,
-        hc_fn: torch.Tensor,
+        hc_fn3: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -163,7 +178,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         The gate constants are baked into the op, so only the tensors are
         passed; this just puts `layer_input` first for the caller.
         """
-        post_mix, res_mix, layer_input = self.mhc_ops.pre(x, hc_fn, hc_scale, hc_base)
+        post_mix, res_mix, layer_input = self.mhc_ops.pre(
+            x, *hc_fn3, hc_scale, hc_base
+        )
         return layer_input, post_mix, res_mix
 
     def forward(
@@ -186,7 +203,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
             x, post_mix, res_mix = self.hc_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                x, self._fn3("hc_attn_fn"), self.hc_attn_scale, self.hc_attn_base
             )
         else:
             residual, post_mix, res_mix, x = self.mhc_ops.fused(
@@ -194,7 +211,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 residual,
                 post_mix,
                 res_mix,
-                self.hc_attn_fn,
+                *self._fn3("hc_attn_fn"),
                 self.hc_attn_scale,
                 self.hc_attn_base,
             )
@@ -207,7 +224,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             residual,
             post_mix,
             res_mix,
-            self.hc_ffn_fn,
+            *self._fn3("hc_ffn_fn"),
             self.hc_ffn_scale,
             self.hc_ffn_base,
         )
@@ -623,6 +640,9 @@ class DeepseekV4Model(nn.Module):
                         continue
         finally:
             staged.flush_all()
+        for layer in self.layers:
+            if isinstance(layer, DeepseekV4DecoderLayer):
+                layer.split_hc_fns()
 
         return loaded_params
 

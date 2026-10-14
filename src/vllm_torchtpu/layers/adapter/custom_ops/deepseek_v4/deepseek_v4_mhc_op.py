@@ -30,6 +30,7 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     fused_post_pre_kernel,
     post_kernel,
     pre_kernel,
+    utils,
 )
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
@@ -66,7 +67,9 @@ def _gate_suffix(
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
 def _mhc_pre_jax(
     residual: jax.Array,
-    fn: jax.Array,
+    fn_hi: jax.Array,
+    fn_mid: jax.Array,
+    fn_lo: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     *,
@@ -79,7 +82,7 @@ def _mhc_pre_jax(
     """Mix GEMM + stream collapse in Pallas, gates/Sinkhorn in XLA."""
     return pre_kernel.mhc_pre(
         residual,
-        fn,
+        utils.SplitFn(fn_hi, fn_mid, fn_lo),
         hc_scale,
         hc_base,
         rms_eps,
@@ -105,7 +108,9 @@ def _mhc_fused_post_pre_jax(
     residual: jax.Array,
     post_layer_mix: jax.Array,
     comb_res_mix: jax.Array,
-    fn: jax.Array,
+    fn_hi: jax.Array,
+    fn_mid: jax.Array,
+    fn_lo: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     *,
@@ -121,7 +126,7 @@ def _mhc_fused_post_pre_jax(
         residual,
         post_layer_mix,
         comb_res_mix,
-        fn,
+        utils.SplitFn(fn_hi, fn_mid, fn_lo),
         hc_scale,
         hc_base,
         rms_eps,
@@ -153,7 +158,7 @@ def _fake_pre_outputs(
     )
 
 
-def _fake_mhc_pre(residual, fn, hc_scale, hc_base, *args, **kwargs):
+def _fake_mhc_pre(residual, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return _fake_pre_outputs(residual)
 
@@ -163,9 +168,7 @@ def _fake_mhc_post(x, residual, post_layer_mix, comb_res_mix, *args, **kwargs):
     return torch.empty_like(residual)
 
 
-def _fake_mhc_fused_post_pre(
-    x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, *args, **kwargs
-):
+def _fake_mhc_fused_post_pre(x, residual, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return (torch.empty_like(residual), *_fake_pre_outputs(residual))
 
@@ -177,7 +180,7 @@ def _mhc_pre_op(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
 ):
-    op_name = "pallas::deepseek_v4_mhc_pre_v1" + _gate_suffix(
+    op_name = "pallas::deepseek_v4_mhc_pre_v2" + _gate_suffix(
         rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
     )
     op = _mhc_op_cache.get(op_name)
@@ -195,7 +198,9 @@ def _mhc_pre_op(
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None, None),  # residual
-                P(),  # fn
+                P(),  # fn_hi
+                P(),  # fn_mid
+                P(),  # fn_lo
                 P(),  # hc_scale
                 P(),  # hc_base
             ),
@@ -237,7 +242,7 @@ def _mhc_fused_post_pre_op(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
 ):
-    op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v1" + _gate_suffix(
+    op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v2" + _gate_suffix(
         rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
     )
     op = _mhc_op_cache.get(op_name)
@@ -258,12 +263,41 @@ def _mhc_fused_post_pre_op(
                 P(ATTN_DATA_AXIS, None, None),  # residual
                 P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
                 P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
-                P(),  # fn
+                P(),  # fn_hi
+                P(),  # fn_mid
+                P(),  # fn_lo
                 P(),  # hc_scale
                 P(),  # hc_base
             ),
         )
         op.register_fake(_fake_mhc_fused_post_pre)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
+def _mhc_split_fn_jax(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    return tuple(utils.split_fn3(fn))
+
+
+def get_mhc_split_fn_op():
+    """fn (f32) -> its three bf16 chunks, as the ``pre``/``fused`` ops take it.
+
+    Run once per weight at load, outside the compiled region.
+    """
+    op_name = "pallas::deepseek_v4_mhc_split_fn_v1"
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            _mhc_split_fn_jax,
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(P(),),
+        )
+
+        def _fake(fn):
+            return tuple(torch.empty_like(fn, dtype=torch.bfloat16) for _ in range(3))
+
+        op.register_fake(_fake)
         _mhc_op_cache[op_name] = op
     return op
 
@@ -275,13 +309,15 @@ class MHCOps(NamedTuple):
     contracts; ``fused`` is the seam op, equivalent to ``post`` followed by
     ``pre`` on its output but sharing one pass over the residual streams.
 
-    ``pre(residual, fn, hc_scale, hc_base)``
+    ``fn3`` below is fn's three bf16 chunks from ``get_mhc_split_fn_op``.
+
+    ``pre(residual, *fn3, hc_scale, hc_base)``
         residual (..., hc_mult, hidden_size) bf16 in; post_mix
         (..., hc_mult, 1) f32, comb_mix (..., hc_mult, hc_mult) f32,
         layer_input (..., hidden_size) bf16 out.
     ``post(x, residual, post_layer_mix, comb_res_mix)``
         (..., hc_mult, hidden_size) bf16 out.
-    ``fused(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base)``
+    ``fused(x, residual, post_layer_mix, comb_res_mix, *fn3, hc_scale, hc_base)``
         residual_cur -- the ``post`` output -- then ``pre``'s three outputs
         computed from it.
     """

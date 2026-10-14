@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Callable
-from typing import cast
+from typing import NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -69,23 +69,39 @@ def trim_to(num_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
     return tuple(a[:num_tokens] for a in arrays)
 
 
-def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+class SplitFn(NamedTuple):
+    """fn as its three bf16 chunks (see ``split_fn3``), split ahead of time.
+
+    The chunks depend only on the weight, so serving splits each fn once at
+    load instead of once per call.
+    """
+
+    hi: jax.Array
+    mid: jax.Array
+    lo: jax.Array
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.hi.shape
+
+
+def split_fn3(fn: jax.Array | SplitFn) -> SplitFn:
     """3-chunk bf16 split of fn (8 mantissa bits each = f32's 24).
 
-    Computed in XLA outside the kernel; the chunks are what stays
-    VMEM-resident. Chunks MUST be built with reduce_precision, not dtype
-    round-trips: XLA's excess-precision simplification folds
-    f32->bf16->f32 into the identity, which silently zeroes the mid/lo
-    chunks.
+    The chunks are what stays VMEM-resident. Chunks MUST be built with
+    reduce_precision, not dtype round-trips: XLA's excess-precision
+    simplification folds f32->bf16->f32 into the identity, which silently
+    zeroes the mid/lo chunks. An already split fn is returned as is.
     """
+    if isinstance(fn, SplitFn):
+        assert all(t.dtype == jnp.bfloat16 for t in fn), [t.dtype for t in fn]
+        return fn
+    assert fn.dtype == jnp.float32, fn.dtype
     fn_hi = jax.lax.reduce_precision(fn, 8, 7)
     rem = fn - fn_hi
     fn_mid = jax.lax.reduce_precision(rem, 8, 7)
     fn_lo = jax.lax.reduce_precision(rem - fn_mid, 8, 7)
-    return cast(
-        tuple[jax.Array, jax.Array, jax.Array],
-        tuple(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo)),
-    )
+    return SplitFn(*(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo)))
 
 
 def mhc_pre_gates(

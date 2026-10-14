@@ -90,7 +90,7 @@ def _mixes_collapse_kernel(
 @functools.partial(jax.jit, static_argnames=("token_block_size", "vmem_limit_bytes"))
 def mhc_pre_mixes(
     x2d: jax.Array,
-    fn: jax.Array,
+    fn: jax.Array | utils.SplitFn,
     *,
     token_block_size: int = 64,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
@@ -109,7 +109,6 @@ def mhc_pre_mixes(
         sqrsum: (num_tokens, 1), float32.
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
-    assert fn.dtype == jnp.float32, fn.dtype
     num_tokens, hc_hidden = x2d.shape
     hc_mult3 = fn.shape[0]
     assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, x2d.shape)
@@ -168,7 +167,7 @@ def mhc_pre_mixes(
 )
 def mhc_pre_mixes_collapse(
     x2d: jax.Array,
-    fn: jax.Array,
+    fn: jax.Array | utils.SplitFn,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     rms_eps: float,
@@ -183,7 +182,6 @@ def mhc_pre_mixes_collapse(
     sqrsum (T, 1) f32; layer_input2d (T, hidden_size) bf16).
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
-    assert fn.dtype == jnp.float32, fn.dtype
     num_tokens, hc_hidden = x2d.shape
     hc_mult3 = fn.shape[0]
     assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, x2d.shape)
@@ -259,7 +257,7 @@ def mhc_pre_mixes_collapse(
 
 def mhc_pre(
     residual: jax.Array,
-    fn: jax.Array,
+    fn: jax.Array | utils.SplitFn,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     rms_eps: float,
@@ -282,7 +280,6 @@ def mhc_pre(
     unsliced is worth more than removing them.
     """
     assert residual.dtype == jnp.bfloat16
-    assert fn.dtype == jnp.float32
 
     outer_shape = residual.shape[:-2]
     hc_mult, hidden_size = residual.shape[-2:]

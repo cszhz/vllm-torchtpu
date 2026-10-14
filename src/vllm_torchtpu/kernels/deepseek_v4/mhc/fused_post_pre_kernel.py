@@ -111,7 +111,7 @@ def fused_post_pre_mixes(
     res2d: jax.Array,
     post2d: jax.Array,
     comb2d: jax.Array,
-    fn: jax.Array,
+    fn: jax.Array | utils.SplitFn,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     rms_eps: float,
@@ -155,7 +155,6 @@ def fused_post_pre_mixes(
     assert res2d.dtype == jnp.bfloat16, res2d.dtype
     assert post2d.dtype == jnp.float32, post2d.dtype
     assert comb2d.dtype == jnp.float32, comb2d.dtype
-    assert fn.dtype == jnp.float32, fn.dtype
 
     num_tokens, hidden_size = x2d.shape
     hc_hidden = res2d.shape[1]
@@ -228,7 +227,7 @@ def mhc_fused_post_pre(
     residual: jax.Array,
     post_layer_mix: jax.Array,
     comb_res_mix: jax.Array,
-    fn: jax.Array,
+    fn: jax.Array | utils.SplitFn,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     rms_eps: float,
