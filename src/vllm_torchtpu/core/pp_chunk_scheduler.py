@@ -107,8 +107,13 @@ class TpuPipelineChunkScheduler(Scheduler):
         pending = 0
         for request in self.running:
             pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
-        for request in self.waiting:
-            pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
+        # Async connector lookups move requests into skipped_waiting. They
+        # remain pending work and may become schedulable in this very step.
+        # Count both waiting queues when choosing the cap; the base scheduler
+        # still decides which requests are ready to execute.
+        for queue in (self.waiting, self.skipped_waiting):
+            for request in queue:
+                pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
         if pending == 0:
             return None
         granularity = self._cost.granularity

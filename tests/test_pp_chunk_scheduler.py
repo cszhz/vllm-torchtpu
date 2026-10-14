@@ -25,13 +25,19 @@ def _model(attn=1.5e-7, slack=0.1, granularity=4096) -> StepCostModel:
 
 
 def _scheduler(
-    mamba_split=False, cost=None, running=(), waiting=(), step_limit=None
+    mamba_split=False,
+    cost=None,
+    running=(),
+    waiting=(),
+    step_limit=None,
+    skipped_waiting=(),
 ) -> TpuPipelineChunkScheduler:
     scheduler = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
     scheduler._cost = cost
     scheduler._step_limit = step_limit
     scheduler._pp_size = 8
     scheduler.waiting = list(waiting)
+    scheduler.skipped_waiting = list(skipped_waiting)
     scheduler.vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16384),
         parallel_config=SimpleNamespace(pipeline_parallel_size=8),
@@ -230,6 +236,24 @@ def test_the_step_limit_spreads_the_pending_prefill_over_the_stages():
     with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
         scheduler.schedule()
     assert scheduler._step_limit is None
+
+
+def test_async_lookup_queue_does_not_shrink_the_pending_work_budget():
+    pending = [_request(0, 65536, f"w{i}") for i in range(4)]
+    scheduler = _scheduler(cost=_model(granularity=2048), waiting=pending)
+    assert scheduler._pending_step_limit() == 16384
+
+    # A V6D lookup moves requests between queues, without consuming tokens.
+    # The next schedule may promote them; it must retain the same step cap.
+    scheduler.waiting = []
+    scheduler.skipped_waiting = pending
+    assert scheduler._pending_step_limit() == 16384
+
+    # Count only the remaining prompt work, even in the skipped queue.
+    scheduler.skipped_waiting = [_request(24576, 32768)]
+    assert scheduler._pending_step_limit() == 4096
+    scheduler.skipped_waiting = [_decode("done")]
+    assert scheduler._pending_step_limit() is None
 
 
 def test_the_step_limit_keeps_a_prompt_whole_when_halves_are_no_faster():
