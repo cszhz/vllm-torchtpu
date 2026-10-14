@@ -2593,6 +2593,7 @@ def test_spec_tokens_reduce_before_selecting_rows():
     torch.testing.assert_close(target_ids, logits[target].argmax(-1).int())
 
 
+@pytest.mark.usefixtures("vllm_config_context")
 def test_truncate_draft_rope_preserves_position_lookup():
     from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
@@ -2620,6 +2621,7 @@ def test_truncate_draft_rope_preserves_position_lookup():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("factor", [1.0, 4.0])
+@pytest.mark.usefixtures("vllm_config_context")
 def test_truncate_draft_yarn_preserves_forward(dtype, factor):
     from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
         YaRNScalingRotaryEmbedding,
