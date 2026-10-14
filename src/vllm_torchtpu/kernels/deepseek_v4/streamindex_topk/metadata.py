@@ -328,7 +328,14 @@ def compute_batched_seq_metadata(
             bkv_idx=bkv_idx,
         )
 
-    return jax.lax.cond(is_empty_pass, _empty_schedule, _compute_schedule)
+    # A select, not lax.cond: every CSA layer of a step builds this schedule
+    # from the same metadata, and XLA merges identical computations but not
+    # identical conditionals -- under lax.cond each layer paid its own build.
+    return jax.tree_util.tree_map(
+        lambda full, empty: jnp.where(is_empty_pass, empty, full),
+        _compute_schedule(),
+        _empty_schedule(),
+    )
 
 
 def compute_metadata(
