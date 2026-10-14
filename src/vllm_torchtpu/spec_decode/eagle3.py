@@ -280,7 +280,6 @@ class Eagle3Proposer:
         from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
         from vllm.model_executor.models.qwen3_next_mtp import Qwen3NextMTP
 
-        from vllm_torchtpu import envs
         from vllm_torchtpu.runner.utils import relayout_rope_caches
 
         # These models expose an untransformed shared LM head. Other draft
