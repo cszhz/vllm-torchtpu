@@ -130,7 +130,7 @@ def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     }
 
 
-def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
+def _request_capacity_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     spec = FullAttentionSpec(
         block_size=384, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
     )
@@ -161,29 +161,27 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
         _attention_kernel_block_size=kernel_page_size,
         _attention_kv_cache_group_id=0,
     )
-    runner._refresh_smem_request_caps = (
-        TPUModelRunner._refresh_smem_request_caps.__get__(runner)
-    )
+    runner._refresh_request_caps = TPUModelRunner._refresh_request_caps.__get__(runner)
     return runner
 
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "dcp_size,kernel_page_size,expected_cap,expected_pages,most_pages",
-    [(1, 384, 47, 2731, 171), (8, 384, 64, 342, 22), (8, 16, 15, 8208, 528)],
+    "dcp_size,kernel_page_size,expected_pages,most_pages",
+    [(1, 384, 2731, 171), (8, 384, 342, 22), (8, 16, 8208, 528)],
 )
 @pytest.mark.parametrize("uniform_group", [False, True])
-def test_smem_caps_match_metadata_and_schedule_geometry(
-    dcp_size, kernel_page_size, expected_cap, expected_pages, most_pages, uniform_group
+def test_request_capacity_preserves_metadata_and_schedule_geometry(
+    dcp_size, kernel_page_size, expected_pages, most_pages, uniform_group
 ):
-    runner = _smem_runner(dcp_size, kernel_page_size)
+    runner = _request_capacity_runner(dcp_size, kernel_page_size)
     if uniform_group:
         group = runner.kv_cache_config.kv_cache_groups[0]
         group.kv_cache_spec = UniformTypeKVCacheSpecs(
             block_size=384, kv_cache_specs={"attn.0": group.kv_cache_spec}
         )
-    runner._refresh_smem_request_caps()
-    assert runner.num_reqs_max_model_len == expected_cap
+    runner._refresh_request_caps()
+    assert runner.num_reqs_max_model_len == 64
     assert runner.num_reqs_most_model_len == 64
     assert runner.num_blocks_per_most_len_req == most_pages
     assert runner._attention_capacity == {}
@@ -207,12 +205,12 @@ def test_smem_caps_match_metadata_and_schedule_geometry(
         )
         assert schedule_pages == metadata_pages
         assert page_size == kernel_page_size
-        assert seqs == (expected_cap if use_max else 64)
+        assert seqs == 64
 
 
 @pytest.mark.cpu_test
-def test_smem_caps_follow_widest_attention_group():
-    runner = _smem_runner()
+def test_wide_attention_tables_do_not_split_scheduled_requests():
+    runner = _request_capacity_runner()
     runner.input_batch.block_table.extend(
         [
             SimpleNamespace(max_num_blocks_per_req=4096),
@@ -231,19 +229,36 @@ def test_smem_caps_follow_widest_attention_group():
             ),
         ]
     )
-    runner._refresh_smem_request_caps()
-    assert runner.num_reqs_max_model_len == 32
+    runner._refresh_request_caps()
+    assert runner.num_reqs_max_model_len == 64
+    runner.input_batch.num_reqs = 64
+    runner.input_batch.req_ids = [f"req{i}" for i in range(64)]
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=64,
+        num_scheduled_tokens=dict.fromkeys(runner.input_batch.req_ids, 1),
+    )
+    assert TPUModelRunner._count_input_chunks(runner, scheduler_output) == (1, 64)
 
 
 @pytest.mark.cpu_test
-def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
-    runner = _smem_runner(most_model_len=None)
+@pytest.mark.parametrize("most_model_len", [None, 65536])
+def test_request_capacity_respects_token_budget(most_model_len):
+    runner = _request_capacity_runner(most_model_len=most_model_len)
+    runner.max_num_tokens = 16
+    runner._refresh_request_caps()
+    assert runner.num_reqs_max_model_len == 16
+    assert runner.num_reqs_most_model_len == (16 if most_model_len else None)
+
+
+@pytest.mark.cpu_test
+def test_request_capacity_refreshes_after_placeholder_table_rebuild(monkeypatch):
+    runner = _request_capacity_runner(most_model_len=None)
     final_table = runner.input_batch.block_table[0]
     runner.input_batch.block_table[0] = SimpleNamespace(max_num_blocks_per_req=2731)
     runner.max_num_blocks_per_req = 2731
     runner.block_table_cpu = torch.zeros((64, 2731), dtype=torch.int32)
-    runner._refresh_smem_request_caps()
-    assert runner.num_reqs_max_model_len == 47
+    runner._refresh_request_caps()
+    assert runner.num_reqs_max_model_len == 64
 
     def rebuild(_self, _config, _sizes):
         runner.input_batch.block_table[0] = final_table
@@ -252,8 +267,8 @@ def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     # super() requires a TPUModelRunner instance, but no device initialization.
     real_runner = object.__new__(TPUModelRunner)
     real_runner.__dict__.update(runner.__dict__)
-    real_runner._refresh_smem_request_caps = (
-        TPUModelRunner._refresh_smem_request_caps.__get__(real_runner)
+    real_runner._refresh_request_caps = TPUModelRunner._refresh_request_caps.__get__(
+        real_runner
     )
     TPUModelRunner.may_reinitialize_input_batch(
         real_runner, runner.kv_cache_config, [384]

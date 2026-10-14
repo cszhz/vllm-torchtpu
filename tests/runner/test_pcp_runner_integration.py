@@ -22,7 +22,6 @@ import pytest
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
-from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind,
@@ -260,21 +259,15 @@ def _scheduler_output(scheduled_tokens):
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "max_model_len,expected_budget,expected_chunks",
-    [(1048576, 47, [47, 17]), (65536, 766, [64])],
+    "max_model_len",
+    [1048576, 65536],
 )
 @pytest.mark.parametrize("dcp_size", [1, 8])
 @pytest.mark.parametrize("scheduled_per_req", [1, 4])
-def test_smem_page_table_budget_splits_short_decode_batch(
-    max_model_len, expected_budget, expected_chunks, dcp_size, scheduled_per_req
+def test_large_page_tables_preserve_whole_decode_batch(
+    max_model_len, dcp_size, scheduled_per_req
 ):
-    """Reproduce the 1M SMEM clamp using real CPU input preparation.
-
-    The token store only needs the actual P8K+D1K context. The old global
-    budget is checked first, then final rank-local tables refresh the cap.
-    Four scheduled tokens also exercise the K=3 verification window's input
-    path; this harness does not execute the MTP drafter or a TPU kernel.
-    """
+    """A 1M page-table width must preserve all requests and verify tokens."""
     scheduled_tokens = [scheduled_per_req] * 64
     computed = 8192 + 1024 - scheduled_per_req
     runner = _make_runner(
@@ -288,23 +281,17 @@ def test_smem_page_table_budget_splits_short_decode_batch(
     )
     runner.max_model_len = max_model_len
     runner.parallel_config.decode_context_parallel_size = dcp_size
-    budget = PallasAttentionBackend.get_max_num_seqs(
-        runner.max_model_len, runner.block_size
-    )
-    assert budget == expected_budget
     spec = runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec
     pages = spec.max_num_blocks_per_req(runner.vllm_config, max_model_len)
     runner.input_batch.block_table[0] = _BlockTable(
         torch.zeros((64, pages), dtype=torch.int32)
     )
     runner.max_num_blocks_per_req = pages
-    TPUModelRunner._refresh_smem_request_caps(runner)
-    if dcp_size == 8:
-        expected_chunks = [64]
+    TPUModelRunner._refresh_request_caps(runner)
     scheduler_output = _scheduler_output(scheduled_tokens)
     assert TPUModelRunner._count_input_chunks(runner, scheduler_output) == (
-        len(expected_chunks),
-        max(expected_chunks),
+        1,
+        64,
     )
 
     chunks = []
@@ -322,7 +309,6 @@ def test_smem_page_table_budget_splits_short_decode_batch(
         assert ctx.query_start_loc[: num_reqs + 1].tolist() == [
             i * scheduled_per_req for i in range(num_reqs + 1)
         ]
-        # Check the second chunk gathers requests 47..63, not 0..16 again.
         expected_tokens = runner.input_batch.token_ids_cpu_tensor[
             start_index:end_index, computed : computed + scheduled_per_req
         ].flatten()
@@ -332,7 +318,7 @@ def test_smem_page_table_budget_splits_short_decode_batch(
         chunks.append(num_reqs)
         start_index = end_index
 
-    assert chunks == expected_chunks
+    assert chunks == [64]
     assert sum(chunks) == 64
 
 

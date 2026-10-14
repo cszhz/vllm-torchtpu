@@ -660,18 +660,6 @@ class PallasAttentionBackend(AttentionBackend):
             return (1, 0, 2, 3, 4, 5)
         return (0, 1, 2, 3, 4)
 
-    @staticmethod
-    def get_max_num_seqs(model_len: int, page_size: int) -> int:
-        num_page_per_req = cdiv(model_len, page_size)
-        return PallasAttentionBackend.get_max_num_seqs_for_pages(num_page_per_req)
-
-    @staticmethod
-    def get_max_num_seqs_for_pages(pages_per_req: int) -> int:
-        """Budget the page table actually prefetched into SMEM."""
-        if pages_per_req <= 0:
-            raise ValueError("pages_per_req must be positive")
-        return 1024 * 1024 // 2 // pages_per_req // 4
-
     # TPU has limited SREGs (scalar registers), if page_size is too small, we
     # can spill SREGs easily which leads to bad performance. The strategy we
     # apply here is trying to split max-model-len to 16 pages which make the
