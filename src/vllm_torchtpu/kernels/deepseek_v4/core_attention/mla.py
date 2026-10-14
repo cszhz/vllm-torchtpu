@@ -184,7 +184,9 @@ def _mla_ragged_paged_attention_kernel(
         else:
             cp.start()
 
-    def _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
+    def _fetch_bkv(
+        batch_start_seq_idx, bkv_idx, bkv_sem_idx, *, wait=False, enabled=True
+    ):
         for b in range(batch_size):
             sem = sems.at[0, b, bkv_sem_idx]
             # bkv_x2_ref shape:
@@ -197,12 +199,14 @@ def _mla_ragged_paged_attention_kernel(
                 lkv_dim,
             )
 
-            seq_idx = batch_start_seq_idx + b
+            # A disabled fetch may name the sequence past the last one; it reads a
+            # valid one and copies nothing.
+            seq_idx = jnp.minimum(batch_start_seq_idx + b, max_num_seqs - 1)
             kv_len = kv_lens_ref[seq_idx]
             kv_len_start = bkv_idx * bkv_sz
             kv_p_start = bkv_idx * bkv_p
 
-            kv_left = kv_len - kv_len_start
+            kv_left = jnp.where(enabled, kv_len - kv_len_start, 0)
             dma_bkv_sz = jnp.clip(kv_left, 0, bkv_sz)
             page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
@@ -360,8 +364,8 @@ def _mla_ragged_paged_attention_kernel(
             l_ref[...] = jnp.stack(bl_list)
             m_ref[...] = jnp.stack(bm_list)
 
-    def start_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx):
-        return _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
+    def start_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, enabled=True):
+        return _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, enabled=enabled)
 
     def wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx):
         return _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, wait=True)
@@ -507,12 +511,6 @@ def _mla_ragged_paged_attention_kernel(
                     batch_start_seq_idx, bq_idx, bkv_idx, bkv_sem_idx
                 )
 
-                # Prefetch next bkv
-                @pl.when(next_seq_idx < end_seq_idx)
-                def prefetch_next_bkv():
-                    sem_ids_ref[1] = next_bkv_sem_idx
-                    start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
-
                 # Wait for cur bkv
                 wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
 
@@ -530,6 +528,18 @@ def _mla_ragged_paged_attention_kernel(
                     bq_idx=bq_idx,
                     bkv_idx=bkv_idx,
                     kv_lens_to_attend_segment=kv_lens_to_attend_segment,
+                )
+
+                # Prefetch next bkv. Issued after the compute and without a branch, so
+                # the scalar work of the per-page copies is scheduled alongside the
+                # vector work instead of in a region of its own; past the last block
+                # the copies are empty.
+                sem_ids_ref[1] = next_bkv_sem_idx
+                start_fetch_bkv(
+                    next_seq_idx,
+                    next_bkv_idx,
+                    next_bkv_sem_idx,
+                    enabled=next_seq_idx < end_seq_idx,
                 )
                 return (kv_lens_to_attend_segment,)
 
