@@ -22,9 +22,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from vllm.logger import init_logger
-
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
