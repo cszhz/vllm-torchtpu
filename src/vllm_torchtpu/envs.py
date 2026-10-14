@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_FUSED_CHAIN: bool = False
     TPU_SAMPLER_GRAPH_RNG: bool = False
     DP_SCHED_ENABLED: bool = False
+    TPU_KV_HOLD_REPLAY_CHECKPOINT: bool = False
     TPU_STEP_TIMING_LOG_STEPS: int = 0
     TPU_KV_DROP_HCA_STATE_CHECKPOINT: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
@@ -788,6 +789,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SAMPLER_GRAPH_RNG": env_bool("TPU_SAMPLER_GRAPH_RNG"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # Engine core: sliding-window groups keep each request's replay-boundary
+    # prefix-cache checkpoint until the request is freed, and the freed request
+    # queues it with the prefix it serves (core/checkpoint_free_order.py).
+    "TPU_KV_HOLD_REPLAY_CHECKPOINT": env_bool("TPU_KV_HOLD_REPLAY_CHECKPOINT"),
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.
     "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),
