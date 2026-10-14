@@ -4498,6 +4498,7 @@ class TPUModelRunner(GPUModelRunner):
         # below.
         is_async = bool(self.scheduler_config.async_scheduling)
         eagle3_drafts = None
+        mtp_prefill_outputs: list[torch.Tensor] = []
         if self._is_async_drafter and combined_selected_tokens:
             if envs.TPU_MTP_PREFILL_ONLY:
                 assert not is_spec_step
@@ -4505,7 +4506,7 @@ class TPUModelRunner(GPUModelRunner):
                 assert isinstance(drafter, Eagle3Proposer)
                 from vllm_torchtpu.spec_decode.prefill_only import handoff_seed_tokens
 
-                drafter.prefill_only(
+                mtp_prefill_outputs = drafter.prefill_only(
                     scheduler_output,
                     handoff_seed_tokens(
                         torch.cat(
@@ -4565,6 +4566,8 @@ class TPUModelRunner(GPUModelRunner):
         ):
             # Scheduler source publication must follow this batch's draft KV.
             # Keep this separate from the token copy event used by the runner.
+            if mtp_prefill_outputs:
+                synchronize_tensors(mtp_prefill_outputs, wait=False)
             record_start_ns = time.perf_counter_ns()
             kv_ready_event = torch.tpu.Event()
             kv_ready_event.record()

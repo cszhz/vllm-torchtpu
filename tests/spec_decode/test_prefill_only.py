@@ -98,6 +98,11 @@ def test_chunking_and_prefix_caching_are_orthogonal(chunked, cached):
 
 @pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
 def test_kv_transfer_admits_only_pipeline_producer(monkeypatch, role):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_KV_RESHARD_TRANSPORT", "raiden")
+    monkeypatch.setattr(envs, "TPU_RAIDEN_QWEN35_ADMISSION", True)
+    monkeypatch.setattr(envs, "TPU_RAIDEN_POOL_TAGS_PER_LAYER", True)
     c = config()
     c.kv_transfer_config = SimpleNamespace(
         kv_connector="TPURaidenConnector", kv_role=role

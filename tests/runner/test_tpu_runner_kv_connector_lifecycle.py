@@ -55,6 +55,7 @@ def test_execute_model_starts_transfer_before_draining_previous_results(
         ),
         _flush_disjoint_async_results=lambda: events.append("flush"),
         _pcp_enabled=False,
+        _pp_wave=None,
         _reorder_batch_for_rpa=forward,
         kv_connector_no_forward=lambda *_args: output,
     )
@@ -287,3 +288,52 @@ def test_mtp_producer_output_waits_for_post_draft_kv(is_async, verify):
     events.append("scheduler_output")
     assert output.sampled_token_ids == [[7]]
     assert events == ["draft", "record", "wait", "scheduler_output"]
+
+
+def test_pp_prefill_mtp_hidden_outputs_are_enqueued_before_token_fence(monkeypatch):
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    events = []
+    runner = _fake_runner("mtp", False, False, MagicMock())
+    runner.vllm_config.kv_transfer_config = SimpleNamespace(is_kv_producer=True)
+    hidden = torch.tensor([[1.0, 2.0]])
+    drafter = MagicMock(spec=Eagle3Proposer)
+    drafter.prefill_only.side_effect = lambda *args: events.append("mtp") or [hidden]
+    runner._async_drafter = drafter
+    runner.execute_model_state.scheduler_output.kv_connector_metadata = None
+    connector = _recording_connector(events)
+    monkeypatch.setenv("TPU_MTP_PREFILL_ONLY", "1")
+
+    def enqueue(tensors, *, wait):
+        assert len(tensors) == 1 and tensors[0] is hidden
+        assert wait is False
+        events.append("enqueue_mtp")
+
+    event = MagicMock()
+    event.record.side_effect = lambda: events.append("record")
+    event.synchronize.side_effect = lambda: events.append("wait")
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=lambda: event), raising=False
+    )
+
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+            return_value=connector,
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.synchronize_tensors", side_effect=enqueue
+        ),
+        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy),
+        patch(
+            "vllm_torchtpu.spec_decode.prefill_only.handoff_seed_tokens",
+            side_effect=lambda tokens, *args: tokens,
+        ),
+    ):
+        output = TPUModelRunner.sample_tokens(runner, None)
+    assert output.sampled_token_ids == [[7]]
+    assert events == ["mtp", "enqueue_mtp", "record", "save", "poll", "clear", "wait"]
+    runner.spec_decode_manager.propose_draft_token_ids.assert_not_called()

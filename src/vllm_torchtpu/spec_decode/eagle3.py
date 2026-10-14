@@ -1053,7 +1053,7 @@ class Eagle3Proposer:
         scheduler_output: SchedulerOutput,
         device_seed: torch.Tensor,
         discard_sampled_tokens_req_indices: list[int] | None = None,
-    ) -> None:
+    ) -> list[torch.Tensor]:
         """Populate MTP KV; capture CPU snapshots only for explicit diagnostics.
 
         No draft logits or proposals are produced. Intermediate chunks use the
@@ -1066,6 +1066,7 @@ class Eagle3Proposer:
 
         if not isinstance(self.draft_model, QwenMTPPrefillMixin):
             raise NotImplementedError("MTP prefill supports Qwen3Next and Qwen3.5 MoE.")
+        outputs: list[torch.Tensor] = []
         snapshots = []
         assert self.draft_chunks is not None
         for chunk in self.draft_chunks:
@@ -1089,6 +1090,7 @@ class Eagle3Proposer:
                 num_rejected_np=rejected,
                 num_tokens_padded=ids.shape[0],
             )
+            outputs.append(output)
             if not self.capture_prefill_snapshots:
                 continue
             rows = int(chunk.query_start_loc_np[-1])
@@ -1118,6 +1120,8 @@ class Eagle3Proposer:
             logger.info(
                 "MTP prefill captured on final stage: %d chunks", len(snapshots)
             )
+
+        return outputs
 
     def propose(
         self,
