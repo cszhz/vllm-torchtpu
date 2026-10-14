@@ -5,7 +5,6 @@ import contextlib
 import copy
 import dataclasses
 import functools
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,7 +13,6 @@ from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
@@ -25,7 +23,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
-from vllm_torchtpu.runner.decode_nan_dump import DecodeNaNDumper
 from vllm_torchtpu.spec_decode.qwen3_next_mtp_loader import (
     maybe_use_qwen3_next_mtp_loader,
 )
@@ -197,7 +194,6 @@ class Eagle3Proposer:
         # load_model by diffing the global attention-layer registry before
         # vs after the draft model loads.
         self._draft_attn_layer_names: set[str] | None = None
-        self._decode_nan_dumper: DecodeNaNDumper | None = None
         # True once load_model has wired this draft's attention layers to read
         # the target's KV cache (cross-model KV sharing, Gemma-4-style MTP).
         # Resolved from the draft model's own declaration, NOT from
@@ -258,20 +254,6 @@ class Eagle3Proposer:
         )
         draft_attn_layer_names = set(all_attn_layers.keys()) - target_attn_layer_names
         self._draft_attn_layer_names = draft_attn_layer_names
-        if self.runner._decode_nan_dumper is not None:
-            self._decode_nan_dumper = DecodeNaNDumper(
-                "draft",
-                (
-                    set(
-                        get_layers_from_vllm_config(
-                            self.vllm_config, AttentionLayerBase
-                        )
-                    )
-                    | set(get_layers_from_vllm_config(self.vllm_config, MambaBase))
-                )
-                - self.runner._decode_nan_dumper.layer_names,
-                Path(envs.TPU_DECODE_NAN_DUMP_DIR),
-            )
 
         if self.runner._pcp_enabled and self.runner._mtp_enabled:
             self._validate_pcp_draft_model(draft_attn_layer_names)
@@ -1201,10 +1183,6 @@ class Eagle3Proposer:
             )
             hidden_carry_per_chunk.append(hidden_carry)
             positions_carry_per_chunk.append(positions_carry)
-            if self._decode_nan_dumper is not None:
-                self._decode_nan_dumper.check(
-                    runner, last_hidden_carry, np.arange(chunk.num_reqs)
-                )
             with set_model_tag("eagle_head"):
                 draft_tokens_per_chunk.append(
                     [self._draft_propose_token(last_hidden_carry)]
@@ -1291,10 +1269,6 @@ class Eagle3Proposer:
                     loop_query_start_loc=loop_qsl_per_chunk[ci],
                     loop_request_distribution=loop_reqdist_per_chunk[ci],
                 )
-                if self._decode_nan_dumper is not None:
-                    self._decode_nan_dumper.check(
-                        runner, last_hidden, np.arange(chunk.num_reqs)
-                    )
                 with set_model_tag("eagle_head"):
                     draft_tokens_per_chunk[ci].append(
                         self._draft_propose_token(last_hidden)
@@ -1822,15 +1796,6 @@ class Eagle3Proposer:
         }
         if self.speculative_config.method == "mtp":
             kwargs["spec_step_idx"] = step_idx
-
-        if self._decode_nan_dumper is not None:
-            self._decode_nan_dumper.record_forward(
-                self.runner,
-                chunk.start_index,
-                chunk.num_reqs,
-                kwargs,
-                attn_metadata,
-            )
 
         model = self._draft_model_for_step(step_idx)
         with (
