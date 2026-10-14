@@ -4805,25 +4805,6 @@ class TPURaidenConnectorWorker:
             )
         return live_bytes // page_tokens
 
-    def _stage3_state_live_bytes(self, tag: str) -> int:
-        """Return the admitted whole-slot byte size for an exact state tag."""
-        manifest = self._raiden_manifest
-        if manifest is None or not hasattr(manifest, "geometry_by_tag"):
-            raise RuntimeError("GDN state reshard requires the admitted pool manifest")
-        from vllm_torchtpu.distributed.kv_transfer.raiden.tags import class_tag
-
-        geometry = manifest.geometry_by_tag().get(class_tag(tag))
-        if not geometry:
-            raise RuntimeError(
-                f"GDN state tag {tag!r} is absent from the pool manifest"
-            )
-        live_bytes = int(geometry["live_bytes_per_block"])
-        if live_bytes <= 0:
-            raise RuntimeError(
-                f"GDN state tag {tag!r} has invalid live bytes {live_bytes}"
-            )
-        return live_bytes
-
     def _stage3_state_regions(self, tag: str) -> tuple[Any, ...]:
         """Return one uniform admitted live-region map for a state tag."""
         manifest = self._raiden_manifest
@@ -4943,6 +4924,7 @@ class TPURaidenConnectorWorker:
             sol_fa_geometry_from_manifest,
             sol_gdn_conv_lane_bytes,
         )
+        from vllm_torchtpu.distributed.kv_transfer.raiden.tags import class_tag
 
         aliased_raw = self._raiden_manifest.binding == BINDING_ALIASED_RAW
         if aliased_raw and not self._stage3_kimi:
@@ -4984,6 +4966,10 @@ class TPURaidenConnectorWorker:
             physical_granule = geometry.packing * geometry.page_tokens
             conv_lane_bytes = sol_gdn_conv_lane_bytes(geometry)
 
+        # Validate the manifest once per request, not once per layer's state tag.
+        manifest = self._raiden_manifest
+        assert manifest is not None
+        geometry_by_tag = manifest.geometry_by_tag()
         registrations = []
         for exact_tag, ordinal in self._stage3_state_registration_tags():
             block_id = mamba_state_block_ids[ordinal]
@@ -5002,7 +4988,17 @@ class TPURaidenConnectorWorker:
                         "aliased raw GDN pool base and block stride must "
                         f"be physical-token aligned ({exact_tag})"
                     )
-            admitted_live_bytes = self._stage3_state_live_bytes(exact_tag)
+            state_geometry = geometry_by_tag.get(class_tag(exact_tag))
+            if not state_geometry:
+                raise RuntimeError(
+                    f"GDN state tag {exact_tag!r} is absent from the pool manifest"
+                )
+            admitted_live_bytes = int(state_geometry["live_bytes_per_block"])
+            if admitted_live_bytes <= 0:
+                raise RuntimeError(
+                    f"GDN state tag {exact_tag!r} has invalid live bytes "
+                    f"{admitted_live_bytes}"
+                )
             if self._stage3_kimi:
                 dst_shards = tpu_envs.TPU_RAIDEN_DST_SHARDS
                 assert dst_shards is not None
