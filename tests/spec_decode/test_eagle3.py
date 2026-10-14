@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import inspect
 from types import SimpleNamespace
 from unittest import mock
 
@@ -897,68 +898,93 @@ def test_propose_empty_batch():
     )
 
 
-def test_propose_pads_to_coordinated_chunk_bound(device):
-    """Under EP-DP lockstep, a rank with fewer chunks than the coordinated
-    bound must pad with run_dp_dummy_draft chunks so draft-forward counts pair
-    across DP ranks."""
-    proposer = _make_proposer(draft_tp=1)
-    proposer.speculative_config.num_speculative_tokens = 1
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("method", ["eagle3", "mtp"])
+@pytest.mark.parametrize("num_steps", [1, 3])
+@pytest.mark.parametrize("num_real_chunks", [1, 2, 3])
+@pytest.mark.parametrize("is_async", [False, True])
+def test_propose_pads_each_step_to_coordinated_chunk_bound(
+    monkeypatch, method, num_steps, num_real_chunks, is_async
+):
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a: None)
+    device = torch.device("cpu")
+    proposer = _make_proposer(draft_tp=2, target_tp=2, method=method)
+    proposer.speculative_config.num_speculative_tokens = num_steps
     proposer.runner = SimpleNamespace(
-        input_batch=SimpleNamespace(num_reqs=1),
+        input_batch=SimpleNamespace(num_reqs=num_real_chunks),
         max_num_reqs=16,
         num_reqs_max_model_len=16,
         num_reqs_most_model_len=16,
-        num_tokens_paddings=[16],
+        num_tokens_paddings=[16, 64],
         device=device,
-        # Lockstep ON with a coordinated bound of 3 chunks; this rank has 1.
+        uses_mrope=False,
+        _hidden_states_dtype=torch.float32,
         _dp_lockstep_enabled=lambda: True,
         _dp_step_num_chunks=3,
-        _dp_target_bucket=16,
+        _dp_target_bucket=64,
     )
-
-    chunk = _make_chunk(
-        input_ids=torch.zeros(16, dtype=torch.int32, device=device),
-        position_ids=torch.zeros(16, dtype=torch.int32, device=device),
-        query_start_loc_np=np.arange(2, dtype=np.int32),
-        start_index=0,
-        num_reqs=1,
-        device=device,
-        attn_ctx=SimpleNamespace(use_max_model_len=True),
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8),
+        model=SimpleNamespace(
+            use_aux_hidden_state=method == "eagle3", fc_input_size=24
+        ),
     )
-    proposer.draft_chunks = [chunk]
-
-    class _StubDraft:
-        model = SimpleNamespace(use_aux_hidden_state=True)
-
-        def combine_hidden_states(self, x):
-            return x
-
-        def compute_logits(self, hidden):
-            return torch.zeros((hidden.shape[0], 4), device=device)
-
-    proposer.draft_model = _StubDraft()
-    proposer._prepare_draft_inputs = lambda *a, **k: (
-        torch.zeros(16, dtype=torch.int32, device=device),
-        torch.zeros(16, dtype=torch.int32, device=device),
-        torch.zeros(1, dtype=torch.int64, device=device),
-        np.zeros(1, dtype=np.int32),
+    proposer.draft_chunks = [
+        _make_chunk(
+            input_ids=torch.zeros(64, dtype=torch.int32),
+            position_ids=torch.zeros(64, dtype=torch.int32),
+            query_start_loc_np=np.arange(2, dtype=np.int32),
+            start_index=ci,
+            num_reqs=1,
+            device=device,
+            hidden_states=torch.zeros((64, 8)),
+            attn_ctx=SimpleNamespace(use_max_model_len=True),
+        )
+        for ci in range(num_real_chunks)
+    ]
+    proposer._draft_combine_hidden_states = lambda *states: states[0]
+    proposer._draft_gather_carries = inspect.unwrap(
+        Eagle3Proposer._draft_gather_carries
+    ).__get__(proposer)
+    proposer._draft_propose_token = lambda hidden: hidden[:, 0].to(torch.int32)
+    proposer._prepare_draft_inputs = lambda chunk, *a, **k: (
+        chunk.input_ids,
+        chunk.position_ids,
+        torch.arange(16, dtype=torch.int64),
+        torch.zeros(16, dtype=torch.int32) if is_async else np.zeros(16, np.int32),
     )
-    proposer._forward_draft = lambda **k: (
-        torch.zeros((16, 8), device=device),
-        torch.zeros((16, 8), device=device),
-    )
-    dummy_chunks = []
-    proposer.run_dp_dummy_draft = lambda n: dummy_chunks.append(n)
+    trace = []
 
-    proposer.propose(
-        sampled_token_ids=[[0]],
+    def forward(*, chunk, step_idx, num_tokens_padded, **kwargs):
+        trace.append((step_idx, num_tokens_padded))
+        hidden = torch.full(
+            (num_tokens_padded, 8), chunk.start_index * 10 + step_idx + 1
+        )
+        return hidden, hidden
+
+    proposer._forward_draft = forward
+    result = proposer.propose(
+        sampled_token_ids=[[0]] * num_real_chunks,
         discard_sampled_tokens_req_indices=[],
         num_rejected_tokens_np=None,
         scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+        return_device=is_async,
+        next_tokens_per_chunk=(
+            [torch.zeros((1, num_steps + 1), dtype=torch.int32)] * num_real_chunks
+            if is_async
+            else None
+        ),
     )
 
-    # coordinated bound 3 − 1 real chunk = 2 padding chunks.
-    assert dummy_chunks == [2]
+    assert trace == [(0, 64)] * 3 + [
+        (step, 16) for step in range(1, num_steps) for _ in range(3)
+    ]
+    assert (result.tolist() if is_async else result) == [
+        [ci * 10 + step + 1 for step in range(num_steps)]
+        for ci in range(num_real_chunks)
+    ]
 
 
 def test_loop_bucket_constant_under_sharded_lockstep():
@@ -982,6 +1008,7 @@ def test_loop_bucket_constant_under_sharded_lockstep():
     assert rep._loop_bucket(33) == 64
 
 
+@pytest.mark.cpu_test
 def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
     """Sharded draft under EP-DP lockstep: each padding chunk must replay the
     real propose's collective trace — combine (1/chunk), first-pass forward
@@ -1029,10 +1056,9 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
     # One combine per chunk, at the coordinated bucket width (aux thirds).
     assert len(combine) == 2
     assert all(t.shape == (64, 8) for t in combine[0])
-    # K forwards per chunk: first pass @bucket=64, then K-1 loop @p=16
-    # (constant loop bucket = pad(max_num_reqs)).
-    assert [f["num_tokens_padded"] for f in fwd] == [64, 16, 16] * 2
-    assert [f["step_idx"] for f in fwd] == [0, 1, 2] * 2
+    # Both first passes precede step 1 and step 2, matching real propose.
+    assert [f["num_tokens_padded"] for f in fwd] == [64, 64, 16, 16, 16, 16]
+    assert [f["step_idx"] for f in fwd] == [0, 0, 1, 1, 2, 2]
     # Loop steps carry the loop metadata tensors (shape parity with propose).
     assert all(
         f.get("loop_query_start_loc") is not None for f in fwd if f["step_idx"] > 0
@@ -1041,6 +1067,7 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
     assert tok_shapes == [(16, 8)] * 6
 
 
+@pytest.mark.cpu_test
 def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
     """An MTP draft has no combine_hidden_states, so the replay must not
     emit one.
@@ -1091,8 +1118,8 @@ def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
     proposer.run_dp_dummy_draft(2)
 
     # Same forward/lm-head trace as eagle3, only without the combine step.
-    assert [f["num_tokens_padded"] for f in fwd] == [64, 16, 16] * 2
-    assert [f["step_idx"] for f in fwd] == [0, 1, 2] * 2
+    assert [f["num_tokens_padded"] for f in fwd] == [64, 64, 16, 16, 16, 16]
+    assert [f["step_idx"] for f in fwd] == [0, 0, 1, 1, 2, 2]
     assert tok_shapes == [(16, 8)] * 6
 
 

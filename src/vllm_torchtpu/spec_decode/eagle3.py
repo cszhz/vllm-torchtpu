@@ -5,6 +5,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -1093,6 +1094,11 @@ class Eagle3Proposer:
                 "in eagle3, or no hidden_states were captured). "
                 "Ensure target verify step correctly recorded state."
             )
+        dummy_steps = self._dp_dummy_draft_steps(
+            runner._dp_step_num_chunks - len(chunks)
+            if runner._dp_lockstep_enabled()
+            else 0
+        )
         # First pass, per chunk — mirrors the target's chunked verify forward.
         # _prepare_draft_inputs returns last_token_indices padded to the chunk's
         # loop bucket p, so the per-request gathers/carries below are
@@ -1187,6 +1193,7 @@ class Eagle3Proposer:
                 draft_tokens_per_chunk.append(
                     [self._draft_propose_token(last_hidden_carry)]
                 )
+        next(dummy_steps, None)
 
         if K > 1:
             # Loop steps: uniform decode shape, one query per request. The
@@ -1310,14 +1317,7 @@ class Eagle3Proposer:
                             # hundred KiB.
                             self._mtp_restore_topk(saved_topk_per_chunk[ci])
                         run_draft_step(ci, step)
-
-        # EP-DP lockstep: pad this rank's draft-forward count up to the
-        # step's coordinated chunk bound so ranks with fewer chunks still
-        # run the same number of draft forwards as their peers.
-        if runner._dp_lockstep_enabled():
-            extra_chunks = runner._dp_step_num_chunks - len(chunks)
-            if extra_chunks > 0:
-                self.run_dp_dummy_draft(extra_chunks)
+                    next(dummy_steps, None)
 
         # Assemble [total_num_reqs, K]. Each chunk's tokens are padded to p; slice
         # to the real num_reqs at the end. Sync slices on the host (the [p, K] D2H
@@ -2013,23 +2013,18 @@ class Eagle3Proposer:
                 logger.info("  -- drafter compute_logits n: %d", n)
 
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
-        """Replay a busy rank's DRAFT collective trace on an idle/padding rank,
-        for `num_chunks` padding chunks (EP-DP lockstep).
+        """Replay all draft steps on an idle rank."""
+        for _ in self._dp_dummy_draft_steps(num_chunks):
+            pass
 
-        SHARDED draft (draft_tp == target tp): the draft's collectives are matched
-        across ranks by graph-structure channel IDs, so each padding chunk must
-        replay the REAL propose trace, channel IDs attach to collectives only.
-
-        REPLICATED draft (draft_tp=1): entirely local — it emits no
-        collectives, so there is nothing for an idle rank to pair with and the
-        forwards would be pure wasted device time.
-        """
-        if not self._dp_lockstep_sharded():
+    def _dp_dummy_draft_steps(self, num_chunks: int) -> Iterator[None]:
+        """Yield after each step's padding chunks to match propose's collectives."""
+        if num_chunks <= 0 or not self._dp_lockstep_sharded():
             return
         self._draft_md_cache.clear()
         runner = self.runner
         K = self.speculative_config.num_speculative_tokens
-        if num_chunks * K == 0:
+        if K == 0:
             return
         bucket = runner._dp_target_bucket
         assert bucket is not None, "_dp_target_bucket unset in lockstep step"
@@ -2082,7 +2077,7 @@ class Eagle3Proposer:
             num_reqs=num_reqs,
             aux_hidden_states=[],
         )
-        # Replay the real propose trace per padding chunk.
+        # Match propose's first-pass and loop buckets.
         p = self._loop_bucket(num_reqs)
         draft_hidden = self._draft_hidden_size()
         dtype = runner._hidden_states_dtype
@@ -2127,50 +2122,41 @@ class Eagle3Proposer:
                 dtype=dtype,
                 device=runner.device,
             )
-        for _ in range(num_chunks):
-            # Mirror the real first pass: combine -> forward @bucket -> lm head.
-            if uses_aux or combines_plain:
-                with set_model_tag("eagle_head"):
-                    if uses_aux:
-                        self._draft_combine_hidden_states(*combine_aux)
-                    else:
-                        assert self.draft_model is not None
-                        self.draft_model.combine_hidden_states(combine_plain)
-            last_hidden, _ = self._forward_draft(
-                chunk=chunk,
-                input_ids=input_ids,
-                positions=positions,
-                target_hidden_states=target_hidden_states,
-                step_idx=0,
-                seq_lens_delta=0,
-                num_rejected_np=None,
-                num_tokens_padded=bucket,
-            )
-            with set_model_tag("eagle_head"):
-                tok = self._draft_propose_token(first_pass_carry)
-            # Mirror the K-1 loop steps: forward @p -> lm head @p. Under
-            # IndexShare, _forward_draft routes these to the loop-step program
-            # exactly as a real propose does, so this rank runs the same
-            # programs, and the same collectives, as its peers. They read the
-            # top-k table without having written it this step; load_model
-            # seeds it with -1 so that read stays in range.
-            for step in range(1, K):
-                last_hidden, _ = self._forward_draft(
-                    chunk=chunk,
-                    input_ids=loop_input_ids,
-                    positions=loop_positions,
-                    target_hidden_states=loop_hidden,
-                    step_idx=step,
-                    # Mirror the real loop so the dummy traces the same
-                    # metadata program the peer ranks' propose emits.
-                    seq_lens_delta=(step if self.advance_draft_positions else 0),
-                    num_rejected_np=None,
-                    num_tokens_padded=p,
-                    loop_query_start_loc=loop_qsl,
-                    loop_request_distribution=loop_reqdist,
-                )
+        for step in range(K):
+            for _ in range(num_chunks):
+                if step == 0:
+                    if uses_aux or combines_plain:
+                        with set_model_tag("eagle_head"):
+                            if uses_aux:
+                                self._draft_combine_hidden_states(*combine_aux)
+                            else:
+                                assert self.draft_model is not None
+                                self.draft_model.combine_hidden_states(combine_plain)
+                    self._forward_draft(
+                        chunk=chunk,
+                        input_ids=input_ids,
+                        positions=positions,
+                        target_hidden_states=target_hidden_states,
+                        step_idx=0,
+                        seq_lens_delta=0,
+                        num_rejected_np=None,
+                        num_tokens_padded=bucket,
+                    )
+                    last_hidden = first_pass_carry
+                else:
+                    last_hidden, _ = self._forward_draft(
+                        chunk=chunk,
+                        input_ids=loop_input_ids,
+                        positions=loop_positions,
+                        target_hidden_states=loop_hidden,
+                        step_idx=step,
+                        seq_lens_delta=(step if self.advance_draft_positions else 0),
+                        num_rejected_np=None,
+                        num_tokens_padded=p,
+                        loop_query_start_loc=loop_qsl,
+                        loop_request_distribution=loop_reqdist,
+                    )
                 with set_model_tag("eagle_head"):
                     tok = self._draft_propose_token(last_hidden)
-            # Force the chunk to execute so its collectives fire in lockstep
-            # with the peer ranks' real propose (nothing consumes the result).
-            synchronize_tensors(tok)
+                synchronize_tensors(tok)
+            yield
