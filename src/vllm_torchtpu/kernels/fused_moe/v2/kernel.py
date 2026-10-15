@@ -1054,6 +1054,13 @@ def _build_fused_ep_moe_kernel(
                 def _(b=b):
                     weight_starts(visit_sm[b], b)
 
+            if starts_next_weights:
+                # The first visit's weights go out ahead of the barrier, so
+                # its stream overlaps the peers' arrival.
+                @pl.when(n_visit > 0)
+                def _():
+                    weight_starts(visit_sm[0], 0, 0)
+
         prologue()
         _all_pairs_barrier(ep)
 
@@ -1450,15 +1457,6 @@ def _build_fused_ep_moe_kernel(
                 # they have all retired by the loop's back edge, which is
                 # before this.
                 weight_starts(e, slot)
-            if starts_next_weights:
-                # Every later visit had its weights started by the one before,
-                # which is the whole point; the first has nobody to start them
-                # for it.
-
-                @pl.when(visit_i == 0)
-                def _():
-                    weight_starts(e, slot, sslot)
-
             weight_waits(e, slot, sslot)
             if scales_ahead:
                 # The other scale slot was last read by the previous visit.
