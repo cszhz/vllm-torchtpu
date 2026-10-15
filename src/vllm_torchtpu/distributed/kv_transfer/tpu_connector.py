@@ -6226,7 +6226,7 @@ class TPURaidenConnectorWorker:
             # The scheduler finished these requests: their registrations
             # made ahead of the finish start the TTL clock and the status
             # probe.
-            now = time.perf_counter()
+            now = time.time()
             for req_id in finished_req_ids or ():
                 registration = self._stage3_registered_sends.get(req_id)
                 if registration is not None and registration.finish_pending:
