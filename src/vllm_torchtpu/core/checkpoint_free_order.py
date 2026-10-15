@@ -82,7 +82,8 @@ def chain_ordered_blocks(kv_cache_manager, request: Request) -> list[KVCacheBloc
     full_mgr = managers[full[0]]
     alignment = full_mgr.cache_hit_alignment_tokens
     boundary = (request.num_prompt_tokens - 1) // alignment * alignment
-    split = boundary // full_mgr.block_size
+    # A boundary inside a block (fine prefix hits) keeps that block with the head.
+    split = -(-boundary // full_mgr.block_size)
 
     rest: list[KVCacheBlock] = []
     checkpoint: list[KVCacheBlock] = []
