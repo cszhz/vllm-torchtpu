@@ -18,7 +18,8 @@ With ``TPU_FINE_PREFIX_HIT_TOKENS=U`` hits land on multiples of ``U``:
 - Each request registers its full-attention prompt-tail block under the last
   ``U`` boundary before its final prompt token, where the next turn of the
   conversation resumes, and that entry survives the block filling up during
-  decode (KV rows below the boundary never change).
+  decode (KV rows below the boundary never change). Windowed groups keep a
+  checkpoint at that boundary and at the block-aligned one before it.
 """
 
 from __future__ import annotations
@@ -102,11 +103,35 @@ def _validate(coordinator, unit: int) -> None:
         fail("needs a full-attention group")
 
 
+def _keep_block_aligned_checkpoints(manager, scheduler_block_size: int) -> None:
+    """Windowed groups also keep the block-aligned replay checkpoint.
+
+    The fine checkpoint serves the next turn; a request that diverges between
+    the two boundaries (a truncated history, a sibling stream) still needs the
+    block-aligned one, which block-aligned hits would have kept.
+    """
+    block_mask = manager.reachable_block_mask
+
+    def reachable_block_mask(*args, reachable_boundaries=(), **kwargs):
+        boundaries = list(reachable_boundaries)
+        boundaries += [
+            b // scheduler_block_size * scheduler_block_size for b in boundaries
+        ]
+        return block_mask(*args, reachable_boundaries=boundaries, **kwargs)
+
+    manager.reachable_block_mask = reachable_block_mask
+    manager._tpu_coarse_alignment = scheduler_block_size
+
+
 def _enable(coordinator, unit: int) -> None:
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
     _validate(coordinator, unit)
     coordinator._tpu_fine_prefix_unit = unit
     for manager in coordinator.single_type_managers:
         manager.cache_hit_alignment_tokens = unit
+        if isinstance(manager, SlidingWindowManager):
+            _keep_block_aligned_checkpoints(manager, coordinator.scheduler_block_size)
     coordinator.block_pool._tpu_keep_partial_entries = True
     logger.info(
         "TPU_FINE_PREFIX_HIT_TOKENS: prefix-cache hits land on %d-token "

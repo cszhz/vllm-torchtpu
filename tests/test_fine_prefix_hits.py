@@ -125,8 +125,7 @@ def fine(request, monkeypatch):
     return request.param
 
 
-@pytest.fixture
-def hold(monkeypatch):
+def _hold(monkeypatch):
     monkeypatch.setattr(KVCacheManager, "free", cfo._free)
     monkeypatch.setattr(KVCacheManager, "pop_blocks_for_free", cfo._pop_blocks_for_free)
     monkeypatch.setattr(
@@ -134,6 +133,11 @@ def hold(monkeypatch):
         "remove_skipped_blocks",
         cfo._remove_skipped_blocks_holding_checkpoint,
     )
+
+
+@pytest.fixture
+def hold(monkeypatch):
+    _hold(monkeypatch)
 
 
 # 40,333-token first turn: replay boundary 40,320 = 39 blocks + 384 tokens.
@@ -212,6 +216,20 @@ def test_divergence_inside_a_block_falls_back_to_a_checkpoint(fine):
     _run(mgr, TURN1)
     _, hit, _ = mgr.get_computed_blocks(_request(TURN1[:35_000] + [5] * 900, 4))
     assert hit == 32 * FULL
+
+
+@pytest.mark.parametrize("held", [False, True], ids=["free", "hold"])
+def test_divergence_between_the_two_checkpoints_keeps_the_block_hit(
+    fine, held, monkeypatch
+):
+    """A prompt that leaves turn 1 between 39,936 and the fine boundary 40,320
+    (a truncated history) still resumes at the block-aligned checkpoint."""
+    if held:
+        _hold(monkeypatch)
+    mgr = _manager(400)
+    _run(mgr, TURN1, decode_steps=300)
+    _, hit, _ = mgr.get_computed_blocks(_request(TURN1[:40_100] + [3] * 900, 4))
+    assert hit == 39 * FULL
 
 
 @pytest.mark.parametrize("unit", [64, 96, 1024])
