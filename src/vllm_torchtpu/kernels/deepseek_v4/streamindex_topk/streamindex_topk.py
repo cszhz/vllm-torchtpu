@@ -183,6 +183,70 @@ class _BlockedPrefillConfig:
 def kernel(
     # Prefetch
     seq_lens_ref,  # [max_num_seqs]
+    cu_q_lens_ref,  # [max_num_seqs + 1]
+    start_end_seq_idx_ref,  # [3] (start_seq, end_seq, chunk_token_start)
+    metadata_ref,  # MetadataRef
+    cp_rank_ref,  # [1]
+    # Input
+    page_indices_hbm_ref,  # [max_num_seqs * pages_per_seq]
+    q_hbm_ref,
+    indexer_weights_hbm_ref,
+    cache_kv_hbm_ref,
+    *score_refs,
+    seq_batch_size: int,
+    **kwargs,
+):
+    """`score_pipeline` over an SMEM copy of this pass's page-table rows.
+
+    A scalar prefetch would copy the whole table into SMEM before the kernel
+    starts, ~4 us at 64 sequences x 1024 pages; a pass reads only the rows of
+    its own sequences (and of the padding ones that fill its last tile).
+    """
+    max_num_seqs = seq_lens_ref.shape[0]
+    pages_per_seq = page_indices_hbm_ref.shape[0] // max_num_seqs
+    start_seq = start_end_seq_idx_ref[0]
+    end_seq = jnp.minimum(start_end_seq_idx_ref[1] + seq_batch_size - 1, max_num_seqs)
+
+    def body(page_indices_ref, sem):
+        # SMEM is tiled by 128 words, so a window has to start on a tile; a table
+        # whose rows are not whole tiles is copied whole.
+        if pages_per_seq % 128 == 0:
+            rows = pl.ds(
+                start_seq * pages_per_seq,
+                jnp.maximum(end_seq - start_seq, 0) * pages_per_seq,
+            )
+        else:
+            rows = pl.ds(0, page_indices_hbm_ref.shape[0])
+        copy = pltpu.make_async_copy(
+            page_indices_hbm_ref.at[rows], page_indices_ref.at[rows], sem
+        )
+        copy.start()
+        copy.wait()
+        score_pipeline(
+            seq_lens_ref,
+            page_indices_ref,
+            cu_q_lens_ref,
+            start_end_seq_idx_ref,
+            metadata_ref,
+            cp_rank_ref,
+            q_hbm_ref,
+            indexer_weights_hbm_ref,
+            cache_kv_hbm_ref,
+            *score_refs,
+            seq_batch_size=seq_batch_size,
+            **kwargs,
+        )
+
+    pl.run_scoped(
+        body,
+        pltpu.SMEM(page_indices_hbm_ref.shape, page_indices_hbm_ref.dtype),
+        pltpu.SemaphoreType.DMA(()),
+    )
+
+
+def score_pipeline(
+    # Prefetch
+    seq_lens_ref,  # [max_num_seqs]
     page_indices_ref,  # [max_num_seqs * pages_per_seq]
     cu_q_lens_ref,  # [max_num_seqs + 1]
     start_end_seq_idx_ref,  # [3] (start_seq, end_seq, chunk_token_start)
@@ -1302,6 +1366,7 @@ def streamindex_topk(
         # one buffer per chunk either way.
         aliased = scores_init is not None
         in_specs = [
+            hbm_spec,  # page_indices
             hbm_spec,  # q
             hbm_spec,  # prepared_indexer_weights
             hbm_spec,  # cache_kv
@@ -1315,7 +1380,6 @@ def streamindex_topk(
         chunk_start = 0 if chunk_token_start is None else chunk_token_start
         scalar_prefetches = (
             seq_lens,
-            page_indices,
             cu_q_lens,
             jnp.array([start_seq_idx, end_seq_idx, chunk_start], jnp.int32),
             pass_meta,
@@ -1324,8 +1388,8 @@ def streamindex_topk(
 
         num_scalar_prefetch = len(scalar_prefetches)
         num_flat_prefetches = len(jax.tree_util.tree_leaves(scalar_prefetches))
-        # The aliased `scores_init` is the 4th operand after the flat prefetches.
-        input_output_aliases = {num_flat_prefetches + 3: 0} if aliased else {}
+        # The aliased `scores_init` is the 5th operand after the flat prefetches.
+        input_output_aliases = {num_flat_prefetches + 4: 0} if aliased else {}
 
         layout_tag = "" if kv_layout == KVLayout.HEAD_ALONG_SUBLANE else "-sal"
         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}{layout_tag}"
@@ -1371,6 +1435,7 @@ def streamindex_topk(
         )
         scores = pallas_kernel(
             *scalar_prefetches,
+            page_indices,
             q,
             prepared_indexer_weights,
             cache_kv,

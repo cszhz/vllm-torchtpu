@@ -71,13 +71,13 @@ def _mla_ragged_paged_attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_seqs]
     kv_lens_to_attend_ref,  # [max_num_tokens]
-    page_indices_ref,  # [max_num_seqs * pages_per_seq]
     cu_q_lens_ref,  # [max_num_seqs + 1]
     start_end_seq_idx_ref,  # [2] (start_seq_idx, end_seq_idx)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     bo_ids_ref,
     # Input
+    page_indices_hbm_ref,  # [max_num_seqs * pages_per_seq]
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
@@ -98,6 +98,10 @@ def _mla_ragged_paged_attention_kernel(
     l_ref,  # [batch_size, bq_sz * num_q_heads],
     m_ref,  # [batch_size, bq_sz * num_q_heads],
     acc_ref,  # [batch_size, bq_sz * num_q_heads, head_dim],
+    # SMEM copy of the rows of `page_indices_hbm_ref` this pass reads; the other
+    # rows are never written or read.
+    page_indices_ref,  # [max_num_seqs * pages_per_seq]
+    page_indices_sem,
     *,
     static_q_len: int | None,
     sm_scale: float,
@@ -113,7 +117,7 @@ def _mla_ragged_paged_attention_kernel(
     assert num_slots % num_slots_per_token == 0
     page_size = num_slots // num_slots_per_token
     max_num_seqs = kv_lens_ref.shape[0]
-    num_page_indices = page_indices_ref.shape[0]
+    num_page_indices = page_indices_hbm_ref.shape[0]
 
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
@@ -199,9 +203,10 @@ def _mla_ragged_paged_attention_kernel(
                 lkv_dim,
             )
 
-            # A disabled fetch may name the sequence past the last one; it reads a
-            # valid one and copies nothing.
-            seq_idx = jnp.minimum(batch_start_seq_idx + b, max_num_seqs - 1)
+            # A disabled fetch may name the sequence past the last one; it reads
+            # the pass's last one (whose page-table row is in SMEM) and copies
+            # nothing.
+            seq_idx = jnp.minimum(batch_start_seq_idx + b, end_seq_idx - 1)
             kv_len = kv_lens_ref[seq_idx]
             kv_len_start = bkv_idx * bkv_sz
             kv_p_start = bkv_idx * bkv_p
@@ -597,6 +602,23 @@ def _mla_ragged_paged_attention_kernel(
         start_fetch_bq(start_seq_idx, 0, 0)
         start_fetch_swa(start_seq_idx, 0, 0)
 
+        # Only this pass's rows of the page table: a scalar prefetch would copy
+        # the whole table into SMEM, ~4 us at 64 sequences x 1024 pages. SMEM is
+        # tiled by 128 words, so a window has to start on a tile; a table whose
+        # rows are not whole tiles is copied whole.
+        if pages_per_seq % 128 == 0:
+            rows = pl.ds(
+                start_seq_idx * pages_per_seq,
+                (end_seq_idx - start_seq_idx) * pages_per_seq,
+            )
+        else:
+            rows = pl.ds(0, num_page_indices)
+        page_table_copy = pltpu.make_async_copy(
+            page_indices_hbm_ref.at[rows], page_indices_ref.at[rows], page_indices_sem
+        )
+        page_table_copy.start()
+        page_table_copy.wait()
+
         # Initialize bkv_x2_ref to avoid NaN issues from accessing uninitialized
         # memory
         bkv_zeros = jnp.zeros(bkv_x2_ref.shape[1:], bkv_x2_ref.dtype)
@@ -821,6 +843,7 @@ def mla_ragged_paged_attention(
 
         grid = ((end_seq_idx - start_seq_idx) // batch_size,)
         in_specs = [
+            pl.BlockSpec(memory_space=pltpu.HBM),  # page_indices
             pl.BlockSpec(memory_space=pltpu.VMEM),  # attention_sinks
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv
@@ -890,12 +913,13 @@ def mla_ragged_paged_attention(
             l_scratch,
             m_scratch,
             acc_scratch,
+            pltpu.SMEM(page_indices.shape, page_indices.dtype),
+            pltpu.SemaphoreType.DMA(()),
         ]
 
         scalar_prefetches = (
             kv_lens,
             kv_lens_to_attend,
-            page_indices,
             cu_q_lens,
             jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
             # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
@@ -938,6 +962,7 @@ def mla_ragged_paged_attention(
         )
         return kernel(
             *scalar_prefetches,
+            page_indices,
             attention_sinks,
             q,
             cache_kv,
