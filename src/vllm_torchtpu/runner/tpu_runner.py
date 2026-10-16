@@ -350,7 +350,10 @@ SAMPLING_EPS = 1e-5
 def _get_sequence_layout_planner_for_runner(runner: Any):
     planner = runner.sequence_layout_planner
     eligibility = getattr(planner, "eligibility", None)
-    if eligibility is not None and getattr(eligibility, "is_zigzag", False):
+    if eligibility is not None and (
+        getattr(eligibility, "is_zigzag", False)
+        or getattr(eligibility, "is_interleaved", False)
+    ):
         from vllm_torchtpu.layers.core.pcp_sequence_layout import (
             resolve_pcp_zigzag_page_size,
         )
@@ -711,9 +714,16 @@ class TPUModelRunner(GPUModelRunner):
             (
                 getattr(self, "sequence_layout_planner", None) is not None
                 and getattr(self.sequence_layout_planner, "eligibility", None) is not None
-                and getattr(self.sequence_layout_planner.eligibility, "is_zigzag", False)
+                and (
+                    getattr(self.sequence_layout_planner.eligibility, "is_zigzag", False)
+                    or getattr(
+                        self.sequence_layout_planner.eligibility,
+                        "is_interleaved",
+                        False,
+                    )
+                )
             )
-            or (envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag")
+            or (envs.VLLM_TPU_PCP_LAYOUT.lower() in ("zigzag", "interleaved"))
         )
         if is_zigzag_pcp:
             from vllm_torchtpu.layers.core.pcp_sequence_layout import (
@@ -1369,7 +1379,8 @@ class TPUModelRunner(GPUModelRunner):
 
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
         is_zigzag_pcp = (
-            self._pcp_enabled and envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag"
+            self._pcp_enabled
+            and envs.VLLM_TPU_PCP_LAYOUT.lower() in ("zigzag", "interleaved")
         )
 
         def segment(req_id: str) -> int:
@@ -2518,7 +2529,8 @@ class TPUModelRunner(GPUModelRunner):
 
         # Get the number of scheduled tokens for each request.
         is_zigzag_pcp = (
-            self._pcp_enabled and envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag"
+            self._pcp_enabled
+            and envs.VLLM_TPU_PCP_LAYOUT.lower() in ("zigzag", "interleaved")
         )
         seg_end = (
             rpa_num_decode_reqs
@@ -2679,6 +2691,7 @@ class TPUModelRunner(GPUModelRunner):
                 ]
                 + num_scheduled_tokens_per_req
             )
+            self.seq_lens_np[num_reqs:] = 0
         self._check_attention_schedule(
             num_reqs,
             num_scheduled_tokens_per_req,
@@ -2751,9 +2764,11 @@ class TPUModelRunner(GPUModelRunner):
             self.position_ids = self.positions_cpu[local_token_slice].to(
                 self.device, non_blocking=True
             )
+        pcp_meta = getattr(layout_plan, "pcp_metadata", None)
         is_pcp_zigzag = (
             layout_plan.descriptor is not None
             and layout_plan.descriptor.protocol == PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL
+            and not getattr(pcp_meta, "is_interleaved", False)
         )
         if is_pcp_zigzag:
             target_num_reqs = max(target_num_reqs, 2 * num_reqs)
@@ -3119,7 +3134,8 @@ class TPUModelRunner(GPUModelRunner):
 
         num_reqs = self.input_batch.num_reqs
         is_zigzag_pcp = (
-            self._pcp_enabled and envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag"
+            self._pcp_enabled
+            and envs.VLLM_TPU_PCP_LAYOUT.lower() in ("zigzag", "interleaved")
         )
         start_index = 0
         num_chunks = 0
@@ -4697,10 +4713,12 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 request_distribution = combined_device[0:3]
                 dummy_mamba_request_distribution = combined_device[3:6]
+            dummy_pcp_meta = getattr(dummy_layout_plan, "pcp_metadata", None)
             is_pcp_zigzag = (
                 dummy_layout_plan.descriptor is not None
                 and dummy_layout_plan.descriptor.protocol
                 == PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL
+                and not getattr(dummy_pcp_meta, "is_interleaved", False)
             )
             self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
                 num_reqs=num_reqs,

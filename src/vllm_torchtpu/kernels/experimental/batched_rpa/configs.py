@@ -25,18 +25,36 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import utils
 
 @dataclasses.dataclass(frozen=True)
 class BlockSizes:
-  """Tuning parameters for the RPA kernel."""
+  """Tuning parameters for the RPA kernel.
+
+  Attributes:
+    bq_sz: Query block size.
+    bq_c_sz: Query chunk block size for prefill.
+    bkv_sz: Key/Value block size.
+    batch_size: Batch size.
+    n_buffer: Number of pipeline buffers (defaults to NUM_INPUT_SLOTS = 3).
+  """
 
   bq_sz: int
   bq_c_sz: int
   bkv_sz: int
   batch_size: int
-  n_buffer: int
+  n_buffer: int = 3
 
 
 @dataclasses.dataclass(frozen=True)
 class ModelConfigs:
-  """Model config that will always stay constant."""
+  """Model config that will always stay constant.
+
+  Attributes:
+    num_q_heads: Number of query attention heads.
+    num_kv_heads: Number of key/value attention heads.
+    head_dim: Dimensionality of each attention head.
+    mask_value: Attention mask value for masked positions.
+    sm_scale: Softmax scaling factor.
+    soft_cap: Soft-capping threshold for attention logits.
+    sliding_window: Size of the sliding attention window.
+  """
 
   num_q_heads: int
   num_kv_heads: int
@@ -75,12 +93,60 @@ class KVLayout(enum.StrEnum):
   SEQ_ALONG_LANE = enum.auto()
 
   @property
-  def symbol(self):
+  def symbol(self) -> str:
     match self:
       case KVLayout.HEAD_ALONG_SUBLANE:
         return "snh"
       case KVLayout.SEQ_ALONG_LANE:
         return "nhs"
+
+
+class RpaCase(enum.StrEnum):
+  """Represents the different cases for Ragged Paged Attention.
+
+  - DECODE: Sequences are in decode-only mode (q_len = 1).
+  - PREFILL: Sequences are in prefill-only mode (q_len > 1, static). Note that
+    Batched RPA folds PREFILL into MIXED, but the enum value is kept because
+    distribution still has three entries and RPA v3 / MLA use it.
+  - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
+  """
+
+  DECODE = enum.auto()
+  PREFILL = enum.auto()
+  MIXED = enum.auto()
+
+  @property
+  def symbol(self) -> str:
+    match self:
+      case RpaCase.DECODE:
+        return "d"
+      case RpaCase.PREFILL:
+        return "p"
+      case RpaCase.MIXED:
+        return "m"
+
+  def get_range(
+      self, distribution: jax.Array
+  ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
+    assert distribution.shape == (3,)
+    match self:
+      case RpaCase.DECODE:
+        return 0, distribution[0]
+      case RpaCase.PREFILL:
+        return distribution[0], distribution[1]
+      case RpaCase.MIXED:
+        return distribution[1], distribution[2]
+
+
+# Inputs need three slots. The fetch for a tile is issued throughout the
+# preceding tile rather than all at once at its start, so it cannot be waited
+# on right away -- it needs one extra tile in flight for the DMA to land.
+NUM_INPUT_SLOTS = 3
+
+# Outputs only need two. The writeback issued at step N is waited at the top of
+# step N + 2, which is exactly when slot N % 2 comes back around, so the DMA
+# still gets all of step N + 1 to land.
+NUM_OUTPUT_SLOTS = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,8 +173,10 @@ class ServingConfigs:
   pcp_ring_axis_name: str | None = None
   pcp_ring_mesh_axis_names: tuple[str, ...] | None = None
   paged_new_kv: bool = False
+  cp_interleaved: bool = False
   attention_scope: AttentionScope = AttentionScope.FULL
   return_lse: bool = False
+  skip_kv_update: bool = False
 
   @property
   def max_decode_bkv_p_new(self) -> int:
@@ -174,39 +242,7 @@ class ServingConfigs:
     return self.pcp_ring_axis_name is not None
 
 
-class RpaCase(enum.StrEnum):
-  """Represents the different cases for Ragged Paged Attention.
-
-  - DECODE: Sequences are in decode-only mode (q_len = 1).
-  - PREFILL: Sequences are in prefill-only mode (q_len > 1, static).
-  - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
-  """
-
-  DECODE = enum.auto()
-  PREFILL = enum.auto()
-  MIXED = enum.auto()
-
-  @property
-  def symbol(self):
-    match self:
-      case RpaCase.DECODE:
-        return "d"
-      case RpaCase.PREFILL:
-        return "p"
-      case RpaCase.MIXED:
-        return "m"
-
-  def get_range(
-      self, distribution: jax.Array
-  ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
-    assert distribution.shape == (3,)
-    match self:
-      case RpaCase.DECODE:
-        return 0, distribution[0]
-      case RpaCase.PREFILL:
-        return distribution[0], distribution[1]
-      case RpaCase.MIXED:
-        return distribution[1], distribution[2]
+RpaServeConfigs = ServingConfigs
 
 
 @dataclasses.dataclass(frozen=True, eq=True)
@@ -216,6 +252,10 @@ class RpaConfigs:
   serve: ServingConfigs
   mode: RpaCase
   vmem_limit_bytes: int
+
+  @property
+  def rpa_case(self) -> RpaCase:
+    return self.mode
 
   # Expose block sizes for ease of use.
 
@@ -238,6 +278,20 @@ class RpaConfigs:
   @property
   def n_buffer(self) -> int:
     return self.block.n_buffer
+
+  def seq_range(
+      self, distribution: jax.Array
+  ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
+    """Sequences this kernel call schedules.
+
+    Batched RPA has no specialised prefill-only path, so MIXED also covers the
+    prefill-only segment [distribution[0], distribution[1]).
+    """
+    if self.mode == RpaCase.DECODE:
+      return 0, distribution[0]
+    if self.mode == RpaCase.MIXED:
+      return distribution[0], distribution[2]
+    raise ValueError(f"Batched RPA does not dispatch {self.mode}; use MIXED.")
 
   # Define derived values.
 

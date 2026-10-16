@@ -29,6 +29,8 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
     pcp_local_token_counts,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
+    PCP_INTERLEAVED_SEQUENCE_LAYOUT_DESCRIPTOR,
+    PCP_INTERLEAVED_SEQUENCE_LAYOUT_PROTOCOL,
     PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
     PCP_ZIGZAG_SEQUENCE_LAYOUT_DESCRIPTOR,
     PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL,
@@ -61,6 +63,7 @@ class PcpSequenceLayoutMode(Enum):
     DISABLED = "DISABLED"
     STREAMING = "STREAMING"
     ZIGZAG = "ZIGZAG"
+    INTERLEAVED = "INTERLEAVED"
 
 
 @dataclass(frozen=True)
@@ -141,6 +144,7 @@ class PcpSequenceLayoutEligibility:
         pipeline_parallel_size: int = 1,
         async_scheduling: bool = False,
         is_zigzag: bool = False,
+        is_interleaved: bool = False,
         block_size: int = 16,
         max_num_tokens: int = 4096,
     ):
@@ -150,9 +154,10 @@ class PcpSequenceLayoutEligibility:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.async_scheduling = bool(async_scheduling)
         self.is_zigzag = bool(is_zigzag)
+        self.is_interleaved = bool(is_interleaved)
         self.block_size = (
             resolve_pcp_zigzag_page_size(block_size)
-            if self.is_zigzag
+            if (self.is_zigzag or self.is_interleaved)
             else int(block_size)
         )
         self.max_num_tokens = int(max_num_tokens)
@@ -173,6 +178,7 @@ class PcpSequenceLayoutEligibility:
 
         env_layout = envs.VLLM_TPU_PCP_LAYOUT.lower()
         is_zigzag = env_layout == "zigzag"
+        is_interleaved = env_layout == "interleaved"
 
         return cls(
             pcp_size=parallel_config.prefill_context_parallel_size,
@@ -181,6 +187,7 @@ class PcpSequenceLayoutEligibility:
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             async_scheduling=bool(scheduler_config.async_scheduling),
             is_zigzag=is_zigzag,
+            is_interleaved=is_interleaved,
             block_size=block_size,
             max_num_tokens=max_num_tokens,
         )
@@ -223,6 +230,13 @@ class PcpSequenceLayoutEligibility:
             raise NotImplementedError(self._BOUNDARY_MESSAGE)
 
         self._validate_execution_support()
+        if self.is_interleaved:
+            return self._evaluate_interleaved_query(
+                spans,
+                num_tokens_paddings=num_tokens_paddings,
+                max_num_tokens=max_num_tokens,
+                dp_target_bucket=dp_target_bucket,
+            )
         if self.is_zigzag:
             return self._evaluate_zigzag_query(
                 spans,
@@ -312,10 +326,77 @@ class PcpSequenceLayoutEligibility:
             raise NotImplementedError(
                 "PCP partial sequence layout does not support pipeline parallelism yet."
             )
-        if not self.is_zigzag and self.interleave_size <= 0:
+        if not (self.is_zigzag or self.is_interleaved) and self.interleave_size <= 0:
             raise ValueError(
                 "PCP partial sequence layout requires cp_kv_cache_interleave_size > 0."
             )
+
+    def _evaluate_interleaved_query(
+        self,
+        spans: tuple[PcpRequestSpan, ...],
+        *,
+        num_tokens_paddings: Sequence[int] | None,
+        max_num_tokens: int | None,
+        dp_target_bucket: int | None,
+    ) -> PcpSequenceLayoutDecision:
+        has_decode = any(
+            span.scheduled_tokens == 1 and span.computed_tokens > 0
+            for span in spans
+        )
+        has_prefill = any(
+            span.scheduled_tokens > 1 or span.computed_tokens == 0
+            for span in spans
+        )
+        if has_decode and has_prefill:
+            raise NotImplementedError(
+                "PCP batched RPA interleaved layout does not support mixed decode and prefill batches."
+            )
+
+        local_quantum = self.block_size
+        if has_decode:
+            s_live = len(spans)
+        else:
+            q_lens = [span.scheduled_tokens for span in spans]
+            chunk, off, s_live = pcp_interleaved_token_layout(
+                q_lens, self.pcp_size, self.block_size
+            )
+
+        local_padded_tokens = None
+        global_padded_tokens = None
+        if num_tokens_paddings is not None:
+            paddings = sorted(int(padding) for padding in num_tokens_paddings)
+            s_target = max(s_live, 2 * self.block_size) if not has_decode else s_live
+            local_padded_tokens = _first_ge(paddings, s_target)
+            if dp_target_bucket is not None and dp_target_bucket > local_padded_tokens:
+                local_padded_tokens = int(dp_target_bucket)
+            if not has_decode:
+                local_padded_tokens = max(local_padded_tokens, 2 * self.block_size)
+                local_padded_tokens = (
+                    (local_padded_tokens + local_quantum - 1) // local_quantum
+                ) * local_quantum
+            if max_num_tokens is not None and local_padded_tokens > int(max_num_tokens):
+                raise ValueError(
+                    f"PCP local padded token length exceeds runner max token buffer: "
+                    f"{local_padded_tokens=} max_num_tokens={int(max_num_tokens)}."
+                )
+            global_padded_tokens = local_padded_tokens * self.pcp_size
+
+        local_counts = np.full(self.pcp_size, s_live, dtype=np.int32)
+        return PcpSequenceLayoutDecision(
+            mode=PcpSequenceLayoutMode.INTERLEAVED,
+            spans=spans,
+            pcp_size=self.pcp_size,
+            interleave_size=self.interleave_size,
+            pcp_alignment=None,
+            absolute_query_start_offsets_per_req=np.asarray(
+                [span.absolute_query_start for span in spans], dtype=np.int64
+            ),
+            token_owner_start_offsets_per_req=np.zeros(len(spans), dtype=np.int64),
+            local_token_counts=local_counts,
+            local_required_tokens=s_live,
+            local_padded_tokens=local_padded_tokens,
+            global_padded_tokens=global_padded_tokens,
+        )
 
     def _evaluate_zigzag_query(
         self,
@@ -535,6 +616,38 @@ class PcpSequenceLayoutPlanner:
                 target_num_reqs=target_num_reqs,
                 padded_num_reqs=padded_num_reqs,
             )
+        if decision.mode is PcpSequenceLayoutMode.INTERLEAVED:
+            prepared = prepare_pcp_interleaved_sequence_layout(
+                runner,
+                scheduler_output,
+                start_index,
+                num_reqs,
+                num_scheduled_tokens_per_req,
+                int(total_num_scheduled_tokens),
+                use_max_model_len,
+                target_num_reqs,
+                padded_num_reqs,
+                decision=decision,
+            )
+            return SequenceLayoutPlan(
+                descriptor=PCP_INTERLEAVED_SEQUENCE_LAYOUT_DESCRIPTOR,
+                token_slice=prepared.local_token_slice,
+                global_num_tokens=int(total_num_scheduled_tokens),
+                global_padded_num_tokens=(prepared.padded_total_num_scheduled_tokens),
+                local_num_tokens=prepared.local_total_num_scheduled_tokens,
+                local_padded_num_tokens=(prepared.local_padded_total_num_scheduled_tokens),
+                logits_indices_cpu=prepared.logits_indices_cpu,
+                logits_local_indices_cpu=prepared.logits_local_indices_cpu,
+                logits_owner_mask_cpu=prepared.logits_owner_mask_cpu,
+                requires_hidden_state_gather=True,
+                pcp_metadata=prepared.pcp_metadata,
+                _packed_to_request_major_token_indices=(
+                    prepared.packed_to_request_major_token_indices
+                ),
+                _request_major_to_packed_token_indices=(
+                    prepared.request_major_to_packed_token_indices
+                ),
+            )
         if decision.mode is PcpSequenceLayoutMode.ZIGZAG:
             prepared = prepare_pcp_zigzag_sequence_layout(
                 runner,
@@ -613,6 +726,41 @@ class PcpSequenceLayoutPlanner:
                 kv_cache_initialized=False,
             )
         num_tokens = int(num_tokens)
+        if self.eligibility.is_interleaved:
+            from vllm_torchtpu.layers.core.attention_metadata import PCPMetadata
+
+            n_off = max(num_reqs, 1)
+            block_size = getattr(self.eligibility, "block_size", 16)
+            max_tokens_cap = max(
+                int(getattr(self.eligibility, "max_num_tokens", num_tokens) or num_tokens),
+                num_tokens,
+            )
+            req_pages = max(1, max_tokens_cap // block_size)
+            dev = "tpu" if torch.cuda.is_available() or hasattr(torch, "tpu") else "cpu"
+            dummy_pcp = PCPMetadata(
+                query_start_loc=torch.zeros((self.eligibility.pcp_size, n_off + 1), dtype=torch.int32, device=dev),
+                kv_cache_lens=torch.zeros((n_off,), dtype=torch.int32, device=dev),
+                q_pos_offsets=torch.zeros((self.eligibility.pcp_size, n_off), dtype=torch.int32, device=dev),
+                new_kv_page_indices=torch.zeros((n_off * self.eligibility.pcp_size * req_pages,), dtype=torch.int32, device=dev),
+                update_kv_cache=torch.zeros((self.eligibility.pcp_size, n_off), dtype=torch.bool, device=dev),
+                gdn_rm_to_packed=torch.zeros((max_tokens_cap * self.eligibility.pcp_size,), dtype=torch.int32, device=dev),
+                gdn_packed_to_rm=torch.zeros((max_tokens_cap * self.eligibility.pcp_size,), dtype=torch.int32, device=dev),
+                gdn_packed_to_local=torch.zeros((max_tokens_cap,), dtype=torch.int32, device=dev),
+                gdn_query_start_loc=torch.zeros((n_off + 1,), dtype=torch.int32, device=dev),
+                cache_pages=0,
+                is_decode=False,
+                is_interleaved=True,
+            )
+            return SequenceLayoutPlan(
+                descriptor=PCP_INTERLEAVED_SEQUENCE_LAYOUT_DESCRIPTOR,
+                token_slice=slice(0, num_tokens),
+                global_num_tokens=num_tokens * self.eligibility.pcp_size,
+                global_padded_num_tokens=num_tokens * self.eligibility.pcp_size,
+                local_num_tokens=num_tokens,
+                local_padded_num_tokens=num_tokens,
+                requires_hidden_state_gather=True,
+                pcp_metadata=dummy_pcp,
+            )
         if self.eligibility.is_zigzag:
             from vllm_torchtpu.layers.core.attention_metadata import PCPMetadata
 
@@ -1402,6 +1550,450 @@ def prepare_pcp_zigzag_sequence_layout(
         runner.seq_lens_cpu[2 * i] = total_len
         runner.seq_lens_cpu[2 * i + 1] = total_len
     runner.seq_lens_cpu[2 * num_reqs :] = 0
+
+    runner.query_start_loc_cpu[: n_off + 1] = torch.from_numpy(cu_q_lens_np[pcp_rank])
+
+    return PcpPreparedBatch(
+        local_token_slice=local_token_slice,
+        padded_total_num_scheduled_tokens=padded_total_num_tokens,
+        local_total_num_scheduled_tokens=local_total_tokens,
+        local_padded_total_num_scheduled_tokens=s_pad,
+        logits_indices_cpu=logits_indices_cpu,
+        logits_local_indices_cpu=logits_local_indices_cpu,
+        logits_owner_mask_cpu=logits_owner_mask_cpu,
+        packed_to_request_major_token_indices=packed_to_request_major,
+        request_major_to_packed_token_indices=request_major_to_packed,
+        pcp_metadata=pcp_metadata,
+    )
+
+
+def pcp_interleaved_token_layout(
+    num_scheduled_tokens: list[int] | np.ndarray,
+    pcp_size: int,
+    block_size: int = 128,
+) -> tuple[list[int], list[int], int]:
+    """Per-request page-interleaved chunking for multi-request PCP.
+
+    Each request i with n = counts[i] scheduled tokens is allocated
+    c_i = max(block_size, ceil(n / (pcp_size * block_size)) * block_size)
+    local tokens per rank. Within request i, logical page p of size block_size
+    is assigned to rank r = p % pcp_size at local page index (p // pcp_size).
+    Returns (chunk, off, s_live):
+      chunk[i]: local token count c_i of request i per rank, multiple of block_size
+      off[i]: start offset of request i's slot within one rank's region
+      s_live: live tokens per rank; the global buffer needs pcp_size * s_live rows
+    """
+    quantum = pcp_size * block_size
+    off, acc, chunk = [], 0, []
+    for n in num_scheduled_tokens:
+        c = max(block_size, int(np.ceil(int(n) / quantum)) * block_size)
+        chunk.append(c)
+        off.append(acc)
+        acc += c
+    return chunk, off, acc
+
+
+def pcp_interleaved_seq_arrays(
+    chunk: list[int],
+    off: list[int],
+    pcp_size: int,
+    n_off: int,
+    counts: list[int] | None = None,
+    block_size: int = 128,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-seq attention metadata for an interleaved chunking result.
+
+    Uses 1 sequence slot per request (num_reqs), NOT 2 * num_reqs.
+    Returns (cu_q_lens, q_pos_offsets, pcp_write_flags):
+      cu_q_lens: shape (pcp_size, n_off + 1)
+      q_pos_offsets: shape (pcp_size, n_off)
+      pcp_write_flags: shape (pcp_size, n_off)
+    """
+    del counts
+    n_reqs = len(chunk)
+    cu_q_lens = np.zeros((pcp_size, n_off + 1), dtype=np.int32)
+    q_pos_offsets = np.zeros((pcp_size, n_off), dtype=np.int32)
+    pcp_write_flags = np.zeros((pcp_size, n_off), dtype=bool)
+
+    for r in range(pcp_size):
+        for i in range(n_reqs):
+            c_i = chunk[i]
+            o_i = off[i]
+            cu_q_lens[r, i] = o_i
+            cu_q_lens[r, i + 1] = o_i + c_i
+            q_pos_offsets[r, i] = r * block_size
+            pcp_write_flags[r, i] = True
+        if n_reqs < n_off:
+            cu_q_lens[r, n_reqs + 1 :] = cu_q_lens[r, n_reqs]
+
+    return cu_q_lens, q_pos_offsets, pcp_write_flags
+
+
+def pcp_interleaved_page_table(
+    chunk: list[int],
+    pcp_size: int,
+    block_size: int,
+    n_off: int,
+    off: list[int] | None = None,
+    s_pad: int | None = None,
+    counts: list[int] | None = None,
+    max_s_pad: int | None = None,
+) -> np.ndarray:
+    """Page table for the all-gathered current KV under page-interleaved sharding."""
+    del counts
+    n_reqs = len(chunk)
+    cap_s_pad = max_s_pad if max_s_pad is not None else s_pad
+    if cap_s_pad is not None:
+        max_req_pages = max(1, cap_s_pad // block_size)
+    else:
+        max_req_pages = max(c // block_size for c in chunk) if chunk else 1
+        max_req_pages = max(1, max_req_pages)
+    if s_pad is not None:
+        s_pad_val = s_pad
+    else:
+        s_pad_val = sum(chunk)
+    pcp_table_np = np.zeros((n_off, pcp_size * max_req_pages), dtype=np.int32)
+    for i in range(n_reqs):
+        c_i = chunk[i]
+        req_pages = max(1, c_i // block_size)
+        o_i = off[i] if off is not None else sum(chunk[:i])
+        for p in range(pcp_size * req_pages):
+            rank = p % pcp_size
+            local_page = p // pcp_size
+            base = (rank * s_pad_val + o_i) // block_size + local_page
+            pcp_table_np[i, p] = base
+    return pcp_table_np
+
+
+def apply_pcp_interleaved_token_order(
+    input_ids: np.ndarray,
+    positions: np.ndarray,
+    counts: list[int],
+    chunk: list[int],
+    off: list[int],
+    pcp_size: int,
+    padded_total_num_tokens: int,
+    block_size: int = 128,
+    mrope_positions: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Permute token-major buffers into page-interleaved rank-major buffers."""
+    s_pad = padded_total_num_tokens // pcp_size
+    num_reqs = len(counts)
+    src_off = np.cumsum([0] + counts)[:-1]
+    perm = np.full(padded_total_num_tokens, -1, dtype=np.int64)
+    j = np.arange(block_size)
+
+    for i in range(num_reqs):
+        c_i = chunk[i]
+        req_pages = max(1, c_i // block_size)
+        for p in range(pcp_size * req_pages):
+            r = p % pcp_size
+            local_page = p // pcp_size
+            dst = r * s_pad + off[i] + local_page * block_size + j
+            tok = p * block_size + j
+            real = tok < counts[i]
+            perm[dst[real]] = src_off[i] + tok[real]
+
+    valid = perm >= 0
+    orig_ids = input_ids.copy()
+    input_ids.fill(0)
+    input_ids[valid] = orig_ids[perm[valid]]
+
+    orig_pos = positions.copy()
+    positions.fill(0)
+    positions[valid] = orig_pos[perm[valid]]
+
+    if mrope_positions is not None:
+        orig_mrope = mrope_positions.copy()
+        mrope_positions.fill(0)
+        mrope_positions[:, valid] = orig_mrope[:, perm[valid]]
+
+    packed_to_rm = perm
+    rm_to_packed = np.full(padded_total_num_tokens, -1, dtype=np.int64)
+    rm_to_packed[perm[valid]] = np.where(valid)[0]
+    return rm_to_packed, packed_to_rm
+
+
+def prepare_pcp_interleaved_sequence_layout(
+    runner: Any,
+    scheduler_output: Any,
+    start_index: int,
+    num_reqs: int,
+    num_scheduled_tokens_per_req: np.ndarray,
+    total_num_scheduled_tokens: int,
+    use_max_model_len: bool,
+    target_num_reqs: int,
+    padded_num_reqs: int,
+    get_native_pcp_rank: Any | None = None,
+    get_native_pcp_world_size: Any | None = None,
+    decision: PcpSequenceLayoutDecision | None = None,
+) -> PcpPreparedBatch:
+    """Prepare native PCP page-interleaved host state for real requests."""
+    del total_num_scheduled_tokens, use_max_model_len
+    if decision is None:
+        decision = PcpSequenceLayoutEligibility.from_vllm_config(
+            runner.vllm_config
+        ).evaluate_runner_chunk(
+            input_batch=runner.input_batch,
+            scheduler_output=scheduler_output,
+            start_index=start_index,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
+            num_tokens_paddings=runner.num_tokens_paddings,
+            max_num_tokens=runner.max_num_tokens,
+            dp_target_bucket=runner._dp_target_bucket,
+        )
+    PcpSequenceLayoutEligibility.require_mode(decision, PcpSequenceLayoutMode.INTERLEAVED)
+
+    pcp_size = decision.pcp_size
+    if pcp_size <= 1:
+        raise ValueError("PCP interleaved requires prefill_context_parallel_size > 1.")
+
+    if get_native_pcp_rank is None:
+        get_native_pcp_rank = _get_native_pcp_rank
+    if get_native_pcp_world_size is None:
+        get_native_pcp_world_size = _get_native_pcp_world_size
+
+    native_pcp_world_size = get_native_pcp_world_size()
+    if native_pcp_world_size != pcp_size:
+        raise RuntimeError(
+            "Native PCP group size does not match prefill_context_parallel_size: "
+            f"{native_pcp_world_size=} {pcp_size=}."
+        )
+    pcp_rank = get_native_pcp_rank()
+    if not 0 <= pcp_rank < pcp_size:
+        raise RuntimeError(f"Native PCP rank is out of range: {pcp_rank=} {pcp_size=}.")
+
+    counts = [int(c) for c in num_scheduled_tokens_per_req[:num_reqs]]
+    padded_total_num_tokens = decision.global_padded_tokens
+    assert padded_total_num_tokens is not None
+    s_pad = padded_total_num_tokens // pcp_size
+
+    block_size = resolve_pcp_zigzag_page_size(
+        getattr(runner, "block_size", 16),
+        getattr(runner, "_attention_kernel_block_size", None),
+    )
+    max_tokens_cap = max(
+        int(getattr(runner, "max_num_tokens", s_pad) or s_pad),
+        s_pad,
+    )
+
+    is_decode = any(
+        span.scheduled_tokens == 1 and span.computed_tokens > 0
+        for span in decision.spans
+    )
+
+    _ensure_host_token_buffer_capacity(runner, padded_total_num_tokens)
+
+    from vllm_torchtpu.layers.core.attention_metadata import PCPMetadata
+
+    n_off = max(target_num_reqs, num_reqs)
+    dev = runner.device
+
+    computed = [
+        int(runner.input_batch.num_computed_tokens_cpu[start_index + i])
+        for i in range(num_reqs)
+    ]
+    kv_cache_lens_np = np.zeros(n_off, dtype=np.int32)
+    for i in range(num_reqs):
+        kv_cache_lens_np[i] = computed[i]
+
+    logits_indices_cpu = torch.zeros(
+        (padded_num_reqs,), dtype=torch.int32, device="cpu"
+    )
+    logits_local_indices_cpu = torch.zeros(
+        (padded_num_reqs,), dtype=torch.int32, device="cpu"
+    )
+    logits_owner_mask_cpu = torch.zeros(
+        (padded_num_reqs,), dtype=torch.bool, device="cpu"
+    )
+
+    if is_decode:
+        local_start = 0
+        local_end = s_pad
+        local_token_slice = slice(local_start, local_end)
+        local_total_tokens = num_reqs
+
+        request_major_to_packed = np.arange(padded_total_num_tokens, dtype=np.int64)
+        packed_to_request_major = np.arange(padded_total_num_tokens, dtype=np.int64)
+
+        for i in range(num_reqs):
+            logits_indices_cpu[i] = i
+            logits_local_indices_cpu[i] = i
+            logits_owner_mask_cpu[i] = (pcp_rank == 0)
+        if num_reqs < padded_num_reqs:
+            logits_indices_cpu[num_reqs:] = (
+                logits_indices_cpu[num_reqs - 1] if num_reqs > 0 else 0
+            )
+            logits_local_indices_cpu[num_reqs:] = 0
+            logits_owner_mask_cpu[num_reqs:] = False
+
+        cu_q_lens_np = np.zeros((pcp_size, n_off + 1), dtype=np.int32)
+        q_pos_offsets_np = np.zeros((pcp_size, n_off), dtype=np.int32)
+        pcp_write_np = np.zeros((pcp_size, n_off), dtype=bool)
+
+        for r in range(pcp_size):
+            for i in range(num_reqs):
+                cu_q_lens_np[r, i] = i
+                cu_q_lens_np[r, i + 1] = i + 1
+                q_pos_offsets_np[r, i] = 0
+                pcp_write_np[r, i] = True
+            if num_reqs < n_off:
+                cu_q_lens_np[r, num_reqs + 1 :] = num_reqs
+
+        max_req_pages = max(1, max_tokens_cap // block_size)
+        pcp_table_np = np.zeros((n_off, pcp_size * max_req_pages), dtype=np.int32)
+        max_computed = max(computed) if computed else 0
+        cache_pages = max(1, (max_computed + block_size - 1) // block_size)
+
+        gdn_rm_to_packed_np = np.zeros(max_tokens_cap * pcp_size, dtype=np.int32)
+        gdn_rm_to_packed_np[:padded_total_num_tokens] = np.arange(
+            padded_total_num_tokens, dtype=np.int32
+        )
+        gdn_packed_to_rm_np = np.zeros(max_tokens_cap * pcp_size, dtype=np.int32)
+        for r in range(pcp_size):
+            gdn_packed_to_rm_np[r * s_pad : (r + 1) * s_pad] = np.arange(
+                s_pad, dtype=np.int32
+            )
+        gdn_packed_to_local_np = np.zeros(max_tokens_cap, dtype=np.int32)
+        gdn_packed_to_local_np[:s_pad] = np.arange(s_pad, dtype=np.int32)
+        gdn_qsl_np = np.zeros(n_off + 1, dtype=np.int32)
+        for i in range(num_reqs):
+            gdn_qsl_np[i + 1] = i + 1
+        if num_reqs < n_off:
+            gdn_qsl_np[num_reqs + 1 :] = num_reqs
+
+        runner._request_distribution_cpu[0] = num_reqs
+        runner._request_distribution_cpu[1] = num_reqs
+        runner._request_distribution_cpu[2] = num_reqs
+    else:
+        chunk, off, _ = pcp_interleaved_token_layout(counts, pcp_size, block_size)
+
+        mrope_np = None
+        if runner.uses_mrope:
+            mrope_np = runner.mrope_positions.cpu[:, :padded_total_num_tokens].numpy()
+
+        input_ids_np = runner.input_ids_cpu[:padded_total_num_tokens].numpy()
+        positions_np = runner.positions_np[:padded_total_num_tokens]
+
+        request_major_to_packed, packed_to_request_major = apply_pcp_interleaved_token_order(
+            input_ids_np,
+            positions_np,
+            counts,
+            chunk,
+            off,
+            pcp_size,
+            padded_total_num_tokens,
+            block_size=block_size,
+            mrope_positions=mrope_np,
+        )
+
+        local_start = pcp_rank * s_pad
+        local_end = local_start + s_pad
+        local_token_slice = slice(local_start, local_end)
+        local_total_tokens = (
+            int(decision.local_token_counts[pcp_rank])
+            if decision.local_token_counts is not None
+            else s_pad
+        )
+
+        for i in range(num_reqs):
+            last = counts[i] - 1
+            p_last = last // block_size
+            owner_rank = p_last % pcp_size
+            local_offset = (
+                off[i] + (p_last // pcp_size) * block_size + (last % block_size)
+            )
+            g_slot = owner_rank * s_pad + local_offset
+            logits_indices_cpu[i] = int(g_slot)
+            if owner_rank == pcp_rank:
+                logits_local_indices_cpu[i] = int(local_offset)
+                logits_owner_mask_cpu[i] = True
+            else:
+                logits_local_indices_cpu[i] = 0
+                logits_owner_mask_cpu[i] = False
+        if num_reqs < padded_num_reqs:
+            logits_indices_cpu[num_reqs:] = (
+                logits_indices_cpu[num_reqs - 1] if num_reqs > 0 else 0
+            )
+            logits_local_indices_cpu[num_reqs:] = 0
+            logits_owner_mask_cpu[num_reqs:] = False
+
+        cu_q_lens_np, q_pos_offsets_np, pcp_write_np = pcp_interleaved_seq_arrays(
+            chunk, off, pcp_size, n_off, counts=counts, block_size=block_size
+        )
+        pcp_table_np = pcp_interleaved_page_table(
+            chunk,
+            pcp_size,
+            block_size,
+            n_off,
+            off=off,
+            s_pad=s_pad,
+            counts=counts,
+            max_s_pad=max_tokens_cap,
+        )
+
+        max_computed = max(computed) if computed else 0
+        cache_pages = max(1, (max_computed + block_size - 1) // block_size) if max_computed > 0 else 0
+
+        gdn_rm_to_packed_raw = np.where(
+            request_major_to_packed >= 0, request_major_to_packed, 0
+        ).astype(np.int32)
+        gdn_rm_to_packed_np = np.zeros(max_tokens_cap * pcp_size, dtype=np.int32)
+        gdn_rm_to_packed_np[: len(gdn_rm_to_packed_raw)] = gdn_rm_to_packed_raw
+
+        gdn_packed_to_rm_raw = np.where(
+            packed_to_request_major >= 0, packed_to_request_major, 0
+        ).astype(np.int32)
+        gdn_packed_to_rm_np = np.zeros(max_tokens_cap * pcp_size, dtype=np.int32)
+        gdn_packed_to_rm_np[: len(gdn_packed_to_rm_raw)] = gdn_packed_to_rm_raw
+
+        local_packed_to_rm = packed_to_request_major[local_start:local_end]
+        gdn_packed_to_local_raw = np.where(
+            local_packed_to_rm >= 0, local_packed_to_rm, 0
+        ).astype(np.int32)
+        gdn_packed_to_local_np = np.zeros(max_tokens_cap, dtype=np.int32)
+        gdn_packed_to_local_np[: len(gdn_packed_to_local_raw)] = gdn_packed_to_local_raw
+
+        gdn_qsl_np = np.zeros(n_off + 1, dtype=np.int32)
+        acc_q = 0
+        for i in range(num_reqs):
+            acc_q += counts[i]
+            gdn_qsl_np[i + 1] = acc_q
+        if num_reqs < n_off:
+            gdn_qsl_np[num_reqs + 1 :] = acc_q
+
+        runner._request_distribution_cpu[0] = 0
+        runner._request_distribution_cpu[1] = 0
+        runner._request_distribution_cpu[2] = num_reqs
+
+    pcp_metadata = PCPMetadata(
+        query_start_loc=torch.from_numpy(cu_q_lens_np).to(dev, non_blocking=True),
+        kv_cache_lens=torch.from_numpy(kv_cache_lens_np).to(dev, non_blocking=True),
+        q_pos_offsets=torch.from_numpy(q_pos_offsets_np).to(dev, non_blocking=True),
+        new_kv_page_indices=torch.from_numpy(pcp_table_np.reshape(-1)).to(
+            dev, non_blocking=True
+        ),
+        update_kv_cache=torch.from_numpy(pcp_write_np).to(dev, non_blocking=True),
+        gdn_rm_to_packed=torch.from_numpy(gdn_rm_to_packed_np).to(
+            dev, non_blocking=True
+        ),
+        gdn_packed_to_rm=torch.from_numpy(gdn_packed_to_rm_np).to(
+            dev, non_blocking=True
+        ),
+        gdn_packed_to_local=torch.from_numpy(gdn_packed_to_local_np).to(
+            dev, non_blocking=True
+        ),
+        gdn_query_start_loc=torch.from_numpy(gdn_qsl_np).to(dev, non_blocking=True),
+        cache_pages=cache_pages,
+        is_decode=is_decode,
+        is_interleaved=True,
+    )
+
+    for i in range(num_reqs):
+        total_len = computed[i] + counts[i]
+        runner.seq_lens_cpu[i] = total_len
+    runner.seq_lens_cpu[num_reqs:] = 0
 
     runner.query_start_loc_cpu[: n_off + 1] = torch.from_numpy(cu_q_lens_np[pcp_rank])
 

@@ -827,7 +827,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log the PCP sequence layout window on every step.
     "VLLM_TPU_DEBUG_PCP_LAYOUT":
     env_bool("VLLM_TPU_DEBUG_PCP_LAYOUT"),
-    # Layout strategy for PCP input preparation: 'zigzag' or 'streaming'.
+    # Layout strategy for PCP input preparation: 'interleaved', 'zigzag', or 'streaming'.
     "VLLM_TPU_PCP_LAYOUT":
     lambda: os.getenv("VLLM_TPU_PCP_LAYOUT", "streaming").strip().lower(),
     # Added to every worker's local rank when it binds to a physical chip.

@@ -18,18 +18,26 @@ import pytest
 import torch
 
 from vllm_torchtpu.layers.core.pcp_sequence_layout import (
+    PCP_INTERLEAVED_SEQUENCE_LAYOUT_DESCRIPTOR,
     PCP_ZIGZAG_SEQUENCE_LAYOUT_DESCRIPTOR,
     PcpSequenceLayoutEligibility,
     PcpSequenceLayoutMode,
     PcpSequenceLayoutPlanner,
+    apply_pcp_interleaved_token_order,
     apply_pcp_zigzag_token_order,
+    pcp_interleaved_page_table,
+    pcp_interleaved_seq_arrays,
+    pcp_interleaved_token_layout,
     pcp_zigzag_page_table,
     pcp_zigzag_seq_arrays,
     pcp_zigzag_token_layout,
+    prepare_pcp_interleaved_sequence_layout,
     prepare_pcp_zigzag_sequence_layout,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
+    PCP_INTERLEAVED_SEQUENCE_LAYOUT_PROTOCOL,
     PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL,
+    is_pcp_interleaved_sequence_layout_descriptor,
     is_pcp_zigzag_sequence_layout_descriptor,
 )
 
@@ -311,4 +319,143 @@ def test_pcp_zigzag_page_table_multi_request():
     req0_pages = set(table[0, :4].tolist())
     req1_pages = set(table[2, :4].tolist())
     assert req0_pages.isdisjoint(req1_pages)
+
+
+def test_pcp_interleaved_token_layout():
+    pcp_size = 2
+    block_size = 128
+    counts = [300, 600]
+    chunk, off, s_live = pcp_interleaved_token_layout(
+        counts, pcp_size, block_size=block_size
+    )
+    # quantum = 2 * 128 = 256
+    # req 0: ceil(300 / 256) * 128 = 256
+    # req 1: ceil(600 / 256) * 128 = 384
+    assert chunk == [256, 384]
+    assert off == [0, 256]
+    assert s_live == 640
+
+
+def test_pcp_interleaved_seq_arrays():
+    pcp_size = 2
+    block_size = 128
+    n_off = 4
+    counts = [300, 600]
+    chunk, off, _ = pcp_interleaved_token_layout(
+        counts, pcp_size, block_size=block_size
+    )
+    cu_q_lens, q_pos_offsets, pcp_write = pcp_interleaved_seq_arrays(
+        chunk, off, pcp_size, n_off, counts=counts, block_size=block_size
+    )
+    assert cu_q_lens.shape == (pcp_size, n_off + 1)
+    assert q_pos_offsets.shape == (pcp_size, n_off)
+    assert pcp_write.shape == (pcp_size, n_off)
+
+    for r in range(pcp_size):
+        assert np.array_equal(cu_q_lens[r], [0, 256, 640, 640, 640])
+        assert q_pos_offsets[r, 0] == r * block_size
+        assert q_pos_offsets[r, 1] == r * block_size
+        assert q_pos_offsets[r, 2] == 0
+        assert np.array_equal(pcp_write[r], [True, True, False, False])
+
+
+def test_pcp_interleaved_page_table():
+    pcp_size = 2
+    block_size = 128
+    n_off = 2
+    counts = [512, 256]
+    chunk, off, s_live = pcp_interleaved_token_layout(
+        counts, pcp_size, block_size=block_size
+    )
+    s_pad = 512
+    table = pcp_interleaved_page_table(
+        chunk, pcp_size, block_size, n_off, off=off, s_pad=s_pad
+    )
+    # max_req_pages = 512 // 128 = 4, width = 2 * 4 = 8
+    assert table.shape == (n_off, 8)
+    # Req 0 has c_0 = 256 (req_pages = 2, 4 logical pages):
+    # p=0 (rank 0, lp 0): (0*512 + 0)//128 + 0 = 0
+    # p=1 (rank 1, lp 0): (1*512 + 0)//128 + 0 = 4
+    # p=2 (rank 0, lp 1): (0*512 + 0)//128 + 1 = 1
+    # p=3 (rank 1, lp 1): (1*512 + 0)//128 + 1 = 5
+    assert np.array_equal(table[0, :4], [0, 4, 1, 5])
+    # Req 1 has c_1 = 128 (req_pages = 1, 2 logical pages, off[1] = 256):
+    # p=0 (rank 0, lp 0): (0*512 + 256)//128 + 0 = 2
+    # p=1 (rank 1, lp 0): (1*512 + 256)//128 + 0 = 6
+    assert np.array_equal(table[1, :2], [2, 6])
+
+
+def test_apply_pcp_interleaved_token_order():
+    pcp_size = 2
+    block_size = 128
+    counts = [384]  # 3 pages of 128: p=0 (rank 0, lp 0), p=1 (rank 1, lp 0), p=2 (rank 0, lp 1)
+    chunk, off, s_live = pcp_interleaved_token_layout(
+        counts, pcp_size, block_size=block_size
+    )
+    assert chunk == [256]
+    s_pad = 256
+    padded_total_num_tokens = s_pad * pcp_size  # 512
+
+    input_ids = np.zeros(padded_total_num_tokens, dtype=np.int32)
+    input_ids[:384] = np.arange(1, 385, dtype=np.int32)
+    positions_np = np.zeros(padded_total_num_tokens, dtype=np.int32)
+    positions_np[:384] = np.arange(384, dtype=np.int32)
+
+    rm_to_packed, packed_to_rm = apply_pcp_interleaved_token_order(
+        input_ids,
+        positions_np,
+        counts,
+        chunk,
+        off,
+        pcp_size,
+        padded_total_num_tokens,
+        block_size=block_size,
+    )
+
+    assert np.array_equal(packed_to_rm[rm_to_packed[:384]], np.arange(384))
+    # Rank 0 local buffer [0:256] holds page 0 (tokens 0..127) and page 2 (tokens 256..383)
+    assert np.array_equal(positions_np[0:128], np.arange(0, 128))
+    assert np.array_equal(positions_np[128:256], np.arange(256, 384))
+    # Rank 1 local buffer [256:512] holds page 1 (tokens 128..255) and padding (0)
+    assert np.array_equal(positions_np[256:384], np.arange(128, 256))
+    assert np.all(positions_np[384:512] == 0)
+
+
+def test_pcp_interleaved_eligibility_and_prepare_dummy():
+    eligibility = PcpSequenceLayoutEligibility(
+        pcp_size=2,
+        interleave_size=1,
+        is_interleaved=True,
+        block_size=128,
+    )
+    assert eligibility.enabled
+    assert eligibility.is_interleaved
+
+    decision = eligibility.evaluate_runner_chunk(
+        input_batch=_input_batch(computed=[0], prompt=[128]),
+        scheduler_output=_scheduler_output([128]),
+        start_index=0,
+        num_reqs=1,
+        num_scheduled_tokens_per_req=np.array([128], dtype=np.int32),
+        num_tokens_paddings=[128, 256, 512],
+        max_num_tokens=512,
+    )
+    assert decision.mode is PcpSequenceLayoutMode.INTERLEAVED
+    # Prefill buckets must be >= 2 * block_size (256)
+    assert decision.local_required_tokens == 128
+    assert decision.local_padded_tokens == 256
+
+    planner = PcpSequenceLayoutPlanner(eligibility)
+    plan = planner.prepare_dummy(
+        num_tokens=256,
+        num_reqs=2,
+        kv_cache_initialized=True,
+    )
+    assert is_pcp_interleaved_sequence_layout_descriptor(plan.descriptor)
+    assert plan.descriptor.protocol == PCP_INTERLEAVED_SEQUENCE_LAYOUT_PROTOCOL
+    assert plan.pcp_metadata is not None
+    assert plan.pcp_metadata.is_interleaved is True
+    assert plan.pcp_metadata.gdn_packed_to_rm is not None
+    assert plan.pcp_metadata.query_start_loc.shape == (2, 3)
+
 

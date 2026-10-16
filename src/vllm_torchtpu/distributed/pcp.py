@@ -58,6 +58,75 @@ def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
     return group.all_reduce(tensor)
 
 
+def all_to_all_single(tensor: torch.Tensor) -> torch.Tensor:
+    """All-to-all exchange along the leading dimension of ``tensor`` across the PCP group.
+
+    Block ``d`` of ``tensor``'s leading axis goes to rank ``d``; block ``r`` of
+    the result came from rank ``r``.
+    """
+    group = get_pcp_group()
+    if group is None or int(group.world_size) == 1:
+        return tensor
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    if hasattr(group, "all_to_all_single"):
+        return group.all_to_all_single(tensor)
+    from torch.distributed import _functional_collectives as funcol
+
+    out = funcol.all_to_all_single(tensor, None, None, group.device_group)
+    return funcol.wait_tensor(out)
+
+
+def all_to_all_head_to_token(tensor: torch.Tensor) -> torch.Tensor:
+    """Exchange ``tensor`` from head-replicated / token-sharded ``[L, C, ...]``
+    to token-all / head-sharded ``[P * L, C // P, ...]`` across the PCP group.
+    """
+    group = get_pcp_group()
+    if group is None or int(group.world_size) == 1:
+        return tensor
+    world_size = int(group.world_size)
+    L = tensor.shape[0]
+    if tensor.shape[1] % world_size != 0:
+        raise ValueError(
+            f"Head/channel dimension {tensor.shape[1]} must be divisible by "
+            f"PCP world_size {world_size}."
+        )
+    c_per_rank = tensor.shape[1] // world_size
+    rest = tensor.shape[2:]
+    send_buf = (
+        tensor.reshape(L, world_size, c_per_rank, *rest)
+        .transpose(0, 1)
+        .contiguous()
+    )
+    recv_buf = all_to_all_single(send_buf)
+    return recv_buf.reshape(world_size * L, c_per_rank, *rest)
+
+
+def all_to_all_token_to_head(tensor: torch.Tensor) -> torch.Tensor:
+    """Exchange ``tensor`` from token-all / head-sharded ``[P * L, C_local, ...]``
+    back to token-sharded / head-replicated ``[L, P * C_local, ...]`` across the PCP group.
+    """
+    group = get_pcp_group()
+    if group is None or int(group.world_size) == 1:
+        return tensor
+    world_size = int(group.world_size)
+    if tensor.shape[0] % world_size != 0:
+        raise ValueError(
+            f"Leading token dimension {tensor.shape[0]} must be divisible by "
+            f"PCP world_size {world_size}."
+        )
+    L = tensor.shape[0] // world_size
+    c_per_rank = tensor.shape[1]
+    rest = tensor.shape[2:]
+    send_buf = tensor.reshape(world_size, L, c_per_rank, *rest).contiguous()
+    recv_buf = all_to_all_single(send_buf)
+    return (
+        recv_buf.transpose(0, 1)
+        .contiguous()
+        .reshape(L, world_size * c_per_rank, *rest)
+    )
+
+
 def get_pcp_cache_rank() -> int:
     """
     Index of the PCP chunk whose KV this worker's device physically holds.

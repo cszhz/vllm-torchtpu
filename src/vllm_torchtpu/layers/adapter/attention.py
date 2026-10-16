@@ -737,7 +737,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
             if (
                 get_current_vllm_config().parallel_config.prefill_context_parallel_size
                 > 1
-                and envs.VLLM_TPU_PCP_LAYOUT.lower() != "zigzag"
+                and envs.VLLM_TPU_PCP_LAYOUT.lower() not in ("zigzag", "interleaved")
             ):
                 return [128, 256, 512, 1024, 2048, 4096]
             return [128]
@@ -1083,6 +1083,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         pcp_world_size = get_pcp_world_size()
         pcp_rank = get_pcp_rank()
+        cp_interleaved = bool(
+            getattr(attn_metadata.pcp, "is_interleaved", False)
+        ) or (envs.VLLM_TPU_PCP_LAYOUT.lower() == "interleaved")
         return _forward_with_pcp(
             layer=layer,
             query=query,
@@ -1098,6 +1101,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_rank=pcp_rank,
             kv_layout=self.kv_layout,
             use_causal_mask=self.use_causal_mask,
+            cp_interleaved=cp_interleaved,
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
@@ -1275,7 +1279,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         )
         if pcp_configured:
             if (
-                envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag"
+                envs.VLLM_TPU_PCP_LAYOUT.lower() in ("zigzag", "interleaved")
                 and isinstance(self, PallasBatchedRPAAttentionBackendImpl)
             ):
                 from vllm_torchtpu.distributed.pcp import (
@@ -1287,6 +1291,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 self._pcp_streaming = False
                 pcp_world_size = get_pcp_world_size()
                 pcp_rank = get_pcp_rank()
+                cp_interleaved = envs.VLLM_TPU_PCP_LAYOUT.lower() == "interleaved"
                 for is_decode in (False, True):
                     _build_pcp_kernels(
                         sliding_window=self.sliding_window,
@@ -1300,6 +1305,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         use_causal_mask=self.use_causal_mask,
                         kv_layout=self.kv_layout,
                         is_decode=is_decode,
+                        cp_interleaved=cp_interleaved,
                     )
                 return
 

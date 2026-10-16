@@ -105,11 +105,11 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
 
   @property
   def schedule_rank(self):
-    """Whose cache stripe this schedule walks.
+    """In standard CP, this is the rank's own stripe (self.rank).
 
-    Normally this rank's own. The ring makes every rank walk rank 0's -- the
-    longest -- so they all run the same number of KV blocks and rotate in
-    lockstep, and a short rank's tail gets masked in the kernel.
+    Under Ring Attention (ring_enabled=True), every rank walks rank 0's stripe
+    length to ensure all ranks execute identical step counts and rotate in
+    lockstep.
     """
     return 0 if self.cfgs.ring_enabled else self.rank
 
@@ -135,9 +135,12 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
     the ring visits every block once per hop instead of once at all.
     """
     cfgs = self.cfgs
-    kv_cache_len = cfgs.local_kv_cache_len(
-        global_kv_cache_len, self.schedule_rank
-    )
+    if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
+      kv_cache_len = global_kv_cache_len
+    else:
+      kv_cache_len = cfgs.local_kv_cache_len(
+          global_kv_cache_len, self.schedule_rank
+      )
     kv_new_start = q_start
     num_k = pl.cdiv(kv_cache_len + kv_new_len, cfgs.bkv_sz)
 
@@ -145,13 +148,39 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
     q_sz_task = jnp.clip(q_end - q_src, 0, cfgs.bq_sz)
 
     start_k_idx = 0
-    if (sliding_window := cfgs.model.sliding_window) is not None:
-      sw_start_idx = q_position + q_idx * cfgs.bq_sz - sliding_window + 1
-      start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
+    if (
+        cfgs.serve.cp_interleaved
+        and cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY
+        and cfgs.rpa_case != configs.RpaCase.DECODE
+    ):
+      assert cfgs.serve.cp_group_size is not None
+      if (sliding_window := cfgs.model.sliding_window) is not None:
+        u_min = q_idx * cfgs.bq_sz
+        min_q_pos = (
+            q_position
+            + (u_min >> cfgs.serve.page_size_log2)
+            * (cfgs.serve.cp_group_size << cfgs.serve.page_size_log2)
+            + (u_min & cfgs.serve.page_size_mask)
+        )
+        sw_start_idx = min_q_pos - sliding_window + 1
+        start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
-    end_k_idx_causal = (
-        q_position + q_idx * cfgs.bq_sz + q_sz_task - 1
-    ) // cfgs.bkv_sz + 1
+      u_max = jnp.maximum(0, q_idx * cfgs.bq_sz + q_sz_task - 1)
+      max_q_pos = (
+          q_position
+          + (u_max >> cfgs.serve.page_size_log2)
+          * (cfgs.serve.cp_group_size << cfgs.serve.page_size_log2)
+          + (u_max & cfgs.serve.page_size_mask)
+      )
+      end_k_idx_causal = max_q_pos // cfgs.bkv_sz + 1
+    else:
+      if (sliding_window := cfgs.model.sliding_window) is not None:
+        sw_start_idx = q_position + q_idx * cfgs.bq_sz - sliding_window + 1
+        start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
+
+      end_k_idx_causal = (
+          q_position + q_idx * cfgs.bq_sz + q_sz_task - 1
+      ) // cfgs.bkv_sz + 1
     end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
 
     if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
@@ -218,31 +247,70 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
     NEW_TOKENS_ONLY: `kv_cache_len` is the global cache length (no cache
     KV is fetched, it only positions the new tokens).
     """
+    if self.cfgs.ring_enabled:
+      return self._k_loop_ring(
+          k_idx,
+          carry,
+          s_idx=s_idx,
+          q_idx=q_idx,
+          q_end=q_end,
+          q_src=q_src,
+          q_sz_task=q_sz_task,
+          kv_cache_len=kv_cache_len,
+          kv_new_len=kv_new_len,
+          end_k_idx=end_k_idx,
+          update_kv_cache=update_kv_cache,
+          kv_new_start=kv_new_start,
+          num_k=num_k,
+          num_q=num_q,
+          **kwargs,
+      )
+    return self._k_loop(
+        k_idx,
+        carry,
+        s_idx=s_idx,
+        q_idx=q_idx,
+        q_end=q_end,
+        q_src=q_src,
+        q_sz_task=q_sz_task,
+        kv_cache_len=kv_cache_len,
+        kv_new_len=kv_new_len,
+        end_k_idx=end_k_idx,
+        update_kv_cache=update_kv_cache,
+        kv_new_start=kv_new_start,
+        num_k=num_k,
+        num_q=num_q,
+        **kwargs,
+    )
+
+  def _k_loop(
+      self,
+      k_idx,
+      carry: schedule.LoopCarry,
+      *,
+      s_idx,
+      q_idx,
+      q_end,
+      q_src,
+      q_sz_task,
+      kv_cache_len,
+      kv_new_len,
+      end_k_idx,
+      update_kv_cache,
+      kv_new_start=0,
+      num_k=0,
+      num_q=0,
+      **kwargs,
+  ) -> schedule.LoopCarry:
+    """k_loop implementation for standard Context Parallelism."""
     cfgs = self.cfgs
     sched = self.schedule
     count = carry.count
     step, target_lane = divmod(count, cfgs.batch_size)
 
-    ring = cfgs.ring_enabled
     loop_k_idx = k_idx
-    is_round_0 = False
     is_valid_task = True
-    if ring:
-      cp_group_size = cfgs.serve.cp_group_size
-      assert cp_group_size is not None
-      step_within_q = loop_k_idx // cfgs.batch_size
-      k_group = step_within_q // cp_group_size
-      hop = lax.rem(step_within_q, cp_group_size)
-      is_round_0 = hop == 0
-      local_k_idx = k_group * cfgs.batch_size + target_lane
-      is_valid_task = local_k_idx < num_k
-      k_idx = local_k_idx
-      loop_k_idx = local_k_idx * cp_group_size + hop
-      is_last_k = jnp.where(
-          (hop == cp_group_size - 1) & (local_k_idx == num_k - 1), 1, 0
-      )
-    else:
-      is_last_k = jnp.where(loop_k_idx == end_k_idx - 1, 1, 0)
+    is_last_k = jnp.where(loop_k_idx == end_k_idx - 1, 1, 0)
 
     sched.s_idx[step, target_lane] = jnp.where(is_valid_task, s_idx, -1)
     sched.q_idx[step, target_lane] = jnp.where(is_valid_task, q_idx, 0)
@@ -275,17 +343,7 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
       src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
       sched.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
       if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        if ring:
-          fetch_sz = dma_sz
-          if new_tokens_only:
-            fetch_sz = 0
-          else:
-            fetch_sz = jnp.where(is_round_0, fetch_sz, 0)
-          sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-          sched.dma_kv_cache[step, target_lane, i, 2] = utils.align_to(
-              fetch_sz, cfgs.kv_token_align
-          )
-        elif new_tokens_only:
+        if new_tokens_only:
           p_idx = kv_p_start + i
           local_page_i = jnp.minimum(
               p_idx // cp_group_size,
@@ -304,13 +362,150 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
           )
       else:
         sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-        fetch_sz = dma_sz
-        if new_tokens_only:
-          fetch_sz = 0
-        elif ring:
-          fetch_sz = jnp.where(is_round_0, fetch_sz, 0)
+        fetch_sz = 0 if new_tokens_only else dma_sz
         sched.dma_kv_cache[step, target_lane, i, 2] = fetch_sz
 
+    self._fill_dma_kv_new(
+        step=step,
+        target_lane=target_lane,
+        k_idx=k_idx,
+        s_idx=s_idx,
+        q_idx=q_idx,
+        num_q=num_q,
+        kv_len_start=kv_len_start,
+        kv_left=kv_left,
+        kv_left_frm_cache=kv_left_frm_cache,
+        kv_cache_len=kv_cache_len,
+        kv_new_len=kv_new_len,
+        kv_new_start=kv_new_start,
+        update_kv_cache=update_kv_cache,
+        cp_group_size=cp_group_size,
+    )
+    return self.advance_carry(carry)
+
+  def _k_loop_ring(
+      self,
+      k_idx,
+      carry: schedule.LoopCarry,
+      *,
+      s_idx,
+      q_idx,
+      q_end,
+      q_src,
+      q_sz_task,
+      kv_cache_len,
+      kv_new_len,
+      end_k_idx,
+      update_kv_cache,
+      kv_new_start=0,
+      num_k=0,
+      num_q=0,
+      **kwargs,
+  ) -> schedule.LoopCarry:
+    """k_loop implementation for Ring Attention (PCP)."""
+    cfgs = self.cfgs
+    sched = self.schedule
+    count = carry.count
+    step, target_lane = divmod(count, cfgs.batch_size)
+
+    cp_group_size = cfgs.serve.cp_group_size
+    assert cp_group_size is not None
+
+    loop_k_idx = k_idx
+    step_within_q = loop_k_idx // cfgs.batch_size
+    k_group = step_within_q // cp_group_size
+    hop = lax.rem(step_within_q, cp_group_size)
+    is_round_0 = hop == 0
+    local_k_idx = k_group * cfgs.batch_size + target_lane
+    is_valid_task = local_k_idx < num_k
+    k_idx = local_k_idx
+    loop_k_idx = local_k_idx * cp_group_size + hop
+    is_last_k = jnp.where(
+        (hop == cp_group_size - 1) & (local_k_idx == num_k - 1), 1, 0
+    )
+
+    sched.s_idx[step, target_lane] = jnp.where(is_valid_task, s_idx, -1)
+    sched.q_idx[step, target_lane] = jnp.where(is_valid_task, q_idx, 0)
+    sched.k_idx[step, target_lane] = jnp.where(is_valid_task, loop_k_idx, 0)
+    sched.is_last_k[step, target_lane] = is_last_k
+
+    sched.dma_q[step, target_lane, 0] = jnp.where(is_valid_task, q_src, 0)
+    sched.dma_q[step, target_lane, 1] = jnp.where(is_valid_task, q_sz_task, 0)
+
+    kv_len_start = k_idx * cfgs.bkv_sz
+    kv_p_start = k_idx * cfgs.bkv_p
+    k_len = kv_cache_len + kv_new_len
+    kv_left = k_len - kv_len_start
+    kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
+    kv_left = jnp.where(is_valid_task, kv_left, 0)
+    kv_left_frm_cache = jnp.where(is_valid_task, kv_left_frm_cache, 0)
+    p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
+
+    new_tokens_only = (
+        cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY
+    )
+
+    for i in range(cfgs.bkv_p_cache):
+      dst_vmem = i << cfgs.serve.page_size_log2
+      dma_sz = kv_left_frm_cache - dst_vmem
+      dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
+
+      src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
+      sched.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
+      sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm
+
+      # In ring attention, only round 0 (hop == 0) fetches from HBM; subsequent
+      # rounds receive KV from peer devices over the ICI ring.
+      if new_tokens_only:
+        fetch_sz = 0
+      else:
+        fetch_sz = jnp.where(is_round_0, dma_sz, 0)
+
+      if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        sched.dma_kv_cache[step, target_lane, i, 2] = utils.align_to(
+            fetch_sz, cfgs.kv_token_align
+        )
+      else:
+        sched.dma_kv_cache[step, target_lane, i, 2] = fetch_sz
+
+    self._fill_dma_kv_new(
+        step=step,
+        target_lane=target_lane,
+        k_idx=k_idx,
+        s_idx=s_idx,
+        q_idx=q_idx,
+        num_q=num_q,
+        kv_len_start=kv_len_start,
+        kv_left=kv_left,
+        kv_left_frm_cache=kv_left_frm_cache,
+        kv_cache_len=kv_cache_len,
+        kv_new_len=kv_new_len,
+        kv_new_start=kv_new_start,
+        update_kv_cache=update_kv_cache,
+        cp_group_size=cp_group_size,
+    )
+    return self.advance_carry(carry)
+
+  def _fill_dma_kv_new(
+      self,
+      *,
+      step,
+      target_lane,
+      k_idx,
+      s_idx,
+      q_idx,
+      num_q,
+      kv_len_start,
+      kv_left,
+      kv_left_frm_cache,
+      kv_cache_len,
+      kv_new_len,
+      kv_new_start,
+      update_kv_cache,
+      cp_group_size,
+  ):
+    cfgs = self.cfgs
+    sched = self.schedule
     # CACHE_ONLY still falls through.
     kv_left_frm_new = kv_left - kv_left_frm_cache
     bkv_sz_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
@@ -343,9 +538,7 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
               (new_tok_offset + new_sz - 1) // cfgs.serve.page_size + 1,
               0,
           )
-          fetch_val = jnp.where(
-              i < num_pages_to_fetch, cfgs.serve.page_size, 0
-          )
+          fetch_val = jnp.where(i < num_pages_to_fetch, cfgs.serve.page_size, 0)
           new_page_start = (
               hbm_token_idx_base - new_tok_offset
           ) + i * cfgs.serve.page_size
@@ -462,5 +655,3 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
         dma_sz = jnp.maximum(0, end_in_slot - dst_vmem)
 
         fill_dma_kv_new(i, dst_vmem, dma_sz)
-
-    return self.advance_carry(carry)

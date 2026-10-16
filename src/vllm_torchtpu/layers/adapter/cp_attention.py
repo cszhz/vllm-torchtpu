@@ -37,6 +37,7 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.pcp import (
     all_gather_equal_tokens,
@@ -559,6 +560,7 @@ def _pallas_rpa_kernel_pcp_new(
     cp_rank_val: int,
     use_causal_mask: bool = True,
     kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    cp_interleaved: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     import jax.numpy as jnp
 
@@ -591,6 +593,7 @@ def _pallas_rpa_kernel_pcp_new(
         use_causal_mask=use_causal_mask,
         return_lse=True,
         kv_layout=kv_layout,
+        cp_interleaved=cp_interleaved,
     )
     return new_kv_cache, output, lse
 
@@ -656,6 +659,7 @@ def build_pcp_kernels(
     use_causal_mask: bool = True,
     kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
     is_decode: bool = False,
+    cp_interleaved: bool = False,
 ) -> tuple:
     """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops for PCP."""
     kv_layout = _batched_rpa_configs.KVLayout(kv_layout)
@@ -671,6 +675,7 @@ def build_pcp_kernels(
         use_causal_mask,
         kv_layout,
         is_decode,
+        cp_interleaved,
     )
     cache_key = ("pcp_cache", *base_key)
     new_key = ("pcp_new", *base_key)
@@ -725,6 +730,7 @@ def build_pcp_kernels(
             cp_rank_val=cp_rank,
             use_causal_mask=use_causal_mask,
             kv_layout=kv_layout,
+            cp_interleaved=cp_interleaved,
         )
         cached_new = _PCP_KERNEL_REGISTRY[new_key] = _build_pcp_kernel_op(
             f"pallas::rpa_pcp_new_{_alloc_pcp_instance_id()}", fn, mesh=None
@@ -778,6 +784,7 @@ def forward_with_pcp(
     pcp_rank: int,
     kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
     use_causal_mask: bool = True,
+    cp_interleaved: bool = False,
 ) -> torch.Tensor:
     """Orchestrate the two-pass PCP attention forward.
 
@@ -790,6 +797,12 @@ def forward_with_pcp(
     pcp_meta = attn_metadata.pcp
     if pcp_meta is None:
         raise ValueError("forward_with_pcp requires attn_metadata.pcp to be set.")
+
+    is_interleaved = (
+        bool(cp_interleaved)
+        or bool(getattr(pcp_meta, "is_interleaved", False))
+        or (envs.VLLM_TPU_PCP_LAYOUT.lower() == "interleaved")
+    )
 
     q_scale = k_scale = v_scale = None
     if kv_cache_quantized_dtype:
@@ -821,6 +834,7 @@ def forward_with_pcp(
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
         is_decode=is_decode,
+        cp_interleaved=is_interleaved,
     )
 
     num_seqs = attn_metadata.seq_lens.shape[0]
@@ -873,23 +887,30 @@ def forward_with_pcp(
     value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
 
     # ---- 1. CACHE_ONLY pass ----
-    cu_cache = _make_cu_cache(cu_q_lens_local, num_seqs)
-    dist_cache = attn_metadata.request_distribution.clone()
-    if is_decode:
-        dist_cache[0] = torch.maximum(
-            torch.tensor(1, dtype=dist_cache.dtype, device=dist_cache.device),
-            attn_metadata.request_distribution[0] // 2,
-        )
-        dist_cache[1] = dist_cache[0]
-        dist_cache[2] = dist_cache[0]
+    if is_interleaved:
+        cu_cache = cu_q_lens_local
+        dist_cache = attn_metadata.request_distribution.clone()
+        seq_lens_req = attn_metadata.seq_lens
+        block_tables_req = attn_metadata.block_tables
+        kv_new_lens_req = kv_new_lens
     else:
-        dist_cache[0] = 0
-        dist_cache[1] = 0
-        dist_cache[2] = attn_metadata.request_distribution[2] // 2
+        cu_cache = _make_cu_cache(cu_q_lens_local, num_seqs)
+        dist_cache = attn_metadata.request_distribution.clone()
+        if is_decode:
+            dist_cache[0] = torch.maximum(
+                torch.tensor(1, dtype=dist_cache.dtype, device=dist_cache.device),
+                attn_metadata.request_distribution[0] // 2,
+            )
+            dist_cache[1] = dist_cache[0]
+            dist_cache[2] = dist_cache[0]
+        else:
+            dist_cache[0] = 0
+            dist_cache[1] = 0
+            dist_cache[2] = attn_metadata.request_distribution[2] // 2
 
-    seq_lens_req = _per_request_1d(attn_metadata.seq_lens, num_seqs)
-    block_tables_req = _per_request_pages(attn_metadata.block_tables, num_seqs)
-    kv_new_lens_req = _per_request_1d(kv_new_lens, num_seqs)
+        seq_lens_req = _per_request_1d(attn_metadata.seq_lens, num_seqs)
+        block_tables_req = _per_request_pages(attn_metadata.block_tables, num_seqs)
+        kv_new_lens_req = _per_request_1d(kv_new_lens, num_seqs)
 
     cache_pages = pcp_meta.cache_pages
     run_cache_pass = torch.compiler.is_compiling() or (cache_pages > 0)
@@ -961,13 +982,22 @@ def forward_with_pcp(
     if is_decode:
         k_curr = key
         v_curr = value
-        new_seq_lens = seq_lens_req
-        new_block_tables = block_tables_req
-        new_cu_q_lens = cu_cache
-        new_dist = dist_cache
-        new_kv_new_lens = kv_new_lens_req
-        new_q_positions = _per_request_1d(q_positions, num_seqs)
-        new_update_kv_cache = _per_request_1d(update_kv_cache_local, num_seqs)
+        if is_interleaved:
+            new_seq_lens = attn_metadata.seq_lens
+            new_block_tables = attn_metadata.block_tables
+            new_cu_q_lens = cu_q_lens_local
+            new_dist = attn_metadata.request_distribution
+            new_kv_new_lens = kv_new_lens
+            new_q_positions = q_positions
+            new_update_kv_cache = update_kv_cache_local
+        else:
+            new_seq_lens = seq_lens_req
+            new_block_tables = block_tables_req
+            new_cu_q_lens = cu_cache
+            new_dist = dist_cache
+            new_kv_new_lens = kv_new_lens_req
+            new_q_positions = _per_request_1d(q_positions, num_seqs)
+            new_update_kv_cache = _per_request_1d(update_kv_cache_local, num_seqs)
     else:
         k_curr = all_gather_equal_tokens(key, dim=0)
         v_curr = all_gather_equal_tokens(value, dim=0)
@@ -1083,6 +1113,7 @@ def pcp_forward_batched(
     )
 
     cache_pages = md.pcp.cache_pages
+    is_interleaved = bool(getattr(md.pcp, "is_interleaved", False))
 
     def _shard_fn(
         q_local,
@@ -1113,13 +1144,25 @@ def pcp_forward_batched(
             pad = [(0, num_seqs - heads.shape[0])] + [(0, 0)] * (x.ndim - 1)
             return jnp.pad(heads, pad)
 
-        cu_cache = pcp_cu_q_lens_local[0][::2]
-        cu_cache = jnp.pad(
-            cu_cache, (0, num_seqs + 1 - cu_cache.shape[0]), mode="edge"
-        )
-        dist_cache = jnp.array([0, 0, 0], jnp.int32).at[2].set(
-            distribution_local[2] // 2
-        )
+        if is_interleaved:
+            cu_cache = pcp_cu_q_lens_local[0]
+            dist_cache = distribution_local
+            kv_lens_cache = kv_lens_local
+            page_indices_cache = page_indices_local
+            kv_new_lens_cache = kv_new_lens
+        else:
+            cu_cache = pcp_cu_q_lens_local[0][::2]
+            cu_cache = jnp.pad(
+                cu_cache, (0, num_seqs + 1 - cu_cache.shape[0]), mode="edge"
+            )
+            dist_cache = jnp.array([0, 0, 0], jnp.int32).at[2].set(
+                distribution_local[2] // 2
+            )
+            kv_lens_cache = _per_request(kv_lens_local)
+            page_indices_cache = _per_request(
+                page_indices_local.reshape(num_seqs, -1)
+            ).reshape(-1)
+            kv_new_lens_cache = _per_request(kv_new_lens)
 
         if cache_pages == 0:
             context_out = context_lse = None
@@ -1129,14 +1172,12 @@ def pcp_forward_batched(
                 k_local,
                 v_local,
                 kv_cache_local,
-                _per_request(kv_lens_local),
-                _per_request(page_indices_local.reshape(num_seqs, -1)).reshape(
-                    -1
-                ),
+                kv_lens_cache,
+                page_indices_cache,
                 cu_cache,
                 dist_cache,
                 cp_rank=cp_rank,
-                kv_new_lens=_per_request(kv_new_lens),
+                kv_new_lens=kv_new_lens_cache,
                 attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
                 pcp_ring_axis_name=pcp_axis,
                 pcp_ring_mesh_axis_names=tuple(mesh.axis_names),
@@ -1166,6 +1207,7 @@ def pcp_forward_batched(
                 new_kv_page_indices=new_kv_page_indices,
                 attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
                 use_causal_mask=use_causal_mask,
+                cp_interleaved=is_interleaved,
                 **common,
             )
         )
