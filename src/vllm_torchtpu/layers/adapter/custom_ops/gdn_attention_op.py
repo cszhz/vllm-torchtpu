@@ -35,6 +35,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import (
     all_gather_equal_tokens,
     all_to_all_head_to_token,
+    all_to_all_qkvba_head_to_token,
     all_to_all_token_to_head,
     get_or_create_pcp_mesh,
     get_pcp_rank,
@@ -55,7 +56,10 @@ from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
 )
-from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
 from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention,
     run_jax_gdn_attention_pcp_tp_prefill,
@@ -81,17 +85,33 @@ def _reorder_gdn_qkv_for_pcp_torch(
     dim: int = -1,
 ) -> torch.Tensor:
     """Pack Q/K/V as one rank-major shard per PCP rank in PyTorch."""
+    return _reorder_gdn_qkv_for_pcp_scaled_torch(
+        tensor,
+        geometry,
+        kq_total_dim=geometry.num_kq_heads * d_k,
+        v_total_dim=geometry.num_v_heads * d_v,
+        dim=dim,
+    )
+
+
+def _reorder_gdn_qkv_for_pcp_scaled_torch(
+    tensor: torch.Tensor,
+    geometry: GdnHeadGeometry,
+    *,
+    kq_total_dim: int,
+    v_total_dim: int,
+    dim: int = 0,
+) -> torch.Tensor:
+    """Pack Q/K/V weight or block-scale rows as one rank-major shard per PCP rank."""
     if dim < 0:
         dim += tensor.ndim
-    key_dim = geometry.num_kq_heads * d_k
-    value_dim = geometry.num_v_heads * d_v
-    expected_dim = 2 * key_dim + value_dim
+    expected_dim = 2 * kq_total_dim + v_total_dim
     if tensor.size(dim) != expected_dim:
         raise ValueError(
             f"Expected concatenated QKV width {expected_dim} on dim {dim}, "
             f"got shape={tuple(tensor.shape)}."
         )
-    q, k, v = torch.split(tensor, [key_dim, key_dim, value_dim], dim=dim)
+    q, k, v = torch.split(tensor, [kq_total_dim, kq_total_dim, v_total_dim], dim=dim)
     q_shards = torch.chunk(q, geometry.num_unique_kq_shards, dim=dim)
     k_shards = torch.chunk(k, geometry.num_unique_kq_shards, dim=dim)
     v_shards = torch.chunk(v, geometry.parallel_size, dim=dim)
@@ -358,9 +378,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._create_conv1d()
+        pcp_enabled = self._pcp_streaming_enabled()
+        self._pcp_streaming_configured = pcp_enabled
         # `_require_pcp_projection_parameters` hands this weight straight to
         # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
-        if hasattr(self, "in_proj_qkvz"):
+        # Only exempt `in_proj_qkvz` from the canonical [n_in, n_out] flip when
+        # PCP streaming is active; non-streaming modes (`PCP=1`, `zigzag`,
+        # `interleaved`) use the standard linear method and benefit from the
+        # load-time transpose.
+        if pcp_enabled and hasattr(self, "in_proj_qkvz"):
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
@@ -368,6 +394,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self._pcp_interleaved_world_size = self._pcp_interleaved_size()
         self._pcp_head_geometry: GdnHeadGeometry | None = None
         self._pcp_cached_rank: int = -1
+        self._pcp_weights_sliced: bool = False
+        self._pcp_qkv_weights_permuted: bool = False
         if self._pcp_interleaved_world_size > 1:
             self._pcp_head_geometry = derive_gdn_head_geometry(
                 self.tp_head_geometry.local_num_kq_heads,
@@ -398,8 +426,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 self._update_pcp_head_slice_buffers(0)
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op()
-        pcp_enabled = self._pcp_streaming_enabled()
-        self._pcp_streaming_configured = pcp_enabled
         self.gdn_pcp_op = (
             self._build_gdn_op(pcp_streaming=True) if pcp_enabled else None
         )
@@ -407,7 +433,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             self._build_pooled_pcp_gdn_op() if pcp_enabled else None
         )
 
-    def _update_pcp_head_slice_buffers(self, pcp_rank: int) -> None:
+    def _update_pcp_head_slice_buffers(
+        self, pcp_rank: int, *, materialize_weights: bool = False
+    ) -> None:
         geom = getattr(self, "_pcp_head_geometry", None)
         if geom is None:
             return
@@ -434,6 +462,27 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self._pcp_conv_idx.copy_(conv_idx)
         self._pcp_v_head_idx.copy_(v_head_idx)
         self._pcp_cached_rank = pcp_rank
+        if materialize_weights or getattr(self, "_pcp_weights_sliced", False):
+            conv_w_idx = conv_idx.to(device=self.conv1d.weight.device)
+            self._pcp_conv_weight = torch.index_select(
+                self.conv1d.weight.data, 0, conv_w_idx
+            ).contiguous()
+            self._pcp_conv_bias = (
+                torch.index_select(
+                    self.conv1d.bias.data,
+                    0,
+                    conv_idx.to(device=self.conv1d.bias.device),
+                ).contiguous()
+                if self.conv1d.bias is not None
+                else None
+            )
+            self._pcp_A_log = torch.index_select(
+                self.A_log.data, 0, v_head_idx.to(device=self.A_log.device)
+            ).contiguous()
+            self._pcp_dt_bias = torch.index_select(
+                self.dt_bias.data, 0, v_head_idx.to(device=self.dt_bias.device)
+            ).contiguous()
+            self._pcp_weights_sliced = True
 
     def _get_pcp_interleaved_params(
         self, device: torch.device
@@ -453,6 +502,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         self._update_pcp_head_slice_buffers(cur_rank)
                 except Exception:
                     pass
+            if getattr(self, "_pcp_weights_sliced", False):
+                return (
+                    pcp_geom,
+                    self._pcp_conv_weight,
+                    self._pcp_conv_bias,
+                    self._pcp_A_log,
+                    self._pcp_dt_bias,
+                )
             conv_idx = self._pcp_conv_idx
             v_head_idx = self._pcp_v_head_idx
             if conv_idx.device != device:
@@ -608,6 +665,114 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             conv_state_dtype = torch.float32
         return conv_state_dtype, temporal_state_dtype
 
+    def _maybe_permute_pcp_qkv_proj_weights(
+        self, pcp_geom: GdnHeadGeometry
+    ) -> None:
+        if getattr(self, "_pcp_qkv_weights_permuted", False):
+            return
+        if pcp_geom.num_unique_kq_shards != pcp_geom.parallel_size:
+            return
+        proj = getattr(self, "in_proj_qkvz", None)
+        has_z = True
+        if proj is None:
+            proj = getattr(self, "in_proj_qkv", None)
+            has_z = False
+        if proj is None or getattr(proj, "weight", None) is None:
+            return
+        weight = proj.weight
+        if weight.ndim != 2:
+            return
+
+        key_dim = pcp_geom.num_kq_heads * self.head_k_dim
+        value_dim = pcp_geom.num_v_heads * self.head_v_dim
+        qkv_size = 2 * key_dim + value_dim
+        z_size = value_dim if has_z else 0
+        expected_out = qkv_size + z_size
+
+        is_flipped = getattr(proj, WEIGHT_FLIPPED_ATTR, False)
+        out_dim = 1 if is_flipped else 0
+        if weight.size(out_dim) != expected_out:
+            return
+
+        kq_shard_dim = pcp_geom.local_num_kq_heads * self.head_k_dim
+        v_shard_dim = pcp_geom.local_num_v_heads * self.head_v_dim
+
+        # Validate FP8 scale alignment before mutating weight.
+        scale_candidates = []
+        seen_ptrs: set[int] = set()
+        for scale_attr in ("weight_scale_inv", "weight_scale"):
+            scale_param = getattr(proj, scale_attr, None)
+            if scale_param is None or not isinstance(scale_param, torch.Tensor):
+                continue
+            ptr = scale_param.data.data_ptr()
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            if scale_param.ndim not in (1, 2) or scale_param.numel() <= 1:
+                continue
+            scale_out_dim = 1 if (scale_param.ndim == 2 and is_flipped) else 0
+            scale_out_len = scale_param.size(scale_out_dim)
+            if scale_out_len == expected_out:
+                block_h = 1
+            elif expected_out % scale_out_len == 0:
+                block_h = expected_out // scale_out_len
+            else:
+                return
+            if (
+                kq_shard_dim % block_h != 0
+                or v_shard_dim % block_h != 0
+                or qkv_size % block_h != 0
+            ):
+                return
+            scale_candidates.append((scale_param, scale_out_dim, block_h))
+
+        bias = getattr(proj, "bias", None)
+        if bias is not None and isinstance(bias, torch.Tensor) and bias.numel() > 0:
+            if bias.ndim != 1 or bias.size(0) != expected_out:
+                return
+
+        w_data = weight.data
+        w_qkv = w_data[:, :qkv_size] if out_dim == 1 else w_data[:qkv_size, :]
+        w_qkv_reordered = _reorder_gdn_qkv_for_pcp_scaled_torch(
+            w_qkv,
+            pcp_geom,
+            kq_total_dim=key_dim,
+            v_total_dim=value_dim,
+            dim=out_dim,
+        )
+        w_qkv.copy_(w_qkv_reordered)
+
+        if bias is not None and isinstance(bias, torch.Tensor) and bias.numel() > 0:
+            b_qkv = bias.data[:qkv_size]
+            b_qkv.copy_(
+                _reorder_gdn_qkv_for_pcp_scaled_torch(
+                    b_qkv,
+                    pcp_geom,
+                    kq_total_dim=key_dim,
+                    v_total_dim=value_dim,
+                    dim=0,
+                )
+            )
+
+        for scale_param, scale_out_dim, block_h in scale_candidates:
+            s_data = scale_param.data
+            qkv_scale_len = qkv_size // block_h
+            s_qkv = (
+                s_data[:, :qkv_scale_len]
+                if scale_out_dim == 1
+                else s_data[:qkv_scale_len]
+            )
+            s_qkv_reordered = _reorder_gdn_qkv_for_pcp_scaled_torch(
+                s_qkv,
+                pcp_geom,
+                kq_total_dim=key_dim // block_h,
+                v_total_dim=value_dim // block_h,
+                dim=scale_out_dim,
+            )
+            s_qkv.copy_(s_qkv_reordered)
+
+        self._pcp_qkv_weights_permuted = True
+
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         """Back the conv weight with a buffer of its own 3-D shape.
 
@@ -624,11 +789,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.conv1d.weight.data = torch.empty(
             w.shape, dtype=w.dtype, device=w.device
         ).copy_(w)
-        if getattr(self, "_pcp_head_geometry", None) is not None:
+        pcp_geom = getattr(self, "_pcp_head_geometry", None)
+        if pcp_geom is not None:
             try:
-                self._update_pcp_head_slice_buffers(get_pcp_rank())
+                cur_rank = get_pcp_rank()
             except Exception:
-                pass
+                cur_rank = max(getattr(self, "_pcp_cached_rank", 0), 0)
+            self._update_pcp_head_slice_buffers(
+                cur_rank, materialize_weights=True
+            )
+            self._maybe_permute_pcp_qkv_proj_weights(pcp_geom)
 
     def get_state_shape(
         self,
@@ -1279,31 +1449,21 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     A_log,
                     dt_bias,
                 ) = self._get_pcp_interleaved_params(mixed_qkv.device)
-                mixed_qkv_reordered = _reorder_gdn_qkv_for_pcp_torch(
-                    mixed_qkv,
-                    pcp_geom,
-                    d_k=self.head_k_dim,
-                    d_v=self.head_v_dim,
-                    dim=-1,
-                )
-                mixed_qkv_a2a = all_to_all_head_to_token(mixed_qkv_reordered)
-                b_a2a = all_to_all_head_to_token(b)
-                a_a2a = all_to_all_head_to_token(a)
-                rm_to_packed = pcp_meta.gdn_rm_to_packed[: mixed_qkv_a2a.size(0)]
-                mixed_qkv_gdn = torch.index_select(
-                    mixed_qkv_a2a,
-                    0,
-                    rm_to_packed,
-                )
-                b_gdn = torch.index_select(
-                    b_a2a,
-                    0,
-                    rm_to_packed,
-                )
-                a_gdn = torch.index_select(
-                    a_a2a,
-                    0,
-                    rm_to_packed,
+                if getattr(self, "_pcp_qkv_weights_permuted", False):
+                    mixed_qkv_reordered = mixed_qkv
+                else:
+                    mixed_qkv_reordered = _reorder_gdn_qkv_for_pcp_torch(
+                        mixed_qkv,
+                        pcp_geom,
+                        d_k=self.head_k_dim,
+                        d_v=self.head_v_dim,
+                        dim=-1,
+                    )
+                mixed_qkv_gdn, b_gdn, a_gdn = all_to_all_qkvba_head_to_token(
+                    mixed_qkv_reordered,
+                    b,
+                    a,
+                    pcp_meta.gdn_rm_to_packed,
                 )
                 gdn_qsl = pcp_meta.gdn_query_start_loc
             elif is_pcp_zigzag:
@@ -1377,7 +1537,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 if is_pcp_interleaved:
                     assert pcp_geom is not None
                     core_attn_out = core_attn_out.view(
-                        -1, pcp_geom.local_num_v_heads, self.head_v_dim
+                        -1, pcp_geom.local_num_v_heads * self.head_v_dim
                     )
                     packed_to_rm = pcp_meta.gdn_packed_to_rm[: core_attn_out.size(0)]
                     core_attn_out = torch.index_select(
@@ -1478,7 +1638,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 if is_pcp_interleaved:
                     assert pcp_geom is not None
                     core_attn_out = core_attn_out.view(
-                        -1, pcp_geom.local_num_v_heads, self.head_v_dim
+                        -1, pcp_geom.local_num_v_heads * self.head_v_dim
                     )
                     packed_to_rm = pcp_meta.gdn_packed_to_rm[: core_attn_out.size(0)]
                     core_attn_out = torch.index_select(

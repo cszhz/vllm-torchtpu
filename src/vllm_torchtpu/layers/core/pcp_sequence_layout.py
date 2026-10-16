@@ -1657,11 +1657,13 @@ def pcp_interleaved_page_table(
         c_i = chunk[i]
         req_pages = max(1, c_i // block_size)
         o_i = off[i] if off is not None else sum(chunk[:i])
-        for p in range(pcp_size * req_pages):
-            rank = p % pcp_size
-            local_page = p // pcp_size
-            base = (rank * s_pad_val + o_i) // block_size + local_page
-            pcp_table_np[i, p] = base
+        n_pages = pcp_size * req_pages
+        p = np.arange(n_pages, dtype=np.int32)
+        rank = p % pcp_size
+        local_page = p // pcp_size
+        pcp_table_np[i, :n_pages] = (
+            (rank * s_pad_val + o_i) // block_size + local_page
+        )
     return pcp_table_np
 
 
@@ -1681,18 +1683,19 @@ def apply_pcp_interleaved_token_order(
     num_reqs = len(counts)
     src_off = np.cumsum([0] + counts)[:-1]
     perm = np.full(padded_total_num_tokens, -1, dtype=np.int64)
-    j = np.arange(block_size)
+    j = np.arange(block_size, dtype=np.int64)
 
     for i in range(num_reqs):
         c_i = chunk[i]
         req_pages = max(1, c_i // block_size)
-        for p in range(pcp_size * req_pages):
-            r = p % pcp_size
-            local_page = p // pcp_size
-            dst = r * s_pad + off[i] + local_page * block_size + j
-            tok = p * block_size + j
-            real = tok < counts[i]
-            perm[dst[real]] = src_off[i] + tok[real]
+        n_pages = pcp_size * req_pages
+        p = np.arange(n_pages, dtype=np.int64)[:, None]
+        r = p % pcp_size
+        local_page = p // pcp_size
+        dst = (r * s_pad + off[i] + local_page * block_size + j).reshape(-1)
+        n_real = min(int(counts[i]), dst.size)
+        if n_real > 0:
+            perm[dst[:n_real]] = src_off[i] + np.arange(n_real, dtype=np.int64)
 
     valid = perm >= 0
     orig_ids = input_ids.copy()

@@ -102,6 +102,61 @@ def all_to_all_head_to_token(tensor: torch.Tensor) -> torch.Tensor:
     return recv_buf.reshape(world_size * L, c_per_rank, *rest)
 
 
+def all_to_all_qkvba_head_to_token(
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    rm_to_packed: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused head-to-token all-to-all (and optional token permutation) for GDN [mixed_qkv, b, a].
+
+    Packs rank-major ``mixed_qkv`` ``[L, P * qkv_per_rank]``, ``b`` ``[L, P * v_per_rank]``,
+    and ``a`` ``[L, P * v_per_rank]`` into a single ``[P, L, qkv_per_rank + 2 * v_per_rank]``
+    send buffer, executes a single ``all_to_all_single``, optionally permutes tokens
+    via ``torch.index_select(0, rm_to_packed)``, and splits back into
+    ``(mixed_qkv_gdn, b_gdn, a_gdn)`` of shapes ``[P * L, qkv_per_rank]``,
+    ``[P * L, v_per_rank]``, and ``[P * L, v_per_rank]``.
+    """
+    group = get_pcp_group()
+    if group is None or int(group.world_size) == 1:
+        if rm_to_packed is not None:
+            idx = rm_to_packed[: mixed_qkv.size(0)]
+            return (
+                torch.index_select(mixed_qkv, 0, idx),
+                torch.index_select(b, 0, idx),
+                torch.index_select(a, 0, idx),
+            )
+        return mixed_qkv, b, a
+    world_size = int(group.world_size)
+    L = mixed_qkv.shape[0]
+    if mixed_qkv.shape[1] % world_size != 0 or b.shape[1] % world_size != 0:
+        raise ValueError(
+            f"QKV ({mixed_qkv.shape[1]}) and B/A ({b.shape[1]}) channel dimensions "
+            f"must be divisible by PCP world_size {world_size}."
+        )
+    qkv_per_rank = mixed_qkv.shape[1] // world_size
+    v_per_rank = b.shape[1] // world_size
+    total_per_rank = qkv_per_rank + 2 * v_per_rank
+
+    qkv_3d = mixed_qkv.reshape(L, world_size, qkv_per_rank)
+    b_3d = b.reshape(L, world_size, v_per_rank)
+    a_3d = a.reshape(L, world_size, v_per_rank)
+    send_buf = (
+        torch.cat((qkv_3d, b_3d, a_3d), dim=-1)
+        .transpose(0, 1)
+        .contiguous()
+    )
+    recv_buf = all_to_all_single(send_buf).reshape(world_size * L, total_per_rank)
+    if rm_to_packed is not None:
+        recv_buf = torch.index_select(
+            recv_buf, 0, rm_to_packed[: recv_buf.size(0)]
+        )
+    mixed_qkv_gdn, b_gdn, a_gdn = recv_buf.split(
+        [qkv_per_rank, v_per_rank, v_per_rank], dim=-1
+    )
+    return mixed_qkv_gdn.contiguous(), b_gdn.contiguous(), a_gdn.contiguous()
+
+
 def all_to_all_token_to_head(tensor: torch.Tensor) -> torch.Tensor:
     """Exchange ``tensor`` from token-all / head-sharded ``[P * L, C_local, ...]``
     back to token-sharded / head-replicated ``[L, P * C_local, ...]`` across the PCP group.

@@ -459,3 +459,189 @@ def test_pcp_interleaved_eligibility_and_prepare_dummy():
     assert plan.pcp_metadata.query_start_loc.shape == (2, 3)
 
 
+def test_all_to_all_qkvba_head_to_token_and_load_time_weight_slicing():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from vllm_torchtpu.distributed.pcp import (
+        all_to_all_head_to_token,
+        all_to_all_qkvba_head_to_token,
+    )
+    from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
+    from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+        VllmGatedDeltaNetAttention,
+    )
+
+    pcp_size = 2
+    num_tokens = 4
+    qkv_dim = 32
+    v_heads = 8
+
+    mixed_qkv = torch.arange(
+        num_tokens * qkv_dim, dtype=torch.bfloat16
+    ).reshape(num_tokens, qkv_dim)
+    b = torch.arange(
+        num_tokens * v_heads, dtype=torch.bfloat16
+    ).reshape(num_tokens, v_heads)
+    a = (b + 100).to(torch.bfloat16)
+    rm_to_packed = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.int32)
+
+    fake_group = SimpleNamespace(world_size=pcp_size, device_group=MagicMock())
+
+    with (
+        patch("vllm_torchtpu.distributed.pcp.get_pcp_group", return_value=fake_group),
+        patch(
+            "vllm_torchtpu.distributed.pcp.all_to_all_single",
+            side_effect=lambda t: t.clone(),
+        ) as mock_a2a,
+    ):
+        qkv_f, b_f, a_f = all_to_all_qkvba_head_to_token(
+            mixed_qkv, b, a, rm_to_packed=rm_to_packed
+        )
+        assert mock_a2a.call_count == 1
+        qkv_ref = torch.index_select(
+            all_to_all_head_to_token(mixed_qkv), 0, rm_to_packed
+        )
+        b_ref = torch.index_select(all_to_all_head_to_token(b), 0, rm_to_packed)
+        a_ref = torch.index_select(all_to_all_head_to_token(a), 0, rm_to_packed)
+        assert torch.equal(qkv_f, qkv_ref)
+        assert torch.equal(b_f, b_ref)
+        assert torch.equal(a_f, a_ref)
+
+    # Verify load-time slicing of conv1d.weight, conv1d.bias, A_log, dt_bias
+    attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+    torch.nn.Module.__init__(attn)
+    attn.head_k_dim = 4
+    attn.head_v_dim = 4
+    attn._pcp_head_geometry = derive_gdn_head_geometry(4, 8, pcp_size)
+    attn._pcp_cached_rank = -1
+    attn._pcp_weights_sliced = False
+    attn._pcp_qkv_weights_permuted = False
+    pcp_conv_dim = attn._pcp_head_geometry.local_conv_dim(4, 4)
+    pcp_v_heads = attn._pcp_head_geometry.local_num_v_heads
+    attn.register_buffer(
+        "_pcp_conv_idx", torch.zeros(pcp_conv_dim, dtype=torch.int32), persistent=False
+    )
+    attn.register_buffer(
+        "_pcp_v_head_idx", torch.zeros(pcp_v_heads, dtype=torch.int32), persistent=False
+    )
+    attn.conv1d = SimpleNamespace(
+        weight=torch.nn.Parameter(
+            torch.arange(64 * 4, dtype=torch.float32).reshape(64, 1, 4),
+            requires_grad=False,
+        ),
+        bias=torch.nn.Parameter(
+            torch.arange(64, dtype=torch.float32), requires_grad=False
+        ),
+    )
+    attn.A_log = torch.nn.Parameter(
+        torch.arange(8, dtype=torch.float32), requires_grad=False
+    )
+    attn.dt_bias = torch.nn.Parameter(
+        torch.arange(100, 108, dtype=torch.float32), requires_grad=False
+    )
+
+    with patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_rank",
+        return_value=1,
+    ):
+        attn.process_weights_after_loading(torch.bfloat16)
+        assert attn._pcp_weights_sliced is True
+        with patch("torch.index_select", side_effect=RuntimeError("should not slice at runtime")):
+            geom, cw, cb, alog, dtb = attn._get_pcp_interleaved_params(
+                torch.device("cpu")
+            )
+        assert cw is attn._pcp_conv_weight
+        assert cb is attn._pcp_conv_bias
+        assert alog is attn._pcp_A_log
+        assert dtb is attn._pcp_dt_bias
+        assert cw.shape == (32, 1, 4)
+        assert torch.equal(alog, torch.tensor([4.0, 5.0, 6.0, 7.0]))
+        assert torch.equal(dtb, torch.tensor([104.0, 105.0, 106.0, 107.0]))
+
+
+@pytest.mark.parametrize("is_flipped", [False, True])
+def test_pcp_load_time_qkvz_weight_and_scale_permutation(is_flipped: bool):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
+    from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+        VllmGatedDeltaNetAttention,
+        _reorder_gdn_qkv_for_pcp_torch,
+    )
+    from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+
+    pcp_size = 2
+    d_k = 128
+    d_v = 128
+    n_kq = 4
+    n_v = 8
+    n_in = 256
+    block_h = 128
+    block_w = 128
+    geom = derive_gdn_head_geometry(n_kq, n_v, pcp_size)
+
+    key_dim = n_kq * d_k  # 512
+    val_dim = n_v * d_v  # 1024
+    qkv_size = 2 * key_dim + val_dim  # 2048
+    z_size = val_dim  # 1024
+    n_out = qkv_size + z_size  # 3072
+
+    torch.manual_seed(42)
+    x = torch.randn(6, n_in, dtype=torch.float32)
+    w_out_in = torch.randn(n_out, n_in, dtype=torch.float32)
+    s_out_in = torch.rand(n_out // block_h, n_in // block_w, dtype=torch.float32) + 0.5
+
+    # Expand block scales to elementwise [n_out, n_in] to compute reference FP8 matmul
+    s_expanded = s_out_in.repeat_interleave(block_h, dim=0).repeat_interleave(
+        block_w, dim=1
+    )
+    ref_out = x @ (w_out_in * s_expanded).T
+    ref_qkv, ref_z = ref_out.split([qkv_size, z_size], dim=-1)
+    ref_qkv_reordered = _reorder_gdn_qkv_for_pcp_torch(
+        ref_qkv, geom, d_k=d_k, d_v=d_v, dim=-1
+    )
+
+    attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+    attn.head_k_dim = d_k
+    attn.head_v_dim = d_v
+    attn._pcp_head_geometry = geom
+    attn._pcp_qkv_weights_permuted = False
+
+    w_param = (
+        torch.nn.Parameter(w_out_in.T.contiguous(), requires_grad=False)
+        if is_flipped
+        else torch.nn.Parameter(w_out_in.clone(), requires_grad=False)
+    )
+    s_param = (
+        torch.nn.Parameter(s_out_in.T.contiguous(), requires_grad=False)
+        if is_flipped
+        else torch.nn.Parameter(s_out_in.clone(), requires_grad=False)
+    )
+    proj = SimpleNamespace(
+        weight=w_param,
+        weight_scale_inv=s_param,
+        weight_scale=s_param,  # aliases weight_scale_inv as in create_weights
+        bias=None,
+    )
+    setattr(proj, WEIGHT_FLIPPED_ATTR, is_flipped)
+    attn.in_proj_qkvz = proj
+
+    attn._maybe_permute_pcp_qkv_proj_weights(geom)
+    assert attn._pcp_qkv_weights_permuted is True
+    # Idempotence check
+    attn._maybe_permute_pcp_qkv_proj_weights(geom)
+
+    w_perm = w_param.data.T if is_flipped else w_param.data
+    s_perm = s_param.data.T if is_flipped else s_param.data
+    s_perm_expanded = s_perm.repeat_interleave(block_h, dim=0).repeat_interleave(
+        block_w, dim=1
+    )
+    perm_out = x @ (w_perm * s_perm_expanded).T
+    perm_qkv, perm_z = perm_out.split([qkv_size, z_size], dim=-1)
+
+    torch.testing.assert_close(perm_qkv, ref_qkv_reordered)
+    torch.testing.assert_close(perm_z, ref_z)
+
+
+
