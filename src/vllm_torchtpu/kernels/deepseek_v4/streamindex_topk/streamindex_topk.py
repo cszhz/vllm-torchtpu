@@ -346,9 +346,9 @@ def score_pipeline(
         kv_spec = pl.BlockSpec(
             (
                 pl.BoundedSlice(seq_batch_size),
-                kv_sublane_groups,
+                bkv_p * kv_sublane_groups,
                 kv_packing,
-                bkv_sz,
+                page_size,
             ),
             lambda p_id: (seq_tile(p_id), 0, 0, bkv_block(p_id)),
             pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
@@ -429,34 +429,50 @@ def score_pipeline(
     # ------------------------------------------------------------------------
     # SEQ_ALONG_LANE block access.
     #
-    # The VMEM block is u8[seq_batch, kv_sublane_groups, kv_packing, bkv_sz]:
-    # packed group g holds key dims [4g, 4g + 4) of every token, one byte per
-    # dim, and group `kv_head_dim_groups` holds the UE8M0 scale in byte 0.
-    # Viewed as u32, row `g * nt + j` (nt = bkv_sz // 128) is group g of lane
-    # tile j, so a sublane-strided load of rows `j, j + nt, ...` yields the
-    # [head_dim // 4, 128] words of lane tile j. Bitcasting those words to FP8
+    # The VMEM block is u8[seq_batch, bkv_p * kv_sublane_groups, kv_packing,
+    # page_size]: the block's pages back to back, each exactly as it is laid out
+    # in HBM, so every page arrives in one contiguous copy. In a page, packed
+    # group g holds key dims [4g, 4g + 4) of every token, one byte per dim, and
+    # group `kv_head_dim_groups` holds the UE8M0 scale in byte 0. Viewed as u32
+    # with tp = page_size // 128 lane tiles a page, row
+    # `(page * kv_sublane_groups + g) * tp + j` is group g of the page's lane
+    # tile j, so a sublane-strided load with stride tp yields the
+    # [head_dim // 4, 128] words of one lane tile. Bitcasting those words to FP8
     # gives [head_dim, 128] with key dim 4g + i taken from byte i -- exactly the
     # MXU-native packed layout -- so no relayout is needed on the key path.
+    # (Pages used to land in lane windows of a [groups, kv_packing, bkv_sz]
+    # block, which made that stride a whole block row, bkv_sz // 128 tiles. On
+    # tpu7x the verify pass ran 20-23% longer that way.)
     # ------------------------------------------------------------------------
     num_lane_tiles_bkv = bkv_sz // 128
+    tiles_per_page = page_size // 128
 
     def seq_along_lane_block_rows(bkv_vmem):
         return bkv_vmem.bitcast(jnp.uint32).reshape(
-            seq_batch_size, kv_sublane_groups * num_lane_tiles_bkv, 128
+            seq_batch_size, bkv_p * kv_sublane_groups * tiles_per_page, 128
         )
+
+    def seq_along_lane_row(group, lane_tile_idx):
+        """u32 row of `group` of block lane tile `lane_tile_idx`."""
+        page, tile = divmod(lane_tile_idx, tiles_per_page)
+        return (page * kv_sublane_groups + group) * tiles_per_page + tile
 
     def seq_along_lane_key_tile(rows, batch_idx, lane_tile_idx):
         """[head_dim, 128] FP8 keys of lane tile `lane_tile_idx`."""
         words = rows[
             batch_idx,
-            pl.ds(lane_tile_idx, kv_head_dim_groups, stride=num_lane_tiles_bkv),
+            pl.ds(
+                seq_along_lane_row(0, lane_tile_idx),
+                kv_head_dim_groups,
+                stride=tiles_per_page,
+            ),
             :,
         ]
         return pltpu.bitcast(words, jnp.float8_e4m3fn)
 
     def seq_along_lane_scale_tile(rows, batch_idx, lane_tile_idx):
         """[1, 128] f32 dequantization scales of lane tile `lane_tile_idx`."""
-        row = kv_head_dim_groups * num_lane_tiles_bkv + lane_tile_idx
+        row = seq_along_lane_row(kv_head_dim_groups, lane_tile_idx)
         words = rows[batch_idx, pl.ds(row, 1), :]
         # UE8M0 holds a bare biased exponent, which is where f32 keeps its own:
         # moving byte 0 into the f32 exponent field yields 2^(e - 127) exactly
