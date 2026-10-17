@@ -39,6 +39,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     init_distributed_environment,
 )
+from vllm.lora.request import LoRARequest
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1 import utils as vllm_utils
@@ -830,6 +831,18 @@ class TPUWorker(WorkerBase):
 
     def get_kv_cache_spec(self):
         return self.model_runner.get_kv_cache_spec()
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        return self.model_runner.add_lora(lora_request)
+
+    def remove_lora(self, lora_id: int) -> bool:
+        return self.model_runner.remove_lora(lora_id)
+
+    def pin_lora(self, lora_id: int) -> bool:
+        return self.model_runner.pin_lora(lora_id)
+
+    def list_loras(self) -> set[int]:
+        return self.model_runner.list_loras()
 
     def get_num_gpu_blocks_override(self) -> int | None:
         return self.vllm_config.cache_config.num_gpu_blocks_override

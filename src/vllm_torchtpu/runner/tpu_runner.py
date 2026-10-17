@@ -3402,15 +3402,22 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         if self.lora_config is not None:
-            # We need to respect padding when activating LoRA adapters
-            padded_num_scheduled_tokens_per_req = np.copy(
-                num_scheduled_tokens_per_req
-            )  # Copying to avoid accidental state corruption bugs
-            padded_num_scheduled_tokens_per_req[-1] += (
-                padded_total_num_scheduled_tokens - total_num_scheduled_tokens
+            # Map this chunk's tokens and logits rows to adapter ids, padded
+            # with 0 (no adapter) to the lengths the compiled graph reads.
+            req_lora_ids = self.input_batch.request_lora_mapping[
+                start_index : start_index + num_reqs
+            ]
+            token_lora_ids = np.repeat(req_lora_ids, num_scheduled_tokens_per_req)
+            token_mapping = np.pad(
+                token_lora_ids,
+                (0, padded_total_num_scheduled_tokens - total_num_scheduled_tokens),
             )
-
-            self.set_active_loras(self.input_batch, padded_num_scheduled_tokens_per_req)
+            prompt_mapping = np.pad(req_lora_ids, (0, padded_num_reqs - num_reqs))
+            self._set_active_loras(
+                tuple(prompt_mapping.tolist()),
+                tuple(token_mapping.tolist()),
+                set(self.input_batch.lora_id_to_lora_request.values()),
+            )
 
         # Prepare token substitution indices
         cur_input_indices, pre_next_tokens_indices = (
@@ -5220,6 +5227,8 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        if self.lora_config is not None:
+            self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         if self.is_pooling_model:
             self._resolve_static_pooler()
         if self.parallel_config.pipeline_parallel_size > 1:
