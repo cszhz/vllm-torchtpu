@@ -307,6 +307,7 @@ def score_pipeline(
     bkv_sz_per_kv_packing = bkv_p * page_size_per_kv_packing
     bkv_sz = bkv_p * page_size
     num_sublanes_bkv = bkv_sz // 128
+    shift_comp = (compression_ratio - 1).bit_length()
 
     # The schedule holds every chunk's steps back to back, so this chunk starts
     # where the chunks before it end and runs `num_steps[chunk_idx]` steps.
@@ -552,6 +553,7 @@ def score_pipeline(
         scale_val_vec,
         bq_weights_vec,
         q_is_head_major=False,
+        num_sublanes=num_sublanes_bkv,
     ):
         assert len(bq_vec) == seq_batch_size
         assert len(bkv_vec) == seq_batch_size
@@ -570,7 +572,7 @@ def score_pipeline(
             # `blocked_prefill_step`: the top-k reads each row only up to its
             # `row_lengths` entry, the causal and end-of-sequence limit.
             s_summed = s_summed * scale_val
-            ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
+            ret.append(s_summed.reshape(-1, num_sublanes, 128))
         return jnp.concatenate(ret, axis=0)
 
     def step_body(q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None):
@@ -595,48 +597,70 @@ def score_pipeline(
         w_data = weights_vmem[...].reshape(seq_batch_size, -1, num_q_heads)
         bq_weights_vec = [w_data[batch_idx] for batch_idx in range(seq_batch_size)]
 
-        bkvs = []
-        bkv_scales = []
-        for batch_idx in range(seq_batch_size):
-            if seq_along_lane:
-                # Keys and scales come straight out of the packed block in their MXU
-                # and lane layouts respectively; see `seq_along_lane_block_rows`.
-                rows = seq_along_lane_block_rows(bkv_vmem)
-                lane_tiles = range(num_lane_tiles_bkv)
-                fp8_val = jnp.concatenate(
-                    [
-                        seq_along_lane_key_tile(rows, batch_idx, lane_tile_idx)
-                        for lane_tile_idx in lane_tiles
-                    ],
-                    axis=1,
-                )
-                scale_val = jnp.concatenate(
-                    [
-                        seq_along_lane_scale_tile(rows, batch_idx, lane_tile_idx)
-                        for lane_tile_idx in lane_tiles
-                    ],
-                    axis=1,
-                )
-                bkvs.append(fp8_val)
-                bkv_scales.append(scale_val)
-            else:
-                bkv = bkv_vmem[batch_idx, :bkv_sz_per_kv_packing][...]
-                flat_bkv = bkv.reshape(-1, bkv.shape[-1])
-                fp8_val = pltpu.bitcast(flat_bkv[:, :head_dim], jnp.float8_e4m3fn)
-                scale_val = pltpu.bitcast(
-                    flat_bkv[:, head_dim : head_dim + 1].T, jnp.float8_e8m0fnu
-                ).astype(jnp.float32)
-                bkvs.append(fp8_val.reshape(bkv_sz, head_dim))
-                bkv_scales.append(scale_val)
+        def score(num_tiles):
+            """Scores the block's first `num_tiles` lane tiles."""
+            bkvs = []
+            bkv_scales = []
+            for batch_idx in range(seq_batch_size):
+                if seq_along_lane:
+                    # Keys and scales come straight out of the packed block in their
+                    # MXU and lane layouts respectively; see
+                    # `seq_along_lane_block_rows`.
+                    rows = seq_along_lane_block_rows(bkv_vmem)
+                    lane_tiles = range(num_tiles)
+                    fp8_val = jnp.concatenate(
+                        [
+                            seq_along_lane_key_tile(rows, batch_idx, lane_tile_idx)
+                            for lane_tile_idx in lane_tiles
+                        ],
+                        axis=1,
+                    )
+                    scale_val = jnp.concatenate(
+                        [
+                            seq_along_lane_scale_tile(rows, batch_idx, lane_tile_idx)
+                            for lane_tile_idx in lane_tiles
+                        ],
+                        axis=1,
+                    )
+                    bkvs.append(fp8_val)
+                    bkv_scales.append(scale_val)
+                else:
+                    bkv = bkv_vmem[batch_idx, :bkv_sz_per_kv_packing][...]
+                    flat_bkv = bkv.reshape(-1, bkv.shape[-1])
+                    fp8_val = pltpu.bitcast(flat_bkv[:, :head_dim], jnp.float8_e4m3fn)
+                    scale_val = pltpu.bitcast(
+                        flat_bkv[:, head_dim : head_dim + 1].T, jnp.float8_e8m0fnu
+                    ).astype(jnp.float32)
+                    bkvs.append(fp8_val.reshape(bkv_sz, head_dim))
+                    bkv_scales.append(scale_val)
 
-        scores = compute_scores(
-            bq_vec,
-            bkvs,
-            bkv_scales,
-            bq_weights_vec,
-            q_is_head_major=q_hm_ref is not None,
-        )
-        scores_vmem[...] = pltpu.bitcast(scores, jnp.int32)
+            scores = compute_scores(
+                bq_vec,
+                bkvs,
+                bkv_scales,
+                bq_weights_vec,
+                q_is_head_major=q_hm_ref is not None,
+                num_sublanes=num_tiles,
+            )
+            scores_vmem[:, :num_tiles] = pltpu.bitcast(scores, jnp.int32)
+
+        # A sequence's last KV block is usually part empty, and positions past
+        # its compressed length are never read (the top-k stops at
+        # `row_lengths`). When they fill at least half the block, only the
+        # first half is scored. The scored positions' arithmetic is unchanged.
+        half_tiles = num_lane_tiles_bkv // 2
+        if (
+            seq_along_lane
+            and seq_batch_size == 1
+            and cp_size == 1
+            and half_tiles % 8 == 0
+        ):
+            kv_len = seq_lens_ref[seq_tile(pl.program_id(0))] >> shift_comp
+            past_half = kv_len - bkv_idx * bkv_sz > half_tiles * 128
+            pl.when(past_half)(functools.partial(score, num_lane_tiles_bkv))
+            pl.when(jnp.logical_not(past_half))(functools.partial(score, half_tiles))
+        else:
+            score(num_lane_tiles_bkv)
 
     def blocked_prefill_step(
         q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref, q_half_ref=None
