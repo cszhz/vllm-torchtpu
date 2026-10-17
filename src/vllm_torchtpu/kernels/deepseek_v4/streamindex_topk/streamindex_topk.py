@@ -639,7 +639,7 @@ def score_pipeline(
         scores_vmem[...] = pltpu.bitcast(scores, jnp.int32)
 
     def blocked_prefill_step(
-        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref
+        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref, q_half_ref=None
     ):
         """Scores one (q block, kv block) step of the multi-token path.
 
@@ -653,6 +653,8 @@ def score_pipeline(
             head, token) row order.
           wb_ref: [num_tok_blks, H, tok_blk, 128] cache of the indexer weights,
             broadcast along lanes; bf16 for FP8 queries, f32 otherwise.
+          q_half_ref: [H * tok_blk // 2, D] cache of the block's first half of
+            tokens in (head group, head, token) row order, or None.
         """
         bkv_idx = bkv_block(pl.program_id(0))
         tok_blk = prefill_cfg.tok_blk
@@ -681,6 +683,14 @@ def score_pipeline(
                     q_hm_ref[pl.ds(prefill_cfg.cache_row(h, tb), tok_blk)] = q_rows[
                         h * tok_blk : (h + 1) * tok_blk
                     ]
+                    if q_half_ref is not None:
+                        g, hg = h % num_head_groups, h // num_head_groups
+                        q_half_ref[
+                            pl.ds(
+                                (g * heads_per_group + hg) * (tok_blk // 2),
+                                tok_blk // 2,
+                            )
+                        ] = q_rows[h * tok_blk : h * tok_blk + tok_blk // 2]
                     wb_ref[tb, h] = jnp.broadcast_to(
                         w[t0 : t0 + tok_blk, h : h + 1], (tok_blk, 128)
                     ).astype(wb_ref.dtype)
@@ -736,12 +746,13 @@ def score_pipeline(
                     "nd,md->nm", q_rows, keys, preferred_element_type=jnp.float32
                 )
 
-        def reduce_token_block(sts, tb):
-            """sum_h relu(st_h) * w_h over the rows of token block `tb`.
+        def reduce_token_block(sts, tb, rows):
+            """sum_h relu(st_h) * w_h over the first `rows` rows of token block `tb`.
 
             Args:
               sts: per head group, the [rows_per_group, lane_chunk] q @ k block.
               tb: token block index.
+              rows: leading rows (tokens) of the block to reduce.
             """
             acc = None
             for i in range(heads_per_group):
@@ -749,9 +760,14 @@ def score_pipeline(
                 # MXUs, so the accumulation drains every MXU at the rate it produces
                 # results.
                 for g, st in enumerate(sts):
-                    r0 = tb * rows_per_group_tok_blk + i * tok_blk
-                    st_h = st[r0 : r0 + tok_blk]
-                    w_h = wb_ref[tb, i * num_head_groups + g]
+                    # The half-block cache holds `rows` rows per head.
+                    r0 = (
+                        i * rows
+                        if rows < tok_blk
+                        else tb * rows_per_group_tok_blk + i * tok_blk
+                    )
+                    st_h = st[r0 : r0 + rows]
+                    w_h = wb_ref[tb, i * num_head_groups + g][:rows]
                     if tiles_per_chunk > 1:
                         w_h = jnp.concatenate([w_h] * tiles_per_chunk, axis=1)
                     if prefill_cfg.bf16_reduce:
@@ -774,44 +790,77 @@ def score_pipeline(
             if prefill_cfg.strided_score_store
             else None
         )
-        chunk_scores = []
-        for c in range(num_lane_chunks):
-            keys, scales = load_chunk(c)
-            # Reload the cached rows for every chunk instead of keeping the whole q
-            # block live in registers across chunks. Each head group is its own
-            # matmul so that the groups can run on different MXUs.
-            sts = [
-                qk(q_hm_ref[pl.ds(g * rows_per_group, rows_per_group)], keys)
-                for g in range(num_head_groups)
-            ]
-            tb_scores = []
-            for tb in range(num_tok_blks):
-                acc = reduce_token_block(sts, tb) * scales
+
+        def score_block(rows):
+            """Scores every token block, reducing only its first `rows` rows."""
+            chunk_scores = []
+            for c in range(num_lane_chunks):
+                keys, scales = load_chunk(c)
+                # Reload the cached rows for every chunk instead of keeping the whole
+                # q block live in registers across chunks. Each head group is its
+                # own matmul so that the groups can run on different MXUs.
+                if rows < tok_blk:
+                    group_rows = heads_per_group * rows
+                    sts = [
+                        qk(q_half_ref[pl.ds(g * group_rows, group_rows)], keys)
+                        for g in range(num_head_groups)
+                    ]
+                else:
+                    sts = [
+                        qk(q_hm_ref[pl.ds(g * rows_per_group, rows_per_group)], keys)
+                        for g in range(num_head_groups)
+                    ]
+                tb_scores = []
+                for tb in range(num_tok_blks):
+                    acc = reduce_token_block(sts, tb, rows) * scales
+                    if scores_rows is None:
+                        tb_scores.append(acc)
+                        continue
+                    for jj in range(tiles_per_chunk):
+                        lane_tile = c * tiles_per_chunk + jj
+                        scores_rows[
+                            pl.ds(
+                                tb * tok_blk * score_pitch + lane_tile,
+                                rows,
+                                stride=score_pitch,
+                            )
+                        ] = pltpu.bitcast(acc[:, jj * 128 : (jj + 1) * 128], jnp.int32)
                 if scores_rows is None:
-                    tb_scores.append(acc)
-                    continue
-                for jj in range(tiles_per_chunk):
-                    lane_tile = c * tiles_per_chunk + jj
-                    scores_rows[
-                        pl.ds(
-                            tb * tok_blk * score_pitch + lane_tile,
-                            tok_blk,
-                            stride=score_pitch,
-                        )
-                    ] = pltpu.bitcast(acc[:, jj * 128 : (jj + 1) * 128], jnp.int32)
+                    chunk_scores.append(jnp.concatenate(tb_scores, axis=0))
+
             if scores_rows is None:
-                chunk_scores.append(jnp.concatenate(tb_scores, axis=0))
+                s_summed = jnp.concatenate(chunk_scores, axis=1)
+                scores_vmem[...] = pltpu.bitcast(
+                    s_summed.reshape(bq_sz, num_sublanes_bkv, 128), jnp.int32
+                )
 
-        if scores_rows is None:
-            s_summed = jnp.concatenate(chunk_scores, axis=1)
-            scores_vmem[...] = pltpu.bitcast(
-                s_summed.reshape(bq_sz, num_sublanes_bkv, 128), jnp.int32
+        # A q block's rows past its sequence (or chunk) are padding: they are
+        # never copied out. When at most half the block is real, as in the last
+        # block of a 100-token chunk, only the first packed 16-row half is
+        # reduced. The real rows' arithmetic is unchanged.
+        half = tok_blk // 2
+        if q_half_ref is not None:
+            assert scores_rows is not None
+            _, valid_rows = bref_override.token_window(
+                (None, cu_q_lens_ref, metadata_ref, start_end_seq_idx_ref),
+                pl.program_id(0),
+                scores_hbm_ref.shape[0],
+                bq_sz=bq_sz,
+                seq_batch_size=seq_batch_size,
+                chunk_idx=chunk_idx,
             )
+            pl.when(valid_rows <= half)(functools.partial(score_block, half))
+            pl.when(valid_rows > half)(functools.partial(score_block, tok_blk))
+        else:
+            score_block(tok_blk)
 
-    def _run_all(q_hm_ref=None, wb_ref=None):
+    def _run_all(q_hm_ref=None, wb_ref=None, q_half_ref=None):
         if prefill_cfg.enabled:
             body = functools.partial(
-                blocked_prefill_step, q_hm_ref=q_hm_ref, wb_ref=wb_ref
+                blocked_prefill_step,
+                q_hm_ref=q_hm_ref,
+                wb_ref=wb_ref,
+                q_half_ref=q_half_ref,
             )
         else:
             body = functools.partial(step_body, q_hm_ref=q_hm_ref)
@@ -837,7 +886,15 @@ def score_pipeline(
         _run_pipeline()
 
     # Only the multi-token path reorders q, and only a single sequence per tile
-    # keeps the cached block unambiguous.
+    # keeps the cached block unambiguous. A single 32-token block also keeps a
+    # cache of its first 16 tokens, for blocks with at most 16 real rows.
+    half_block_cache = (
+        prefill_cfg.enabled
+        and prefill_cfg.num_tok_blks == 1
+        and prefill_cfg.bf16_reduce
+        and prefill_cfg.strided_score_store
+        and prefill_cfg.tok_blk == 32
+    )
     if prefill_cfg.enabled:
         pl.run_scoped(
             _run_all,
@@ -850,6 +907,11 @@ def score_pipeline(
                     128,
                 ),
                 prefill_cfg.wb_dtype,
+            ),
+            *(
+                (pltpu.VMEM((num_q_heads * bq_sz // 2, head_dim), q_hbm_ref.dtype),)
+                if half_block_cache
+                else ()
             ),
         )
     elif seq_batch_size == 1 and bq_sz > 1:
