@@ -152,22 +152,31 @@ class DSparkProposer(DFlashProposer):
 
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
+        sample_start = 0 if self.sample_from_anchor else 1
+        num_slots = block_size - sample_start
 
-        # Draft-vocab logits for every slot; the Markov bias is added in
-        # draft space and ids are remapped to target vocab after argmax.
-        logits = self.draft_model.compute_draft_logits(valid_hidden)
-        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
+        # Reorder the narrow hidden states before the vocabulary projection.
+        # Each Markov step then reads contiguous request rows without
+        # relayouting the much wider [requests, slots, vocab] logits.
+        slot_hidden = (
+            valid_hidden.view(padded_num_reqs, block_size, hidden.shape[-1])[
+                :, sample_start:
+            ]
+            .transpose(0, 1)
+            .reshape(num_slots * padded_num_reqs, hidden.shape[-1])
+        )
+        logits = self.draft_model.compute_draft_logits(slot_hidden)
+        logits_3d = logits.view(num_slots, padded_num_reqs, logits.shape[-1])
 
         ids_3d = input_ids[: padded_num_reqs * block_size].view(
             padded_num_reqs, block_size
         )
         prev = ids_3d[:, 0]
         draft_tokens = []
-        sample_start = 0 if self.sample_from_anchor else 1
-        for i in range(sample_start, block_size):
+        for i in range(num_slots):
             bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
             step = self.draft_model.map_draft_to_target(
-                (logits_3d[:, i] + bias).argmax(dim=-1)
+                (logits_3d[i] + bias).argmax(dim=-1)
             )
             draft_tokens.append(step)
             prev = step
