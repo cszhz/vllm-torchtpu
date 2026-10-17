@@ -256,6 +256,12 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
 # lose ~90 us of cover to buy a ~129 us hoist and only the largest shape's
 # plan is long enough to pay for it.
 AGQ_MIN_LOCAL_TOKENS = 1024
+# Expert-parallel width at or above which it is enqueued ahead at every shape:
+# the gather carries ep * t_local rows, so at 16 shards it outlasts the routing
+# plan even at small buckets. Measured at DeepSeek-V4-Pro's EP16 shape (two
+# hosts, 7168-wide fp8 rows), per-layer device time 440.4 -> 420.3 / 375.8 ->
+# 358.0 / 358.1 -> 348.0 / 348.1 -> 342.2 us at t_local 128 / 64 / 32 / 16.
+AGQ_MIN_EP = 16
 
 # Per-config cache of the shard_map'd MoE callable; a fresh shard_map
 # body would re-trace the whole kernel for every hidden layer.
@@ -746,9 +752,10 @@ def fused_ep_moe_v2(
         # enqueues it 129 us earlier and costs them the cover they had; that
         # trade measures +2.80% at 2048 local tokens and negative at every
         # smaller shape, so it is taken only where the routing plan in front
-        # of the collective is longer than the scatters behind it. Same bits
-        # either way; only the queue moves.
-        if t_local >= AGQ_MIN_LOCAL_TOKENS:
+        # of the collective is longer than the scatters behind it, or where
+        # the mesh is wide enough that the collective is. Same bits either
+        # way; only the queue moves.
+        if t_local >= AGQ_MIN_LOCAL_TOKENS or ep >= AGQ_MIN_EP:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
         token_gather = shard_token_gather(
             routing, me, shard_stride=ragged_stride, rows=slab_row
