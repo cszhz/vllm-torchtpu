@@ -1062,7 +1062,6 @@ def _build_fused_ep_moe_kernel(
                     weight_starts(visit_sm[0], 0, 0)
 
         prologue()
-        _all_pairs_barrier(ep)
 
         def _start_next_gate_up(visit_i, slot, last_tile):
             """`() -> ()`: start the NEXT expert's gate/up slab, called from
@@ -1968,6 +1967,11 @@ def _build_fused_ep_moe_kernel(
             prime_expert(
                 visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.int32(0), jnp.bool_(False)
             )
+
+        # Everything up to here is local -- the first visit's weights, its
+        # index window and its token rows -- so it runs under the barrier,
+        # which only has to precede the first push into a peer.
+        _all_pairs_barrier(ep)
 
         def push_expert(e):
             """Push expert e's remote regions and hop its own-dest region."""
