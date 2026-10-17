@@ -38,6 +38,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilderContext,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.model_loader_patches import unused_checkpoint_weight_hook
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -959,10 +960,25 @@ class Eagle3Proposer:
                 )
 
             cast(Any, model).load_weights = load_weights
+            # The loaders' fetch plans drop the borrowed modules' tensors as
+            # well, through vLLM's ``is_unused_checkpoint_weight`` hook: the
+            # default loader skips whole shards with it, the sharded Run:AI
+            # loader single tensors. The draft's own hook, if any, still
+            # applies. The ``load_weights`` filter above stays for loaders
+            # that stream every tensor regardless.
+            model_is_unused = unused_checkpoint_weight_hook(model)
+
+            def is_unused_checkpoint_weight(name: str) -> bool:
+                return any(key in name for key in shared_keys) or (
+                    model_is_unused is not None and model_is_unused(name)
+                )
+
+            cast(Any, model).is_unused_checkpoint_weight = is_unused_checkpoint_weight
             try:
                 model_loader.load_weights(model, draft_model_config)
             finally:
                 del cast(Any, model).load_weights
+                del cast(Any, model).is_unused_checkpoint_weight
             if base_loader._has_online_quant(model):
                 base_loader.finalize_layerwise_processing(model, draft_model_config)
             base_loader.process_weights_after_loading(
