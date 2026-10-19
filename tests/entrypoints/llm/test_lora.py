@@ -84,7 +84,7 @@ def adapters(tmp_path_factory):
     """A request per random adapter, each with its own id, as OpenRL sends a
     new id for every saved adapter."""
     root = tmp_path_factory.mktemp("adapters")
-    names = ["a", "b", "c", "swap0", "swap1", "swap2"]
+    names = ["a", "b", "c", "swap0", "swap1", "swap2", "pair0", "pair1"]
     requests = {
         name: LoRARequest(name, lora_id, _write_adapter(root / name, seed=lora_id))
         for lora_id, name in enumerate(names, start=1)
@@ -218,6 +218,10 @@ def _xla_cache_entries(worker):
     return len(torch.tpu._get_cache_stats().per_entry_stats)
 
 
+def _dynamo_graphs(worker):
+    return torch._dynamo.utils.counters["stats"]["unique_graphs"]
+
+
 def _assert_mixed_batch_matches_uniform_batches(llm, adapters):
     """Rows of one batch that use different adapters, or none, come out as
     they do in batches of the same shape that use a single one."""
@@ -235,6 +239,40 @@ def lora_llm():
 
 
 class TestLoRAEngine:
+    # First in the class, so the engine has not filled any slot yet.
+    def test_new_adapters_swap_in_without_compiling(self, lora_llm, adapters):
+        """OpenRL sends a new adapter id at every step. Filling a free slot,
+        replacing an adapter in a full set of slots, and swapping in more new
+        ids must compile nothing, also through the add_lora RPC, which runs
+        with grad enabled."""
+        base = _greedy(lora_llm, None)
+        entries = lora_llm.collective_rpc(_xla_cache_entries)
+        assert _greedy(lora_llm, adapters["a"]) != base
+        # The first swap still traces the slot write once more: Dynamo guards
+        # on the torch thread count, which the worker lowers after warm-up.
+        graphs = lora_llm.collective_rpc(_dynamo_graphs)
+
+        # "b" fills the second slot and "c" replaces "a".
+        for name in ("b", "c", "swap0", "swap1", "swap2"):
+            assert _greedy(lora_llm, adapters[name]) != base, name
+        rpc = LoRARequest("rpc_swap", 60, adapters["a"].lora_path)
+        assert lora_llm.llm_engine.add_lora(rpc)
+        assert lora_llm.collective_rpc(_xla_cache_entries) == entries
+        assert lora_llm.collective_rpc(_dynamo_graphs) == graphs
+
+    def test_one_batch_brings_in_two_new_adapters(self, lora_llm, adapters):
+        """Both adapters are activated in the same step, one right after the
+        other, and each row still matches a batch that uses its adapter
+        alone."""
+        pair = [adapters["pair0"], adapters["pair1"]]
+        loaded = lora_llm.llm_engine.list_loras()
+        assert not loaded & {request.lora_int_id for request in pair}
+
+        mixed = _greedy(lora_llm, [pair[i % 2] for i in range(len(PROMPTS))])
+        uniform = [_greedy(lora_llm, request) for request in pair]
+        for i, tokens in enumerate(mixed):
+            assert tokens == uniform[i % 2][i], PROMPTS[i]
+
     def test_adapters_change_the_output(self, lora_llm, adapters):
         base = _greedy(lora_llm, None)
         a = _greedy(lora_llm, adapters["a"])
@@ -244,20 +282,6 @@ class TestLoRAEngine:
 
     def test_mixed_batch_matches_uniform_batches(self, lora_llm, adapters):
         _assert_mixed_batch_matches_uniform_batches(lora_llm, adapters)
-
-    def test_new_adapters_swap_in_without_compiling(self, lora_llm, adapters):
-        """OpenRL sends a new adapter id at every step. Once every slot has
-        held an adapter and one has been replaced, swapping in new ones with
-        the same target modules must compile nothing."""
-        base = _greedy(lora_llm, None)
-        # "c" replaces an adapter in a full set of slots.
-        for name in ("a", "b", "c"):
-            _greedy(lora_llm, adapters[name])
-        entries = lora_llm.collective_rpc(_xla_cache_entries)
-
-        for name in ("swap0", "swap1", "swap2"):
-            assert _greedy(lora_llm, adapters[name]) != base, name
-        assert lora_llm.collective_rpc(_xla_cache_entries) == entries
 
     def test_evicted_adapter_reloads_with_the_same_output(self, lora_llm, adapters):
         before = _greedy(lora_llm, adapters["a"])

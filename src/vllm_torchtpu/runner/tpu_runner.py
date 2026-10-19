@@ -69,6 +69,7 @@ from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
     MRotaryEmbeddingInterleaved,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models import supports_lora
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
@@ -138,6 +139,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     create_sequence_layout_planner,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -5312,6 +5314,23 @@ class TPUModelRunner(GPUModelRunner):
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
 
+    def load_lora_model(
+        self,
+        model: torch.nn.Module,
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> torch.nn.Module:
+        """Wraps the model's layers for LoRA. load_model calls it when LoRA is
+        enabled. It does what vLLM's runner mixin does, but creates
+        TPUWorkerLoRAManager, so each adapter swap writes its TPU slot with
+        one program."""
+        if not supports_lora(model):
+            raise ValueError(f"{model.__class__.__name__} does not support LoRA yet.")
+        self.lora_manager = TPUWorkerLoRAManager(
+            vllm_config, device, model.embedding_modules
+        )
+        return self.lora_manager.create_lora_manager(model, vllm_config)
+
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
@@ -6525,6 +6544,11 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, self.max_num_tokens, self._pp_intermediate_template
             )
             self._pp_wave.warmup()
+        if self.lora_config is not None:
+            lora_manager = self.lora_manager
+            assert isinstance(lora_manager, TPUWorkerLoRAManager)
+            with self._precompile_timed("LoRA adapter activation"):
+                lora_manager.precompile_activation()
         if self.enforce_eager:
             return
         with self.maybe_setup_dummy_loras(self.lora_config):
