@@ -40,6 +40,7 @@ from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.model_manager import AdapterLRUCache, LRUCacheLoRAModelManager
 
 from tests.distributed.tpu_test_utils import run_in_isolated_process
+from vllm_torchtpu.layers.adapter.custom_ops import lora_slot_update_op
 from vllm_torchtpu.lora import lora_manager
 from vllm_torchtpu.lora.lora_manager import TPULoRAModelManager, _AdapterSlotWriter
 
@@ -66,7 +67,7 @@ def slot_writes(monkeypatch):
 
     def write_adapter_to_slot(stacked_weights, slot_weights, slot_index):
         slots.append(int(slot_index[0]))
-        updated = lora_manager._compute_slot_update(
+        updated = lora_slot_update_op._compute_slot_update(
             [jnp.asarray(weights.numpy()) for weights in stacked_weights],
             jnp.asarray(slot_weights.numpy()),
             jnp.asarray(slot_index.numpy()),
@@ -74,7 +75,7 @@ def slot_writes(monkeypatch):
         for weights, new_weights in zip(stacked_weights, updated):
             weights.copy_(torch.from_numpy(np.array(new_weights)))
 
-    monkeypatch.setattr(lora_manager, "_write_adapter_to_slot", write_adapter_to_slot)
+    monkeypatch.setattr(lora_manager, "write_adapter_to_slot", write_adapter_to_slot)
     return slots
 
 

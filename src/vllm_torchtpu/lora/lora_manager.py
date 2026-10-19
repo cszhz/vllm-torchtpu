@@ -14,12 +14,9 @@
 """LoRA managers that load an adapter into its TPU slot with one program."""
 
 import contextlib
-import math
 from collections.abc import Iterator
 
-import jax
 import torch
-from torch_tpu._internal import pallas
 from vllm.lora.layers import (
     BaseLayerWithLoRA,
     ColumnParallelLinearWithLoRA,
@@ -34,6 +31,9 @@ from vllm.lora.layers import (
 from vllm.lora.model_manager import LRUCacheLoRAModelManager
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 
+from vllm_torchtpu.layers.adapter.custom_ops.lora_slot_update_op import (
+    write_adapter_to_slot,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -76,52 +76,6 @@ def _host_weights_like(
     if isinstance(device_weights, tuple):
         return tuple(next(host_views) for _ in device_weights)
     return next(host_views)
-
-
-# Without this op, vLLM loads an adapter with hundreds of small eager writes,
-# each its own TPU program. This op writes the adapter's slot of every stacked
-# tensor in one program. It is a JAX op so the stacked tensors can be donated
-# and updated in place.
-def _compute_slot_update(
-    stacked_weights: list[jax.Array], slot_weights: jax.Array, slot_index: jax.Array
-) -> list[jax.Array]:
-    updated, offset = [], 0
-    for weights in stacked_weights:
-        slot_size = math.prod(weights.shape[1:])
-        new_slot = slot_weights[offset : offset + slot_size].reshape(
-            (1, *weights.shape[1:])
-        )
-        updated.append(
-            jax.lax.dynamic_update_slice_in_dim(
-                weights, new_slot, slot_index[0], axis=0
-            )
-        )
-        offset += slot_size
-    return updated
-
-
-_slot_update_op = pallas.jax_op(
-    "pallas::lora_slot_update", _compute_slot_update, donate_argnums=(0,)
-)
-_slot_update_op.register_fake(
-    lambda stacked_weights, slot_weights, slot_index: [
-        torch.empty_like(weights) for weights in stacked_weights
-    ]
-)
-
-
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _write_adapter_to_slot(
-    stacked_weights: list[torch.Tensor],
-    slot_weights: torch.Tensor,
-    slot_index: torch.Tensor,
-) -> None:
-    """Writes one slot of every stacked tensor from slot_weights, packed in
-    stacked_weights order."""
-    updated = _slot_update_op(stacked_weights, slot_weights, slot_index)
-    for weights, new_weights in zip(stacked_weights, updated):
-        # Donated inputs are left invalid; point them at the outputs.
-        weights.copy_(new_weights)
 
 
 class _AdapterSlotWriter:
@@ -197,7 +151,7 @@ class _AdapterSlotWriter:
 
     def _host_views(self) -> Iterator[torch.Tensor]:
         """Yields one host view per stacked tensor, packed in the order
-        _compute_slot_update unpacks slot_weights. A view takes any slot index,
+        write_adapter_to_slot unpacks slot_weights. A view takes any slot index,
         since activate_adapter picks the slot, but every index lands in the
         same region, so the buffer only needs to hold one slot."""
         offset = 0
@@ -230,7 +184,7 @@ class _AdapterSlotWriter:
         # The add_lora RPC runs with grad enabled, and a grad-mode change
         # retraces the compiled writer.
         with torch.no_grad():
-            _write_adapter_to_slot(
+            write_adapter_to_slot(
                 self._stacked_weights, slot_weights, self._slot_indices[slot]
             )
 
