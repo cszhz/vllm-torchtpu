@@ -99,7 +99,7 @@ class PunicaWrapperTPU(PunicaWrapperBase):
         so the y passed in is not used.
 
         Args:
-            y: Upstream's fp32 output buffer.
+            y: The fp32 shrink buffer vLLM's layers pass in.
             x: Input tensor. (num_tokens, in_features)
             lora_a_stacked: lora_a's weights. lora_a_stacked[i]:
                 (max_loras, 1, max_lora_rank, in_features)
@@ -211,7 +211,7 @@ class PunicaWrapperTPU(PunicaWrapperBase):
                 (max_loras, 1, output_slices[i], max_lora_rank)
             scale: Scaling factor.
             output_slices: Every slice's size.
-            buffer: Upstream's output buffer for add_shrink. Unused.
+            buffer: Shrink buffer in vLLM's add_lora_linear signature. Unused.
 
         Returns:
             The updated y as a new tensor.
@@ -246,7 +246,7 @@ class PunicaWrapperTPU(PunicaWrapperBase):
             lora_a_stacked: (max_loras, 1, max_lora_rank, hidden_size)
             lora_b_stacked: (max_loras, 1, vocab_size, max_lora_rank)
             scale: Scaling factor.
-            buffer: Upstream's buffer for the shrink output. Unused.
+            buffer: Shrink buffer in vLLM's add_lora_logits signature. Unused.
 
         Returns:
             The updated y as a new tensor.

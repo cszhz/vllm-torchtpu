@@ -78,6 +78,15 @@ def _host_weights_like(
     return next(host_views)
 
 
+def _fall_back(reason: str) -> None:
+    """Warns once that adapters keep vLLM's slice-by-slice writes."""
+    logger.warning_once(
+        "[LoRA] %s, so adapters are written to the TPU one slice at a "
+        "time; adapter swaps and the decode steps after them run slower.",
+        reason,
+    )
+
+
 class _AdapterSlotWriter:
     """Loads an adapter into one slot of every stacked LoRA tensor at once.
 
@@ -102,34 +111,28 @@ class _AdapterSlotWriter:
             for module in modules
             if type(module) not in _SUPPORTED_LAYERS
         }
-        stacked_weights = [] if unsupported else _stacked_weights(modules)
         if unsupported:
-            reason = f"LoRA layers {sorted(unsupported)} are not supported"
-        elif len({weights.dtype for weights in stacked_weights}) > 1:
-            reason = "the stacked LoRA tensors mix dtypes"
-        elif len({id(weights) for weights in stacked_weights}) < len(stacked_weights):
+            return _fall_back(f"LoRA layers {sorted(unsupported)} are not supported")
+        stacked_weights = _stacked_weights(modules)
+        if len({weights.dtype for weights in stacked_weights}) > 1:
+            return _fall_back("the stacked LoRA tensors mix dtypes")
+        if len({id(weights) for weights in stacked_weights}) < len(stacked_weights):
             # A tensor donated twice in one call fails.
-            reason = "two LoRA modules share a stacked tensor"
-        else:
-            return cls(modules, max_loras, device)
-        logger.warning_once(
-            "[LoRA] %s, so adapters are written to the TPU one slice at a "
-            "time; adapter swaps and the decode steps after them run slower.",
-            reason,
-        )
-        return None
+            return _fall_back("two LoRA modules share a stacked tensor")
+        return cls(modules, stacked_weights, max_loras, device)
 
     def __init__(
         self,
         modules: list[BaseLayerWithLoRA],
+        stacked_weights: list[torch.Tensor],
         max_loras: int,
         device: torch.device,
     ) -> None:
         self._modules = modules
-        self._stacked_weights = _stacked_weights(modules)
+        self._stacked_weights = stacked_weights
         self._host_slot_weights = torch.empty(
-            sum(weights[0].numel() for weights in self._stacked_weights),
-            dtype=self._stacked_weights[0].dtype,
+            sum(weights[0].numel() for weights in stacked_weights),
+            dtype=stacked_weights[0].dtype,
         )
         self._slot_indices = [
             torch.tensor([slot], dtype=torch.int32, device=device)
