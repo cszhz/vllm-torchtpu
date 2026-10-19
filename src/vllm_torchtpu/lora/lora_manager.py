@@ -213,6 +213,9 @@ class _AdapterSlotWriter:
     @contextlib.contextmanager
     def redirect_writes_to_host(self) -> Iterator[None]:
         for module, (lora_a, lora_b) in zip(self._modules, self._host_weights):
+            # nn.Module.__setattr__ is typed for tensors and modules, but the
+            # linear layers store a tuple here, as vLLM does.
+            # pyrefly: ignore[bad-argument-type]
             module.lora_a_stacked, module.lora_b_stacked = lora_a, lora_b
         try:
             yield

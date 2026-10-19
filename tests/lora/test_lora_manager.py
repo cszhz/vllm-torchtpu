@@ -45,7 +45,10 @@ from vllm_torchtpu.lora.lora_manager import TPULoRAModelManager, _AdapterSlotWri
 
 NUM_SLOTS, MAX_RANK, MAX_CPU_LORAS = 3, 8, 8
 HIDDEN, Q, KV, INTERMEDIATE, VOCAB = 16, 32, 8, 24, 40
-CPU, TPU = torch.device("cpu"), torch.device("tpu")
+CPU = torch.device("cpu")
+# The tpu device type exists only once torch_tpu loads in full, which CPU-only
+# runs skip.
+TPU = "tpu"
 
 
 @pytest.fixture(autouse=True)
@@ -413,7 +416,7 @@ def _tpu_managers(make_layers=_tpu_layers):
     # The engine runs eager ops in this mode.
     execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
     torch.default_generator.manual_seed(0)
-    return _managers(make_layers, TPU)
+    return _managers(make_layers, torch.device(TPU))
 
 
 def _dynamo_graphs():
