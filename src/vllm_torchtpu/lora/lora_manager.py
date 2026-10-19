@@ -21,6 +21,7 @@ from vllm.lora.layers import (
     BaseLayerWithLoRA,
     ColumnParallelLinearWithLoRA,
     LogitsProcessorWithLoRA,
+    MergedColumnParallelLinearVariableSliceWithLoRA,
     MergedColumnParallelLinearWithLoRA,
     MergedQKVParallelLinearWithLoRA,
     QKVParallelLinearWithLoRA,
@@ -43,6 +44,7 @@ logger = init_logger(__name__)
 _SUPPORTED_LAYERS = (
     ColumnParallelLinearWithLoRA,
     MergedColumnParallelLinearWithLoRA,
+    MergedColumnParallelLinearVariableSliceWithLoRA,
     QKVParallelLinearWithLoRA,
     MergedQKVParallelLinearWithLoRA,
     RowParallelLinearWithLoRA,

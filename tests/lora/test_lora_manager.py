@@ -16,23 +16,35 @@ guard that every slot still ends up exactly as vLLM's own manager writes it,
 and, on the chip, that the write compiles once, holds at most one extra slot,
 and leaves the stacked tensors' device layout alone."""
 
+from types import SimpleNamespace
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
 import torch._dynamo.utils
+import vllm.lora.layers
 from torch import nn
 from torch_tpu._internal import execution_mode
 from vllm.config.lora import LoRAConfig
 from vllm.lora.layers import (
     BaseLayerWithLoRA,
+    ClassificationHeadWithLoRA,
     ColumnParallelLinearWithLoRA,
+    ColumnParallelLinearWithShardedLoRA,
+    FusedMoE3DWithLoRA,
+    FusedMoEWithLoRA,
     LogitsProcessorWithLoRA,
+    MergedColumnParallelLinearVariableSliceWithLoRA,
     MergedColumnParallelLinearWithLoRA,
+    MergedColumnParallelLinearWithShardedLoRA,
     MergedQKVParallelLinearWithLoRA,
+    MergedQKVParallelLinearWithShardedLoRA,
     QKVParallelLinearWithLoRA,
+    QKVParallelLinearWithShardedLoRA,
     ReplicatedLinearWithLoRA,
     RowParallelLinearWithLoRA,
+    RowParallelLinearWithShardedLoRA,
     VocabParallelEmbeddingWithLoRA,
 )
 from vllm.lora.lora_model import LoRAModel
@@ -111,6 +123,22 @@ def _vocab_layer(cls, lora_a_shape, lora_b_shape, device=CPU, dtype=torch.float3
     return layer
 
 
+def _variable_slice_layer(device, dtype):
+    """A merged layer of three slices with different widths, as Mamba2's
+    in_proj. Its set_lora splits one whole adapter weight by the base layer's
+    output_sizes."""
+    output_sizes = (INTERMEDIATE, KV, Q)
+    layer = _linear_layer(
+        MergedColumnParallelLinearVariableSliceWithLoRA,
+        [(1, MAX_RANK, HIDDEN)] * len(output_sizes),
+        [(1, size, MAX_RANK) for size in output_sizes],
+        device,
+        dtype,
+    )
+    layer.base_layer = SimpleNamespace(output_sizes=output_sizes)
+    return layer
+
+
 def _layers(device=CPU, dtype=torch.float32) -> dict[str, BaseLayerWithLoRA]:
     """One layer of every supported type, sized like a tiny decoder."""
     from_hidden = (1, MAX_RANK, HIDDEN)
@@ -152,6 +180,7 @@ def _layers(device=CPU, dtype=torch.float32) -> dict[str, BaseLayerWithLoRA]:
             device,
             dtype,
         ),
+        "in_proj": _variable_slice_layer(device, dtype),
         "row": _linear_layer(
             RowParallelLinearWithLoRA,
             [(1, MAX_RANK, Q)],
@@ -198,9 +227,13 @@ def _adapter(lora_id, layers, rank=MAX_RANK, skip=(), drop_second_slice=False):
         else:
             in_sizes = [stacked.shape[-1] for stacked in stacked_a]
         out_sizes = [stacked.shape[2] for stacked in stacked_b]
-        if len(in_sizes) == 1:
+        if len(in_sizes) == 1 or isinstance(
+            layer, MergedColumnParallelLinearVariableSliceWithLoRA
+        ):
+            # One weight for the whole module, as a checkpoint saves a layer
+            # it does not know is split; set_lora splits it by output_sizes.
             lora_a = torch.randn(rank, in_sizes[0], dtype=dtype)
-            lora_b = torch.randn(out_sizes[0], rank, dtype=dtype)
+            lora_b = torch.randn(sum(out_sizes), rank, dtype=dtype)
             loras[name] = LoRALayerWeights(name, rank, rank, lora_a, lora_b)
             continue
         slices_a: list[torch.Tensor | None] = [
@@ -377,6 +410,36 @@ def test_unsupported_layers_fall_back_to_vllm_writes(slot_writes, make_unsupport
     _activate((tpu_manager, vllm_manager), _adapter(1, vllm_manager.modules))
     assert slot_writes == []
     _assert_same_slots(tpu_manager, vllm_manager)
+
+
+def test_every_vllm_lora_layer_class_is_classified():
+    """A layer class joins _SUPPORTED_LAYERS only after its reset_lora and
+    set_lora were read to write through lora_a_stacked[index] and
+    lora_b_stacked[index] alone. When vLLM adds a class, this fails until it is
+    added there or listed here, with the reason it keeps vLLM's own writes."""
+    takes_vllm_writes = {
+        # Built only with fully_sharded_loras, which the TPU platform rejects.
+        ColumnParallelLinearWithShardedLoRA,
+        MergedColumnParallelLinearWithShardedLoRA,
+        MergedQKVParallelLinearWithShardedLoRA,
+        QKVParallelLinearWithShardedLoRA,
+        RowParallelLinearWithShardedLoRA,
+        # MoE models are rejected; the expert weights live in w13 and w2
+        # tensors, not in lora_a_stacked and lora_b_stacked.
+        FusedMoEWithLoRA,
+        FusedMoE3DWithLoRA,
+        # Writes the saved classification head into full_weight_stacked and
+        # full_bias_stacked, which the slot write does not carry.
+        ClassificationHeadWithLoRA,
+    }
+    exported = (getattr(vllm.lora.layers, name) for name in vllm.lora.layers.__all__)
+    layer_classes = {
+        cls
+        for cls in exported
+        if isinstance(cls, type) and issubclass(cls, BaseLayerWithLoRA)
+    } - {BaseLayerWithLoRA}
+
+    assert layer_classes == set(lora_manager._SUPPORTED_LAYERS) | takes_vllm_writes
 
 
 def test_worker_without_lora_layers_activates_without_writes(slot_writes):
