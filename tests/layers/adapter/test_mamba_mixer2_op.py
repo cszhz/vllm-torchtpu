@@ -22,7 +22,10 @@ import numpy as np
 import torch
 from jax.sharding import Mesh
 
-from vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op import VllmMambaMixer2
+from vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op import (
+    VllmMambaMixer2,
+    mamba_mixer2_core_tpu,
+)
 from vllm_torchtpu.layers.core.mamba_mixer2 import (
     run_jax_mamba_mixer,
 )
@@ -726,6 +729,77 @@ class TestVllmMambaMixer2:
             return_value=(torch.bfloat16, torch.float32),
         ):
             assert layer.get_state_dtype() == (torch.float32, torch.float32)
+
+    def test_use_fused_jax_rms_norm_multiprocess_tp(self):
+        # TP=1, n_groups=1 -> fused in JAX.
+        layer_tp1 = _granite_mamba_layer(tp_size=1, n_groups=1)
+        assert layer_tp1._use_fused_jax_rms_norm() is True
+
+        # TP=2, n_groups=4 -> groups divide TP, fused in JAX.
+        layer_tp2_sharded = _granite_mamba_layer(tp_size=2, n_groups=4)
+        assert layer_tp2_sharded._use_fused_jax_rms_norm() is True
+
+        # TP=2, original n_groups=1 (replicated to self.n_groups=2, norm.n_groups=1)
+        # -> requires cross-rank PyTorch all-reduce, not fused in JAX.
+        layer_tp2_replicated = _granite_mamba_layer(tp_size=2, n_groups=2)
+        layer_tp2_replicated.norm.n_groups = 1
+        assert layer_tp2_replicated._use_fused_jax_rms_norm() is False
+
+    def test_mamba_mixer2_core_tpu_updates_only_widened_conv_state_prefix(self):
+        kernel_size = 4
+        conv_state = jnp.arange(2 * kernel_size * 3, dtype=jnp.float32).reshape(
+            2, kernel_size, 3
+        )
+        rec_state = jnp.zeros((2, 1, 2, 2), dtype=jnp.float32)
+        out = jnp.zeros((4, 2), dtype=jnp.float32)
+
+        def _fake_run_jax_mamba_mixer(_proj, c_state_in, r_state, *args, **kwargs):
+            return (c_state_in + 10.0, r_state), out
+
+        with patch(
+            "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op.run_jax_mamba_mixer",
+            side_effect=_fake_run_jax_mamba_mixer,
+        ) as mock_run:
+            new_conv, _, _ = mamba_mixer2_core_tpu(
+                jnp.zeros((4, 6), dtype=jnp.float32),
+                conv_state,
+                rec_state,
+                jnp.zeros((3, 1, kernel_size), dtype=jnp.float32),
+                None,
+                -jnp.ones((1,), dtype=jnp.float32),
+                jnp.ones((1,), dtype=jnp.float32),
+                jnp.zeros((1,), dtype=jnp.float32),
+                None,
+                jnp.array([0, 1], dtype=jnp.int32),
+                jnp.array([0, 2, 4], dtype=jnp.int32),
+                jnp.array([0, 2, 2], dtype=jnp.int32),
+                jnp.array([2, 2], dtype=jnp.int32),
+                mesh=_mesh(),
+                tped_intermediate_size=2,
+                tped_conv_size=3,
+                tped_dt_size=1,
+                num_heads=1,
+                head_dim=2,
+                n_groups=1,
+                d_state=2,
+                kernel_size=kernel_size,
+                chunk_size=4,
+                shard_groups=True,
+                rms_norm_eps=1e-5,
+                apply_rms_norm=False,
+            )
+
+        kernel_conv_state = mock_run.call_args.args[1]
+        assert kernel_conv_state.shape == (2, kernel_size - 1, 3)
+        np.testing.assert_array_equal(
+            np.asarray(kernel_conv_state), np.asarray(conv_state[:, :-1, :])
+        )
+        np.testing.assert_array_equal(
+            np.asarray(new_conv[:, :-1, :]), np.asarray(conv_state[:, :-1, :] + 10.0)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(new_conv[:, -1:, :]), np.asarray(conv_state[:, -1:, :])
+        )
 
     def test_ssd_minimal_discrete_hybrid_matches_jax_reference(self):
         batch, seqlen, block_len, n_heads, d_head, d_state = 2, 16, 4, 4, 8, 8

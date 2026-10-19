@@ -25,7 +25,7 @@ from vllm_torchtpu.layers.core.mamba_mixer2 import run_jax_mamba_mixer
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
-from vllm_torchtpu.utils import get_dp_size, get_mesh_shape_product
+from vllm_torchtpu.utils import get_dp_size
 
 
 def mamba_mixer2_core_tpu(
@@ -58,6 +58,10 @@ def mamba_mixer2_core_tpu(
     apply_rms_norm: bool,
     has_silu_activation: bool = True,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    # Speculative decoding: MambaStateShapeCalculator.mamba2_state_shape widens
+    # conv_state along dim 1 to `conv_kernel - 1 + num_spec`, whereas
+    # ragged_causal_conv1d requires `kernel_size - 1`. Slice the prefix for the
+    # kernel and update the donated buffer (donate_argnums=(1, 2)) in-place.
     state_len = conv_state.shape[1]
     target_state_len = kernel_size - 1
     if state_len > target_state_len:
@@ -121,14 +125,13 @@ class VllmMambaMixer2(MambaMixer2):
             w.shape, dtype=w.dtype, device=w.device
         ).copy_(w)
 
-    def _use_fused_jax_rms_norm(self, jax_tp_size: int) -> bool:
-        # When PyTorch runs multiprocess TP (self.tp_size > 1) over a single-chip
-        # JAX mesh (jax_tp_size == 1) and the un-replicated group count is 1,
-        # Mixer2RMSNormGated requires a cross-rank PyTorch all-reduce.
-        # In all other cases, fuse GatedRMSNorm directly inside JAX.
+    def _use_fused_jax_rms_norm(self) -> bool:
+        # When PyTorch runs multiprocess TP (self.tp_size > 1) and the
+        # un-replicated group count is 1, Mixer2RMSNormGated requires a
+        # cross-rank PyTorch all-reduce. In all other cases, fuse
+        # GatedRMSNorm directly inside JAX.
         orig_single_group_replicated = (
             self.tp_size > 1
-            and jax_tp_size == 1
             and (self.n_groups // self.tp_size) == 1
             and getattr(self.norm, "n_groups", self.n_groups) == 1
         )
@@ -140,24 +143,10 @@ class VllmMambaMixer2(MambaMixer2):
         parallel_config = getattr(vllm_context.vllm_config, "parallel_config", None)
         dp_enabled = parallel_config is not None and get_dp_size(parallel_config) > 1
 
-        head_axis = "model" if "model" in mesh.axis_names else None
-        jax_tp_size = get_mesh_shape_product(mesh, head_axis) if head_axis else 1
-
-        if self.n_groups % jax_tp_size == 0:
-            shard_groups = True
-            local_n_groups = (self.n_groups // self.tp_size) // jax_tp_size
-        else:
-            shard_groups = False
-            local_n_groups = self.n_groups
-
-        local_num_heads = (self.num_heads // self.tp_size) // jax_tp_size
-        tped_intermediate_size = (self.intermediate_size // self.tp_size) // jax_tp_size
-        tped_conv_size = (self.conv_dim // self.tp_size) // jax_tp_size
-        tped_dt_size = (self.num_heads // self.tp_size) // jax_tp_size
-
+        local_n_groups = self.n_groups // self.tp_size
         chunk_size = 32 if dp_enabled else 64
         rms_norm_eps = getattr(self.norm, "variance_epsilon", 1e-5)
-        apply_rms_norm = self._use_fused_jax_rms_norm(jax_tp_size)
+        apply_rms_norm = self._use_fused_jax_rms_norm()
         self._apply_py_norm = not apply_rms_norm
         has_silu_activation = getattr(self, "has_silu_activation", True)
 
@@ -165,16 +154,16 @@ class VllmMambaMixer2(MambaMixer2):
         wrapped_fn = functools.partial(
             mamba_mixer2_core_tpu,
             mesh=mesh,
-            tped_intermediate_size=tped_intermediate_size,
-            tped_conv_size=tped_conv_size,
-            tped_dt_size=tped_dt_size,
-            num_heads=local_num_heads,
+            tped_intermediate_size=self.tped_intermediate_size,
+            tped_conv_size=self.tped_conv_size,
+            tped_dt_size=self.tped_dt_size,
+            num_heads=self.tped_dt_size,
             head_dim=self.head_dim,
             n_groups=local_n_groups,
             d_state=self.ssm_state_size,
             kernel_size=self.conv_kernel_size,
             chunk_size=chunk_size,
-            shard_groups=shard_groups,
+            shard_groups=True,
             rms_norm_eps=rms_norm_eps,
             apply_rms_norm=apply_rms_norm,
             has_silu_activation=has_silu_activation,
