@@ -217,6 +217,26 @@ class StepMetadata:
     local_k_end: list[jax.Array] | None = None
 
 
+def _mask_invalid_v(
+    v: jax.Array,
+    b_idx: int,
+    step_meta: StepMetadata,
+    *,
+    sequence_axis: int,
+) -> jax.Array:
+    # PV reduces over the whole tile: zero probabilities do not isolate NaNs
+    # from stale VMEM or another request in a fetched new-KV page.
+    token = lax.broadcasted_iota(jnp.int32, v.shape, sequence_axis)
+    valid = token < (
+        step_meta.bkv_sz_frm_cache[b_idx] + step_meta.bkv_sz_frm_new[b_idx]
+    )
+    if step_meta.local_k_start is not None:
+        valid &= token >= step_meta.local_k_start[b_idx]
+    if step_meta.local_k_end is not None:
+        valid &= token < step_meta.local_k_end[b_idx]
+    return jnp.where(valid, v, jnp.zeros_like(v))
+
+
 def fetch_step_metadata(
     step: jax.Array,
     schedule_ref: schedule.RpaSchedule,
@@ -420,6 +440,14 @@ def rpa_body(
                 # Load as uint32 to avoid dtype conversion during strided load
                 k_head_u32 = utils.strided_load(k_head_ref, 0, pack_dim, 1)
                 v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
+                # HND packs channels of one token together. Mask the words
+                # before unpacking, including any co-located V scale channels.
+                v_head_u32 = _mask_invalid_v(
+                    v_head_u32[:, : cfgs.bkv_sz],
+                    b_idx,
+                    step_meta,
+                    sequence_axis=1,
+                )
 
                 if cfgs.serve.dtype_kv == jnp.uint8:
                     fp4 = jnp.float4_e2m1fn
@@ -456,6 +484,7 @@ def rpa_body(
 
             k = k[: cfgs.model.num_kv_heads]
             v = v[: cfgs.model.num_kv_heads]
+            v = _mask_invalid_v(v, b_idx, step_meta, sequence_axis=1)
             k_b.append(k)
             v_b.append(v)
     # Stack to (batch, num_heads, bkv_sz, num_lanes)
