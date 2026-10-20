@@ -2583,7 +2583,9 @@ def _indexer_v41_impl(
     # query padding and fits 2x larger KV blocks. 96/384 buckets use multiples of 48.
     is_decode_or_verify = n_cfg <= 1536
     bq_mixed = 8 if is_decode_or_verify else 128
-    bkv_pages = (64 if is_decode_or_verify else 8) * max(1, compression_ratio)
+    # Decode-sized KV block: 64 pages (prefill TP=2) vs 16 (decode TP=1 fits 64MB VMEM at cr=2).
+    bkv_dec = 64 if _prefill_role() else 16
+    bkv_pages = (bkv_dec if is_decode_or_verify else 8) * max(1, compression_ratio)
     chunk_tokens = (
         512
         if (not is_decode_or_verify and q.shape[0] >= 512 and q.shape[0] % 512 == 0)
