@@ -148,6 +148,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
+                gates_in_kernel=envs.VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL,
             )
             object.__setattr__(self, "_mhc_ops_instance", ops)
         return ops

@@ -131,6 +131,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
+    VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = False
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -971,6 +972,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )()
         or DEFAULT_INDEXER_KV_CACHE_MODE
     ).lower(),
+    # DeepSeek-V4 mHC: compute the post/comb gates (sigmoid, softmax and
+    # Sinkhorn) inside the Pallas pre / fused seam kernels instead of as an
+    # XLA epilogue of ~130 tiny ops per seam.
+    "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL": env_bool(
+        "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL"
+    ),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),

@@ -37,6 +37,7 @@ def select_token_block(
     *,
     vmem_need: Callable[[int], int] | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    whole_small_batch: bool = False,
 ) -> tuple[int, int]:
     """Grid token block, and the token count padded to a multiple of it.
 
@@ -45,8 +46,16 @@ def select_token_block(
     ``vmem_limit_bytes`` — degrading to a smaller block instead of a
     compile-time VMEM OOM — with ``SUBLANE`` as the floor.
 
+    ``whole_small_batch``: a batch smaller than one ``SUBLANE`` block is
+    not padded; the single block overhangs the arrays instead (rows are
+    independent and out-of-range output rows are dropped), which skips the
+    pad/trim copies of every operand. Callers size the grid with
+    ``pl.cdiv(padded_tokens, token_block)``.
+
     Returns (token_block, padded_tokens).
     """
+    if whole_small_batch and num_tokens < SUBLANE <= token_block_size:
+        return SUBLANE, num_tokens
     tb = min(token_block_size, round_up(num_tokens, SUBLANE))
     if vmem_need is not None:
         while tb > SUBLANE and vmem_need(tb) > vmem_limit_bytes:
@@ -146,4 +155,81 @@ def mhc_pre_gates(
         comb_mix = comb_mix / (
             jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps
         )
+    return pre_mix, post_mix, comb_mix
+
+
+class GateConsts(NamedTuple):
+    """Static constants of the post/comb gates, for kernels that compute
+    them in-block (see ``gates_in_block``)."""
+
+    hc_sinkhorn_eps: float
+    hc_post_mult_value: float
+    sinkhorn_repeat: int
+
+
+def _sum4(terms: list[jax.Array]) -> jax.Array:
+    if len(terms) == 4:
+        return (terms[0] + terms[1]) + (terms[2] + terms[3])
+    acc = terms[0]
+    for t in terms[1:]:
+        acc = acc + t
+    return acc
+
+
+def gates_in_block(
+    acc: jax.Array,
+    sqr: jax.Array,
+    sc_ref,
+    hb_ref,
+    *,
+    hc_mult: int,
+    hidden_size: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+    gates: GateConsts,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``mhc_pre_gates`` for one token block, inside a Pallas kernel.
+
+    acc (tb, hc_mult3) raw mixes, sqr (tb, 1) squared sums, sc_ref (1, 3)
+    and hb_ref (1, hc_mult3) VMEM refs. Returns pre_mix (tb, M), post_mix
+    (tb, M), comb_mix (tb, M*M). Same math as ``mhc_pre_gates``; the
+    Mosaic transcendental/division lowerings put post/comb a few f32 ulp
+    from the XLA path (pre_mix is bit-identical). The Sinkhorn runs token-major
+    (tokens on lanes, one row per (i, j) entry), so each row/column
+    reduction is a few full-vreg adds instead of cross-lane work.
+    """
+    m, h = hc_mult, hidden_size
+    eps = gates.hc_sinkhorn_eps
+    scaled = acc * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
+
+    pre_mix = jax.nn.sigmoid(scaled[:, :m] * sc_ref[0, 0] + hb_ref[:, :m]) + hc_pre_eps
+    post_logits = scaled[:, m : 2 * m] * sc_ref[0, 1] + hb_ref[:, m : 2 * m]
+    # Spelled out: Mosaic's native logistic is far less accurate than XLA's
+    # (measured 2.9e-3 vs 8.8e-7 max relative error against f64). pre_mix
+    # keeps it, to stay bit-identical with the XLA-gates path's collapse.
+    post_mix = (1.0 / (1.0 + jnp.exp(-post_logits))) * gates.hc_post_mult_value
+    comb_logits = scaled[:, 2 * m :] * sc_ref[0, 2] + hb_ref[:, 2 * m :]
+
+    lt = comb_logits.T  # (M*M, tb), row k = i * M + j
+    c = [[lt[i * m + j : i * m + j + 1, :] for j in range(m)] for i in range(m)]
+    for i in range(m):
+        mx = c[i][0]
+        for j in range(1, m):
+            mx = jnp.maximum(mx, c[i][j])
+        e = [jnp.exp(c[i][j] - mx) for j in range(m)]
+        s = _sum4(e)
+        c[i] = [e[j] / s + eps for j in range(m)]
+
+    def col_norm(c):
+        cols = [_sum4([c[i][j] for i in range(m)]) + eps for j in range(m)]
+        return [[c[i][j] / cols[j] for j in range(m)] for i in range(m)]
+
+    def row_norm(c):
+        rows = [_sum4(c[i]) + eps for i in range(m)]
+        return [[c[i][j] / rows[i] for j in range(m)] for i in range(m)]
+
+    c = col_norm(c)
+    for _ in range(gates.sinkhorn_repeat - 1):
+        c = col_norm(row_norm(c))
+    comb_mix = jnp.concatenate([c[i][j] for i in range(m) for j in range(m)], 0).T
     return pre_mix, post_mix, comb_mix

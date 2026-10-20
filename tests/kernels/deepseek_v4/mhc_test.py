@@ -46,6 +46,9 @@ FUSED_F32_RTOL, FUSED_F32_ATOL = 1e-3, 1e-5
 # 2.4e-3 on the TPU backend); the small-shape fused tests use this
 # looser bound, the real-shape tests keep FUSED_F32_RTOL.
 FUSED_SMALL_H_RTOL = 5e-3
+# In-kernel vs XLA gates on identical mixes: transcendental/division
+# lowerings differ by a few ulp, and 20 Sinkhorn sweeps carry that along.
+GATES_RTOL, GATES_ATOL = 1e-5, 1e-7
 
 
 def _ref_mhc_pre_mixes(x2d: jax.Array, fn: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -588,6 +591,88 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         np.testing.assert_allclose(
             _to_np(got_layer), _to_np(want_layer), rtol=BF16_RTOL, atol=BF16_ATOL
         )
+
+
+@pytest.mark.tpu_test
+class MhcGatesInKernelTpuTest(parameterized.TestCase):
+    """``gates_in_kernel`` vs the XLA-gates path of the same kernels.
+
+    The streams and layer input never see the post/comb gates, so they must
+    be bit-identical; the gates differ only by transcendental/division
+    rounding (Mosaic vs XLA lowering). Needs TPU hardware.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    def _check_gates(self, got_post, got_comb, want_post, want_comb):
+        np.testing.assert_allclose(
+            _to_np(got_post), _to_np(want_post), rtol=GATES_RTOL, atol=GATES_ATOL
+        )
+        np.testing.assert_allclose(
+            _to_np(got_comb), _to_np(want_comb), rtol=GATES_RTOL, atol=GATES_ATOL
+        )
+
+    @parameterized.product(num_tokens=[1, 8, 16, 17, 32, 128], sinkhorn_repeat=[1, 20])
+    def test_fused(self, num_tokens, sinkhorn_repeat):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        args = _fused_args(np.random.default_rng(11), num_tokens, 7168, sinkhorn_repeat)
+        fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
+        want_res, want_post, want_comb, want_layer = fused_fn(*args)
+        got_res, got_post, got_comb, got_layer = fused_fn(*args, gates_in_kernel=True)
+
+        self.assertEqual(got_post.shape, want_post.shape)
+        self.assertEqual(got_comb.shape, want_comb.shape)
+        np.testing.assert_array_equal(_to_np(got_res), _to_np(want_res))
+        np.testing.assert_array_equal(_to_np(got_layer), _to_np(want_layer))
+        self._check_gates(got_post, got_comb, want_post, want_comb)
+
+    @parameterized.product(num_tokens=[8, 16, 17], sinkhorn_repeat=[1, 20])
+    def test_pre(self, num_tokens, sinkhorn_repeat):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import pre_kernel
+
+        rng = np.random.default_rng(12)
+        residual, fn, hc_scale, hc_base = _make_pre_inputs(rng, num_tokens, 7168)
+        args = (
+            jnp.asarray(residual).astype(jnp.bfloat16),
+            jnp.asarray(fn),
+            jnp.asarray(hc_scale),
+            jnp.asarray(hc_base),
+            RMS_EPS,
+            HC_PRE_EPS,
+            HC_SINKHORN_EPS,
+            HC_POST_MULT_VALUE,
+            sinkhorn_repeat,
+        )
+        want_post, want_comb, want_layer = pre_kernel.mhc_pre(*args)
+        got_post, got_comb, got_layer = pre_kernel.mhc_pre(*args, gates_in_kernel=True)
+
+        np.testing.assert_array_equal(_to_np(got_layer), _to_np(want_layer))
+        self._check_gates(got_post, got_comb, want_post, want_comb)
+
+    def test_padded_zero_rows_are_finite(self):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import pre_kernel
+
+        rng = np.random.default_rng(13)
+        residual, fn, hc_scale, hc_base = _make_pre_inputs(rng, 16, 7168)
+        residual[5:] = 0.0
+        outs = pre_kernel.mhc_pre(
+            jnp.asarray(residual).astype(jnp.bfloat16),
+            jnp.asarray(fn),
+            jnp.asarray(hc_scale),
+            jnp.asarray(hc_base),
+            RMS_EPS,
+            HC_PRE_EPS,
+            HC_SINKHORN_EPS,
+            HC_POST_MULT_VALUE,
+            20,
+            gates_in_kernel=True,
+        )
+        for out in outs:
+            self.assertTrue(bool(jnp.isfinite(out.astype(jnp.float32)).all()))
 
 
 if __name__ == "__main__":

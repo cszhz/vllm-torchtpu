@@ -55,12 +55,14 @@ def _gate_suffix(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    gates_in_kernel: bool,
 ) -> str:
     """The gate constants are baked into the traced op, so they name it."""
     return (
         f"_r{_name_float(rms_eps)}_p{_name_float(hc_pre_eps)}"
         f"_s{_name_float(hc_sinkhorn_eps)}"
         f"_a{_name_float(hc_post_mult_value)}_i{sinkhorn_repeat}"
+        + ("_gk" if gates_in_kernel else "")
     )
 
 
@@ -78,8 +80,10 @@ def _mhc_pre_jax(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    gates_in_kernel: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Mix GEMM + stream collapse in Pallas, gates/Sinkhorn in XLA."""
+    """Mix GEMM + stream collapse in Pallas, gates/Sinkhorn in XLA (or in
+    the kernel, with ``gates_in_kernel``)."""
     return pre_kernel.mhc_pre(
         residual,
         utils.SplitFn(fn_hi, fn_mid, fn_lo),
@@ -90,6 +94,7 @@ def _mhc_pre_jax(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        gates_in_kernel=gates_in_kernel,
     )
 
 
@@ -119,6 +124,7 @@ def _mhc_fused_post_pre_jax(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    gates_in_kernel: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """One layer's post and the next layer's pre as a single kernel."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
@@ -134,6 +140,7 @@ def _mhc_fused_post_pre_jax(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        gates_in_kernel=gates_in_kernel,
     )
 
 
@@ -179,9 +186,15 @@ def _mhc_pre_op(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    gates_in_kernel: bool,
 ):
     op_name = "pallas::deepseek_v4_mhc_pre_v2" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        gates_in_kernel,
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
@@ -194,6 +207,7 @@ def _mhc_pre_op(
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
+                gates_in_kernel=gates_in_kernel,
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
@@ -241,9 +255,15 @@ def _mhc_fused_post_pre_op(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    gates_in_kernel: bool,
 ):
     op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v2" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        gates_in_kernel,
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
@@ -256,6 +276,7 @@ def _mhc_fused_post_pre_op(
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
+                gates_in_kernel=gates_in_kernel,
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
@@ -333,6 +354,8 @@ def get_mhc_ops(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    *,
+    gates_in_kernel: bool = False,
 ) -> MHCOps:
     """Build (or fetch) every mHC op for these gate constants.
 
@@ -342,12 +365,16 @@ def get_mhc_ops(
     the returned ops and invoke them directly, keeping the op lookup out of
     the traced graph entirely.
     """
+    consts = (
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        gates_in_kernel,
+    )
     return MHCOps(
-        pre=_mhc_pre_op(
-            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
-        ),
-        fused=_mhc_fused_post_pre_op(
-            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
-        ),
+        pre=_mhc_pre_op(*consts),
+        fused=_mhc_fused_post_pre_op(*consts),
         post=get_mhc_post_op(),
     )
