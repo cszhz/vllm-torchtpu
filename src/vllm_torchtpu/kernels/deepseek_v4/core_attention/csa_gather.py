@@ -22,6 +22,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
 
@@ -194,17 +195,18 @@ def main_kernel(
             rope_out_block,
         )
         core_start_idx = period_idx * row_chunk_size
-        # [merge] Keep the decode-side (common-base) guard: a period whose
-        # first index is negative -- `_build_candidate_union_and_bitmask`
-        # marks inactive union chunks with -1 when u_chunk < m_union -- is
-        # skipped instead of gathering row -1 with bounds checks disabled.
-        first_idx = idx_ref[pl.ds(0, row_subchunk_size)][0]
+        run_period = (core_start_idx < valid_indices) & (active_inner_steps > 0)
+        if not envs.VLLM_DSV41_PURE_20L_PREFILL:
+            # [merge] Decode-side (common-base) guard: a period whose first
+            # index is negative -- `_build_candidate_union_and_bitmask` marks
+            # inactive union chunks with -1 when u_chunk < m_union -- is
+            # skipped instead of gathering row -1 with bounds checks disabled.
+            # The prefill tree (cd4eedb) has no such guard; keep its kernel
+            # body byte-identical on the prefill role.
+            first_idx = idx_ref[pl.ds(0, row_subchunk_size)][0]
+            run_period = run_period & (first_idx >= 0)
 
-        @pl.when(
-            (core_start_idx < valid_indices)
-            & (active_inner_steps > 0)
-            & (first_idx >= 0)
-        )
+        @pl.when(run_period)
         def _run_gather():
             # Prefetch r = 0 (`buf 0`) and r = 1 (`buf 1`) before entering inner pipeline.
             for s in range(num_streams):
