@@ -18,10 +18,6 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-# Ensure highest precision for matmuls on TPU to match float32 references.
-jax.config.update("jax_default_matmul_precision", "highest")
-
-
 # ==============================================================================
 # Pallas TPU Kernels (Native head batching, grid over chunks only)
 # ==============================================================================
@@ -273,7 +269,14 @@ def ssd_minimal_discrete_hybrid(
 
     # 1. Intra-chunk diagonal output (Y_diag)
     L = jnp.exp(_segsum_jax(A_c))
-    Y_diag = jnp.einsum("chln,chsn,chls,chsp->chlp", C_c, B_c, L, X_c)
+    Y_diag = jnp.einsum(
+        "chln,chsn,chls,chsp->chlp",
+        C_c,
+        B_c,
+        L,
+        X_c,
+        precision=jax.lax.Precision.HIGHEST,
+    )
 
     # 2. Intra-chunk state generation (Pallas)
     decay_states = jnp.exp(A_cumsum[..., -1:] - A_cumsum)[..., None]

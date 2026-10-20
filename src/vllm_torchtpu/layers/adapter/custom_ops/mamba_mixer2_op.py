@@ -53,7 +53,6 @@ def mamba_mixer2_core_tpu(
     d_state: int,
     kernel_size: int,
     chunk_size: int,
-    shard_groups: bool,
     rms_norm_eps: float,
     apply_rms_norm: bool,
     has_silu_activation: bool = True,
@@ -93,7 +92,6 @@ def mamba_mixer2_core_tpu(
         d_state=d_state,
         kernel_size=kernel_size,
         chunk_size=chunk_size,
-        shard_groups=shard_groups,
         rms_norm_eps=rms_norm_eps,
         apply_rms_norm=apply_rms_norm,
         has_silu_activation=has_silu_activation,
@@ -107,6 +105,17 @@ def mamba_mixer2_core_tpu(
 class VllmMambaMixer2(MambaMixer2):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        cache_config = getattr(self, "cache_config", None)
+        if (
+            cache_config is not None
+            and (
+                getattr(cache_config, "enable_prefix_caching", False) is True
+                or getattr(cache_config, "mamba_cache_mode", "none") in ("all", "align")
+            )
+        ) or getattr(self, "mamba_cache_mode", "none") in ("all", "align"):
+            raise NotImplementedError(
+                "Prefix caching is not yet supported for MambaMixer2 on TPU."
+            )
         self._apply_py_norm = False
         self.mamba_op = self._build_mamba_op()
 
@@ -163,7 +172,6 @@ class VllmMambaMixer2(MambaMixer2):
             d_state=self.ssm_state_size,
             kernel_size=self.conv_kernel_size,
             chunk_size=chunk_size,
-            shard_groups=True,
             rms_norm_eps=rms_norm_eps,
             apply_rms_norm=apply_rms_norm,
             has_silu_activation=has_silu_activation,

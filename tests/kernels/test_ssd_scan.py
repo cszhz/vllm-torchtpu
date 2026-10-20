@@ -22,9 +22,6 @@ from jax._src import test_util as jtu
 
 from vllm_torchtpu.layers.core.ssd_scan import ssd_minimal_discrete_hybrid
 
-# Ensure highest precision for matmuls on TPU to match float32 references.
-jax.config.update("jax_default_matmul_precision", "highest")
-
 
 def _segsum_jax(x):
     T = x.shape[-1]
@@ -64,10 +61,23 @@ def ssd_minimal_discrete_jax(
     A_cumsum = jnp.cumsum(A_c, axis=-1)
 
     L = jnp.exp(_segsum_jax(A_c))
-    Y_diag = jnp.einsum("chln,chsn,chls,chsp->chlp", C_c, B_c, L, X_c)
+    Y_diag = jnp.einsum(
+        "chln,chsn,chls,chsp->chlp",
+        C_c,
+        B_c,
+        L,
+        X_c,
+        precision=jax.lax.Precision.HIGHEST,
+    )
 
     decay_states = jnp.exp(A_cumsum[..., -1:] - A_cumsum)
-    states_c = jnp.einsum("chln,chlp,chl->chpn", B_c, X_c, decay_states)
+    states_c = jnp.einsum(
+        "chln,chlp,chl->chpn",
+        B_c,
+        X_c,
+        decay_states,
+        precision=jax.lax.Precision.HIGHEST,
+    )
 
     decay_chunk = jnp.exp(A_cumsum[..., -1])
 
@@ -85,7 +95,13 @@ def ssd_minimal_discrete_jax(
     )
 
     state_decay_out = jnp.exp(A_cumsum)
-    Y_off = jnp.einsum("chln,chpn,chl->chlp", C_c, states_incoming, state_decay_out)
+    Y_off = jnp.einsum(
+        "chln,chpn,chl->chlp",
+        C_c,
+        states_incoming,
+        state_decay_out,
+        precision=jax.lax.Precision.HIGHEST,
+    )
 
     Y = Y_diag + Y_off
     final_states = states_outgoing[last_chunk_indices]

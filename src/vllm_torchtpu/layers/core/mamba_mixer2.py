@@ -21,7 +21,6 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.causal_conv1d import causal_conv1d
 from vllm_torchtpu.layers.core.ssd_scan import ssd_minimal_discrete_hybrid
-from vllm_torchtpu.utils import get_mesh_shape_product
 
 _HEAD_SHARDING_AXIS = "model"
 
@@ -43,10 +42,7 @@ def jax_gated_rms_norm(
     gate: jnp.ndarray,
     weight: jnp.ndarray | None,
     eps: float,
-    shard_groups: bool,
-    tp_size: int,
     n_groups: int = 1,
-    head_axis_name: str | None = _HEAD_SHARDING_AXIS,
 ) -> jnp.ndarray:
     input_dtype = x.dtype
 
@@ -56,20 +52,13 @@ def jax_gated_rms_norm(
         return x_gated.astype(input_dtype)
 
     # 2. Compute Variance and Normalize
-    if shard_groups or tp_size <= 1 or head_axis_name is None:
-        orig_shape = x_gated.shape
-        if n_groups > 1:
-            x_gated = x_gated.reshape(
-                *orig_shape[:-1], n_groups, orig_shape[-1] // n_groups
-            )
-        variance = jnp.mean(jnp.square(x_gated), axis=-1, keepdims=True)
-        x_norm = (x_gated * jax.lax.rsqrt(variance + eps)).reshape(orig_shape)
-    else:
-        local_sum = jnp.sum(jnp.square(x_gated), axis=-1, keepdims=True)
-        global_sum = jax.lax.psum(local_sum, axis_name=head_axis_name)
-        count = tp_size * x.shape[-1]
-        variance = global_sum / count
-        x_norm = x_gated * jax.lax.rsqrt(variance + eps)
+    orig_shape = x_gated.shape
+    if n_groups > 1:
+        x_gated = x_gated.reshape(
+            *orig_shape[:-1], n_groups, orig_shape[-1] // n_groups
+        )
+    variance = jnp.mean(jnp.square(x_gated), axis=-1, keepdims=True)
+    x_norm = (x_gated * jax.lax.rsqrt(variance + eps)).reshape(orig_shape)
 
     # 3. Apply weight
     return (weight.astype(jnp.float32) * x_norm).astype(input_dtype)
@@ -241,143 +230,36 @@ def run_jax_mamba_mixer_local(
     d_state: int,
     kernel_size: int,
     chunk_size: int,
-    shard_groups: bool,
-    tp_size: int,
     rms_norm_eps: float,
     apply_rms_norm: bool = True,
     has_silu_activation: bool = True,
-    head_axis_name: str | None = _HEAD_SHARDING_AXIS,
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the local device execution of Mamba-2 Mixer."""
-    if shard_groups or tp_size <= 1 or head_axis_name is None:
-        tped_intermediate_size_local = tped_intermediate_size
-        tped_conv_size_local = tped_conv_size
-
-        hidden_states_B_C = j_projected_states[
-            ...,
-            tped_intermediate_size_local : tped_intermediate_size_local
-            + tped_conv_size_local,
-        ]
-        dt_raw = j_projected_states[
-            ..., tped_intermediate_size_local + tped_conv_size_local :
-        ]
-
-        conv_state_in = conv_state
-        j_conv_weight_local = j_conv_weight
-        j_conv_bias_local = j_conv_bias
-        X_MLP_local = j_projected_states[..., :tped_intermediate_size_local]
-    else:
-        rank = jax.lax.axis_index(head_axis_name)
-        local_intermediate = tped_intermediate_size
-        local_dt = tped_dt_size
-
-        global_intermediate = local_intermediate * tp_size
-        global_groups_ssm = n_groups * d_state
-
-        X_MLP_local = jax.lax.dynamic_slice_in_dim(
-            j_projected_states,
-            rank * local_intermediate,
-            local_intermediate,
-            axis=-1,
-        )
-
-        X_conv_start = global_intermediate
-        X_conv_local = jax.lax.dynamic_slice_in_dim(
-            j_projected_states,
-            X_conv_start + rank * local_intermediate,
-            local_intermediate,
-            axis=-1,
-        )
-
-        B_start = X_conv_start + global_intermediate
-        B_replicated = j_projected_states[..., B_start : B_start + global_groups_ssm]
-        C_start = B_start + global_groups_ssm
-        C_replicated = j_projected_states[..., C_start : C_start + global_groups_ssm]
-
-        dt_start = C_start + global_groups_ssm
-        dt_local = jax.lax.dynamic_slice_in_dim(
-            j_projected_states, dt_start + rank * local_dt, local_dt, axis=-1
-        )
-
-        hidden_states_B_C = jnp.concatenate(
-            [X_conv_local, B_replicated, C_replicated], axis=-1
-        )
-        dt_raw = dt_local
-
-        X_conv_cache_local = jax.lax.dynamic_slice_in_dim(
-            conv_state,
-            rank * local_intermediate,
-            local_intermediate,
-            axis=-1,
-        )
-        B_cache_replicated = conv_state[
-            ..., global_intermediate : global_intermediate + global_groups_ssm
-        ]
-        C_cache_replicated = conv_state[
-            ...,
-            global_intermediate + global_groups_ssm : global_intermediate
-            + 2 * global_groups_ssm,
-        ]
-
-        conv_state_in = jnp.concatenate(
-            [X_conv_cache_local, B_cache_replicated, C_cache_replicated],
-            axis=-1,
-        )
-
-        X_conv_w_local = jax.lax.dynamic_slice_in_dim(
-            j_conv_weight,
-            rank * local_intermediate,
-            local_intermediate,
-            axis=0,
-        )
-        B_w_replicated = j_conv_weight[
-            global_intermediate : global_intermediate + global_groups_ssm, ...
-        ]
-        C_w_replicated = j_conv_weight[
-            global_intermediate + global_groups_ssm : global_intermediate
-            + 2 * global_groups_ssm,
-            ...,
-        ]
-
-        j_conv_weight_local = jnp.concatenate(
-            [X_conv_w_local, B_w_replicated, C_w_replicated], axis=0
-        )
-
-        if j_conv_bias is not None:
-            X_conv_b_local = jax.lax.dynamic_slice_in_dim(
-                j_conv_bias,
-                rank * local_intermediate,
-                local_intermediate,
-                axis=0,
-            )
-            B_b_replicated = j_conv_bias[
-                global_intermediate : global_intermediate + global_groups_ssm
-            ]
-            C_b_replicated = j_conv_bias[
-                global_intermediate + global_groups_ssm : global_intermediate
-                + 2 * global_groups_ssm
-            ]
-            j_conv_bias_local = jnp.concatenate(
-                [X_conv_b_local, B_b_replicated, C_b_replicated], axis=0
-            )
-        else:
-            j_conv_bias_local = None
-
-        tped_intermediate_size_local = local_intermediate
-        tped_conv_size_local = local_intermediate + 2 * global_groups_ssm
+    X_MLP_local = j_projected_states[..., :tped_intermediate_size]
+    hidden_states_B_C = j_projected_states[
+        ...,
+        tped_intermediate_size : tped_intermediate_size + tped_conv_size,
+    ]
+    dt_raw = j_projected_states[
+        ...,
+        tped_intermediate_size + tped_conv_size : tped_intermediate_size
+        + tped_conv_size
+        + tped_dt_size,
+    ]
 
     max_reqs = seq_lens.shape[0]
     query_lens = query_start_loc[1 : max_reqs + 1] - query_start_loc[:max_reqs]
     has_initial_state = (seq_lens - query_lens) > 0
 
+    j_conv_weight_local = j_conv_weight
     if j_conv_weight_local.ndim == 2:
         j_conv_weight_local = jnp.expand_dims(j_conv_weight_local, axis=1)
 
     out_conv, new_conv_state = causal_conv1d.ragged_causal_conv1d(
         hidden_states_B_C,
-        conv_state_in,
+        conv_state,
         j_conv_weight_local,
-        j_conv_bias_local,
+        j_conv_bias,
         query_start_loc,
         state_indices,
         distribution,
@@ -392,8 +274,8 @@ def run_jax_mamba_mixer_local(
     X_raw, B_raw, C_raw = jnp.split(
         out_conv,
         [
-            tped_intermediate_size_local,
-            tped_intermediate_size_local + local_groups_ssm,
+            tped_intermediate_size,
+            tped_intermediate_size + local_groups_ssm,
         ],
         axis=-1,
     )
@@ -407,6 +289,7 @@ def run_jax_mamba_mixer_local(
 
     dt = jax.nn.softplus(dt_raw.astype(jnp.float32) + j_dt_bias.astype(jnp.float32))
     decay = dt * j_A.astype(jnp.float32)
+    X_dt = (X.astype(jnp.float32) * dt[..., None]).astype(X.dtype)
 
     (
         X_c,
@@ -418,7 +301,7 @@ def run_jax_mamba_mixer_local(
         start_chunk_indices,
         padded_indices_valid,
     ) = pack_inputs_mamba(
-        X,
+        X_dt,
         B,
         C,
         decay,
@@ -477,35 +360,12 @@ def run_jax_mamba_mixer_local(
             gate=X_MLP_local,
             weight=j_norm_weight,
             eps=rms_norm_eps,
-            shard_groups=shard_groups,
-            tp_size=tp_size,
             n_groups=n_groups,
-            head_axis_name=head_axis_name,
         )
     else:
         Y_out = Y_final.astype(j_projected_states.dtype)
 
-    if not shard_groups and tp_size > 1 and head_axis_name is not None:
-        global_groups_ssm = n_groups * d_state
-        new_X_conv_local = new_conv_state[..., :tped_intermediate_size_local]
-        new_B = new_conv_state[
-            ...,
-            tped_intermediate_size_local : tped_intermediate_size_local
-            + global_groups_ssm,
-        ]
-        new_C = new_conv_state[..., tped_intermediate_size_local + global_groups_ssm :]
-
-        new_X_conv_global = jax.lax.all_gather(
-            new_X_conv_local, axis_name=head_axis_name, axis=2
-        )
-        new_X_conv_global = new_X_conv_global.reshape(
-            new_X_conv_global.shape[0], new_X_conv_global.shape[1], -1
-        )
-        new_conv_state_out = jnp.concatenate([new_X_conv_global, new_B, new_C], axis=2)
-    else:
-        new_conv_state_out = new_conv_state
-
-    return (new_conv_state_out, updated_recurrent_state), Y_out
+    return (new_conv_state, updated_recurrent_state), Y_out
 
 
 def run_jax_mamba_mixer(
@@ -533,7 +393,6 @@ def run_jax_mamba_mixer(
     d_state: int,
     kernel_size: int,
     chunk_size: int = 64,
-    shard_groups: bool = True,
     rms_norm_eps: float = 1e-5,
     apply_rms_norm: bool = True,
     has_silu_activation: bool = True,
@@ -544,21 +403,12 @@ def run_jax_mamba_mixer(
 
     data_axis = "attn_dp" if "attn_dp" in mesh.axis_names else None
     head_axis = _HEAD_SHARDING_AXIS if _HEAD_SHARDING_AXIS in mesh.axis_names else None
-    tp_size = get_mesh_shape_product(mesh, head_axis) if head_axis else 1
 
-    if shard_groups:
-        projected_states_spec = P(data_axis, head_axis)
-        conv_state_spec = P(data_axis, None, head_axis)
-        conv_weight_spec = P(head_axis, None, None)
-        conv_bias_spec = P(head_axis) if j_conv_bias is not None else None
-        new_conv_state_spec = P(data_axis, None, head_axis)
-    else:
-        projected_states_spec = P(data_axis, None)
-        conv_state_spec = P(data_axis, None, None)
-        conv_weight_spec = P(None, None, None)
-        conv_bias_spec = None
-        new_conv_state_spec = P(data_axis, None, None)
-
+    projected_states_spec = P(data_axis, head_axis)
+    conv_state_spec = P(data_axis, None, head_axis)
+    conv_weight_spec = P(head_axis, None, None)
+    conv_bias_spec = P(head_axis) if j_conv_bias is not None else None
+    new_conv_state_spec = P(data_axis, None, head_axis)
     norm_weight_spec = P(head_axis) if j_norm_weight is not None else None
 
     in_specs = (
@@ -596,12 +446,9 @@ def run_jax_mamba_mixer(
         d_state=d_state,
         kernel_size=kernel_size,
         chunk_size=chunk_size,
-        shard_groups=shard_groups,
-        tp_size=tp_size,
         rms_norm_eps=rms_norm_eps,
         apply_rms_norm=apply_rms_norm,
         has_silu_activation=has_silu_activation,
-        head_axis_name=head_axis,
     )
 
     mapped_fn = jax.shard_map(
