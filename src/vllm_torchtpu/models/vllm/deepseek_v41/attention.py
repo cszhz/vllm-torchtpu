@@ -176,71 +176,46 @@ def _o_proj_wob_jax(
     *,
     head_dim: int,
 ) -> jax.Array:
-    if not _PREFILL_ROLE:
-        # Decode stack (1d02e4ab9) dispatch.
-        if x.shape[1] == 16 and wo_b_s.ndim == 1:
-            return o_proj.fused_reverse_rope_wo_a_wo_b_projection(
-                x,
-                positions,
-                cos_sin_cache,
-                wo_a,
-                wo_a_scale,
-                wo_b_w,
-                wo_b_s,
-                head_dim=head_dim,
-            )
-        if not isinstance(x.shape[0], torch.SymInt) and x.shape[1] == 128 and wo_b_s.ndim == 4 and x.shape[0] <= 384:
-            return o_proj.fused_reverse_rope_wo_a_wo_b_h128_projection(
-                x,
-                positions,
-                cos_sin_cache,
-                wo_a,
-                wo_a_scale,
-                wo_b_w,
-                wo_b_s,
-                head_dim=head_dim,
-            )
-    else:
-        # g1 kernel is not defined in either tree's o_projection.py; guard so an
-        # 8-local-head config falls through to the generic path instead of
-        # raising AttributeError.
-        if (
-            x.shape[1] == 8
-            and wo_b_s.ndim in (1, 4)
-            and hasattr(o_proj, "fused_reverse_rope_wo_a_wo_b_g1_projection")
-        ):
-            return o_proj.fused_reverse_rope_wo_a_wo_b_g1_projection(
-                x,
-                positions,
-                cos_sin_cache,
-                wo_a,
-                wo_a_scale,
-                wo_b_w,
-                wo_b_s,
-                head_dim=head_dim,
-            )
-        if x.shape[1] == 16 and wo_b_s.ndim in (1, 4):
-            return o_proj.fused_reverse_rope_wo_a_wo_b_projection(
-                x,
-                positions,
-                cos_sin_cache,
-                wo_a,
-                wo_a_scale,
-                wo_b_w,
-                wo_b_s,
-                head_dim=head_dim,
-            )
-        if x.shape[1] in (32, 64, 128) and wo_b_s.ndim in (1, 4):
-            return o_proj.fused_reverse_rope_wo_a_wo_b_h128_projection(
-                x,
-                positions,
-                cos_sin_cache,
-                wo_a,
-                wo_a_scale,
-                wo_b_w,
-                wo_b_s,
-                head_dim=head_dim,
-            )
+    # g1 kernel is not defined in either tree's o_projection.py; guard so an
+    # 8-local-head config falls through to the generic path instead of
+    # raising AttributeError.
+    if (
+        x.shape[1] == 8
+        and wo_b_s.ndim in (1, 4)
+        and hasattr(o_proj, "fused_reverse_rope_wo_a_wo_b_g1_projection")
+    ):
+        return o_proj.fused_reverse_rope_wo_a_wo_b_g1_projection(
+            x,
+            positions,
+            cos_sin_cache,
+            wo_a,
+            wo_a_scale,
+            wo_b_w,
+            wo_b_s,
+            head_dim=head_dim,
+        )
+    if x.shape[1] == 16 and wo_b_s.ndim in (1, 4):
+        return o_proj.fused_reverse_rope_wo_a_wo_b_projection(
+            x,
+            positions,
+            cos_sin_cache,
+            wo_a,
+            wo_a_scale,
+            wo_b_w,
+            wo_b_s,
+            head_dim=head_dim,
+        )
+    if x.shape[1] in (32, 64, 128) and wo_b_s.ndim in (1, 4):
+        return o_proj.fused_reverse_rope_wo_a_wo_b_h128_projection(
+            x,
+            positions,
+            cos_sin_cache,
+            wo_a,
+            wo_a_scale,
+            wo_b_w,
+            wo_b_s,
+            head_dim=head_dim,
+        )
     orig_m = x.shape[0]
     m_pad = 64 if orig_m == 48 else ((orig_m + 7) & ~7)
     pad_t = m_pad - orig_m
@@ -1952,17 +1927,6 @@ class VllmDeepseekV41MLAAttention(
     ) -> torch.Tensor:
         weight = self.fused_wqa_wkv.weight if w_wqa is None else w_wqa
         weight_scale = self.fused_wqa_wkv.weight_scale if ws_wqa is None else ws_wqa
-        if not _PREFILL_ROLE:
-            if hidden_states_fp8 is not None and hidden_states_scale is not None:
-                if getattr(self.fused_wqa_wkv, KEEP_VLLM_LAYOUT_ATTR, False):
-                    weight = weight.transpose(0, 1)
-                return quantized_matmul_prequant(
-                    hidden_states_fp8,
-                    hidden_states_scale,
-                    weight,
-                    weight_scale,
-                )
-            return self.fused_wqa_wkv(hidden_states)[0]
         if weight.shape[0] != hidden_states.shape[-1]:
             weight = weight.transpose(0, 1)
         if hidden_states_fp8 is not None and hidden_states_scale is not None:
@@ -2162,8 +2126,7 @@ class VllmDeepseekV41MLAAttention(
             )
             if not self.non_causal_multi_token_decode and _TOKEN_SHARD_MIN_TOKENS > 0:
                 self._build_tp_wo_b_weights()
-        if _PREFILL_ROLE:
-            self._build_fused_csa_input_weights()
+        self._build_fused_csa_input_weights()
         if not torch.compiler.is_compiling():
             for _op_name in (
                 "q_rope_op",
@@ -2405,7 +2368,7 @@ class VllmDeepseekV41MLAAttention(
             use_fused_q_rope = bool(
                 _FUSED_Q_ROPE
                 and wq_b_s is not None
-                and wq_b_s.ndim in ((1, 4) if _PREFILL_ROLE else (1,))
+                and wq_b_s.ndim in (1, 4)
                 and not has_wqb_bias
                 and self.n_local_heads % 8 == 0
             )
@@ -2866,7 +2829,7 @@ class VllmDeepseekV41MLAAttention(
             )
             main_cache_kv = (
                 dummy_main
-                if (orig_main_cache_kv is None or (same_buf and _PREFILL_ROLE))
+                if (orig_main_cache_kv is None or same_buf)
                 else orig_main_cache_kv
             )
             m_lens, main_tables, main_q_loc, main_dist = _unpack_meta(main_meta)
@@ -3057,22 +3020,13 @@ class VllmDeepseekV41MLAAttention(
         w_wo_b = self.wo_b.weight
         ws_wo_b = self.wo_b._parameters.get("weight_scale")
 
-        if _PREFILL_ROLE:
-            use_wob = (
-                ws_wo_b is not None
-                and ws_wo_b.ndim in (1, 4)
-                and self.wo_b._parameters.get("bias") is None
-                and self.n_local_heads in (8, 16, 32, 64, 128)
-            )
-            transpose_wob = w_wo_b.shape[0] == self.hidden_size
-        else:
-            use_wob = (
-                ws_wo_b is not None
-                and ws_wo_b.ndim == 1
-                and self.wo_b._parameters.get("bias") is None
-                and self.n_local_heads == 16
-            )
-            transpose_wob = getattr(self.wo_b, KEEP_VLLM_LAYOUT_ATTR, False)
+        use_wob = (
+            ws_wo_b is not None
+            and ws_wo_b.ndim in (1, 4)
+            and self.wo_b._parameters.get("bias") is None
+            and self.n_local_heads in (8, 16, 32, 64, 128)
+        )
+        transpose_wob = w_wo_b.shape[0] == self.hidden_size
         if use_wob:
             w_wo_b_in = w_wo_b.transpose(0, 1) if transpose_wob else w_wo_b
             out_wob = self.o_proj_wob_op(

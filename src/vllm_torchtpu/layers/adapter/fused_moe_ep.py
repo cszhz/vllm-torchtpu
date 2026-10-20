@@ -211,7 +211,11 @@ def _build_op(
     wire_bf16_max_tokens = (
         int(envs.VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS) if prefill_role else -1
     )
-    coalesce_kw = {} if prefill_role else {"coalesce_peer_push": False}
+    coalesce_kw = (
+        {}
+        if (prefill_role or envs.VLLM_DSV41_MOE_V2_COALESCED_PUSH)
+        else {"coalesce_peer_push": False}
+    )
     fp4_max_t = int(envs.VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS)
     fp8_max_t = int(envs.VLLM_DSV41_MOE_FP8_PATH_C_MAX_TOKENS)
     max_v2_t_local = (
@@ -224,8 +228,6 @@ def _build_op(
     def _capacity(rows: int) -> int:
         if cap_override is not None:
             return int(cap_override)
-        if not prefill_role:
-            return _TILE_M
         return 32 if rows <= 128 else (64 if rows <= 1024 else _TILE_M)
 
     key = (

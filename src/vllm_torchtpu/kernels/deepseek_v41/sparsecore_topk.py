@@ -210,11 +210,7 @@ def _radix_select_and_emit(
 def _topk_body_no_keys(
     aw_hbm,
     scores_hbm,
-    lengths_hbm,
-    out_hbm,
-    glob_vmem,
-    rowbuf_vmem,
-    *,
+    *rest_args,
     b: int,
     p: int = 1,
     n: int,
@@ -222,7 +218,13 @@ def _topk_body_no_keys(
     slice_len: int,
     num_waves: int,
     use_dyn_waves: bool = False,
+    has_cand_indices: bool = False,
 ):
+    if has_cand_indices:
+        cand_idx_hbm, lengths_hbm, out_hbm, glob_vmem, rowbuf_vmem = rest_args
+    else:
+        lengths_hbm, out_hbm, glob_vmem, rowbuf_vmem = rest_args
+        cand_idx_hbm = None
     cores_per_chip = _get_sc_subcores()
     sc = pltpu.get_tpu_info().sparse_core
     sub_stride = 16 if sc is None else sc.num_subcores
@@ -241,7 +243,7 @@ def _topk_body_no_keys(
 
     lane_iota = jnp.arange(LANES, dtype=jnp.int32)
 
-    def pipeline_step(scores_vmem, len_slice_vmem, out_vmem):
+    def _step_impl(scores_vmem, cand_idx_vmem, len_slice_vmem, out_vmem):
         row = remap_idx(pl.program_id(0))[0]
         eff_len = jnp.where(row < b, jnp.minimum(_vec_at(len_slice_vmem, 0), n), 0)
         i_hi = jnp.where(eff_len > 0, jnp.minimum(slice_len, eff_len), 0)
@@ -268,8 +270,13 @@ def _topk_body_no_keys(
                 rowbuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full((LANES,), -1, jnp.int32)
 
             def emit(i, woff, _key, sel):
+                src_idx = (
+                    cand_idx_vmem[pl.ds(i * LANES, LANES)]
+                    if cand_idx_vmem is not None
+                    else (i * LANES + lane_iota)
+                )
                 plsc.store_compressed(
-                    rowbuf_vmem.at[pl.ds(woff, LANES)], i * LANES + lane_iota, mask=sel
+                    rowbuf_vmem.at[pl.ds(woff, LANES)], src_idx, mask=sel
                 )
                 return woff + plsc.all_reduce_population_count(sel)[0]
 
@@ -294,12 +301,20 @@ def _topk_body_no_keys(
         return pl.BlockSpec((size,), remap_idx, pipeline_mode=mode)
 
     def run_waves(num_steps):
-        pltpu.emit_pipeline(
-            pipeline_step,
-            grid=(num_steps,),
-            in_specs=(spec(slice_len), spec(LANES)),
-            out_specs=(spec(k),),
-        )(scores_hbm, lengths_hbm, out_hbm)
+        if has_cand_indices:
+            pltpu.emit_pipeline(
+                lambda s_v, c_v, l_v, o_v: _step_impl(s_v, c_v, l_v, o_v),
+                grid=(num_steps,),
+                in_specs=(spec(slice_len), spec(slice_len), spec(LANES)),
+                out_specs=(spec(k),),
+            )(scores_hbm, cand_idx_hbm, lengths_hbm, out_hbm)
+        else:
+            pltpu.emit_pipeline(
+                lambda s_v, l_v, o_v: _step_impl(s_v, None, l_v, o_v),
+                grid=(num_steps,),
+                in_specs=(spec(slice_len), spec(LANES)),
+                out_specs=(spec(k),),
+            )(scores_hbm, lengths_hbm, out_hbm)
 
     if use_dyn_waves:
         pltpu.emit_pipeline(
@@ -465,6 +480,7 @@ def _sc_topk_direct(
     *,
     p: int = 1,
     active_waves: jax.Array | None = None,
+    cand_indices: jax.Array | None = None,
     scheduling_group_id: int | None = None,
     need_keys: bool = True,
 ) -> tuple[jax.Array, jax.Array | None]:
@@ -477,6 +493,12 @@ def _sc_topk_direct(
     padded_b = num_waves * num_subcores
     if padded_b > b or slice_len > n:
         scores = jnp.pad(scores, ((0, padded_b - b), (0, slice_len - n)))
+        if cand_indices is not None:
+            cand_indices = jnp.pad(
+                cand_indices,
+                ((0, padded_b - b), (0, slice_len - n)),
+                constant_values=-1,
+            )
 
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
     lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
@@ -485,6 +507,8 @@ def _sc_topk_direct(
     aw_vec = jnp.full((LANES,), active_waves if use_dyn else num_waves, dtype=jnp.int32)
 
     if not need_keys:
+        has_ci = cand_indices is not None
+        ci_args = (cand_indices.reshape(-1),) if has_ci else ()
         slots = _run_sc_kernel(
             functools.partial(
                 _topk_body_no_keys,
@@ -495,16 +519,18 @@ def _sc_topk_direct(
                 slice_len=slice_len,
                 num_waves=num_waves,
                 use_dyn_waves=use_dyn,
+                has_cand_indices=has_ci,
             ),
             slot_type,
             (
                 pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),
                 pltpu.VMEM((k + LANES,), jnp.int32),
             ),
-            f"sc_topk_nokeys_b{b}_n{n}_k{k}_dyn{int(use_dyn)}",
+            f"sc_topk_nokeys_b{b}_n{n}_k{k}_dyn{int(use_dyn)}_ci{int(has_ci)}",
             scheduling_group_id,
             aw_vec,
             scores.reshape(-1),
+            *ci_args,
             lengths_2d.reshape(-1),
         )
         return slots.reshape(padded_b, k)[:b], None
@@ -586,17 +612,15 @@ def sparsecore_topk(
         local_indices < 0, -1, offsets[None, :, None] + local_indices
     ).reshape(b, p * k)
 
-    final_cand_slots, _ = _sc_topk_direct(
+    final_indices, _ = _sc_topk_direct(
         cand_scores.reshape(b, p * k),
         k,
         active_slices * k,
+        cand_indices=global_cand_indices,
         scheduling_group_id=stage2_scheduling_group_id,
         need_keys=False,
     )
-    final_indices = jnp.take_along_axis(
-        global_cand_indices, jnp.maximum(final_cand_slots, 0), axis=1
-    )
-    return jnp.where(final_cand_slots >= 0, final_indices, -1)
+    return final_indices
 
 
 def _sc_cand_gather_topk_body(

@@ -1518,6 +1518,7 @@ class DeepseekV41Model(nn.Module):
         padded_num_tokens: int,
         pre_async: Any = None,
         async_subst: Any = None,
+        spec_async_subst: Any = None,
         debug_tok0_out: dict[int, int] | None = None,
     ) -> None:
         if self.engram_hash is not None:
@@ -1531,6 +1532,7 @@ class DeepseekV41Model(nn.Module):
                 known,
                 pre_async=pre_async,
                 async_subst=async_subst,
+                spec_async_subst=spec_async_subst,
                 debug_tok0_out=debug_tok0_out,
                 padded_num_tokens=padded_num_tokens,
             )

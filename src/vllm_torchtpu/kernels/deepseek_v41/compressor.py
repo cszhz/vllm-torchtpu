@@ -252,11 +252,7 @@ def compressor_insert_cache_jax(
         valid if compress_ratio == 1 else (valid & (((pos + 1) % compress_ratio) == 0))
     )
 
-    # Prefill-tuned threshold (>=384) vs decode stack (>512): differs only for
-    # 384 <= T <= 512, i.e. the decode T=384 bucket.
-    use_pallas = (
-        num_tokens >= 384 if _prefill_role() else num_tokens > 512
-    ) and page_size % 32 == 0
+    use_pallas = num_tokens >= 384 and page_size % 32 == 0
     M = num_tokens
     latent_work = latent
     pos_work = pos
@@ -2587,9 +2583,7 @@ def _indexer_v41_impl(
     # query padding and fits 2x larger KV blocks. 96/384 buckets use multiples of 48.
     is_decode_or_verify = n_cfg <= 1536
     bq_mixed = 8 if is_decode_or_verify else 128
-    # Decode-sized KV block: 64 pages (prefill-node tuning) vs 16 (decode stack).
-    bkv_dec = 64 if _prefill_role() else 16
-    bkv_pages = (bkv_dec if is_decode_or_verify else 8) * max(1, compression_ratio)
+    bkv_pages = (64 if is_decode_or_verify else 8) * max(1, compression_ratio)
     chunk_tokens = (
         512
         if (not is_decode_or_verify and q.shape[0] >= 512 and q.shape[0] % 512 == 0)

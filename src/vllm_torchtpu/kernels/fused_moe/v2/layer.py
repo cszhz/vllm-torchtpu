@@ -532,7 +532,7 @@ def fused_ep_moe_v2(
     )
 
     coalesce_peer_push = (
-        (prefill_tuned and T <= 1024)
+        ((prefill_tuned or envs.VLLM_DSV41_MOE_V2_COALESCED_PUSH) and T <= 1024)
         if coalesce_peer_push is None
         else bool(coalesce_peer_push)
     )
@@ -600,20 +600,13 @@ def fused_ep_moe_v2(
             topk_weights = jnp.where(valid_route, topk_w_l.astype(jnp.float32), 0.0)
         else:
             scores = _apply_scoring_fn(gate_l, scoring_fn)
-            if prefill_tuned:
-                select_rows = (
-                    t_local
-                    if t_local <= MAX_ROUTING_BLOCK
-                    else next(
-                        d for d in range(MAX_ROUTING_BLOCK, 7, -8) if t_local % d == 0
-                    )
+            select_rows = (
+                t_local
+                if t_local <= MAX_ROUTING_BLOCK
+                else next(
+                    d for d in range(MAX_ROUTING_BLOCK, 7, -8) if t_local % d == 0
                 )
-            else:
-                # Decode: power-of-two divisor; pallas_select falls back to
-                # one whole-R block when it is not a multiple of 8.
-                select_rows = MAX_ROUTING_BLOCK
-                while t_local % select_rows:
-                    select_rows //= 2
+            )
             if hash_l is not None:
                 topk_idx = hash_l.astype(jnp.int32)
                 topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
