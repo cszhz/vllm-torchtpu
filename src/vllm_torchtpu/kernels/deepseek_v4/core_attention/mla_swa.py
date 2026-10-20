@@ -164,7 +164,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     q_start = cu_q_lens_ref[seq_idx]
     q_end = cu_q_lens_ref[seq_idx + 1]
     q_len = q_end - q_start
-    kv_len = kv_lens_ref[seq_idx]
+    kv_len = kv_lens_ref[seq_idx] & 0xFFFFF
 
     def flash_attention(
         bq_vmem_ref,  # [bq_sz, num_q_heads, head_dim] VMEM ref
@@ -409,7 +409,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             cp.start()
 
     def _get_kv_len(seq_idx):
-        return jnp.where(seq_idx < end_seq_idx, kv_lens_ref[seq_idx], 0)
+        return jnp.where(seq_idx < end_seq_idx, kv_lens_ref[seq_idx] & 0xFFFFF, 0)
 
     def _get_q_len(seq_idx):
         return jnp.where(
@@ -426,7 +426,16 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         # first key it can ever need is q_pos_min - sliding_window + 1.
         kv_len_s = _get_kv_len(seq_idx)
         q_len_s = _get_q_len(seq_idx)
-        min_start = jnp.where(q_len_s > 1, kv_len_s - q_len_s, 0) if ced_decoder else 0
+        eff_q_span_s = jnp.where(
+            seq_idx < end_seq_idx,
+            jnp.maximum(q_len_s, kv_lens_ref[seq_idx] >> 20),
+            0,
+        )
+        min_start = (
+            jnp.where(eff_q_span_s > 1, kv_len_s - eff_q_span_s, 0)
+            if ced_decoder
+            else 0
+        )
         return jnp.maximum(
             kv_len_s - q_len_s + bq_idx * bq_sz - sliding_window + 1,
             min_start,
@@ -446,7 +455,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             lkv_dim,
         )
 
-        kv_len = kv_lens_ref[seq_idx]
+        kv_len = kv_lens_ref[seq_idx] & 0xFFFFF
         # Window base for this (seq, bq) block plus the relative block. `start_offset`
         # is an exact token position, so `kv_len_start` is generally not a multiple
         # of page_size; `page_off` is where inside its page the window starts.
@@ -2509,11 +2518,17 @@ def mla_sliding_window_ragged_paged_attention(
         and chunk_prefill_size is None
         and q.shape[0] % eff_verify_q_len == 0
     ):
+        seq_q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+        active_seq = jnp.arange(max_num_seqs, dtype=jnp.int32) < distribution[2]
         is_uniform_verify = (
             (distribution[0] == 0)
             & (distribution[1] == 0)
             & (distribution[2] > 0)
             & (cu_q_lens[distribution[2]] == distribution[2] * eff_verify_q_len)
+            & jnp.all(
+                ~active_seq
+                | ((seq_q_lens == eff_verify_q_len) & ((kv_lens >> 20) == 0))
+            )
         )
 
         def _run_uniform_verify(kv_in):

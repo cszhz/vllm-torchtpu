@@ -87,12 +87,18 @@ def _prepare_swa_metadata(
     # Trim oversized page tables BEFORE ring-mapping so scalar prefetch into
     # SMEM and modulo mapping operate on ~16 pages/seq instead of 2048.
     if pages_per_seq > window_pages * 2:
+        eff_span_packed = swa_kv_lens >> 20
+        raw_kv_lens = swa_kv_lens & 0xFFFFF
         q_lens = swa_cu_q_lens[1:] - swa_cu_q_lens[:-1]
+        eff_span = jnp.maximum(q_lens, eff_span_packed)
         base_pages = (
-            jnp.maximum(0, swa_kv_lens - q_lens - sliding_window) // logical_page_size
+            jnp.maximum(0, raw_kv_lens - eff_span - sliding_window) // logical_page_size
         )
-        swa_kv_lens = jnp.maximum(0, swa_kv_lens - base_pages * logical_page_size)
-        page_table_2d = swa_page_indices.reshape(max_num_seqs, pages_per_seq)
+        raw_kv_lens = jnp.maximum(0, raw_kv_lens - base_pages * logical_page_size)
+        swa_kv_lens = raw_kv_lens | (eff_span_packed << 20)
+        page_table_2d = swa_page_indices[
+            : max_num_seqs * pages_per_seq
+        ].reshape(max_num_seqs, pages_per_seq)
         col_idx = jnp.minimum(
             base_pages[:, None] + jnp.arange(window_pages, dtype=jnp.int32)[None, :],
             pages_per_seq - 1,
@@ -313,8 +319,10 @@ def _attention_csa(
     union_gather_indices: jax.Array | None = None,
     cand_bits_tiled: jax.Array | None = None,
     n_unique: jax.Array | None = None,
+    pre_gathered_nope: jax.Array | None = None,
+    pre_gathered_rope: jax.Array | None = None,
     *,
-    precomputed_union: tuple[jax.Array, jax.Array, jax.Array]
+    precomputed_union: tuple[jax.Array, ...]
     | None = None,
     sm_scale: float,
     sliding_window: int,
@@ -326,7 +334,9 @@ def _attention_csa(
     non_causal_block: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: SWA pass, then sparse attention over the indexer's top-k rows."""
-    if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
+    if (
+        sw_cache.shape[0] if two_caches_same_buffer else main_cache_kv.shape[0]
+    ) == 0 or main_cache_rope.shape[0] == 0:
         return jnp.zeros(q.shape, dtype=q.dtype), sw_cache
 
     swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
@@ -354,11 +364,26 @@ def _attention_csa(
         main_cache_kv = updated_sw_cache
 
     eff_union = (
-        (union_gather_indices, cand_bits_tiled, n_unique)
-        if union_gather_indices is not None
+        (
+            union_gather_indices,
+            cand_bits_tiled,
+            n_unique,
+            pre_gathered_nope,
+            pre_gathered_rope,
+        )
+        if not two_caches_same_buffer
+        and union_gather_indices is not None
         and cand_bits_tiled is not None
         and n_unique is not None
-        else precomputed_union
+        and pre_gathered_nope is not None
+        and pre_gathered_rope is not None
+        else (
+            (union_gather_indices, cand_bits_tiled, n_unique)
+            if union_gather_indices is not None
+            and cand_bits_tiled is not None
+            and n_unique is not None
+            else precomputed_union
+        )
     )
 
     output = sparse_ragged_paged_attention(
