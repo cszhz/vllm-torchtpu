@@ -26,9 +26,9 @@ from jax.experimental import hijax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.routing_moe.common import layout_util
-from tokamax._src.ops.experimental.routing_moe.gmm import config
-from tokamax._src.ops.experimental.routing_moe.gmm import metadata
+from vllm_torchtpu.kernels.routing_moe.common import layout_util
+from vllm_torchtpu.kernels.routing_moe.gmm import config
+from vllm_torchtpu.kernels.routing_moe.gmm import metadata
 
 
 GridIndices = tuple[jax.Array | int, jax.Array | int, jax.Array | int]

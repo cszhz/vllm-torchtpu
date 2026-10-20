@@ -21,8 +21,8 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src import test_utils
-from tokamax._src.ops.experimental.routing_moe.layer import wrapper
-from tokamax._src.ops.experimental.routing_moe.test import reference
+from vllm_torchtpu.kernels.routing_moe.layer import wrapper
+from vllm_torchtpu.kernels.routing_moe.test import reference
 
 P = sharding.PartitionSpec
 NamedSharding = sharding.NamedSharding

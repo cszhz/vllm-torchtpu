@@ -25,8 +25,8 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.routing_moe.common import arg
-from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from vllm_torchtpu.kernels.routing_moe.common import arg
+from vllm_torchtpu.kernels.routing_moe.common import layout_util
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)

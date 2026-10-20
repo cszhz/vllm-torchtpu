@@ -26,12 +26,12 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.routing_moe.common import arg
-from tokamax._src.ops.experimental.routing_moe.gmm import config
-from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
-from tokamax._src.ops.experimental.routing_moe.gmm import metadata
-from tokamax._src.ops.experimental.routing_moe.gmm import pipeline
-from tokamax._src.ops.experimental.routing_moe.gmm import plan
+from vllm_torchtpu.kernels.routing_moe.common import arg
+from vllm_torchtpu.kernels.routing_moe.gmm import config
+from vllm_torchtpu.kernels.routing_moe.gmm import memory_ref
+from vllm_torchtpu.kernels.routing_moe.gmm import metadata
+from vllm_torchtpu.kernels.routing_moe.gmm import pipeline
+from vllm_torchtpu.kernels.routing_moe.gmm import plan
 
 
 @jax.jit(static_argnames=("fuse_act", "out_dtype", "custom_plan"))

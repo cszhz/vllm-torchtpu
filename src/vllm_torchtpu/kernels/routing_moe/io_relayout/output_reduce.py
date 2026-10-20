@@ -17,7 +17,7 @@
 
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.routing_moe.common import arg
+from vllm_torchtpu.kernels.routing_moe.common import arg
 
 
 @jax.jit(static_argnames=("num_local_experts",))

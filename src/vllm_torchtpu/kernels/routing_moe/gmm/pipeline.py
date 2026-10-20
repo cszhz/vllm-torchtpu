@@ -23,11 +23,11 @@ from jax import lax
 from jax.experimental import hijax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from tokamax._src.ops.experimental.routing_moe.common import layout_util
-from tokamax._src.ops.experimental.routing_moe.gmm import compute
-from tokamax._src.ops.experimental.routing_moe.gmm import config
-from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
-from tokamax._src.ops.experimental.routing_moe.gmm import metadata
+from vllm_torchtpu.kernels.routing_moe.common import layout_util
+from vllm_torchtpu.kernels.routing_moe.gmm import compute
+from vllm_torchtpu.kernels.routing_moe.gmm import config
+from vllm_torchtpu.kernels.routing_moe.gmm import memory_ref
+from vllm_torchtpu.kernels.routing_moe.gmm import metadata
 
 
 def inner_pipeline(

@@ -23,7 +23,7 @@ from jax import lax
 from jax.experimental import hijax
 from jax.experimental import pallas as pl
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.routing_moe.gmm import config
+from vllm_torchtpu.kernels.routing_moe.gmm import config
 
 
 @jax.tree_util.register_dataclass

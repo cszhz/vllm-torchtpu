@@ -17,8 +17,8 @@
 
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.routing_moe.common import layout_util
-from tokamax._src.ops.experimental.routing_moe.gmm import config
+from vllm_torchtpu.kernels.routing_moe.common import layout_util
+from vllm_torchtpu.kernels.routing_moe.gmm import config
 
 
 def _swigluoai(

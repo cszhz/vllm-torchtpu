@@ -20,10 +20,10 @@ import functools
 import jax
 from jax import numpy as jnp
 from jax import sharding
-from tokamax._src.ops.experimental.routing_moe.common import arg
-from tokamax._src.ops.experimental.routing_moe.gmm import kernel as gmm
-from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
-from tokamax._src.ops.experimental.routing_moe.io_relayout import output_reduce
+from vllm_torchtpu.kernels.routing_moe.common import arg
+from vllm_torchtpu.kernels.routing_moe.gmm import kernel as gmm
+from vllm_torchtpu.kernels.routing_moe.io_relayout import input_pack
+from vllm_torchtpu.kernels.routing_moe.io_relayout import output_reduce
 
 P = sharding.PartitionSpec
 NamedSharding = sharding.NamedSharding

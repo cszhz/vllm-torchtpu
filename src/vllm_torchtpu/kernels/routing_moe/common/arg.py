@@ -24,7 +24,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from vllm_torchtpu.kernels.routing_moe.common import layout_util
 
 
 @dataclasses.dataclass(frozen=True)

@@ -16,7 +16,7 @@
 """Input relayout helper from large to compact layout."""
 
 import jax
-from tokamax._src.ops.experimental.routing_moe.common import arg
+from vllm_torchtpu.kernels.routing_moe.common import arg
 
 
 @jax.jit
