@@ -7,13 +7,18 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-try:
-    import torch
-    from torch_tpu._internal import pallas as _pallas_mod
+# Decode-stack (D) behaviour: wrap torch_tpu's pallas.jax_op factory in
+# torch._dynamo.disable. Skipped on the pure-20L prefill role, whose tree never
+# had it (prefill builds every jax_op outside Dynamo tracing, so the wrap buys
+# nothing there and would add an early torch_tpu import to every process).
+if not envs.VLLM_DSV41_PURE_20L_PREFILL:
+    try:
+        import torch
+        from torch_tpu._internal import pallas as _pallas_mod
 
-    _pallas_mod.jax_op = torch._dynamo.disable(_pallas_mod.jax_op)
-except Exception:
-    pass
+        _pallas_mod.jax_op = torch._dynamo.disable(_pallas_mod.jax_op)
+    except Exception:
+        pass
 
 
 def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
@@ -612,6 +617,13 @@ def _patch_multiproc_worker_global_rank_env() -> None:
         pc = vllm_config.parallel_config
         binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
         _os.environ.update(binding.as_env())
+        pod_g_chip = _os.environ.get("POD_G_CHIP_ID")
+        if pod_g_chip is not None and pod_g_chip != "":
+            phys_core = int(pod_g_chip) * 2 + int(local_rank)
+            _os.environ["TPU_VISIBLE_CHIPS"] = str(phys_core)
+            _os.environ["TPU_VISIBLE_DEVICES"] = str(phys_core)
+            _os.environ["TORCH_TPU_TOPOLOGY"] = "1,1,1,2"
+            _os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
         logger.info(
             "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
             "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
@@ -636,6 +648,15 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
 
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
+    if envs.VLLM_DSV41_PURE_20L_PREFILL:
+        # Prefill role only: compact SWA aux partition in the scheduler's
+        # BlockPool (pairs with the compact SWA KV layout in
+        # kv_cache_deepseek_v41_flash.py).
+        from vllm_torchtpu.runner.kv_cache_deepseek_v41_flash import (
+            _apply_compact_swa_block_pool_patch,
+        )
+
+        _apply_compact_swa_block_pool_patch()
     from vllm_torchtpu import patch_registry
 
     patch_registry.apply("engine_core")
@@ -2079,6 +2100,7 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
 
 def _patch_decode_bench_connector_safe_main_end() -> None:
     """Restrict DecodeBenchConnectorWorker fills to [1 : _main_end) blocks only."""
+    import torch
     from vllm.distributed.kv_transfer.kv_connector.v1 import (
         decode_bench_connector as _dbc,
     )
@@ -2164,16 +2186,18 @@ def _patch_decode_bench_connector_safe_main_end() -> None:
     cls._tpu_safe_main_end_patch = True
 
 
-try:
-    _patch_decode_bench_connector_safe_main_end()
-except Exception:
-    pass
+# Decode role only (the prefill tree never patched DecodeBenchConnector).
+if not envs.VLLM_DSV41_PURE_20L_PREFILL:
+    try:
+        _patch_decode_bench_connector_safe_main_end()
+    except Exception:
+        pass
 
-try:
-    from vllm_torchtpu.distributed.kv_transfer.decode_bench_seeding import (
-        patch_decode_bench_seeding,
-    )
+    try:
+        from vllm_torchtpu.distributed.kv_transfer.decode_bench_seeding import (
+            patch_decode_bench_seeding,
+        )
 
-    patch_decode_bench_seeding()
-except Exception:
-    pass
+        patch_decode_bench_seeding()
+    except Exception:
+        pass

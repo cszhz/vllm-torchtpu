@@ -489,6 +489,12 @@ class TPUWorker(WorkerBase):
 
         # VLLM directive of the percentage of HBM memory the model executor can use
         self.model_runner.profile_run(self.model_runner.max_num_tokens)
+        if envs.VLLM_DSV41_PURE_20L_PREFILL:
+            # Prefill role: drop profile_run garbage before measuring HBM.
+            import gc
+
+            gc.collect()
+            utils.synchronize_device()
 
         gpu_memory_utilization = self.cache_config.gpu_memory_utilization
         budget = utils.compute_hbm_budget(self.devices, gpu_memory_utilization)
@@ -536,7 +542,14 @@ class TPUWorker(WorkerBase):
             "architectures",
             (),
         )
-        if any("DeepseekV41" in a for a in hf_arch):
+        # Decode role: the DSv4.1 KV allocator sizes its SWA overflow arrays
+        # per KV block, so scale the budget by MLA / (MLA + SWA extra) bytes.
+        # The prefill role (VLLM_DSV41_PURE_20L_PREFILL=1) uses the compact SWA
+        # pool instead, whose size does not scale with num_blocks.
+        if (
+            any("DeepseekV41" in a for a in hf_arch)
+            and not envs.VLLM_DSV41_PURE_20L_PREFILL
+        ):
             from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
             page_size = int(self.cache_config.block_size) // 4
@@ -703,17 +716,51 @@ class TPUWorker(WorkerBase):
         return key
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        import gc
         from vllm_torchtpu import patch_registry
 
+        # HBM stage logging (+ gc/sync) is prefill-role only; decode keeps the
+        # plain load path.
+        hbm_stages = bool(envs.VLLM_DSV41_PURE_20L_PREFILL)
+        if hbm_stages:
+            b_pre = utils.compute_hbm_budget(self.devices, 1.0)
+            logger.info(
+                "[M] HBM Stage | stage=Pre-load | rank=%d | used_gb=%.2fGiB | limit_gb=%.2fGiB",
+                self.rank,
+                b_pre.total_used / utils.GBYTES,
+                b_pre.total_limit / utils.GBYTES,
+            )
         patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
+        if hbm_stages:
+            gc.collect()
+            utils.synchronize_device()
+            b_post = utils.compute_hbm_budget(self.devices, 1.0)
+            logger.info(
+                "[M] HBM Stage | stage=Post-load | rank=%d | used_gb=%.2fGiB | limit_gb=%.2fGiB",
+                self.rank,
+                b_post.total_used / utils.GBYTES,
+                b_post.total_limit / utils.GBYTES,
+            )
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        import gc
+
         start = time.perf_counter()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
+        if envs.VLLM_DSV41_PURE_20L_PREFILL:
+            gc.collect()
+            utils.synchronize_device()
+            b_comp = utils.compute_hbm_budget(self.devices, 1.0)
+            logger.info(
+                "[M] HBM Stage | stage=Post-compile | rank=%d | used_gb=%.2fGiB | limit_gb=%.2fGiB",
+                self.rank,
+                b_comp.total_used / utils.GBYTES,
+                b_comp.total_limit / utils.GBYTES,
+            )
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
@@ -759,9 +806,22 @@ class TPUWorker(WorkerBase):
         self.model_runner.prewarm_kv_offload_shape(p)
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        import gc
+
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        if envs.VLLM_DSV41_PURE_20L_PREFILL:
+            gc.collect()
+            utils.synchronize_device()
+            b_kv = utils.compute_hbm_budget(self.devices, 1.0)
+            logger.info(
+                "[M] HBM Stage | stage=Post-KV | rank=%d | used_gb=%.2fGiB | limit_gb=%.2fGiB | num_blocks=%d",
+                self.rank,
+                b_kv.total_used / utils.GBYTES,
+                b_kv.total_limit / utils.GBYTES,
+                kv_cache_config.num_blocks,
+            )
 
     def get_node_kv_ip_port(self) -> tuple[int, str, int]:
         node_id = dist_utils.get_node_id()

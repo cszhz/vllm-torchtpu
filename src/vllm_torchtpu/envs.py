@@ -155,6 +155,36 @@ if TYPE_CHECKING:
     VLLM_DSV41_TP_INDEXER_MIN_TOKENS: int = 64
     VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS: int = 0
     VLLM_DSV41_TP_ATTN_LOCAL_TOPK: bool = False
+    VLLM_DSV41_ENGRAM_H2D_PREFIX: bool = True
+    VLLM_DSV41_MOE_V2_REQUANTIZE: bool = True
+    VLLM_DSV41_MOE_V2_SUBCHANNEL_FP8: bool = True
+    VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS: int = 768
+    VLLM_DSV41_REPL_SHARED_EXPERTS: bool = False
+    VLLM_DSV41_TP_ATTN_TP8: bool = False
+    VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS: int = 0
+    VLLM_DSV41_MOE_FP8_PATH_C_MAX_TOKENS: int = 512
+    VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS: int | None = None
+    VLLM_DSV41_MOE_EP_V2_ALL39: bool = True
+    VLLM_DSV41_MOE_V2_CAPACITY: int | None = None
+    VLLM_DSV41_MOE_V2_COALESCED_PUSH: bool = False
+    ENABLE_DECODE_BENCH_CONNECTOR: bool = False
+    VLLM_XLA_CACHE_PATH: str = "/tmp/xla_cache"
+    VLLM_DSV41_SC_UNION_MAX_SHIFT: int = 9
+    VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT: int | None = None
+    VLLM_DSV41_CSA_UNION_VERIFY_BQ: int = 0
+    VLLM_DSV41_CSA_UNION_MAX_TOKENS: int = 16384
+    VLLM_DSV41_FAST_GROUPED_ATTN: bool = True
+    VLLM_DSV41_MOE_V2_MAX_PREFETCH: int = 2
+    VLLM_DSV41_MOE_V2_VMEM_MB: float | None = None
+    VLLM_DSV41_DECODER_TP_ATTN_VERIFY: bool = False
+    VLLM_DSV41_ENCODER_CAND_MODE: bool = True
+    VLLM_DSV41_DECODER_TP_ATTN_MIN_TOKENS: int = 1024
+    VLLM_DSV41_MOE_SUBLANE_TILING: bool = True
+    VLLM_DSV41_MOE_FP4_GMM1_FP8: bool = True
+    VLLM_DSV41_MOE_FP4_GMM2_FP8: bool = False
+    VLLM_DSV41_MOE_FP4_BF16_LHS: bool | None = None
+    VLLM_DSV41_FLASHMLA_TP8: bool = False
+    VLLM_DSV41_DSPARK_SHARDED_CTX_KV: bool = True
 
 
 def env_with_choices(
@@ -905,9 +935,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Token-parallel indexer at TP>1: each rank scores T/tp tokens, then the
     # top-k indices are all-gathered. Used when T >= MIN_TOKENS and T/tp >= 8.
     "VLLM_DSV41_TP_INDEXER": env_bool("VLLM_DSV41_TP_INDEXER", False),
-    "VLLM_DSV41_TP_INDEXER_MIN_TOKENS": env_int(
-        "VLLM_DSV41_TP_INDEXER_MIN_TOKENS", 64
-    ),
+    "VLLM_DSV41_TP_INDEXER_MIN_TOKENS": env_int("VLLM_DSV41_TP_INDEXER_MIN_TOKENS", 64),
     # L12: steps with fewer tokens keep the mHC residual replicated over TP
     # (all-reduce) instead of token-sharded (reduce-scatter + all-gathers).
     # tp_collectives.tp_token_shard_ok is the one predicate for the Engram
@@ -919,6 +947,62 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when the indexer layer and every layer reusing its top-k rows run
     # token-parallel attention, which reads only this rank's T/tp rows.
     "VLLM_DSV41_TP_ATTN_LOCAL_TOPK": env_bool("VLLM_DSV41_TP_ATTN_LOCAL_TOPK", False),
+    # Enable host Engram prefetch and active-bucket prefix H2D upload across
+    # 1+K speculative verify tokens.
+    "VLLM_DSV41_ENGRAM_H2D_PREFIX": env_bool("VLLM_DSV41_ENGRAM_H2D_PREFIX", True),
+    "VLLM_DSV41_MOE_V2_REQUANTIZE": env_bool("VLLM_DSV41_MOE_V2_REQUANTIZE", True),
+    "VLLM_DSV41_MOE_V2_SUBCHANNEL_FP8": env_bool(
+        "VLLM_DSV41_MOE_V2_SUBCHANNEL_FP8", True
+    ),
+    "VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS": env_int(
+        "VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS", 768
+    ),
+    "VLLM_DSV41_REPL_SHARED_EXPERTS": env_bool("VLLM_DSV41_REPL_SHARED_EXPERTS", False),
+    "VLLM_DSV41_TP_ATTN_TP8": env_bool("VLLM_DSV41_TP_ATTN_TP8", False),
+    "VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS": env_int(
+        "VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS", 0
+    ),
+    "VLLM_DSV41_MOE_FP8_PATH_C_MAX_TOKENS": env_int(
+        "VLLM_DSV41_MOE_FP8_PATH_C_MAX_TOKENS", 512
+    ),
+    "VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS": env_optional_int(
+        "VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS"
+    ),
+    "VLLM_DSV41_MOE_EP_V2_ALL39": env_bool("VLLM_DSV41_MOE_EP_V2_ALL39", True),
+    "VLLM_DSV41_MOE_V2_CAPACITY": env_optional_int("VLLM_DSV41_MOE_V2_CAPACITY"),
+    "VLLM_DSV41_MOE_V2_COALESCED_PUSH": env_bool(
+        "VLLM_DSV41_MOE_V2_COALESCED_PUSH", False
+    ),
+    "ENABLE_DECODE_BENCH_CONNECTOR": env_bool("ENABLE_DECODE_BENCH_CONNECTOR", False),
+    "VLLM_XLA_CACHE_PATH": env_str("VLLM_XLA_CACHE_PATH", "/tmp/xla_cache"),
+    "VLLM_DSV41_SC_UNION_MAX_SHIFT": env_int("VLLM_DSV41_SC_UNION_MAX_SHIFT", 9),
+    "VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT": env_optional_int(
+        "VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT"
+    ),
+    "VLLM_DSV41_CSA_UNION_VERIFY_BQ": env_int("VLLM_DSV41_CSA_UNION_VERIFY_BQ", 0),
+    "VLLM_DSV41_CSA_UNION_MAX_TOKENS": env_int(
+        "VLLM_DSV41_CSA_UNION_MAX_TOKENS", 16384
+    ),
+    "VLLM_DSV41_FAST_GROUPED_ATTN": env_bool("VLLM_DSV41_FAST_GROUPED_ATTN", True),
+    "VLLM_DSV41_MOE_V2_MAX_PREFETCH": env_int("VLLM_DSV41_MOE_V2_MAX_PREFETCH", 2),
+    "VLLM_DSV41_MOE_V2_VMEM_MB": lambda: (
+        float(v) if (v := os.getenv("VLLM_DSV41_MOE_V2_VMEM_MB")) else None
+    ),
+    "VLLM_DSV41_DECODER_TP_ATTN_VERIFY": env_bool(
+        "VLLM_DSV41_DECODER_TP_ATTN_VERIFY", False
+    ),
+    "VLLM_DSV41_ENCODER_CAND_MODE": env_bool("VLLM_DSV41_ENCODER_CAND_MODE", True),
+    "VLLM_DSV41_DECODER_TP_ATTN_MIN_TOKENS": env_int(
+        "VLLM_DSV41_DECODER_TP_ATTN_MIN_TOKENS", 1024
+    ),
+    "VLLM_DSV41_MOE_SUBLANE_TILING": env_bool("VLLM_DSV41_MOE_SUBLANE_TILING", True),
+    "VLLM_DSV41_MOE_FP4_GMM1_FP8": env_bool("VLLM_DSV41_MOE_FP4_GMM1_FP8", True),
+    "VLLM_DSV41_MOE_FP4_GMM2_FP8": env_bool("VLLM_DSV41_MOE_FP4_GMM2_FP8", False),
+    "VLLM_DSV41_MOE_FP4_BF16_LHS": env_optional_bool("VLLM_DSV41_MOE_FP4_BF16_LHS"),
+    "VLLM_DSV41_FLASHMLA_TP8": env_bool("VLLM_DSV41_FLASHMLA_TP8", False),
+    "VLLM_DSV41_DSPARK_SHARDED_CTX_KV": env_bool(
+        "VLLM_DSV41_DSPARK_SHARDED_CTX_KV", True
+    ),
 }
 
 

@@ -78,6 +78,7 @@ EXEMPT_PATHS = {
 # decide whether it belongs in envs.py instead.
 BOOTSTRAP_VARS = {
     "LOCAL_RANK",
+    "POD_G_CHIP_ID",
     "LOCAL_WORLD_SIZE",
     "PYTHONHASHSEED",
     "RANK",

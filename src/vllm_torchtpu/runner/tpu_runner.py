@@ -1182,12 +1182,22 @@ class TPUModelRunner(GPUModelRunner):
             )
             return
         target = self.model if model is None else model
-        max_len = self.model_config.max_model_len
+        from vllm.model_executor.layers.rotary_embedding import (
+            DeepseekScalingRotaryEmbedding,
+        )
+
+        spec_extra = (
+            self.speculative_config.num_speculative_tokens + 1
+            if self.speculative_config is not None
+            else 0
+        )
+        max_len = self.model_config.max_model_len + spec_extra
         num_eligible = 0
         num_truncated = 0
         for name, module in target.named_modules():
             if type(module) not in (
                 RotaryEmbedding,
+                DeepseekScalingRotaryEmbedding,
                 MRotaryEmbedding,
                 MRotaryEmbeddingInterleaved,
             ):
@@ -2159,7 +2169,9 @@ class TPUModelRunner(GPUModelRunner):
             valid_mask = pre_pos >= 0
             if not valid_mask.any():
                 return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
-            req_starts = np.cumsum(num_scheduled_tokens_per_req) - num_scheduled_tokens_per_req
+            req_starts = (
+                np.cumsum(num_scheduled_tokens_per_req) - num_scheduled_tokens_per_req
+            )
             valid_n = num_scheduled_tokens_per_req[valid_mask]
             total_valid = int(valid_n.sum())
             within = self.arange_np[:total_valid] - np.repeat(
@@ -2841,7 +2853,7 @@ class TPUModelRunner(GPUModelRunner):
             if (
                 self.speculative_config is not None
                 and dec_mask.any()
-                and os.environ.get("VLLM_DSV41_ENGRAM_H2D_PREFIX", "1") != "1"
+                and not bool(envs.VLLM_DSV41_ENGRAM_H2D_PREFIX)
             ):
                 known[dec_mask] = False
                 if known.any():
@@ -3232,11 +3244,8 @@ class TPUModelRunner(GPUModelRunner):
             comb_view[5] = num_reqs
 
             stride = 1 + self.speculative_config.num_speculative_tokens
-            within_all = (
-                self.arange_np[:total_num_scheduled_tokens]
-                - np.repeat(
-                    self.query_start_loc_np[:num_reqs], num_scheduled_tokens_per_req
-                )
+            within_all = self.arange_np[:total_num_scheduled_tokens] - np.repeat(
+                self.query_start_loc_np[:num_reqs], num_scheduled_tokens_per_req
             )
             pre_sub_np = pack_np[off7:off8]
             pre_sub_np[:total_num_scheduled_tokens] = np.where(
@@ -3316,7 +3325,9 @@ class TPUModelRunner(GPUModelRunner):
                     subtract_num_rejected_tokens,
                 )
 
-                req_slice = self.input_batch.req_ids[start_index : start_index + num_reqs]
+                req_slice = self.input_batch.req_ids[
+                    start_index : start_index + num_reqs
+                ]
                 id_map = self._pre_async_results.req_id_to_index_copy
                 pre_pos = np.fromiter(
                     (id_map.get(r, -1) for r in req_slice),
@@ -3406,15 +3417,15 @@ class TPUModelRunner(GPUModelRunner):
                 combined[4] = chunk_num_windowed
                 combined[5] = num_reqs
                 if getattr(self, "_fast_token_substitution", False):
-                    chunk_comb_key = (chunk_num_decode, chunk_num_windowed, num_reqs)
+                    combined_key = tuple(combined[0:6].tolist())
                     if (
                         not hasattr(self, "_cached_comb_dev")
-                        or getattr(self, "_cached_comb_key", None) != chunk_comb_key
+                        or getattr(self, "_last_combined_key", None) != combined_key
                     ):
                         self._cached_comb_dev = combined.to(
                             self.device, non_blocking=True
                         )
-                        self._cached_comb_key = chunk_comb_key
+                        self._last_combined_key = combined_key
                     combined_device = self._cached_comb_dev
                 else:
                     combined_device = combined.to(self.device, non_blocking=True)
@@ -4207,10 +4218,7 @@ class TPUModelRunner(GPUModelRunner):
                         padded_r = spec_decode_metadata.draft_lengths.shape[0]
                         packed_ts = getattr(self, "_step_packed_temps_and_seeds", None)
                         self._step_packed_temps_and_seeds = None
-                        if (
-                            packed_ts is not None
-                            and packed_ts.shape[0] == padded_r + 2
-                        ):
+                        if packed_ts is not None and packed_ts.shape[0] == padded_r + 2:
                             temps_and_seeds = packed_ts
                         else:
                             ts_cpu = torch.empty(
@@ -5178,7 +5186,7 @@ class TPUModelRunner(GPUModelRunner):
                 next_tokens_ready_event = None
                 if (
                     spec_num_rejected is not None
-                    and os.environ.get("VLLM_DSV41_ENGRAM_H2D_PREFIX", "1") == "1"
+                    and bool(envs.VLLM_DSV41_ENGRAM_H2D_PREFIX)
                     and getattr(getattr(self.model, "model", None), "engram_hash", None)
                     is not None
                 ):
@@ -6191,7 +6199,10 @@ class TPUModelRunner(GPUModelRunner):
                 if row_tokens is None:
                     continue
                 synchronize_tensors(row_tokens)
-                if getattr(self.model, "lm_head", None) is not None and getattr(self.model, "logits_processor", None) is not None:
+                if (
+                    getattr(self.model, "lm_head", None) is not None
+                    and getattr(self.model, "logits_processor", None) is not None
+                ):
                     k_eff = max(int(self.model_config.max_logprobs), 1)
                     out = self.gather_logprobs(
                         torch.zeros(
@@ -6202,7 +6213,9 @@ class TPUModelRunner(GPUModelRunner):
                         row_tokens,
                     )
                 else:
-                    out = self.gather_logprobs(self._dummy_logits(num_tokens), row_tokens)
+                    out = self.gather_logprobs(
+                        self._dummy_logits(num_tokens), row_tokens
+                    )
                 synchronize_tensors(out.logprobs)
 
     @torch.no_grad()
@@ -7600,9 +7613,9 @@ class TPUModelRunner(GPUModelRunner):
         total_tokens = draft_token_ids.shape[0]
         device = logits_argmax.device
 
-        bonus_token_ids = torch.index_select(
-            logits_argmax, 0, bonus_logits_indices
-        ).to(torch.int32)
+        bonus_token_ids = torch.index_select(logits_argmax, 0, bonus_logits_indices).to(
+            torch.int32
+        )
         num_draft_i32 = num_draft_tokens.to(torch.int32)
         row_start = (torch.cumsum(num_draft_i32, dim=0) - num_draft_i32).unsqueeze(1)
         col_idx = torch.arange(
@@ -7610,15 +7623,13 @@ class TPUModelRunner(GPUModelRunner):
         ).unsqueeze(0)
         flat_slot = (row_start + col_idx).clamp(0, max(total_tokens - 1, 0)).view(-1)
 
-        draft_2d = (
-            torch.index_select(draft_token_ids.to(torch.int32), 0, flat_slot)
-            .view(batch_size, max_draft_tokens)
-        )
+        draft_2d = torch.index_select(
+            draft_token_ids.to(torch.int32), 0, flat_slot
+        ).view(batch_size, max_draft_tokens)
         target_idx_2d = torch.index_select(target_logits_indices, 0, flat_slot)
-        target_2d = (
-            torch.index_select(logits_argmax.to(torch.int32), 0, target_idx_2d)
-            .view(batch_size, max_draft_tokens)
-        )
+        target_2d = torch.index_select(
+            logits_argmax.to(torch.int32), 0, target_idx_2d
+        ).view(batch_size, max_draft_tokens)
         valid_2d = col_idx < num_draft_i32.unsqueeze(1)
 
         if self.rejection_sampler.synthetic_mode:
@@ -7649,9 +7660,7 @@ class TPUModelRunner(GPUModelRunner):
         full_out = torch.cat(
             [
                 main_2d,
-                torch.full(
-                    (batch_size, 1), -1, dtype=torch.int32, device=device
-                ),
+                torch.full((batch_size, 1), -1, dtype=torch.int32, device=device),
             ],
             dim=1,
         )
@@ -7867,22 +7876,22 @@ class TPUModelRunner(GPUModelRunner):
         ).unsqueeze(0)
         flat_slot = (row_start + col_idx).clamp(0, max(total_tokens - 1, 0)).view(-1)
 
-        draft_2d = (
-            torch.index_select(draft_token_ids.to(torch.int32), 0, flat_slot)
-            .view(batch_size, max_draft_tokens)
-        )
+        draft_2d = torch.index_select(
+            draft_token_ids.to(torch.int32), 0, flat_slot
+        ).view(batch_size, max_draft_tokens)
         target_idx_1d = torch.index_select(target_logits_indices, 0, flat_slot)
 
         row_draft_ids = torch.full(
             (total_tokens,), -1, dtype=torch.int32, device=device
         )
         row_draft_ids.scatter_(0, target_idx_1d.to(torch.int64), draft_2d.view(-1))
-        req_idx_per_draft = torch.arange(
-            batch_size, dtype=torch.int64, device=device
-        ).unsqueeze(1).expand(batch_size, max_draft_tokens).reshape(-1)
-        row_req_idx = torch.zeros(
-            (total_tokens,), dtype=torch.int64, device=device
+        req_idx_per_draft = (
+            torch.arange(batch_size, dtype=torch.int64, device=device)
+            .unsqueeze(1)
+            .expand(batch_size, max_draft_tokens)
+            .reshape(-1)
         )
+        row_req_idx = torch.zeros((total_tokens,), dtype=torch.int64, device=device)
         row_req_idx.scatter_(0, target_idx_1d.to(torch.int64), req_idx_per_draft)
         row_req_idx.scatter_(
             0,
@@ -7894,14 +7903,16 @@ class TPUModelRunner(GPUModelRunner):
         seed_hi = temps_and_seeds[batch_size + 1]
         inv_temps = torch.reciprocal(req_temperatures[row_req_idx] + 1e-5)
 
-        global_lse, global_draft_logit, sampled_ids = tp_local_random_spec_verify_logits(
-            self.model.logits_processor,
-            self.model.lm_head,
-            sample_hidden_states,
-            inv_temps,
-            row_draft_ids.unsqueeze(1),
-            seed_lo,
-            u_local=u_local,
+        global_lse, global_draft_logit, sampled_ids = (
+            tp_local_random_spec_verify_logits(
+                self.model.logits_processor,
+                self.model.lm_head,
+                sample_hidden_states,
+                inv_temps,
+                row_draft_ids.unsqueeze(1),
+                seed_lo,
+                u_local=u_local,
+            )
         )
 
         draft_lse_2d = torch.index_select(global_lse, 0, target_idx_1d).view(
@@ -7944,9 +7955,7 @@ class TPUModelRunner(GPUModelRunner):
         full_out = torch.cat(
             [
                 main_2d,
-                torch.full(
-                    (batch_size, 1), -1, dtype=torch.int32, device=device
-                ),
+                torch.full((batch_size, 1), -1, dtype=torch.int32, device=device),
             ],
             dim=1,
         )
