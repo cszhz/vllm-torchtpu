@@ -25,6 +25,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
+
 # Util.
 
 
@@ -620,7 +622,18 @@ def inner_kernel(
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
 
-                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
+                _rhs_bits = jax.dtypes.itemsize_bits(
+                    cfgs.rhs_cfgs.quant_dtype or cfgs.rhs_cfgs.dtype
+                )
+                # P/D merge: patch_156 f32 K-loop accumulation for 4-bit rhs
+                # is a prefill-node change; the decode role keeps the
+                # deployed acc_ref.dtype (bf16 when lhs is quantized).
+                _k_acc_dt = (
+                    jnp.float32
+                    if (_rhs_bits == 4 and envs.VLLM_DSV41_PURE_20L_PREFILL)
+                    else acc_ref.dtype
+                )
+                acc_n = jnp.zeros((bucket_m, col_size), dtype=_k_acc_dt)
                 for start_k, end_k, block_lhs_q, block_scale in lhs_q_blocks:
                     block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
@@ -633,19 +646,19 @@ def inner_kernel(
                         block_lhs_q,
                         block_rhs,
                         preferred_element_type=preferred_element_type,
-                    ).astype(acc_ref.dtype)
+                    ).astype(_k_acc_dt)
 
-                    block_acc *= block_scale.astype(acc_ref.dtype)
+                    block_acc *= block_scale.astype(_k_acc_dt)
 
                     if cfgs.rhs_cfgs.should_dequantize_after_matmul:
                         b_id = start_k // rhs_qbs
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m
                         )[b_id, :, start_n : start_n + col_size]
-                        block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
+                        block_acc *= rhs_scale_replicated.astype(_k_acc_dt)
 
                     acc_n += block_acc
-                acc_list.append(acc_n)
+                acc_list.append(acc_n.astype(acc_ref.dtype))
             acc = jnp.concatenate(acc_list, axis=1)
 
         # Step 3: Output post-processing.

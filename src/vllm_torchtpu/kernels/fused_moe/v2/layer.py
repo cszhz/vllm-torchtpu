@@ -23,7 +23,10 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
+    BF16,
+    FP8,
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
     QB4,
@@ -104,7 +107,11 @@ def _combine_arrivals(
     """
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
-    mirror_sublanes, tile_m = arrival_scales.shape
+    if arrival_scales.ndim == 2:
+        mirror_sublanes, tile_m = arrival_scales.shape
+        n_wire_scales = 1
+    else:
+        mirror_sublanes, n_wire_scales, tile_m = arrival_scales.shape
     hidden = lane_blocks * lanes
     # A gather clamps an out-of-range index to the last one; a DMA does not,
     # and a sublane index clamped on its own would pair the last sublane with
@@ -112,8 +119,14 @@ def _combine_arrivals(
     rows = jnp.minimum(pos, recv_rows - 1)
     shift = pow2_shift(tile_m, "the mirror's lane count")
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
-    row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
-    coef = row_scales * topk_weights.astype(jnp.float32)
+    sub_idx = jnp.right_shift(scl, shift)
+    lane_idx = scl & (tile_m - 1)
+    if n_wire_scales == 1:
+        row_scales = arrival_scales[sub_idx, lane_idx]
+        coef = row_scales * topk_weights.astype(jnp.float32)
+    else:
+        row_scales = arrival_scales.swapaxes(1, 2)[sub_idx, lane_idx]
+        coef = row_scales * topk_weights.astype(jnp.float32)[:, :, None]
     if combine_step_tokens(t_local):
         combine = build_combine_kernel(
             t_local=t_local,
@@ -122,21 +135,42 @@ def _combine_arrivals(
             lane_blocks=lane_blocks,
             wire_dtype=arrivals.dtype,
             out_dtype=out_dtype,
+            n_wire_scales=n_wire_scales,
         )
         return combine(arrivals, coef, rows)
     rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
-    coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
+    if n_wire_scales == 1:
+        coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
+        terms = []
+        for k in range(topk):
+            slot_rows = lax.slice(
+                rows_fp8, (k * t_local, 0, 0), ((k + 1) * t_local, lane_blocks, lanes)
+            )
+            slot_coef = lax.slice(coef_k, (k * t_local,), ((k + 1) * t_local,))
+            terms.append(slot_rows.astype(jnp.float32) * slot_coef[:, None, None])
+        return sum(terms).astype(out_dtype).reshape(t_local, hidden)
+    coef_k = coef.swapaxes(0, 1).reshape(topk * t_local, n_wire_scales)
+    blocks_per_scale = lane_blocks // n_wire_scales
     terms = []
     for k in range(topk):
         slot_rows = lax.slice(
             rows_fp8, (k * t_local, 0, 0), ((k + 1) * t_local, lane_blocks, lanes)
         )
-        slot_coef = lax.slice(coef_k, (k * t_local,), ((k + 1) * t_local,))
-        terms.append(slot_rows.astype(jnp.float32) * slot_coef[:, None, None])
+        slot_coef = lax.slice(
+            coef_k, (k * t_local, 0), ((k + 1) * t_local, n_wire_scales)
+        )
+        terms.append(
+            (
+                slot_rows.reshape(
+                    t_local, n_wire_scales, blocks_per_scale, lanes
+                ).astype(jnp.float32)
+                * slot_coef[:, :, None, None]
+            ).reshape(t_local, lane_blocks, lanes)
+        )
     return sum(terms).astype(out_dtype).reshape(t_local, hidden)
 
 
-def _exchange_layout(t_local, topk, e_total, quantized):
+def _exchange_layout(t_local, topk, e_total, quantized, n_act_scales=1):
     """(scale offset, count offset, width) of the flat routing payload.
 
     ONE all-gather carries everything the other shards need to know about
@@ -150,7 +184,7 @@ def _exchange_layout(t_local, topk, e_total, quantized):
     Section starts are lane-block aligned so every unpack slice is a view.
     """
     idx = align_up(t_local * topk, HIDDEN_LANE_BLOCK)
-    scale = align_up(t_local, HIDDEN_LANE_BLOCK) if quantized else 0
+    scale = align_up(t_local * n_act_scales, HIDDEN_LANE_BLOCK) if quantized else 0
     return idx, idx + scale, idx + scale + e_total
 
 
@@ -171,7 +205,7 @@ def _pack_routing_exchange(pairs, scale_bits, counts, layout):
     return jnp.concatenate([p for p in parts if p.size])
 
 
-def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total):
+def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total, n_act_scales=1):
     """Inverse of _pack_routing_exchange over the gathered [ep, width] rows.
 
     Returns the gathered pairs [ep, t*K], the row-scale BIT PATTERNS [T] (the
@@ -184,7 +218,9 @@ def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total):
     scale_bits = (
         None
         if scale_at == count_at
-        else lax.slice(exchange, (0, scale_at), (ep, scale_at + t_local)).reshape(-1)
+        else lax.slice(
+            exchange, (0, scale_at), (ep, scale_at + t_local * n_act_scales)
+        ).reshape(-1, n_act_scales)
     )
     counts = lax.slice(exchange, (0, count_at), (ep, count_at + e_total))
     return pairs, scale_bits, counts
@@ -260,6 +296,10 @@ def fused_ep_moe_v2(
     topk_weights_override=None,
     routed_scaling_factor=1.0,
     token_replica_groups=None,
+    subchannel_fp8=None,
+    requantize_mid=None,
+    wire_bf16=None,
+    coalesce_peer_push=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -330,7 +370,15 @@ def fused_ep_moe_v2(
     # documented public entry, so the check belongs where the operands come
     # in rather than only in the serving adapter above it.
     for name, w in (("w1", w1), ("w2", w2)):
-        actual = weight_format_of_dtype(w.dtype)
+        actual = (
+            WeightFormat.FP4
+            if (
+                weight_format == WeightFormat.FP4
+                and jnp.dtype(w.dtype)
+                in (jnp.dtype(jnp.int32), jnp.dtype(jnp.uint32), jnp.dtype(jnp.uint8))
+            )
+            else weight_format_of_dtype(w.dtype)
+        )
         if actual != weight_format:
             raise ValueError(
                 f"weight format {weight_format!r} takes "
@@ -442,6 +490,53 @@ def fused_ep_moe_v2(
                 f"topk_weights_override must be one weight per token slot, "
                 f"[{x.shape[0]}, {topk}]; got {tuple(topk_weights_override.shape)}"
             )
+    # P/D merge: the sub-channel fp8, small-T BF16 wire and coalesced-push
+    # defaults are prefill-node tunings. Under the decode role
+    # (VLLM_DSV41_PURE_20L_PREFILL unset) the unset defaults reproduce the
+    # deployed decode kernel exactly: per-row fp8, the format's own wire and
+    # the per-tile / per-expert push. Explicit arguments still win.
+    prefill_tuned = bool(envs.VLLM_DSV41_PURE_20L_PREFILL)
+    if subchannel_fp8 is None:
+        subchannel_fp8 = prefill_tuned and bool(envs.VLLM_DSV41_MOE_V2_SUBCHANNEL_FP8)
+    else:
+        subchannel_fp8 = bool(subchannel_fp8)
+    if requantize_mid is None:
+        requantize_mid = bool(envs.VLLM_DSV41_MOE_V2_REQUANTIZE)
+    else:
+        requantize_mid = bool(requantize_mid)
+    if wire_bf16 is None:
+        wire_bf16 = bool(
+            prefill_tuned
+            and form.wire_dtype is FP8
+            and int(envs.VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS) >= T
+        )
+    else:
+        wire_bf16 = bool(wire_bf16)
+
+    wire_dtype = BF16 if wire_bf16 else form.wire_dtype
+    act_block_size = (
+        rhs_qb
+        if (
+            subchannel_fp8
+            and form.quantized_activations
+            and hidden % rhs_qb == 0
+            and inter % rhs_qb == 0
+        )
+        else None
+    )
+    n_act_scales = hidden // act_block_size if act_block_size is not None else 1
+    wire_block_size = (
+        rhs_qb
+        if (subchannel_fp8 and wire_dtype is FP8 and hidden % rhs_qb == 0)
+        else None
+    )
+
+    coalesce_peer_push = (
+        (prefill_tuned and T <= 1024)
+        if coalesce_peer_push is None
+        else bool(coalesce_peer_push)
+    )
+
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -454,6 +549,11 @@ def fused_ep_moe_v2(
         act_fn=act_fn,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        requantize_mid=requantize_mid,
+        act_block_size=act_block_size,
+        wire_block_size=wire_block_size,
+        wire_dtype=wire_dtype,
+        coalesce_peer_push=coalesce_peer_push,
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -477,7 +577,7 @@ def fused_ep_moe_v2(
             x_l = lax.optimization_barrier(x_l)
         rows_bf16 = x_l.astype(jnp.bfloat16)
         if form.quantized_activations:
-            q_l, row_scale_l = rowquant_fp8(rows_bf16)
+            q_l, row_scale_l = rowquant_fp8(rows_bf16, block_size=act_block_size)
         else:
             q_l, row_scale_l = rows_bf16, None
         q_g = lax.all_gather(
@@ -500,9 +600,20 @@ def fused_ep_moe_v2(
             topk_weights = jnp.where(valid_route, topk_w_l.astype(jnp.float32), 0.0)
         else:
             scores = _apply_scoring_fn(gate_l, scoring_fn)
-            select_rows = MAX_ROUTING_BLOCK
-            while t_local % select_rows:
-                select_rows //= 2
+            if prefill_tuned:
+                select_rows = (
+                    t_local
+                    if t_local <= MAX_ROUTING_BLOCK
+                    else next(
+                        d for d in range(MAX_ROUTING_BLOCK, 7, -8) if t_local % d == 0
+                    )
+                )
+            else:
+                # Decode: power-of-two divisor; pallas_select falls back to
+                # one whole-R block when it is not a multiple of 8.
+                select_rows = MAX_ROUTING_BLOCK
+                while t_local % select_rows:
+                    select_rows //= 2
             if hash_l is not None:
                 topk_idx = hash_l.astype(jnp.int32)
                 topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
@@ -546,11 +657,17 @@ def fused_ep_moe_v2(
             if row_scale_l is None
             else (
                 lax.bitcast_convert_type(
-                    row_scale_l[:, 0].astype(jnp.float32), jnp.int32
+                    row_scale_l.reshape(-1).astype(jnp.float32), jnp.int32
                 )
             )
         )
-        layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
+        layout = _exchange_layout(
+            t_local,
+            topk,
+            e_total,
+            form.quantized_activations,
+            n_act_scales=n_act_scales,
+        )
         exchange = lax.all_gather(
             _pack_routing_exchange(
                 local_blocks.reshape(-1), scale_bits_l, block_hist.sum(axis=0), layout
@@ -560,7 +677,7 @@ def fused_ep_moe_v2(
             tiled=True,
         ).reshape(ep, layout[-1])
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
-            exchange, layout, t_local, topk, e_total
+            exchange, layout, t_local, topk, e_total, n_act_scales=n_act_scales
         )
         gathered = GatheredPairs(
             expert_blocks=pairs_g.reshape(T * topk // block, block),
@@ -626,14 +743,23 @@ def fused_ep_moe_v2(
         # dropped; nothing reads them, and the slab's own rows are the same
         # either way.
         if form.quantized_activations:
-            scale_bits = jnp.repeat(scale_bits_g, topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
-            scale_slab = lax.bitcast_convert_type(
-                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
-                .at[slab_row]
-                .add(scale_bits, mode="drop"),
-                jnp.float32,
-            ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+            if n_act_scales == 1:
+                scale_bits = jnp.repeat(scale_bits_g.reshape(-1), topk)
+                scale_slab = lax.bitcast_convert_type(
+                    jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
+                    .at[slab_row]
+                    .add(scale_bits, mode="drop"),
+                    jnp.float32,
+                ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+            else:
+                scale_bits = jnp.repeat(scale_bits_g, topk, axis=0).T
+                scale_slab = lax.bitcast_convert_type(
+                    jnp.zeros((n_act_scales, scale_rows * HIDDEN_LANE_BLOCK), jnp.int32)
+                    .at[:, slab_row]
+                    .add(scale_bits, mode="drop"),
+                    jnp.float32,
+                ).reshape(n_act_scales, scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
         expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
@@ -726,13 +852,7 @@ def fused_ep_moe_v2(
     topk_w_args = (topk_weights_override,) if has_topk_weights_override else ()
     in_specs = (
         (P(ax),)
-        * (
-            4
-            + len(scale_args)
-            + len(gating_args)
-            + len(hash_args)
-            + len(topk_w_args)
-        )
+        * (4 + len(scale_args) + len(gating_args) + len(hash_args) + len(topk_w_args))
         + (P(),) * len(score_bias_args)
         + (P(ax),) * len(bias_args)
     )
@@ -778,6 +898,11 @@ def fused_ep_moe_v2(
         has_hash_ids and hash_topk_ids.dtype,
         has_topk_weights_override and topk_weights_override.dtype,
         float(routed_scaling_factor),
+        requantize_mid,
+        act_block_size,
+        wire_block_size,
+        wire_dtype,
+        coalesce_peer_push,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

@@ -60,6 +60,14 @@ def _select_expert_buffers(
     return max(1, min(_MAX_EXPERT_BUFFERS, (budget - fixed_bytes) // expert_bytes))
 
 
+def pack_fp4_kmajor_u8(w: jax.Array) -> jax.Array:
+    """Pack [E, K, N] float4_e2m1fn into [E, K // 2, N] uint8 matching pltpu.bitcast."""
+    e, k, n = w.shape
+    return jax.lax.bitcast_convert_type(
+        jnp.swapaxes(w.reshape(e, k // 2, 2, n), -1, -2), jnp.uint8
+    )
+
+
 def _packing_factor_for(w1, w2, rhs_quant_dtype):
     if (
         rhs_quant_dtype in (None, jnp.float8_e4m3fn)
@@ -87,6 +95,14 @@ def can_use_dense_expert(
 ):
     """Check arithmetic/layout support; the compiler owns resource limits."""
     return False
+    if (
+        w1.dtype != jnp.float8_e4m3fn
+        or w2.dtype != jnp.float8_e4m3fn
+        or rhs_quant_dtype not in (None, jnp.float8_e4m3fn)
+    ):
+        return False
+    if activation not in _SUPPORTED_ACTIVATIONS:
+        return False
     if b1 is not None or b2 is not None or s1 is None or s2 is None:
         return False
     if hidden.ndim != 2 or w1.ndim != 3 or w2.ndim != 3:
@@ -141,6 +157,7 @@ def _apply_activation(gate, up, activation):
 def _kernel(
     active_ref,
     x_ref,
+    xs_in_ref,
     coeff_ref,
     w1_hbm,
     w2_hbm,
@@ -171,10 +188,19 @@ def _kernel(
     activation="silu",
     rhs_quant_dtype=None,
     is_w4a16=False,
+    x_is_prequantized=False,
 ):
     owner_ref[...] = jnp.zeros((m, h), jnp.float32)
-    if not is_w4a16:
+    if x_is_prequantized:
+        xq_val = pltpu.bitcast(x_ref[...], jnp.float8_e4m3fn)
+        xs_src = xs_in_ref
+    elif not is_w4a16:
         _quantize(x_ref[...], xq_ref, xs_ref)
+        xq_val = None
+        xs_src = xs_ref
+    else:
+        xq_val = None
+        xs_src = xs_ref
     expert_columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
 
     def compute(e, w1_ref, w2_ref, s1_ref, s2_ref):
@@ -229,7 +255,7 @@ def _kernel(
                 for k in range(0, h, 512):
                     k_lo = k // packing_factor
                     k_hi = (k + 512) // packing_factor
-                    xs = xs_ref[k // 512, :, :]
+                    xs = xs_src[k // 512, :, :]
                     s1_slice = s1_ref if s1_blocks == 1 else s1_ref[k // 512]
                     rhs_g = w1_ref[k_lo:k_hi, n : n + 256]
                     rhs_u = w1_ref[k_lo:k_hi, i + n : i + n + 256]
@@ -239,8 +265,9 @@ def _kernel(
                     if rhs_g.dtype != jnp.float8_e4m3fn:
                         rhs_g = rhs_g.astype(jnp.float8_e4m3fn)
                         rhs_u = rhs_u.astype(jnp.float8_e4m3fn)
+                    lhs_q = xq_val[:, k : k + 512] if x_is_prequantized else xq_ref[:, k : k + 512]
                     pg = jnp.matmul(
-                        xq_ref[:, k : k + 512],
+                        lhs_q,
                         rhs_g,
                         preferred_element_type=jnp.float32,
                     ).astype(jnp.bfloat16)
@@ -248,7 +275,7 @@ def _kernel(
                     pg *= s1_slice[:, n : n + 256].astype(jnp.bfloat16)
                     acc_g += pg
                     pu = jnp.matmul(
-                        xq_ref[:, k : k + 512],
+                        lhs_q,
                         rhs_u,
                         preferred_element_type=jnp.float32,
                     ).astype(jnp.bfloat16)
@@ -275,10 +302,11 @@ def _kernel(
                         rhs = pltpu.bitcast(rhs, rhs_quant_dtype)
                     if rhs.dtype != jnp.float8_e4m3fn:
                         rhs = rhs.astype(jnp.float8_e4m3fn)
+                    lhs_q = xq_val[:, k : k + 512] if x_is_prequantized else xq_ref[:, k : k + 512]
                     part = jnp.matmul(
-                        xq_ref[:, k : k + 512], rhs, preferred_element_type=jnp.float32
+                        lhs_q, rhs, preferred_element_type=jnp.float32
                     ).astype(jnp.bfloat16)
-                    part *= xs_ref[k // 512, :, :]
+                    part *= xs_src[k // 512, :, :]
                     s1_slice = s1_ref if s1_blocks == 1 else s1_ref[k // 512]
                     scale = jnp.concatenate(
                         (
@@ -639,17 +667,27 @@ def dense_expert_moe(
     *,
     activation="silu",
     rhs_quant_dtype=None,
+    hidden_q=None,
+    hidden_scale=None,
 ):
-    orig_m, h = hidden.shape
+    x_is_prequantized = hidden_q is not None and hidden_scale is not None
+    orig_m, h = hidden_q.shape if x_is_prequantized else hidden.shape
     pad_m = (-orig_m) % 16
     m = orig_m + pad_m
+    is_w4a16 = rhs_quant_dtype is None and w1.dtype == jnp.float4_e2m1fn
+    if (
+        not is_w4a16
+        and rhs_quant_dtype == jnp.float4_e2m1fn
+        and w1.dtype == jnp.float4_e2m1fn
+    ):
+        w1 = pack_fp4_kmajor_u8(w1)
+        w2 = pack_fp4_kmajor_u8(w2)
     packing_factor = _packing_factor_for(w1, w2, rhs_quant_dtype)
     assert packing_factor is not None
     experts, i_packed, _ = w2.shape
     i = i_packed * packing_factor
     s1_blocks = s1.shape[1]
     s2_blocks = s2.shape[1]
-    is_w4a16 = rhs_quant_dtype is None and w1.dtype == jnp.float4_e2m1fn
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
 
     expert_ids = jnp.arange(experts, dtype=jnp.int32)[None, :]
@@ -659,12 +697,26 @@ def dense_expert_moe(
         selected = local_ids[:, route : route + 1] == expert_ids
         coeff = coeff + selected.astype(jnp.float32) * weights[:, route : route + 1]
     active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
-    if pad_m:
-        hidden = jnp.pad(hidden, ((0, pad_m), (0, 0)))
+    if x_is_prequantized:
+        if pad_m:
+            hidden_q = jnp.pad(hidden_q, ((0, pad_m), (0, 0)))
+            hidden_scale = jnp.pad(hidden_scale, ((0, pad_m), (0, 0)))
+        x_arg = hidden_q
+        xs_in_arg = jnp.broadcast_to(
+            hidden_scale.transpose(1, 0).astype(jnp.bfloat16)[:, :, None],
+            (h // 512, m, 256),
+        )
+    else:
+        if pad_m:
+            hidden = jnp.pad(hidden, ((0, pad_m), (0, 0)))
+        x_arg = hidden
+        xs_in_arg = jnp.zeros((1, 8, 128), jnp.bfloat16)
     coeff = jnp.pad(coeff, ((0, pad_m), (0, (-experts) % 128)))
 
     if (
         not is_w4a16
+        and not x_is_prequantized
+        and packing_factor == 1
         and i > 512
         and (h // 2) % 512 == 0
         and (i // 2) % 512 == 0
@@ -763,8 +815,10 @@ def dense_expert_moe(
             (num_buffers, 1, h) if s2_blocks == 1 else (num_buffers, s2_blocks, 1, h)
         )
         quant_scratches = [
-            pltpu.VMEM((m, h), jnp.float8_e4m3fn),
-            pltpu.VMEM((h // 512, m, 256), jnp.bfloat16),
+            pltpu.VMEM((1, 128) if x_is_prequantized else (m, h), jnp.float8_e4m3fn),
+            pltpu.VMEM(
+                (1, 8, 256) if x_is_prequantized else (h // 512, m, 256), jnp.bfloat16
+            ),
             pltpu.VMEM((m, i), jnp.bfloat16),
             pltpu.VMEM((m, i), jnp.float8_e4m3fn),
             pltpu.VMEM((i // 512, m, 256), jnp.bfloat16),
@@ -783,11 +837,13 @@ def dense_expert_moe(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             is_w4a16=is_w4a16,
+            x_is_prequantized=x_is_prequantized,
         ),
         out_shape=jax.ShapeDtypeStruct((m, h), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=[
+                pl.BlockSpec(memory_space=pltpu.VMEM),
                 pl.BlockSpec(memory_space=pltpu.VMEM),
                 pl.BlockSpec(memory_space=pltpu.VMEM),
                 *[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
@@ -809,5 +865,5 @@ def dense_expert_moe(
             disable_bounds_checks=True,
         ),
         name=(f"dense_expert_moe-e_{experts}-m_{m}-h_{h}-i_{i}-buffers_{num_buffers}"),
-    )(active, hidden, coeff, w1, w2, s1, s2)
+    )(active, x_arg, xs_in_arg, coeff, w1, w2, s1, s2)
     return out[:orig_m]

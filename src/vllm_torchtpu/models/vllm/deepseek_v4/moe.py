@@ -32,11 +32,11 @@ from vllm_torchtpu.distributed.tp_collectives import (
     tp_reduce_scatter,
 )
 from vllm_torchtpu.layers.adapter import moe_routing
-from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.fused_moe import (
     moe_fp8_dispatch_enabled,
     quantize_moe_dispatch,
 )
+from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.router_topk import (
     fused_gate_grouped_rowmax_select,
 )
@@ -256,8 +256,6 @@ class DeepseekV4MoE(nn.Module):
         )
         router_logits = hidden_states
         defer_shared_to_rs = run_local_shared
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-
         routed = getattr(self.experts, "routed_experts", None)
         qm = getattr(routed, "quant_method", None)
         if (
@@ -398,6 +396,9 @@ class DeepseekV4MoE(nn.Module):
                     routed_scaling_factor=float(routed.routed_scaling_factor),
                 )
                 local_topk_w = w_f32.to(x_local.dtype)
+                local_topk_ids = moe_routing.maybe_modulo_remap_topk_ids(
+                    local_topk_ids, routed
+                )
             else:
                 if self.gate.tid2eid is None:
                     local_gate_out = self.gate(x_local)
@@ -451,6 +452,9 @@ class DeepseekV4MoE(nn.Module):
                         routed_scaling_factor=float(routed.routed_scaling_factor),
                     )
                     local_topk_w = w_f32.to(x_local.dtype)
+                    local_topk_ids = moe_routing.maybe_modulo_remap_topk_ids(
+                        local_topk_ids, routed
+                    )
                 else:
                     local_gate_out = self.gate(x_local)
                     local_logits = (

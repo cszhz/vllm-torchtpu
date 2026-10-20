@@ -216,6 +216,24 @@ def all_gather_packed_topk_s32(
     return all_gather_fn(packed_local, dim=0)
 
 
+def maybe_modulo_remap_topk_ids(topk_ids: torch.Tensor, layer) -> torch.Tensor:
+    """Remap selected expert IDs `eid -> (eid % ep) * g_local + (eid // ep)` when
+    `VLLM_DSV41_MODULO_EXPERT_BALANCE=1` on non-fused-EP layers (fused-EP remaps at its own boundary).
+    """
+    if layer is None or not getattr(envs, "VLLM_DSV41_MODULO_EXPERT_BALANCE", False):
+        return topk_ids
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+    if fused_moe_ep_supported(getattr(layer, "quant_method", None)):
+        return topk_ids
+    ep = layer.moe_config.ep_size
+    e_total = layer.global_num_experts
+    if ep <= 1 or e_total % ep != 0:
+        return topk_ids
+    g_local = e_total // ep
+    return ((topk_ids % ep) * g_local + (topk_ids // ep)).to(topk_ids.dtype)
+
+
 def route(
     layer,
     hidden_states: torch.Tensor,
@@ -239,16 +257,17 @@ def route(
         )
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
-        return simulated
+        return simulated[0], maybe_modulo_remap_topk_ids(simulated[1], layer)
     custom_routing_fn = layer.custom_routing_function
     if custom_routing_fn is not None:
-        return custom_routing_fn(
+        w, ids = custom_routing_fn(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=topk,
             renormalize=layer.renormalize,
         )
-    return select_experts(
+        return w, maybe_modulo_remap_topk_ids(ids, layer)
+    w, ids = select_experts(
         hidden_states=hidden_states,
         router_logits=router_logits,
         topk=topk,
@@ -257,6 +276,7 @@ def route(
         layer=layer,
         input_ids=input_ids,
     )
+    return w, maybe_modulo_remap_topk_ids(ids, layer)
 
 
 def _apply_scoring_fn(scoring_fn: str, router_logits: torch.Tensor) -> torch.Tensor:

@@ -68,6 +68,16 @@ from vllm.model_executor.parameter import ChannelQuantScaleParameter
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+    FUSED_MOE_EP_OP_ATTR,
+    fused_moe_ep,
+    fused_moe_ep_supported,
+    fused_moe_ep_unsupported_reason,
+    hash_topk_ids_operand,
+    prebuild_fused_moe_ep,
+    register_score_bias_buffer,
+    score_bias_operand,
+)
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
