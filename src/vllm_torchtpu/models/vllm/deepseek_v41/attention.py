@@ -697,11 +697,33 @@ class VllmDeepseekV41MLAAttention(
             object.__setattr__(self, cache_attr, res)
         return res
 
+    def _swa_kv_cache_group_id(self) -> int | None:
+        """KV-cache group of this layer's SWA cache (set at KV-cache init).
+
+        SWA layers are split across several KV-cache groups, each with its
+        own block table. In the decode KV layout the layers at the same
+        position of different groups share one physical array, so page
+        indices computed from one group's block table must never be reused by
+        a layer of another group (decodefix 11e6c02). The prefill layout
+        (VLLM_DSV41_PURE_20L_PREFILL=1) gives every SWA layer a private
+        array, where following the leader group's table is self-consistent,
+        so the prefill role keeps cd4eedb's group-agnostic sharing.
+        """
+        if _PREFILL_ROLE:
+            return None
+        swa_layer = getattr(self, "swa_cache_layer", None)
+        return getattr(swa_layer, "_dsv41_kv_cache_group_id", None)
+
     def _swa_group_bounds(self, ced_decoder: bool | None = None) -> tuple[Any, int]:
         eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
+        my_group = self._swa_kv_cache_group_id()
         cache_attr = (
             "_cached_swa_group_bounds_ced" if eff_ced else "_cached_swa_group_bounds"
         )
+        if not _PREFILL_ROLE:
+            # The group id is only known after KV-cache init; key the memo on
+            # it so bounds computed earlier (profiling) are not reused.
+            cache_attr += f"_g{my_group}"
         cached = self.__dict__.get(cache_attr)
         if cached is not None:
             return cached
@@ -724,8 +746,10 @@ class VllmDeepseekV41MLAAttention(
         first_leader: Any = self
         for mod in attn_mods:
             if (
-                mod.compress_ratio > 0
-            ) == is_csa and mod.window_size == self.window_size:
+                (mod.compress_ratio > 0) == is_csa
+                and mod.window_size == self.window_size
+                and (_PREFILL_ROLE or mod._swa_kv_cache_group_id() == my_group)
+            ):
                 lid = extract_layer_index(mod.prefix)
                 if eff_ced and lid < ced_boundary:
                     continue
@@ -844,7 +868,9 @@ class VllmDeepseekV41MLAAttention(
         if cache_dict is None or my_lid == extract_layer_index(first_leader.prefix):
             cache_dict = {}
             first_leader._step_swa_metadata_by_pages = cache_dict
-        page_key = sw_cache_num_pages if _PREFILL_ROLE else 0
+        # Both roles key on the page count: the ring mapping depends on it
+        # (prefill cd4eedb; decodefix 11e6c02).
+        page_key = sw_cache_num_pages
         cached = cache_dict.get(page_key)
         if cached is None:
             mapped = self._get_swa_page_indices_op(sw_cache_num_pages)(swa_tables)

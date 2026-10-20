@@ -927,6 +927,19 @@ def resolve_csa_union_params(
     return None
 
 
+def _m_run(swa_m_t, sinks_t):
+    """Running-max seed for the b_q < 8 unrolled online-softmax blocks.
+
+    Decode role (decodefix 11e6c02): include the attention sink so that
+    ``exp(sinks_t - m_new)`` cannot overflow to inf. The prefill role
+    (VLLM_DSV41_PURE_20L_PREFILL=1) keeps cd4eedb's kernel body unchanged.
+    Both are only traced on the CSA candidate-union path.
+    """
+    if envs.VLLM_DSV41_PURE_20L_PREFILL:
+        return swa_m_t
+    return jnp.maximum(swa_m_t, sinks_t)
+
+
 def _grouped_attention_kernel(
     n_unique_ref,  # i32[num_groups]
     meta_ref,  # i32[3] (start_group, num_active_groups, num_valid_tokens)
@@ -1173,7 +1186,7 @@ def _grouped_attention_kernel(
             swa_acc_t = swa_acc_tiles[qt]
 
             if b_q < 8:
-                m_new = jnp.maximum(swa_m_t, jnp.max(s_cur, axis=1))
+                m_new = jnp.maximum(_m_run(swa_m_t, sinks_t), jnp.max(s_cur, axis=1))
                 exp_swa = jnp.exp(swa_m_t - m_new)
                 p = jnp.exp(s_cur - m_new[:, None])
                 s_nxt = (
@@ -1245,7 +1258,7 @@ def _grouped_attention_kernel(
                 max_s01 = jnp.maximum(jnp.max(s0_t, axis=1), jnp.max(s1_cur, axis=1))
 
                 if b_q < 8:
-                    m_new = jnp.maximum(swa_m_t, max_s01)
+                    m_new = jnp.maximum(_m_run(swa_m_t, sinks_t), max_s01)
                     exp_swa = jnp.exp(swa_m_t - m_new)
                     p01 = jnp.concatenate(
                         [
@@ -1360,7 +1373,7 @@ def _grouped_attention_kernel(
                 )
 
                 if b_q < 8:
-                    m_new = jnp.maximum(swa_m_t, max_s012)
+                    m_new = jnp.maximum(_m_run(swa_m_t, sinks_t), max_s012)
                     exp_swa = jnp.exp(swa_m_t - m_new)
                     p012 = jnp.concatenate(
                         [
@@ -1828,7 +1841,7 @@ def _batched_grouped_attention_kernel(
             swa_acc_t = swa_acc_all[k, qt]
             p_dtype = q_dtype if _FAST_GROUPED_ATTN else jnp.float32
             if b_q < 8:
-                m_new = jnp.maximum(swa_m_t, jnp.max(s_cur, axis=1))
+                m_new = jnp.maximum(_m_run(swa_m_t, sinks_t), jnp.max(s_cur, axis=1))
                 exp_swa = jnp.exp(swa_m_t - m_new)
                 p = jnp.exp(s_cur - m_new[:, None])
                 s_nxt = _masked_qk_k(qt + 1) if qt + 1 < num_q_tiles else None

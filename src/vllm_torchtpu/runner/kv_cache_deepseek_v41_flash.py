@@ -135,6 +135,36 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
         mla_layer_names, swa_layer_groups, state_layer_names = (
             self._classify_ds_v4_layers(kv_cache_config, per_layer_spec)
         )
+        # Tag every cache layer with its KV-cache group (decodefix 11e6c02).
+        # Attention layers share per-step SWA page indices only within one
+        # group: each group has its own block table, and in the decode layout
+        # same-position SWA layers of different groups are overlaid on one
+        # physical array. (The prefill role ignores the tag; see
+        # VllmDeepseekV41MLAAttention._swa_kv_cache_group_id.)
+        static_ctx = runner.vllm_config.compilation_config.static_forward_context
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                layer_mod = static_ctx.get(layer_name)
+                if layer_mod is not None:
+                    layer_mod._dsv41_kv_cache_group_id = gid
+        if not _use_prefill_compact_swa_layout():
+            # Memoize the per-group SWA layer bounds now, outside any trace, so
+            # compiled forwards hit the memo instead of scanning every
+            # attention layer (and installing guards on all of them) while
+            # tracing (decodefix cfacfa7). The prefill role keeps cd4eedb's
+            # lazy bounds.
+            for mod in static_ctx.values():
+                group_bounds = getattr(mod, "_swa_group_bounds", None)
+                if callable(group_bounds) and hasattr(mod, "swa_cache_layer"):
+                    for ced in (False, True):
+                        group_bounds(ced)
+        logger.info(
+            "DeepSeek-V4.1-Flash KV cache groups: %s",
+            [
+                (gid, len(g.layer_names), g.layer_names[0] if g.layer_names else "")
+                for gid, g in enumerate(kv_cache_config.kv_cache_groups)
+            ],
+        )
         packing = self._DS_V4_KV_PACKING
 
         max_reqs = getattr(runner, "max_num_reqs", None)
