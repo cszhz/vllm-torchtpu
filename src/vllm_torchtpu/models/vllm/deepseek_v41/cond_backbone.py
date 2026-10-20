@@ -55,9 +55,7 @@ def _inject_donor_attrs_in_header(header: str, donated_inputs: set[int]) -> str:
             return f"{aname}: {atype} {merged}"
         return f"{aname}: {atype} {{jax.buffer_donor = true}}"
 
-    return re.sub(
-        r"(%arg(\d+)):\s*(tensor<[^>]+>)(\s*\{[^}]*\})?", _repl, header
-    )
+    return re.sub(r"(%arg(\d+)):\s*(tensor<[^>]+>)(\s*\{[^}]*\})?", _repl, header)
 
 
 def _rewrite_dsv41_cond_mlir(
@@ -81,9 +79,7 @@ def _rewrite_dsv41_cond_mlir(
     header = _inject_donor_attrs_in_header(lines[main_start], donor_indices)
     arg_types: dict[str, str] = {}
     donor_args: set[str] = set()
-    for m in re.finditer(
-        r"(%arg(\d+)):\s*(tensor<[^>]+>)(\s*\{[^}]*\})?", header
-    ):
+    for m in re.finditer(r"(%arg(\d+)):\s*(tensor<[^>]+>)(\s*\{[^}]*\})?", header):
         aname, idx_str, atype, attr = (
             m.group(1),
             m.group(2),
@@ -120,9 +116,7 @@ def _rewrite_dsv41_cond_mlir(
         lhs_rhs = first_line.split(" = ", 1)
         assert len(lhs_rhs) == 2, f"Unexpected MLIR op line: {first_line}"
         lhs, rhs_first = lhs_rhs[0].strip(), lhs_rhs[1]
-        full_rhs = rhs_first + (
-            "\n" + "\n".join(chunk[1:]) if len(chunk) > 1 else ""
-        )
+        full_rhs = rhs_first + ("\n" + "\n".join(chunk[1:]) if len(chunk) > 1 else "")
         defs = ssa_re.findall(lhs)
         uses = ssa_re.findall(full_rhs)
         if "dsv41_cond_upper_boundary" in first_line:
@@ -143,9 +137,7 @@ def _rewrite_dsv41_cond_mlir(
     def _base_ssa(v: str) -> str:
         return v.split("#", 1)[0]
 
-    dec_ret_indices = [
-        i for i, rv in enumerate(ret_vals) if _base_ssa(rv) in in_dec
-    ]
+    dec_ret_indices = [i for i, rv in enumerate(ret_vals) if _base_ssa(rv) in in_dec]
     def_to_uses: dict[str, list[str]] = {}
     for _chunk, defs, uses in ops:
         for d in defs:
@@ -183,16 +175,10 @@ def _rewrite_dsv41_cond_mlir(
             used_donors.add(dname)
 
     enc_lines = [
-        line
-        for i in range(len(ops))
-        if i not in dec_op_indices
-        for line in ops[i][0]
+        line for i in range(len(ops)) if i not in dec_op_indices for line in ops[i][0]
     ]
     dec_lines = [
-        line
-        for i in range(len(ops))
-        if i in dec_op_indices
-        for line in ops[i][0]
+        line for i in range(len(ops)) if i in dec_op_indices for line in ops[i][0]
     ]
 
     if_ret_types = [ret_types[i] for i in dec_ret_indices]
@@ -215,9 +201,7 @@ def _rewrite_dsv41_cond_mlir(
 
     if_lhs = ", ".join(f"%cond_out_{k}" for k in range(len(dec_ret_indices)))
     if_type_sig = (
-        f"({', '.join(if_ret_types)})"
-        if len(if_ret_types) != 1
-        else if_ret_types[0]
+        f"({', '.join(if_ret_types)})" if len(if_ret_types) != 1 else if_ret_types[0]
     )
 
     new_body = list(enc_lines)
@@ -255,9 +239,7 @@ def _rewrite_dsv41_cond_mlir(
         len(ret_vals),
         pred_arg,
     )
-    return "\n".join(
-        lines[:main_start] + [header] + new_body + lines[main_end:]
-    )
+    return "\n".join(lines[:main_start] + [header] + new_body + lines[main_end:])
 
 
 def install_dsv41_cond_mlir_hook() -> None:
@@ -282,8 +264,7 @@ def install_dsv41_cond_mlir_hook() -> None:
         module_name: str | None = None,
     ) -> Any:
         has_cond_boundary = envs.VLLM_DSV41_SINGLE_BACKBONE_COND and any(
-            "dsv41_cond_upper_boundary" in str(n.target)
-            for n in module.graph.nodes
+            "dsv41_cond_upper_boundary" in str(n.target) for n in module.graph.nodes
         )
         if not has_cond_boundary:
             return orig_fx_to_mlir(
@@ -313,9 +294,7 @@ def install_dsv41_cond_mlir_hook() -> None:
             module_name=module_name,
         )
         raw_text = ttc.serialize_mlir_text(res_orig.module)
-        orig_layouts = [
-            list(p[0]) for p in res_orig.executable.get_parameter_layouts()
-        ]
+        orig_layouts = [list(p[0]) for p in res_orig.executable.get_parameter_layouts()]
         mlir_result_tensors = res_orig.mlir_result_tensors
         reconstruct_fx_outputs_fn = res_orig.reconstruct_fx_outputs_fn
         updates_rng = res_orig.updates_default_generator_state
@@ -330,7 +309,7 @@ def install_dsv41_cond_mlir_hook() -> None:
         del raw_text
 
         h = hashlib.sha256(rewritten_text.encode("utf-8")).hexdigest()[:24]
-        cache_dir = os.environ.get("VLLM_XLA_CACHE_PATH", "/tmp/xla_cache")
+        cache_dir = envs.VLLM_XLA_CACHE_PATH
         os.makedirs(cache_dir, exist_ok=True)
         cache_path = os.path.join(cache_dir, f"cond_exec_{h}.bin")
         cond_mod = ttc.parse_mlir_text(rewritten_text) if build_mlir_module else None

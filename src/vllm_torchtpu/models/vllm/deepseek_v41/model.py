@@ -173,6 +173,29 @@ def _moe_vllm_config(
     return moe_vllm_config
 
 
+class _PurePrefillBoundaryLayer(nn.Module):
+    """Minimal L20 module for VLLM_DSV41_PURE_20L_PREFILL (`attn` + `attn_norm` only)."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str,
+        topk_indices_buffer: torch.Tensor,
+        candidate_block_buffer: torch.Tensor | None = None,
+    ) -> None:
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        self.attn = VllmDeepseekV41MLAAttention(
+            vllm_config=vllm_config,
+            prefix=f"{prefix}.attn",
+            topk_indices_buffer=topk_indices_buffer,
+            candidate_block_buffer=candidate_block_buffer,
+        )
+        self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn = None
+        self.engram = None
+
+
 class DeepseekV41DecoderLayer(nn.Module):
     """DeepSeek-V4.1 decoder layer with Single-Pass Delayed mHC, CSA2, and Engram."""
 
@@ -608,6 +631,8 @@ def _clear_stage_caches(
                 attn._step_indexer_metadata = None
             attn._step_csa_union = None
             attn._step_swa_metadata = None
+            attn._step_swa_metadata_by_pages = None
+            attn._step_swa_win_metadata_by_pages = None
             attn._step_tp_swa_metadata = None
             attn._step_cos_sin = None
             attn._step_cos_sin_local = None
@@ -638,7 +663,7 @@ def _run_engram_prelude_and_layers(
     bool,
 ]:
     tp_size = get_tensor_model_parallel_world_size()
-    if tp_size > 1 and _TOKEN_SHARD_MIN_TOKENS >= 0:
+    if tp_size > 1 and _TOKEN_SHARD_MIN_TOKENS > 0:
         # The threshold splits the bucket ladder into replicated and
         # token-sharded shape_variants traces; lift tp_rank_idx first in both
         # so their FX placeholder signatures agree (the alias is DCE'd).
@@ -1106,7 +1131,7 @@ class DeepseekV41DecoderStage(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         positions = torch.ops.aten.alias.default(positions)
         num_tokens = positions.shape[0]
-        if tp_size > 1 and _TOKEN_SHARD_MIN_TOKENS >= 0:
+        if tp_size > 1 and _TOKEN_SHARD_MIN_TOKENS > 0:
             # Canonical tp_rank_idx lift (see _run_engram_prelude_and_layers).
             _ = torch.ops.aten.alias.default(self.tp_rank_idx)
         token_sharded_mhc = tp_token_shard_ok(num_tokens, tp_size)
@@ -1200,22 +1225,35 @@ class DeepseekV41Model(nn.Module):
                 (max_tokens, cand_blocks), -1, dtype=torch.int32
             )
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda prefix: DeepseekV41DecoderLayer(
+        total_layers = int(config.num_hidden_layers)
+        ced_boundary = total_layers // 2
+        pure_20l = bool(envs.VLLM_DSV41_PURE_20L_PREFILL)
+        num_layers_to_build = (ced_boundary + 1) if pure_20l else total_layers
+
+        def _build_layer(prefix: str) -> nn.Module:
+            if pure_20l and extract_layer_index(prefix) == ced_boundary:
+                return _PurePrefillBoundaryLayer(
+                    vllm_config,
+                    prefix,
+                    self.topk_indices_buffer,
+                    self.candidate_block_buffer,
+                )
+            return DeepseekV41DecoderLayer(
                 vllm_config,
                 prefix,
                 self.topk_indices_buffer,
                 self.engram_layout,
                 self.candidate_block_buffer,
-            ),
+            )
+
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            num_layers_to_build,
+            _build_layer,
             prefix=f"{prefix}.layers",
         )
         if hasattr(config, "_tpu_candidate_block_buffer"):
             delattr(config, "_tpu_candidate_block_buffer")
 
-        total_layers = int(config.num_hidden_layers)
-        ced_boundary = total_layers // 2
         engram_lids = (
             self.engram_layout.layer_ids if self.engram_layout is not None else ()
         )
@@ -1226,7 +1264,7 @@ class DeepseekV41Model(nn.Module):
             and total_layers >= 2
             and total_layers % 2 == 0
             and self.start_layer == 0
-            and self.end_layer == total_layers
+            and self.end_layer in (total_layers, ced_boundary + 1)
             and all(lid < ced_boundary for lid in engram_lids)
             and [lid for lid in kv_src_lids if lid >= ced_boundary] == [ced_boundary]
         )
@@ -1267,7 +1305,7 @@ class DeepseekV41Model(nn.Module):
 
         self.norm = (
             RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            if get_pp_group().is_last_rank
+            if (get_pp_group().is_last_rank and not pure_20l)
             else PPMissingLayer()
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -1519,7 +1557,11 @@ class DeepseekV41Model(nn.Module):
                         _ = attn._get_attn_op(True)
                         if supports_ced:
                             _ = attn._get_attn_op(False, ced_decoder=True)
-                            _ = attn._get_attn_op(True, ced_decoder=True)
+                            # Bug #77 (decode): pre-warm the has_union CED decoder
+                            # variant too. PURE_20L prefill never runs a CED
+                            # decoder step, so it keeps the original warm set.
+                            if not envs.VLLM_DSV41_PURE_20L_PREFILL:
+                                _ = attn._get_attn_op(True, ced_decoder=True)
                     else:
                         all_real = False
                 elif supports_ced:
@@ -1550,7 +1592,41 @@ class DeepseekV41Model(nn.Module):
             )
             if engram_hashes is not None:
                 self._engram_buf_dirty = True
+            elif envs.VLLM_DSV41_PURE_20L_PREFILL:
+                # PURE_20L prefill: no upper layers / logits, so a step without a
+                # fully-known host prefetch only needs zeroed rows (prefill path).
+                tp_size = get_tensor_model_parallel_world_size()
+                t_local = (
+                    num_tokens // tp_size
+                    if tp_token_shard_ok(num_tokens, tp_size)
+                    else num_tokens
+                )
+                if buf_1d is not None:
+                    if getattr(self, "_engram_buf_dirty", False):
+                        if buf_1d.ndim == 2:
+                            buf_1d[: min(max(t_local, 32), buf_1d.shape[0])].zero_()
+                        else:
+                            n_bytes = (
+                                t_local
+                                * n_tables
+                                * _engram_table_bytes(
+                                    n_hash_cols, self._engram_packed_dim
+                                )
+                            )
+                            buf_1d[:n_bytes].zero_()
+                        self._engram_buf_dirty = False
+                    engram_hashes = buf_1d
+                else:
+                    cols_flat = (t_local * n_tables * n_hash_cols) // num_tokens
+                    engram_hashes = torch.zeros(
+                        (num_tokens, cols_flat, self._engram_packed_dim),
+                        dtype=torch.uint8,
+                        device=positions.device,
+                    )
             elif buf_1d is not None:
+                # Decode path: host prefetch missing / not all-known (e.g. DSpark
+                # draft tokens under async scheduling) -> hash on device and do
+                # the host table lookup into the static buffer.
                 all_attn_metadata = get_forward_context().attn_metadata
                 if (
                     isinstance(all_attn_metadata, dict)
@@ -1699,14 +1775,8 @@ class DeepseekV41Model(nn.Module):
 
         if plan is None or plan.passthrough:
             if hidden_states.shape[0] != num_tokens:
-                pm_cols = int(pre_mix.shape[-1])
-                pm_pad = ((pm_cols + 127) // 128) * 128
                 hidden_states = tp_all_gather(hidden_states, dim=0)
-                pm_gathered = tp_all_gather(
-                    torch.nn.functional.pad(pre_mix, (0, pm_pad - pm_cols)), dim=0
-                )
-                pre_mix = pm_gathered[:, :pm_cols] + 0.0
-                synchronize_tensors([hidden_states, pre_mix], wait=True)
+                pre_mix = tp_all_gather(pre_mix, dim=0)
             return self.decoder_stage(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1717,7 +1787,7 @@ class DeepseekV41Model(nn.Module):
         dec_q_loc = plan.query_start_loc.to(dev, non_blocking=True)
         dec_seq_lens = plan.seq_lens.to(dev, non_blocking=True)
         dec_dist = plan.request_distribution.to(dev, non_blocking=True)
-        gather_idx = plan.gather_indices.to(dev, non_blocking=True)
+        gather_idx = plan.gather_idx.to(dev, non_blocking=True) if hasattr(plan, "gather_idx") else plan.gather_indices.to(dev, non_blocking=True)
         scatter_idx = plan.scatter_indices.to(dev, non_blocking=True)
         if hidden_states.shape[0] != num_tokens:
             tp_rank = get_tensor_model_parallel_rank()
@@ -1736,20 +1806,30 @@ class DeepseekV41Model(nn.Module):
                 pre_mix[local_idx],
                 torch.zeros_like(pre_mix[local_idx]),
             )
+            hs_flat = hs_sel.reshape(hs_sel.shape[0], -1)
+            hs_cols = hs_flat.shape[-1]
             pm_cols = int(pm_sel.shape[-1])
             pm_pad = ((pm_cols + 127) // 128) * 128
-            dec_hidden = tensor_model_parallel_all_reduce(hs_sel)
-            dec_pm_pad = tensor_model_parallel_all_reduce(
-                torch.nn.functional.pad(pm_sel, (0, pm_pad - pm_cols))
+            reduced_seam = tensor_model_parallel_all_reduce(
+                torch.cat(
+                    [
+                        hs_flat,
+                        torch.nn.functional.pad(
+                            pm_sel.to(hs_flat.dtype), (0, pm_pad - pm_cols)
+                        ),
+                    ],
+                    dim=-1,
+                )
             )
-            dec_pre_mix = dec_pm_pad[:, :pm_cols] + 0.0
+            dec_hidden = reduced_seam[:, :hs_cols].contiguous().reshape(hs_sel.shape)
+            dec_pre_mix = reduced_seam[:, hs_cols : hs_cols + pm_cols].contiguous().to(
+                pm_sel.dtype
+            )
             dec_positions = positions.index_select(0, gather_idx)
-            synchronize_tensors([dec_hidden, dec_pre_mix, dec_positions], wait=True)
         else:
             dec_hidden, dec_pre_mix, dec_positions = _ced_gather_inputs(
                 hidden_states, pre_mix, positions, gather_idx
             )
-            synchronize_tensors([dec_hidden, dec_pre_mix, dec_positions], wait=True)
 
         if isinstance(attn_metadata, dict):
             decoder_metadata: Any = {
@@ -1898,7 +1978,8 @@ class DeepseekV41Model(nn.Module):
             staged.flush_all()
 
         for layer in self.layers[self.start_layer : self.end_layer]:
-            layer._ensure_mhc_buffers(force=True)
+            if hasattr(layer, "_ensure_mhc_buffers"):
+                layer._ensure_mhc_buffers(force=True)
             engram_mod = getattr(layer, "engram", None)
             if engram_mod is not None:
                 engram_mod.process_weights_after_loading()
@@ -1919,20 +2000,72 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
 
     model_cls = DeepseekV41Model  # type: ignore[assignment]
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        filtered_weights = (
-            (name, w)
-            for name, w in weights
-            if not name.startswith(("mtp.", "vision.", "aligner.", "image_"))
-            and not name.endswith(".bias_vl")
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        if not envs.VLLM_DSV41_PURE_20L_PREFILL:
+            super().__init__(vllm_config=vllm_config, prefix=prefix)
+            return
+        import sys
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+        sys.setrecursionlimit(50000)
+        nn.Module.__init__(self)
+        config = vllm_config.model_config.hf_config
+        self.config = config
+        self.model = self.model_cls(
+            vllm_config=vllm_config,
+            prefix=f"{prefix}.model" if prefix else "model",
         )
+        self.lm_head = None
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self.lm_head is None:
+            return hidden_states.new_zeros(
+                (hidden_states.shape[0], self.config.vocab_size),
+                dtype=torch.float32,
+            )
+        return super().compute_logits(hidden_states)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        pure_20l = bool(envs.VLLM_DSV41_PURE_20L_PREFILL)
+        ced_boundary = int(self.config.num_hidden_layers) // 2
+        layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+        def _iter_filtered():
+            for name, w in weights:
+                if name.startswith(("mtp.", "vision.", "aligner.", "image_")):
+                    continue
+                if name.endswith(".bias_vl"):
+                    continue
+                if pure_20l:
+                    if name.startswith(("head.", "lm_head.", "norm.", "model.norm.")):
+                        continue
+                    m = layer_re.search(name)
+                    if m:
+                        lid = int(m.group(1))
+                        if lid > ced_boundary:
+                            continue
+                        if lid == ced_boundary and any(
+                            tag in name
+                            for tag in (".ffn.", ".mlp.", ".ffn_norm.", ".hc_")
+                        ):
+                            continue
+                yield name, w
+
         return AutoWeightsLoader(self).load_weights(
-            filtered_weights, mapper=self.hf_to_vllm_mapper
+            _iter_filtered(), mapper=self.hf_to_vllm_mapper
         )
 
     def process_weights_after_loading(self) -> None:
         for layer in self.model.layers[self.model.start_layer : self.model.end_layer]:
-            layer._ensure_mhc_buffers()
+            if hasattr(layer, "_ensure_mhc_buffers"):
+                layer._ensure_mhc_buffers()
             engram_mod = getattr(layer, "engram", None)
             if engram_mod is not None:
                 engram_mod.process_weights_after_loading(allow_dummy=True)

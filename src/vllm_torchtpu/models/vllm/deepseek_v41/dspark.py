@@ -14,6 +14,7 @@
 """TPU implementation of the DeepSeek-V4.1 DSpark speculative decoding draft model."""
 
 from __future__ import annotations
+import vllm_torchtpu.envs as envs
 
 import os
 
@@ -97,9 +98,7 @@ def _init_dspark_qmm_ops() -> tuple[Callable, Callable]:
         out = _quantized_matmul_jax(x_pad, w_q, w_s)
         return out[:orig_m] if m_pad > orig_m else out
 
-    zero_cat_op = pallas.jax_op(
-        "pallas::dspark_zero_cat_qmm_kernel", _zero_cat_qmm_jax
-    )
+    zero_cat_op = pallas.jax_op("pallas::dspark_zero_cat_qmm_kernel", _zero_cat_qmm_jax)
     aligned_qmm_op = pallas.jax_op(
         "pallas::dspark_aligned_qmm_kernel", _aligned_qmm_jax
     )
@@ -122,9 +121,7 @@ def _init_dspark_qmm_ops() -> tuple[Callable, Callable]:
         w_s: torch.Tensor,
     ) -> torch.Tensor:
         del w_s
-        return torch.empty(
-            (x.shape[0], w_q.shape[-1]), dtype=x.dtype, device=x.device
-        )
+        return torch.empty((x.shape[0], w_q.shape[-1]), dtype=x.dtype, device=x.device)
 
     zero_cat_op.register_fake(_fake_zero_cat_qmm)
     aligned_qmm_op.register_fake(_fake_aligned_qmm)
@@ -264,8 +261,7 @@ class DSparkDeepseekV41Model(nn.Module):
             elif w_data.dtype in (torch.bfloat16, torch.float16, torch.float32):
                 if w_data.shape == (self.hidden_size, self.hidden_size * n_chunks):
                     splits = tuple(
-                        c.contiguous()
-                        for c in w_data.split(self.hidden_size, dim=1)
+                        c.contiguous() for c in w_data.split(self.hidden_size, dim=1)
                     )
                     self._main_proj_bf16_splits = splits
                     if w_data.device.type == "tpu":
@@ -369,7 +365,9 @@ class DSparkDeepseekV41Model(nn.Module):
 
     def precompute_and_store_context_kv(
         self,
-        target_hidden_states: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+        target_hidden_states: torch.Tensor
+        | tuple[torch.Tensor, ...]
+        | list[torch.Tensor],
         positions: torch.Tensor,
         metadata: tuple,
     ) -> torch.Tensor:
@@ -379,10 +377,9 @@ class DSparkDeepseekV41Model(nn.Module):
         total_tokens = positions.shape[0]
         if tp_size > 1:
             _ = torch.ops.aten.alias.default(self.tp_rank_idx)
-        use_token_shard = (
-            os.environ.get("VLLM_DSV41_DSPARK_SHARDED_CTX_KV", "1") == "1"
-            and tp_token_shard_ok(total_tokens, tp_size)
-        )
+        use_token_shard = bool(
+            envs.VLLM_DSV41_DSPARK_SHARDED_CTX_KV
+        ) and tp_token_shard_ok(total_tokens, tp_size)
         if use_token_shard:
             tp_rank = get_tensor_model_parallel_rank()
             if isinstance(target_hidden_states, (list, tuple)):
@@ -603,6 +600,17 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             ckpt_up_proj_name="w3",
             num_experts=self.config.dspark_n_routed_experts,
         )
+        if getattr(envs, "VLLM_DSV41_MODULO_EXPERT_BALANCE", False):
+            from vllm.distributed import get_ep_group
+
+            ep_size = get_ep_group().world_size
+            num_experts = self.config.dspark_n_routed_experts
+            if ep_size > 1 and num_experts % ep_size == 0:
+                g_local = num_experts // ep_size
+                expert_mapping = [
+                    (pname, wname, (eid % ep_size) * g_local + (eid // ep_size), sid)
+                    for pname, wname, eid, sid in expert_mapping
+                ]
         expert_scale_suffix = (
             ".weight_scale"
             if getattr(self.config, "expert_dtype", "fp4") == "fp4"
@@ -820,12 +828,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             .contiguous()
             .view(num_pred * padded_num_reqs, -1)
         )
-        if (
-            lm_head is None
-            or markov_w2 is None
-            or tp_size <= 1
-            or meta is None
-        ):
+        if lm_head is None or markov_w2 is None or tp_size <= 1 or meta is None:
             logits_kbv = self.compute_draft_logits(pred_kcb).view(
                 num_pred, padded_num_reqs, -1
             )
@@ -833,9 +836,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             prev = prev_init
             for idx in range(num_pred):
                 bias = self.markov_bias(self.markov_embed(prev))
-                step = self.map_draft_to_target(
-                    (logits_kbv[idx] + bias).argmax(dim=-1)
-                )
+                step = self.map_draft_to_target((logits_kbv[idx] + bias).argmax(dim=-1))
                 draft_tokens.append(step)
                 prev = step
             return torch.stack(draft_tokens, dim=1)
@@ -871,9 +872,9 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         prev = prev_init
         for idx in range(num_pred):
             bias_local = torch.nn.functional.linear(self.markov_embed(prev), w2_pad)
-            local_val, local_idx = (
-                logits_kbv[idx] + bias_local + pad_bias
-            ).max(dim=-1, keepdim=True)
+            local_val, local_idx = (logits_kbv[idx] + bias_local + pad_bias).max(
+                dim=-1, keepdim=True
+            )
             packed_local = torch.cat(
                 [
                     local_val.to(torch.float32).view(torch.int32),
