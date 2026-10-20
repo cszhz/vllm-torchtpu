@@ -62,5 +62,6 @@ def write_adapter_to_slot(
     stacked_weights order."""
     updated = _slot_update_op(stacked_weights, slot_weights, slot_index)
     for weights, new_weights in zip(stacked_weights, updated):
-        # Donated inputs are left invalid; point them at the outputs.
+        # Writes the result back into the donated tensor. XLA aliases the
+        # output to that buffer, so no second copy of the weights is made.
         weights.copy_(new_weights)

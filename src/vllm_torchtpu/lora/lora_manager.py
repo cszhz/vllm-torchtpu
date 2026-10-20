@@ -80,7 +80,7 @@ def _host_weights_like(
     return next(host_views)
 
 
-def _fall_back(reason: str) -> None:
+def _warn_fallback(reason: str) -> None:
     """Warns once that adapters keep vLLM's slice-by-slice writes."""
     logger.warning_once(
         "[LoRA] %s, so adapters are written to the TPU one slice at a "
@@ -114,13 +114,16 @@ class _AdapterSlotWriter:
             if type(module) not in _SUPPORTED_LAYERS
         }
         if unsupported:
-            return _fall_back(f"LoRA layers {sorted(unsupported)} are not supported")
+            _warn_fallback(f"LoRA layers {sorted(unsupported)} are not supported")
+            return None
         stacked_weights = _stacked_weights(modules)
         if len({weights.dtype for weights in stacked_weights}) > 1:
-            return _fall_back("the stacked LoRA tensors mix dtypes")
+            _warn_fallback("the stacked LoRA tensors mix dtypes")
+            return None
         if len({id(weights) for weights in stacked_weights}) < len(stacked_weights):
             # A tensor donated twice in one call fails.
-            return _fall_back("two LoRA modules share a stacked tensor")
+            _warn_fallback("two LoRA modules share a stacked tensor")
+            return None
         return cls(modules, stacked_weights, max_loras, device)
 
     def __init__(
@@ -156,9 +159,10 @@ class _AdapterSlotWriter:
 
     def _host_views(self) -> Iterator[torch.Tensor]:
         """Yields one host view per stacked tensor, packed in the order
-        write_adapter_to_slot unpacks slot_weights. A view takes any slot index,
-        since activate_adapter picks the slot, but every index lands in the
-        same region, so the buffer only needs to hold one slot."""
+        write_adapter_to_slot unpacks slot_weights. Each view is a one-slot
+        region of the buffer expanded over the slot dimension with stride 0,
+        so set_lora can index whichever slot activate_adapter picked and every
+        slot index lands in that same region."""
         offset = 0
         for weights in self._stacked_weights:
             slot_size = weights[0].numel()
