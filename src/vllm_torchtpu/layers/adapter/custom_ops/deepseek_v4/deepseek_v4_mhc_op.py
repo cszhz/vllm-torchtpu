@@ -56,6 +56,7 @@ def _gate_suffix(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     gates_in_kernel: bool,
+    fuse_norm: bool,
 ) -> str:
     """The gate constants are baked into the traced op, so they name it."""
     return (
@@ -63,10 +64,13 @@ def _gate_suffix(
         f"_s{_name_float(hc_sinkhorn_eps)}"
         f"_a{_name_float(hc_post_mult_value)}_i{sinkhorn_repeat}"
         + ("_gk" if gates_in_kernel else "")
+        + ("_n" if fuse_norm else "")
     )
 
 
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
+# jax_op derives the torch schema from these signatures: every tensor must be
+# positional and annotated, so the norm variants are separate functions.
 def _mhc_pre_jax(
     residual: jax.Array,
     fn_hi: jax.Array,
@@ -95,6 +99,40 @@ def _mhc_pre_jax(
         hc_post_mult_value,
         sinkhorn_repeat,
         gates_in_kernel=gates_in_kernel,
+    )
+
+
+def _mhc_pre_norm_jax(
+    residual: jax.Array,
+    fn_hi: jax.Array,
+    fn_mid: jax.Array,
+    fn_lo: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    norm_weight: jax.Array,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    gates_in_kernel: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``_mhc_pre_jax`` emitting the layer input RMS-normalized with
+    ``norm_weight`` (the sublayer's input norm, which shares ``rms_eps``)."""
+    return pre_kernel.mhc_pre(
+        residual,
+        utils.SplitFn(fn_hi, fn_mid, fn_lo),
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        gates_in_kernel=gates_in_kernel,
+        norm_weight=norm_weight,
+        norm_eps=rms_eps,
     )
 
 
@@ -144,6 +182,45 @@ def _mhc_fused_post_pre_jax(
     )
 
 
+def _mhc_fused_post_pre_norm_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    fn_hi: jax.Array,
+    fn_mid: jax.Array,
+    fn_lo: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    norm_weight: jax.Array,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    gates_in_kernel: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``_mhc_fused_post_pre_jax`` emitting the RMS-normalized layer input."""
+    return fused_post_pre_kernel.mhc_fused_post_pre(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        utils.SplitFn(fn_hi, fn_mid, fn_lo),
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        gates_in_kernel=gates_in_kernel,
+        norm_weight=norm_weight,
+        norm_eps=rms_eps,
+    )
+
+
 def _fake_pre_outputs(
     residual: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -187,6 +264,7 @@ def _mhc_pre_op(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     gates_in_kernel: bool,
+    fuse_norm: bool,
 ):
     op_name = "pallas::deepseek_v4_mhc_pre_v2" + _gate_suffix(
         rms_eps,
@@ -195,13 +273,14 @@ def _mhc_pre_op(
         hc_post_mult_value,
         sinkhorn_repeat,
         gates_in_kernel,
+        fuse_norm,
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
         op = pallas.jax_op(
             op_name,
             functools.partial(
-                _mhc_pre_jax,
+                _mhc_pre_norm_jax if fuse_norm else _mhc_pre_jax,
                 rms_eps=rms_eps,
                 hc_pre_eps=hc_pre_eps,
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
@@ -217,6 +296,7 @@ def _mhc_pre_op(
                 P(),  # fn_lo
                 P(),  # hc_scale
                 P(),  # hc_base
+                *([P()] if fuse_norm else []),  # norm weight
             ),
         )
         op.register_fake(_fake_mhc_pre)
@@ -256,6 +336,7 @@ def _mhc_fused_post_pre_op(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     gates_in_kernel: bool,
+    fuse_norm: bool,
 ):
     op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v2" + _gate_suffix(
         rms_eps,
@@ -264,13 +345,14 @@ def _mhc_fused_post_pre_op(
         hc_post_mult_value,
         sinkhorn_repeat,
         gates_in_kernel,
+        fuse_norm,
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
         op = pallas.jax_op(
             op_name,
             functools.partial(
-                _mhc_fused_post_pre_jax,
+                _mhc_fused_post_pre_norm_jax if fuse_norm else _mhc_fused_post_pre_jax,
                 rms_eps=rms_eps,
                 hc_pre_eps=hc_pre_eps,
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
@@ -289,6 +371,7 @@ def _mhc_fused_post_pre_op(
                 P(),  # fn_lo
                 P(),  # hc_scale
                 P(),  # hc_base
+                *([P()] if fuse_norm else []),  # norm weight
             ),
         )
         op.register_fake(_fake_mhc_fused_post_pre)
@@ -341,6 +424,10 @@ class MHCOps(NamedTuple):
     ``fused(x, residual, post_layer_mix, comb_res_mix, *fn3, hc_scale, hc_base)``
         residual_cur -- the ``post`` output -- then ``pre``'s three outputs
         computed from it.
+
+    With ``fuse_norm`` both ``pre`` and ``fused`` take one more trailing
+    argument, the sublayer's input-norm weight (hidden_size,), and return
+    layer_input already RMS-normalized with it.
     """
 
     pre: Any
@@ -356,6 +443,7 @@ def get_mhc_ops(
     sinkhorn_repeat: int,
     *,
     gates_in_kernel: bool = False,
+    fuse_norm: bool = False,
 ) -> MHCOps:
     """Build (or fetch) every mHC op for these gate constants.
 
@@ -372,6 +460,7 @@ def get_mhc_ops(
         hc_post_mult_value,
         sinkhorn_repeat,
         gates_in_kernel,
+        fuse_norm,
     )
     return MHCOps(
         pre=_mhc_pre_op(*consts),

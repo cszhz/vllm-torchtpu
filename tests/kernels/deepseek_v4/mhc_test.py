@@ -653,6 +653,56 @@ class MhcGatesInKernelTpuTest(parameterized.TestCase):
         np.testing.assert_array_equal(_to_np(got_layer), _to_np(want_layer))
         self._check_gates(got_post, got_comb, want_post, want_comb)
 
+    @parameterized.product(
+        num_tokens=[8, 16, 17], weight_dtype=[jnp.bfloat16, jnp.float32]
+    )
+    def test_fused_norm(self, num_tokens, weight_dtype):
+        """Fused attn/ffn RMSNorm vs vLLM's rms_norm on the unnormalized
+        layer input: at most a rare 1-ulp bf16 flip (f32 mean-reduction
+        order)."""
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import (
+            fused_post_pre_kernel,
+            pre_kernel,
+        )
+
+        rng = np.random.default_rng(14)
+        weight = jnp.asarray(rng.uniform(0.5, 1.5, (7168,)), weight_dtype)
+        norm = dict(norm_weight=weight, norm_eps=RMS_EPS)
+
+        def ref_norm(x):
+            xf = x.astype(jnp.float32)
+            var = jnp.mean(xf * xf, axis=-1, keepdims=True)
+            y = (xf * jax.lax.rsqrt(var + RMS_EPS)).astype(weight.dtype) * weight
+            return y.astype(jnp.bfloat16)
+
+        args = _fused_args(rng, num_tokens, 7168)
+        fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
+        want = fused_fn(*args, gates_in_kernel=True)
+        got = fused_fn(*args, gates_in_kernel=True, **norm)
+        for g, w in zip(got[:3], want[:3]):
+            np.testing.assert_array_equal(_to_np(g), _to_np(w))
+        np.testing.assert_allclose(
+            _to_np(got[3]), _to_np(ref_norm(want[3])), rtol=8e-3, atol=1e-6
+        )
+
+        residual, fn, hc_scale, hc_base = _make_pre_inputs(rng, num_tokens, 7168)
+        pre_args = (
+            jnp.asarray(residual).astype(jnp.bfloat16),
+            jnp.asarray(fn),
+            jnp.asarray(hc_scale),
+            jnp.asarray(hc_base),
+            RMS_EPS,
+            HC_PRE_EPS,
+            HC_SINKHORN_EPS,
+            HC_POST_MULT_VALUE,
+            20,
+        )
+        want = pre_kernel.mhc_pre(*pre_args, gates_in_kernel=True)
+        got = pre_kernel.mhc_pre(*pre_args, gates_in_kernel=True, **norm)
+        np.testing.assert_allclose(
+            _to_np(got[2]), _to_np(ref_norm(want[2])), rtol=8e-3, atol=1e-6
+        )
+
     def test_padded_zero_rows_are_finite(self):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import pre_kernel
 

@@ -102,6 +102,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+        # The mHC kernels then emit attn_norm/ffn_norm-normalized inputs.
+        self.fuse_norm = envs.VLLM_TPU_DSV4_MHC_FUSE_NORM
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -149,6 +151,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
                 gates_in_kernel=envs.VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL,
+                fuse_norm=self.fuse_norm,
             )
             object.__setattr__(self, "_mhc_ops_instance", ops)
         return ops
@@ -167,6 +170,12 @@ class DeepseekV4DecoderLayer(nn.Module):
     def _fn3(self, name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return tuple(getattr(self, f"{name}_{s}") for s in ("hi", "mid", "lo"))
 
+    def _norm_arg(self, norm: RMSNorm) -> tuple[torch.Tensor, ...]:
+        return (norm.weight,) if self.fuse_norm else ()
+
+    def _norm(self, norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
+        return x if self.fuse_norm else norm(x)
+
     def hc_pre(
         self,
         x: torch.Tensor,
@@ -180,7 +189,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         passed; this just puts `layer_input` first for the caller.
         """
         post_mix, res_mix, layer_input = self.mhc_ops.pre(
-            x, *hc_fn3, hc_scale, hc_base
+            x, *hc_fn3, hc_scale, hc_base, *self._norm_arg(self.attn_norm)
         )
         return layer_input, post_mix, res_mix
 
@@ -215,9 +224,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 *self._fn3("hc_attn_fn"),
                 self.hc_attn_scale,
                 self.hc_attn_base,
+                *self._norm_arg(self.attn_norm),
             )
 
-        x = self.attn_norm(x)
+        x = self._norm(self.attn_norm, x)
         x = self.attn(positions, x)
 
         residual, post_mix, res_mix, x = self.mhc_ops.fused(
@@ -228,8 +238,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             *self._fn3("hc_ffn_fn"),
             self.hc_ffn_scale,
             self.hc_ffn_base,
+            *self._norm_arg(self.ffn_norm),
         )
-        x = self.ffn_norm(x)
+        x = self._norm(self.ffn_norm, x)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 

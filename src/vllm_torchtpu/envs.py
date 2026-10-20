@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = False
+    VLLM_TPU_DSV4_MHC_FUSE_NORM: bool = False
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -978,6 +979,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL": env_bool(
         "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL"
     ),
+    # DeepSeek-V4 mHC: the pre / fused seam kernels also apply the
+    # sublayer's attn_norm / ffn_norm RMSNorm to the layer input they emit.
+    "VLLM_TPU_DSV4_MHC_FUSE_NORM": env_bool("VLLM_TPU_DSV4_MHC_FUSE_NORM"),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),

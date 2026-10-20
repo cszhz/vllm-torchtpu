@@ -158,6 +158,25 @@ def mhc_pre_gates(
     return pre_mix, post_mix, comb_mix
 
 
+# Above this many tokens the XLA gates epilogue is the faster one: per seam
+# at H=7168, in-kernel vs XLA was 76.6 vs 81.9 us at T=512 but 289.8 vs
+# 272.3 us at T=2048 (the token-major Sinkhorn fills only tb of 128 lanes).
+GATES_IN_KERNEL_MAX_TOKENS = 512
+
+
+def gate_consts(
+    num_tokens: int,
+    gates_in_kernel: bool,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> "GateConsts | None":
+    """The in-kernel gate constants, or None for the XLA gates epilogue."""
+    if not gates_in_kernel or num_tokens > GATES_IN_KERNEL_MAX_TOKENS:
+        return None
+    return GateConsts(hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
+
+
 class GateConsts(NamedTuple):
     """Static constants of the post/comb gates, for kernels that compute
     them in-block (see ``gates_in_block``)."""
@@ -233,3 +252,20 @@ def gates_in_block(
         c = col_norm(row_norm(c))
     comb_mix = jnp.concatenate([c[i][j] for i in range(m) for j in range(m)], 0).T
     return pre_mix, post_mix, comb_mix
+
+
+def finish_layer_input(lay: jax.Array, norm_w_ref, norm_eps: float | None) -> jax.Array:
+    """The collapsed f32 layer input as the bf16 the sublayer consumes.
+
+    With ``norm_eps`` it is also RMS-normalized (vLLM ``rms_norm``: bf16
+    input, f32 statistics), so the sublayer's own input norm can be skipped.
+    The weight multiply stays in f32 with one final rounding, which is what
+    XLA makes of rms_norm's bf16 ``x.to(weight.dtype) * weight``.
+    """
+    out = lay.astype(jnp.bfloat16)
+    if norm_eps is None:
+        return out
+    x = out.astype(jnp.float32)
+    var = jnp.mean(x * x, axis=-1, keepdims=True)
+    w = norm_w_ref[...].astype(jnp.float32)
+    return (x * jax.lax.rsqrt(var + norm_eps) * w).astype(jnp.bfloat16)
