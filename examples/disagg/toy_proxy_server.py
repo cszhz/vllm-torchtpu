@@ -283,6 +283,7 @@ async def lifespan(app: FastAPI):
                 "host": host,
                 "port": port,
                 "id": i,
+                "dp_inflight": [0] * max(0, int(global_args.decoder_dp_size)),
             }
         )
 
@@ -334,6 +335,11 @@ def parse_args():
     parser.add_argument(
         "--decoder-ports", "--decoder-port", type=int, nargs="+", default=[9400]
     )
+    # Pin each decode request to a DP rank of its decoder (X-data-parallel-rank),
+    # least in-flight first. The decode server's internal DP load balancer can
+    # leave ranks uneven, and the DP-coordinated step pads every rank to the
+    # busiest rank's token bucket. 0 keeps the server-side balancing.
+    parser.add_argument("--decoder-dp-size", type=int, default=0)
 
     args = parser.parse_args()
 
@@ -428,7 +434,25 @@ async def stream_from_decode(
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
     }
+    inflight = client_info.get("dp_inflight") or []
+    dp_rank = None
+    if inflight:
+        dp_rank = min(range(len(inflight)), key=lambda r: (inflight[r], r))
+        inflight[dp_rank] += 1
+        headers["X-data-parallel-rank"] = str(dp_rank)
+    try:
+        async for chunk in _stream_from_decode_once(
+            client_info, endpoint, req_data, request_id, headers
+        ):
+            yield chunk
+    finally:
+        if dp_rank is not None:
+            inflight[dp_rank] -= 1
 
+
+async def _stream_from_decode_once(
+    client_info: dict, endpoint: str, req_data: dict, request_id: str, headers: dict
+):
     for attempt in range(_MAX_ATTEMPTS):
         yielded_any = False
         try:
