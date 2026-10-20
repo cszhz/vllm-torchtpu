@@ -1892,8 +1892,8 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
 
 def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, caplog):
     """Raiden GLM admission downgrades default 'sal' to HAS with a one-time
-    warning, rejects explicit 'sal' with ValueError, and leaves 'has'/'xla' and
-    DSv4 admission unaffected."""
+    warning, keeps explicit 'sal', and leaves 'has'/'xla' and DSv4 admission
+    unaffected."""
     import importlib
     import logging
 
@@ -1965,16 +1965,15 @@ def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, c
             if "incompatible with Raiden GLM admission" in r.message
         ]
 
-    # 5. Explicit 'sal' (env or mode arg) + Raiden GLM admission -> ValueError.
+    # 5. Explicit 'sal' (env or mode arg) + Raiden GLM admission -> SAL; Raiden
+    #    admission accepts it only on a DCP engine.
     monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
     monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
     assert envs.is_indexer_kv_cache_mode_explicit()
-    with pytest.raises(ValueError, match="Raiden GLM admission"):
-        st_mod.indexer_kv_layout(256)
+    assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
     monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
     monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
-    with pytest.raises(ValueError, match="Raiden GLM admission"):
-        st_mod.indexer_kv_layout(256, mode="sal")
+    assert st_mod.indexer_kv_layout(256, mode="sal") == KVLayout.SEQ_ALONG_LANE
 
     # 6. _resolve_indexer_kv_cache_mode under the downgrade returns
     #    ('pallas', HEAD_ALONG_SUBLANE) on TPU and ('xla', HEAD_ALONG_SUBLANE) on CPU.
@@ -1990,7 +1989,8 @@ def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, c
         "xla",
         KVLayout.HEAD_ALONG_SUBLANE,
     )
-    with pytest.raises(ValueError, match="Raiden GLM admission"):
+    # Explicit 'sal' keeps SEQ_ALONG_LANE, which a HAS-shaped cache does not fit.
+    with pytest.raises(ValueError, match="SEQ_ALONG_LANE shape"):
         mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed, mode="sal")
 
 

@@ -246,6 +246,32 @@ def test_measured_glm_layout_fingerprint_golden():
     )
 
 
+def test_glm_fingerprint_tells_the_indexer_layouts_apart():
+    sal_manifest = rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=glm_named_kv_caches(idx_shape=(16, 33, 4, 1024)),
+        raw_tensors=(),
+        block_size_tokens=1024,
+        indexer_seq_along_lane=True,
+    )
+    sal_fingerprint, sal_payload = rlf.measured_glm_layout_fingerprint(
+        sal_manifest,
+        page_tokens=1024,
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+        indexer_seq_along_lane=True,
+    )
+    has_fingerprint, has_payload = rlf.measured_glm_layout_fingerprint(
+        _glm_manifest(),
+        page_tokens=1024,
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions,
+    )
+
+    assert sal_payload["layouts"]["dsa.idx"]["page_shape"] == [33, 4, 1024]
+    assert sal_payload["layouts"]["mla.nope"] == has_payload["layouts"]["mla.nope"]
+    assert sal_fingerprint != has_fingerprint
+
+
 def test_glm_fingerprint_rejects_shape_divergence_within_tag():
     manifest = _glm_manifest()
     divergent = _glm_manifest(rope_shape=(16, 256, 4, 256))

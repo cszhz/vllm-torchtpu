@@ -1096,14 +1096,15 @@ def indexer_kv_layout(
 ) -> KVLayout:
     """Returns the single-source `KVLayout` for an indexer K cache of `block_size`.
 
-    `sal` requires `block_size` to be a positive multiple of 128 and is not
-    supported by Raiden GLM Stage-3 admission (`build_glm_mla_pool_manifest` /
-    `lower_glm_row_spans` require packed-row `HEAD_ALONG_SUBLANE` geometry).
-    When `sal` is selected by default and Raiden GLM admission is enabled, or
-    when `block_size < 128` or `block_size % 128 != 0`, this helper selects
+    `sal` requires `block_size` to be a positive multiple of 128. Raiden GLM
+    Stage-3 admission ships it only as whole pages between DCP peers; every
+    other GLM transfer needs packed-row `HEAD_ALONG_SUBLANE` geometry. When
+    `sal` is selected by default and Raiden GLM admission is enabled, or when
+    `block_size < 128` or `block_size % 128 != 0`, this helper selects
     `KVLayout.HEAD_ALONG_SUBLANE` (logging a one-time warning) so cache
     allocation and op execution always agree on the layout. Explicitly
-    requesting `sal` while Raiden GLM admission is enabled raises `ValueError`.
+    requesting `sal` under Raiden GLM admission keeps `SEQ_ALONG_LANE`, which
+    admission accepts only on a DCP engine.
     """
     try:
         from vllm_torchtpu import envs
@@ -1129,25 +1130,16 @@ def indexer_kv_layout(
             "expected one of ('xla', 'has', 'sal')."
         )
     if resolved == "sal":
-        if raiden_glm_admission:
-            if explicit_mode:
-                raise ValueError(
-                    "VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is incompatible with "
-                    "Raiden GLM admission (TPU_USE_RAIDEN_KV_CACHE_MANAGER=1 and "
-                    "TPU_RAIDEN_GLM_ADMISSION=1), which requires packed-row "
-                    "HEAD_ALONG_SUBLANE layout for dsa.idx. Set "
-                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=has (or unset it to allow "
-                    "automatic fallback)."
-                )
+        if raiden_glm_admission and not explicit_mode:
             key: tuple[str, int | str] = (resolved, "raiden_glm_admission")
             if key not in _INDEXER_KV_LAYOUT_FALLBACK_LOGGED:
                 _INDEXER_KV_LAYOUT_FALLBACK_LOGGED.add(key)
                 logger.warning(
                     "Default VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is incompatible "
-                    "with Raiden GLM admission (which requires packed-row "
-                    "HEAD_ALONG_SUBLANE layout for dsa.idx); falling back to "
-                    "HEAD_ALONG_SUBLANE layout with 'has' writer. Set "
-                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=has to silence this warning.",
+                    "with Raiden GLM admission except between DCP prefill and "
+                    "DCP decode; falling back to HEAD_ALONG_SUBLANE layout with "
+                    "'has' writer. Set VLLM_TPU_INDEXER_KV_CACHE_MODE=has to "
+                    "silence this warning, or =sal on both DCP peers.",
                 )
             return KVLayout.HEAD_ALONG_SUBLANE
         if block_size < 128 or block_size % 128 != 0:

@@ -688,6 +688,17 @@ def _use_raiden_glm_admission() -> bool:
     return tpu_envs.use_raiden_glm_admission()
 
 
+def _glm_indexer_seq_along_lane(vllm_config: VllmConfig) -> bool:
+    """Whether the GLM indexer K cache was allocated SEQ_ALONG_LANE."""
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        KVLayout,
+        indexer_kv_layout,
+    )
+
+    block_size = int(vllm_config.cache_config.block_size)
+    return indexer_kv_layout(block_size) == KVLayout.SEQ_ALONG_LANE
+
+
 def _use_raiden_dsv4_admission() -> bool:
     return bool(
         tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER and tpu_envs.TPU_RAIDEN_DSV4_ADMISSION
@@ -3008,12 +3019,23 @@ class TPURaidenConnectorWorker:
                 "register_kv_caches() before register_runner()"
             )
         raw_tensors = tuple(runner.kv_cache_raw_tensors or ())
+        # A SEQ_ALONG_LANE page holds no packed rows, so it only ships whole,
+        # from a DCP prefill to a DCP decode.
+        indexer_seq_along_lane = _glm_indexer_seq_along_lane(self.vllm_config)
+        dcp_size = int(self.vllm_config.parallel_config.decode_context_parallel_size)
+        if indexer_seq_along_lane and dcp_size == 1:
+            raise ValueError(
+                "Raiden GLM admission accepts a SEQ_ALONG_LANE indexer cache "
+                f"only on a DCP engine, got topology {topology}; set "
+                "VLLM_TPU_INDEXER_KV_CACHE_MODE=has"
+            )
 
         manifest = rpm.build_glm_mla_pool_manifest(
             named_kv_caches=named_kv_caches,
             raw_tensors=raw_tensors,
             block_size_tokens=int(self.vllm_config.cache_config.block_size),
             per_layer_tags=_use_per_layer_pool_tags(),
+            indexer_seq_along_lane=indexer_seq_along_lane,
         )
         rpm.verify_storage_binding(
             manifest=manifest,
@@ -3369,18 +3391,20 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _measure_raiden_glm_layout(
-        manifest: Any, page_tokens: int
+        manifest: Any, page_tokens: int, indexer_seq_along_lane: bool = False
     ) -> tuple[str, dict[str, Any]]:
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
             measured_glm_layout_fingerprint,
         )
 
         # Pipeline stage may hold no indexer layer, so the indexer class stays out of
-        # the fingerprint on both sides.
+        # the fingerprint on both sides. A SEQ_ALONG_LANE indexer is always in it, so
+        # a packed-row peer never pairs with it.
         return measured_glm_layout_fingerprint(
             manifest,
             page_tokens=page_tokens,
-            hash_indexer=not _use_per_layer_pool_tags(),
+            hash_indexer=not _use_per_layer_pool_tags() or indexer_seq_along_lane,
+            indexer_seq_along_lane=indexer_seq_along_lane,
         )
 
     def _measure_stage3_layout(self, manifest: Any) -> tuple[str, dict[str, Any], int]:
@@ -3422,7 +3446,9 @@ class TPURaidenConnectorWorker:
         if _use_raiden_glm_admission():
             page_tokens = int(self.vllm_config.cache_config.block_size)
             fingerprint, payload = self._measure_raiden_glm_layout(
-                manifest, page_tokens
+                manifest,
+                page_tokens,
+                indexer_seq_along_lane=_glm_indexer_seq_along_lane(self.vllm_config),
             )
             return fingerprint, payload, page_tokens
         if _raiden_seq_on_lane_layout():

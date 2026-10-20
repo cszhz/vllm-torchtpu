@@ -1486,8 +1486,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission
-    #     is active with the default mode; an explicit "sal" with Raiden GLM
-    #     admission raises ValueError).
+    #     is active with the default mode; Raiden GLM admission accepts an
+    #     explicit "sal" only on a DCP engine).
     #   "has": Pallas coalesced_kv_append(_dcp) in HEAD_ALONG_SUBLANE layout.
     #   "xla": XLA .at[].set scatter in HEAD_ALONG_SUBLANE layout.
     "VLLM_TPU_INDEXER_KV_CACHE_MODE": lambda: (

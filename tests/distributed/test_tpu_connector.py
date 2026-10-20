@@ -6135,6 +6135,20 @@ def test_glm_admission_topology_admits_dcp_producer_of_same_geometry():
     assert topology == "tp16dcp16_prefill"
 
 
+def test_glm_admission_accepts_seq_along_lane_indexer_only_on_dcp_engine():
+    worker = _make_raiden_worker(tp_rank=0, tp_size=8, block_size=256)
+    worker.named_kv_caches = {"model.layers.0.self_attn.indexer": object()}
+
+    with (
+        patch.object(worker, "_raiden_stage3_enabled", return_value=True),
+        patch.object(worker, "_maybe_host_reshard_store"),
+        patch(f"{_MOD}._resolved_reshard_controller_address", return_value="c:1"),
+        patch(f"{_MOD}._glm_indexer_seq_along_lane", return_value=True),
+        pytest.raises(ValueError, match="only on a DCP engine, got topology tp8_"),
+    ):
+        worker._admit_raiden_glm_kv_cache(MagicMock(kv_cache_raw_tensors=()))
+
+
 def test_glm_dcp_producer_publishes_whole_scheduler_blocks():
     producer = _make_raiden_scheduler(is_producer=True, block_size=256, tp_size=16)
     _glm_dcp_config(producer.vllm_config)

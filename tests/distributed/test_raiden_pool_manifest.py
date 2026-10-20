@@ -1027,55 +1027,6 @@ def test_glm_manifest_sparse_mla_pairs():
     rpm.verify_storage_binding(manifest, named, raw_tensors=())
 
 
-def _glm_sparsecore_named_kv_caches(*, nope_rows=256, rope_rows=32):
-    # TPU_SPARSE_MLA_{NOPE,ROPE}_LAYOUT=sparsecore with packed rope: uint32
-    # word rows, one 512 B nope row per token, eight 64 B rope tokens per row.
-    named = {
-        f"model.layers.{idx}.self_attn.attn": (
-            FakeTensor((16, nope_rows, 128), 4, dtype="torch.uint32"),
-            FakeTensor((16, rope_rows, 128), 4, dtype="torch.uint32"),
-        )
-        for idx in range(2)
-    }
-    named["model.layers.0.self_attn.indexer"] = FakeTensor(
-        (16, 64, 4, 256), 1, dtype="torch.uint8"
-    )
-    return named
-
-
-def test_glm_manifest_accepts_sparsecore_word_rows():
-    named = _glm_sparsecore_named_kv_caches()
-    manifest = rpm.build_glm_mla_pool_manifest(
-        named_kv_caches=named, raw_tensors=(), block_size_tokens=256
-    )
-
-    geometry = manifest.geometry_by_tag()
-    assert geometry[rpm.TAG_MLA_NOPE]["live_bytes_per_block"] == 256 * 512
-    assert geometry[rpm.TAG_MLA_ROPE]["live_bytes_per_block"] == 32 * 512
-    for pool in manifest.pools:
-        (region,) = pool.regions
-        if pool.tag == rpm.TAG_MLA_NOPE:
-            assert (region.unit_bytes, region.num_units) == (512, 256)
-        elif pool.tag == rpm.TAG_MLA_ROPE:
-            assert (region.unit_bytes, region.num_units) == (512, 32)
-    rpm.verify_storage_binding(manifest, named, raw_tensors=())
-
-
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        (dict(nope_rows=128), "nope rows 128 do not match"),
-        (dict(rope_rows=24), "word rows 24 do not divide"),
-    ],
-)
-def test_glm_manifest_rejects_bad_sparsecore_geometry(overrides, message):
-    named = _glm_sparsecore_named_kv_caches(**overrides)
-    with pytest.raises(rpm.ManifestError, match=message):
-        rpm.build_glm_mla_pool_manifest(
-            named_kv_caches=named, raw_tensors=(), block_size_tokens=256
-        )
-
-
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
@@ -1090,6 +1041,92 @@ def test_glm_manifest_rejects_bad_sparsecore_geometry(overrides, message):
 def test_glm_manifest_rejects_bad_geometry(overrides, message):
     named = glm_named_kv_caches(**overrides)
     with pytest.raises(rpm.ManifestError, match=message):
+        rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=named, raw_tensors=(), block_size_tokens=_GLM_BLOCK_SIZE
+        )
+
+
+def _glm_sparsecore_caches(
+    nope_shape=(16, _GLM_BLOCK_SIZE, 128), rope_shape=(16, _GLM_BLOCK_SIZE // 4, 128)
+):
+    """GLM caches under TPU_SPARSE_MLA_{NOPE,ROPE}_LAYOUT=sparsecore."""
+    named = glm_named_kv_caches()
+    for idx in range(2):
+        named[f"model.layers.{idx}.self_attn.mla_attn"] = (
+            FakeTensor(nope_shape, 4, dtype="torch.uint32"),
+            FakeTensor(rope_shape, 4, dtype="torch.uint32"),
+        )
+    return named
+
+
+def test_glm_manifest_sparsecore_layout_keeps_tensorcore_geometry():
+    # Both layouts hold a page as the same whole 512-byte rows, so the
+    # transfer lowering must not see a difference.
+    def build(named):
+        return rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=named,
+            raw_tensors=(),
+            block_size_tokens=_GLM_BLOCK_SIZE,
+            per_layer_tags=True,
+        )
+
+    tensorcore = build(glm_named_kv_caches())
+    sparsecore = build(_glm_sparsecore_caches())
+    assert sparsecore.geometry_by_tag() == tensorcore.geometry_by_tag()
+    twins = {pool.tag: pool for pool in tensorcore.pools}
+    for pool in sparsecore.pools:
+        assert pool.regions == twins[pool.tag].regions
+        assert pool.block_stride_bytes == twins[pool.tag].block_stride_bytes
+    assert {
+        pool.dtype_tag for pool in sparsecore.pools if pool.tag.startswith("mla.")
+    } == {"uint32"}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (dict(nope_shape=(16, 512, 128)), "nope rows 512 do not match"),
+        (dict(rope_shape=(16, 300, 128)), "KV block size"),
+        (dict(rope_shape=(16, 256, 120)), "lane-aligned"),
+    ],
+)
+def test_glm_manifest_rejects_bad_sparsecore_geometry(overrides, message):
+    with pytest.raises(rpm.ManifestError, match=message):
+        rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=_glm_sparsecore_caches(**overrides),
+            raw_tensors=(),
+            block_size_tokens=_GLM_BLOCK_SIZE,
+        )
+
+
+def test_glm_manifest_admits_seq_along_lane_indexer_as_whole_pages():
+    named = glm_named_kv_caches(idx_shape=(16, 33, 4, _GLM_BLOCK_SIZE))
+
+    def build(**kwargs):
+        return rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=named,
+            raw_tensors=(),
+            block_size_tokens=_GLM_BLOCK_SIZE,
+            **kwargs,
+        )
+
+    (pool,) = build(indexer_seq_along_lane=True).pools_of_class(rpm.TAG_DSA_IDX)
+    page_bytes = 33 * 4 * _GLM_BLOCK_SIZE
+    assert pool.block_stride_bytes == page_bytes
+    assert [(region.unit_bytes, region.num_units) for region in pool.regions] == [
+        (page_bytes, 1)
+    ]
+    with pytest.raises(rpm.ManifestError, match="KV block size"):
+        build()
+
+
+def test_glm_manifest_rejects_rank3_indexer_cache():
+    # Only the MLA caches have a SparseCore layout.
+    named = glm_named_kv_caches()
+    named["model.layers.0.self_attn.indexer"] = FakeTensor(
+        (16, 256, 256), 4, dtype="torch.uint32"
+    )
+    with pytest.raises(rpm.ManifestError, match="SparseCore uint32"):
         rpm.build_glm_mla_pool_manifest(
             named_kv_caches=named, raw_tensors=(), block_size_tokens=_GLM_BLOCK_SIZE
         )

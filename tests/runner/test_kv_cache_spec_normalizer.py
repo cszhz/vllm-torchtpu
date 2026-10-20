@@ -1,3 +1,17 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
@@ -558,8 +572,8 @@ def test_deepseek_v32_indexer_backend_and_spec_normalizer_raiden_glm_fallback(
     monkeypatch, caplog
 ) -> None:
     """Default 'sal' falls back to HAS shape/page size when Raiden GLM admission
-    is enabled, while explicit 'sal' raises ValueError and DSv4 admission alone
-    does not downgrade."""
+    is enabled, while explicit 'sal' and DSv4 admission alone do not
+    downgrade."""
     import importlib
     import logging
 
@@ -616,19 +630,19 @@ def test_deepseek_v32_indexer_backend_and_spec_normalizer_raiden_glm_fallback(
     ]
     assert len(warnings) == 1
 
-    # 2. Explicit 'sal' + Raiden GLM admission -> ValueError.
+    # 2. Explicit 'sal' + Raiden GLM admission -> keeps SAL (132 B/token).
     monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
     monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
-    with pytest.raises(ValueError, match="Raiden GLM admission"):
-        VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
-            nb, block_size, 1, head_size, torch.uint8
-        )
-    with pytest.raises(ValueError, match="Raiden GLM admission"):
-        normalize_kv_cache_specs_for_tpu(
-            {"indexer": indexer_spec},
-            torch.float8_e4m3fn,
-            attention_backend=PallasAttentionBackend,
-        )
+    shape_explicit = VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
+        nb, block_size, 1, head_size, torch.uint8
+    )
+    assert shape_explicit == (nb, 33, 4, 256)
+    norm_explicit = normalize_kv_cache_specs_for_tpu(
+        {"indexer": indexer_spec},
+        torch.float8_e4m3fn,
+        attention_backend=PallasAttentionBackend,
+    )["indexer"]
+    assert norm_explicit.state_content_bytes == 132
 
     # 3. DSv4 admission alone (with GLM admission off) -> keeps SAL (132 B/token).
     monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
