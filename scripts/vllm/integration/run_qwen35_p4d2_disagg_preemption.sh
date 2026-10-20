@@ -146,7 +146,11 @@ grep -Fqx "TPU_RAIDEN_PREFIX_AWARE_LOAD=${TPU_RAIDEN_PREFIX_AWARE_LOAD}" \
 grep -Fqx "PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE=${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}" \
   "${RUN_DIR}/launch_params.txt"
 grep -Fqx "DECODE_SPECULATIVE_CONFIG=${DECODE_SPECULATIVE_CONFIG}" "${RUN_DIR}/launch_params.txt"
-grep -Fqx 'role=decode kv_load_failure_policy=fail' \
+expected_load_failure_policy=recompute
+if [[ "${PREEMPTION_EXPECT}" == "abort" ]]; then
+  expected_load_failure_policy=fail
+fi
+grep -Fqx "role=decode kv_load_failure_policy=${expected_load_failure_policy}" \
   "${RUN_DIR}/role_wrapper.log"
 if grep -Fq -- '--scheduler-cls' "${RUN_DIR}/prefill_vllm_args.quoted" \
   "${RUN_DIR}/decode_vllm_args.quoted"; then
@@ -157,16 +161,6 @@ if grep -Fq 'raiden_pd_send_completion' "${RUN_DIR}/prefill_vllm_args.quoted"; t
   echo "Capacity test must leave producer send completion disabled" >&2
   exit 1
 fi
-if [[ "${PREEMPTION_EXPECT}" == "abort" ]]; then
-  grep -Fqx 'role=decode additional_config={"abort_on_preemption":true}' \
-    "${RUN_DIR}/role_wrapper.log"
-else
-  if grep -Fq 'abort_on_preemption' "${RUN_DIR}/role_wrapper.log"; then
-    echo "Default-policy baseline unexpectedly enabled abort_on_preemption" >&2
-    exit 1
-  fi
-fi
-
 python scripts/vllm/integration/with_pd_capacity_preemption.py \
   --host "${P4D2_BIND_HOST}" \
   --prefill-port "${PREFILL_PORT}" \

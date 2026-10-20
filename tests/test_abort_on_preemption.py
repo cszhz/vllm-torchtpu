@@ -21,6 +21,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.example_connector import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
@@ -72,12 +73,14 @@ def tiny_model(tmp_path_factory: pytest.TempPathFactory) -> str:
 def _create_scheduler(
     model: str,
     *,
-    enabled: bool | None,
+    load_failure_policy: str = "fail",
+    kv_role: str | None = "kv_consumer",
+    scheduler_cls: type[Scheduler] = Scheduler,
     policy: str = "fcfs",
     num_blocks: int = 11,
     enable_prefix_caching: bool = False,
     hash_additional_config: bool = False,
-    decode_fail: bool = False,
+    raiden_connector: bool = False,
 ) -> Scheduler:
     _patch_vllm_abort_on_preemption()
     model_config = ModelConfig(
@@ -103,21 +106,25 @@ def _create_scheduler(
         enable_prefix_caching=enable_prefix_caching,
     )
     cache_config.num_gpu_blocks = num_blocks
-    additional_config = {} if enabled is None else {"abort_on_preemption": enabled}
     vllm_config = VllmConfig(
         model_config=model_config,
         scheduler_config=scheduler_config,
         cache_config=cache_config,
         parallel_config=ParallelConfig(),
-        additional_config=additional_config,
     )
     # Keep transport I/O out of the ordinary scheduler cases. The composition
     # test retains the real Raiden config and substitutes only factory creation.
-    vllm_config.kv_transfer_config = KVTransferConfig(
-        kv_connector=("TPURaidenConnector" if decode_fail else "ExampleConnector"),
-        kv_role="kv_consumer",
-        kv_connector_extra_config={"shared_storage_path": model},
-        kv_load_failure_policy="fail" if decode_fail else "recompute",
+    vllm_config.kv_transfer_config = (
+        KVTransferConfig(
+            kv_connector=(
+                "TPURaidenConnector" if raiden_connector else "ExampleConnector"
+            ),
+            kv_role=kv_role,
+            kv_connector_extra_config={"shared_storage_path": model},
+            kv_load_failure_policy=load_failure_policy,
+        )
+        if kv_role is not None
+        else None
     )
     if hash_additional_config:
         vllm_config.additional_config = _HashAdditionalConfig()
@@ -133,7 +140,7 @@ def _create_scheduler(
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_spec)],
     )
-    scheduler = Scheduler(
+    scheduler = scheduler_cls(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         block_size=BLOCK_SIZE,
@@ -191,12 +198,22 @@ def _runner_output(
 
 
 @pytest.mark.parametrize("hash_additional_config", [False, True])
-def test_default_off_keeps_capacity_preemption_recomputable(
-    tiny_model, hash_additional_config
+@pytest.mark.parametrize(
+    ("kv_role", "load_failure_policy"),
+    [
+        (None, "fail"),
+        ("kv_producer", "fail"),
+        ("kv_both", "fail"),
+        ("kv_consumer", "recompute"),
+    ],
+)
+def test_other_instances_keep_capacity_preemption_recomputable(
+    tiny_model, hash_additional_config, kv_role, load_failure_policy
 ):
     scheduler = _create_scheduler(
         tiny_model,
-        enabled=None,
+        load_failure_policy=load_failure_policy,
+        kv_role=kv_role,
         num_blocks=6,
         hash_additional_config=hash_additional_config,
     )
@@ -211,10 +228,20 @@ def test_default_off_keeps_capacity_preemption_recomputable(
     assert request.status == RequestStatus.PREEMPTED
     assert request in scheduler.waiting
     assert request.request_id in scheduler.requests
+    assert "_tpu_capacity_preemption" not in scheduler.__dict__
 
 
-def test_last_request_finishes_from_zero_token_preemption_step(tiny_model):
-    scheduler = _create_scheduler(tiny_model, enabled=True, num_blocks=6)
+@pytest.mark.parametrize("scheduler_cls", [Scheduler, AsyncScheduler])
+@pytest.mark.parametrize("hash_additional_config", [False, True])
+def test_fail_policy_finishes_from_zero_token_preemption_step(
+    tiny_model, scheduler_cls, hash_additional_config
+):
+    scheduler = _create_scheduler(
+        tiny_model,
+        scheduler_cls=scheduler_cls,
+        hash_additional_config=hash_additional_config,
+        num_blocks=6,
+    )
     request = _request("last", 80, client_index=2)
     scheduler.add_request(request)
 
@@ -269,9 +296,7 @@ def test_decode_load_failure_and_capacity_terminal_compose_once(
     monkeypatch.setattr(
         KVConnectorFactory, "create_connector", staticmethod(create_example_connector)
     )
-    scheduler = _create_scheduler(
-        tiny_model, enabled=True, num_blocks=6, decode_fail=True
-    )
+    scheduler = _create_scheduler(tiny_model, num_blocks=6, raiden_connector=True)
     assert type(scheduler) is Scheduler
     decode_failures = scheduler._tpu_capacity_preemption.original_update.__self__
     assert isinstance(decode_failures, _DecodeLoadFailures)
@@ -335,7 +360,7 @@ def test_decode_load_failure_and_capacity_terminal_compose_once(
 
 
 def test_terminal_waits_for_its_finished_id_step(tiny_model):
-    scheduler = _create_scheduler(tiny_model, enabled=True, num_blocks=3)
+    scheduler = _create_scheduler(tiny_model, num_blocks=3)
     scheduler.defer_block_free = True
     older = _request("older", 14)
     victim = _request("victim", 16, client_index=4)
@@ -386,9 +411,7 @@ def test_terminal_waits_for_its_finished_id_step(tiny_model):
 
 @pytest.mark.parametrize("policy", ["fcfs", "priority"])
 def test_policy_victim_gets_one_structured_terminal(tiny_model, policy):
-    scheduler = _create_scheduler(
-        tiny_model, enabled=True, policy=policy, num_blocks=11
-    )
+    scheduler = _create_scheduler(tiny_model, policy=policy, num_blocks=11)
     active = _request("active", 80, priority=0, arrival_time=0.0)
     victim = _request("victim", 80, client_index=3, priority=5, arrival_time=1.0)
 
@@ -437,7 +460,7 @@ def test_policy_victim_gets_one_structured_terminal(tiny_model, policy):
 
 @pytest.mark.parametrize("policy", ["fcfs", "priority"])
 def test_inflight_victim_is_kept_while_later_work_runs(tiny_model, policy):
-    scheduler = _create_scheduler(tiny_model, enabled=True, policy=policy, num_blocks=4)
+    scheduler = _create_scheduler(tiny_model, policy=policy, num_blocks=4)
     pressure = _request("pressure", 16, priority=0, arrival_time=0.0)
     schedulable = _request("schedulable", 14, priority=1, arrival_time=1.0)
     victim = _request("victim", 16, priority=5, arrival_time=2.0)
@@ -465,7 +488,6 @@ def test_inflight_victim_is_kept_while_later_work_runs(tiny_model, policy):
 def test_management_reset_still_requeues_requests(tiny_model):
     scheduler = _create_scheduler(
         tiny_model,
-        enabled=True,
         num_blocks=20,
         enable_prefix_caching=True,
     )
@@ -487,7 +509,6 @@ def test_management_reset_still_requeues_requests(tiny_model):
 def test_abort_releases_only_victims_shared_prefix_reference(tiny_model):
     scheduler = _create_scheduler(
         tiny_model,
-        enabled=True,
         num_blocks=20,
         enable_prefix_caching=True,
     )

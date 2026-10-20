@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in capacity preemption errors for vLLM 0.29 KV consumers.
+"""Capacity preemption errors for vLLM 0.29 KV consumers using fail policy.
 
 Only enabled scheduler instances use the adapted allocation loop. The init
 patch leaves the upstream scheduler class, configuration dataclasses and
@@ -85,7 +85,7 @@ def _capacity_schedule(original):
     for before, after in replacements:
         if source.count(before) != 1:
             raise RuntimeError(
-                "abort_on_preemption requires the vLLM 0.29 capacity loop; "
+                "KV consumer fail policy requires the vLLM 0.29 capacity loop; "
                 f"expected one patch context: {before!r}"
             )
         source = source.replace(before, after, 1)
@@ -176,18 +176,13 @@ def patch_scheduler_init() -> None:
 
     @wraps(original_init)
     def init(self, vllm_config, *args, **kwargs):
-        config = vllm_config.additional_config
+        kv = vllm_config.kv_transfer_config
         enabled = (
-            config.get("abort_on_preemption", False)
-            if isinstance(config, dict)
-            else False
+            kv is not None
+            and kv.kv_role == "kv_consumer"
+            and kv.kv_load_failure_policy == "fail"
         )
-        if not isinstance(enabled, bool):
-            raise ValueError("additional_config.abort_on_preemption must be a bool")
         if enabled:
-            kv = vllm_config.kv_transfer_config
-            if kv is None or kv.kv_role != "kv_consumer":
-                raise ValueError("abort_on_preemption requires kv_role='kv_consumer'")
             class_schedule = type(self).schedule
             if class_schedule is original_schedule:
                 schedule = _capacity_schedule(original_schedule)
@@ -197,7 +192,7 @@ def patch_scheduler_init() -> None:
                 )
             else:
                 raise ValueError(
-                    "abort_on_preemption requires the upstream Scheduler.schedule; "
+                    "KV consumer fail policy requires the upstream Scheduler.schedule; "
                     f"{type(self).__name__} overrides it"
                 )
         original_init(self, vllm_config, *args, **kwargs)
@@ -206,7 +201,10 @@ def patch_scheduler_init() -> None:
             self._tpu_capacity_preemption = state
             self.schedule = MethodType(schedule, self)
             self.update_from_output = state.update_from_output
-            logger.info("Enabled capacity preemption abort for KV consumer")
+            logger.info(
+                "Enabled capacity preemption abort for KV consumer "
+                "with kv_load_failure_policy=fail"
+            )
 
     Scheduler.__init__ = init
     Scheduler._tpu_abort_on_preemption_patch = True

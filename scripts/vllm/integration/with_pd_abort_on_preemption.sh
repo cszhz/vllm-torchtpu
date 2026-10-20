@@ -7,6 +7,10 @@ original=("$@")
 inner_wrapper="${PD_CAPACITY_PREEMPTION_INNER_WRAPPER:-}"
 
 if [[ "${role}" == "decode" ]]; then
+  load_failure_policy=recompute
+  if [[ "${PREEMPTION_EXPECT:?PREEMPTION_EXPECT is required}" == "abort" ]]; then
+    load_failure_policy=fail
+  fi
   kv_config_index=""
   for index in "${!original[@]}"; do
     arg="${original[index]}"
@@ -17,42 +21,31 @@ if [[ "${role}" == "decode" ]]; then
       fi
       kv_config_index=$((index + 1))
     fi
-    if [[ "${arg}" == "--additional-config" ]]; then
-      echo "Decode command already has --additional-config; refusing to replace it" >&2
-      exit 2
-    fi
   done
   if [[ -z "${kv_config_index}" ]]; then
     echo "Decode command has no --kv-transfer-config to configure" >&2
     exit 2
   fi
   original[kv_config_index]="$(
-    python - "${original[kv_config_index]}" <<'PY'
+    python - "${original[kv_config_index]}" "${load_failure_policy}" <<'PY'
 import json
 import sys
 
 config = json.loads(sys.argv[1])
+policy = sys.argv[2]
 existing = config.get("kv_load_failure_policy")
-if existing not in (None, "fail"):
+if existing not in (None, policy):
     raise SystemExit(
-        "Decode kv_load_failure_policy conflicts with required fail policy: "
+        f"Decode kv_load_failure_policy conflicts with required {policy} policy: "
         f"{existing!r}"
     )
-config["kv_load_failure_policy"] = "fail"
+config["kv_load_failure_policy"] = policy
 print(json.dumps(config, separators=(",", ":"), sort_keys=True))
 PY
   )"
-  if [[ "${PREEMPTION_EXPECT:?PREEMPTION_EXPECT is required}" == "abort" ]]; then
-    original+=(--additional-config '{"abort_on_preemption":true}')
-  fi
   if [[ -n "${RUN_DIR:-}" ]]; then
-    printf '%s\n' 'role=decode kv_load_failure_policy=fail' \
+    printf 'role=decode kv_load_failure_policy=%s\n' "${load_failure_policy}" \
       >>"${RUN_DIR}/role_wrapper.log"
-    if [[ "${PREEMPTION_EXPECT}" == "abort" ]]; then
-      printf '%s\n' \
-        'role=decode additional_config={"abort_on_preemption":true}' \
-        >>"${RUN_DIR}/role_wrapper.log"
-    fi
   fi
 fi
 
