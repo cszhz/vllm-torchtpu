@@ -140,6 +140,9 @@ export VLLM_PLUGINS=torchtpu,torchtpu_layers
 export PYTHONPATH="/workspace/sitecustomize_bench:/workspace/vllm:/workspace/vllm-torchtpu/src"
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1200
 export TORCHINDUCTOR_AUTOGRAD_CACHE=0 SPEC_WARMUP=0 VLLM_SPEC_WARMUP=0
+# Native aborts (Raiden is C++) still print the Python stack, and nothing is lost
+# in a block-buffered stdout when a worker dies.
+export PYTHONFAULTHANDLER=1 PYTHONUNBUFFERED=1
 
 # --- DeepSeek-V4.1 model env (decode block, no DSpark / DecodeBench) -------
 export TPU_ROPE_CACHE_TRUNCATE=1 TPU_ROPE_CACHE_ROW_MAJOR=1
