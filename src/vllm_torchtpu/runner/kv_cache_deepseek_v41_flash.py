@@ -522,11 +522,19 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
             dtype: torch.dtype = torch.uint8,
             scale_idx: tuple | None = None,
         ) -> torch.Tensor:
-            cache = torch.zeros(shape, dtype=dtype, device=runner.device)
             if scale_idx is not None and main_end > 1:
-                cache[(slice(1, main_end), *scale_idx)] = (
+                # Populate UE8M0 unit scales on CPU and H2D-transfer so XLA's
+                # 4D slice-scatter pass does not leave the TPU layout
+                # unmaterialized or pad non-multiple-of-8 num_blocks (P/D
+                # Raiden admission requires exact block-aligned on-device
+                # bytes and a materialized device layout).
+                cache_cpu = torch.zeros(shape, dtype=dtype)
+                cache_cpu[(slice(1, main_end), *scale_idx)] = (
                     (0x7F << 24) if dtype == torch.int32 else 0x7F
                 )  # e8m0 = 1.0
+                cache = cache_cpu.to(runner.device)
+            else:
+                cache = torch.zeros(shape, dtype=dtype, device=runner.device)
             cache._main_end = main_end
             synchronize_tensors([cache])
             logger.debug(
