@@ -6313,6 +6313,8 @@ class TPURaidenConnectorWorker:
                         raiden_controller_address=controller_address,
                         worker_id=f"worker_{self._local_raiden_transfer_rank()}",
                     )
+        if __import__("os").environ.get("TPU_RAIDEN_PD_PROBE", "0") == "1":
+            self._probe_raiden_manager(kv_caches, manager_kwargs)
         engine = self._new_raiden_manager(**manager_kwargs)
         logger.info(
             "TPURaidenConnectorWorker rank%d --> Raiden engine enabled | "
@@ -6326,6 +6328,51 @@ class TPURaidenConnectorWorker:
             num_slots,
         )
         return engine
+
+    def _probe_raiden_manager(
+        self, kv_caches: list[Any], manager_kwargs: dict[str, Any]
+    ) -> None:
+        """Debug (TPU_RAIDEN_PD_PROBE=1): bisect a native abort in the manager.
+
+        Logs every storage's placement, then builds throwaway managers over
+        (a) one fresh small tensor on the cache device, (b) the first real
+        storage, (c) all storages without the controller registration. The
+        last probe line before an abort names the failing case.
+        """
+        import sys
+
+        def say(msg: str) -> None:
+            print(f"[RAIDEN-PROBE dp{self.dp_rank}] {msg}", flush=True)
+            sys.stdout.flush()
+
+        for i, t in enumerate(kv_caches):
+            say(
+                f"storage {i}: shape={tuple(t.shape)} dtype={t.dtype} "
+                f"device={t.device} contiguous={t.is_contiguous()} "
+                f"offset={t.storage_offset()} stride={tuple(t.stride())} "
+                f"type={type(t).__name__}"
+            )
+        base = {
+            k: v
+            for k, v in manager_kwargs.items()
+            if k
+            not in ("kv_caches", "raiden_worker_port", "raiden_controller_address",
+                    "worker_id", "local_control_port")
+        }
+        port = 31000 + 10 * int(self.dp_rank)
+        cases = [
+            ("fresh_small", [torch.zeros((4, 8, 128), dtype=torch.int32,
+                                         device=kv_caches[0].device)]),
+            ("first_storage", list(kv_caches[:1])),
+            ("all_no_ctrl", list(kv_caches)),
+        ]
+        for j, (name, caches) in enumerate(cases):
+            say(f"case {name} start")
+            mgr = self._new_raiden_manager(
+                kv_caches=caches, local_control_port=port + j, **base
+            )
+            say(f"case {name} OK")
+            del mgr
 
     @staticmethod
     def _wait_for_address_ready(address: str, timeout_s: float = 30.0) -> None:
