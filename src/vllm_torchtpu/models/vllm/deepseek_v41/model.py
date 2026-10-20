@@ -211,6 +211,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
         layer_idx = extract_layer_index(prefix)
+        self.layer_id = layer_idx
         self.is_first_stream_layer = layer_idx in (0, config.num_hidden_layers)
         tp_size = get_tensor_model_parallel_world_size()
         self.attn = VllmDeepseekV41MLAAttention(
@@ -359,7 +360,12 @@ class DeepseekV41DecoderLayer(nn.Module):
         ced_decoder: bool | None = None,
         ced_global_from_encoder: bool | None = None,
         tp_rank_idx: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        capture_entry_aux: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
+        """Returns (ffn_out, residual, ffn_pre, ffn_post, ffn_comb), plus the
+        layer's entry stream averaged over the hc copies when
+        `capture_entry_aux` (the DSpark target hidden state, as in the
+        reference `main_hiddens.append(h.mean(dim=2))` before the layer)."""
         ops = self.mhc_ops
         if (
             getattr(self, "_hc_attn_fn_split", None) is None
@@ -530,6 +536,10 @@ class DeepseekV41DecoderLayer(nn.Module):
                     hc_attn_base,
                 )
 
+        # `residual` is now this layer's entry stream (previous layer's post
+        # mix applied, plus engram if any).
+        entry_aux = residual.mean(dim=-2) if capture_entry_aux else None
+
         if token_sharded:
             x = self.attn(
                 positions,
@@ -593,13 +603,8 @@ class DeepseekV41DecoderLayer(nn.Module):
                     hidden_states_fp8=ffn_fp8,
                     hidden_states_scale=ffn_scale,
                 )
-            return (
-                ffn_out,
-                residual,
-                ffn_pre,
-                ffn_post,
-                ffn_comb,
-            )
+            outs = (ffn_out, residual, ffn_pre, ffn_post, ffn_comb)
+            return (*outs, entry_aux) if capture_entry_aux else outs
         residual, ffn_post, ffn_comb, hidden_states, ffn_pre = ops.fused(
             x,
             residual,
@@ -617,8 +622,37 @@ class DeepseekV41DecoderLayer(nn.Module):
                 return_token_sharded=True,
                 input_is_token_sharded=True,
             )
-            return ffn_out, residual, ffn_pre, ffn_post, ffn_comb
-        return self.ffn(hidden_states), residual, ffn_pre, ffn_post, ffn_comb
+        else:
+            ffn_out = self.ffn(hidden_states)
+        outs = (ffn_out, residual, ffn_pre, ffn_post, ffn_comb)
+        return (*outs, entry_aux) if capture_entry_aux else outs
+
+
+def _gather_aux_hidden_states(
+    aux_hidden_states: list[torch.Tensor], token_sharded_mhc: bool
+) -> list[torch.Tensor]:
+    if not aux_hidden_states or not token_sharded_mhc:
+        return aux_hidden_states
+    if len(aux_hidden_states) == 1:
+        return [tp_all_gather(aux_hidden_states[0], dim=0)]
+    gathered = tp_all_gather(torch.cat(aux_hidden_states, dim=-1), dim=0)
+    return list(gathered.chunk(len(aux_hidden_states), dim=-1))
+
+
+def _run_layer(
+    layer: nn.Module,
+    aux_hidden_state_layers: tuple[int, ...],
+    aux_hidden_states: list[torch.Tensor],
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, ...]:
+    """Run one decoder layer, appending its entry stream when it is a
+    DSpark/eagle target layer."""
+    if aux_hidden_state_layers and getattr(layer, "layer_id", None) in aux_hidden_state_layers:
+        *outs, entry_aux = layer(*args, capture_entry_aux=True, **kwargs)
+        aux_hidden_states.append(entry_aux)
+        return tuple(outs)
+    return layer(*args, **kwargs)
 
 
 def _clear_stage_caches(
@@ -653,6 +687,7 @@ def _run_engram_prelude_and_layers(
     intermediate_tensors: IntermediateTensors | None,
     inputs_embeds: torch.Tensor | None,
     precomputed_engram_hashes: torch.Tensor | None = None,
+    aux_hidden_state_layers: tuple[int, ...] = (),
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -661,6 +696,7 @@ def _run_engram_prelude_and_layers(
     torch.Tensor | None,
     torch.Tensor | None,
     bool,
+    list[torch.Tensor],
 ]:
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size > 1 and _TOKEN_SHARD_MIN_TOKENS > 0:
@@ -759,6 +795,7 @@ def _run_engram_prelude_and_layers(
         pre_mix = intermediate_tensors["pre_mix"]
 
     previous_x, previous_post_mix, previous_res_mix = None, None, None
+    aux_hidden_states: list[torch.Tensor] = []
     for layer in layers:
         if (
             layer.engram is not None
@@ -804,7 +841,10 @@ def _run_engram_prelude_and_layers(
             pre_mix,
             previous_post_mix,
             previous_res_mix,
-        ) = layer(
+        ) = _run_layer(
+            layer,
+            aux_hidden_state_layers,
+            aux_hidden_states,
             positions,
             hidden_states,
             pre_mix,
@@ -823,6 +863,7 @@ def _run_engram_prelude_and_layers(
         previous_post_mix,
         previous_res_mix,
         token_sharded_mhc,
+        aux_hidden_states,
     )
 
 
@@ -859,6 +900,9 @@ class DeepseekV41FullStage(nn.Module):
         self._single_backbone_cond = single_backbone_cond
         self._engram_table_ids = engram_table_ids
         self._engram_packed_dim = engram_packed_dim
+        # Layer ids whose entry stream feeds the DSpark drafter (set by
+        # DeepseekV41Model._set_aux_hidden_state_layers before warmup).
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
         self.embed_tokens = embed_tokens
         self.layers = nn.ModuleList(layers)
         self.engram_hash = engram_hash
@@ -874,7 +918,7 @@ class DeepseekV41FullStage(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         engram_hashes: torch.Tensor | None = None,
         run_upper_layers: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if self._single_backbone_cond:
             from vllm_torchtpu.models.vllm.deepseek_v41.cond_backbone import (
                 _dsv41_cond_upper_boundary_op,
@@ -891,6 +935,7 @@ class DeepseekV41FullStage(nn.Module):
                 previous_post_mix,
                 previous_res_mix,
                 token_sharded_mhc,
+                aux_hidden_states,
             ) = _run_engram_prelude_and_layers(
                 embed_tokens=self.embed_tokens,
                 layers=enc_layers,
@@ -905,6 +950,7 @@ class DeepseekV41FullStage(nn.Module):
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 precomputed_engram_hashes=engram_hashes,
+                aux_hidden_state_layers=self.aux_hidden_state_layers,
             )
             _clear_stage_caches(enc_layers)
             hidden_states, normalized = get_mhc_post_collapse_norm_v41_op(
@@ -932,7 +978,10 @@ class DeepseekV41FullStage(nn.Module):
                     pre_mix,
                     previous_post_mix,
                     previous_res_mix,
-                ) = layer(
+                ) = _run_layer(
+                    layer,
+                    self.aux_hidden_state_layers,
+                    aux_hidden_states,
                     positions,
                     hidden_states,
                     pre_mix,
@@ -956,6 +1005,10 @@ class DeepseekV41FullStage(nn.Module):
             )
             if token_sharded_mhc:
                 out = tp_all_gather(out, dim=0)
+            if self.aux_hidden_state_layers:
+                return out, _gather_aux_hidden_states(
+                    aux_hidden_states, token_sharded_mhc
+                )
             return out
 
         (
@@ -966,6 +1019,7 @@ class DeepseekV41FullStage(nn.Module):
             previous_post_mix,
             previous_res_mix,
             token_sharded_mhc,
+            aux_hidden_states,
         ) = _run_engram_prelude_and_layers(
             embed_tokens=self.embed_tokens,
             layers=self.layers,
@@ -980,6 +1034,7 @@ class DeepseekV41FullStage(nn.Module):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             precomputed_engram_hashes=engram_hashes,
+            aux_hidden_state_layers=self.aux_hidden_state_layers,
         )
         _clear_stage_caches(self.layers)
         if not get_pp_group().is_last_rank:
@@ -999,6 +1054,8 @@ class DeepseekV41FullStage(nn.Module):
         )
         if token_sharded_mhc:
             out = tp_all_gather(out, dim=0)
+        if self.aux_hidden_state_layers:
+            return out, _gather_aux_hidden_states(aux_hidden_states, token_sharded_mhc)
         return out
 
 
@@ -1060,6 +1117,7 @@ class DeepseekV41EncoderStage(nn.Module):
             previous_post_mix,
             previous_res_mix,
             token_sharded_mhc,
+            aux_hidden_states,
         ) = _run_engram_prelude_and_layers(
             embed_tokens=self.embed_tokens,
             layers=self.layers,
@@ -1431,6 +1489,22 @@ class DeepseekV41Model(nn.Module):
                     self._ced_enabled,
                     envs.VLLM_DSV41_TP_ATTN_MIN_TOKENS,
                 )
+
+    def _set_aux_hidden_state_layers(self, layer_ids: tuple[int, ...]) -> None:
+        """Capture the entry stream of `layer_ids` for the DSpark drafter.
+
+        Only the full stage captures them; the CED encoder/decoder split does
+        not (decode runs with CED off).
+        """
+        self.aux_hidden_state_layers = tuple(layer_ids)
+        if self.full_stage is not None:
+            self.full_stage.aux_hidden_state_layers = self.aux_hidden_state_layers
+        if self.decoder_stage is not None and self.aux_hidden_state_layers:
+            logger.warning(
+                "DeepSeek-V4.1: aux hidden states %s are not captured on the "
+                "CED decoder stage; DSpark gets them only from the full stage.",
+                self.aux_hidden_state_layers,
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1999,6 +2073,12 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
     """DeepSeek-V4.1 causal language model on TPU."""
 
     model_cls = DeepseekV41Model  # type: ignore[assignment]
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # DSpark on V4.1 reads the *entry* stream of its target layers
+        # (dspark_target_layer_ids, unshifted). The V4 base only records the
+        # ids on the model, which the V4.1 stages never read.
+        self.model._set_aux_hidden_state_layers(tuple(layers))
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         if not envs.VLLM_DSV41_PURE_20L_PREFILL:
