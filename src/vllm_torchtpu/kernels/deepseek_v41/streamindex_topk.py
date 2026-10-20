@@ -41,8 +41,6 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import 
 from vllm_torchtpu.kernels.deepseek_v41.sparsecore_topk import (
     sc_build_cand_page_table,
     sc_cand_gather_topk,
-    sc_cand_pregathered_topk,
-    sc_gather_cand_kv_blocks,
     sc_write_cand_and_topk,
     sparsecore_topk,
 )
@@ -200,19 +198,15 @@ def kernel(
         bkv_idx = bkv_block(p_id)
 
         w_data = weights_vmem[...].reshape(seq_batch_size, -1, num_q_heads)
-        w_pre_folded = q_hm_ref is not None
+        w_pre_folded = False
         if q_hm_ref is not None:
-            w_f32 = w_data[0].astype(jnp.float32)
-            w_max = jnp.max(w_f32, axis=-1, keepdims=True)
-            bq_weights_vec = [w_max]
 
             @pl.when(bkv_idx == 0)
             def _():
-                rel_w = jnp.where(w_max > 0.0, w_f32 / w_max, 0.0)[:, :, None]
-                q_scaled = (q_vmem[...].astype(jnp.float32) * rel_w).astype(q_vmem.dtype)
-                q_hm_ref[...] = transpose_to_head_major(q_scaled, bq_sz)
+                q_hm_ref[...] = transpose_to_head_major(q_vmem[...], bq_sz)
 
             bq_vec = [q_hm_ref[...]]
+            bq_weights_vec = [w_data[0]]
         else:
             q_data = q_vmem[...].reshape(seq_batch_size, -1, head_dim)
             bq_vec = [q_data[i] for i in range(seq_batch_size)]
@@ -220,9 +214,7 @@ def kernel(
 
         chunk_start = start_end_seq_idx_ref[2]
         q_iota = jnp.arange(bq_sz, dtype=jnp.int32)
-        k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
-            jnp.int32, (bq_sz, bkv_sz), 1
-        )
+        k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, (bq_sz, bkv_sz), 1)
         lane_id = (
             lax.broadcasted_iota(jnp.int32, (1, num_blk_sublanes_bkv, 128), 2)
             if produce_blk_scores
@@ -253,7 +245,12 @@ def kernel(
         for batch_idx in range(seq_batch_size):
             bq = bq_vec[batch_idx].reshape(-1, head_dim)
             s_summed = (
-                reduce_heads(bq, bkvs[batch_idx], bq_weights_vec[batch_idx], w_pre_folded=w_pre_folded)
+                reduce_heads(
+                    bq,
+                    bkvs[batch_idx],
+                    bq_weights_vec[batch_idx],
+                    w_pre_folded=w_pre_folded,
+                )
                 * bkv_scales[batch_idx]
             )
             kv_len = seq_lens_ref[batch_start_seq_idx + batch_idx] >> shift_comp
@@ -529,9 +526,7 @@ def _compute_metadata(
             c_le = chunk_ends[:, None] <= all_steps[None, :]
             c_start_step = jnp.max(jnp.where(c_le, chunk_ends[:, None], 0), axis=0)
             step_in_chunk = all_steps - c_start_step
-            c_idx = jnp.minimum(
-                jnp.sum(c_le, axis=0, dtype=jnp.int32), num_chunks - 1
-            )
+            c_idx = jnp.minimum(jnp.sum(c_le, axis=0, dtype=jnp.int32), num_chunks - 1)
             chunk_hit = (
                 jnp.arange(num_chunks, dtype=jnp.int32)[:, None] == c_idx[None, :]
             )
@@ -549,18 +544,14 @@ def _compute_metadata(
             seg_tile = jnp.minimum(
                 jnp.sum(t_le, axis=0, dtype=jnp.int32), max_seq_tiles - 1
             )
-            tile_start_in_chunk = jnp.max(
-                jnp.where(t_le, step_tile_ends, 0), axis=0
-            )
+            tile_start_in_chunk = jnp.max(jnp.where(t_le, step_tile_ends, 0), axis=0)
             start_step_id_repeat = jnp.where(
                 valid_step, c_start_step + tile_start_in_chunk, 0
             )
             tile_step_id = all_steps - start_step_id_repeat
         else:
             seg_num_steps = seg_num_steps_2d.reshape(-1)
-            seg_start_step_id = jnp.cumulative_sum(
-                seg_num_steps, include_initial=True
-            )
+            seg_start_step_id = jnp.cumulative_sum(seg_num_steps, include_initial=True)
             valid_step = all_steps < seg_start_step_id[-1]
             # Gather-free step -> segment lookup. seg_start_step_id is non-decreasing,
             # so counting segment ends <= step equals searchsorted(side="right"); the
@@ -603,7 +594,11 @@ def _chunk_and_bq_config(max_num_tokens: int) -> tuple[int, int, int, int]:
     bkv_p = 16 if is_decode_or_verify else 8
     chunk_tokens = (
         512
-        if (not is_decode_or_verify and max_num_tokens >= 512 and max_num_tokens % 512 == 0)
+        if (
+            not is_decode_or_verify
+            and max_num_tokens >= 512
+            and max_num_tokens % 512 == 0
+        )
         else {
             1536: 512,
             1280: 640,
@@ -896,9 +891,7 @@ def streamindex_topk(
 
     bq_mixed = min(num_queries_per_block, chunk_len)
     decode_req_batch_size = 4
-    decode_batch_end = (
-        distribution[0] // decode_req_batch_size * decode_req_batch_size
-    )
+    decode_batch_end = distribution[0] // decode_req_batch_size * decode_req_batch_size
     # Rows: (start_seq, end_seq, seq_batch_size, bq_sz, case).
     pass_specs = (
         (jnp.array(0), decode_batch_end, decode_req_batch_size, 1, MlaCase.DECODE),
@@ -1049,12 +1042,8 @@ def streamindex_topk(
                         batch_tile_idx=precomputed_pass_schedules[
                             3 * idx, :max_steps_i
                         ],
-                        bq_idx=precomputed_pass_schedules[
-                            3 * idx + 1, :max_steps_i
-                        ],
-                        bkv_idx=precomputed_pass_schedules[
-                            3 * idx + 2, :max_steps_i
-                        ],
+                        bq_idx=precomputed_pass_schedules[3 * idx + 1, :max_steps_i],
+                        bkv_idx=precomputed_pass_schedules[3 * idx + 2, :max_steps_i],
                     ),
                 )
             )
@@ -1126,9 +1115,7 @@ def streamindex_topk(
                     pred = pred & (slice_spec[3] < start + chunk_len)
                 state = lax.cond(pred, run, lambda s: s, state)
             else:
-                state = lax.cond(
-                    slice_spec[3] < slice_spec[4], run, lambda s: s, state
-                )
+                state = lax.cond(slice_spec[3] < slice_spec[4], run, lambda s: s, state)
         assert state is not None
         scores, blk_scores = state
         assert scores is not None

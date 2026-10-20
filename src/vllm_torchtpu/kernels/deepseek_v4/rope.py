@@ -611,11 +611,12 @@ def _rope_quant_body(
 ) -> None:
     """Process one ``(tile_n, [num_heads,] LANE)`` chunk with optional w_scale."""
     x_raw = x_ref[...]
+    w_sign = None
     if has_w_scale:
         w_ref, q_ref, scale_ref = rest_refs
-        x_raw = (x_raw.astype(jnp.float32) * w_ref[...][..., None]).astype(
-            x_raw.dtype
-        )
+        w_val = w_ref[...].astype(jnp.float32)[..., None]
+        w_sign = jnp.sign(w_val)
+        x_raw = (x_raw.astype(jnp.float32) * jnp.abs(w_val)).astype(x_raw.dtype)
     else:
         q_ref, scale_ref = rest_refs
     x = x_raw.astype(jnp.float32)
@@ -635,6 +636,8 @@ def _rope_quant_body(
     scale = abs_max / qmax
     scale_inv = jnp.where(abs_max == 0.0, 0.0, 1.0 / scale)
     q_ref[...] = (y * scale_inv).astype(quant_dtype)
+    if w_sign is not None:
+        scale = scale * w_sign
     scale_ref[...] = scale.reshape(scale_ref.shape)
 
 
@@ -767,12 +770,8 @@ def rmsnorm_rope(
     w_block_shape = (1,) * (len(x_block_shape) - 1) + (x_block_shape[-1],)
     cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
 
-    x_idx_map = (
-        (lambda i: (i, 0, 0)) if len(x_block_shape) == 3 else (lambda i: (i, 0))
-    )
-    w_idx_map = (
-        (lambda i: (0, 0, 0)) if len(x_block_shape) == 3 else (lambda i: (0, 0))
-    )
+    x_idx_map = (lambda i: (i, 0, 0)) if len(x_block_shape) == 3 else (lambda i: (i, 0))
+    w_idx_map = (lambda i: (0, 0, 0)) if len(x_block_shape) == 3 else (lambda i: (0, 0))
 
     return pl.pallas_call(
         functools.partial(
@@ -821,9 +820,9 @@ def _qkv_norm_rope_quant_body(
     abs_max = jnp.max(jnp.abs(qr_f32), axis=-1, keepdims=True)
     lhs_s = abs_max / FP8_E4M3_MAX
     lhs_s_safe = jnp.where(lhs_s == 0.0, 1.0, lhs_s)
-    qr_fp8_ref[...] = jnp.clip(
-        qr_f32 / lhs_s_safe, -FP8_E4M3_MAX, FP8_E4M3_MAX
-    ).astype(jnp.float8_e4m3fn)
+    qr_fp8_ref[...] = jnp.clip(qr_f32 / lhs_s_safe, -FP8_E4M3_MAX, FP8_E4M3_MAX).astype(
+        jnp.float8_e4m3fn
+    )
     qr_s_ref[...] = jnp.broadcast_to(lhs_s_safe, (qr_kv.shape[0], LANE))
 
     kv_rms = jax.lax.rsqrt(jnp.mean(kv_x * kv_x, axis=-1, keepdims=True) + kv_eps)
@@ -936,7 +935,14 @@ def qkv_norm_rope_quant(
     """Fused q_norm + qr FP8 quant + kv_norm + RoPE in a single Pallas kernel."""
     cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
     return qkv_norm_rope_quant_cos_sin(
-        qr_kv, q_weight, kv_weight, cos_sin, eps=eps, q_eps=q_eps, kv_eps=kv_eps, name=name
+        qr_kv,
+        q_weight,
+        kv_weight,
+        cos_sin,
+        eps=eps,
+        q_eps=q_eps,
+        kv_eps=kv_eps,
+        name=name,
     )
 
 
@@ -1051,7 +1057,14 @@ def qkv_norm_rope(
     """Fused q_norm + kv_norm + RoPE outputting [num_tokens, q_dim + kv_dim] directly for tp_all_gather."""
     cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
     return qkv_norm_rope_cos_sin(
-        qr_kv, q_weight, kv_weight, cos_sin, eps=eps, q_eps=q_eps, kv_eps=kv_eps, name=name
+        qr_kv,
+        q_weight,
+        kv_weight,
+        cos_sin,
+        eps=eps,
+        q_eps=q_eps,
+        kv_eps=kv_eps,
+        name=name,
     )
 
 
@@ -1178,9 +1191,9 @@ def _qkv_norm_rope_and_quant_body(
     abs_max = jnp.max(jnp.abs(qr_f32), axis=-1, keepdims=True)
     lhs_s = abs_max / FP8_E4M3_MAX
     lhs_s_safe = jnp.where(lhs_s == 0.0, 1.0, lhs_s)
-    qr_fp8_ref[...] = jnp.clip(
-        qr_f32 / lhs_s_safe, -FP8_E4M3_MAX, FP8_E4M3_MAX
-    ).astype(jnp.float8_e4m3fn)
+    qr_fp8_ref[...] = jnp.clip(qr_f32 / lhs_s_safe, -FP8_E4M3_MAX, FP8_E4M3_MAX).astype(
+        jnp.float8_e4m3fn
+    )
     qr_s_ref[...] = jnp.broadcast_to(lhs_s_safe, (qr_kv.shape[0], LANE))
 
     kv_rms = jax.lax.rsqrt(jnp.mean(kv_x * kv_x, axis=-1, keepdims=True) + kv_eps)
@@ -1288,5 +1301,12 @@ def qkv_norm_rope_and_quant(
     """Fused q_norm + kv_norm + RoPE + local qr FP8 quant in a single Pallas kernel."""
     cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
     return qkv_norm_rope_and_quant_cos_sin(
-        qr_kv, q_weight, kv_weight, cos_sin, eps=eps, q_eps=q_eps, kv_eps=kv_eps, name=name
+        qr_kv,
+        q_weight,
+        kv_weight,
+        cos_sin,
+        eps=eps,
+        q_eps=q_eps,
+        kv_eps=kv_eps,
+        name=name,
     )

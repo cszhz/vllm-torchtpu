@@ -36,7 +36,21 @@ from vllm_torchtpu.kernels.deepseek_v41.sparse_mla import (
 from vllm_torchtpu.kernels.deepseek_v41.streamindex_topk import (
     streamindex_topk,
 )
+from vllm_torchtpu import envs
 from vllm_torchtpu.utils import largest_divisor
+
+
+def _prefill_role() -> bool:
+    """True on the dedicated prefill node (VLLM_DSV41_PURE_20L_PREFILL=1).
+
+    Selects the prefill-tuned variants (last-token-only compressor state writes,
+    8-deep scatter ring, Pallas insert at >=384 tokens, 64-page decode indexer KV
+    blocks, padded/lane-aligned fused wq_b kernel). Everything else (decode node,
+    spec decode, prefix caching) keeps the decode stack's variants: per-token
+    state writes are required whenever a step can start at an arbitrary
+    position (DSpark rollback, prefix-cache hit). Read at trace time.
+    """
+    return bool(envs.VLLM_DSV41_PURE_20L_PREFILL)
 
 
 def _seq_ids_from_locs(
@@ -150,6 +164,7 @@ def compress_r2_pool_norm_jax(
     ).reshape(eff_max_seqs, 1024)
 
     token_idx = jnp.arange(num_tokens, dtype=jnp.int32)
+
     def _single_seq_prev():
         return jnp.concatenate([seq_cache_prev[:1], wkv_wgate[:-1]], axis=0)
 
@@ -161,9 +176,7 @@ def compress_r2_pool_norm_jax(
         batch_prev = wkv_wgate[jnp.clip(token_idx - 1, 0, num_tokens - 1)]
         req = _seq_ids_from_locs(query_start_loc, num_tokens, eff_max_seqs)
         in_batch_prev = token_idx > query_start_loc[req]
-        return jnp.where(
-            in_batch_prev[:, None], batch_prev, seq_cache_prev[req]
-        )
+        return jnp.where(in_batch_prev[:, None], batch_prev, seq_cache_prev[req])
 
     prev_kv_score = jax.lax.cond(
         distribution[2] <= 1,
@@ -171,17 +184,34 @@ def compress_r2_pool_norm_jax(
         _multi_seq_prev,
     )
 
-    req_all = _seq_ids_from_locs(query_start_loc, num_tokens, eff_max_seqs)
-    valid_all = token_idx < query_start_loc[distribution[2]]
-    should_write = valid_all & ((pos & 1) == 0)
-    write_slots = jnp.where(
-        should_write,
-        _state_slot_for(req_all, pos),
-        total_state_slots,
-    )
-    wkv_words = jax.lax.bitcast_convert_type(
-        wkv_wgate.reshape(num_tokens, 8, 128), jnp.int32
-    )
+    if _prefill_role():
+        # Prefill node: no spec-decode rollback / prefix-cache hits, so only the
+        # last token of each sequence needs to persist its (even-pos) state.
+        last_tok_idx = jnp.clip(q_end - 1, 0, num_tokens - 1)
+        last_pos = pos[last_tok_idx]
+        should_write = seq_valid & ((last_pos & 1) == 0)
+        write_slots = jnp.where(
+            should_write,
+            _state_slot_for(seq_ids, last_pos),
+            total_state_slots,
+        )
+        wkv_words = jax.lax.bitcast_convert_type(
+            wkv_wgate[last_tok_idx].reshape(eff_max_seqs, 8, 128), jnp.int32
+        )
+    else:
+        # Decode stack: persist every even-position token so a step may resume
+        # from any position (DSpark verify rollback, prefix-cache hit).
+        req_all = _seq_ids_from_locs(query_start_loc, num_tokens, eff_max_seqs)
+        valid_all = token_idx < query_start_loc[distribution[2]]
+        should_write = valid_all & ((pos & 1) == 0)
+        write_slots = jnp.where(
+            should_write,
+            _state_slot_for(req_all, pos),
+            total_state_slots,
+        )
+        wkv_words = jax.lax.bitcast_convert_type(
+            wkv_wgate.reshape(num_tokens, 8, 128), jnp.int32
+        )
     state_slots = state_slots.at[write_slots].set(wkv_words, mode="drop")
 
     kv0, score0 = prev_kv_score[:, :head_dim], prev_kv_score[:, head_dim:]
@@ -219,12 +249,14 @@ def compressor_insert_cache_jax(
     token_idx = jnp.arange(num_tokens, dtype=jnp.int32)
     valid = token_idx < query_start_loc[distribution[2]]
     is_boundary = (
-        valid
-        if compress_ratio == 1
-        else (valid & (((pos + 1) % compress_ratio) == 0))
+        valid if compress_ratio == 1 else (valid & (((pos + 1) % compress_ratio) == 0))
     )
 
-    use_pallas = num_tokens > 512 and page_size % 32 == 0
+    # Prefill-tuned threshold (>=384) vs decode stack (>512): differs only for
+    # 384 <= T <= 512, i.e. the decode T=384 bucket.
+    use_pallas = (
+        num_tokens >= 384 if _prefill_role() else num_tokens > 512
+    ) and page_size % 32 == 0
     M = num_tokens
     latent_work = latent
     pos_work = pos
@@ -305,7 +337,9 @@ def compressor_insert_cache_jax(
         )
         eff_step = 1 if (num_tokens >= 384 and compress_ratio > 1) else compress_ratio
         rope_cache = _scatter_packed_4_jax(
-            rope_cache.reshape(num_pages * (page_size // 4), csa_cache_layout.ROW_WORDS),
+            rope_cache.reshape(
+                num_pages * (page_size // 4), csa_cache_layout.ROW_WORDS
+            ),
             rope_records,
             kv_slot,
             is_boundary,
@@ -496,7 +530,9 @@ def compressor_insert_cache_jax(
                 d_q = jnp.bitwise_and(shift, 3)
                 lane_sh = pltpu.roll(comb_rope, d_q * 32, axis=1)
                 sh0 = pltpu.roll(lane_sh, d_r, axis=0)
-                sh1 = pltpu.roll(lane_sh, jnp.bitwise_and(d_r + 1, rope_tile - 1), axis=0)
+                sh1 = pltpu.roll(
+                    lane_sh, jnp.bitwise_and(d_r + 1, rope_tile - 1), axis=0
+                )
                 upd_rope = jnp.where(q_iota < d_q, sh1, sh0)
 
                 @pl.when(full == 1)
@@ -583,7 +619,7 @@ def _scatter_packed_4_jax(
 
     if num_tokens >= 192:
         K = min(num_tokens, align_to(cdiv(num_tokens, 4 * step) + 96, 32))
-        if K < num_tokens:
+        if num_tokens > K:
             first_idx = _compact_indices(is_first, K)
             safe_f = jnp.maximum(first_idx, 0)
             f_row = row_id[safe_f]
@@ -656,9 +692,7 @@ def indexer_produce_k_jax(
     token_idx = jnp.arange(num_tokens, dtype=jnp.int32)
     valid = token_idx < query_start_loc[distribution[2]]
     is_boundary = (
-        valid
-        if compress_ratio == 1
-        else (valid & (((pos + 1) % compress_ratio) == 0))
+        valid if compress_ratio == 1 else (valid & (((pos + 1) % compress_ratio) == 0))
     )
 
     pos_work = pos
@@ -666,7 +700,9 @@ def indexer_produce_k_jax(
         # Compact to boundary tokens so the tile loop only visits written rows.
         M = min(
             num_tokens,
-            max(tile_k, align_to((num_tokens + eff_max_seqs) // compress_ratio, tile_k)),
+            max(
+                tile_k, align_to((num_tokens + eff_max_seqs) // compress_ratio, tile_k)
+            ),
         )
         owned_idx = _compact_indices(is_boundary, M)
         safe_idx = jnp.maximum(owned_idx, 0)
@@ -753,9 +789,9 @@ def indexer_produce_k_jax(
     num_m_tiles = cdiv(M, tile_k)
     pad_m = (num_m_tiles + 1) * tile_k - M
     tok_words_padded = jnp.pad(k_records_i32, ((0, pad_m), (0, pad_groups)))
-    tok_tiles = tok_words_padded.reshape(num_m_tiles + 1, tile_k, padded_groups).transpose(
-        0, 2, 1
-    )
+    tok_tiles = tok_words_padded.reshape(
+        num_m_tiles + 1, tile_k, padded_groups
+    ).transpose(0, 2, 1)
 
     # SEQ_ALONG_LANE puts tokens on lanes, so each touched tile is either
     # written directly when full or read-merged-written when partial.
@@ -872,7 +908,9 @@ def indexer_produce_k_jax(
                     if tile_k == 128:
                         valid_mask = (tid >= 0) & (lane_1d >= l0) & (lane_1d < l_end)
                         vmem_cache_ref.at[cur_buf][...] = jnp.where(
-                            valid_mask[:, None, :], upd_u8, vmem_cache_ref.at[cur_buf][...]
+                            valid_mask[:, None, :],
+                            upd_u8,
+                            vmem_cache_ref.at[cur_buf][...],
                         )
                     else:
                         valid0 = (tid >= 0) & (lane_1d >= l0) & (lane_1d < l_end)
@@ -880,11 +918,11 @@ def indexer_produce_k_jax(
                         valid1 = (tid >= 0) & (lane_hi >= l0) & (lane_hi < l_end)
                         cur0 = vmem_cache_ref.at[cur_buf, :, :, pl.ds(0, 128)][...]
                         cur1 = vmem_cache_ref.at[cur_buf, :, :, pl.ds(128, 128)][...]
-                        vmem_cache_ref.at[cur_buf, :, :, pl.ds(0, 128)][...] = jnp.where(
-                            valid0[:, None, :], upd_u8[:, :, :128], cur0
+                        vmem_cache_ref.at[cur_buf, :, :, pl.ds(0, 128)][...] = (
+                            jnp.where(valid0[:, None, :], upd_u8[:, :, :128], cur0)
                         )
-                        vmem_cache_ref.at[cur_buf, :, :, pl.ds(128, 128)][...] = jnp.where(
-                            valid1[:, None, :], upd_u8[:, :, 128:], cur1
+                        vmem_cache_ref.at[cur_buf, :, :, pl.ds(128, 128)][...] = (
+                            jnp.where(valid1[:, None, :], upd_u8[:, :, 128:], cur1)
                         )
 
             _start_write(i, cur_buf)
@@ -957,12 +995,8 @@ def fused_indexer_produce_k_jax(
             ).astype(jnp.bfloat16)
         )
     k_f32 = k_raw.astype(jnp.float32)
-    rstd = jax.lax.rsqrt(
-        jnp.mean(k_f32 * k_f32, axis=-1, keepdims=True) + rms_eps
-    )
-    k_normed = (k_f32 * rstd).astype(jnp.bfloat16) * knorm_weight.astype(
-        jnp.bfloat16
-    )
+    rstd = jax.lax.rsqrt(jnp.mean(k_f32 * k_f32, axis=-1, keepdims=True) + rms_eps)
+    k_normed = (k_f32 * rstd).astype(jnp.bfloat16) * knorm_weight.astype(jnp.bfloat16)
     return indexer_produce_k_jax(
         k_normed,
         cos_sin_cache,
@@ -1036,9 +1070,7 @@ def _fused_quant_pack_and_single_pallas_scatter(
 
     valid = token_idx < query_start_loc[distribution[2]]
     is_boundary_all = (
-        valid
-        if compress_ratio == 1
-        else (valid & (((pos + 1) % compress_ratio) == 0))
+        valid if compress_ratio == 1 else (valid & (((pos + 1) % compress_ratio) == 0))
     )
 
     num_kv_pages, kv_page_size = nope_cache.shape[:2]
@@ -1048,11 +1080,7 @@ def _fused_quant_pack_and_single_pallas_scatter(
 
     tile_k = (
         256
-        if (
-            num_tokens > 1536
-            and kv_page_size % 256 == 0
-            and idx_page_size % 256 == 0
-        )
+        if (num_tokens > 1536 and kv_page_size % 256 == 0 and idx_page_size % 256 == 0)
         else 128
     )
     use_narrow_nr = num_tokens <= 1536
@@ -1064,11 +1092,13 @@ def _fused_quant_pack_and_single_pallas_scatter(
         if compress_ratio == 1
         else min(
             num_tokens,
-            max(tile_k, align_to((num_tokens + eff_max_seqs) // compress_ratio, tile_k)),
+            max(
+                tile_k, align_to((num_tokens + eff_max_seqs) // compress_ratio, tile_k)
+            ),
         )
     )
 
-    if compress_ratio == 2 and M == num_tokens // 2:
+    if compress_ratio == 2 and num_tokens // 2 == M:
         even_is_b = is_boundary_all[0]
 
         def _fast_strided_idx():
@@ -1253,11 +1283,62 @@ def _fused_quant_pack_and_single_pallas_scatter(
         num_m_tiles + 1, tile_k, padded_groups
     ).transpose(0, 2, 1)
 
-    has_state_cache = state_slots_in is not None
-    ring_depth = 4
+    has_state_cache = st_write_slots is not None
+    state_in_nope = has_state_cache and state_slots_in is None
+    states_per_page_dma = nope_cache.shape[1] // 8
+    # State-write loops run over st_should_write's length: eff_max_seqs for
+    # last-token writes (prefill role), num_tokens for per-token writes (decode).
+    # Prefill role: 8-deep VMEM ring, reads prefetched half_ring tiles ahead.
+    # Decode role: the decode stack's 4-deep ring (read issued after the write
+    # retire on the same buffer). sbuf = vbuf % half_ring == vbuf when the
+    # ring is 4 deep, so the shared helpers below trace the decode kernel.
+    deep_ring = _prefill_role()
+    half_ring = 4
+    ring_depth = 8 if deep_ring else 4
 
     def _single_cache_kernel(*args):
-        if has_state_cache:
+        if state_in_nope:
+            (
+                tile_ids_ref,
+                idx_pages_ref,
+                safe_t0_ref,
+                lanes0_ref,
+                lanes_end_ref,
+                is_full_ref,
+                st_slots_ref,
+                st_should_ref,
+                n_tiles_ref,
+                st_words_vmem_ref,
+                nope_tiles_vmem_ref,
+                rope_tiles_vmem_ref,
+                k_tiles_vmem_ref,
+                nope_in_hbm_ref,
+                rope_in_hbm_ref,
+                k_in_hbm_ref,
+                nope_out_hbm_ref,
+                rope_out_hbm_ref,
+                k_out_hbm_ref,
+                vmem_nope_ref,
+                vmem_rope_ref,
+                vmem_k_ref,
+                sem_ref,
+                st_sem_ref,
+                *wide_scratch,
+            ) = args
+
+            @pl.loop(0, st_should_ref.shape[0])
+            def _issue_state_writes(s_i):
+                @pl.when(st_should_ref[s_i] == 1)
+                def _do_st():
+                    slot = st_slots_ref[s_i]
+                    p_st = slot // states_per_page_dma
+                    r_st = (slot % states_per_page_dma) * 8
+                    pltpu.make_async_copy(
+                        st_words_vmem_ref.at[s_i],
+                        nope_out_hbm_ref.at[p_st, pl.ds(r_st, 8), :],
+                        st_sem_ref.at[0],
+                    ).start()
+        elif has_state_cache:
             (
                 tile_ids_ref,
                 idx_pages_ref,
@@ -1358,7 +1439,8 @@ def _fused_quant_pack_and_single_pallas_scatter(
                 is_nar,
             )
 
-        def _start_read_all3(idx, buf):
+        def _start_read_all3(idx, vbuf):
+            sbuf = vbuf % half_ring
             (
                 p_kv,
                 p_idx,
@@ -1374,83 +1456,88 @@ def _fused_quant_pack_and_single_pallas_scatter(
             @pl.when(is_full_ref[idx] == 0)
             def _rd():
                 if use_narrow_nr:
+
                     @pl.when(is_nar)
                     def _rd_nar():
                         pltpu.make_async_copy(
                             nope_in_hbm_ref.at[p_kv, pl.ds(nope_nar_off, nr_dma), :],
-                            vmem_nope_ref.at[buf],
-                            sem_ref.at[0, buf],
+                            vmem_nope_ref.at[vbuf],
+                            sem_ref.at[0, sbuf],
                         ).start()
                         pltpu.make_async_copy(
                             rope_in_hbm_ref.at[p_kv, pl.ds(rope_nar_off, rope_dma), :],
-                            vmem_rope_ref.at[buf],
-                            sem_ref.at[1, buf],
+                            vmem_rope_ref.at[vbuf],
+                            sem_ref.at[1, sbuf],
                         ).start()
 
                     @pl.when(~is_nar)
                     def _rd_wide():
                         pltpu.make_async_copy(
                             nope_in_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
-                            vmem_nope_wide_ref.at[buf],
-                            sem_wide_ref.at[0, buf],
+                            vmem_nope_wide_ref.at[vbuf],
+                            sem_wide_ref.at[0, sbuf],
                         ).start()
                         pltpu.make_async_copy(
                             rope_in_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
-                            vmem_rope_wide_ref.at[buf],
-                            sem_wide_ref.at[1, buf],
+                            vmem_rope_wide_ref.at[vbuf],
+                            sem_wide_ref.at[1, sbuf],
                         ).start()
                 else:
                     pltpu.make_async_copy(
                         nope_in_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
-                        vmem_nope_ref.at[buf],
-                        sem_ref.at[0, buf],
+                        vmem_nope_ref.at[vbuf],
+                        sem_ref.at[0, sbuf],
                     ).start()
                     pltpu.make_async_copy(
                         rope_in_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
-                        vmem_rope_ref.at[buf],
-                        sem_ref.at[1, buf],
+                        vmem_rope_ref.at[vbuf],
+                        sem_ref.at[1, sbuf],
                     ).start()
                 pltpu.make_async_copy(
                     k_in_hbm_ref.at[p_idx, :, :, pl.ds(k_off, tile_k)],
-                    vmem_k_ref.at[buf],
-                    sem_ref.at[2, buf],
+                    vmem_k_ref.at[vbuf],
+                    sem_ref.at[2, sbuf],
                 ).start()
 
-        def _wait_read_nr_nar(idx, buf):
+        def _wait_read_nr_nar(idx, vbuf):
+            sbuf = vbuf % half_ring
             p_kv, _, _, _, nope_nar_off, rope_nar_off, _, _, _ = _tile_hbm_slices(idx)
             pltpu.make_async_copy(
                 nope_in_hbm_ref.at[p_kv, pl.ds(nope_nar_off, nr_dma), :],
-                vmem_nope_ref.at[buf],
-                sem_ref.at[0, buf],
+                vmem_nope_ref.at[vbuf],
+                sem_ref.at[0, sbuf],
             ).wait()
             pltpu.make_async_copy(
                 rope_in_hbm_ref.at[p_kv, pl.ds(rope_nar_off, rope_dma), :],
-                vmem_rope_ref.at[buf],
-                sem_ref.at[1, buf],
+                vmem_rope_ref.at[vbuf],
+                sem_ref.at[1, sbuf],
             ).wait()
 
-        def _wait_read_nr_wide(idx, buf, n_buf_ref, r_buf_ref, s_ref):
+        def _wait_read_nr_wide(idx, vbuf, n_buf_ref, r_buf_ref, s_ref):
+            sbuf = vbuf % half_ring
             p_kv, _, k_off, r_tile_off, _, _, _, _, _ = _tile_hbm_slices(idx)
             pltpu.make_async_copy(
                 nope_in_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
-                n_buf_ref.at[buf],
-                s_ref.at[0, buf],
+                n_buf_ref.at[vbuf],
+                s_ref.at[0, sbuf],
             ).wait()
             pltpu.make_async_copy(
                 rope_in_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
-                r_buf_ref.at[buf],
-                s_ref.at[1, buf],
+                r_buf_ref.at[vbuf],
+                s_ref.at[1, sbuf],
             ).wait()
 
-        def _wait_read_k(idx, buf):
+        def _wait_read_k(idx, vbuf):
+            sbuf = vbuf % half_ring
             _, p_idx, k_off, _, _, _, _, _, _ = _tile_hbm_slices(idx)
             pltpu.make_async_copy(
                 k_in_hbm_ref.at[p_idx, :, :, pl.ds(k_off, tile_k)],
-                vmem_k_ref.at[buf],
-                sem_ref.at[2, buf],
+                vmem_k_ref.at[vbuf],
+                sem_ref.at[2, sbuf],
             ).wait()
 
-        def _start_write_all3(idx, buf):
+        def _start_write_all3(idx, vbuf):
+            sbuf = vbuf % half_ring
             (
                 p_kv,
                 p_idx,
@@ -1463,49 +1550,51 @@ def _fused_quant_pack_and_single_pallas_scatter(
                 is_nar,
             ) = _tile_hbm_slices(idx)
             if use_narrow_nr:
+
                 @pl.when(is_nar)
                 def _wr_nar():
                     pltpu.make_async_copy(
-                        vmem_nope_ref.at[buf],
+                        vmem_nope_ref.at[vbuf],
                         nope_out_hbm_ref.at[p_kv, pl.ds(nope_nar_off, nr_dma), :],
-                        sem_ref.at[3, buf],
+                        sem_ref.at[3, sbuf],
                     ).start()
                     pltpu.make_async_copy(
-                        vmem_rope_ref.at[buf],
+                        vmem_rope_ref.at[vbuf],
                         rope_out_hbm_ref.at[p_kv, pl.ds(rope_nar_off, rope_dma), :],
-                        sem_ref.at[4, buf],
+                        sem_ref.at[4, sbuf],
                     ).start()
 
                 @pl.when(~is_nar)
                 def _wr_wide():
                     pltpu.make_async_copy(
-                        vmem_nope_wide_ref.at[buf],
+                        vmem_nope_wide_ref.at[vbuf],
                         nope_out_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
-                        sem_wide_ref.at[2, buf],
+                        sem_wide_ref.at[2, sbuf],
                     ).start()
                     pltpu.make_async_copy(
-                        vmem_rope_wide_ref.at[buf],
+                        vmem_rope_wide_ref.at[vbuf],
                         rope_out_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
-                        sem_wide_ref.at[3, buf],
+                        sem_wide_ref.at[3, sbuf],
                     ).start()
             else:
                 pltpu.make_async_copy(
-                    vmem_nope_ref.at[buf],
+                    vmem_nope_ref.at[vbuf],
                     nope_out_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
-                    sem_ref.at[3, buf],
+                    sem_ref.at[3, sbuf],
                 ).start()
                 pltpu.make_async_copy(
-                    vmem_rope_ref.at[buf],
+                    vmem_rope_ref.at[vbuf],
                     rope_out_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
-                    sem_ref.at[4, buf],
+                    sem_ref.at[4, sbuf],
                 ).start()
             pltpu.make_async_copy(
-                vmem_k_ref.at[buf],
+                vmem_k_ref.at[vbuf],
                 k_out_hbm_ref.at[p_idx, :, :, pl.ds(k_off, tile_k)],
-                sem_ref.at[5, buf],
+                sem_ref.at[5, sbuf],
             ).start()
 
-        def _wait_write_all3(idx, buf):
+        def _wait_write_all3(idx, vbuf):
+            sbuf = vbuf % half_ring
             (
                 p_kv,
                 p_idx,
@@ -1518,60 +1607,64 @@ def _fused_quant_pack_and_single_pallas_scatter(
                 is_nar,
             ) = _tile_hbm_slices(idx)
             if use_narrow_nr:
+
                 @pl.when(is_nar)
                 def _ww_nar():
                     pltpu.make_async_copy(
-                        vmem_nope_ref.at[buf],
+                        vmem_nope_ref.at[vbuf],
                         nope_out_hbm_ref.at[p_kv, pl.ds(nope_nar_off, nr_dma), :],
-                        sem_ref.at[3, buf],
+                        sem_ref.at[3, sbuf],
                     ).wait()
                     pltpu.make_async_copy(
-                        vmem_rope_ref.at[buf],
+                        vmem_rope_ref.at[vbuf],
                         rope_out_hbm_ref.at[p_kv, pl.ds(rope_nar_off, rope_dma), :],
-                        sem_ref.at[4, buf],
+                        sem_ref.at[4, sbuf],
                     ).wait()
 
                 @pl.when(~is_nar)
                 def _ww_wide():
                     pltpu.make_async_copy(
-                        vmem_nope_wide_ref.at[buf],
+                        vmem_nope_wide_ref.at[vbuf],
                         nope_out_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
-                        sem_wide_ref.at[2, buf],
+                        sem_wide_ref.at[2, sbuf],
                     ).wait()
                     pltpu.make_async_copy(
-                        vmem_rope_wide_ref.at[buf],
+                        vmem_rope_wide_ref.at[vbuf],
                         rope_out_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
-                        sem_wide_ref.at[3, buf],
+                        sem_wide_ref.at[3, sbuf],
                     ).wait()
             else:
                 pltpu.make_async_copy(
-                    vmem_nope_ref.at[buf],
+                    vmem_nope_ref.at[vbuf],
                     nope_out_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
-                    sem_ref.at[3, buf],
+                    sem_ref.at[3, sbuf],
                 ).wait()
                 pltpu.make_async_copy(
-                    vmem_rope_ref.at[buf],
+                    vmem_rope_ref.at[vbuf],
                     rope_out_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
-                    sem_ref.at[4, buf],
+                    sem_ref.at[4, sbuf],
                 ).wait()
             pltpu.make_async_copy(
-                vmem_k_ref.at[buf],
+                vmem_k_ref.at[vbuf],
                 k_out_hbm_ref.at[p_idx, :, :, pl.ds(k_off, tile_k)],
-                sem_ref.at[5, buf],
+                sem_ref.at[5, sbuf],
             ).wait()
 
-        @pl.loop(0, jnp.minimum(n_tiles, ring_depth))
+        @pl.loop(0, jnp.minimum(n_tiles, half_ring))
         def _prologue(p_i):
             _start_read_all3(p_i, p_i)
 
         @pl.loop(0, n_tiles)
         def _step(i):
             cur_buf = i % ring_depth
+            ahead_buf = (i + half_ring) % ring_depth
 
-            @pl.when(i >= ring_depth)
-            def _wait_ring_write():
-                _wait_write_all3(i - ring_depth, cur_buf)
-                _start_read_all3(i, cur_buf)
+            @pl.when(i >= half_ring)
+            def _retire_write():
+                _wait_write_all3(i - half_ring, ahead_buf)
+                if not deep_ring:
+                    # 4-deep ring: ahead_buf == cur_buf; re-arm it for tile i.
+                    _start_read_all3(i, cur_buf)
 
             tid = tile_ids_ref[i]
             t0 = safe_t0_ref[i]
@@ -1606,16 +1699,18 @@ def _fused_quant_pack_and_single_pallas_scatter(
                     d_q = jnp.bitwise_and(shift_k, 3)
                     lane_sh = pltpu.roll(comb_rope, d_q * 32, axis=1)
                     sh0 = pltpu.roll(lane_sh, d_r, axis=0)
-                    sh1 = pltpu.roll(lane_sh, jnp.bitwise_and(d_r + 1, rope_tile - 1), axis=0)
+                    sh1 = pltpu.roll(
+                        lane_sh, jnp.bitwise_and(d_r + 1, rope_tile - 1), axis=0
+                    )
                     upd_rope = jnp.where(q_iota < d_q, sh1, sh0)
 
                     kt0 = k_tiles_vmem_ref[m_tile]
                     kt1 = k_tiles_vmem_ref[m_tile + 1]
                     comb_k = jnp.where(lanes_full >= m_off, kt0, kt1)
                     rolled_k = pltpu.roll(comb_k, shift_k, axis=1)
-                    upd_k = pltpu.bitcast(rolled_k[:sublane_groups, :], jnp.uint8).reshape(
-                        sublane_groups, pack, tile_k
-                    )
+                    upd_k = pltpu.bitcast(
+                        rolled_k[:sublane_groups, :], jnp.uint8
+                    ).reshape(sublane_groups, pack, tile_k)
 
                     @pl.when(full == 1)
                     def _store_full():
@@ -1625,8 +1720,12 @@ def _fused_quant_pack_and_single_pallas_scatter(
 
                     @pl.when(full == 0)
                     def _store_partial():
-                        valid_nope = (tid >= 0) & (sublanes_nr >= l0) & (sublanes_nr < l_end)
-                        valid_rope = (tid >= 0) & (slot_rope >= l0) & (slot_rope < l_end)
+                        valid_nope = (
+                            (tid >= 0) & (sublanes_nr >= l0) & (sublanes_nr < l_end)
+                        )
+                        valid_rope = (
+                            (tid >= 0) & (slot_rope >= l0) & (slot_rope < l_end)
+                        )
                         _wait_read_nr_wide(i, cur_buf, n_buf_ref, r_buf_ref, s_ref)
                         _wait_read_k(i, cur_buf)
                         n_buf_ref.at[cur_buf][...] = jnp.where(
@@ -1646,11 +1745,11 @@ def _fused_quant_pack_and_single_pallas_scatter(
                             valid1 = (tid >= 0) & (lane_hi >= l0) & (lane_hi < l_end)
                             cur0 = vmem_k_ref.at[cur_buf, :, :, pl.ds(0, 128)][...]
                             cur1 = vmem_k_ref.at[cur_buf, :, :, pl.ds(128, 128)][...]
-                            vmem_k_ref.at[cur_buf, :, :, pl.ds(0, 128)][...] = jnp.where(
-                                valid0[:, None, :], upd_k[:, :, :128], cur0
+                            vmem_k_ref.at[cur_buf, :, :, pl.ds(0, 128)][...] = (
+                                jnp.where(valid0[:, None, :], upd_k[:, :, :128], cur0)
                             )
-                            vmem_k_ref.at[cur_buf, :, :, pl.ds(128, 128)][...] = jnp.where(
-                                valid1[:, None, :], upd_k[:, :, 128:], cur1
+                            vmem_k_ref.at[cur_buf, :, :, pl.ds(128, 128)][...] = (
+                                jnp.where(valid1[:, None, :], upd_k[:, :, 128:], cur1)
                             )
 
             if use_narrow_nr:
@@ -1659,7 +1758,9 @@ def _fused_quant_pack_and_single_pallas_scatter(
                 @pl.when(is_nar)
                 def _store_nar_tile():
                     shift_nope = jnp.bitwise_and((l0 - sub_off) - m_off, tile_k - 1)
-                    shift_rope = jnp.bitwise_and((l0 - r_sub_off * 4) - m_off, tile_k - 1)
+                    shift_rope = jnp.bitwise_and(
+                        (l0 - r_sub_off * 4) - m_off, tile_k - 1
+                    )
 
                     n0 = nope_tiles_vmem_ref[m_tile]
                     n1 = nope_tiles_vmem_ref[m_tile + 1]
@@ -1673,23 +1774,31 @@ def _fused_quant_pack_and_single_pallas_scatter(
                     d_q = jnp.bitwise_and(shift_rope, 3)
                     lane_sh = pltpu.roll(comb_rope, d_q * 32, axis=1)
                     sh0 = pltpu.roll(lane_sh, d_r, axis=0)
-                    sh1 = pltpu.roll(lane_sh, jnp.bitwise_and(d_r + 1, rope_tile - 1), axis=0)
+                    sh1 = pltpu.roll(
+                        lane_sh, jnp.bitwise_and(d_r + 1, rope_tile - 1), axis=0
+                    )
                     upd_rope_sub = jnp.where(q_iota < d_q, sh1, sh0)[:rope_dma]
 
                     kt0 = k_tiles_vmem_ref[m_tile]
                     kt1 = k_tiles_vmem_ref[m_tile + 1]
                     comb_k = jnp.where(lanes_full >= m_off, kt0, kt1)
                     rolled_k = pltpu.roll(comb_k, shift_k, axis=1)
-                    upd_k = pltpu.bitcast(rolled_k[:sublane_groups, :], jnp.uint8).reshape(
-                        sublane_groups, pack, tile_k
-                    )
+                    upd_k = pltpu.bitcast(
+                        rolled_k[:sublane_groups, :], jnp.uint8
+                    ).reshape(sublane_groups, pack, tile_k)
 
                     _wait_read_nr_nar(i, cur_buf)
                     _wait_read_k(i, cur_buf)
                     sub_nr_narrow = sublanes_nr[:nr_dma] + sub_off
-                    valid_nope = (tid >= 0) & (sub_nr_narrow >= l0) & (sub_nr_narrow < l_end)
+                    valid_nope = (
+                        (tid >= 0) & (sub_nr_narrow >= l0) & (sub_nr_narrow < l_end)
+                    )
                     slot_rope_narrow = slot_rope[:rope_dma] + (r_sub_off * 4)
-                    valid_rope = (tid >= 0) & (slot_rope_narrow >= l0) & (slot_rope_narrow < l_end)
+                    valid_rope = (
+                        (tid >= 0)
+                        & (slot_rope_narrow >= l0)
+                        & (slot_rope_narrow < l_end)
+                    )
                     valid_k = (tid >= 0) & (lane_1d >= l0) & (lane_1d < l_end)
                     vmem_nope_ref.at[cur_buf][...] = jnp.where(
                         valid_nope, upd_nope_sub, vmem_nope_ref.at[cur_buf][...]
@@ -1703,17 +1812,40 @@ def _fused_quant_pack_and_single_pallas_scatter(
 
                 @pl.when(~is_nar)
                 def _store_wide_fallback():
-                    _write_wide_tile(vmem_nope_wide_ref, vmem_rope_wide_ref, sem_wide_ref)
+                    _write_wide_tile(
+                        vmem_nope_wide_ref, vmem_rope_wide_ref, sem_wide_ref
+                    )
             else:
                 _write_wide_tile(vmem_nope_ref, vmem_rope_ref, sem_ref)
 
+            if deep_ring:
+
+                @pl.when(i + half_ring < n_tiles)
+                def _prefetch_read():
+                    _start_read_all3(i + half_ring, ahead_buf)
+
             _start_write_all3(i, cur_buf)
 
-        @pl.loop(jnp.maximum(0, n_tiles - ring_depth), n_tiles)
+        @pl.loop(jnp.maximum(0, n_tiles - half_ring), n_tiles)
         def _epilogue(e_i):
             _wait_write_all3(e_i, e_i % ring_depth)
 
-        if has_state_cache:
+        if state_in_nope:
+
+            @pl.loop(0, st_should_ref.shape[0])
+            def _wait_all_state_writes_nope(s_i):
+                @pl.when(st_should_ref[s_i] == 1)
+                def _wt_st():
+                    slot = st_slots_ref[s_i]
+                    p_st = slot // states_per_page_dma
+                    r_st = (slot % states_per_page_dma) * 8
+                    pltpu.make_async_copy(
+                        st_words_vmem_ref.at[s_i],
+                        nope_out_hbm_ref.at[p_st, pl.ds(r_st, 8), :],
+                        st_sem_ref.at[0],
+                    ).wait()
+        elif has_state_cache:
+
             @pl.when(n_st > 0)
             def _wait_all_state_writes():
                 pltpu.make_async_copy(
@@ -1730,7 +1862,7 @@ def _fused_quant_pack_and_single_pallas_scatter(
         pltpu.VMEM((ring_depth, n_buf_rows, 128), jnp.int32),
         pltpu.VMEM((ring_depth, r_buf_rows, 128), jnp.int32),
         pltpu.VMEM((ring_depth, sublane_groups, pack, tile_k), jnp.uint8),
-        pltpu.SemaphoreType.DMA((6, ring_depth)),
+        pltpu.SemaphoreType.DMA((6, half_ring)),
     ]
     if has_state_cache:
         scratch_list.append(pltpu.SemaphoreType.DMA((1,)))
@@ -1739,8 +1871,56 @@ def _fused_quant_pack_and_single_pallas_scatter(
             [
                 pltpu.VMEM((ring_depth, tile_k, 128), jnp.int32),
                 pltpu.VMEM((ring_depth, rope_tile, 128), jnp.int32),
-                pltpu.SemaphoreType.DMA((4, ring_depth)),
+                pltpu.SemaphoreType.DMA((4, half_ring)),
             ]
+        )
+
+    if state_in_nope:
+        return pl.pallas_call(
+            _single_cache_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=9,
+                grid=(1,),
+                in_specs=[
+                    vmem_spec,
+                    vmem_spec,
+                    vmem_spec,
+                    vmem_spec,
+                    hbm_spec,
+                    hbm_spec,
+                    hbm_spec,
+                ],
+                out_specs=[hbm_spec, hbm_spec, hbm_spec],
+                scratch_shapes=scratch_list,
+            ),
+            out_shape=(
+                jax.ShapeDtypeStruct(nope_cache.shape, nope_cache.dtype),
+                jax.ShapeDtypeStruct(rope_cache.shape, rope_cache.dtype),
+                jax.ShapeDtypeStruct(k_cache.shape, k_cache.dtype),
+            ),
+            input_output_aliases={13: 0, 14: 1, 15: 2},
+            compiler_params=pltpu.CompilerParams(
+                vmem_limit_bytes=100 * 1024 * 1024,
+                disable_bounds_checks=True,
+            ),
+            name=f"fused_single_pallas_3cache_r2_aliased_{compress_ratio}",
+        )(
+            tile_ids,
+            idx_pages,
+            safe_t0,
+            lanes0,
+            lanes_end,
+            is_full,
+            st_write_slots,
+            st_should_write,
+            jnp.asarray([n_active_tiles, n_st_writes], dtype=jnp.int32),
+            st_wkv_words,
+            nope_tiles,
+            rope_tiles,
+            k_tiles,
+            nope_cache,
+            rope_cache,
+            k_cache,
         )
 
     if has_state_cache:
@@ -1916,10 +2096,11 @@ def fused_compress_r2_insert_produce_k_jax(
     eff_max_seqs = min(max_num_seqs, max(8, align_to(num_tokens, 8)))
 
     max_state_blocks = state_block_table.shape[0] // max_num_seqs
-    num_st_pages, st_page_size = state_cache.shape[:2]
+    st_src = nope_cache if state_cache is None else state_cache
+    num_st_pages, st_page_size = st_src.shape[:2]
     states_per_page = st_page_size // 8
     total_state_slots = num_st_pages * states_per_page
-    state_slots_in = state_cache.reshape((total_state_slots, 8, 128))
+    state_slots_in = st_src.reshape((total_state_slots, 8, 128))
 
     pos = positions.astype(jnp.int32)
     seq_ids = jnp.arange(eff_max_seqs, dtype=jnp.int32)
@@ -1964,28 +2145,38 @@ def fused_compress_r2_insert_produce_k_jax(
         _multi_seq_prev,
     )
 
-    req_all = _seq_ids_from_locs(query_start_loc, num_tokens, eff_max_seqs)
-    valid_all = token_idx < query_start_loc[distribution[2]]
-    st_should_write = (valid_all & ((pos & 1) == 0)).astype(jnp.int32)
-    n_st_writes = jnp.sum(st_should_write).astype(jnp.int32)
-    st_write_slots = _state_slot_for(req_all, pos)
-    st_wkv_words = jax.lax.bitcast_convert_type(
-        wkv_wgate.reshape(num_tokens, 8, 128), jnp.int32
-    )
+    if _prefill_role():
+        # Last token per sequence only (see compress_r2_pool_norm_jax).
+        last_tok_idx = jnp.clip(q_end - 1, 0, num_tokens - 1)
+        last_pos = pos[last_tok_idx]
+        st_should_write = (seq_valid & ((last_pos & 1) == 0)).astype(jnp.int32)
+        n_st_writes = jnp.sum(st_should_write).astype(jnp.int32)
+        st_write_slots = _state_slot_for(seq_ids, last_pos)
+        st_wkv_words = jax.lax.bitcast_convert_type(
+            wkv_wgate[last_tok_idx].reshape(eff_max_seqs, 8, 128), jnp.int32
+        )
+    else:
+        # Every even-position token (decode stack; DSpark rollback-safe).
+        req_all = _seq_ids_from_locs(query_start_loc, num_tokens, eff_max_seqs)
+        valid_all = token_idx < query_start_loc[distribution[2]]
+        st_should_write = (valid_all & ((pos & 1) == 0)).astype(jnp.int32)
+        n_st_writes = jnp.sum(st_should_write).astype(jnp.int32)
+        st_write_slots = _state_slot_for(req_all, pos)
+        st_wkv_words = jax.lax.bitcast_convert_type(
+            wkv_wgate.reshape(num_tokens, 8, 128), jnp.int32
+        )
 
     kv0, score0 = prev_kv_score[:, :head_dim], prev_kv_score[:, head_dim:]
     kv1, score1 = wkv_wgate[:, :head_dim], wkv_wgate[:, head_dim:]
     max_s = jnp.maximum(score0, score1)
     e0, e1 = jnp.exp(score0 - max_s), jnp.exp(score1 - max_s)
     pf32 = ((e0 * kv0 + e1 * kv1) / (e0 + e1)).astype(jnp.bfloat16).astype(jnp.float32)
-    rstd = jax.lax.rsqrt(
-        jnp.mean(pf32 * pf32, axis=-1, keepdims=True) + comp_rms_eps
-    )
+    rstd = jax.lax.rsqrt(jnp.mean(pf32 * pf32, axis=-1, keepdims=True) + comp_rms_eps)
     latent = jax.lax.optimization_barrier(
         (pf32 * rstd).astype(jnp.bfloat16) * norm_weight.astype(jnp.bfloat16)
     )
 
-    new_st_slots, new_nope, new_rope, new_k = _fused_quant_pack_and_single_pallas_scatter(
+    scatter_out = _fused_quant_pack_and_single_pallas_scatter(
         latent,
         wk_weight,
         knorm_weight,
@@ -2002,16 +2193,19 @@ def fused_compress_r2_insert_produce_k_jax(
         wk_weight_scale,
         compress_ratio=compress_ratio,
         idx_rms_eps=idx_rms_eps,
-        state_slots_in=state_slots_in,
+        state_slots_in=(None if state_cache is None else state_slots_in),
         st_write_slots=st_write_slots,
         st_should_write=st_should_write,
         st_wkv_words=st_wkv_words,
         n_st_writes=n_st_writes,
     )
+    if state_cache is None:
+        return scatter_out  # type: ignore[return-value]
+    new_st_slots, new_nope, new_rope, new_k = scatter_out
     return new_st_slots.reshape(state_cache.shape), new_nope, new_rope, new_k
 
 
-def fused_indexer_wq_b_rope_quant_jax(
+def _fused_indexer_wq_b_rope_quant_decode_jax(
     query_fp8: jax.Array,  # [num_tokens, q_lora_rank] f8
     query_scale: jax.Array,  # [num_tokens, 1] f32
     wq_b_weight: jax.Array,  # [q_lora_rank, n_head * head_dim] f8
@@ -2024,7 +2218,10 @@ def fused_indexer_wq_b_rope_quant_jax(
     n_head: int,
     head_dim: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """Single pipelined Pallas kernel: FP8 wq_b GEMM + w_scale + RoPE + FP8 quant in VMEM."""
+    """Decode-stack variant of fused_indexer_wq_b_rope_quant_jax (unpadded,
+    largest_divisor tiling, [T, 1] query scale), plus the signed head-weight fix:
+    q is scaled by |w_h| and the output scale carries sign(w_h).
+    """
     num_tokens, k_dim = query_fp8.shape
     out_features = n_head * head_dim
     tile_n = largest_divisor(num_tokens, cap=128)
@@ -2061,8 +2258,9 @@ def fused_indexer_wq_b_rope_quant_jax(
                 .astype(jnp.bfloat16)
                 .reshape(tile_n, n_head, head_dim)
             )
+            ws = ws_ref[...].astype(jnp.float32)
             x = (
-                (q_bf16.astype(jnp.float32) * ws_ref[...][..., None])
+                (q_bf16.astype(jnp.float32) * jnp.abs(ws)[..., None])
                 .astype(jnp.bfloat16)
                 .astype(jnp.float32)
             )
@@ -2074,7 +2272,7 @@ def fused_indexer_wq_b_rope_quant_jax(
             scale = abs_max / jnp.float32(448.0)
             scale_inv = jnp.where(abs_max == 0.0, 0.0, 1.0 / scale)
             q_out_ref[...] = (y * scale_inv).astype(jnp.float8_e4m3fn)
-            s_out_ref[...] = scale.reshape(tile_n, n_head)
+            s_out_ref[...] = scale.reshape(tile_n, n_head) * jnp.sign(ws)
 
         q_in_spec = pl.BlockSpec(
             (tile_n, k_dim), lambda i: (i, 0), memory_space=pltpu.VMEM
@@ -2147,6 +2345,172 @@ def fused_indexer_wq_b_rope_quant_jax(
     )
 
 
+def fused_indexer_wq_b_rope_quant_jax(
+    query_fp8: jax.Array,  # [num_tokens, q_lora_rank] f8
+    query_scale: jax.Array,  # [num_tokens, 1] f32
+    wq_b_weight: jax.Array,  # [q_lora_rank, n_head * head_dim] f8
+    wq_b_weight_scale: jax.Array,  # [n_head * head_dim] f32
+    positions: jax.Array,  # [num_tokens] i32
+    cos_sin_cache: jax.Array,  # [max_pos, 64] f32
+    indexer_weights: jax.Array,  # [num_tokens, n_head] bf16/f32
+    *,
+    softmax_scale: float,
+    n_head: int,
+    head_dim: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Single pipelined Pallas kernel: FP8 wq_b GEMM + w_scale + RoPE + FP8 quant in VMEM."""
+    if not _prefill_role():
+        return _fused_indexer_wq_b_rope_quant_decode_jax(
+            query_fp8,
+            query_scale,
+            wq_b_weight,
+            wq_b_weight_scale,
+            positions,
+            cos_sin_cache,
+            indexer_weights,
+            softmax_scale=softmax_scale,
+            n_head=n_head,
+            head_dim=head_dim,
+        )
+    orig_num_tokens, k_dim = query_fp8.shape
+    pad_align = 8 if orig_num_tokens <= 128 else 128
+    pad_t = align_to(orig_num_tokens, pad_align) - orig_num_tokens
+    if pad_t > 0:
+        query_fp8 = jnp.pad(query_fp8, ((0, pad_t), (0, 0)))
+        query_scale = jnp.pad(query_scale, ((0, pad_t), (0, 0)))
+        positions = jnp.pad(positions, ((0, pad_t),))
+        indexer_weights = jnp.pad(indexer_weights, ((0, pad_t), (0, 0)))
+    num_tokens = orig_num_tokens + pad_t
+    out_features = n_head * head_dim
+    tile_n = num_tokens if num_tokens <= 128 else 128
+    num_tiles = num_tokens // tile_n
+    n_head_aligned = align_to(n_head, 128)
+    cs_expanded = _expand_cos_sin(positions, cos_sin_cache)
+    w_scale_all = indexer_weights.astype(jnp.float32) * softmax_scale * (n_head**-0.5)
+    if n_head_aligned > n_head:
+        w_scale_all = jnp.pad(w_scale_all, ((0, 0), (0, n_head_aligned - n_head)))
+    q_scale_all = jnp.broadcast_to(
+        query_scale.astype(jnp.float32), (num_tokens, head_dim)
+    )
+
+    def _pallas_fused_kernel(
+        q_fp8_hbm_ref,
+        cs_hbm_ref,
+        w_s_hbm_ref,
+        q_s_hbm_ref,
+        wqb_w_vmem_ref,
+        wqb_s_vmem_ref,
+        q_out_hbm_ref,
+        s_out_hbm_ref,
+    ):
+        lane = jnp.arange(head_dim)
+        sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
+        w_mat = wqb_w_vmem_ref[...]
+        ws_vec = wqb_s_vmem_ref[...][None, :]
+
+        def _pipe_step(q_ref, cs_ref, ws_ref, qs_ref, q_out_ref, s_out_ref):
+            proj = jnp.einsum(
+                "tk,kn->tn",
+                q_ref[...],
+                w_mat,
+                preferred_element_type=jnp.float32,
+            )
+            proj_scaled = (proj * ws_vec).reshape(tile_n, n_head, head_dim)
+            q_bf16 = (proj_scaled * qs_ref[...][:, None, :]).astype(jnp.bfloat16)
+            ws_unpad = ws_ref[...][:, :n_head].astype(jnp.float32)
+            x = (
+                (q_bf16.astype(jnp.float32) * jnp.abs(ws_unpad)[..., None])
+                .astype(jnp.bfloat16)
+                .astype(jnp.float32)
+            )
+            cs = cs_ref[...]
+            cos = cs[:, None, :head_dim]
+            sin = cs[:, None, head_dim:] * sign[None, None, :]
+            y = x * cos + _lane_gather(x, lane ^ 1) * sin
+            abs_max = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
+            scale = abs_max / jnp.float32(448.0)
+            scale_inv = jnp.where(abs_max == 0.0, 0.0, 1.0 / scale)
+            q_out_ref[...] = (y * scale_inv).astype(jnp.float8_e4m3fn)
+            s_unpad = scale.reshape(tile_n, n_head) * jnp.sign(ws_unpad)
+            if n_head_aligned > n_head:
+                s_out_ref[...] = jnp.pad(
+                    s_unpad, ((0, 0), (0, n_head_aligned - n_head))
+                )
+            else:
+                s_out_ref[...] = s_unpad
+
+        q_in_spec = pl.BlockSpec(
+            (tile_n, k_dim), lambda i: (i, 0), memory_space=pltpu.VMEM
+        )
+        cs_in_spec = pl.BlockSpec(
+            (tile_n, 2 * head_dim), lambda i: (i, 0), memory_space=pltpu.VMEM
+        )
+        ws_in_spec = pl.BlockSpec(
+            (tile_n, n_head_aligned), lambda i: (i, 0), memory_space=pltpu.VMEM
+        )
+        qs_in_spec = pl.BlockSpec(
+            (tile_n, head_dim), lambda i: (i, 0), memory_space=pltpu.VMEM
+        )
+        q_out_spec = pl.BlockSpec(
+            (tile_n, n_head, head_dim), lambda i: (i, 0, 0), memory_space=pltpu.VMEM
+        )
+        s_out_spec = pl.BlockSpec(
+            (tile_n, n_head_aligned), lambda i: (i, 0), memory_space=pltpu.VMEM
+        )
+
+        pltpu.emit_pipeline(
+            _pipe_step,
+            grid=(num_tiles,),
+            in_specs=[q_in_spec, cs_in_spec, ws_in_spec, qs_in_spec],
+            out_specs=[q_out_spec, s_out_spec],
+        )(
+            q_fp8_hbm_ref,
+            cs_hbm_ref,
+            w_s_hbm_ref,
+            q_s_hbm_ref,
+            q_out_hbm_ref,
+            s_out_hbm_ref,
+        )
+
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+    q_out, s_out_aligned = pl.pallas_call(
+        _pallas_fused_kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct((num_tokens, n_head, head_dim), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((num_tokens, n_head_aligned), jnp.float32),
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            grid=(1,),
+            in_specs=[
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                vmem_spec,
+                vmem_spec,
+            ],
+            out_specs=[hbm_spec, hbm_spec],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=100 * 1024 * 1024,
+            disable_bounds_checks=True,
+        ),
+        name="fused_indexer_wq_b_rope_quant",
+    )(
+        query_fp8,
+        cs_expanded,
+        w_scale_all,
+        q_scale_all,
+        wq_b_weight,
+        wq_b_weight_scale.reshape(1, out_features),
+    )
+    if pad_t > 0:
+        return q_out[:orig_num_tokens], s_out_aligned[:orig_num_tokens, :n_head]
+    return q_out, s_out_aligned[:, :n_head]
+
+
 def _indexer_v41_impl(
     q: jax.Array,  # [num_tokens, n_head, 128] bf16
     positions: jax.Array,
@@ -2203,9 +2567,7 @@ def _indexer_v41_impl(
         q_quant = q
         weights = indexer_weights
     else:
-        w_scale = (
-            indexer_weights.astype(jnp.float32) * softmax_scale * (n_head**-0.5)
-        )
+        w_scale = indexer_weights.astype(jnp.float32) * softmax_scale * (n_head**-0.5)
         q_quant, q_scales = rope_quant(
             q, positions, cos_sin_cache, w_scale=w_scale, quant_dtype=jnp.float8_e4m3fn
         )
@@ -2225,7 +2587,9 @@ def _indexer_v41_impl(
     # query padding and fits 2x larger KV blocks. 96/384 buckets use multiples of 48.
     is_decode_or_verify = n_cfg <= 1536
     bq_mixed = 8 if is_decode_or_verify else 128
-    bkv_pages = (16 if is_decode_or_verify else 8) * max(1, compression_ratio)
+    # Decode-sized KV block: 64 pages (prefill-node tuning) vs 16 (decode stack).
+    bkv_dec = 64 if _prefill_role() else 16
+    bkv_pages = (bkv_dec if is_decode_or_verify else 8) * max(1, compression_ratio)
     chunk_tokens = (
         512
         if (not is_decode_or_verify and q.shape[0] >= 512 and q.shape[0] % 512 == 0)
@@ -2475,7 +2839,9 @@ def indexer_v41_tp_jax(
         if cand_mode == "read":
             assert candidates is not None
             if candidates.shape[0] != t_l:
-                candidates = jax.lax.dynamic_slice_in_dim(candidates, rank[0] * t_l, t_l)
+                candidates = jax.lax.dynamic_slice_in_dim(
+                    candidates, rank[0] * t_l, t_l
+                )
     if t_rows != t_l:
 
         def pad_rows(x: jax.Array, **kw) -> jax.Array:
