@@ -346,6 +346,10 @@ class _Stage3Dsv4Pool:
     # Rows per page is `live_bytes_per_block // row_bytes`, not `page_tokens`:
     # CSA NoPE packs four tokens into a row and RoPE sixteen.
     row_bytes: int
+    # Ship the request's tail page whole rather than the rows its tokens
+    # cover: the manifest marks pages that are not token-major
+    # (`DSV4_REGION_PAGES`, DeepSeek-V4.1).
+    whole_tail_page: bool = False
 
 
 @dataclass(frozen=True)
@@ -2972,13 +2976,14 @@ class TPURaidenConnectorWorker:
         for pool in self._stage3_dsv4_plan:
             logger.info(
                 "Raiden DSv4 pool tag=%s plan_position=%d page_tokens=%d "
-                "live_bytes_per_block=%d row_bytes=%d pools=%d",
+                "live_bytes_per_block=%d row_bytes=%d pools=%d whole_tail_page=%s",
                 pool.tag,
                 pool.plan_position,
                 pool.page_tokens,
                 pool.live_bytes_per_block,
                 pool.row_bytes,
                 counts[pool.tag],
+                pool.whole_tail_page,
             )
 
     def _measure_dsv4_pool_plan(
@@ -2990,6 +2995,10 @@ class TPURaidenConnectorWorker:
         so it recomputes one here. The two must agree: `plan_position`
         indexes the block tables the scheduler sends.
         """
+        from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
+            DSV4_REGION_PAGES,
+        )
+
         transfer_groups = _stage3_transfer_groups(kv_cache_groups, multi_group=True)
         plan_position_by_group = {
             group.cache_group_index: position
@@ -3021,6 +3030,7 @@ class TPURaidenConnectorWorker:
                     ),
                     live_bytes_per_block=int(geometry[tag]["live_bytes_per_block"]),
                     row_bytes=int(region.unit_bytes),
+                    whole_tail_page=region.name == DSV4_REGION_PAGES,
                 )
             )
         if not pools:
@@ -4313,6 +4323,7 @@ class TPURaidenConnectorWorker:
                         live_bytes_per_block=pool.live_bytes_per_block,
                         row_bytes=pool.row_bytes,
                         block_ids=group.pages,
+                        whole_tail_page=pool.whole_tail_page,
                     )
                 )
             owned_spans = sum(len(reg.spans) for reg in pool_spans)

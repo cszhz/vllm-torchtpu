@@ -1365,6 +1365,19 @@ def build_glm_mla_pool_manifest(
 DSV4_STATE_CACHE_SUFFIX = ".compressor.state_cache"
 DSV4_INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
 DSV4_CSA_COMPRESS_RATIO = 4
+# RoPE rows of a CSA page hold this many compressed states each
+# (`csa_cache_layout.ROPE_TOKENS_PER_ROW`). It equals the V4.0 compress ratio,
+# which is why V4.0 code reused that constant; V4.1 compresses at 1 or 2.
+DSV4_CSA_ROPE_STATES_PER_ROW = 4
+
+# Region names. `dsv4_rows` pages are token-major (a row prefix holds a token
+# prefix), so a request's tail page ships only the rows its tokens cover.
+# `dsv4_pages` pages are not, or not provably (DeepSeek-V4.1's seq-along-lane
+# indexer keeps tokens on the lane axis of every row), so the tail page ships
+# whole. The destination's rows past the request end are garbage either way;
+# decode writes them before it reads them.
+DSV4_REGION_ROWS = "dsv4_rows"
+DSV4_REGION_PAGES = "dsv4_pages"
 
 _DSV4_STATE_TAG_BY_KV_TAG = {
     TAG_DSV4_CSA_NOPE: TAG_DSV4_STATE_CSA,
@@ -1386,11 +1399,13 @@ def dsv4_compressed_kv_layer_name(state_cache_name: str) -> str:
     return base + ".k_cache" if base.endswith(".indexer") else base
 
 
-def _dsv4_row_region(*, row_bytes: int, num_rows: int) -> tuple[RegionSpec, ...]:
+def _dsv4_row_region(
+    *, row_bytes: int, num_rows: int, name: str = DSV4_REGION_ROWS
+) -> tuple[RegionSpec, ...]:
     """One dense region of whole packed rows covering the full page."""
     return (
         RegionSpec(
-            name="dsv4_rows",
+            name=name,
             offset_bytes=0,
             stride_bytes=row_bytes,
             unit_bytes=row_bytes,
@@ -1443,14 +1458,21 @@ def _dsv4_num_states(spec: Any, layer_name: str) -> int:
     return _dsv4_spec_field(spec, "num_states", layer_name)
 
 
-def _dsv4_kv_tag(layer_name: str, spec: Any) -> str:
-    """The compressed-KV role of an MLA layer (CSA reports its NoPE tag)."""
+def _dsv4_kv_tag(layer_name: str, spec: Any, cache: Any = None) -> str:
+    """The compressed-KV role of an MLA layer (CSA reports its NoPE tag).
+
+    V4.0 CSA compresses at ratio 4. DeepSeek-V4.1 CSA compresses at ratio 1 or
+    2, the ratio V4.0's HCA reports too, so the ratio alone cannot tell them
+    apart; what can is the allocation: only CSA binds a `(nope, rope)` pair.
+    """
     if layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX):
         return TAG_DSV4_IDX
     if (
         _dsv4_spec_field(spec, "tokens_per_state", layer_name)
         == DSV4_CSA_COMPRESS_RATIO
     ):
+        return TAG_DSV4_CSA_NOPE
+    if isinstance(cache, tuple) and len(cache) == 2:
         return TAG_DSV4_CSA_NOPE
     return TAG_DSV4_HCA
 
@@ -1475,13 +1497,17 @@ class Dsv4LayerEntry(NamedTuple):
 def _dsv4_classify(
     kv_cache_groups: Sequence[Any],
     named_kv_caches: Mapping[str, Any],
-) -> list[Dsv4LayerEntry]:
+) -> tuple[list[Dsv4LayerEntry], bool]:
     """Split DSv4's layers into one `Dsv4LayerEntry` per (layer, array).
 
     Mirrors `TPUModelRunner._classify_ds_v4_layers` and the overlay plan it
     feeds. Iteration is in cache-group order, then declared layer order, so
     both transfer peers build the same pool list.
+
+    Also returns whether any layer uses a DeepSeek-V4.1 layout, in which case
+    every pool ships whole tail pages (`DSV4_REGION_PAGES`).
     """
+    whole_pages = False
     kv_tag_by_layer: dict[str, str] = {}
     for group in kv_cache_groups:
         for layer_name in group.layer_names:
@@ -1490,7 +1516,9 @@ def _dsv4_classify(
             if "swa_cache" in layer_name:
                 continue
             kv_tag_by_layer[layer_name] = _dsv4_kv_tag(
-                layer_name, _dsv4_layer_spec(group.kv_cache_spec, layer_name)
+                layer_name,
+                _dsv4_layer_spec(group.kv_cache_spec, layer_name),
+                named_kv_caches.get(layer_name),
             )
 
     entries: list[Dsv4LayerEntry] = []
@@ -1552,24 +1580,48 @@ def _dsv4_classify(
                     entries.append(
                         Dsv4LayerEntry(kv_tag, layer_name, group_index, arrays[0])
                     )
-                _dsv4_check_role_rows(
+                if _dsv4_check_role_rows(
                     kv_tag,
                     layer_name,
                     _dsv4_layer_spec(group.kv_cache_spec, layer_name),
                     arrays,
-                )
-    return entries
+                ):
+                    whole_pages = True
+    return entries, whole_pages
 
 
 def _dsv4_check_role_rows(
     kv_tag: str, layer_name: str, spec: Any, arrays: Sequence[Any]
-) -> None:
-    """Row counts must match the runner's per-role allocation table."""
+) -> bool:
+    """Row counts must match the runner's per-role allocation table.
+
+    Returns True when the layer uses a DeepSeek-V4.1 layout, whose pages are
+    not all token-major and so must ship whole (see `DSV4_REGION_PAGES`):
+      * CSA at ratio 1 or 2 (V4.0 CSA is ratio 4). Rows stay `T` NoPE and
+        `T / 4` RoPE for a page of `T` compressed states.
+      * the seq-along-lane indexer `uint8[nb, head_size / 4, 4, T]`, with the
+        page's `T` states on the lane axis. V4.0 keeps `T / 4` rows instead.
+    """
     tokens = _dsv4_num_states(spec, layer_name)
+    v41 = False
     if kv_tag == TAG_DSV4_CSA_NOPE:
-        expected = {"nope": tokens, "rope": tokens // DSV4_CSA_COMPRESS_RATIO}
+        expected = {"nope": tokens, "rope": tokens // DSV4_CSA_ROPE_STATES_PER_ROW}
+        v41 = (
+            _dsv4_spec_field(spec, "tokens_per_state", layer_name)
+            != DSV4_CSA_COMPRESS_RATIO
+        )
     elif kv_tag == TAG_DSV4_IDX:
         expected = {"k_cache": tokens // DSV4_CSA_COMPRESS_RATIO}
+        shape = tuple(int(dim) for dim in getattr(arrays[0], "shape", ()))
+        if len(shape) == 4 and shape[1] != expected["k_cache"]:
+            if shape[3] != tokens:
+                raise ManifestError(
+                    f"DSv4 {kv_tag} layer {layer_name} array k_cache has shape "
+                    f"{shape}: neither {expected['k_cache']} rows (V4.0) nor "
+                    f"{tokens} lanes (V4.1 seq-along-lane) for its "
+                    f"{tokens}-state page"
+                )
+            return True
     else:
         expected = {"latents": tokens * 2}
     for (role, rows), array in zip(expected.items(), arrays):
@@ -1579,6 +1631,7 @@ def _dsv4_check_role_rows(
                 f"DSv4 {kv_tag} layer {layer_name} array {role} has "
                 f"{shape[1]} rows; the {tokens}-token page needs {rows}"
             )
+    return v41
 
 
 def build_dsv4_pool_manifest(
@@ -1602,7 +1655,7 @@ def build_dsv4_pool_manifest(
     if not kv_cache_groups:
         raise ManifestError("DSv4 admission needs at least one KV cache group")
 
-    entries = _dsv4_classify(kv_cache_groups, named_kv_caches)
+    entries, whole_pages = _dsv4_classify(kv_cache_groups, named_kv_caches)
 
     binding, _ = _binding_for(
         [(entry.layer_name, entry.array) for entry in entries], raw_tensors
@@ -1617,6 +1670,8 @@ def build_dsv4_pool_manifest(
     pools: list[PoolEntry] = []
     # storage index -> (group index, layer name) of the pool that claimed it.
     claimed_by_group: dict[tuple[int, int], str] = {}
+    # (role tag, group index, page shape) per pool, for the shape split.
+    page_shapes: list[tuple[str, int, tuple[int, int, int]]] = []
     for tag_base, layer_name, group_index, array in entries:
         dtype_tag = _dtype_tag(array)
         shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
@@ -1679,14 +1734,51 @@ def build_dsv4_pool_manifest(
                 base_offset_bytes=0,
                 block_stride_bytes=block_stride,
                 num_blocks=num_blocks,
-                regions=_dsv4_row_region(row_bytes=row_bytes, num_rows=rows),
+                regions=_dsv4_row_region(
+                    row_bytes=row_bytes,
+                    num_rows=rows,
+                    name=DSV4_REGION_PAGES if whole_pages else DSV4_REGION_ROWS,
+                ),
                 dtype_tag=dtype_tag,
             )
         )
+        page_shapes.append((tag_base, group_index, (rows, packing, width)))
 
+    _dsv4_split_tags_by_page_shape(pools, page_shapes)
     manifest = PoolManifest(binding=binding, storages=storages.storages, pools=pools)
     block_counts = {pool.num_blocks for pool in manifest.pools}
     if len(block_counts) != 1:
         raise ManifestError(f"pools disagree on num_blocks: {sorted(block_counts)}")
     manifest.geometry_by_tag()  # raises on per-tag geometry divergence
     return manifest
+
+
+def dsv4_page_shape_tag(base_tag: str, page_shape: Sequence[int]) -> str:
+    """``dsv4.swa`` + (512, 1, 128) -> ``dsv4.swa.s512x1x128``."""
+    return f"{base_tag}.s" + "x".join(str(int(dim)) for dim in page_shape)
+
+
+def _dsv4_split_tags_by_page_shape(
+    pools: list[PoolEntry],
+    page_shapes: Sequence[tuple[str, int, tuple[int, int, int]]],
+) -> None:
+    """Give each page shape within one (role, group) tag its own tag.
+
+    A tag must have one page geometry (`geometry_by_tag`, and the layout
+    fingerprint's one-shape-per-tag rule). DeepSeek-V4.1 breaks that three
+    ways, all inside one kv cache group:
+      * CSA layers compress at 2 (T=512 states per 1024-token page) and at 1
+        (T=1024), so NoPE, RoPE and the indexer each come in two page shapes.
+      * SWA layers overlay the smallest CSA NoPE hosts first and dedicated
+        overflow arrays after, which have the SWA page's own row count.
+    Splitting is deterministic in the layer order both peers share, and leaves
+    V4.0 tags untouched (each of its tags already has one shape).
+    """
+    shapes_by_tag: dict[tuple[str, int], set[tuple[int, int, int]]] = {}
+    for tag_base, group_index, shape in page_shapes:
+        shapes_by_tag.setdefault((tag_base, group_index), set()).add(shape)
+    for pool, (tag_base, group_index, shape) in zip(pools, page_shapes):
+        if len(shapes_by_tag[(tag_base, group_index)]) > 1:
+            pool.tag = dsv4_group_tag(
+                dsv4_page_shape_tag(tag_base, shape), group_index
+            )
