@@ -134,20 +134,35 @@ class _AdapterSlotWriter:
         device: torch.device,
     ) -> None:
         self._modules = modules
+        # The TPU tensors that write_slot updates: all LoRA A and B tensors of
+        # all layers in one list, e.g. [q_a, k_a, v_a, q_b, k_b, v_b, o_a, ...].
+        # Each has shape [max_loras, ...]: index 0 picks the slot.
         self._stacked_weights = stacked_weights
+        # Collects the new adapter's weights on the CPU, so they go to the TPU
+        # in one copy instead of hundreds of small writes. Holds one slot of
+        # each tensor above, in the same order:
+        # [q_a[slot] | k_a[slot] | ... | o_b[slot]]
         self._host_slot_weights = torch.empty(
             sum(weights[0].numel() for weights in stacked_weights),
             dtype=stacked_weights[0].dtype,
         )
+        # Tells the write program which slot to write. slot_indices[i] is slot
+        # number i as a TPU tensor; as a program input (not a constant), one
+        # compile works for every slot.
         self._slot_indices = [
             torch.tensor([slot], dtype=torch.int32, device=device)
             for slot in range(max_loras)
         ]
         self._device = device
 
+        # Each layer's (lora_a_stacked, lora_b_stacked) on the TPU. Used to put
+        # them back on the layers after set_lora is done.
         self._device_weights = [
             (module.lora_a_stacked, module.lora_b_stacked) for module in modules
         ]
+        # Put on the layers while set_lora runs, so set_lora writes into
+        # _host_slot_weights instead of the TPU. Same layout as
+        # _device_weights.
         host_views = self._host_views()
         self._host_weights = [
             (
@@ -158,11 +173,15 @@ class _AdapterSlotWriter:
         ]
 
     def _host_views(self) -> Iterator[torch.Tensor]:
-        """Yields one host view per stacked tensor, packed in the order
-        write_adapter_to_slot unpacks slot_weights. Each view is a one-slot
-        region of the buffer expanded over the slot dimension with stride 0,
-        so set_lora can index whichever slot activate_adapter picked and every
-        slot index lands in that same region."""
+        """Makes the CPU views that set_lora writes into, one per tensor in
+        _stacked_weights: its part of _host_slot_weights, shaped like the full
+        tensor.
+
+        All slots share the same memory. E.g. for q_a of shape [8, 1, 16, 1024],
+        view[0], view[1], ..., view[7] are the same 1 x 16 x 1024 block. So
+        set_lora can write to whichever slot vLLM picked and it lands in that
+        block.
+        """
         offset = 0
         for weights in self._stacked_weights:
             slot_size = weights[0].numel()
