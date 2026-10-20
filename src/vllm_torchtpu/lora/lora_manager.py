@@ -219,14 +219,20 @@ class TPULoRAModelManager(LRUCacheLoRAModelManager):
         )
 
     def activate_adapter(self, lora_id: int) -> bool:
-        # vLLM calls this every step for each adapter in the batch; only one
-        # that is not active yet needs its writes landed on the host.
-        if self._slot_writer is None or lora_id in self._active_adapters:
+        # vLLM calls this every step for each adapter in the batch; one that
+        # already has a slot needs no write.
+        if self._slot_writer is None or lora_id in self.lora_index_to_id:
             return super().activate_adapter(lora_id)
-        with self._slot_writer.redirect_writes_to_host():
-            activated = super().activate_adapter(lora_id)
-        if activated:
-            self._slot_writer.write_slot(self.lora_index_to_id.index(lora_id))
+        try:
+            with self._slot_writer.redirect_writes_to_host():
+                activated = super().activate_adapter(lora_id)
+            if activated:
+                self._slot_writer.write_slot(self.lora_index_to_id.index(lora_id))
+        except BaseException:
+            # vLLM gives the adapter its slot before the weights land; without
+            # this, a failed write would leave the slot serving stale weights.
+            self.deactivate_adapter(lora_id)
+            raise
         return activated
 
     def precompile_activation(self) -> None:

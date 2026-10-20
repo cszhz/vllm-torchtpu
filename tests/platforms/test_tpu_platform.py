@@ -698,6 +698,49 @@ class TestTpuPlatform:
             else:
                 TpuPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize(
+        ("model_dtype", "lora_dtype"),
+        [
+            # vLLM resolves lora_dtype "auto" to the model dtype.
+            (torch.float16, torch.float16),
+            (torch.float32, torch.float32),
+            # Set by hand to the dtype the model runs in on TPU.
+            (torch.float16, torch.bfloat16),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_runs_lora_in_bfloat16(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, model_dtype, lora_dtype
+    ):
+        """The TPU runs a float16 or float32 model in bfloat16; its LoRA weights
+        must follow, or the first forward fails on the LoRA dtype check."""
+        vllm_config.model_config.dtype = model_dtype
+        vllm_config.model_config.is_moe = False
+        vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype)
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.model_config.dtype == torch.bfloat16
+        assert vllm_config.lora_config.lora_dtype == torch.bfloat16
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_unsupported_lora(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        vllm_config.model_config.is_moe = False
+        vllm_config.lora_config = LoRAConfig(
+            lora_dtype=torch.bfloat16, fully_sharded_loras=True
+        )
+
+        with pytest.raises(ValueError, match="LoRA on TPU"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
@@ -963,15 +1006,6 @@ class TestLoRAConfigValidation:
 
         assert "tensor_parallel_size > 1" in str(excinfo.value)
         assert "lora_dtype torch.float16" in str(excinfo.value)
-
-    def test_check_and_update_config_runs_the_check(self, monkeypatch):
-        monkeypatch.delenv("USE_PHASED_PROFILER", raising=False)
-        config = self._config(tensor_parallel_size=2)
-        config.additional_config = {}
-        config.profiler_config = SimpleNamespace(torch_profiler_dir="")
-
-        with pytest.raises(ValueError, match="LoRA on TPU"):
-            TpuPlatform.check_and_update_config(config)
 
 
 def test_config_hook_registers_tpu_kv_connectors_by_name():

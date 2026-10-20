@@ -718,7 +718,6 @@ class TpuPlatform(Platform):
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
         _validate_phased_profiling_config(vllm_config)
-        _validate_lora_config(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
@@ -891,7 +890,15 @@ class TpuPlatform(Platform):
                 "Using bfloat16 instead.",
                 model_config.dtype,
             )
+            lora_config = vllm_config.lora_config
+            if lora_config is not None and lora_config.lora_dtype == model_config.dtype:
+                # vLLM set lora_dtype "auto" to this dtype before this hook;
+                # the LoRA weights must stay in the dtype the model runs in.
+                lora_config.lora_dtype = torch.bfloat16
             model_config.dtype = torch.bfloat16
+        # After the bfloat16 switch, so lora_dtype is checked against the
+        # dtype the model runs in.
+        _validate_lora_config(vllm_config)
 
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config

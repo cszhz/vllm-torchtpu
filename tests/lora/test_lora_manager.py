@@ -362,7 +362,9 @@ def test_lru_eviction_writes_the_freed_slot(slot_writes):
     _assert_same_slots(tpu_manager, vllm_manager)
 
 
-def test_device_tensors_are_restored_when_activation_fails(slot_writes):
+def test_failed_activation_restores_tensors_and_frees_the_slot(slot_writes):
+    """A set_lora that raises leaves the layers on their TPU tensors, and the
+    slot vLLM gave the adapter is free again."""
     tpu_manager, _ = _managers()
     device_weights = {
         name: (layer.lora_a_stacked, layer.lora_b_stacked)
@@ -375,6 +377,29 @@ def test_device_tensors_are_restored_when_activation_fails(slot_writes):
         assert layer.lora_a_stacked is device_weights[name][0], name
         assert layer.lora_b_stacked is device_weights[name][1], name
     assert slot_writes == []
+    assert tpu_manager.lora_index_to_id == [None] * NUM_SLOTS
+
+
+def test_failed_slot_write_frees_the_slot(slot_writes, monkeypatch):
+    """vLLM gives the adapter its slot before the weights land. When the write
+    fails, e.g. the upload runs out of HBM, the slot must not keep the adapter,
+    or its requests would read stale weights; the next activation writes it."""
+    tpu_manager, vllm_manager = _managers()
+    adapter = _adapter(1, vllm_manager.modules)
+    write_on_host = lora_manager.write_adapter_to_slot
+
+    def failing_write(*args):
+        raise RuntimeError("RESOURCE_EXHAUSTED")
+
+    monkeypatch.setattr(lora_manager, "write_adapter_to_slot", failing_write)
+    with pytest.raises(RuntimeError, match="RESOURCE_EXHAUSTED"):
+        _activate((tpu_manager,), adapter)
+    assert tpu_manager.lora_index_to_id == [None] * NUM_SLOTS
+
+    monkeypatch.setattr(lora_manager, "write_adapter_to_slot", write_on_host)
+    _activate((tpu_manager, vllm_manager), adapter)
+    assert slot_writes == [0]
+    _assert_same_slots(tpu_manager, vllm_manager)
 
 
 class _CustomColumnLoRA(ColumnParallelLinearWithLoRA):
