@@ -84,6 +84,10 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu:_patch_vllm_mamba_split_scheduler_block_size", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_mtp_prefill_cache_groups", _ENGINE),
+    Patch(
+        "vllm_torchtpu.core.explicit_cache_checkpoint:patch_explicit_cache_checkpoint",
+        _ENGINE,
+    ),
     Patch("vllm_torchtpu:_patch_vllm_offloading_config_build", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_raiden_pd_completion", _ENGINE),
