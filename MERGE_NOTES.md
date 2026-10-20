@@ -29,7 +29,7 @@
 | 8 | `kernels/deepseek_v4/o_projection.py` | hand-merged | P is needed for prefill (H=64, K-blocked `wo_b` scales). The only D-visible change is the VMEM vs weight-outer threshold for 256 < t_pad <= 384: 256 when PURE_20L (P), 384 otherwise (D). |
 | 9 | `kernels/deepseek_v4/rope.py` | take-P | D equals P's parent, so P is D plus the **indexer sign fix** (`sign(w)*ReLU(|w| q.k)`) in `_rope_quant_body`. |
 | 10 | `kernels/deepseek_v41/compressor.py` | hand-merged | P base, with `_prefill_role()` (=PURE_20L). Prefill keeps P's kernels and last-token-only state writes. Decode keeps D's per-token state writes (needed by DSpark rollback), 4-deep scatter ring, Pallas insert above 512 tokens, 16-page decode KV blocks and unpadded `wq_b` kernel. P's aliased-state path (`state_cache=None`) is kept for both roles. The **sign fix is applied to both P's and D's `wq_b` kernels** (see Risk R1). |
-| 11 | `kernels/deepseek_v41/sparse_mla.py` | take-P | The candidate-union code is dead on both configs (`CSA_UNION=0`). Decode (T<=384) reaches a fallback branch that is byte-identical in P and D. Prefill (T=16384) needs P's 256/512-token chunking (0ca85037d). P is the API superset (`precompute_csa_union_and_gather`). D's different union implementation is dropped; see Risk R6 (decode-fix sinks fix). |
+| 11 | `kernels/deepseek_v41/sparse_mla.py` | hand-merged (P + decodefix) | The candidate-union code is dead on both configs (`CSA_UNION=0`). Decode (T<=384) reaches a fallback branch that is byte-identical in P and D. Prefill (T=16384) needs P's 256/512-token chunking (0ca85037d). P is the API superset (`precompute_csa_union_and_gather`). D's different union implementation is dropped. Decode role: decodefix's sinks-in-running-max fix applied to all b_q<8 blocks (`_m_run`, R6). |
 | 12 | `kernels/deepseek_v41/streamindex_topk.py` | take-P | D equals P's parent, so P is D plus the **indexer sign fix** (no `w/max(w)` folding before the ReLU). This must ship together with rope.py and compressor.py. |
 | 13 | `kernels/deepseek_v41/tp_attention.py` | take-P | Only used with TP_ATTN at TP>1 (prefill). D's call sites are API-compatible. |
 | 14 | `kernels/experimental/moe_dense_expert.py` | take-P | Disabled in both trees (`can_use_dense_expert` returns False). P adds optional kwargs used by the merged `fused_moe_gmm`. |
@@ -67,7 +67,7 @@
 | t4 | `tests/spec_decode/test_dspark_v41_cpu.py` | take-D | D-only test. It already fails to import on D (`_gather_aux_hidden_states` exists in neither tree). |
 | t5 | `tools/check_env_reads.py` | take-P | Adds `POD_G_CHIP_ID` to `BOOTSTRAP_VARS`. |
 
-Totals over the 42 `src/` files: take-P 17, take-D 6, hand-merged 19.
+Totals over the 42 `src/` files: take-P 16, take-D 6, hand-merged 20 (sparse_mla became P plus the role-gated decodefix sinks fix).
 
 ## `runner/kv_cache_deepseek_v41_flash.py` (hardest file)
 
@@ -124,12 +124,25 @@ The two layouts are a real design conflict, so both are kept verbatim and the ro
   * The bench client must keep `VLLM_BENCH_DP_SIZE=1` on prefill; the driver already does this.
 * **R5. Prefill weight loading.** D's `quant_method` re-process loop (layers.py) and moe.py's shared-expert path assume every
   prefill shared expert has `has_tp_local_weights()` True and is already flipped. Check the startup log, and that 21 layers are built.
-* **R6. decodefix integration.** The decodefix commit `11e6c029f` patches D's `sparse_mla.py` (sinks in the b_q<8 running max),
-  `attention.py` and `kv_cache_deepseek_v41_flash.py`. In this tree:
-  * `sparse_mla.py` is P's. P's `_grouped_attention_kernel` b_q<8 branch also omits sinks from `m_new`, so port the fix
-    there. Both versions only run on the CSA-union path, which is off on both nodes.
-  * `attention.py` decode paths are D's code behind `_PREFILL_ROLE`. Apply the per-layer SWA-metadata keying to the decode branch.
-  * `kv_cache_deepseek_v41_flash.py`: apply decodefix's change inside `_init_decode_overlay_layout`.
+* **R6. decodefix integration: done** (cpk/dsv41-decode-fix `11e6c02`, `570c809`, `cfacfa7`; `b5665ed` was already present).
+  * `11e6c02`, SWA page indices per KV-cache group:
+    * `kv_cache_deepseek_v41_flash.py` tags each cache layer with `_dsv41_kv_cache_group_id`; this runs in both layouts and is harmless.
+    * `attention.py` `_swa_kv_cache_group_id()` makes the SWA group bounds and their memo key per group **on the decode role only**.
+      Page-index cache entries are keyed on the page count in both roles.
+    * Prefill-layout analysis: the same group-agnostic sharing exists in cd4eedb, but there it is **benign**. P's compact layout
+      gives every SWA layer its own private array (`overlay_hosts[len(...)]`, 21 arrays for 21 SWA layers). A layer that
+      follows the leader group's block table therefore only touches its own array, and the table's block ids are unique among
+      live requests, so reads and writes stay self-consistent across 16K chunks. The decode layout is different: there
+      same-position layers of different groups share one array, which is the corruption decodefix fixed. Prefill therefore
+      keeps cd4eedb's behaviour. Phase-1 P/D prefill (`PURE_20L=0`) uses the decode layout and gets the fix.
+  * `11e6c02`, sinks in the running max: `sparse_mla.py` is P's in this tree, and in P **all four** b_q<8 unrolled blocks
+    (1/2/3-chunk plus the batched kernel) omit `sinks_t` from `m_new`. `_m_run()` includes the sink on the decode role, and the
+    prefill kernel body is unchanged. These blocks are only traced on the CSA-union path.
+  * `cfacfa7`: per-group SWA bounds are memoized at KV init, outside any trace, on the decode layout only (otherwise the decode step is +14%).
+  * `570c809`: DSpark target hidden-state capture, cherry-picked into the P-based `model.py` with one conflict resolved.
+    `capture_entry_aux` defaults to False, and `_run_layer` only checks ids when aux layers are set, so the PURE_20L encoder path is unchanged.
+  * `b5665ed`: the sign fix was already in combined from P. `rope.py` and `streamindex_topk.py` are byte-identical to decodefix,
+    and compressor.py's `_fused_indexer_wq_b_rope_quant_decode_jax` applies `abs(ws)`/`sign(ws)`.
 * **R7.** The gating assumes decode stays at TP=1 with CSA_UNION=0. TP>1 decode or CSA_UNION=1 would run P's ungated
   TP-attention or union code and needs fresh validation.
 * **R8.** If decode HLO fingerprints differ from 1d02e4a, check these first: `fused_moe_ep`, `fused_moe_gmm` and `mxfp4`
