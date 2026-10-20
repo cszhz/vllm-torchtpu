@@ -571,7 +571,10 @@ class BaseMetadataComputer:
     kv_p_start = k_idx * cfgs.bkv_p
     k_len = kv_cache_len + kv_new_len
     kv_left = k_len - kv_len_start
-    kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
+    if cfgs.serve.skip_kv_update:
+      kv_left_frm_cache = kv_left
+    else:
+      kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
     p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
 
     for i in range(cfgs.bkv_p_cache):
@@ -802,7 +805,7 @@ class BaseMetadataComputer:
         kv_new_lens_ref=kv_new_lens_ref,
         update_kv_cache_ref=update_kv_cache_ref,
     )
-    start_seq_idx, end_seq_idx = self.cfgs.mode.get_range(distribution_ref)  # pytype: disable=bad-argument-type
+    start_seq_idx, end_seq_idx = self.cfgs.seq_range(distribution_ref)  # pytype: disable=bad-argument-type
     init_carry = LoopCarry(0, 0)
     return jax.lax.fori_loop(
         start_seq_idx, end_seq_idx, seq_loop_fn, init_carry
@@ -827,42 +830,7 @@ def rpa_metadata_schedule_kernel(
     cfgs: configs.RpaConfigs,
     computer_cls: type[BaseMetadataComputer] = BaseMetadataComputer,
 ):
-  """Generates the HBM-to-VMEM DMA schedule.
-
-  This kernel:
-  1. Iterates through each (potentially ragged) sequence
-  2. Breaks Queries (Q) and Key-Values (KV) into blocks (bq_sz, bkv_sz).
-  3. Assigns tasks to 'lanes' (TPU batch items) based on current lane occupancy
-    to ensure balanced execution across the batch dimension.
-  4. Encodes DMA offsets:
-    - dma_q: HBM start index and size for Query blocks.
-    - dma_kv_cache: Paged indices for existing KV tokens.
-    - dma_kv_new: offsets for new tokens being added to the cache.
-    - do_writeback: boolean flag indicating if a block should be flushed to
-      HBM (ie does this block contain new tokens to add to KV cache).
-
-  Args:
-    cu_q_lens_ref: [max_num_seqs + 1]. Cumulative sum of each sequence's query
-      length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
-      b=cu_q_lens[i+1] represents q/k/v of sequence i.
-    q_positions_ref: [max_num_seqs]. Position of each sequence's first query
-      token in the sequence's KV index space (cache tokens followed by new
-      tokens); the causal mask is relative to it.
-    global_kv_cache_lens_ref: [max_num_seqs]. Cache length of each sequence
-      before CP sharding; `RpaConfigs.local_kv_cache_len` narrows it to this
-      call's share.
-    kv_new_lens_ref: [max_num_seqs]. New kv length of each sequence.
-    update_kv_cache_ref: [max_num_seqs]. 1 if this sequence writes its new KV
-      back to the paged cache.
-    distribution_ref: [3]. Cumulative sum of number of decode, prefill, and
-      mixed
-    extra_scalars_ref: Additional scalar refs for custom metadata computers.
-    schedule_hbm_ref: HBM memory that will store output of the kernel.
-    schedule_ref: Scratch memory where schedule results gets written.
-    dma_sem: Semaphore used for writing scheduler output to HBM.
-    cfgs: Configuration of the kernel.
-    computer_cls: Metadata computer class to use for schedule generation.
-  """
+  """Generates the HBM-to-VMEM DMA schedule."""
   # Step 1: Compute and fill scheduler metadata.
   computer = computer_cls(
       schedule=schedule_ref,

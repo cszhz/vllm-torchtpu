@@ -116,10 +116,12 @@ def resolve_pcp_topology_order(vllm_config) -> dict[str, list[list[int]]] | None
 
     from vllm_torchtpu import envs as tpu_envs
 
-    if not tpu_envs.TPU_PCP_TOPOLOGY_AWARE_MESH:
+    if not tpu_envs.TPU_PCP_TOPOLOGY_AWARE_MESH or tp_size > 1:
         logger.info(
-            "Topology aware mesh not applied: TPU_PCP_TOPOLOGY_AWARE_MESH=0 "
-            "(device-order PCP/TP layout)."
+            "Topology aware mesh not applied: TPU_PCP_TOPOLOGY_AWARE_MESH=%s, tp_size=%d "
+            "(device-order PCP/TP layout).",
+            tpu_envs.TPU_PCP_TOPOLOGY_AWARE_MESH,
+            tp_size,
         )
         return None
     if not hasattr(torch.tpu, "topology_aware_mesh"):

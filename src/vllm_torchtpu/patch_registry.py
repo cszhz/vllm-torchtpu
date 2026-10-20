@@ -49,6 +49,10 @@ PATCHES = (
     # Environment setup and custom-op registration.
     Patch("vllm_torchtpu.env_override:_patch_jax_pallas_fori_lowering",
           ("import", )),
+    Patch(
+        "vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion",
+        _ACTIVE,
+    ),
     Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops",
           _ACTIVE),
 

@@ -64,9 +64,11 @@ from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention,
     run_jax_gdn_attention_pcp_tp_prefill,
     run_jax_gdn_attention_pooled,
+    run_jax_gdn_attention_pooled_pcp_prefill,
     run_jax_gdn_attention_pooled_pcp_prefill_projection,
 )
 from vllm_torchtpu.layers.core.attention_metadata import PCPMetadata
+from vllm_torchtpu.layers.core.pcp_sequence_layout import resolve_pcp_zigzag_page_size
 from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_interleaved_attention_metadata,
     is_pcp_streaming_attention_metadata,
@@ -74,6 +76,10 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+
+_GDN_PCP_AXIS_NAME = "pcp"
+_GDN_TP_AXIS_NAME = "tp"
+_GDN_PCP_TP_STATE_AXIS = (_GDN_TP_AXIS_NAME, _GDN_PCP_AXIS_NAME)
 
 
 def _reorder_gdn_qkv_for_pcp_torch(
@@ -382,11 +388,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self._pcp_streaming_configured = pcp_enabled
         # `_require_pcp_projection_parameters` hands this weight straight to
         # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
-        # Only exempt `in_proj_qkvz` from the canonical [n_in, n_out] flip when
-        # PCP streaming is active; non-streaming modes (`PCP=1`, `zigzag`,
-        # `interleaved`) use the standard linear method and benefit from the
-        # load-time transpose.
-        if pcp_enabled and hasattr(self, "in_proj_qkvz"):
+        if hasattr(self, "in_proj_qkvz"):
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
@@ -396,41 +398,20 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self._pcp_cached_rank: int = -1
         self._pcp_weights_sliced: bool = False
         self._pcp_qkv_weights_permuted: bool = False
-        if self._pcp_interleaved_world_size > 1:
-            self._pcp_head_geometry = derive_gdn_head_geometry(
-                self.tp_head_geometry.local_num_kq_heads,
-                self.tp_head_geometry.local_num_v_heads,
-                self._pcp_interleaved_world_size,
-            )
-            pcp_conv_dim = self._pcp_head_geometry.local_conv_dim(
-                self.head_k_dim, self.head_v_dim
-            )
-            pcp_v_heads = self._pcp_head_geometry.local_num_v_heads
-            self.register_buffer(
-                "_pcp_conv_idx",
-                torch.zeros(
-                    pcp_conv_dim, dtype=torch.int32, device=self.conv1d.weight.device
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                "_pcp_v_head_idx",
-                torch.zeros(
-                    pcp_v_heads, dtype=torch.int32, device=self.A_log.device
-                ),
-                persistent=False,
-            )
-            try:
-                self._update_pcp_head_slice_buffers(get_pcp_rank())
-            except Exception:
-                self._update_pcp_head_slice_buffers(0)
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op()
         self.gdn_pcp_op = (
-            self._build_gdn_op(pcp_streaming=True) if pcp_enabled else None
+            self._build_gdn_op(pcp_streaming=True)
+            if (pcp_enabled or self._pcp_interleaved_world_size > 1)
+            else None
         )
         self.gdn_pooled_pcp_op = (
             self._build_pooled_pcp_gdn_op() if pcp_enabled else None
+        )
+        self.gdn_pooled_pcp_a2a_op = (
+            self._build_pooled_pcp_a2a_gdn_op()
+            if self._pcp_interleaved_world_size > 1
+            else None
         )
 
     def _update_pcp_head_slice_buffers(
@@ -871,18 +852,35 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
 
         if pcp_streaming:
+            from vllm_torchtpu.distributed.pallas_shapes import (
+                install_pallas_shape_conversion,
+            )
+
+            install_pallas_shape_conversion()
             parallel_config = vllm_context.vllm_config.parallel_config
             interleave_size = parallel_config.cp_kv_cache_interleave_size
-            if not isinstance(interleave_size, int) or interleave_size <= 0:
-                raise ValueError(
-                    "GDN PCP streaming requires cp_kv_cache_interleave_size > 0."
+            if (
+                not isinstance(interleave_size, int)
+                or interleave_size <= 0
+                or self._pcp_interleaved_world_size > 1
+            ):
+                interleave_size = resolve_pcp_zigzag_page_size(
+                    vllm_context.vllm_config.cache_config.block_size
                 )
-            pcp_mesh = get_or_create_pcp_mesh(axis_name="pcp")
+            pcp_mesh = get_or_create_pcp_mesh(
+                axis_name=_GDN_PCP_AXIS_NAME,
+                tp_axis_name=_GDN_TP_AXIS_NAME,
+            )
             pcp_size = get_pcp_world_size()
-            if pcp_size != pcp_mesh.shape["pcp"]:
+            if pcp_size != pcp_mesh.shape[_GDN_PCP_AXIS_NAME]:
                 raise ValueError(
                     f"PCP world size {pcp_size} does not match mesh shape "
-                    f"{pcp_mesh.shape['pcp']}."
+                    f"{pcp_mesh.shape[_GDN_PCP_AXIS_NAME]}."
+                )
+            if self.tp_size != pcp_mesh.shape[_GDN_TP_AXIS_NAME]:
+                raise ValueError(
+                    f"TP size {self.tp_size} does not match mesh shape "
+                    f"{pcp_mesh.shape[_GDN_TP_AXIS_NAME]}."
                 )
             derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads, pcp_size)
             op_name = f"pallas::gdn_attention_pcp_{self.prefix.replace('.', '_')}"
@@ -898,26 +896,32 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 interleave_size=interleave_size,
             )
             input_partition_specs = (
-                PartitionSpec("pcp"),  # mixed_qkv
-                PartitionSpec("pcp"),  # b
-                PartitionSpec("pcp"),  # a
-                PartitionSpec(None, None, "pcp"),  # conv_state
-                PartitionSpec(None, "pcp", None, None),  # recurrent_state
-                PartitionSpec(),  # conv_weight
-                PartitionSpec() if has_conv_bias else None,  # conv_bias
-                PartitionSpec(),  # A_log
-                PartitionSpec(),  # dt_bias
+                PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),  # mixed_qkv
+                PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),  # b
+                PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),  # a
+                PartitionSpec(None, None, _GDN_PCP_TP_STATE_AXIS),  # conv_state
+                PartitionSpec(
+                    None, _GDN_PCP_TP_STATE_AXIS, None, None
+                ),  # recurrent_state
+                PartitionSpec(_GDN_TP_AXIS_NAME),  # conv_weight
+                (
+                    PartitionSpec(_GDN_TP_AXIS_NAME) if has_conv_bias else None
+                ),  # conv_bias
+                PartitionSpec(_GDN_TP_AXIS_NAME),  # A_log
+                PartitionSpec(_GDN_TP_AXIS_NAME),  # dt_bias
                 PartitionSpec(),  # state_indices
                 PartitionSpec(),  # query_start_loc
                 PartitionSpec(),  # request_distribution
                 PartitionSpec(),  # seq_lens
             )
             output_partition_specs = (
-                PartitionSpec(None, None, "pcp"),  # new_conv_state
-                PartitionSpec(None, "pcp", None, None),  # new_recurrent_state
-                PartitionSpec("pcp"),  # output
+                PartitionSpec(None, None, _GDN_PCP_TP_STATE_AXIS),  # new_conv_state
+                PartitionSpec(
+                    None, _GDN_PCP_TP_STATE_AXIS, None, None
+                ),  # new_recurrent_state
+                PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME, None),  # output
             )
-            gdn_jax_op = pcp_streaming_jax_op(
+            gdn_jax_op = pallas.jax_op(
                 op_name,
                 wrapped_fn,
                 donate_argnums=(3, 4),
@@ -1112,6 +1116,153 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # Plain donation + copy_ writeback (aliased in-place by XLA).
             recurrent_state.copy_(new_rec)
 
+            return outputs
+
+        return gdn_impl
+
+    def _build_pooled_pcp_a2a_gdn_op(self):
+        from vllm_torchtpu.distributed.pallas_shapes import (
+            install_pallas_shape_conversion,
+        )
+
+        install_pallas_shape_conversion()
+        vllm_context = get_vllm_model_wrapper_context()
+        local_num_v_heads = self.num_v_heads // self.tp_size
+        local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
+        has_conv_bias = self.conv1d.bias is not None
+        pcp_mesh = get_or_create_pcp_mesh(
+            axis_name=_GDN_PCP_AXIS_NAME,
+            tp_axis_name=_GDN_TP_AXIS_NAME,
+        )
+        pcp_size = get_pcp_world_size()
+        if pcp_size != pcp_mesh.shape[_GDN_PCP_AXIS_NAME]:
+            raise ValueError(
+                f"PCP world size {pcp_size} does not match mesh shape "
+                f"{pcp_mesh.shape[_GDN_PCP_AXIS_NAME]}."
+            )
+        if self.tp_size != pcp_mesh.shape[_GDN_TP_AXIS_NAME]:
+            raise ValueError(
+                f"TP size {self.tp_size} does not match mesh shape "
+                f"{pcp_mesh.shape[_GDN_TP_AXIS_NAME]}."
+            )
+        derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads, pcp_size)
+
+        vllm_config = vllm_context.vllm_config
+        d_k = self.head_k_dim
+        d_v = self.head_v_dim
+        kernel_size = self.conv_kernel_size
+        recurrent_state_dtype = _to_jax_ssm_state_dtype(self.get_state_dtype()[1])
+
+        def wrapped_fn(
+            mixed_qkv: jax.Array,
+            b: jax.Array,
+            a: jax.Array,
+            recurrent_state: jax.Array,
+            conv_weight: jax.Array,
+            conv_bias: jax.Array | None,
+            A_log: jax.Array,
+            dt_bias: jax.Array,
+            state_indices: jax.Array,
+            query_start_loc: jax.Array,
+            distribution: jax.Array,
+            seq_lens: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            interleave_size = resolve_pcp_zigzag_page_size(
+                vllm_config.cache_config.block_size
+            )
+            return run_jax_gdn_attention_pooled_pcp_prefill(
+                mixed_qkv,
+                b,
+                a,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                distribution,
+                seq_lens,
+                n_kq=local_num_kq_heads,
+                n_v=local_num_v_heads,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                pool_block_tokens=vllm_config.cache_config.block_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                mesh=pcp_mesh,
+                recurrent_state_dtype=recurrent_state_dtype,
+                align_requests_to_interleave=True,
+            )
+
+        op_name = (
+            f"pallas::gdn_attention_pooled_pcp_a2a_{self.prefix.replace('.', '_')}"
+        )
+        input_partition_specs = (
+            PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),  # mixed_qkv
+            PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),  # b
+            PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME),  # a
+            PartitionSpec(_GDN_PCP_TP_STATE_AXIS),  # recurrent_state pool (rank-local)
+            PartitionSpec(_GDN_TP_AXIS_NAME),  # conv_weight
+            (PartitionSpec(_GDN_TP_AXIS_NAME) if has_conv_bias else None),  # conv_bias
+            PartitionSpec(_GDN_TP_AXIS_NAME),  # A_log
+            PartitionSpec(_GDN_TP_AXIS_NAME),  # dt_bias
+            PartitionSpec(),  # state_indices
+            PartitionSpec(),  # query_start_loc
+            PartitionSpec(),  # request_distribution
+            PartitionSpec(),  # seq_lens
+        )
+        output_partition_specs = (
+            PartitionSpec(_GDN_PCP_TP_STATE_AXIS),  # new pool
+            PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME, None),  # output
+        )
+        gdn_jax_op = pallas.jax_op(
+            op_name,
+            wrapped_fn,
+            donate_argnums=(3,),
+            mesh=pcp_mesh,
+            input_partition_specs=input_partition_specs,
+            output_partition_specs=output_partition_specs,
+        )
+
+        def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
+            num_tokens = mixed_qkv.size(0)
+            out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
+            out = torch.empty(out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+            return torch.empty_like(recurrent_state), out
+
+        gdn_jax_op.register_fake(_fake_gdn)
+
+        def gdn_impl(
+            mixed_qkv: torch.Tensor,
+            b: torch.Tensor,
+            a: torch.Tensor,
+            recurrent_state: torch.Tensor,
+            conv_weight: torch.Tensor,
+            conv_bias: torch.Tensor | None,
+            A_log: torch.Tensor,
+            dt_bias: torch.Tensor,
+            state_indices: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            request_distribution: torch.Tensor,
+            seq_lens: torch.Tensor,
+        ) -> torch.Tensor:
+            new_rec, outputs = gdn_jax_op(
+                mixed_qkv,
+                b,
+                a,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                request_distribution,
+                seq_lens,
+            )
+            recurrent_state.copy_(new_rec)
             return outputs
 
         return gdn_impl
@@ -1442,29 +1593,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             A_log = self.A_log
             dt_bias = self.dt_bias
             if is_pcp_interleaved:
-                (
-                    pcp_geom,
-                    conv_weight,
-                    conv_bias,
-                    A_log,
-                    dt_bias,
-                ) = self._get_pcp_interleaved_params(mixed_qkv.device)
-                if getattr(self, "_pcp_qkv_weights_permuted", False):
-                    mixed_qkv_reordered = mixed_qkv
-                else:
-                    mixed_qkv_reordered = _reorder_gdn_qkv_for_pcp_torch(
-                        mixed_qkv,
-                        pcp_geom,
-                        d_k=self.head_k_dim,
-                        d_v=self.head_v_dim,
-                        dim=-1,
-                    )
-                mixed_qkv_gdn, b_gdn, a_gdn = all_to_all_qkvba_head_to_token(
-                    mixed_qkv_reordered,
-                    b,
-                    a,
-                    pcp_meta.gdn_rm_to_packed,
-                )
+                mixed_qkv_gdn = mixed_qkv
+                b_gdn = b
+                a_gdn = a
                 gdn_qsl = pcp_meta.gdn_query_start_loc
             elif is_pcp_zigzag:
                 mixed_qkv_ag = all_gather_equal_tokens(mixed_qkv, dim=0)
@@ -1518,35 +1649,44 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         "mamba_slot_read_offsets in the attention metadata."
                     )
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
-                core_attn_out = self.gdn_pooled_op(
-                    mixed_qkv_gdn,
-                    b_gdn,
-                    a_gdn,
-                    recurrent_state,
-                    conv_weight,
-                    conv_bias,
-                    A_log,
-                    dt_bias,
-                    state_indices,
-                    gdn_qsl,
-                    request_distribution,
-                    attn_metadata.seq_lens,
-                    slot_read_offsets,
-                    ckpt_indices,
-                )
                 if is_pcp_interleaved:
-                    assert pcp_geom is not None
-                    core_attn_out = core_attn_out.view(
-                        -1, pcp_geom.local_num_v_heads * self.head_v_dim
+                    gdn_pooled_pcp_a2a_op = self.gdn_pooled_pcp_a2a_op
+                    if gdn_pooled_pcp_a2a_op is None:
+                        raise RuntimeError(
+                            "GDN pooled PCP A2A op was not initialized during model loading."
+                        )
+                    core_attn_out = gdn_pooled_pcp_a2a_op(
+                        mixed_qkv_gdn,
+                        b_gdn,
+                        a_gdn,
+                        recurrent_state,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        self.A_log,
+                        self.dt_bias,
+                        state_indices,
+                        gdn_qsl,
+                        request_distribution,
+                        attn_metadata.seq_lens,
                     )
-                    packed_to_rm = pcp_meta.gdn_packed_to_rm[: core_attn_out.size(0)]
-                    core_attn_out = torch.index_select(
-                        core_attn_out,
-                        0,
-                        packed_to_rm,
+                else:
+                    core_attn_out = self.gdn_pooled_op(
+                        mixed_qkv_gdn,
+                        b_gdn,
+                        a_gdn,
+                        recurrent_state,
+                        conv_weight,
+                        conv_bias,
+                        A_log,
+                        dt_bias,
+                        state_indices,
+                        gdn_qsl,
+                        request_distribution,
+                        attn_metadata.seq_lens,
+                        slot_read_offsets,
+                        ckpt_indices,
                     )
-                    core_attn_out = all_to_all_token_to_head(core_attn_out)
-                elif is_pcp_zigzag:
+                if is_pcp_zigzag:
                     core_attn_out = torch.index_select(
                         core_attn_out,
                         0,
@@ -1588,7 +1728,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 )
                 if mamba_request_distribution is not None:
                     request_distribution = mamba_request_distribution
-                use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
+                use_pcp_streaming = (
+                    is_pcp_streaming_attention_metadata(attn_metadata)
+                    or is_pcp_interleaved
+                )
                 if not use_pcp_streaming and self.num_spec > 0:
                     assert slot_read_offsets is not None, (
                         "Speculative decoding with GDN layers requires "
@@ -1635,19 +1778,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         attn_metadata.request_distribution,
                         attn_metadata.seq_lens,
                     )
-                if is_pcp_interleaved:
-                    assert pcp_geom is not None
-                    core_attn_out = core_attn_out.view(
-                        -1, pcp_geom.local_num_v_heads * self.head_v_dim
-                    )
-                    packed_to_rm = pcp_meta.gdn_packed_to_rm[: core_attn_out.size(0)]
-                    core_attn_out = torch.index_select(
-                        core_attn_out,
-                        0,
-                        packed_to_rm,
-                    )
-                    core_attn_out = all_to_all_token_to_head(core_attn_out)
-                elif is_pcp_zigzag:
+                if is_pcp_zigzag:
                     core_attn_out = torch.index_select(
                         core_attn_out,
                         0,

@@ -40,6 +40,22 @@ from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.utils import get_mesh_shape_product
 
+_GDN_TP_AXIS_NAME = "tp"
+
+
+def _gdn_tp_axis_name(mesh: jax.sharding.Mesh) -> str | None:
+    """Return the optional TP axis used by an op-local PCP mesh."""
+    return _GDN_TP_AXIS_NAME if _GDN_TP_AXIS_NAME in tuple(mesh.axis_names) else None
+
+
+def _gdn_pcp_tp_state_axis(
+    pcp_axis: str, tp_axis: str | None
+) -> str | tuple[str, str]:
+    """Map TP-local, then PCP-local state slices to global shard order."""
+    if tp_axis is None:
+        return pcp_axis
+    return (tp_axis, pcp_axis)
+
 
 def run_jax_gdn_attention(
     j_mixed_qkv: jnp.ndarray,
@@ -285,6 +301,7 @@ def _derive_pcp_rank_major_reorder_indices(
     pcp_size: int,
     interleave_size: int,
     local_padded_num_tokens: int,
+    align_requests_to_interleave: bool = False,
 ) -> jnp.ndarray:
     """Rebuild packed-rank-major -> request-major token indices.
 
@@ -300,20 +317,29 @@ def _derive_pcp_rank_major_reorder_indices(
     if q_lens.shape != token_owner_starts.shape:
         raise ValueError("q_lens and token_owner_starts must have equal shape.")
     req_count = q_lens.shape[0]
-    token_owner_ends = token_owner_starts + q_lens
-
-    rank_ids = jnp.arange(pcp_size, dtype=jnp.int32).reshape(pcp_size, 1)
-    rank_counts = _pcp_rank_token_count_before(
-        token_owner_ends.reshape(1, req_count),
-        rank_ids,
-        pcp_size=pcp_size,
-        interleave_size=interleave_size,
-    ) - _pcp_rank_token_count_before(
-        token_owner_starts.reshape(1, req_count),
-        rank_ids,
-        pcp_size=pcp_size,
-        interleave_size=interleave_size,
-    )
+    cycle = pcp_size * interleave_size
+    if align_requests_to_interleave and local_padded_num_tokens >= 2 * interleave_size:
+        token_owner_starts = jnp.zeros_like(q_lens)
+        c_i = jnp.where(
+            q_lens > 0,
+            jnp.maximum(interleave_size, ((q_lens + cycle - 1) // cycle) * interleave_size),
+            0,
+        )
+        rank_counts = jnp.broadcast_to(c_i[None, :], (pcp_size, req_count))
+    else:
+        token_owner_ends = token_owner_starts + q_lens
+        rank_ids = jnp.arange(pcp_size, dtype=jnp.int32).reshape(pcp_size, 1)
+        rank_counts = _pcp_rank_token_count_before(
+            token_owner_ends.reshape(1, req_count),
+            rank_ids,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+        ) - _pcp_rank_token_count_before(
+            token_owner_starts.reshape(1, req_count),
+            rank_ids,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+        )
     rank_req_ends = jnp.cumsum(rank_counts, axis=1)
     rank_req_starts = rank_req_ends - rank_counts
 
@@ -552,26 +578,29 @@ def run_jax_gdn_attention_pcp_tp_prefill(
     local_n_v = geometry.local_num_v_heads
     local_conv_state_dim = geometry.local_conv_dim(d_k, d_v)
 
-    token_spec = P(pcp_axis, None)
+    tp_axis = _gdn_tp_axis_name(mesh)
+    pcp_tp_state_axis = _gdn_pcp_tp_state_axis(pcp_axis, tp_axis)
+    token_spec = P(pcp_axis, tp_axis)
     replicated_spec = P()
-    conv_state_spec = P(None, None, pcp_axis)
-    recurrent_state_spec = P(None, pcp_axis, None, None)
+    tp_parameter_spec = P(tp_axis) if tp_axis is not None else replicated_spec
+    conv_state_spec = P(None, None, pcp_tp_state_axis)
+    recurrent_state_spec = P(None, pcp_tp_state_axis, None, None)
     in_specs = (
         token_spec,  # j_mixed_qkv
         token_spec,  # j_b
         token_spec,  # j_a
         conv_state_spec,  # conv_state
         recurrent_state_spec,  # recurrent_state
-        replicated_spec,  # j_conv_weight
-        replicated_spec if j_conv_bias is not None else None,  # j_conv_bias
-        replicated_spec,  # j_A_log
-        replicated_spec,  # j_dt_bias
+        tp_parameter_spec,  # j_conv_weight
+        tp_parameter_spec if j_conv_bias is not None else None,  # j_conv_bias
+        tp_parameter_spec,  # j_A_log
+        tp_parameter_spec,  # j_dt_bias
         replicated_spec,  # query_start_loc
         replicated_spec,  # state_indices
         replicated_spec,  # distribution
         replicated_spec,  # seq_lens
     )
-    output_spec = P(pcp_axis, None, None)
+    output_spec = P(pcp_axis, tp_axis, None)
     out_specs = ((conv_state_spec, recurrent_state_spec), output_spec)
 
     def _pcp_prefill_fn(
@@ -1285,6 +1314,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
+    recurrent_state_dtype: jnp.dtype = jnp.float32,
+    align_requests_to_interleave: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN PCP prefill over the unified block pool.
 
@@ -1303,27 +1334,30 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     local_n_kq = geometry.local_num_kq_heads
     local_n_v = geometry.local_num_v_heads
 
-    token_spec = P(pcp_axis, None)
+    tp_axis = _gdn_tp_axis_name(mesh)
+    pcp_tp_state_axis = _gdn_pcp_tp_state_axis(pcp_axis, tp_axis)
+    token_spec = P(pcp_axis, tp_axis)
     replicated_spec = P()
+    tp_parameter_spec = P(tp_axis) if tp_axis is not None else replicated_spec
     # Rank-local pool: the op adapter presents the per-rank pools as one
     # logical array stacked on axis 0, so the shard_map body receives
     # exactly this rank's pool.
-    pool_spec = P(pcp_axis)
+    pool_spec = P(pcp_tp_state_axis)
     in_specs = (
         token_spec,  # j_mixed_qkv
         token_spec,  # j_b
         token_spec,  # j_a
         pool_spec,  # recurrent_state (attention-shaped pool)
-        replicated_spec,  # j_conv_weight
-        replicated_spec if j_conv_bias is not None else None,  # j_conv_bias
-        replicated_spec,  # j_A_log
-        replicated_spec,  # j_dt_bias
+        tp_parameter_spec,  # j_conv_weight
+        tp_parameter_spec if j_conv_bias is not None else None,  # j_conv_bias
+        tp_parameter_spec,  # j_A_log
+        tp_parameter_spec,  # j_dt_bias
         replicated_spec,  # query_start_loc
         replicated_spec,  # state_indices
         replicated_spec,  # distribution
         replicated_spec,  # seq_lens
     )
-    output_spec = P(pcp_axis, None, None)
+    output_spec = P(pcp_axis, tp_axis, None)
     out_specs = (pool_spec, output_spec)
 
     def _pooled_pcp_prefill_fn(
@@ -1361,10 +1395,15 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
             pcp_size=pcp_size,
             interleave_size=interleave_size,
             local_padded_num_tokens=local_qkv.shape[0],
+            align_requests_to_interleave=align_requests_to_interleave,
         )
         valid_mask = full_reorder >= 0
         scatter_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
         gather_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
+        if align_requests_to_interleave and local_qkv.shape[0] < 2 * interleave_size:
+            gather_indices = jnp.tile(
+                gather_indices[: local_qkv.shape[0]], pcp_size
+            )
 
         (input_starts_by_rank, send_sizes_by_rank, output_starts_by_rank) = (
             _derive_pcp_ragged_exchange_descriptors(
@@ -1448,6 +1487,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
             d_v=d_v,
             kernel_size=kernel_size,
             pool_block_tokens=pool_block_tokens,
+            recurrent_state_dtype=recurrent_state_dtype,
         )
 
         seq_output_shard = seq_output_shard.reshape(
