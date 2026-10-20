@@ -15,6 +15,7 @@ from vllm_torchtpu.core.raiden_pd import (
     patch_scheduler_init,
 )
 from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPURaidenConnector
 
 
 @pytest.mark.parametrize(
@@ -66,6 +67,7 @@ def test_init_patch_installs_completion_on_official_schedulers(
     monkeypatch.setattr(dist_utils, "get_raiden_inline_load", lambda: False)
 
     def base_init(self, *_args, **_kwargs):
+        self.connector = TPURaidenConnector.__new__(TPURaidenConnector)
         self.finished_req_ids_dict = None
         self.num_spec_tokens = 0
         self.parallel_config = config.parallel_config

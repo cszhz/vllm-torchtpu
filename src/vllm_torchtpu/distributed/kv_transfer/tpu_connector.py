@@ -24,7 +24,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
@@ -1035,6 +1035,13 @@ class TPURaidenConnector(TPUConnector):
 
     force_raiden_connector = True
 
+    def abort_pending_sends(self, request_ids: Iterable[str]) -> None:
+        scheduler = self.connector_scheduler
+        assert isinstance(scheduler, TPURaidenConnectorScheduler), (
+            "Producer send abort requires a Raiden connector scheduler"
+        )
+        scheduler.abort_pending_sends(request_ids)
+
     def get_block_ids_with_load_errors_group_index(self) -> int | None:
         assert self.connector_worker is not None
         if self.connector_worker._pd_load_failures is not None:
@@ -1505,6 +1512,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self._stage3_finished_sends: OrderedDict[
             str, tuple[int, tuple[int, ...], int, dict[str, Any]]
         ] = OrderedDict()
+        self._stage3_sends_to_expire: dict[ReqId, int] = {}
         self._stage3_fa_group_index = 0
         self._stage3_transfer_groups: tuple[_Stage3TransferGroup, ...] = ()
         self._stage3_mamba_group_indices: list[int] = []
@@ -2082,6 +2090,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         meta = super().build_connector_meta(scheduler_output)
         if self.reqs_to_release:
             meta.reqs_to_release, self.reqs_to_release = (self.reqs_to_release, {})
+        meta.reqs_to_expire, self._stage3_sends_to_expire = (
+            self._stage3_sends_to_expire,
+            {},
+        )
         return meta
 
     def _stage3_register_ahead(self, scheduler_output: SchedulerOutput) -> None:
@@ -2523,6 +2535,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     def update_connector_output(self, connector_output: Any) -> None:
         for req_id in connector_output.finished_sending or ():
             self._stage3_finished_sends.pop(req_id, None)
+
+    def abort_pending_sends(self, request_ids: Iterable[str]) -> None:
+        for req_id in request_ids:
+            registration = self._stage3_finished_sends.get(req_id)
+            if registration is not None:
+                self._stage3_sends_to_expire[req_id] = registration[0]
 
     def get_finished_count(self) -> int:
         if not _use_raiden_stage3_transport():
@@ -3951,6 +3969,12 @@ class TPURaidenConnectorWorker:
                     self._register_stage3_request_row_spans(metadata)
                 else:
                     self._register_stage3_request_blocks(metadata)
+                for req_id, uuid in metadata.reqs_to_expire.items():
+                    registration = self._stage3_registered_sends.get(req_id)
+                    if registration is not None and registration.uuid == uuid:
+                        self._stage3_registered_sends[req_id] = dataclasses.replace(
+                            registration, expiration_time=-1, finish_pending=False
+                        )
             else:
                 for req_id, req_meta in metadata.reqs_to_send.items():
                     engine.register_read(

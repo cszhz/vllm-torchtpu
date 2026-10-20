@@ -3953,7 +3953,10 @@ class TestTPURaidenConnectorWorker:
         )
 
     @pytest.mark.parametrize("perf_counter_s", [1.0, 1_700_000_000.0 + 7 * 86400])
-    def test_v3_stage3_unconsumed_send_cancels_only_if_unclaimed(self, perf_counter_s):
+    @pytest.mark.parametrize("abort_uuid", [None, 765, 766])
+    def test_v3_stage3_unconsumed_send_expires_on_deadline_or_abort(
+        self, perf_counter_s, abort_uuid
+    ):
         worker = _make_raiden_worker(
             tp_rank=0,
             tp_size=1,
@@ -3988,8 +3991,18 @@ class TestTPURaidenConnectorWorker:
             worker.process_send_load(meta)
             assert worker.get_finished() == (set(), set())
             assert facade.cancel_request_blocks_calls == []
-            wall_clock.return_value = wall_time_s + 11.0
+            if abort_uuid is not None:
+                worker.process_send_load(
+                    TPUConnectorMetadata(reqs_to_expire={"unconsumed": abort_uuid})
+                )
+            if abort_uuid != 765:
+                assert worker.get_finished() == (set(), set())
+                wall_clock.return_value = wall_time_s + 11.0
             assert worker.get_finished() == ({"unconsumed"}, set())
+            worker.process_send_load(
+                TPUConnectorMetadata(reqs_to_expire={"unconsumed": 765})
+            )
+            assert worker.get_finished() == (set(), set())
 
         assert facade.cancel_request_blocks_calls == [
             {
@@ -4000,7 +4013,7 @@ class TestTPURaidenConnectorWorker:
         assert facade.complete_request_blocks_calls == []
         assert worker._stage3_registered_sends == {}
 
-    def test_v3_stage3_claimed_send_cannot_expire_under_active_transfer(self):
+    def test_v3_stage3_claimed_send_cannot_expire_after_abort(self):
         worker = _make_raiden_worker(
             tp_rank=0,
             tp_size=1,
@@ -4023,8 +4036,9 @@ class TestTPURaidenConnectorWorker:
             uuid=766,
             local_block_ids=[13],
             num_tokens=1,
-            expiration_time=time.time() - 1.0,
+            expiration_time=time.time() + 30.0,
         )
+        meta.reqs_to_expire["claimed"] = 766
 
         with (
             patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
@@ -7448,6 +7462,23 @@ class TestPipelineParallelRegisterAhead:
             )
         )
 
+    def test_stage3_pp_abort_meta_drains_once_after_register_ahead(self):
+        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+        req = _stage3_request("early-abort", self.PROMPT)
+        with _stage3_producer_env(777):
+            registered = self._register_ahead(producer, req)
+            producer.request_finished(req, [100, 101])
+            producer.abort_pending_sends([req.request_id])
+            aborted = producer.build_connector_meta(_scheduler_output())
+            replay = producer.build_connector_meta(_scheduler_output())
+
+        assert registered.reqs_to_send[req.request_id].uuid == 777
+        assert registered.reqs_to_expire == {}
+        assert aborted.reqs_to_expire == {req.request_id: 777}
+        assert aborted.reqs_to_send == {}
+        assert aborted.reqs_to_release == {}
+        assert replay.reqs_to_expire == {}
+
     def test_stage3_pp_registers_in_prompt_completing_step(self):
         producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
         req = _stage3_request("early", self.PROMPT)
@@ -7702,6 +7733,21 @@ class TestPipelineParallelRegisterAheadWorker:
         )
         worker._stage3_state_group_count = 0
         return worker, facade
+
+    def test_v3_stage3_abort_before_finish_notification_does_not_rearm_expiry(self):
+        worker, facade = self._stage_worker()
+        register = TPUConnectorMetadata(reqs_to_send={"early": _stage3_send(1234)})
+        with _stage3_worker_env():
+            worker.process_send_load(register)
+            assert worker._stage3_registered_sends["early"].finish_pending
+            worker.process_send_load(
+                TPUConnectorMetadata(reqs_to_expire={"early": 1234})
+            )
+            assert worker.get_finished({"early"}) == ({"early"}, set())
+            assert worker.get_finished({"early"}) == (set(), set())
+
+        assert facade.cancel_request_blocks_calls == [{"req_id": "early", "uuid": 1234}]
+        assert worker._stage3_registered_sends == {}
 
     def test_v3_stage3_release_meta_drops_registration_silently(self):
         worker, facade = self._stage_worker()

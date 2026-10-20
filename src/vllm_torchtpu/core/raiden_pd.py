@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from functools import wraps
 
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiConnector,
     MultiKVConnectorWorkerMetadata,
 )
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -56,6 +57,21 @@ class _ProducerCompletion:
     """Keep an opted-in P response open until the existing send barrier."""
 
     def __init__(self, scheduler: Scheduler):
+        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+            TPURaidenConnector,
+        )
+
+        connector = scheduler.connector
+        if isinstance(connector, MultiConnector):
+            connector = next(
+                child
+                for child in connector._connectors
+                if isinstance(child, TPURaidenConnector)
+            )
+        assert isinstance(connector, TPURaidenConnector), (
+            "Raiden send completion requires a TPURaidenConnector"
+        )
+        self.connector = connector
         self.original_update = scheduler.update_from_output
         self.original_finish = scheduler.finish_requests
         self.pending_responses: dict[str, _PendingResponse] = {}
@@ -132,15 +148,26 @@ class _ProducerCompletion:
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
     ) -> list[Request]:
-        if request_ids is None:
-            self.pending_responses.clear()
-        else:
+        if request_ids is not None:
             request_ids = (
                 (request_ids,) if isinstance(request_ids, str) else tuple(request_ids)
             )
+        if finished_status == RequestStatus.FINISHED_ABORTED:
+            # PP can register sends before model completion.
+            pending_request_ids = (
+                self.pending_responses
+                if request_ids is None
+                else (
+                    req_id for req_id in request_ids if req_id in self.pending_responses
+                )
+            )
+            self.connector.abort_pending_sends(pending_request_ids)
+        if request_ids is None:
+            self.pending_responses.clear()
+        else:
             for req_id in request_ids:
                 self.pending_responses.pop(req_id, None)
-        # Cancelling a model-finished response does not authorize early KV free.
+        # Expiry still requires an unclaimed registration or a native terminal.
         return self.original_finish(request_ids, finished_status)
 
 

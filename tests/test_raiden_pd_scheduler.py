@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiConnector,
     MultiKVConnectorWorkerMetadata,
 )
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -26,6 +27,10 @@ from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
     RaidenSendOutcome,
     RaidenSendResults,
 )
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+    TPURaidenConnector,
+    TPURaidenConnectorScheduler,
+)
 
 
 @pytest.fixture(params=[Scheduler, AsyncScheduler])
@@ -33,8 +38,19 @@ def scheduler_cls(request):
     return request.param
 
 
-def _scheduler(scheduler_cls):
+def _scheduler(scheduler_cls, *, multi_connector=False):
     scheduler = scheduler_cls.__new__(scheduler_cls)
+    connector = TPURaidenConnector.__new__(TPURaidenConnector)
+    connector.connector_scheduler = TPURaidenConnectorScheduler.__new__(
+        TPURaidenConnectorScheduler
+    )
+    connector.connector_scheduler._stage3_finished_sends = {}
+    connector.connector_scheduler._stage3_sends_to_expire = {}
+    connector.connector_scheduler.reqs_to_release = {}
+    scheduler.connector = connector
+    if multi_connector:
+        scheduler.connector = MultiConnector.__new__(MultiConnector)
+        scheduler.connector._connectors = [object(), connector]
     scheduler._next_outputs = {}
     scheduler.update_from_output = lambda *_args: scheduler._next_outputs
     scheduler.finish_requests = lambda *_args: []
@@ -182,6 +198,44 @@ def test_cancelled_response_does_not_emit_late_pkg2(scheduler_cls):
         == {}
     )
     assert state.pending_responses == {}
+
+
+@pytest.mark.parametrize("request_ids", [None, "p-request", ["p-request", "missing"]])
+@pytest.mark.parametrize("multi_connector", [False, True])
+def test_abort_reaches_model_finished_send(scheduler_cls, request_ids, multi_connector):
+    scheduler, state = _scheduler(scheduler_cls, multi_connector=multi_connector)
+    _prefill(scheduler)
+    scheduler.requests = {"p-request": SimpleNamespace(is_finished=lambda: True)}
+    state.original_finish = Scheduler.finish_requests.__get__(scheduler)
+    connector = (
+        scheduler.connector._connectors[-1] if multi_connector else scheduler.connector
+    )
+    connector_scheduler = connector.connector_scheduler
+    connector_scheduler._stage3_finished_sends["p-request"] = (7, (), 1, {})
+    connector_scheduler.is_producer = True
+    connector_scheduler.reqs_to_send = {}
+
+    assert scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED) == []
+    metadata = connector.build_connector_meta(None)
+    assert metadata.reqs_to_expire == {"p-request": 7}
+    assert connector.build_connector_meta(None).reqs_to_expire == {}
+    assert state.pending_responses == {}
+    assert "p-request" in scheduler.requests
+
+
+def test_abort_keeps_model_running_registration_on_upstream_path(scheduler_cls):
+    scheduler, state = _scheduler(scheduler_cls)
+    connector_scheduler = scheduler.connector.connector_scheduler
+    connector_scheduler._stage3_finished_sends["running"] = (8, (), 1, {})
+    original_calls = []
+    state.original_finish = (
+        lambda ids, status: original_calls.append((set(ids), status)) or []
+    )
+
+    scheduler.finish_requests(["running"], RequestStatus.FINISHED_ABORTED)
+
+    assert connector_scheduler._stage3_sends_to_expire == {}
+    assert original_calls == [({"running"}, RequestStatus.FINISHED_ABORTED)]
 
 
 def test_prefill_and_send_completion_in_same_step(scheduler_cls):

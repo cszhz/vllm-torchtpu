@@ -61,3 +61,5 @@ class TPUConnectorMetadata(KVConnectorMetadata):
     # Producer request id -> transfer uuid whose ahead-of-finish request-block
     # registration every pipeline stage retires.
     reqs_to_release: dict[ReqId, int] = field(default_factory=dict)
+    # Producer aborts: request ID -> UUID.
+    reqs_to_expire: dict[ReqId, int] = field(default_factory=dict)
