@@ -212,6 +212,7 @@ def _attention_csa(
     csa_gather_and_attention_chunk_size: int,
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
+    csa_gather_no_pad: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -271,6 +272,7 @@ def _attention_csa(
         sm_scale=sm_scale,
         gather_and_attention_chunk_size=gather_and_attention_chunk_size,
         attention_kernel_batch_size=attention_kernel_batch_size,
+        gather_no_pad=csa_gather_no_pad,
     )
     return output, updated_sw_cache
 

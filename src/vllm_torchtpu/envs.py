@@ -145,6 +145,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
+    TPU_DSV4_CSA_GATHER_NO_PAD: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = True
     VLLM_TPU_DSV4_MHC_FUSE_NORM: bool = True
@@ -1032,6 +1033,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_SMALL_BUCKET_TOKENS": env_int(
         "TPU_STREAMIDX_SMALL_BUCKET_TOKENS", 64
     ),
+    # DSv4 CSA: size the SparseCore KV gather's per-subcore chunk so its output
+    # needs no padding rows, and hence no slice copy after it.
+    "TPU_DSV4_CSA_GATHER_NO_PAD": env_bool("TPU_DSV4_CSA_GATHER_NO_PAD"),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission

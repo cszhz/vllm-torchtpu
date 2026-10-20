@@ -384,6 +384,7 @@ class VllmDeepseekV4MLAAttention(
                 "csa_gather_and_attention_chunk_size": (
                     envs.TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE
                 ),
+                "csa_gather_no_pad": envs.TPU_DSV4_CSA_GATHER_NO_PAD,
             }
             if is_csa
             else {

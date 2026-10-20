@@ -652,6 +652,7 @@ def prepare_outputs(
         "attention_kernel_batch_size",
         "gather_and_attention_chunk_size",
         "vmem_limit_bytes",
+        "gather_no_pad",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -672,6 +673,8 @@ def sparse_ragged_paged_attention(
     gather_and_attention_chunk_size: int = 128,
     attention_kernel_batch_size: int = 16,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    # See `csa_gather.csa_gather`'s `no_pad`.
+    gather_no_pad: bool = False,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -921,6 +924,7 @@ def sparse_ragged_paged_attention(
             indices,
             num_valid_indices=num_valid_indices,
             top_k=topk,
+            no_pad=gather_no_pad,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, -1)
         gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk // 4, -1)
