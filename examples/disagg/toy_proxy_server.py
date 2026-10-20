@@ -510,14 +510,31 @@ async def _handle_completions(api: str, request: Request):
 
         # Get the next prefill client in round-robin fashion
         prefill_client_info = get_next_client(request.app, "prefill")
-        render_endpoint = _render_endpoint_for_api(api)
+        prompt_val = req_data.get("prompt")
+        already_token_ids = (
+            isinstance(prompt_val, list)
+            and bool(prompt_val)
+            and (
+                isinstance(prompt_val[0], int)
+                or (
+                    isinstance(prompt_val[0], list)
+                    and bool(prompt_val[0])
+                    and isinstance(prompt_val[0][0], int)
+                )
+            )
+        )
+        render_endpoint = None if already_token_ids else _render_endpoint_for_api(api)
         if render_endpoint is not None:
-            render_response = await render_completion_prompt(
-                prefill_client_info, render_endpoint, req_data, request_id
-            )
-            req_data = _replace_prompt_with_rendered_token_ids(
-                req_data, render_response.json()
-            )
+            try:
+                render_response = await render_completion_prompt(
+                    prefill_client_info, render_endpoint, req_data, request_id
+                )
+                req_data = _replace_prompt_with_rendered_token_ids(
+                    req_data, render_response.json()
+                )
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 404:
+                    raise
 
         # Send request to prefill service
         t_prefill_send = time.time()
