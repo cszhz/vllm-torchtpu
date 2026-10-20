@@ -392,6 +392,8 @@ async def send_request_to_prefill(
     req_data["max_tokens"] = 1
     if "max_completion_tokens" in req_data:
         req_data["max_completion_tokens"] = 1
+    if "min_tokens" in req_data and req_data["min_tokens"] is not None:
+        req_data["min_tokens"] = min(int(req_data["min_tokens"]), 1)
     if "stream_options" in req_data:
         del req_data["stream_options"]
     headers = {
