@@ -597,10 +597,16 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
             return hosts[position]
 
         overlay_hosts = list(csa_nope_hosts)
-        for group_swa_layers in swa_layer_groups:
+        n_csa_hosts = len(csa_nope_hosts)
+        for group_idx, group_swa_layers in enumerate(swa_layer_groups):
             for position, layer_name in enumerate(group_swa_layers):
+                host_pos = (
+                    (position + group_idx) % n_csa_hosts
+                    if n_csa_hosts > 1 and position < n_csa_hosts
+                    else position
+                )
                 kv_caches[layer_name] = _host_at(
-                    overlay_hosts, position, swa_overflow_shape
+                    overlay_hosts, host_pos, swa_overflow_shape
                 )
 
         for position, layer_name in enumerate(state_layer_names):

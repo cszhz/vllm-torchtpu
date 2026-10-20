@@ -711,7 +711,15 @@ def _run_engram_prelude_and_layers(
         assert input_ids.shape[0] == positions.shape[0]
         tp_shard_engram = tp_token_shard_ok(input_ids.shape[0], tp_size)
         all_attn_metadata = get_forward_context().attn_metadata
-        if isinstance(all_attn_metadata, dict) and engram_hash.ensure_cache():
+        if (
+            isinstance(all_attn_metadata, dict)
+            and engram_hash.ensure_cache()
+            and (
+                precomputed_engram_hashes is None
+                or envs.VLLM_DSV41_ENGRAM_H2D_PREFIX
+                or envs.VLLM_DSV41_PURE_20L_PREFILL
+            )
+        ):
             swa_meta = all_attn_metadata[engram_hash.swa_cache_module.prefix]
             engram_hashes_raw = engram_hash(
                 input_ids,
