@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     TPU_KV_HOLD_REPLAY_CHECKPOINT: bool = False
     TPU_FINE_PREFIX_HIT_TOKENS: int = 0
     TPU_KV_DROP_HCA_STATE_CHECKPOINT: bool = False
+    TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -749,6 +750,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # checkpoint (never cached, held or host-offloaded); see
     # core/hca_state_checkpoint.py.
     "TPU_KV_DROP_HCA_STATE_CHECKPOINT": env_bool("TPU_KV_DROP_HCA_STATE_CHECKPOINT"),
+    # Engine core: hash every sliding-window block the host offload stores (each
+    # checkpoint's EAGLE peek block included). Unhashed, a freed one is reused
+    # at once and cancels its store job before it launches, with every
+    # full-attention chunk in that job (core/checkpoint_free_order.py).
+    "TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS": env_bool(
+        "TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS"
+    ),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),

@@ -28,10 +28,14 @@ With ``TPU_KV_HOLD_REPLAY_CHECKPOINT=1`` windowed groups keep those blocks
 until the request is freed, and a freed request queues them with the prefix
 they serve: the tail past B is evicted first, then the checkpoint, then the
 full-attention blocks before B, head last.
+
+``TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS=1`` also hashes every windowed block the
+host offload stores, so a freed one is not reused before its store launches.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
 from vllm_torchtpu import envs
@@ -154,4 +158,147 @@ def patch_hold_replay_checkpoint() -> None:
     logger.info(
         "TPU_KV_HOLD_REPLAY_CHECKPOINT: windowed groups hold each request's "
         "replay-boundary checkpoint until the request is freed"
+    )
+
+
+def _hash_offload_checkpoint_blocks(coordinator) -> None:
+    """Hash every windowed block the host offload stores.
+
+    A freed block without a hash goes to the front of the free queue and is
+    reused at once. The offload connector cancels a store job when one of its
+    source blocks is reallocated before the job launches, and with it every
+    full-attention chunk in the same job, which is then never offered again.
+    The offload policy also stores each checkpoint's EAGLE peek block, which
+    the KV cache does not hash without the EAGLE block drop. Hashed, a freed
+    block waits its turn at the back of the queue.
+    """
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+    groups = coordinator.kv_cache_config.kv_cache_groups
+    peek_managers = []
+    for group, manager in zip(groups, coordinator.single_type_managers):
+        if isinstance(manager, SlidingWindowManager):
+            _cache_offload_checkpoint_blocks(
+                manager, coordinator.scheduler_block_size, group.is_eagle_group
+            )
+            if group.is_eagle_group:
+                peek_managers.append(manager)
+    if peek_managers:
+        _cache_peek_blocks(coordinator, peek_managers)
+
+
+def _cache_peek_blocks(coordinator, managers) -> None:
+    """Let EAGLE-annotated groups cache one block past the aligned point.
+
+    vLLM does this only for groups that still drop the EAGLE block; with the
+    drop off (``VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP``) a checkpoint's peek block
+    would leave the window before it became cacheable.
+    """
+    original = coordinator.cache_blocks
+
+    def cache_blocks(request, num_computed_tokens: int) -> None:
+        original(request, num_computed_tokens)
+        finalized = max(0, num_computed_tokens - coordinator.num_reprefillable_tokens)
+        aligned = coordinator._align_cacheable(finalized)
+        if aligned == 0:
+            return
+        boundaries = coordinator.get_replay_boundaries(request)
+        for manager in managers:
+            if manager.use_eagle or not manager.enable_caching:
+                continue  # vLLM's own EAGLE path covers it
+            manager.cache_blocks(
+                request,
+                min(finalized, aligned + manager.block_size),
+                retention_interval=coordinator.retention_interval,
+                replay_boundaries=boundaries,
+            )
+
+    coordinator.cache_blocks = cache_blocks
+
+
+def _cache_offload_checkpoint_blocks(manager, alignment: int, eagle: bool) -> None:
+    """Also cache the blocks the offload connector's store mask keeps.
+
+    The connector keeps a windowed chunk where ``reachable_block_mask``
+    (aligned to the full-attention chunk, EAGLE peek per the group's
+    annotation) does, with the same retention and replay boundaries.
+    """
+    block_mask = manager.reachable_block_mask
+    store_mask = type(manager).reachable_block_mask
+
+    def reachable_block_mask(
+        start_block,
+        end_block,
+        alignment_tokens,
+        kv_cache_spec,
+        use_eagle,
+        retention_interval=None,
+        reachable_boundaries=(),
+        **kwargs,
+    ):
+        mask = block_mask(
+            start_block=start_block,
+            end_block=end_block,
+            alignment_tokens=alignment_tokens,
+            kv_cache_spec=kv_cache_spec,
+            use_eagle=use_eagle,
+            retention_interval=retention_interval,
+            reachable_boundaries=reachable_boundaries,
+            **kwargs,
+        )
+        if mask is None:
+            return None
+        if kv_cache_spec.extra_retained_tokens:
+            # The connector stores the widened window (see its
+            # _reachable_store_block_mask).
+            kv_cache_spec = dataclasses.replace(
+                kv_cache_spec,
+                sliding_window=kv_cache_spec.sliding_window
+                + kv_cache_spec.extra_retained_tokens,
+                extra_retained_tokens=0,
+            )
+        stored = store_mask(
+            start_block=start_block,
+            end_block=end_block,
+            alignment_tokens=alignment,
+            kv_cache_spec=kv_cache_spec,
+            use_eagle=eagle,
+            retention_interval=retention_interval,
+            reachable_boundaries=reachable_boundaries,
+            dcp_world_size=kwargs.get("dcp_world_size", 1),
+        )
+        if stored is None:
+            return None
+        return [a or b for a, b in zip(mask, stored)]
+
+    manager.reachable_block_mask = reachable_block_mask
+
+
+def install_offload_checkpoint_hashing(set_attr) -> None:
+    """Hash the host offload's windowed checkpoint blocks at coordinator
+    construction (``setattr`` or a test's monkeypatch)."""
+    import functools
+
+    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+
+    original_init = HybridKVCacheCoordinator.__init__
+    if getattr(original_init, "_tpu_offload_checkpoint_hashing", False):
+        return
+
+    @functools.wraps(original_init)
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        _hash_offload_checkpoint_blocks(self)
+
+    __init__._tpu_offload_checkpoint_hashing = True  # type: ignore[attr-defined]
+    set_attr(HybridKVCacheCoordinator, "__init__", __init__)
+
+
+def patch_hash_offload_checkpoint_blocks() -> None:
+    if not envs.TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS:
+        return
+    install_offload_checkpoint_hashing(setattr)
+    logger.info(
+        "TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS: windowed blocks of host-offload "
+        "checkpoints are hashed"
     )

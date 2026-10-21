@@ -36,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm_torchtpu.core import checkpoint_free_order as cfo
 from vllm_torchtpu.core import fine_prefix_hits as fph
 from vllm_torchtpu.core import hca_state_checkpoint as hsc
+from vllm_torchtpu.core.eagle_block_drop import clear_eagle_block_drop
 
 FULL = 1024
 HCA_STATE = 4
@@ -51,10 +52,12 @@ def _swa(block_size, window, head_size):
     )
 
 
-def _manager(num_blocks):
+def _manager(num_blocks, eagle=False):
     groups = [
         KVCacheGroupSpec(["model.layers.0.attn.swa_cache"], _swa(128, 128, 512)),
-        KVCacheGroupSpec(["mtp.0.attn.swa_cache"], _swa(128, 128, 512)),
+        KVCacheGroupSpec(
+            ["mtp.0.attn.swa_cache"], _swa(128, 128, 512), is_eagle_group=eagle
+        ),
         KVCacheGroupSpec(
             ["model.layers.0.attn", "model.layers.2.attn"],
             MLAAttentionSpec(
@@ -172,3 +175,59 @@ def test_caches_and_holds_nothing_for_the_group(monkeypatch):
         if isinstance(m, SlidingWindowManager)
     ]
     assert held == [1, 1, 1, 0]
+
+
+@pytest.mark.parametrize("hashed", [False, True], ids=["as-served", "hashed"])
+def test_offload_peek_block_survives_its_window(hashed, monkeypatch):
+    """The EAGLE peek block of the 32k offload checkpoint leaves the window two
+    prefill steps after it is computed. Unhashed, it is reused at once, which
+    cancels its store job if that has not launched yet, and every
+    full-attention chunk in the job with it; hashed, it queues behind older
+    cached blocks."""
+    # Serve-time free order: freed blocks without a hash are reused first.
+    from vllm.v1.core.block_pool import BlockPool
+
+    from vllm_torchtpu import _patch_vllm_block_pool_lifo_free
+
+    monkeypatch.setattr(BlockPool, "free_blocks", BlockPool.free_blocks)
+    monkeypatch.setattr(BlockPool, "_tpu_lifo_free_patch", False, raising=False)
+    _patch_vllm_block_pool_lifo_free()
+    if hashed:
+        cfo.install_offload_checkpoint_hashing(monkeypatch.setattr)
+    mgr = _manager(400, eagle=True)
+    clear_eagle_block_drop(mgr)
+    req = _request(range(1, 40_001), 4)
+    peek = mgr.coordinator.single_type_managers[1]
+    block = None
+    while req.num_computed_tokens < req.num_prompt_tokens:
+        n = min(100, req.num_prompt_tokens - req.num_computed_tokens)
+        assert mgr.allocate_slots(req, n) is not None
+        req.num_computed_tokens += n
+        blocks = peek.req_to_blocks[req.request_id]
+        if block is None and req.num_computed_tokens >= 32_900:
+            block = blocks[32_768 // 128]  # computed, still in the window
+    assert peek.req_to_blocks[req.request_id][256].is_null  # freed since
+    if hashed:
+        # Still free and cached, behind older blocks in the free queue.
+        assert block.ref_cnt == 0 and block.block_hash is not None
+    else:
+        # Reused by the rest of this very prefill, before any store launched.
+        assert block.ref_cnt == 1 and block.block_hash is None
+
+
+def test_all_knobs_together_keep_the_hits(monkeypatch):
+    """Fine hits, held checkpoints, HCA-state drop and offload checkpoint
+    hashing on an EAGLE-annotated MTP group with the EAGLE block drop off."""
+    fph.install(128, monkeypatch.setattr)
+    fph_test._hold(monkeypatch)
+    hsc.install(monkeypatch.setattr)
+
+    def manager():
+        mgr = _manager(130, eagle=True)
+        clear_eagle_block_drop(mgr)
+        return mgr
+
+    expected = _scenario(manager(), held=True)
+    cfo.install_offload_checkpoint_hashing(monkeypatch.setattr)
+    assert _scenario(manager(), held=True) == expected
+    assert expected[0] == 40_320
