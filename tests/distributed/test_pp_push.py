@@ -249,7 +249,7 @@ def test_blocking_forward_call_returns_the_output(monkeypatch, queue):
 def test_empty_steps_do_not_join_the_wave(monkeypatch, queue):
     executor = _install_on_fake_executor(monkeypatch, stages=4)
     future = executor.execute_model(_step(0, 1), non_block=True)
-    assert not isinstance(future, pp_push._PushFuture)
+    assert isinstance(future, pp_push._PushFuture)
     assert future.result() == ("forward", 1)
     assert executor.calls == []
     assert executor._tpu_wave_state.steps == 0
@@ -266,3 +266,68 @@ def test_each_executor_pushes_for_its_own_pipeline_size(monkeypatch, queue):
     assert four.execute_model(_step(16, 1)) == ("forward", 1)
     assert [c[0] for c in four.calls] == ["pp_settle"]
     assert queue(1, 1).kwargs["max_chunks"] == 24
+
+
+@pytest.mark.parametrize("wait_method", ["result", "exception"])
+@pytest.mark.parametrize("non_block", [False, True])
+def test_empty_wait_drains_older_push_replies(
+    monkeypatch, queue, wait_method, non_block
+):
+    from collections import deque
+
+    from vllm.v1.executor import multiproc_executor
+
+    pending = deque()
+    events = []
+    released = False
+
+    class FifoExecutor:
+        output_rank = 3
+        vllm_config = _config(4)
+
+        def collective_rpc(self, method, **kwargs):
+            nonlocal released
+            events.append(("dispatch", method))
+            if method == "pp_settle":
+                released = True
+
+            def reply():
+                events.append(("reply", method))
+                if method == "pp_push" and not released:
+                    raise RuntimeError("push reply needs all stages to drain")
+                return method
+
+            return multiproc_executor.FutureWrapper(pending, reply)
+
+        def execute_model(self, scheduler_output, non_block=False):
+            future = self.collective_rpc("execute_model")
+            return future if non_block else future.result()
+
+        def sample_tokens(self, grammar_output, non_block=False):
+            raise AssertionError("not used")
+
+    monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", FifoExecutor)
+    pp_push.patch_executor_for_pp_wave(_config(4))
+    executor = FifoExecutor()
+    executor.execute_model(_step(16, 1), non_block=True)
+    executor.execute_model(_step(16, 2), non_block=True)
+    wave = executor._tpu_wave_state
+    # Match the stalled FIFO: a control push precedes the empty RPC.
+    wave.before_waiting(executor, 1, 1)
+    old_push = pending[0]
+    empty = executor.execute_model(_step(0, 3), non_block=non_block)
+    if non_block:
+        # A later real forward must be included in the drain too.
+        executor.execute_model(_step(16, 4), non_block=True)
+        counts = (wave.steps, wave.real_steps)
+        assert getattr(empty, wait_method)() == (
+            "execute_model" if wait_method == "result" else None
+        )
+        assert (wave.steps, wave.real_steps) == counts
+    else:
+        assert empty == "execute_model"
+    assert old_push.exception() is None
+    assert events.index(("dispatch", "pp_settle")) < events.index(("reply", "pp_push"))
+    assert wave.settles == 1 and not wave.open
+    assert executor.execute_model(_step(0, 5)) == "execute_model"
+    assert wave.settles == 1

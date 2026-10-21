@@ -128,7 +128,12 @@ class _PushFuture(Future):
     """
 
     def __init__(
-        self, inner: Future, executor: Any, wave: _WaveState, step: int, real_step: int
+        self,
+        inner: Future,
+        executor: Any,
+        wave: _WaveState,
+        step: int | None,
+        real_step: int,
     ):
         super().__init__()
         self._inner = inner
@@ -137,12 +142,23 @@ class _PushFuture(Future):
         self._step = step
         self._real_step = real_step
 
+    def _before_waiting(self) -> None:
+        if self._step is None:
+            # An empty RPC can wait on earlier push replies in the executor's
+            # FIFO. Drain everything already dispatched, including forwards
+            # submitted after this empty step, before waiting on that FIFO.
+            self._wave.before_waiting(
+                self._executor, self._wave.last_step, self._wave.real_steps
+            )
+        else:
+            self._wave.before_waiting(self._executor, self._step, self._real_step)
+
     def result(self, timeout=None):
-        self._wave.before_waiting(self._executor, self._step, self._real_step)
+        self._before_waiting()
         return self._inner.result(timeout)
 
     def exception(self, timeout=None):
-        self._wave.before_waiting(self._executor, self._step, self._real_step)
+        self._before_waiting()
         # The executor's future resolves only inside result(); a stored
         # exception raises there and is read back below.
         with contextlib.suppress(Exception):
@@ -250,9 +266,11 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
 
     def execute_model(self, scheduler_output, non_block=False):
         state = _state(self)
-        if scheduler_output.total_num_scheduled_tokens <= 0:
-            return orig_execute(self, scheduler_output, non_block=non_block)
-        step = state.dispatched()
+        step = (
+            state.dispatched()
+            if scheduler_output.total_num_scheduled_tokens > 0
+            else None
+        )
         # For pooling models and for steps without sampling the engine
         # waits on this future directly, so it pushes like the sampling one.
         inner = cast(Future, orig_execute(self, scheduler_output, non_block=True))
