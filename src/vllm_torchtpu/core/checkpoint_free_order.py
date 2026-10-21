@@ -44,15 +44,28 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def replay_checkpoint_range(manager, num_prompt_tokens: int) -> range:
+def replay_checkpoint_range(
+    manager, num_prompt_tokens: int, alignment: int | None = None
+) -> range:
     """Block indices of a windowed group's replay-boundary checkpoint."""
-    alignment = manager.cache_hit_alignment_tokens
+    if alignment is None:
+        alignment = manager.cache_hit_alignment_tokens
     boundary = (num_prompt_tokens - 1) // alignment * alignment
     end = boundary // manager.block_size
     need = manager._contiguous_blocks_for_hit(
         manager.sliding_window, manager.block_size, manager.use_eagle
     )
     return range(max(0, end - need), end) if boundary > 0 else range(0)
+
+
+def held_checkpoint_indices(manager, num_prompt_tokens: int) -> set[int]:
+    """The replay checkpoint, plus the block-aligned one under fine prefix hits
+    (``fine_prefix_hits`` sets ``_tpu_coarse_alignment``)."""
+    held = set(replay_checkpoint_range(manager, num_prompt_tokens))
+    coarse = getattr(manager, "_tpu_coarse_alignment", None)
+    if coarse is not None:
+        held.update(replay_checkpoint_range(manager, num_prompt_tokens, coarse))
+    return held
 
 
 def _remove_skipped_blocks_holding_checkpoint(
@@ -63,7 +76,7 @@ def _remove_skipped_blocks_holding_checkpoint(
         return
     assert num_prompt_tokens is not None
     blocks = self.req_to_blocks[request_id]
-    hold = replay_checkpoint_range(self, num_prompt_tokens)
+    hold = held_checkpoint_indices(self, num_prompt_tokens)
     freed: list[KVCacheBlock] = []
     # Backwards to the first freed block, stepping over the held checkpoint.
     for i in range(min(num_skipped // self.block_size, len(blocks)) - 1, -1, -1):
@@ -94,7 +107,8 @@ def chain_ordered_blocks(kv_cache_manager, request: Request) -> list[KVCacheBloc
     full_mgr = managers[full[0]]
     alignment = full_mgr.cache_hit_alignment_tokens
     boundary = (request.num_prompt_tokens - 1) // alignment * alignment
-    split = boundary // full_mgr.block_size
+    # A boundary inside a block (fine prefix hits) keeps that block with the head.
+    split = -(-boundary // full_mgr.block_size)
 
     rest: list[KVCacheBlock] = []
     checkpoint: list[KVCacheBlock] = []
@@ -102,9 +116,9 @@ def chain_ordered_blocks(kv_cache_manager, request: Request) -> list[KVCacheBloc
         if i == full[0]:
             continue
         hold = (
-            replay_checkpoint_range(manager, request.num_prompt_tokens)
+            held_checkpoint_indices(manager, request.num_prompt_tokens)
             if isinstance(manager, SlidingWindowManager)
-            else range(0)
+            else set()
         )
         for idx in range(len(blocks) - 1, -1, -1):
             (checkpoint if idx in hold else rest).append(blocks[idx])

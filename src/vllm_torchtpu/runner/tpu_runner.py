@@ -2242,9 +2242,10 @@ class TPUModelRunner(GPUModelRunner):
     def _dense_kv_copy_supported(self) -> bool:
         """Whether CoW copies run on the per-layer KV cache tensors.
 
-        Only when DCP fine-grained prefix hits are active (see
-        ``_patch_vllm_dcp_fine_prefix_hits``), the one config whose copies
-        this path precompiles; any other emitter keeps the generic path.
+        Only when DCP fine-grained prefix hits (see
+        ``_patch_vllm_dcp_fine_prefix_hits``) or ``TPU_FINE_PREFIX_HIT_TOKENS``
+        are active, the configs whose copies this path precompiles; any other
+        emitter keeps the generic path.
         Attention-only models outside the unified pool bind one tensor per
         layer whose dim 0 is the (kernel-granular) block axis. Mamba state
         without the unified pool is not block-indexed that way.
@@ -2263,7 +2264,8 @@ class TPUModelRunner(GPUModelRunner):
         cached = getattr(self, "_dense_kv_copy_cache", None)
         if cached is None or cached[0] is not kv_cache_config:
             unit = _dcp_fine_prefix_match_unit(kv_cache_config, self.vllm_config)
-            cached = (kv_cache_config, unit is not None)
+            fine = unit is not None or envs.TPU_FINE_PREFIX_HIT_TOKENS > 0
+            cached = (kv_cache_config, fine)
             self._dense_kv_copy_cache = cached
         return cached[1]
 

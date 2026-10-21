@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     DP_SCHED_ENABLED: bool = False
     TPU_STEP_TIMING_LOG_STEPS: int = 0
     TPU_KV_HOLD_REPLAY_CHECKPOINT: bool = False
+    TPU_FINE_PREFIX_HIT_TOKENS: int = 0
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -738,6 +739,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefix-cache checkpoint until the request is freed, and the freed request
     # queues it with the prefix it serves (core/checkpoint_free_order.py).
     "TPU_KV_HOLD_REPLAY_CHECKPOINT": env_bool("TPU_KV_HOLD_REPLAY_CHECKPOINT"),
+    # Engine core: prefix-cache hits on full-attention + sliding-window hybrids
+    # land on multiples of this many tokens instead of the scheduler block; the
+    # full-attention block holding the hit point is copied on write
+    # (core/fine_prefix_hits.py). 0 = off.
+    "TPU_FINE_PREFIX_HIT_TOKENS": env_nonnegative_int("TPU_FINE_PREFIX_HIT_TOKENS", 0),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
