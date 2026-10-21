@@ -397,7 +397,7 @@ def _cp_scatter_indexer_k(
         page = jnp.where(
             valid, local_page_indices[seq_id, virtual_page], jnp.int32(OOB_PAGE)
         )
-        return update_indexer_cache(cache_kv, k_packed, page, slot)
+        return cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(k_packed)
 
     replicated = jax.sharding.PartitionSpec()
     sharded = jax.sharding.PartitionSpec(axis_name)

@@ -111,7 +111,9 @@ def _glm53_native_chunk_kwargs(
     if num_rows == 16:
         # The 16-row decode bucket runs one query row per attention batch.
         return {"attention_kernel_batch_size": 1}
-    if num_rows == _GLM53_PREFILL_BUCKET_ROWS:
+    # The 128-row chunk was measured on the 64-head prefill bucket only;
+    # narrower head buckets keep the kernel default.
+    if num_rows == _GLM53_PREFILL_BUCKET_ROWS and ql_nope.shape[1] == 64:
         return {"gather_and_attention_chunk_size": 128}
     return {}
 
