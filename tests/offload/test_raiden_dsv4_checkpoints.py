@@ -22,12 +22,18 @@ the 128-ratio compressor's 32-token state group with a 128-token window.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from test_raiden_store_offload import FakeKVCacheStore, make_manager, sub_hashes
 from vllm import SamplingParams
 from vllm.utils.hashing import sha256
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    get_request_block_hasher,
+    init_none_hash,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -47,6 +53,8 @@ DSV4_GROUPS = [
     ("model.layers.2.attn.compressor.state_cache", 16, 8, False),
     ("model.layers.0.attn.compressor.state_cache", 32, 128, False),
 ]
+FULL_GROUP = 2
+HCA_STATE_GROUP = 4
 PROMPT = 10_000  # replay boundary 9216, 9 full chunks
 
 init_none_hash(sha256)
@@ -178,6 +186,37 @@ class TestRetentionIntervalStores(unittest.TestCase):
             with self.subTest(interval=interval):
                 self.assertEqual(stored_per_group(stored), per_group)
                 self.assertEqual(host_hit(sched, TURN2), 9216)
+
+
+class TestDropHcaStateCheckpoint(unittest.TestCase):
+    def test_hca_state_group_is_never_stored_looked_up_or_loaded(self):
+        with patch.dict("os.environ", {"TPU_KV_DROP_HCA_STATE_CHECKPOINT": "1"}):
+            sched, store = make_scheduler(32768)
+        stored = prefill(sched, store, make_request("a", TURN1))
+        self.assertEqual(stored_per_group(stored), [1, 2, 9, 1, 0])
+
+        req = make_request("b", TURN2)
+        sched.on_new_request(req)
+        hit, _ = sched.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(hit, 9216)
+        # Blocks as the KV cache manager allocates them for a 9216-token
+        # external hit: windowed groups hold only their window.
+        next_id = iter(range(1000, 2000))
+        null = KVCacheBlock(block_id=0)
+        null.is_null = True
+        groups = []
+        for _, block_size, window, eagle in DSV4_GROUPS:
+            n = 9216 // block_size
+            w = n if window is None else -(-window // block_size) + int(eagle)
+            groups.append(
+                [null] * (n - w) + [KVCacheBlock(next(next_id)) for _ in range(w)]
+            )
+        sched.update_state_after_alloc(req, KVCacheBlocks(tuple(groups)), hit)
+        (job,) = sched._current_batch_load_jobs.values()
+        loaded = stored_per_group(job.src_spec.keys)
+        self.assertEqual(loaded[HCA_STATE_GROUP], 0)
+        self.assertEqual(job.dst_spec.group_sizes[HCA_STATE_GROUP], 0)
+        self.assertEqual(loaded[FULL_GROUP], 9)
 
 
 if __name__ == "__main__":

@@ -60,7 +60,10 @@ def replay_checkpoint_range(
 
 def held_checkpoint_indices(manager, num_prompt_tokens: int) -> set[int]:
     """The replay checkpoint, plus the block-aligned one under fine prefix hits
-    (``fine_prefix_hits`` sets ``_tpu_coarse_alignment``)."""
+    (``fine_prefix_hits`` sets ``_tpu_coarse_alignment``); none for a group that
+    needs no checkpoint (``hca_state_checkpoint`` sets ``_tpu_no_checkpoint``)."""
+    if getattr(manager, "_tpu_no_checkpoint", False):
+        return set()
     held = set(replay_checkpoint_range(manager, num_prompt_tokens))
     coarse = getattr(manager, "_tpu_coarse_alignment", None)
     if coarse is not None:

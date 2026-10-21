@@ -110,6 +110,10 @@ PATCHES = (
         _ENGINE,
     ),
     Patch("vllm_torchtpu.core.fine_prefix_hits:patch_fine_prefix_hits", _ENGINE),
+    Patch(
+        "vllm_torchtpu.core.hca_state_checkpoint:patch_drop_hca_state_checkpoint",
+        _ENGINE,
+    ),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
