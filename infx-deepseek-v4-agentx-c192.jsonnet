@@ -145,6 +145,11 @@ local maxNumSeqs = cdk.numVar('MAX_NUM_SEQS', 64);
 local maxNumBatchedTokens = cdk.numVar('MAX_NUM_BATCHED_TOKENS', 128);
 // As in j-2c8a1b3b-17f0-4b33-bfb6. BLOCK_SIZE=0 drops --block-size and leaves it to vLLM.
 local blockSize = cdk.numVar('BLOCK_SIZE', 1024);
+// The DSv4 HCA and indexer kernel blocks count KV pages, and vllm-torchtpu's defaults (6990d19b3) are sized
+// for a 512-token block. At 1024 they span twice the tuned tokens and the HCA decode pass runs out of VMEM
+// compiling the T16 bucket (j-4fcc236c-bfa4-4f11-8c6a), so 1024 takes the halved, tuned values. Empty = source default.
+local hcaKvPagesPerBlock = cdk.var('TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK', if blockSize == 1024 then '128,64,64' else '');
+local indexerKvPagesPerBlock = cdk.var('TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK', if blockSize == 1024 then '32,64,32' else '');
 local quantization = cdk.var('QUANTIZATION', 'deepseek_v4_fp8');
 local kvCacheDtype = cdk.var('KV_CACHE_DTYPE', 'fp8_e4m3');
 // Raising this enlarges the KV cache but shrinks the HBM left for compiling the largest token bucket after
@@ -744,6 +749,8 @@ local serverJob = cdk.job(
           'TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES',
           'TPU_LOG_HOST_TENSORS_AFTER_LOAD',
           'TPU_STEP_TIMING_LOG_STEPS',
+          'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK',
+          'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK',
           'TPU_DSV4_ATTN_INTRA_CHIP_TP',
           'TPU_PJRT_EVENT_TRACE_ENABLE',
           'USE_PHASED_PROFILER',
@@ -774,6 +781,8 @@ local serverJob = cdk.job(
         [if premappedBufferSize != 'none' then 'TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES']: premappedBufferSize,
         TPU_LOG_HOST_TENSORS_AFTER_LOAD: logHostTensorsAfterLoad,
         TPU_STEP_TIMING_LOG_STEPS: stepTimingLogSteps,
+        [if hcaKvPagesPerBlock != '' then 'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK']: hcaKvPagesPerBlock,
+        [if indexerKvPagesPerBlock != '' then 'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK']: indexerKvPagesPerBlock,
         [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
         // Read by the scheduler in the EngineCore processes, not by Ray workers.
         [if prefillGateMinCadences != '' then 'TPU_PREFILL_GATE_MIN_CADENCES']: prefillGateMinCadences,
