@@ -440,6 +440,7 @@ def _build_kv_connector_output(
     *,
     finished_sending: set[str] | None,
     finished_recving: set[str] | None,
+    failed_recving: set[str],
     kv_connector_worker_meta: Any | None,
     invalid_block_ids: set[int],
     invalid_block_group_index: int | None,
@@ -456,6 +457,7 @@ def _build_kv_connector_output(
     kwargs: dict[str, Any] = {
         "finished_sending": finished_sending,
         "finished_recving": finished_recving,
+        "failed_recving": failed_recving,
         "kv_connector_worker_meta": kv_connector_worker_meta,
         "invalid_block_ids": invalid_block_ids,
         "kv_connector_stats": kv_connector_stats,
@@ -1197,11 +1199,17 @@ class TPUModelRunner(GPUModelRunner):
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
             self._stage_timing.take_samples()
-            return None, None, None, set(), None, None
+            return None, None, set(), None, set(), None, None
         kv_connector = get_kv_transfer_group()
-        finished_sending, finished_recving = kv_connector.get_finished(
+        # get_transfer_results, not get_finished: only it carries
+        # failed_recving, the per-request failure channel that multi-group
+        # KV layouts require (vLLM rejects invalid_block_ids for them).
+        transfer_results = kv_connector.get_transfer_results(
             scheduler_output.finished_req_ids
         )
+        finished_sending = transfer_results.finished_sending or None
+        finished_recving = transfer_results.finished_recving or None
+        failed_recving = transfer_results.failed_recving
         invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
         invalid_block_group_index = (
             kv_connector.get_block_ids_with_load_errors_group_index()
@@ -1234,6 +1242,7 @@ class TPUModelRunner(GPUModelRunner):
         return (
             finished_sending,
             finished_recving,
+            failed_recving,
             worker_meta,
             invalid_block_ids,
             invalid_block_group_index,
@@ -1252,6 +1261,7 @@ class TPUModelRunner(GPUModelRunner):
         (
             finished_sending,
             finished_recving,
+            failed_recving,
             worker_meta,
             invalid_block_ids,
             invalid_block_group_index,
@@ -1260,6 +1270,7 @@ class TPUModelRunner(GPUModelRunner):
         kv_connector_output = _build_kv_connector_output(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
+            failed_recving=failed_recving,
             kv_connector_worker_meta=worker_meta,
             invalid_block_ids=invalid_block_ids,
             invalid_block_group_index=invalid_block_group_index,
@@ -5000,6 +5011,7 @@ class TPUModelRunner(GPUModelRunner):
         (
             finished_sending,
             finished_recving,
+            failed_recving,
             kv_worker_meta,
             invalid_block_ids,
             invalid_block_group_index,
@@ -5011,6 +5023,7 @@ class TPUModelRunner(GPUModelRunner):
             if (
                 finished_sending is None
                 and finished_recving is None
+                and not failed_recving
                 and kv_worker_meta is None
                 and not invalid_block_ids
                 and kv_connector_stats is None
@@ -5018,6 +5031,7 @@ class TPUModelRunner(GPUModelRunner):
             else _build_kv_connector_output(
                 finished_sending=finished_sending,
                 finished_recving=finished_recving,
+                failed_recving=failed_recving,
                 kv_connector_worker_meta=kv_worker_meta,
                 invalid_block_ids=invalid_block_ids,
                 invalid_block_group_index=invalid_block_group_index,
@@ -7733,6 +7747,7 @@ class TPUModelRunner(GPUModelRunner):
         (
             finished_sending,
             finished_recving,
+            failed_recving,
             kv_worker_meta,
             invalid_block_ids,
             invalid_block_group_index,
@@ -7741,6 +7756,7 @@ class TPUModelRunner(GPUModelRunner):
         if (
             finished_sending is None
             and finished_recving is None
+            and not failed_recving
             and kv_worker_meta is None
             and not invalid_block_ids
             and kv_connector_stats is None
@@ -7750,6 +7766,7 @@ class TPUModelRunner(GPUModelRunner):
         output.kv_connector_output = _build_kv_connector_output(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
+            failed_recving=failed_recving,
             kv_connector_worker_meta=kv_worker_meta,
             invalid_block_ids=invalid_block_ids,
             invalid_block_group_index=invalid_block_group_index,
