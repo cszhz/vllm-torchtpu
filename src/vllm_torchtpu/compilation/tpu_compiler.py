@@ -181,6 +181,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
     "USE_PHASED_PROFILER",
+    "TPU_STEP_TIMING_LOG_STEPS",
     # Raiden KV-transfer orchestration/identity only; consumed at serving time
     # by the KV connector and never affect the compiled graph.
     "TPU_RAIDEN_CONTROLLER_ADDRESS",
