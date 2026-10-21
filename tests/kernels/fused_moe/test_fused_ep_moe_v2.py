@@ -754,6 +754,84 @@ def test_split_stages_with_a_reordered_gather_are_bit_exact(sharded_plan):
     assert not np.array_equal(np.asarray(wrong), np.asarray(fused))
 
 
+def _placement_slots(rng, e_total, spare):
+    """(expert of each slot, [experts, replicas] slot table) for a random
+    placement with `spare` extra slots per shard holding replicas."""
+    g_local = e_total // EP
+    ranks = [list(r) for r in rng.permutation(e_total).reshape(EP, g_local)]
+    hot = rng.choice(e_total, size=EP * spare, replace=False)
+    for i, e in enumerate(hot):
+        r = next(r for r in (np.arange(EP) + i) % EP if e not in ranks[r])
+        while len(ranks[r]) >= g_local + spare:
+            r = (r + 1) % EP
+        ranks[r].append(int(e))
+    width = g_local + spare
+    expert_of_slot = np.array([e for held in ranks for e in held])
+    held_at = [list(np.flatnonzero(expert_of_slot == e)) for e in range(e_total)]
+    reps = max(len(h) for h in held_at)
+    table = np.array([h + [-1] * (reps - len(h)) for h in held_at], np.int32)
+    assert expert_of_slot.size == EP * width
+    return expert_of_slot, table
+
+
+@pytest.mark.parametrize("spare", [0, 1])
+@pytest.mark.parametrize("routing", ["topk", "score_bias", "hash"])
+def test_expert_slot_placement_is_bit_exact(routing, spare):
+    """A static placement moves experts between shards and nothing else.
+
+    The weights go in slot order, `expert_slot` maps each global expert to
+    its slots after selection, and every token must come out with the same
+    bits as the unplaced layer -- on the served fp4 block-512 form, for the
+    plain top-k, the bias-corrected top-k and the hash-table selections, with
+    and without spare slots holding replicas. The control checks the
+    placement really moved experts across shards.
+    """
+    mesh = _mesh()
+    e_total = 32
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 52, hidden=1024, inter=512, e_total=e_total, rhs_qb=512
+    )
+    x, gating = _make_inputs(mesh, 53, tokens=256, hidden=1024, e_total=e_total)
+    rng = np.random.default_rng(54 + spare)
+    expert_of_slot, slot_table = _placement_slots(rng, e_total, spare)
+    expert_sharding = NamedSharding(mesh, P(AXIS))
+
+    def to_slot_order(a):
+        return jax.device_put(np.asarray(a)[expert_of_slot], expert_sharding)
+
+    extra = {}
+    if routing == "score_bias":
+        extra["score_bias"] = jnp.asarray(
+            rng.normal(size=(e_total,)).astype(np.float32)
+        )
+    elif routing == "hash":
+        extra["hash_topk_ids"] = _make_hash_ids(
+            mesh, 55, tokens=256, topk=4, e_total=e_total
+        )
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        routed_scaling_factor=2.5,
+        **extra,
+    )
+    identity = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    placed_weights = tuple(to_slot_order(a) for a in (*weights, *scales))
+    placed = fused_ep_moe_v2(
+        x, *placed_weights, gating, expert_slot=jnp.asarray(slot_table), **common
+    )
+    np.testing.assert_array_equal(np.asarray(placed), np.asarray(identity))
+    if spare:
+        return
+    unmapped = fused_ep_moe_v2(x, *placed_weights, gating, **common)
+    assert not np.array_equal(np.asarray(unmapped), np.asarray(identity))
+
+
 @pytest.fixture(scope="module")
 def production_weights():
     """The Qwen3.5-397B MoE weights, fp8 e4m3 with per-channel scales.

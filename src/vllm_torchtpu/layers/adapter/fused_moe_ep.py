@@ -51,6 +51,7 @@ from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu import expert_placement
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
@@ -181,6 +182,7 @@ def _build_op(
     *,
     token_replica_groups=None,
     sorted_gather=None,
+    has_expert_slot=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -203,6 +205,7 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         None if sorted_gather is None else sorted_gather[1],
+        has_expert_slot,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -317,6 +320,7 @@ def _build_op(
         (spec,) * 7
         + ((PartitionSpec(),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
+        + ((PartitionSpec(),) if has_expert_slot else ())
     )
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
@@ -324,7 +328,14 @@ def _build_op(
     # JaxCallable with that one line replaced, was the way around it. Torchtpu
     # takes output_partition_specs itself now, which is the same information
     # without a copy of anyone's source.
-    if has_score_bias:
+    if has_expert_slot:
+        fn = _operand_fn(
+            call,
+            ("score_bias",) * has_score_bias
+            + ("hash_topk_ids",) * has_hash_ids
+            + ("expert_slot",),
+        )
+    elif has_score_bias:
         fn = moe_with_score_bias
     elif has_hash_ids:
         fn = moe_with_hash_ids
@@ -335,6 +346,7 @@ def _build_op(
         fn,
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
+        # [, expert_slot]
         # -- and the single output is sharded on axis 0 like x.
         input_partition_specs=input_specs,
         output_partition_specs=spec,
@@ -363,6 +375,44 @@ def _build_op(
         )
     _OPS[key] = op
     return op
+
+
+# The dtype each optional operand is handed to fused_ep_moe_v2 in; None keeps it.
+_OPERAND_DTYPES = {
+    "score_bias": jnp.float32,
+    "hash_topk_ids": jnp.int32,
+    "expert_slot": None,
+}
+
+
+def _operand_fn(call, names):
+    """`call` behind the signature (x, w1, w2, w1_scale, w2_scale, gating,
+    rank, *names), every operand annotated jax.Array as torch_tpu requires.
+
+    The fixed-arity functions in _build_op cover the unplaced layers and keep
+    their programs as they were; every combination with a placement goes
+    through here instead of one more hand-written function per combination.
+    """
+    import inspect
+
+    fixed = ("x", "w1", "w2", "w1_scale", "w2_scale", "gating", "rank")
+
+    def fn(*operands):
+        extra = dict(zip(names, operands[len(fixed) :], strict=True))
+        kw = {
+            n: v if _OPERAND_DTYPES[n] is None else v.astype(_OPERAND_DTYPES[n])
+            for n, v in extra.items()
+        }
+        return call(*operands[: len(fixed)], **kw)
+
+    param = inspect.Parameter.POSITIONAL_OR_KEYWORD
+    fn.__signature__ = inspect.Signature(
+        [inspect.Parameter(n, param, annotation=jax.Array) for n in fixed + names],
+        return_annotation=jax.Array,
+    )
+    fn.__annotations__ = {n: jax.Array for n in fixed + names} | {"return": jax.Array}
+    fn.__name__ = "moe_with_" + "_".join(names)
+    return fn
 
 
 class _SortedGatherOp:
@@ -561,6 +611,7 @@ def fused_moe_ep(
     router_logits: torch.Tensor,
     score_bias: torch.Tensor | None = None,
     hash_ids: torch.Tensor | None = None,
+    expert_slot: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -572,8 +623,10 @@ def fused_moe_ep(
 
     `score_bias` is the layer's `e_score_correction_bias`, [global experts]
     f32, and `hash_ids` is `hash_topk_ids_operand`'s [tokens, topk] i32 table
-    lookup. Each must be passed exactly when prebuild saw the corresponding
-    thing on the layer -- prebuild built the op's signature around that.
+    lookup; `expert_slot` is a placed layer's slot table
+    (`expert_placement.expert_slot_table`). Each must be passed exactly when
+    prebuild saw the corresponding thing on the layer -- prebuild built the
+    op's signature around that.
     Getting it wrong is a torch arity error at the first call, not a wrong
     answer.
     """
@@ -594,7 +647,7 @@ def fused_moe_ep(
     )
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
-    extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
+    extra = tuple(t for t in (score_bias, hash_ids, expert_slot) if t is not None)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
@@ -902,7 +955,8 @@ def prebuild_fused_moe_ep(
     # silently. `local_experts * ep` is exactly the `e_total` the kernel will
     # derive from the global weight, so requiring the gate width to match it is
     # the same check the kernel would make if it made one.
-    if layer.global_num_experts != local_experts * ep:
+    placed = expert_placement.expert_slot_table(layer)
+    if placed is None and layer.global_num_experts != local_experts * ep:
         logger.warning_once(
             "Fused EP MoE not engaged: the kernel needs one equal contiguous "
             "expert block per shard, but %d global experts over ep=%d does "
@@ -931,6 +985,12 @@ def prebuild_fused_moe_ep(
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
+    has_expert_slot = placed is not None
+    if has_expert_slot and sorted_gather is not None:
+        raise ValueError(
+            f"{layer.layer_name}: TPU_EXPERT_PLACEMENT does not support "
+            "MOE_FUSED_EP_SORTED_GATHER"
+        )
     op = _build_op(
         mesh,
         topk,
@@ -946,6 +1006,7 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         token_replica_groups=token_replica_groups,
         sorted_gather=sorted_gather,
+        has_expert_slot=has_expert_slot,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
