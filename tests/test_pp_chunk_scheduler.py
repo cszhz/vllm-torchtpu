@@ -33,6 +33,10 @@ def _scheduler(
     skipped_waiting=(),
 ) -> TpuPipelineChunkScheduler:
     scheduler = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
+    scheduler.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=16384, long_prefill_token_threshold=16384
+    )
+    scheduler._prefill_threshold_floor = 2048
     scheduler._cost = cost
     scheduler._step_limit = step_limit
     scheduler._pp_size = 8
@@ -379,3 +383,67 @@ def test_engine_core_patch_is_skipped_without_dynamic_chunks(monkeypatch):
     monkeypatch.setattr(engine_core, "EngineCore", FakeCore)
     patch_engine_core_for_pp_chunks(_config(cls=None))
     assert not hasattr(FakeCore, "_tpu_pp_chunks_patch")
+
+
+@pytest.mark.parametrize(
+    "running,waiting,skipped,expected",
+    [
+        (0, 0, 0, 0),
+        (1, 0, 0, 0),
+        (0, 1, 0, 0),
+        (1, 1, 0, 8192),
+        (1, 0, 1, 8192),
+        (4, 0, 0, 4096),
+        (1, 8, 0, 2048),
+    ],
+)
+def test_prefill_cap_tracks_competition(running, waiting, skipped, expected):
+    scheduler = _scheduler(
+        running=[_request(0, 65536, str(i)) for i in range(running)],
+        waiting=[_request(0, 65536) for _ in range(waiting)],
+        skipped_waiting=[_request(0, 65536) for _ in range(skipped)],
+    )
+    observed = []
+
+    def schedule_base(self, throttle_prefills=False):
+        observed.append(self.scheduler_config.long_prefill_token_threshold)
+        return _EMPTY_STEP
+
+    with patch.object(Scheduler, "schedule", schedule_base):
+        scheduler.schedule()
+    assert observed == [expected]
+    assert scheduler.scheduler_config.long_prefill_token_threshold == 16384
+
+
+def test_prefill_cap_restored_after_scheduler_error():
+    scheduler = _scheduler(waiting=[_request(0, 65536)])
+    with (
+        patch.object(Scheduler, "schedule", side_effect=RuntimeError("test")),
+        pytest.raises(RuntimeError, match="test"),
+    ):
+        scheduler.schedule()
+    assert scheduler.scheduler_config.long_prefill_token_threshold == 16384
+
+
+@pytest.mark.parametrize(
+    "configured,expected", [(0, 8192), (32768, 8192), (4096, 4096)]
+)
+def test_prefill_config_is_private(configured, expected):
+    shared = SimpleNamespace(
+        max_num_batched_tokens=32768, long_prefill_token_threshold=configured
+    )
+
+    def init_base(self):
+        self.scheduler_config = shared
+        self.vllm_config = SimpleNamespace(
+            scheduler_config=shared,
+            parallel_config=SimpleNamespace(pipeline_parallel_size=4),
+        )
+        self.need_mamba_block_aligned_split = False
+
+    with patch.object(Scheduler, "__init__", init_base):
+        scheduler = TpuPipelineChunkScheduler()
+    assert scheduler.scheduler_config is not shared
+    assert scheduler._prefill_threshold_floor == expected
+    scheduler.scheduler_config.long_prefill_token_threshold = 123
+    assert shared.long_prefill_token_threshold == configured

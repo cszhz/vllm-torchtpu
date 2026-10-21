@@ -16,10 +16,15 @@ at most as many (query block, KV block) attention pairs as the batched
 attention kernel can schedule, which bounds a chunk deep in a very long
 prompt so the kernel never overruns its SMEM. The cost model
 arrives after the engine core has built its executor and scheduler; until
-then chunks are cut by token count alone.
+then chunks are cut by token count alone. With competing requests, a long
+prefill is capped at the larger of its fair token share and a pipeline-share
+floor (or a smaller configured threshold). A lone request is exempt from this
+cap. Waiting connector lookups count as competition; this trades long-request
+progress for admission opportunities and does not guarantee lower latency.
 """
 
 import math
+from copy import copy
 from typing import Any
 
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -50,6 +55,16 @@ def _prefill_end(request: Any) -> int:
 class TpuPipelineChunkScheduler(Scheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # The base scheduler reads its cap from scheduler_config. Keep a private
+        # copy so each step can change the cap without mutating VllmConfig or
+        # another scheduler/worker sharing that configuration.
+        self.scheduler_config = copy(self.scheduler_config)
+        budget = self.scheduler_config.max_num_batched_tokens
+        stages = self.vllm_config.parallel_config.pipeline_parallel_size
+        configured = self.scheduler_config.long_prefill_token_threshold
+        self._prefill_threshold_floor = min(
+            configured or budget, max(1, budget // stages)
+        )
         self._cost: StepCostModel | None = None
         self._step_limit: int | None = None
         self._pp_size = 1
@@ -92,7 +107,24 @@ class TpuPipelineChunkScheduler(Scheduler):
             if computed >= _prefill_end(request) and request.num_tokens > computed:
                 self._account(1, computed)
                 self._seeded.add(request.request_id)
-        return super().schedule(throttle_prefills)
+        # Port vLLM's single-request exemption and adaptive long-prefill cap
+        # (vllm/v1/core/sched/scheduler.py). Unlike its opt-in knob, derive the
+        # default floor from one pipeline share. Existing PP time, attention
+        # capacity and Mamba alignment constraints still apply afterwards.
+        count = len(self.running) + len(self.waiting) + len(self.skipped_waiting)
+        configured = self.scheduler_config.long_prefill_token_threshold
+        self.scheduler_config.long_prefill_token_threshold = (
+            max(
+                self._prefill_threshold_floor,
+                self.scheduler_config.max_num_batched_tokens // count,
+            )
+            if count > 1
+            else 0
+        )
+        try:
+            return super().schedule(throttle_prefills)
+        finally:
+            self.scheduler_config.long_prefill_token_threshold = configured
 
     def _pending_step_limit(self) -> int | None:
         """The bucket a step is held to: the prefill work still to schedule
