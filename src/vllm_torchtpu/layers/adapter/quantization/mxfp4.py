@@ -1223,18 +1223,35 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 f"admitted layout: {reason}"
             )
             register_score_bias_buffer(layer)
-            # The kernel takes [E, K/block, N]; do the squeeze once here
-            # rather than per layer per step inside the compiled forward.
+            # The kernel takes [E, K/block, N]; materialize a fresh 3D tensor
+            # via CPU roundtrip so PJRT allocates canonical {2,1,0:T(8,128)}
+            # layout instead of an as_strided view of the 4D {3,2,1,0:T(1,128)}
+            # parameter (which otherwise triggers an eager as_strided copy + an
+            # in-graph HBM layout transpose on every decode step).
             layer.register_buffer(
                 "_tpu_fused_w13_scale",
-                layer.w13_weight_scale.squeeze(2).contiguous(),
+                layer.w13_weight_scale.squeeze(2)
+                .to("cpu", dtype=torch.float32)
+                .contiguous()
+                .to(device),
                 persistent=False,
             )
             layer.register_buffer(
                 "_tpu_fused_w2_scale",
-                layer.w2_weight_scale.squeeze(2).contiguous(),
+                layer.w2_weight_scale.squeeze(2)
+                .to("cpu", dtype=torch.float32)
+                .contiguous()
+                .to(device),
                 persistent=False,
             )
+            layer.w13_weight_scale = torch.nn.Parameter(
+                layer._tpu_fused_w13_scale.unsqueeze(2), requires_grad=False
+            )
+            layer.w2_weight_scale = torch.nn.Parameter(
+                layer._tpu_fused_w2_scale.unsqueeze(2), requires_grad=False
+            )
+            gc.collect()
+            synchronize_tensors([layer._tpu_fused_w13_scale, layer._tpu_fused_w2_scale])
             logger.info_once(
                 "DeepSeek-V4 MXFP4 fused EP W4A8 enabled: block-%d",
                 REQUANTIZED_BLOCK_SIZE,

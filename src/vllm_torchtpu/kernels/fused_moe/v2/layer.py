@@ -730,27 +730,40 @@ def fused_ep_moe_v2(
         # that copy is the largest single piece of glue above a thousand
         # rows. The kernel rebuilds the column a tile at a time instead.
         #
-        # The scatter runs the length of the view rather than of the slab.
-        # Those extra elements are past the slab's last row, so a pair the
-        # rebase sent past the end lands on one of them instead of being
-        # dropped; nothing reads them, and the slab's own rows are the same
-        # either way.
+        # Scatter into `ragged_stride` first so off-shard pairs that `rebase`
+        # mapped to `ragged_stride` are out-of-bounds for `mode="drop"` (just
+        # like `token_gather` above) instead of colliding on the first padding
+        # slot, and so both scatters share the same bounds check. Then pad out
+        # to the full `[scale_rows, HIDDEN_LANE_BLOCK]` view.
         if form.quantized_activations:
             scale_rows = act_scale_slab_rows(ragged_stride)
+            scale_pad = scale_rows * HIDDEN_LANE_BLOCK - ragged_stride
             if n_act_scales == 1:
                 scale_bits = jnp.repeat(scale_bits_g.reshape(-1), topk)
-                scale_slab = lax.bitcast_convert_type(
-                    jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
+                scale_scattered = (
+                    jnp.zeros((ragged_stride,), jnp.int32)
                     .at[slab_row]
-                    .add(scale_bits, mode="drop"),
+                    .add(scale_bits, mode="drop")
+                )
+                if scale_pad:
+                    scale_scattered = jnp.pad(scale_scattered, (0, scale_pad))
+                scale_slab = lax.bitcast_convert_type(
+                    scale_scattered,
                     jnp.float32,
                 ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
             else:
                 scale_bits = jnp.repeat(scale_bits_g, topk, axis=0).T
-                scale_slab = lax.bitcast_convert_type(
-                    jnp.zeros((n_act_scales, scale_rows * HIDDEN_LANE_BLOCK), jnp.int32)
+                scale_scattered = (
+                    jnp.zeros((n_act_scales, ragged_stride), jnp.int32)
                     .at[:, slab_row]
-                    .add(scale_bits, mode="drop"),
+                    .add(scale_bits, mode="drop")
+                )
+                if scale_pad:
+                    scale_scattered = jnp.pad(
+                        scale_scattered, ((0, 0), (0, scale_pad))
+                    )
+                scale_slab = lax.bitcast_convert_type(
+                    scale_scattered,
                     jnp.float32,
                 ).reshape(n_act_scales, scale_rows, HIDDEN_LANE_BLOCK)
         else:

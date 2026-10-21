@@ -1277,8 +1277,8 @@ class DeepseekV41Model(nn.Module):
             torch.tensor([tp_rank], dtype=torch.int64),
             persistent=False,
         )
-        init_pre_mix = torch.zeros((1, config.hc_mult), dtype=torch.float32)
-        init_pre_mix[0, 0] = 1.0
+        init_pre_mix = torch.zeros((config.hc_mult,), dtype=torch.float32)
+        init_pre_mix[0] = 1.0
         self.register_buffer("init_pre_mix", init_pre_mix, persistent=False)
         self.topk_indices_buffer = torch.empty(
             max_tokens, config.index_topk, dtype=torch.int32

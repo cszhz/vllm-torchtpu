@@ -100,7 +100,7 @@ class DSparkProposer(DFlashProposer):
         if self.block_size in (3, 4, 5):
             b = self.block_size
             if max_chunk_reqs == 64:
-                return [16, 16 * b, 32 * b, 48 * b, 64 * b]
+                return [16, 8 * b, 16 * b, 32 * b, 48 * b, 64 * b]
             if max_chunk_reqs > 64:
                 max_draft_tokens = max_chunk_reqs * b
                 base = [

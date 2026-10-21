@@ -105,7 +105,8 @@ def test_dspark_v41_model_registry_and_weight_remap():
 def test_dspark_tp8_draft_token_paddings():
     p64 = _make_dspark_proposer(64)
     assert p64._aux_layer_shift == 0
-    assert p64._get_draft_token_paddings() == [16, 80, 160, 240, 320]
+    assert p64._get_draft_token_paddings() == [16, 40, 80, 160, 240, 320]
+    assert p64._get_padded_len(8 * 5) == 40
 
     p256 = _make_dspark_proposer(256)
     buckets = p256._get_draft_token_paddings()
