@@ -6,6 +6,7 @@ PiecewiseBackend to compile FX graphs via TorchTPU's FX->MLIR->PjRt
 pipeline. Each shape bucket gets its own compiled executable.
 """
 
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -74,25 +75,14 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
     torch and cannot go back through it.
     """
     from torch._functorch._aot_autograd.aot_autograd_result import (
-        SerializableCompiledFunction,
         deserialize_bundled_cache_entry,
     )
 
-    restored = deserialize_bundled_cache_entry(entry)
-    serializable = restored.__wrapped__
-    assert isinstance(serializable, SerializableCompiledFunction), (
-        "Torch bundled replay must wrap SerializableCompiledFunction; "
-        f"got {type(serializable).__name__}"
-    )
-    # vLLM persists its own artifact handle. Keep only the boxed runnable:
-    # Torch's serialization wrapper retains a deepcopy of the entire entry,
-    # including another loaded TPU executable, for a serialization we never use.
-    boxed_fn = serializable.compiled_fn
-
-    def forward(*runtime_args: Any) -> Any:
-        return boxed_fn(list(runtime_args))
-
-    return forward
+    # Upstream PR #2068: Torch deep-copies the entry for reserialization,
+    # which vLLM never uses. CompiledArtifact.__reduce__ reloads the executable.
+    with contextlib.suppress(AttributeError, TypeError):
+        entry.__deepcopy__ = lambda _memo: entry
+    return deserialize_bundled_cache_entry(entry)
 
 
 _TPU_COMPILE_ENV_IGNORED = {

@@ -413,6 +413,62 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
         torch.set_num_threads(previous_threads)
 
 
+def test_warmup_releases_host_heap_after_compilation_artifacts(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    events = []
+    monkeypatch.setattr(
+        tpu_worker, "resolve_compilations", lambda _: events.append("save")
+    )
+    monkeypatch.setattr(
+        tpu_worker, "set_torch_threads_for_runtime", lambda: events.append("threads")
+    )
+    monkeypatch.setattr(
+        tpu_worker,
+        "_release_free_host_heap",
+        lambda: events.append("release"),
+        raising=False,
+    )
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(capture_model=lambda: events.append("capture")),
+        compilation_config=SimpleNamespace(compilation_time=0.0),
+    )
+
+    TPUWorker.compile_or_warm_up_model(worker)
+    assert events == ["capture", "save", "threads", "release"]
+
+
+def test_release_free_host_heap_prefers_tcmalloc(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+
+    class FakeProcess:
+        def MallocExtension_ReleaseFreeMemory(self):  # noqa: N802
+            calls.append("tcmalloc")
+
+        def malloc_trim(self, pad):
+            calls.append("glibc")
+
+    monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: FakeProcess())
+    tpu_worker._release_free_host_heap()
+    assert calls == ["tcmalloc"]
+
+
+def test_release_free_host_heap_falls_back_to_malloc_trim(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+
+    class FakeProcess:
+        def malloc_trim(self, pad):
+            calls.append(pad)
+
+    monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: FakeProcess())
+    tpu_worker._release_free_host_heap()
+    assert calls == [0]
+
+
 def test_real_patch_entrypoints_in_spawned_processes():
     import subprocess
     import sys

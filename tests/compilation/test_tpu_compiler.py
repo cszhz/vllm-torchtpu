@@ -406,32 +406,22 @@ class TestTpuCompilerCache:
         assert loaded.signature == (("torch.int32", (16,)),)
         assert loaded.was_wrapped is True
 
-    def test_bundled_replay_releases_the_reserialization_copy(self):
-        """The runtime callable must not keep an extra executable for saving."""
-        import gc
-        import weakref
-
+    def test_bundled_replay_does_not_copy_the_entry(self):
+        """Replay must not load a second executable for reserialization."""
         from vllm_torchtpu.compilation.tpu_compiler import _deserialize_entry
-
-        copies = []
 
         class Entry:
             guards_expr = None
             sanitized_aot_config = None
 
             def __deepcopy__(self, memo):
-                clone = Entry()
-                copies.append(weakref.ref(clone))
-                return clone
+                raise AssertionError("replay must not deepcopy the entry")
 
             def wrap_post_compile(self, example_inputs, aot_config, options):
                 return lambda boxed_args: sum(boxed_args)
 
         # Use Torch's real deserializer and wrapper, without initializing TPU.
         runtime = _deserialize_entry(Entry())
-        gc.collect()
-        assert len(copies) == 1
-        assert copies[0]() is None
         assert runtime(2, 3, 7) == 12
 
     @pytest.mark.cpu_test
