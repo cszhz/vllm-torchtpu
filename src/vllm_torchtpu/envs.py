@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     TPU_EXPERT_PLACEMENT: str = ""
     MOE_EXPERT_COUNT_TAP_DIR: str = ""
     MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
+    MOE_FUSED_EP_SHARED_BEFORE_KERNEL: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK: tuple[int, int, int] = (256, 128, 128)
@@ -830,6 +831,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # steps. Empty disables the tap and leaves the program unchanged.
     "MOE_EXPERT_COUNT_TAP_DIR": env_str("MOE_EXPERT_COUNT_TAP_DIR", ""),
     "MOE_EXPERT_COUNT_TAP_EVERY": env_int("MOE_EXPERT_COUNT_TAP_EVERY", 1000),
+    # Finish the shared expert before the fused EP kernel starts, so it runs
+    # while the kernel's token all-gather is in flight instead of after the
+    # kernel; see VllmMoERunner._apply_quant_method.
+    "MOE_FUSED_EP_SHARED_BEFORE_KERNEL": env_bool("MOE_FUSED_EP_SHARED_BEFORE_KERNEL"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the

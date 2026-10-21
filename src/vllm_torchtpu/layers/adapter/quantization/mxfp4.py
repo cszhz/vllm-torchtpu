@@ -750,6 +750,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        order_after: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
@@ -777,5 +778,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 score_bias_operand(layer),
                 hash_topk_ids_operand(layer, input_ids),
                 expert_placement.expert_slot_table(layer),
+                order_after,
             )
         return super()._forward_monolithic_tpu(layer, x, router_logits, input_ids)
