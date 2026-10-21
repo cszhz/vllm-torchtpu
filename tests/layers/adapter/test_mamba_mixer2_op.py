@@ -133,7 +133,14 @@ class TestVllmMambaMixer2:
                 match="Prefix caching is not yet supported for MambaMixer2",
             ),
         ):
-            VllmMambaMixer2()
+            VllmMambaMixer2(
+                hidden_size=512,
+                ssm_state_size=64,
+                conv_kernel_size=4,
+                intermediate_size=1024,
+                use_conv_bias=True,
+                use_bias=False,
+            )
 
     def test_build_mamba_op_registers_pallas_jax_op_and_fake(self):
         layer0 = _granite_mamba_layer("model.layers.0.mamba")

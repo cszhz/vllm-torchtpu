@@ -14,6 +14,7 @@
 """Out-of-tree TPU custom operation and layer registration for MambaMixer2."""
 
 import functools
+from typing import TYPE_CHECKING, Protocol, cast
 
 import jax
 import torch
@@ -25,7 +26,16 @@ from vllm_torchtpu.layers.core.mamba_mixer2 import run_jax_mamba_mixer
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
-from vllm_torchtpu.utils import get_dp_size
+from vllm_torchtpu.utils import fresh_buffer, get_dp_size
+
+if TYPE_CHECKING:
+
+    class _Mamba2AttentionMetadata(Protocol):
+        block_tables: torch.Tensor
+        seq_lens: torch.Tensor
+        query_start_loc: torch.Tensor
+        request_distribution: torch.Tensor
+        mamba_state_indices: torch.Tensor | None
 
 
 def mamba_mixer2_core_tpu(
@@ -127,12 +137,11 @@ class VllmMambaMixer2(MambaMixer2):
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         del act_dtype
-        w = self.conv1d.weight
+        conv_weight = cast(torch.nn.Parameter, self.conv1d.weight)
+        w: torch.Tensor = conv_weight
         if w.ndim == 2:
             w = w.unsqueeze(1)
-        self.conv1d.weight.data = torch.empty(
-            w.shape, dtype=w.dtype, device=w.device
-        ).copy_(w)
+        conv_weight.data = fresh_buffer(w)
 
     def _use_fused_jax_rms_norm(self) -> bool:
         # When PyTorch runs multiprocess TP (self.tp_size > 1) and the
@@ -267,7 +276,9 @@ class VllmMambaMixer2(MambaMixer2):
             apply_py_norm = True
         else:
             fc = get_forward_context()
-            attn_metadata = fc.attn_metadata[self.prefix]
+            attn_metadata = cast(
+                "dict[str, _Mamba2AttentionMetadata]", fc.attn_metadata
+            )[self.prefix]
             conv_state, recurrent_state = kv_cache
 
             if attn_metadata.mamba_state_indices is not None:
@@ -295,8 +306,8 @@ class VllmMambaMixer2(MambaMixer2):
                 projected_states,
                 conv_state,
                 recurrent_state,
-                self.conv1d.weight,
-                self.conv1d.bias,
+                cast(torch.Tensor, self.conv1d.weight),
+                cast(torch.Tensor | None, self.conv1d.bias),
                 self.A,
                 self.D,
                 self.dt_bias,
