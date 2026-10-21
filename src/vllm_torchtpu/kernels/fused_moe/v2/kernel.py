@@ -1386,7 +1386,8 @@ def _build_fused_ep_moe_kernel(
 
         def n_groups_of(e):
             """Index-window groups expert ``e``'s routed rows span."""
-            return -(-(-(-expert_rows_sm[e] // tile_m)) // gather_tiles)
+            tiles = -(-expert_rows_sm[e] // tile_m)
+            return -(-tiles // gather_tiles)
 
         def issue_rows_ahead(e, visit_j, wslot):
             """After expert ``e`` (visit ``visit_j``) has its first tile's rows
@@ -1402,9 +1403,7 @@ def _build_fused_ep_moe_kernel(
             def _():
                 issue_gather_window(expert_base_sm[e] + gather_payload_rows, other)
 
-            @pl.when(
-                jnp.logical_and(n_groups_of(e) == 1, visit_j + 1 < n_visit)
-            )
+            @pl.when(jnp.logical_and(n_groups_of(e) == 1, visit_j + 1 < n_visit))
             def _():
                 issue_gather_window(expert_base_sm[visit_sm[visit_j + 1]], other)
 
@@ -1696,7 +1695,9 @@ def _build_fused_ep_moe_kernel(
                         next_shift + next_within * tile_m,
                     )
 
-                last_with_next = jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_visit)
+                last_with_next = jnp.logical_and(
+                    t + 1 == n_tiles, visit_i + 1 < n_visit
+                )
 
                 # A single-group expert started the next visit's index window
                 # when its own rows went out, so the next visit's first tile
@@ -1924,7 +1925,9 @@ def _build_fused_ep_moe_kernel(
             # not the round trip. Empty experts are absent from the visit list.
             tiles_done = carry[0]
 
-            @pl.when(jnp.logical_and(visit_i + 1 < n_visit, jnp.logical_not(single_group)))
+            @pl.when(
+                jnp.logical_and(visit_i + 1 < n_visit, jnp.logical_not(single_group))
+            )
             def _():
                 nxt = visit_sm[visit_i + 1]
                 prime_expert(
