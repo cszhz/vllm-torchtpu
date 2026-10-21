@@ -710,6 +710,10 @@ local serverJob = cdk.job(
         TORCHINDUCTOR_AUTOGRAD_CACHE: '0',
         VLLM_ENGINE_READY_TIMEOUT_S: cdk.numVar('VLLM_ENGINE_READY_TIMEOUT_S', 10800),
         VLLM_LOGGING_LEVEL: cdk.var('VLLM_LOGGING_LEVEL', 'INFO'),
+        // Each EngineCore is the Ray driver of its workers and prints their forwarded stdout lines; with a
+        // block-buffered stdout those sit in the buffer until the EngineCore itself logs, which after startup
+        // it rarely does (worker "step timing" lines never reached the pod log in j-c98e62f9).
+        PYTHONUNBUFFERED: '1',
         [if useFastokens then 'VLLM_USE_FASTOKENS']: '1',
         VLLM_TARGET_DEVICE: 'tpu',
         TPU_MULTIHOST_BACKEND: 'ray',
