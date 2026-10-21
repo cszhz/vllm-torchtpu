@@ -59,6 +59,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
+from vllm_torchtpu.kernels.mla.indexer_cache_update import update_indexer_cache
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -396,7 +397,7 @@ def _cp_scatter_indexer_k(
         page = jnp.where(
             valid, local_page_indices[seq_id, virtual_page], jnp.int32(OOB_PAGE)
         )
-        return cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(k_packed)
+        return update_indexer_cache(cache_kv, k_packed, page, slot)
 
     replicated = jax.sharding.PartitionSpec()
     sharded = jax.sharding.PartitionSpec(axis_name)
@@ -481,22 +482,17 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
                 # Insert this step's K rows into the KV cache.
                 tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-                seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                    jnp.int32
-                )
+                seq_id = jnp.searchsorted(cu_q_lens[1:], tok,
+                                          side="right").astype(jnp.int32)
                 q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
                 pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
                 page = jnp.where(
                     tok < cu_q_lens[-1],
-                    page_indices.reshape(seq_lens.shape[0], -1)[
-                        seq_id, pos // block_size
-                    ],
-                    jnp.int32(2**30),
-                )
+                    page_indices.reshape(seq_lens.shape[0], -1)[seq_id,
+                                                                pos // block_size],
+                    jnp.int32(2**30))
                 slot = pos % block_size
-                cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
-                    k_packed
-                )
+                cache_kv = update_indexer_cache(cache_kv, k_packed, page, slot)
             else:
                 cache_kv = coalesced_kv_append(
                     cache_kv,
@@ -1286,6 +1282,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.rotary_emb is not None:
             q_pe_dtype = q_pe.dtype
             k_pe_dtype = k_pe.dtype
+            # A narrow view keeps the RoPE elementwise op off the padded head
+            # stride; a no-op when the split is already dense.
+            q_pe = q_pe.contiguous()
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
             # RoPE caches/frequencies can be fp32 and promote the rotated
             # tensors.  Dense MLA requires new KV values to exactly match the

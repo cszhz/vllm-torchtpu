@@ -73,6 +73,49 @@ mla_ragged_paged_attention = mla_v2_kernel.mla_ragged_paged_attention
 sparse_mla_ragged_paged_attention = sparse_mla_kernel.sparse_ragged_paged_attention
 
 
+# GLM-5.3 TPU7x SparseCore geometry, from the production layout constants.
+# These are measured BF16 tuning domains, not decode/prefill classifications
+# or hardware requirements.
+_GLM53_INDEX_TOPK = 2048
+_GLM53_SPARSECORE_PAGE_SIZE = 1024
+_GLM53_NATIVE_HEAD_SHAPES = ((8, 512, 64), (32, 512, 64), (64, 512, 64))
+_GLM53_PREFILL_BUCKET_ROWS = 1024
+
+
+def _glm53_native_chunk_kwargs(
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    topk_idx: jax.Array,
+    cache_layout: str,
+) -> dict[str, int]:
+    """Measured SparseCore bucket overrides for the GLM-5.3 TPU7x geometry.
+
+    Empty unless every static operand matches the calibrated profile; an
+    explicit `TPU_SPARSE_MLA_CHUNK_TOKENS` still wins (the caller layers it
+    over this result).
+    """
+    num_rows = ql_nope.shape[0]
+    native = (
+        cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
+        and ql_nope.dtype == jnp.bfloat16
+        and (*ql_nope.shape[1:], q_pe.shape[-1]) in _GLM53_NATIVE_HEAD_SHAPES
+        and ql_nope.shape[1] == q_pe.shape[1]
+        and topk_idx.shape == (num_rows, _GLM53_INDEX_TOPK)
+        and kv_cache_nope.shape[1:] == (_GLM53_SPARSECORE_PAGE_SIZE, 128)
+        and kv_cache_rope.shape[1:] == (_GLM53_SPARSECORE_PAGE_SIZE // 4, 128)
+    )
+    if not native:
+        return {}
+    if num_rows == 16:
+        # The 16-row decode bucket runs one query row per attention batch.
+        return {"attention_kernel_batch_size": 1}
+    if num_rows == _GLM53_PREFILL_BUCKET_ROWS:
+        return {"gather_and_attention_chunk_size": 128}
+    return {}
+
+
 def sparse_mla_chunk_kwargs() -> dict[str, int]:
     """Kernel kwargs for the sparse MLA gather + attention chunk size.
 
@@ -1024,7 +1067,15 @@ def sparse_mla_attention(
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
             cache_layout=cache_layout,
-            **chunk_kwargs,
+            **_glm53_native_chunk_kwargs(
+                ql_nope,
+                q_pe,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                cache_layout,
+            )
+            | chunk_kwargs,
         )
 
         lkv_dim = ql_nope.shape[-1]
