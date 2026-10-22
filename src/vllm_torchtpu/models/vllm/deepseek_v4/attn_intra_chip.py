@@ -46,17 +46,32 @@ does the following:
      Chiplet 0 has [Out0_P0 + Out0_P1], Chiplet 1 has [Out1_P0 + Out1_P1]
 
 Experimental: `DeepseekV4DecoderLayer` uses this class when
-TPU_DSV4_ATTN_INTRA_CHIP_TP=1.
+TPU_DSV4_ATTN_INTRA_CHIP_TP=1. TPU_DSV4_PAIR_SWAP fuses step 5 into step 6: the
+peer's rows are fetched by remote DMA inside the `wo_a` kernel.
 """
 
 from __future__ import annotations
 
+import functools
+
+import jax
 import torch
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
+    PAIR_MAX_TOKENS,
+    fused_reverse_rope_wo_a_projection_pair_swap,
+)
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
+from vllm_torchtpu.models.vllm.deepseek_v4.attention import (
+    VllmDeepseekV4MLAAttention,
+    _pallas_op_cache,
+)
 
 logger = init_logger(__name__)
 
@@ -101,6 +116,108 @@ def _swap_with_peer_chiplet(group, mine: torch.Tensor, theirs: torch.Tensor):
     rank = group.rank_in_group
     gathered = group.all_gather(theirs.contiguous(), dim=0)
     return gathered.view(2, *theirs.shape)[1 - rank]
+
+
+def _on_pair_mesh(kernel, mesh: Mesh, *args):
+    """Run `kernel(*shards)` on every core of `mesh`, each core's operands its
+    own shard (the rank-local tensors under the op's specs)."""
+    (ax,) = mesh.axis_names
+    spec = P(ax)
+    args = tuple(jax.device_put(a, NamedSharding(mesh, spec)) for a in args)
+    return jax.shard_map(
+        kernel,
+        mesh=mesh,
+        in_specs=(spec,) * len(args),
+        out_specs=spec,
+        check_vma=False,
+    )(*args)
+
+
+def _wo_a_pair_swap_fn(mesh: Mesh, head_dim: int):
+    kernel = functools.partial(
+        fused_reverse_rope_wo_a_projection_pair_swap, head_dim=head_dim
+    )
+
+    def fn(
+        o: jax.Array,
+        positions: jax.Array,
+        cos_sin_cache: jax.Array,
+        wo_a: jax.Array,
+        wo_a_scale: jax.Array,
+        peer: jax.Array,
+        rank: jax.Array,
+    ) -> jax.Array:
+        return _on_pair_mesh(
+            kernel, mesh, o, positions, cos_sin_cache, wo_a, wo_a_scale, peer, rank
+        )
+
+    return fn
+
+
+def _peer_device_id(my_device: int) -> int:
+    """The other core of `my_device`'s chip."""
+    from vllm_torchtpu.distributed.chip_topology import get_chip_topology
+
+    topology = get_chip_topology()
+    chip = next(ids for ids in topology.chips if my_device in ids)
+    (peer,) = [d for d in chip if d != my_device]
+    return peer
+
+
+class _PairSwap:
+    """The chip-pair wo_a op, which addresses the peer core directly.
+
+    It runs on the EP mesh -- the one the fused MoE kernel uses, since every
+    Pallas kernel in a program must share one device assignment -- and takes
+    the peer's mesh index and my index in the pair as device data. Built at
+    weight load: the mesh's first construction is a collective.
+    """
+
+    def __init__(self, group, device, head_dim: int) -> None:
+        from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
+        from vllm_torchtpu.distributed.mesh_utils import _get_tpu_global_device_id
+
+        mesh = build_ep_mesh()
+        if mesh is None:
+            raise RuntimeError("chip-pair kernels need the expert-parallel mesh")
+        ids = [int(d.id) for d in mesh.devices.flat]
+        me = _get_tpu_global_device_id()
+        peer = ids.index(_peer_device_id(me))
+        as_i32 = functools.partial(torch.tensor, dtype=torch.int32, device=device)
+        logger.info_once(
+            "chip-pair wo_a in-kernel o exchange armed (device %d, peer mesh "
+            "index %d, pair rank %d)",
+            me,
+            peer,
+            group.rank_in_group,
+        )
+        self.peer = as_i32([peer])
+        self.rank = as_i32([group.rank_in_group])
+        name = f"pallas::deepseek_v4_wo_a_pair_swap_d{head_dim}"
+        op = _pallas_op_cache.get(name)
+        if op is None:
+            (ax,) = mesh.axis_names
+            op = pallas.jax_op(
+                name,
+                _wo_a_pair_swap_fn(mesh, head_dim),
+                mesh=mesh,
+                input_partition_specs=(P(ax),) * 7,
+                output_partition_specs=P(ax),
+            )
+            op.register_fake(
+                lambda o, pos, _cache, wo_a, *_: o.new_empty(
+                    (pos.shape[0], wo_a.shape[1])
+                )
+            )
+            _pallas_op_cache[name] = op
+        self._op = op
+
+    def __call__(self, o, positions_all, cos_sin_cache, wo_a, wo_a_scale):
+        """wo_a over [core 0 tokens; core 1 tokens] with my heads, the peer's
+        tokens fetched from its `o` inside the kernel."""
+        return self._op(
+            o, positions_all, cos_sin_cache, wo_a, wo_a_scale, self.peer, self.rank
+        )
 
 
 class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
@@ -180,6 +297,7 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
         for layer in (self.wq_b, self.wo_a, self.wo_b):
             _load_current_chiplet_slice(layer, rank, size)
         object.__setattr__(self, "_chip_pair", group)
+        self._pair_tokens = 2 * vllm_config.scheduler_config.max_num_batched_tokens
         logger.info_once(
             "ATTN_INTRA_CHIP_TP: wq_b/wo_a/wo_b sharded across the chip pair"
         )
@@ -194,6 +312,17 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
             super().process_weights_after_loading(act_dtype)
         finally:
             self.n_local_heads, self.n_local_groups = heads, groups
+        if envs.TPU_DSV4_PAIR_SWAP:
+            if self._pair_tokens > PAIR_MAX_TOKENS:
+                raise ValueError(
+                    "TPU_DSV4_PAIR_SWAP covers one token tile: 2 x "
+                    f"max_num_batched_tokens = {self._pair_tokens} > "
+                    f"{PAIR_MAX_TOKENS}"
+                )
+            swap = _PairSwap(
+                self._chip_pair, self.wo_b.weight.device, int(self.head_dim)
+            )
+            object.__setattr__(self, "_pair_swap", swap)
 
     def _project_q(self, qr: torch.Tensor) -> torch.Tensor:
         # Each core projects both cores' tokens onto its half of the heads, then
@@ -219,20 +348,29 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
         rank = group.rank_in_group
         num_tokens = o.shape[0]
         half = self.n_local_heads // 2
-        o = o.reshape(num_tokens, 2, half, self.head_dim)
-        peer = _swap_with_peer_chiplet(group, o[:, rank], o[:, 1 - rank])
-        pieces = [o[:, rank], peer] if rank == 0 else [peer, o[:, rank]]
-        o_half = torch.cat(pieces, dim=0).contiguous()
         positions_all = group.all_gather(
             positions.to(torch.int32).contiguous(), dim=0
         ).to(positions.dtype)
-        z = self.o_proj_op(
-            o_half,
-            positions_all,
-            self.rotary_emb.cos_sin_cache,
-            self.wo_a.weight,
-            self.wo_a.weight_scale,
-        )
+        if envs.TPU_DSV4_PAIR_SWAP:
+            z = self._pair_swap(
+                o.reshape(num_tokens, self.n_local_heads, self.head_dim),
+                positions_all,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a.weight,
+                self.wo_a.weight_scale,
+            )
+        else:
+            o = o.reshape(num_tokens, 2, half, self.head_dim)
+            peer = _swap_with_peer_chiplet(group, o[:, rank], o[:, 1 - rank])
+            pieces = [o[:, rank], peer] if rank == 0 else [peer, o[:, rank]]
+            o_half = torch.cat(pieces, dim=0).contiguous()
+            z = self.o_proj_op(
+                o_half,
+                positions_all,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a.weight,
+                self.wo_a.weight_scale,
+            )
         partial = self.wo_b(z)
         if isinstance(partial, tuple):
             partial = partial[0]

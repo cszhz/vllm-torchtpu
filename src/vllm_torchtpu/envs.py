@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
+    TPU_DSV4_PAIR_SWAP: bool = False
     TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK: tuple[int, int, int] = (256, 128, 128)
     TPU_DSV4_HCA_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
     TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK: tuple[int, int, int] = (64, 128, 64)
@@ -846,6 +847,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental: shard DSv4 attention wq_b/wo_a/wo_b across a chip's two
     # cores while KV and attention stay DP (deepseek_v4/attn_intra_chip.py).
     "TPU_DSV4_ATTN_INTRA_CHIP_TP": env_bool("TPU_DSV4_ATTN_INTRA_CHIP_TP"),
+    # Under TPU_DSV4_ATTN_INTRA_CHIP_TP: wo_a fetches the peer's attention-output
+    # rows by remote DMA inside the kernel, overlapped with its own rows
+    # (o_projection.fused_reverse_rope_wo_a_projection_pair_swap), instead of a
+    # strided copy + all-gather before it.
+    "TPU_DSV4_PAIR_SWAP": env_bool("TPU_DSV4_PAIR_SWAP"),
     # DSv4 kernel block sizes, each "decode,prefill,mixed". Defaults are the
     # microbenchmark-tuned values, tuned at a 1024-token KV block; the KV page
     # counts are doubled for the default 512-token block so a kernel block
