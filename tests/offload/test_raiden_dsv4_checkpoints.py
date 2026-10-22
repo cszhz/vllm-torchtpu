@@ -23,11 +23,13 @@ with a 128-token window.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 from test_raiden_store_offload import FakeKVCacheStore, make_manager, sub_hashes
 from vllm import SamplingParams
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    get_offloading_group_ids,
+)
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
@@ -43,6 +45,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_offload.base import OffloadingKVEventsConfig, get_offload_group_idx
 from vllm.v1.request import Request
+
+from vllm_torchtpu.core.hca_state_checkpoint import state_spec_cls
 
 # --block-size -> (SWA block, 4-ratio state block = hash block, HCA state
 # block), as the TPU DeepSeek-V4 layers page them.
@@ -68,15 +72,20 @@ def dsv4_groups(full: int) -> list[tuple[str, int, int | None, bool]]:
     ]
 
 
-def dsv4_kv_cache_config(full: int) -> KVCacheConfig:
+def dsv4_kv_cache_config(full: int, drop_hca: bool = False) -> KVCacheConfig:
     groups = []
     for name, block_size, window, eagle in dsv4_groups(full):
+        swa_cls = (
+            state_spec_cls(128, window, full, drop_hca)
+            if name.endswith("compressor.state_cache")
+            else SlidingWindowMLASpec
+        )
         if window is None:
             spec = MLAAttentionSpec(
                 block_size=block_size, num_kv_heads=1, head_size=64, dtype=torch.uint8
             )
         else:
-            spec = SlidingWindowMLASpec(
+            spec = swa_cls(
                 block_size=block_size,
                 num_kv_heads=1,
                 head_size=512,
@@ -89,17 +98,18 @@ def dsv4_kv_cache_config(full: int) -> KVCacheConfig:
     )
 
 
-def make_scheduler(retention_interval: int | None, full: int):
+def make_scheduler(retention_interval: int | None, full: int, drop_hca=False):
     from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
     store = FakeKVCacheStore()
     manager = make_manager(store, device_block_size_factor=1, num_blocks=1 << 20)
+    kv_cache_config = dsv4_kv_cache_config(full, drop_hca)
     block_sizes = [g[1] for g in dsv4_groups(full)]
     spec = SimpleNamespace(
         config=SimpleNamespace(
             groups=[
-                SimpleNamespace(group_id=i, tokens_per_block=bs)
-                for i, bs in enumerate(block_sizes)
+                SimpleNamespace(group_id=i, tokens_per_block=block_sizes[i])
+                for i in get_offloading_group_ids(kv_cache_config)
             ]
         ),
         blocks_per_chunk=1,
@@ -119,7 +129,7 @@ def make_scheduler(retention_interval: int | None, full: int):
         speculative_config=None,
         parallel_config=SimpleNamespace(world_size=1, decode_context_parallel_size=1),
     )
-    sched = TPURaidenOffloadingScheduler(spec, vllm_config, dsv4_kv_cache_config(full))
+    sched = TPURaidenOffloadingScheduler(spec, vllm_config, kv_cache_config)
     return sched, store
 
 
@@ -204,8 +214,7 @@ class TestDropHcaStateCheckpoint(unittest.TestCase):
                 self._check(full, per_group)
 
     def _check(self, full, per_group):
-        with patch.dict("os.environ", {"TPU_KV_DROP_HCA_STATE_CHECKPOINT": "1"}):
-            sched, store = make_scheduler(32768, full)
+        sched, store = make_scheduler(32768, full, drop_hca=True)
         stored = prefill(sched, store, make_request(sched, "a", TURN1))
         self.assertEqual(stored_per_group(stored), per_group)
 
@@ -229,7 +238,7 @@ class TestDropHcaStateCheckpoint(unittest.TestCase):
         (job,) = sched._current_batch_load_jobs.values()
         loaded = stored_per_group(job.src_spec.keys)
         self.assertEqual(loaded[HCA_STATE_GROUP], 0)
-        self.assertEqual(job.dst_spec.group_sizes[HCA_STATE_GROUP], 0)
+        self.assertEqual(len(job.dst_spec.group_sizes), HCA_STATE_GROUP)
         self.assertEqual(loaded[FULL_GROUP], hit // full)
 
 

@@ -734,8 +734,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.
     "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),
-    # Engine core: DeepSeek-V4's 128-ratio compressor state needs no prefix-cache
-    # checkpoint (never cached, held or host-offloaded); see
+    # Model workers: DeepSeek-V4's 128-ratio compressor state cache is declared
+    # not prefix-cacheable (no checkpoint cached, held or host-offloaded); see
     # core/hca_state_checkpoint.py.
     "TPU_KV_DROP_HCA_STATE_CHECKPOINT": env_bool("TPU_KV_DROP_HCA_STATE_CHECKPOINT"),
     # Tile size for MLA transpose pipeline.

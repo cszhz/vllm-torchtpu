@@ -83,7 +83,7 @@ import os
 import socket
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -425,10 +425,6 @@ class RaidenOffloadingManager(OffloadingManager):
         # probes the directory itself.
         self._inflight_store_keys: set[OffloadKey] = set()
 
-        # Scheduler-installed veto on what `prepare_store` admits (see
-        # `set_store_key_filter`); None admits every key.
-        self._store_key_filter: Callable[[OffloadKey, ReqContext], bool] | None = None
-
         # Per request: the keys of a load that prepare_load could not pin, or
         # whose transfer failed to launch or failed in flight. Later lookups
         # for that request answer MISS for them, so the request recomputes
@@ -757,17 +753,6 @@ class RaidenOffloadingManager(OffloadingManager):
         self._pending_remote_slices.update(remote_slices)
         return RaidenLoadStoreSpec(keys)
 
-    def set_store_key_filter(
-        self, key_filter: Callable[[OffloadKey, ReqContext], bool] | None
-    ) -> None:
-        """Install a predicate `prepare_store` consults per key; False skips it.
-
-        A skipped key is reported neither stored nor to-store, so the
-        scheduler builds no transfer for it and moves past it, exactly as for
-        a key that is already resident.
-        """
-        self._store_key_filter = key_filter
-
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
         # The Raiden directory is the sole authority on what is stored: probe
         # it per key, so a key whose entries were displaced from the LRU is
@@ -787,11 +772,8 @@ class RaidenOffloadingManager(OffloadingManager):
             self._block_status.HOST_AND_HBM,
             self._block_status.REMOTE,
         )
-        key_filter = self._store_key_filter
         for key in keys:
             if key in self._inflight_store_keys:
-                continue
-            if key_filter is not None and not key_filter(key, req_context):
                 continue
             sub_hashes = self._sub_hashes(key)
             matches = self._probe(sub_hashes)

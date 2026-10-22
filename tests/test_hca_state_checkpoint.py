@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """TPU_KV_DROP_HCA_STATE_CHECKPOINT on vLLM's KVCacheManager with
-DeepSeek-V4-shaped groups (layer names as the model registers them) at both
-served block sizes: hits are unchanged, and the 128-ratio compressor-state
-group is satisfied by null blocks and caches nothing."""
+DeepSeek-V4-shaped groups at both served block sizes: with the 128-ratio
+compressor state declared not prefix-cacheable, hits are unchanged and the
+group caches nothing."""
 
 import pytest
 import torch
@@ -65,8 +65,9 @@ def _swa(block_size, window, head_size):
     )
 
 
-def _manager(num_blocks, block_size):
+def _manager(num_blocks, block_size, drop_hca=False):
     swa, csa_state, hca_state = GEOMETRY[block_size]
+    hca_cls = hsc.state_spec_cls(128, 128, block_size, drop_hca)
     groups = [
         KVCacheGroupSpec(["model.layers.0.attn.swa_cache"], _swa(swa, 128, 512)),
         KVCacheGroupSpec(["mtp.0.attn.swa_cache"], _swa(swa, 128, 512)),
@@ -88,7 +89,14 @@ def _manager(num_blocks, block_size):
             _swa(csa_state, 8, 4096),
         ),
         KVCacheGroupSpec(
-            ["model.layers.0.attn.compressor.state_cache"], _swa(hca_state, 128, 2048)
+            ["model.layers.0.attn.compressor.state_cache"],
+            hca_cls(
+                block_size=hca_state,
+                num_kv_heads=1,
+                head_size=2048,
+                dtype=torch.uint8,
+                sliding_window=128,
+            ),
         ),
     ]
     config = KVCacheConfig(
@@ -160,9 +168,12 @@ def _cached_blocks(mgr, group):
     )
 
 
-def test_finds_only_the_128_ratio_state_group(block_size):
-    mgr = _manager(64, block_size)
-    assert hsc.hca_state_group_ids(mgr.kv_cache_config) == {HCA_STATE}
+def test_only_the_non_overlapping_state_leaves_prefix_caching():
+    assert hsc.state_spec_cls(128, 128, 512, True) is hsc.RunLocalStateSpec
+    assert hsc.state_spec_cls(128, 128, 512, False) is SlidingWindowMLASpec
+    assert hsc.state_spec_cls(4, 8, 512, True) is SlidingWindowMLASpec
+    with pytest.raises(ValueError, match="whole compressor runs"):
+        hsc.state_spec_cls(128, 128, 64, True)
 
 
 def _scenario(mgr):
@@ -185,29 +196,27 @@ def _scenario(mgr):
     return hits
 
 
-def test_hits_are_unchanged_and_the_group_caches_nothing(block_size, monkeypatch):
+def test_hits_are_unchanged_and_the_group_caches_nothing(block_size):
     num_blocks = 130 * 1024 // block_size
     expected = _scenario(_manager(num_blocks, block_size))
 
-    hsc.install(monkeypatch.setattr)
-    mgr = _manager(num_blocks, block_size)
+    mgr = _manager(num_blocks, block_size, drop_hca=True)
     assert _scenario(mgr) == expected
     assert expected[0] == 39_936
 
-    fresh = _manager(num_blocks, block_size)
+    fresh = _manager(num_blocks, block_size, drop_hca=True)
     _run(fresh, TURN1)
     blocks, hit, _ = fresh.get_computed_blocks(_request(fresh, TURN2, 4))
     assert hit == expected[0]
-    assert blocks.blocks[HCA_STATE] and all(b.is_null for b in blocks.blocks[HCA_STATE])
+    assert not blocks.blocks[HCA_STATE]
     assert _cached_blocks(fresh, HCA_STATE) == 0
 
 
-def test_caches_nothing_for_the_group(block_size, monkeypatch):
+def test_caches_nothing_for_the_group(block_size):
     num_blocks = 400 * 1024 // block_size
     base = _manager(num_blocks, block_size)
     _run(base, TURN1)
-    hsc.install(monkeypatch.setattr)
-    lean = _manager(num_blocks, block_size)
+    lean = _manager(num_blocks, block_size, drop_hca=True)
     _run(lean, TURN1)
     # Two checkpoints (32k and the replay boundary), each a 128-token window.
     hca_blocks_per_checkpoint = 128 // GEOMETRY[block_size][2]
