@@ -52,6 +52,8 @@ def bgmv_shrink(
         f"{x.dtype}; lora_dtype must match the model dtype"
     )
     a = lora_a_stacked.squeeze(1)
+    # Masks after projecting, on the rank side, so the intermediate is
+    # [T, L, r] rather than [T, L, d].
     xa = torch.einsum("td,lrd->tlr", x, a)
     return (xa * onehot[:, :, None]).sum(dim=1) * scale
 
@@ -76,4 +78,7 @@ def bgmv_expand(
         f"{buf.dtype}; lora_dtype must match the model dtype"
     )
     b = lora_b_stacked.squeeze(1)
-    return torch.einsum("tlr,lor->to", buf[:, None, :] * onehot[:, :, None], b)
+    # Masks before projecting, on the rank side, so the intermediate is
+    # [T, L, r] rather than [T, L, out].
+    masked = buf[:, None, :] * onehot[:, :, None]
+    return torch.einsum("tlr,lor->to", masked, b)
