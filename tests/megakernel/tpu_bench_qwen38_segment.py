@@ -50,6 +50,23 @@ from vllm_torchtpu.megakernel.models.qwen38_inputs import (
 from vllm_torchtpu.megakernel.models.qwen38_reference import segment_reference
 
 
+def tile_profile(name: str, B: int = 8) -> Any:
+    """Named tile choices for bucket `B`; `None` = library defaults fitted to VMEM."""
+    from vllm_torchtpu.megakernel.exec_spec import Tiles
+
+    if name == "default":
+        return None
+    if name == "pipe_ep":  # e13 T=2, e2 T=1: the software-pipelined EP expert path
+        return Tiles(ebank=2 << 20, nbe=12 if B <= 16 else 6, nbd=10, vmem_mib=62).with_blocks(
+            {"moe": {"pipe_ep": True, "moe_unroll": True}}
+        )
+    if name == "pipe":  # single-tile experts
+        return Tiles(ebank=3584 << 10, nbe=6 if B <= 16 else 4, nbd=10, vmem_mib=62).with_blocks(
+            {"moe": {"pipe": True}}
+        )
+    raise ValueError(name)
+
+
 def _shardings(tree: Any, R: int, mesh: Mesh) -> Any:
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     return jax.tree.map(
@@ -73,9 +90,11 @@ def run_bucket(
     gain: float = 1.0,
     zero: tuple[str, ...] = (),
     router_gain: float = 1.0,
+    interpret: bool = False,
+    profile: str = "default",
 ) -> dict:
     R = mesh.size
-    ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=tiles is not None, tiles=tiles)
+    ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=interpret, tiles=tiles)
     spec = qwen38.segment_spec(g, R, L=L)
 
     def gen(key):
@@ -187,6 +206,7 @@ def run_bucket(
         "gain": gain,
         "router_gain": router_gain,
         "zero": list(zero),
+        "profile": profile,
         "H": g.H,
         "I": g.I,
         "moe_path": moe_path,
@@ -215,14 +235,15 @@ def main() -> None:
     ap.add_argument("--zero", nargs="+", default=["none"], help="none | gdn | moe")
     ap.add_argument("--router-gain", type=float, nargs="+", default=[1.0])
     ap.add_argument("--geom", nargs="+", default=["2560:640"], help="H:I geometry overrides")
+    ap.add_argument("--profile", nargs="+", default=["default"], help="default | pipe_ep | pipe")
     args = ap.parse_args()
-    g, tiles = qwen38.FULL, None
+    g, tiny_tiles = qwen38.FULL, None
     devs = jax.devices()
     if args.tiny:
         from vllm_torchtpu.megakernel.exec_spec import Tiles
 
         g, devs = qwen38.TINY, devs[:2]
-        tiles = Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64)
+        tiny_tiles = Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64)
     print("devices", len(devs), devs[0].device_kind, "jax", jax.__version__, flush=True)
     mesh = Mesh(np.array(devs), ("tp",))
     out = []
@@ -234,11 +255,12 @@ def main() -> None:
     for g in geoms:
       for L in args.layers:
         for B in args.rows:
-          for gn, z, rg in arms:
+          for (gn, z, rg), prof in [(a, pr) for a in arms for pr in args.profile]:
+            tiles = tiny_tiles if args.tiny else tile_profile(prof, B)
             try:
                 r = run_bucket(
                     g, B, args.T, L, mesh, args.chains, tiles, gn,
-                    () if z == "none" else (z,), rg,
+                    () if z == "none" else (z,), rg, args.tiny, prof,
                 )
             except Exception as e:  # noqa: BLE001 — report and continue to the next bucket
                 r = {"rows": B, "L": L, "error": f"{type(e).__name__}: {e}"[:2000]}
