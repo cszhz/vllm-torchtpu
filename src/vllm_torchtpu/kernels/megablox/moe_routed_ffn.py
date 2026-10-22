@@ -191,7 +191,6 @@ def _route_slots(
 def _routed_ffn_kernel(
     # Scalar prefetch
     start_sm: jax.Array,  # int32[1]: global id of local expert 0
-    weights_sm: jax.Array,  # f32[T * topk] routing weights
     # In
     ids_hbm: jax.Array,  # int32[T, topk]: global expert ids
     rw_hbm: jax.Array,  # [T, topk]: routing weights
@@ -217,9 +216,11 @@ def _routed_ffn_kernel(
     rw_vm: jax.Array,  # [T, topk]
     index_vm: list[jax.Array],  # topk x int32[T]: staging for index_sm
     count_vm: jax.Array,  # int32[E]: staging for count_sm
-    meta_sems: jax.Array,  # DMA[topk + 3]
+    weight_vm: jax.Array,  # f32[topk, T]: staging for weights_sm
+    meta_sems: jax.Array,  # DMA[topk + 4]
     index_sm: list[jax.Array],  # topk x int32[T]: each route's index in route_sm
     count_sm: jax.Array,  # int32[E]: routes per expert
+    weights_sm: jax.Array,  # f32[topk, T]: routing weights
     visit_sm: jax.Array,  # int32[E]
     route_sm: jax.Array,  # int32[E * T + 1]: each expert's routes, token-major
     *,
@@ -268,9 +269,10 @@ def _routed_ffn_kernel(
     # read-modify-write of a counter between routes.
     ids_copy.wait()
     rw_copy.wait()
+    weights = jnp.transpose(rw_vm[...].astype(jnp.float32))
     index, counts = _route_slots(
         jnp.transpose(ids_vm[...]),
-        jnp.transpose(rw_vm[...].astype(jnp.float32)),
+        weights,
         start_sm[0],
         num_experts=num_experts,
         skip_zero_weights=skip_zero_weights,
@@ -282,9 +284,15 @@ def _routed_ffn_kernel(
             zip([*index_vm, count_vm], [*index_sm, count_sm], strict=True)
         )
     ]
+    # The combine's weights travel the same way, so nothing is prefetched to
+    # SMEM before the kernel can issue its first DMA.
+    meta_copies.append(
+        pltpu.make_async_copy(weight_vm, weights_sm, meta_sems.at[topk + 3])
+    )
     for k in range(topk):
         index_vm[k][...] = index[k]
     count_vm[...] = counts
+    weight_vm[...] = weights
     for c in meta_copies:
         c.start()
     x_copy.wait()
@@ -384,7 +392,7 @@ def _routed_ffn_kernel(
                 route = route_sm[first + i]
                 token, k = route >> _K_BITS, route & ((1 << _K_BITS) - 1)
                 acc_vm[pl.ds(token, 1), :] += (
-                    weights_sm[token * topk + k] * rows_vm[pl.ds(i, 1), :]
+                    weights_sm[k, token] * rows_vm[pl.ds(i, 1), :]
                 )
 
             return carry
@@ -467,9 +475,11 @@ def moe_routed_ffn(
         pltpu.VMEM((num_tokens, topk), topk_weights.dtype),
         [pltpu.VMEM((num_tokens,), jnp.int32)] * topk,
         pltpu.VMEM((num_experts,), jnp.int32),
-        pltpu.SemaphoreType.DMA((topk + 3,)),
+        pltpu.VMEM((topk, num_tokens), jnp.float32),
+        pltpu.SemaphoreType.DMA((topk + 4,)),
         [pltpu.SMEM((num_tokens,), jnp.int32)] * topk,
         pltpu.SMEM((num_experts,), jnp.int32),
+        pltpu.SMEM((topk, num_tokens), jnp.float32),
         pltpu.SMEM((num_experts,), jnp.int32),
         pltpu.SMEM((num_experts * num_tokens + 1,), jnp.int32),
     ]
@@ -492,7 +502,7 @@ def moe_routed_ffn(
         ),
         out_shape=jax.ShapeDtypeStruct((num_tokens, hidden), hidden_states.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=1,
             in_specs=[hbm] * 7,
             out_specs=hbm,
             scratch_shapes=scratch_shapes,
@@ -511,7 +521,6 @@ def moe_routed_ffn(
         jnp.zeros((1,), jnp.int32)
         if experts_start is None
         else jnp.reshape(experts_start, (1,)).astype(jnp.int32),
-        topk_weights.astype(jnp.float32).reshape(-1),
         topk_ids,
         topk_weights,
         hidden_states,
