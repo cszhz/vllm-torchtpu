@@ -267,14 +267,19 @@ local specSyntheticAl = cdk.var('SPEC_SYNTHETIC_AL', '3.77');
 // SPEC_DRAFT_SAMPLE=probabilistic draws drafts from the draft distribution at the request's temperature
 // (vLLM draft_sample_method); on TPU it needs SPEC_SYNTHETIC_AL. Empty = greedy drafting.
 local specDraftSample = cdk.var('SPEC_DRAFT_SAMPLE', 'probabilistic');
+// SPEC_DISABLE_EAGLE_BLOCK_DROP=true turns off the EAGLE prefix-cache block drop with vLLM's own
+// speculative-config flag, which also leaves the draft groups unannotated, so KV offload stores no
+// EAGLE peek chunk. Pair it with VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP=0 to measure it alone.
+local specDisableEagleBlockDrop = cdk.boolVar('SPEC_DISABLE_EAGLE_BLOCK_DROP', false);
 local specConfig =
   if specMethod == 'none' then ''
   else if specMethod == 'dspark' then
-    '{"method":"dspark","num_speculative_tokens":%d%s%s}' % [
+    '{"method":"dspark","num_speculative_tokens":%d%s%s%s}' % [
       numSpecTokens,
       if specDraftSample == '' then '' else ',"draft_sample_method":"%s"' % specDraftSample,
       if specSyntheticAl == '' then ''
       else ',"rejection_sample_method":"synthetic","synthetic_acceptance_length":%s' % specSyntheticAl,
+      if specDisableEagleBlockDrop then ',"disable_eagle_block_drop":true' else '',
     ]
   else error 'SPEC_METHOD must be none or dspark, got "%s"' % specMethod;
 // vLLM drops the last matched prefix-cache block of every hit for EAGLE-style drafts (DSpark and the
