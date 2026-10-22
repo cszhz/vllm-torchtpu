@@ -917,6 +917,11 @@ DECODE_ASYNC_GROUP_SIZES = True
 #: op before it (measured in a 16-call profile).
 DECODE_LHS_IN_HBM = True
 
+#: Ablation switch of the decode path, False outside a diagnostic job. True
+#: starts and waits on no output DMA, so the output is wrong; it prices the
+#: writeback tail against the same tree in a scoring job.
+DECODE_DIAG_SKIP_WRITEBACK = False
+
 
 def decode_slots(cfgs: GmmConfigs) -> int:
     """Whole-expert weight buffers of the decode path at `cfgs`."""
@@ -1179,6 +1184,8 @@ def decode_kernel(
         return (slab * sublane < m_hi) & ((slab + 1) * sublane > m_lo)
 
     def write_back(o):
+        if DECODE_DIAG_SKIP_WRITEBACK:
+            return
         for slab in range(out_slabs):
 
             @pl.when(slab_written(slab))
@@ -1328,6 +1335,8 @@ def decode_kernel(
         for o in range(len(out_panels)):
             write_back(o)
 
+    if DECODE_DIAG_SKIP_WRITEBACK:
+        return
     for o in range(len(out_panels)):
         for slab in range(out_slabs):
 
