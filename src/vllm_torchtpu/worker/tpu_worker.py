@@ -533,14 +533,19 @@ class TPUWorker(WorkerBase):
         kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
             self.vllm_config
         )
+        # An adapter swap holds memory only while it runs, so profile_run
+        # does not see it.
+        lora_slot_write_hbm_bytes = self.model_runner.lora_slot_write_hbm_bytes()
         available = utils.min_across_ep_dp(
-            self.parallel_config, budget.available - kv_connector_hbm_reserve
+            self.parallel_config,
+            budget.available - kv_connector_hbm_reserve - lora_slot_write_hbm_bytes,
         )
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
         total_hbm_used_gb = round(budget.total_used / utils.GBYTES, 2)
         kv_connector_hbm_reserve_gb = round(kv_connector_hbm_reserve / utils.GBYTES, 2)
+        lora_slot_write_hbm_gb = round(lora_slot_write_hbm_bytes / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
         logger.info(
             "Memory statistics | "
@@ -548,11 +553,13 @@ class TPUWorker(WorkerBase):
             "total_hbm_limit_cap_gb=%rGiB | "
             "total_hbm_used_gb=%rGiB | "
             "kv_connector_hbm_reserve_gb=%rGiB | "
+            "lora_slot_write_hbm_gb=%rGiB | "
             "total_hbm_avail_gb=%rGiB",
             total_hbm_limit_gb,
             total_hbm_limit_cap_gb,
             total_hbm_used_gb,
             kv_connector_hbm_reserve_gb,
+            lora_slot_write_hbm_gb,
             total_hbm_avail_gb,
         )
 

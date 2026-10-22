@@ -5331,6 +5331,15 @@ class TPUModelRunner(GPUModelRunner):
         )
         return self.lora_manager.create_lora_manager(model, vllm_config)
 
+    def lora_slot_write_hbm_bytes(self) -> int:
+        """HBM an adapter swap takes while it runs, which the KV cache budget
+        must leave free; 0 without LoRA."""
+        if self.lora_config is None:
+            return 0
+        lora_manager = self.lora_manager
+        assert isinstance(lora_manager, TPUWorkerLoRAManager)
+        return lora_manager.slot_write_hbm_bytes()
+
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()

@@ -475,6 +475,39 @@ def test_worker_without_lora_layers_activates_without_writes(slot_writes):
     _activate((tpu_manager, vllm_manager), _adapter(1, {}))
     assert slot_writes == []
     assert tpu_manager.lora_index_to_id == vllm_manager.lora_index_to_id
+    assert tpu_manager.slot_write_hbm_bytes() == 0
+
+
+def _all_stacked(manager):
+    return [
+        weights for layer in manager.modules.values() for weights in _stacked(layer)
+    ]
+
+
+def test_slot_write_reserves_one_slot():
+    """The slot writer uploads one slot of every stacked tensor."""
+    tpu_manager, _ = _managers()
+
+    assert tpu_manager.slot_write_hbm_bytes() == sum(
+        weights[0].nbytes for weights in _all_stacked(tpu_manager)
+    )
+
+
+def test_vllm_writes_reserve_two_copies_and_one_slot():
+    """vLLM's writes copy each whole stacked tensor while the old buffer still
+    exists: up to two new copies, plus the adapter's slot."""
+
+    def unsupported_layers():
+        layers = _layers()
+        _add_custom_layer(layers)
+        return layers
+
+    tpu_manager, _ = _managers(unsupported_layers)
+    assert tpu_manager._slot_writer is None
+
+    assert tpu_manager.slot_write_hbm_bytes() == sum(
+        2 * weights.nbytes + weights[0].nbytes for weights in _all_stacked(tpu_manager)
+    )
 
 
 # The tests below run on the chip, each in a spawned child. The child imports

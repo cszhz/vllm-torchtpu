@@ -220,6 +220,12 @@ class _AdapterSlotWriter:
         self._host_slot_weights.zero_()
         self.write_slot(0)
 
+    @property
+    def slot_bytes(self) -> int:
+        """Size of one adapter slot, which write_slot holds on the TPU while
+        it writes."""
+        return self._host_slot_weights.nbytes
+
 
 class TPULoRAModelManager(LRUCacheLoRAModelManager):
     """LRU LoRA model manager that loads an adapter into its slot at once.
@@ -264,6 +270,26 @@ class TPULoRAModelManager(LRUCacheLoRAModelManager):
         )
         self._slot_writer.precompile()
 
+    def slot_write_hbm_bytes(self) -> int:
+        """HBM that writing an adapter into its slot takes on top of the LoRA
+        weights.
+
+        The memory profile does not see it, since it is freed once the write
+        is done.
+
+        Without the slot writer, vLLM's writes copy each whole stacked tensor
+        instead of updating it in place, and the old and new buffers exist at
+        the same time while the write runs. E.g. stacked tensors of 384 MiB
+        with a 128 MiB slot peaked at 2 x 384 + 128 = 896 MiB: up to two new
+        copies of the tensors, plus the adapter's slot.
+        """
+        if self._slot_writer is not None:
+            return self._slot_writer.slot_bytes
+        stacked_weights = _stacked_weights(list(self.modules.values()))
+        return sum(
+            2 * weights.nbytes + weights[0].nbytes for weights in stacked_weights
+        )
+
 
 class TPUWorkerLoRAManager(LRUCacheWorkerLoRAManager):
     """Worker LoRA manager that uses TPULoRAModelManager.
@@ -278,3 +304,8 @@ class TPUWorkerLoRAManager(LRUCacheWorkerLoRAManager):
         manager = self._adapter_manager
         assert isinstance(manager, TPULoRAModelManager)
         manager.precompile_activation()
+
+    def slot_write_hbm_bytes(self) -> int:
+        manager = self._adapter_manager
+        assert isinstance(manager, TPULoRAModelManager)
+        return manager.slot_write_hbm_bytes()

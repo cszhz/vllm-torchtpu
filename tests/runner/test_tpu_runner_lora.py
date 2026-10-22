@@ -11,14 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The LoRA mapping that _prepare_inputs hands to the LoRA manager."""
+"""LoRA in the TPU runner: the mapping that _prepare_inputs hands to the LoRA
+manager, and the HBM an adapter swap reserves."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 from runner_input_test_utils import _make_runner, _scheduler_output
 from vllm.lora.request import LoRARequest
 
+from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -65,3 +68,17 @@ def test_each_chunk_maps_its_own_requests_padded_to_what_the_graph_reads():
     # Each chunk activates at least the adapters its own mapping uses.
     for prompt, _, requests in calls:
         assert set(prompt) - {0} <= {r.lora_int_id for r in requests}
+
+
+def test_lora_slot_write_hbm_bytes_comes_from_the_lora_manager():
+    """Without LoRA nothing is reserved; with it, the LoRA manager sizes the
+    reserve."""
+    no_lora = SimpleNamespace(lora_config=None)
+    assert TPUModelRunner.lora_slot_write_hbm_bytes(no_lora) == 0
+
+    lora_manager = MagicMock(spec=TPUWorkerLoRAManager)
+    lora_manager.slot_write_hbm_bytes.return_value = 123
+    with_lora = SimpleNamespace(
+        lora_config=SimpleNamespace(), lora_manager=lora_manager
+    )
+    assert TPUModelRunner.lora_slot_write_hbm_bytes(with_lora) == 123
