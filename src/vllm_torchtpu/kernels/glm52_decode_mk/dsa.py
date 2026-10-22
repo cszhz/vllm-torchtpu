@@ -112,6 +112,16 @@ ALIASED = (
     "b_sbuf",
     "att_acc",
 )
+# Fault builds that also place the IndexShare table `own_uv` in the alias window (kernel.aliased_names). There
+# `own_uv` is a pool_alias view with an explicit (8, 128) tiling, so every DMA window into it must start on an 8-row
+# tile (Mosaic verifies this on libtpu 0.0.47); udma then copies whole 8-row granules and `own_u` gets the padded
+# row count. Clean builds keep `own_uv` as native scratch and are unchanged.
+UV_ALIAS_FAULTS = ("f_stale_is_alias", "f_alias_poison_red")
+
+
+def uv_rows(g, tiles):
+    """Rows of own_u / own_uv: UR2, rounded up to the 8-row tile in the UV_ALIAS_FAULTS builds."""
+    return -(-g["UR2"] // 8) * 8 if tiles.fault in UV_ALIAS_FAULTS else g["UR2"]
 
 
 def shl(x, n):
@@ -195,8 +205,8 @@ def scratch(cfg, tiles, max_pages, bmax):
         "b_pre": pltpu.VMEM((g["MEMBR"], 128), I32),
         "b_xacc": pltpu.VMEM((g["XKC"], 384), F32),
         "b_xcc": pltpu.VMEM((2, 128, 128), F32),
-        "own_u": pltpu.SMEM((g["UR2"], 128), I32),
-        "own_uv": pltpu.VMEM((g["UR2"], 128), I32),
+        "own_u": pltpu.SMEM((uv_rows(g, tiles), 128), I32),
+        "own_uv": pltpu.VMEM((uv_rows(g, tiles), 128), I32),
         # per request: 0 nu, 1 uo, 2 nuo, 3 np (local pages), 4 pbase, 5 seq, 6 nold, 7 t0, 8 nq, 9 p0,
         # 10 valid, 11 npmax (rank-0 pages: the wave partition), 12 needs tie bound
         "b_req": pltpu.SMEM((g["BMAX"], 16), I32),
@@ -1594,14 +1604,21 @@ def make(E):
         lax.fori_loop(bw0, bw1, body, 0)
 
     def udma(U):
-        """own_uv rows [0, U) -> own_u (SMEM), in power-of-two row chunks."""
+        """own_uv rows [0, U) -> own_u (SMEM), in power-of-two row chunks. UV_ALIAS_FAULTS builds: rows
+        [0, ceil8(U)) in chunks of >= 8 rows at 8-row-aligned offsets (own_uv is an aliased tiled view there)."""
         sem = E.misc_sem
         cps = []
-        for k in range(int(math.ceil(math.log2(UR2 + 1))), -1, -1):
+        uv_alias = fault in UV_ALIAS_FAULTS
+        nmax = uv_rows(g, tiles)
+        if uv_alias:
+            U = (U + 7) & ~7  # <= nmax: U <= UR2 - XKC / 128, so ceil8(U) <= ceil8(UR2)
+        for k in range(int(math.ceil(math.log2(nmax + 1))), -1, -1):
             n_ = 1 << k
-            if n_ > UR2:
+            if n_ > nmax or (uv_alias and n_ < 8):
                 continue
             off = U & ~(2 * n_ - 1)
+            if uv_alias:
+                off = pl.multiple_of(off, 8)  # a multiple of 2 * n_ >= 16
             cps.append((n_, off))
         for n_, off in cps:
 

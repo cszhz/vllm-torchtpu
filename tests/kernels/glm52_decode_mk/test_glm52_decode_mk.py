@@ -95,6 +95,32 @@ def test_epool_alias_plan(tmax):
     assert set(D.ALIASED) <= set(views)
 
 
+@pytest.mark.parametrize("tmax", [16, 32])
+@pytest.mark.parametrize(
+    "fault", ["", "f_alias_poison", "f_stale_is_alias", "f_alias_poison_red"]
+)
+def test_uv_alias_fault_rows_are_tile_aligned(tmax, fault):
+    """F-STALE-IS-ALIAS / F-ALIAS-POISON-RED place own_uv in the alias window as an (8, 128)-tiled pool_alias view:
+    own_uv and own_u get ceil8(UR2) rows there (so udma's 8-row-aligned granules stay in bounds: libtpu 0.0.47
+    rejects unaligned DMA windows into the view). Every other build keeps UR2 rows and own_uv as native scratch."""
+    cfg = dataclasses.replace(C.FULL, TMAX=tmax)
+    tiles = K.Tiles(fault=fault)
+    g = D.geometry(cfg, tiles, 256, cfg.BMAX)
+    scr = D.scratch(cfg, tiles, 256, cfg.BMAX)
+    in_alias = fault in D.UV_ALIAS_FAULTS
+    rows = -(-g["UR2"] // 8) * 8 if in_alias else g["UR2"]
+    assert scr["own_u"].shape == scr["own_uv"].shape == (rows, 128)
+    assert ("own_uv" in K.aliased_names(tiles)) == in_alias
+    _, views, _, _ = K.epool_layout(cfg, tiles, 256)
+    if in_alias:
+        r0, shp, _ = views["own_uv"]
+        assert shp == (rows, 128) and (r0 * 128) % 4096 == 0
+        # udma's granules: ceil8(U) <= rows for every U the extraction can produce (U <= UR2 - XKC / 128)
+        assert -(-(g["UR2"] - g["XKC"] // 128) // 8) * 8 <= rows
+    else:
+        assert "own_uv" not in views
+
+
 def test_wrapper_metadata_roundtrip():
     """Request / row metadata and the two block tables (each cache's own page modulus)."""
     import jax

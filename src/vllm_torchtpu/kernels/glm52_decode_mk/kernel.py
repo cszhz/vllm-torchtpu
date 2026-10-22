@@ -356,9 +356,7 @@ def aliased_names(tiles):
     IndexShare table `own_uv` (persistent by design) in the alias, after the layer-transient set."""
     if not tiles.alias_dsa:
         return ()
-    extra = (
-        ("own_uv",) if tiles.fault in ("f_stale_is_alias", "f_alias_poison_red") else ()
-    )
+    extra = ("own_uv",) if tiles.fault in DSA.UV_ALIAS_FAULTS else ()
     return DSA.ALIASED + extra
 
 
