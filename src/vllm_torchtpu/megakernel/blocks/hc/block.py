@@ -24,7 +24,8 @@ The model's residual is `NHC` streams of width `h`; the core residual buffer
   combine  res_b = rnd(res_b + rnd(block) * 2 sigmoid(xn @ inj / NHC)_b)
 
 `down` and `inj` share one streamed weight (`<name>_hdn`, columns
-`[down | inj | pad]`). With `mix=False` the sublayer input comes from the inner
+`[down | inj | pad]`); `up` is one weight per stream (`<name>_hup<b>`) so a
+128-row tile fits the weight bank. With `mix=False` the sublayer input comes from the inner
 block alone and `xn` is recomputed for the injection (`<name>_hinj`).
 
 The inner block sees a context whose geometry is `inner_geometry` (width `h`)
@@ -115,7 +116,9 @@ class HCSublayer(Block):
         if self.mix:
             own = [
                 WeightDecl(f"{n}_hdn", K=self.width, N=self.n_down, dtype=BF16),
-                WeightDecl(f"{n}_hup", K=self.k_up, N=self.width, dtype=BF16),
+            ] + [
+                WeightDecl(f"{n}_hup{b}", K=self.k_up, N=self.h, dtype=BF16)
+                for b in range(self.nhc)
             ]
         else:
             own = [WeightDecl(f"{n}_hinj", K=self.width, N=128, dtype=BF16)]
@@ -142,7 +145,7 @@ class HCSublayer(Block):
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
         sw = dict(self.inner.shared_widths(self.gi, ex))
-        sw["acc"] = max(sw.get("acc", 0), self.width, self.n_down)
+        sw["acc"] = max(sw.get("acc", 0), self.h, self.n_down)
         return sw
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> Any:
@@ -203,11 +206,11 @@ class HCSublayer(Block):
             gate = rnd(jax.nn.silu(rnd(rnd(y[:, :lr]) / nhc)))
             scr["hc_g"][:, :lr] = gate.astype(BF16)
             self._set_injection(ctx, y[:, lr : lr + nhc])
-            u = s.dmatmul(f"{n}_hup", scr["hc_g"], self.width)
             mixed = None
             for b in range(nhc):
-                sl = slice(b * h, (b + 1) * h)
-                term = jax.nn.sigmoid(rnd(u[:, sl])) * scr["xb"][:, sl].astype(F32)
+                u = s.dmatmul(f"{n}_hup{b}", scr["hc_g"], h)
+                xn_b = scr["xb"][:, b * h : (b + 1) * h].astype(F32)
+                term = jax.nn.sigmoid(rnd(u)) * xn_b
                 mixed = term if mixed is None else mixed + term
             mixed = rnd(mixed / nhc)
             scr["hc_xb"][...] = mixed.astype(BF16)

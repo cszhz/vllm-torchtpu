@@ -40,7 +40,7 @@ from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 
 NHC, H_SUB, LOWRANK = 4, 256, 64
 
-_TILES = Tiles(bank=512 << 10, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64)
+_TILES = Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,7 +75,10 @@ def _hc_weight_arrays(name: str, hc: dict[str, jax.Array], R: int) -> dict[str, 
     def rep(x):
         return jnp.broadcast_to(x[None], (R, *x.shape))
 
-    return {f"{name}_hdn": rep(hdn), f"{name}_hup": rep(hup)}
+    out = {f"{name}_hdn": rep(hdn)}
+    for b in range(NHC):
+        out[f"{name}_hup{b}"] = rep(hup[..., b * H_SUB : (b + 1) * H_SUB])
+    return out
 
 
 def _torch_gated_residual(x, norm_w, down, up, inj, block, nhc, eps):
