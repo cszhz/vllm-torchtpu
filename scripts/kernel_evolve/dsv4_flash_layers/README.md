@@ -1,6 +1,8 @@
 # DeepSeek-V4-Flash layer-run campaign: what the scorer reads
 
-The campaign is scored by forge's `scorers/serve_e2e.py` on
+The campaign is scored by `serve_e2e.py` here, a byte-for-byte copy of forge's
+`scorers/serve_e2e.py` at the time the campaign was frozen (a campaign from a repository
+runs the scorer its tree holds), on
 `deepseek-v4-flash-dp8-ep@layers`: the model cut to its leading 5 of 43 layers, which
 hold every kind of layer it has, served on one tpu7x 2x2x1 node through Cloud DevKit
 and scored on the device's op time per step.
@@ -10,7 +12,7 @@ corpus. They are here, so a run on any host reads them from its clone of this tr
 
     PERFKIT_CORPUS=<clone>/scripts/kernel_evolve/dsv4_flash_layers/corpus \
     PERFKIT_PYTHON=<a python with jax and numpy> \
-      perfkit scorer run --bench <frozen serve_e2e.py> \
+      perfkit scorer run --bench <clone>/scripts/kernel_evolve/dsv4_flash_layers/serve_e2e.py \
         --arm golden=<golden checkout>:control --arm cand=<candidate checkout> \
         --config deepseek-v4-flash-dp8-ep@layers --candidate cand --job-id <id>
 
