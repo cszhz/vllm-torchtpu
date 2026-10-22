@@ -230,6 +230,10 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         # to pipeline them with MoE computation when chunking is enabled.
         return enable_pipelined_collective_and_compute()
 
+    def _gathers_routed_tokens(self) -> bool:
+        """Whether apply routes this rank's tokens and then runs the DP collectives."""
+        return enable_pipelined_collective_and_compute()
+
     def __init__(self, moe: FusedMoEConfig):
         # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion)
         FusedMoEMethodBase.__init__(self, moe)
@@ -358,7 +362,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "activation": activation_str,
             "rhs_quant_dtype": self.rhs_quant_dtype,
         }
-        if enable_pipelined_collective_and_compute():
+        if self._gathers_routed_tokens():
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
@@ -382,7 +386,17 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         # bracket it with an all-gather/reduce-scatter of its own.
         from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 
-        return enable_pipelined_collective_and_compute() or fused_moe_ep_supported(self)
+        return self._gathers_routed_tokens() or fused_moe_ep_supported(self)
+
+    def _gathers_routed_tokens(self) -> bool:
+        # Routing is row-local, so routing this rank's rows and gathering the
+        # top-k ids and weights hands every rank the tensors that gathering the
+        # [tokens, experts] f32 logits and routing every row would, for 1/dp of
+        # the routing work and a topk-wide gather instead of an experts-wide one.
+        moe = self.moe
+        return super()._gathers_routed_tokens() or (
+            moe.dp_size > 1 and moe.pcp_size == 1 and not moe.is_sequence_parallel
+        )
 
     def _prebuild_w4a8(
         self,

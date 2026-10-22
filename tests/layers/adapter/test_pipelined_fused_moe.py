@@ -35,7 +35,10 @@ from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_ten
     VllmCompressedTensorsW4ANMxfp4MoEMethod,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
-from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4MoEMethod
+from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
+    VllmDeepseekV4Mxfp4MoEMethod,
+    VllmMxfp4MoEMethod,
+)
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4MoEMethod
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedFusedMoEMethod,
@@ -338,6 +341,29 @@ def test_fp8_all_gather_alone_claims_the_collectives():
             patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", True),
         ):
             assert method_cls.supports_internal_mk.fget(None) is False
+
+
+@pytest.mark.parametrize(
+    "dp_size,pcp_size,sequence_parallel,claims",
+    [
+        (8, 1, False, True),
+        (1, 1, False, False),
+        (8, 2, False, False),
+        (8, 1, True, False),
+    ],
+)
+def test_deepseek_v4_mxfp4_routes_its_own_rows_under_dp(
+    dp_size, pcp_size, sequence_parallel, claims
+):
+    """Under plain DP the DeepSeek-V4 method takes vLLM's gather and combine, so
+    it routes this rank's rows and gathers top-k rather than the router logits."""
+    method = object.__new__(VllmDeepseekV4Mxfp4MoEMethod)
+    method.moe = SimpleNamespace(
+        dp_size=dp_size, pcp_size=pcp_size, is_sequence_parallel=sequence_parallel
+    )
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0):
+        assert method.supports_internal_mk is claims
+        assert method._gathers_routed_tokens() is claims
 
 
 def _run_with_fp8_all_gather(
