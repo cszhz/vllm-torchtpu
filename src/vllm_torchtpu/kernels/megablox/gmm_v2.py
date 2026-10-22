@@ -392,6 +392,29 @@ def generate_block_specs(
 # Define kernels.
 
 
+def quantize_lhs_block(
+    block_lhs: jax.Array,  # [m, lhs quant block]
+    lhs_q_dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array]:
+    """One lhs quant block in `lhs_q_dtype` and its per-row scale [m, 1].
+
+    Row-local: a row's values and scale depend on that row alone.
+    """
+    if jnp.issubdtype(lhs_q_dtype, jnp.floating):
+        dtype_max = float(jnp.finfo(lhs_q_dtype).max)
+    else:
+        dtype_max = float(jnp.iinfo(lhs_q_dtype).max)
+    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
+    block_scale = block_abs_max / dtype_max
+
+    # If block_scale=0, it will cause division by zero and return either
+    # NaN or Inf. Since this can cause numeric issue when downcasting to
+    # quantized value, we convert them into 0.
+    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
+    # Convert lhs into quantized dtype.
+    return (block_lhs * block_scale_inv).astype(lhs_q_dtype), block_scale
+
+
 def tile_matmul(
     tiled_lhs: jax.Array,  # [bucket_m, tile_k]
     tiled_rhs_ref: RhsRef,  # [tile_k, tile_n]
@@ -399,8 +422,13 @@ def tile_matmul(
     cfgs: GmmConfigs,
     bucket_m: int,
     is_last_k_step: bool,
+    lhs_scale: jax.Array | None = None,  # [bucket_m, tile_k // lhs quant block]
 ) -> jax.Array:
-    """Multiplies one lhs tile by one rhs tile into [bucket_m, tile_n] of acc_dtype."""
+    """Multiplies one lhs tile by one rhs tile into [bucket_m, tile_n] of acc_dtype.
+
+    With `lhs_scale`, a quantized lhs arrives already quantized: `tiled_lhs`
+    holds `quantize_lhs_block`'s values and `lhs_scale` its block scales.
+    """
     tpu_info = pltpu.get_tpu_info()
     mxu_size = tpu_info.mxu_column_size
 
@@ -462,10 +490,8 @@ def tile_matmul(
         q_block_size = cfgs.lhs_cfgs.quant_block_size
 
         if jnp.issubdtype(lhs_q_dtype, jnp.floating):
-            dtype_max = float(jnp.finfo(lhs_q_dtype).max)
             preferred_element_type = jnp.float32
         else:
-            dtype_max = float(jnp.iinfo(lhs_q_dtype).max)
             preferred_element_type = jnp.int32
 
         # Without n outer loop, result of quantized matmul becomes available only
@@ -485,18 +511,17 @@ def tile_matmul(
                 block_lhs = tiled_lhs[:, start_k:end_k]
                 block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
-                # Perform lhs quantization. Note that for every block_lhs,
-                # same computation will be performed tiles_n//mxu_size times.
-                # But we can let compiler perform CSE and avoid recomputation.
-                block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-                block_scale = block_abs_max / dtype_max
-
-                # If block_scale=0, it will cause division by zero and return either
-                # NaN or Inf. Since this can cause numeric issue when downcasting to
-                # quantized value, we convert them into 0.
-                block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-                # Convert lhs into quantized dtype.
-                block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+                if lhs_scale is None:
+                    # Note that for every block_lhs, same computation will be
+                    # performed tiles_n//mxu_size times. But we can let compiler
+                    # perform CSE and avoid recomputation.
+                    block_lhs_q, block_scale = quantize_lhs_block(
+                        block_lhs, lhs_q_dtype
+                    )
+                else:
+                    b_id = start_k // q_block_size
+                    block_lhs_q = block_lhs.astype(lhs_q_dtype)
+                    block_scale = lhs_scale[:, b_id : b_id + 1]
 
                 # Unlike unquantized path, compiler may not perform implicit type
                 # conversion due to numeric concerns. As this can cause unsupported
