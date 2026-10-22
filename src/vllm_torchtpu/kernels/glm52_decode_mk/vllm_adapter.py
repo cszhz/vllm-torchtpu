@@ -574,7 +574,10 @@ class Glm52DecodeMK:
         try:
             return cls(runner)
         except Unsupported as e:
-            logger.warning("GLM-5.2 decode megakernel disabled: %s", e)
+            logger.warning(
+                "GLM-5.2 decode megakernel disabled (not built; every step runs the stock graphs): %s",
+                e,
+            )
             return None
 
     def __init__(self, runner):
@@ -594,7 +597,13 @@ class Glm52DecodeMK:
             R == FULL.R,
             f"TP {R}: the megakernel is built and verified for TP = DCP = {FULL.R} only",
         )
-        _need(int(getattr(pc, "decode_context_parallel_size", 1)) == R, "DCP != TP")
+        dcp = int(getattr(pc, "decode_context_parallel_size", 1))
+        _need(
+            dcp == R,
+            f"DCP {dcp} != TP {R}: the megakernel is built and verified for DCP = TP = {R} only (its DCP KV "
+            "ownership, q all-gather and A2A merge span the whole TP group; a smaller DCP group is a kernel change, "
+            f"not an adapter one). Serve it with DECODE_CONTEXT_PARALLEL_SIZE={R}",
+        )
         _need(dist.is_initialized() and dist.get_world_size() == R, "world != TP")
         _need(
             int(getattr(pc, "cp_kv_cache_interleave_size", 1)) == FULL.ILV,

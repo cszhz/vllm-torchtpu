@@ -366,6 +366,21 @@ def test_load_guard_refuses_qrep_group_not_the_world(load_env, qrep_layers, q_gr
     assert Glm52DecodeMK.maybe_create(runner) is None  # logged, stock forever
 
 
+@pytest.mark.parametrize("dcp", [8, 4, 1])
+def test_load_guard_refuses_dcp_not_tp_with_a_clear_reason(load_env, dcp, monkeypatch):
+    # the best served config's DECODE_CONTEXT_PARALLEL_SIZE=8 stays refused (DCP8 is a kernel project), loudly
+    with pytest.raises(
+        Unsupported, match=rf"DCP {dcp} != TP 16: .*DECODE_CONTEXT_PARALLEL_SIZE=16"
+    ):
+        Glm52DecodeMK(_glm52_runner(dcp=dcp))
+    warned = []
+    monkeypatch.setattr(VA.logger, "warning", lambda f, *a: warned.append(f % a))
+    assert Glm52DecodeMK.maybe_create(_glm52_runner(dcp=dcp, qrep_layers=(0,))) is None
+    assert len(warned) == 1, warned
+    assert "disabled (not built; every step runs the stock graphs)" in warned[0]
+    assert f"DCP {dcp} != TP 16" in warned[0]
+
+
 def test_load_guard_does_not_read_the_config_qrep_field():
     src = __import__("inspect").getsource(VA.Glm52DecodeMK.__init__)
     assert (
