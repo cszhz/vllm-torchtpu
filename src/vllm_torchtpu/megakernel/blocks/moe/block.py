@@ -93,13 +93,12 @@ class MoEBlock(Block):
         self._validate_options({"shared_gate": self.shared_gate})
         if geometry is not None:
             self._check_option_consistency(geometry)
-        self.options = FrozenDict(
-            {
-                "shared_gate": self.shared_gate,
-                "moe_tp": self.moe_tp,
-                "e_slots": self.e_slots,
-            }
-        )
+        opts: dict[str, Any] = {"shared_gate": self.shared_gate}
+        if self._explicit_moe_tp is not None or geometry is not None:
+            opts["moe_tp"] = self.moe_tp
+        if self._explicit_e_slots is not None or geometry is not None:
+            opts["e_slots"] = self.e_slots
+        self.options = FrozenDict(opts)
 
     def _check_option_consistency(self, g: Any) -> tuple[bool, int]:
         g_tp = getattr(g, "moe_tp", None)
@@ -373,7 +372,7 @@ class MoEBlock(Block):
         layer_idx: int = 0,
     ) -> tuple[jax.Array, Any]:
         geom = self._require_geometry(g)
-        self._check_option_consistency(geom)
+        moe_tp, _ = self._check_option_consistency(geom)
         return moe_reference(
             params,
             x,
@@ -381,4 +380,5 @@ class MoEBlock(Block):
             g=geom,
             ex=ex,
             layer_idx=layer_idx,
+            moe_tp=moe_tp,
         )

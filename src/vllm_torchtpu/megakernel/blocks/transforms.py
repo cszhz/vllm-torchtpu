@@ -157,6 +157,16 @@ def apply_hf_transforms(
     """Shard, pad, and fuse canonical MK-shaped `hf` tensors across `R` ranks."""
     unique_decls: dict[str, HFParamDecl] = {}
     for d in decls:
+        prev = unique_decls.get(d.name)
+        if prev is not None and (
+            prev.shape != d.shape
+            or prev.dtype != d.dtype
+            or prev.transform != d.transform
+        ):
+            raise ValueError(
+                f"apply_hf_transforms got conflicting declarations for {d.name!r}: "
+                f"{prev!r} vs {d!r}"
+            )
         unique_decls.setdefault(d.name, d)
 
     known_names = set(unique_decls)

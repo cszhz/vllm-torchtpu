@@ -259,6 +259,15 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
             {"q_proj": jnp.zeros(q_decl.shape, dtype=q_decl.dtype)},
             R=2,
         )
+    with pytest.raises(ValueError, match="conflicting declarations"):
+        apply_hf_transforms(
+            [
+                q_decl,
+                dataclasses.replace(q_decl, transform=ParamTransform(shard_axis=None)),
+            ],
+            {"q_proj": jnp.zeros(q_decl.shape, dtype=q_decl.dtype)},
+            R=2,
+        )
 
 
 def test_block_bind_resolve_validation_and_fail_closed():
@@ -392,7 +401,10 @@ def test_block_bind_resolve_validation_and_fail_closed():
     fd1 = FrozenDict({"a": [1, {"x": [2, 3]}], "b": 4})
     fd2 = FrozenDict({"b": 4, "a": (1, {"x": (2, 3)})})
     assert fd1 == fd2
+    assert fd1 == {"a": [1, {"x": [2, 3]}], "b": 4}
+    assert fd1.__eq__(42) is NotImplemented
     assert hash(fd1) == hash(fd2)
+    assert dict(MoEBlock().options) == {"shared_gate": True}
 
 
 def _pack_single_block_step_inputs(

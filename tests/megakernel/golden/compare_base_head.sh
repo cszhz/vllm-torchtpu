@@ -13,15 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Compare CPU-interpret golden hashes between <base-ref> and the current tree
-# on the current host (machine-independent base-vs-head verification).
+# Compare CPU-interpret kernel and reference_step golden hashes between
+# <base-ref> and the current tree on the current host (machine-independent
+# base-vs-head verification).
 #
 # Usage:
 #   tests/megakernel/golden/compare_base_head.sh <base-ref> [-n N] [pytest-args...]
 #
 # Note: <base-ref> must already include MK_GOLDEN_JSON support in
-# tests/megakernel/test_golden_bitexact.py. Cases that exist only on one side
-# (base-only or head-only) are reported, not failed.
+# tests/megakernel/test_golden_bitexact.py. When <base-ref> predates the
+# `ref_tiny_*` reference_step cases, this script runs HEAD's `ref_tiny_*`
+# test definitions against `<base-ref>`'s `src/` so those cases are also
+# compared base-vs-head. Cases that exist only on one side (base-only or
+# head-only) are reported, not failed.
 
 set -euo pipefail
 
@@ -91,8 +95,15 @@ fi
     MK_GOLDEN_JSON="$BASE_JSON" \
     "$PYTEST_BIN" "$BASE_TEST" "$@" || [[ $? -eq 5 ]]
   if grep -q "ref_tiny_" "$REPO_ROOT/tests/megakernel/test_golden_bitexact.py" && ! grep -q "ref_tiny_" "$BASE_TEST"; then
+    HAS_K=0
+    for arg in "$@"; do
+      if [[ "$arg" == "-k" || "$arg" == -k* ]]; then
+        HAS_K=1
+        break
+      fi
+    done
     REF_ARGS=("$@")
-    if [[ " $* " != *" -k "* ]]; then
+    if [[ "$HAS_K" -eq 0 ]]; then
       REF_ARGS+=("-k" "ref_tiny_")
     fi
     if [[ " ${REF_ARGS[*]} " == *"ref_tiny_"* ]]; then

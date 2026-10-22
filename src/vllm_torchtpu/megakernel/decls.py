@@ -67,10 +67,11 @@ class FrozenDict(Mapping[str, Any]):
     def __hash__(self) -> int:
         return hash(frozenset(self._dict.items()))
 
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, FrozenDict):
-            return self._dict == other._dict
-        return self._dict == dict(other) if isinstance(other, Mapping) else False
+    def __eq__(self, other: object) -> Any:
+        if isinstance(other, Mapping):
+            other_d = other if isinstance(other, FrozenDict) else FrozenDict(other)
+            return self._dict == other_d._dict
+        return NotImplemented
 
     def __repr__(self) -> str:
         return f"FrozenDict({self._dict!r})"

@@ -34,6 +34,7 @@ def moe_reference(
     g: Any,
     ex: ExecSpec,
     layer_idx: int = 0,
+    moe_tp: bool | None = None,
 ) -> tuple[jax.Array, Any]:
     """Pure-JAX multi-rank MoE forward for one layer."""
     R, B = ex.R, ex.B
@@ -42,9 +43,9 @@ def moe_reference(
     TOPK = int(g.TOPK)
     IS = int(g.IS)
     I = int(g.I)  # noqa: E741
-    moe_tp = bool(getattr(g, "moe_tp", True))
+    is_tp = bool(getattr(g, "moe_tp", True)) if moe_tp is None else bool(moe_tp)
     ISR = IS // R
-    IR = I // R if moe_tp else I
+    IR = I // R if is_tp else I
     ER = E // R
 
     x_moe = x[:B].astype(F32)
@@ -111,9 +112,9 @@ def moe_reference(
         for b in range(B):
             for k in range(TOPK):
                 e = int(top_idx[b, k])
-                if not moe_tp and (e // ER) != r:
+                if not is_tp and (e // ER) != r:
                     continue
-                w_slot = e if moe_tp else (e - r * ER)
+                w_slot = e if is_tp else (e - r * ER)
                 w13_e = e13_l[w_slot].astype(F32)
                 w2_e = e2_l[w_slot].astype(F32)
                 s13 = e13_s_l[w_slot]

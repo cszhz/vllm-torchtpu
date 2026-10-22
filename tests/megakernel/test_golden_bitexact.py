@@ -11,25 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Behaviour-preservation gate: golden hashes of hidden + every pool output.
+"""Behaviour-preservation gate: golden hashes of kernel and reference_step outputs.
 
-Each case runs one tiny paged pooled step (CPU interpret) and hashes the hidden
-output and every returned pool (the pools carry all KV / GDN state). Only public
-APIs are used (profiles, `default_pool_layout`, `states_to_pool`,
-`PallasWriter`), so the harness stays unchanged across internal refactors.
+Two families of cases are checked:
+- Kernel cases (`run_case`): run one tiny paged pooled step (CPU interpret) and
+  hash the hidden output, every returned pool (KV + GDN state), and the
+  resolved `use_gpr` flag.
+- Reference cases (`ref_tiny_*` via `run_ref_case`): run pure-JAX
+  `qwen35.reference_step` across TP, EP+EPLB, paged pool I/O, float32 RoPE
+  intermediates, and attention-only configs, and hash `out` and `states`.
 
 Two execution modes are supported:
 1. Committed-golden mode (default, `MK_GOLDEN_JSON` unset): compares against
    `golden/b1_bitexact.json` when the current host fingerprint matches the
-   `"_meta"` entry recorded in that file. Because Pallas CPU-interpret lowering
-   depends on the host CPU microarchitecture and library versions, a host
-   fingerprint mismatch skips with instructions to run base-vs-head mode.
+   recorded `"_meta"` entry (per-case `"_meta"` for `ref_tiny_*` entries, which
+   never fall back to the file-level `"_meta"`, or file-level `"_meta"` for
+   kernel entries). Because CPU XLA / Pallas lowering depends on the host CPU
+   microarchitecture and library versions, a host fingerprint mismatch skips
+   with instructions to run base-vs-head mode.
 2. Base-vs-head mode (`MK_GOLDEN_JSON=<path>` or
    `tests/megakernel/golden/compare_base_head.sh <base-ref> [-n N]`): records
    fresh reference hashes at `<base-ref>` on the current host with
-   `MK_REGEN_GOLDEN=1 MK_GOLDEN_JSON=$TMP/base.json pytest <this file>`, then
-   verifies the working tree against `$TMP/base.json` with
-   `MK_GOLDEN_JSON=$TMP/base.json pytest <this file>`.
+   `MK_REGEN_GOLDEN=1 MK_GOLDEN_JSON=$TMP/base.json pytest <this file>` (falling
+   back to running HEAD's `ref_tiny_*` cases against `<base-ref>`'s `src/` when
+   `<base-ref>` predates those cases), then verifies the working tree against
+   `$TMP/base.json` with `MK_GOLDEN_JSON=$TMP/base.json pytest <this file>`.
 
 Regenerate the committed golden file only for an intentional numerics change,
 and say so in the PR: `MK_REGEN_GOLDEN=1 pytest <this file>`.
@@ -47,6 +53,7 @@ import hashlib
 import json
 import pathlib
 import platform
+import sys
 from typing import Any
 
 import jax
@@ -118,11 +125,13 @@ def _write_golden_case(
     with lock_path.open("w") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         gold = json.loads(golden_path.read_text()) if golden_path.exists() else {}
+        fp = _host_fingerprint()
         if "gpr" in got:
-            gold[_META_KEY] = {**_host_fingerprint(), "gpr_resolved": True}
-        elif _META_KEY not in gold:
-            gold[_META_KEY] = _host_fingerprint()
-        gold[name] = got
+            gold[_META_KEY] = {**fp, "gpr_resolved": True}
+            gold[name] = got
+        else:
+            gold.setdefault(_META_KEY, fp)
+            gold[name] = {**got, _META_KEY: fp}
         golden_path.write_text(json.dumps(gold, indent=1, sort_keys=True) + "\n")
 
 
@@ -335,9 +344,10 @@ def test_golden_bitexact(name: str):
     all_gold = json.loads(golden_path.read_text())
     if not is_custom_golden:
         case_entry = all_gold.get(name, {})
+        is_ref_case = CASES[name].get("kind") == "ref"
         meta = (
             case_entry.get(_META_KEY)
-            if isinstance(case_entry, dict) and _META_KEY in case_entry
+            if is_ref_case or (isinstance(case_entry, dict) and _META_KEY in case_entry)
             else all_gold.get(_META_KEY)
         )
         cur = _host_fingerprint()
@@ -387,3 +397,46 @@ def test_golden_covers_every_case():
                 f"base_only={base_only}, head_only={head_only}"
             )
     assert gold_cases == head_cases
+
+
+def test_golden_regen_writes_per_case_meta(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    """`MK_REGEN_GOLDEN=1` writes per-case `_meta` and never uses global `_meta`."""
+    tmp_json = tmp_path / "golden.json"
+    other_fp = {
+        "cpu": "Other CPU (x86_64)",
+        "jax": "0.0.0",
+        "jaxlib": "0.0.0",
+        "numpy": "0.0.0",
+        "python": "3.12.0",
+    }
+    tmp_json.write_text(json.dumps({_META_KEY: other_fp}) + "\n")
+    this_mod = sys.modules[__name__]
+    fake_ref = {"out": "bf16:[2,128]:deadbeef", "states": {"kv": "fp8:[2]:cafe"}}
+    monkeypatch.setattr(this_mod, "_dispatch_case", lambda cfg: dict(fake_ref))
+    monkeypatch.setenv("MK_REGEN_GOLDEN", "1")
+    monkeypatch.setenv("MK_GOLDEN_JSON", str(tmp_json))
+    with pytest.raises(pytest.skip.Exception, match="regenerated golden"):
+        test_golden_bitexact("ref_tiny_t1_tp")
+
+    data = json.loads(tmp_json.read_text())
+    assert data[_META_KEY] == other_fp
+    assert data["ref_tiny_t1_tp"][_META_KEY] == _host_fingerprint()
+    assert data["ref_tiny_t1_tp"]["out"] == fake_ref["out"]
+
+    # In committed-golden mode, per-case `_meta` matches this host even though
+    # global `_meta` is `other_fp`; removing per-case `_meta` must skip even if
+    # global `_meta` matches `_host_fingerprint()`.
+    monkeypatch.delenv("MK_REGEN_GOLDEN")
+    monkeypatch.delenv("MK_GOLDEN_JSON")
+    monkeypatch.setattr(this_mod, "GOLDEN", tmp_json)
+    test_golden_bitexact("ref_tiny_t1_tp")
+
+    data[_META_KEY] = _host_fingerprint()
+    del data["ref_tiny_t1_tp"][_META_KEY]
+    tmp_json.write_text(json.dumps(data) + "\n")
+    with pytest.raises(
+        pytest.skip.Exception, match="golden recorded on <missing _meta>"
+    ):
+        test_golden_bitexact("ref_tiny_t1_tp")

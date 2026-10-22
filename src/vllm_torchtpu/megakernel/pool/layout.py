@@ -337,6 +337,8 @@ class PoolLayout:
         R: int | None = None,
     ) -> PoolLayout:
         """Construct a `PoolLayout` from per-layer `cache_decl()` descriptors."""
+        from .derive import derive_pool_layout
+
         return derive_pool_layout(
             decls_or_kv,
             rec_decl,
@@ -345,8 +347,6 @@ class PoolLayout:
             R=R,
         )
 
-
-from .derive import derive_pool_layout  # noqa: E402
 
 __all__ = [
     "LANES",
@@ -357,5 +357,4 @@ __all__ = [
     "VALIDATED_PAGE_SIZE",
     "VALIDATED_REC_PAGES_PER_SLOT",
     "PoolLayout",
-    "derive_pool_layout",
 ]

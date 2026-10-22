@@ -185,6 +185,7 @@ def test_moe_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
         pltpu.make_async_copy(
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).wait()
+        moe.on_layer_start(ctx, jnp.int32(0), jnp.int32(0))
         ring.begin_layer(jnp.int32(0))
         ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
         part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
@@ -367,6 +368,7 @@ def test_moe_block_numerical_parity(moe_tp: bool, R: int, pipe: bool):
         pltpu.make_async_copy(
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).wait()
+        moe.on_layer_start(ctx, jnp.int32(0), jnp.int32(0))
         ring.begin_layer(jnp.int32(0))
         ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
         part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
@@ -568,28 +570,30 @@ def _simulate_expert_ring_no_collision(mp, n_hit: int = 8) -> None:
         fetch_unit(u0)
 
     if mp.PIPE:
-        assert t13 == 1 and t2 == 1
-        assert e_inflight.pop(0 % nbe, None) == 0
-        assert es_inflight.get(0 % nss) == 0
+        assert t13 == 1 and t2 == 1, f"PIPE requires T13=T2=1, got {t13}, {t2}"
+        assert e_inflight.pop(0 % nbe, None) == 0, "e_ring unit 0 not ready"
+        assert es_inflight.get(0 % nss) == 0, "es expert 0 not ready"
         fetch_unit(0 + nbe, t=0)
         for i in range(n_hit - 1):
             u13 = (i + 1) * te
             u2 = i * te + t13
-            assert e_inflight.pop(u13 % nbe, None) == u13
-            assert es_inflight.get((i + 1) % nss) == i + 1
-            assert e_inflight.pop(u2 % nbe, None) == u2
-            assert es_inflight.pop(i % nss, None) == i
+            assert e_inflight.pop(u13 % nbe, None) == u13, f"e_ring unit {u13} missing"
+            assert es_inflight.get((i + 1) % nss) == i + 1, f"es expert {i + 1} missing"
+            assert e_inflight.pop(u2 % nbe, None) == u2, f"e_ring unit {u2} missing"
+            assert es_inflight.pop(i % nss, None) == i, f"es expert {i} missing"
             fetch_unit(u13 + nbe, t=0)
             fetch_unit(u2 + nbe, t=t13)
         last = n_hit - 1
         u2_last = last * te + t13
-        assert e_inflight.pop(u2_last % nbe, None) == u2_last
-        assert es_inflight.pop(last % nss, None) == last
+        assert e_inflight.pop(u2_last % nbe, None) == u2_last, (
+            f"e_ring unit {u2_last} missing"
+        )
+        assert es_inflight.pop(last % nss, None) == last, f"es expert {last} missing"
         fetch_unit(u2_last + nbe, t=t13)
     elif mp.PIPE_EP:
-        assert t13 == 2 * t2
+        assert t13 == 2 * t2, f"PIPE_EP requires T13=2*T2, got {t13}, {t2}"
         for t in range(t13):
-            assert e_inflight.pop(t % nbe, None) == t
+            assert e_inflight.pop(t % nbe, None) == t, f"e_ring unit {t} missing"
             if mp.group_rel:
                 if t % 2 == 1:
                     fetch_unit(t - 1 + nbe, t=t - 1)
@@ -598,7 +602,7 @@ def _simulate_expert_ring_no_collision(mp, n_hit: int = 8) -> None:
                     fetch_unit(t + nbe, t=t)
             else:
                 fetch_unit(t + nbe, t=t)
-        assert es_inflight.get(0 % nss) == 0
+        assert es_inflight.get(0 % nss) == 0, "es expert 0 not ready"
         for i in range(n_hit - 1):
             # In PIPE_EP, all `e2` tiles of expert `i` and all `e13` tiles of
             # expert `i + 1` must already be in flight at the start of `body_ep(i)`.
@@ -620,20 +624,24 @@ def _simulate_expert_ring_no_collision(mp, n_hit: int = 8) -> None:
                 t0, t1 = 2 * s_step, 2 * s_step + 1
                 u13_0 = (i + 1) * te + t0
                 u13_1 = (i + 1) * te + t1
-                assert e_inflight.pop(u2 % nbe, None) == u2
-                assert e_inflight.pop(u13_0 % nbe, None) == u13_0
+                assert e_inflight.pop(u2 % nbe, None) == u2, f"e_ring unit {u2} missing"
+                assert e_inflight.pop(u13_0 % nbe, None) == u13_0, (
+                    f"e_ring unit {u13_0} missing"
+                )
                 fetch_unit(u2 + nbe, t=t13 + s_step)
                 fetch_unit(u13_0 + nbe, t=t0)
-                assert e_inflight.pop(u13_1 % nbe, None) == u13_1
+                assert e_inflight.pop(u13_1 % nbe, None) == u13_1, (
+                    f"e_ring unit {u13_1} missing"
+                )
                 fetch_unit(u13_1 + nbe, t=t1)
             # `scr["es"][s_cur, :, BN:]` is read after the `s_step` loop, then
             # `es_wait(i + 1)` waits on expert `i + 1`'s scales.
-            assert es_inflight.pop(i % nss, None) == i
-            assert es_inflight.get((i + 1) % nss) == i + 1
+            assert es_inflight.pop(i % nss, None) == i, f"es expert {i} missing"
+            assert es_inflight.get((i + 1) % nss) == i + 1, f"es expert {i + 1} missing"
         i_last = n_hit - 1
         for s_step in range(t2):
             u2 = i_last * te + t13 + s_step
-            assert e_inflight.pop(u2 % nbe, None) == u2
+            assert e_inflight.pop(u2 % nbe, None) == u2, f"e_ring unit {u2} missing"
             if mp.group_rel:
                 if s_step % 2 == 1:
                     fetch_unit(u2 - 1 + nbe, t=t13 + s_step - 1)
@@ -642,13 +650,15 @@ def _simulate_expert_ring_no_collision(mp, n_hit: int = 8) -> None:
                     fetch_unit(u2 + nbe, t=t13 + s_step)
             else:
                 fetch_unit(u2 + nbe, t=t13 + s_step)
-        assert es_inflight.pop(i_last % nss, None) == i_last
+        assert es_inflight.pop(i_last % nss, None) == i_last, (
+            f"es expert {i_last} missing"
+        )
     else:
         for i in range(n_hit):
             base = i * te
             for t in range(t13):
                 u = base + t
-                assert e_inflight.pop(u % nbe, None) == u
+                assert e_inflight.pop(u % nbe, None) == u, f"e_ring unit {u} missing"
                 if mp.unroll and mp.group_rel and t13 > 1:
                     if t % 2 == 1:
                         fetch_unit(u - 1 + nbe, t=t - 1)
@@ -657,16 +667,20 @@ def _simulate_expert_ring_no_collision(mp, n_hit: int = 8) -> None:
                         fetch_unit(u + nbe, t=t)
                 else:
                     fetch_unit(u + nbe, t=t if mp.unroll and t13 > 1 else None)
-            assert es_inflight.get(i % nss) == i
+            assert es_inflight.get(i % nss) == i, f"es expert {i} missing"
             u2_base = base + t13
             if t2 == 1:
-                assert e_inflight.pop(u2_base % nbe, None) == u2_base
-                assert es_inflight.pop(i % nss, None) == i
+                assert e_inflight.pop(u2_base % nbe, None) == u2_base, (
+                    f"e_ring unit {u2_base} missing"
+                )
+                assert es_inflight.pop(i % nss, None) == i, f"es expert {i} missing"
                 fetch_unit(u2_base + nbe)
             else:
                 for t in range(t2):
                     u = u2_base + t
-                    assert e_inflight.pop(u % nbe, None) == u
+                    assert e_inflight.pop(u % nbe, None) == u, (
+                        f"e_ring unit {u} missing"
+                    )
                     if mp.unroll and mp.group_rel:
                         if t % 2 == 1:
                             fetch_unit(u - 1 + nbe, t=t13 + t - 1)
@@ -675,8 +689,10 @@ def _simulate_expert_ring_no_collision(mp, n_hit: int = 8) -> None:
                             fetch_unit(u + nbe, t=t13 + t)
                     else:
                         fetch_unit(u + nbe, t=t13 + t if mp.unroll else None)
-                assert es_inflight.pop(i % nss, None) == i
-    assert not e_inflight and not es_inflight
+                assert es_inflight.pop(i % nss, None) == i, f"es expert {i} missing"
+    assert not e_inflight and not es_inflight, (
+        f"unreleased ring slots: e={e_inflight}, es={es_inflight}"
+    )
 
 
 def test_moe_deployment_ring_invariants():
@@ -688,6 +704,8 @@ def test_moe_deployment_ring_invariants():
     seen_pipe = False
     seen_pipe_ep = False
     seen_lazy = False
+    sample_plain_mp = None
+    sample_pipe_mp = None
     sample_pipe_ep_mp = None
     for moe_tp, e_slots in ((False, 0), (False, 72), (True, 0)):
         g = Qwen35Geometry(L=4, moe_tp=moe_tp, e_slots=e_slots)
@@ -706,10 +724,13 @@ def test_moe_deployment_ring_invariants():
                     assert not (mp.PIPE and mp.PIPE_EP)
                     if mp.PIPE:
                         assert mp.T13 == 1 and mp.T2 == 1
-                    if mp.PIPE_EP:
+                        sample_pipe_mp = mp
+                    elif mp.PIPE_EP:
                         assert mp.T13 == 2 * mp.T2
                         assert mp.NBE >= mp.TE and mp.NBE % mp.TE == 0
                         sample_pipe_ep_mp = mp
+                    else:
+                        sample_plain_mp = mp
                     if mp.LAZY_MOE:
                         assert cp.plan.ex.resolved_tiles.nbd >= mp.N_MOE
                     seen_pipe = seen_pipe or mp.PIPE
@@ -721,9 +742,21 @@ def test_moe_deployment_ring_invariants():
         seen_pipe_ep,
         seen_lazy,
     )
+    assert sample_plain_mp is not None
+    assert sample_pipe_mp is not None
     assert sample_pipe_ep_mp is not None
     # Negative self-tests: mutating NSS or NBE below the schedule requirements
     # or breaking PIPE_EP's NBE % TE == 0 invariant must fail the simulator.
+    with pytest.raises(AssertionError, match="es slot .* collision"):
+        _simulate_expert_ring_no_collision(
+            dataclasses.replace(sample_plain_mp, NSS=sample_plain_mp.NSS - 2),
+            n_hit=8,
+        )
+    with pytest.raises(AssertionError, match="es slot .* collision"):
+        _simulate_expert_ring_no_collision(
+            dataclasses.replace(sample_pipe_mp, NSS=sample_pipe_mp.NSS - 2),
+            n_hit=8,
+        )
     with pytest.raises(AssertionError, match="es slot .* collision"):
         _simulate_expert_ring_no_collision(
             dataclasses.replace(sample_pipe_ep_mp, NSS=sample_pipe_ep_mp.NSS - 1),
@@ -934,6 +967,11 @@ def test_moe_dynamic_dma_race_invariants(
             pltpu.make_async_copy(
                 W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
             ).wait()
+            # `MoEBlock.prologue` starts the async DMA into `scr["ecopy"].at[0]`
+            # on `scr["ec_sem"].at[0]`; `kernel.py` calls `b.on_layer_start`
+            # inside `smalls_sync` at the start of every layer to wait on
+            # `scr["ec_sem"].at[slot]` before `po2c_pass1` reads `scr["ecopy"]`.
+            moe.on_layer_start(ctx, jnp.int32(0), jnp.int32(0))
             ring.begin_layer(jnp.int32(0))
             ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
             part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
