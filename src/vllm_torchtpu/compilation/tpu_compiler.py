@@ -176,10 +176,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     # compiled model or custom-kernel lowering.
     "DP_SCHED_ENABLED",
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
+    "VLLM_TPU_SRPT_ATTN_WORK_CAP",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
     "USE_PHASED_PROFILER",
+    "TPU_STEP_TIMING_LOG_STEPS",
     # Raiden KV-transfer orchestration/identity only; consumed at serving time
     # by the KV connector and never affect the compiled graph.
     "TPU_RAIDEN_CONTROLLER_ADDRESS",

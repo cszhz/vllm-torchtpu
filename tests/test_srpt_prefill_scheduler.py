@@ -13,6 +13,7 @@
 # limitations under the License.
 """SrptPrefillScheduler tests on a real scheduler, through schedule()."""
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +30,7 @@ from vllm.config import (
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -517,3 +519,126 @@ def test_max_consecutive_holds_env_var_and_compile_cache(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS"
         not in tpu_compiler._tpu_compile_env_factors()
     )
+
+
+def _capped(model_config, cap: int, **kwargs):
+    scheduler, hasher = _build_real_scheduler(model_config, **kwargs)
+    scheduler.attn_work_cap = cap
+    scheduler._attn_cap_active = True  # as in a step with a decode
+    return scheduler, hasher
+
+
+def _chunk(prompt: int, status=RequestStatus.RUNNING, num_tokens: int | None = None):
+    """The request fields the chunk hook reads."""
+    return SimpleNamespace(
+        num_prompt_tokens=prompt, num_tokens=num_tokens or prompt, status=status
+    )
+
+
+def test_attn_cap_off_leaves_chunks_alone(shared_model_config):
+    scheduler, _ = _capped(shared_model_config, 0)
+    assert scheduler._reserve_prefill_lookahead(_chunk(400_000), 300_000, 128) == 128
+    assert scheduler._attn_work == 0.0
+
+
+@pytest.mark.parametrize(("start", "expected"), [(100_000, 96), (100_005, 91)])
+def test_attn_cap_clips_a_deep_chunk_to_the_grid(shared_model_config, start, expected):
+    scheduler, _ = _capped(shared_model_config, 10_000_000)
+    # The unrounded fit is 99 tokens; the clipped chunk ends on the 16 grid.
+    n = scheduler._reserve_prefill_lookahead(_chunk(400_000), start, 128)
+    assert n == expected and (start + n) % 16 == 0
+    assert n * (start + n / 2) <= 10_000_000
+    assert scheduler._attn_clipped_chunks == 1
+
+
+def test_attn_cap_counts_decodes_and_never_clips_them(shared_model_config):
+    scheduler, _ = _capped(shared_model_config, 1_000_000)
+    decode = _chunk(200_000, num_tokens=200_010)
+    assert scheduler._reserve_prefill_lookahead(decode, 200_010, 7) == 7
+    assert scheduler._attn_work == pytest.approx(7 * (200_010 + 3.5))
+    # No room left: the step's first chunk still advances, a second one waits.
+    assert scheduler._reserve_prefill_lookahead(_chunk(400_000), 100_000, 128) == 16
+    assert scheduler._reserve_prefill_lookahead(_chunk(400_000), 100_000, 128) == 0
+
+
+def test_attn_cap_admits_a_waiting_request_up_to_the_grid(shared_model_config):
+    scheduler, _ = _capped(shared_model_config, 1_000_000)
+    scheduler._reserve_prefill_lookahead(_chunk(50_000), 9_000, 100)  # most of it
+    waiting = _chunk(400_000, status=RequestStatus.WAITING)
+    assert scheduler._reserve_prefill_lookahead(waiting, 300_000, 128) == 16
+    assert scheduler._reserve_prefill_lookahead(waiting, 300_005, 128) == 11
+
+
+def test_attn_cap_lets_shallow_chunks_through_whole(shared_model_config):
+    scheduler, _ = _capped(shared_model_config, 25_000_000)
+    assert scheduler._reserve_prefill_lookahead(_chunk(60_000), 40_000, 121) == 121
+    assert scheduler._attn_clipped_chunks == 0
+
+
+def test_attn_cap_clips_through_schedule_and_hold_planning(
+    shared_model_config, monkeypatch
+):
+    monkeypatch.setenv("VLLM_TPU_SRPT_ATTN_WORK_CAP", "30000")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config, num_blocks=128, max_num_batched_tokens=64
+    )
+    assert scheduler.attn_work_cap == 30_000
+    assert "VLLM_TPU_SRPT_ATTN_WORK_CAP" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+    scheduler._other_rank_decoding = True
+    scheduler.add_request(_make_real_request("long", 1024, hasher, seed=1))
+    # 64 * (c + 32) <= 30000 holds up to c = 416.
+    for _ in range(7):
+        assert scheduler.schedule().num_scheduled_tokens == {"long": 64}
+    assert scheduler._attn_clipped_chunks == 0
+
+    # At c = 448 the fit is 62 tokens, so `long` gets 48 and leaves 16 of the
+    # budget. Hold planning models the clip: `short` fits beside `long`, so
+    # `long` is not held.
+    scheduler.add_request(_make_real_request("short", 16, hasher, seed=2))
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 48, "short": 16}
+    assert scheduler._attn_clipped_chunks == 1
+
+
+def test_upstream_routes_both_queues_through_the_chunk_hook():
+    # The attention cap is inert unless upstream calls the hook for running
+    # chunks and waiting requests alike; fail loudly if a vLLM update drops one.
+    source = inspect.getsource(Scheduler.schedule)
+    assert source.count("self._reserve_prefill_lookahead(") == 2
+
+
+def test_attn_cap_applies_only_while_some_rank_decodes(
+    shared_model_config, monkeypatch
+):
+    monkeypatch.setenv("VLLM_TPU_SRPT_ATTN_WORK_CAP", "30000")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config, num_blocks=128, max_num_batched_tokens=64
+    )
+    monkeypatch.setattr(AsyncScheduler, "update_from_output", lambda *a: {})
+    scheduler.add_request(_make_real_request("long", 1024, hasher, seed=1))
+    for _ in range(7):
+        scheduler.schedule()
+    # At c = 448 a 64-token chunk exceeds the cap, but nothing decodes.
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 64}
+    # Another rank decoded in the last reported step: the chunk is clipped.
+    scheduler.update_from_output(None, SimpleNamespace(other_rank_decoding=True))
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 48}
+    # The runner's shared empty output carries no report: the state holds.
+    scheduler.update_from_output(None, SimpleNamespace())
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 48}
+    scheduler.update_from_output(None, SimpleNamespace(other_rank_decoding=False))
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 64}
+
+
+def test_attn_cap_applies_while_this_rank_decodes(shared_model_config, monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_SRPT_ATTN_WORK_CAP", "30000")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config, num_blocks=128, max_num_batched_tokens=64
+    )
+    scheduler.add_request(_make_real_request("long", 1024, hasher, seed=1))
+    for _ in range(7):
+        scheduler.schedule()
+    # `dec` (held for by SRPT) finishes its prompt and decodes from then on.
+    scheduler.add_request(_make_real_request("dec", 16, hasher, seed=2))
+    assert scheduler.schedule().num_scheduled_tokens == {"dec": 16}
+    # Uncapped, `long` would take the 63 tokens the decode leaves.
+    assert scheduler.schedule().num_scheduled_tokens == {"dec": 1, "long": 48}

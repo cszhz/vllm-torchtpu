@@ -39,6 +39,21 @@ prefills, is stalled: it moves ahead of the other prefill chunks and is not
 held until it gets a block. Decodes still go first, so a stalled chunk can
 still wait while decodes fill the budget.
 
+With ``VLLM_TPU_SRPT_ATTN_WORK_CAP=W`` a step's attention work -- the sum over
+its scheduled tokens of the context each attends to, decodes included -- is kept
+under ``W`` by clipping prefill chunks: a chunk of ``n`` tokens starting at
+context ``c`` costs ``n * (c + n / 2)``. The ranks of a data-parallel group step
+in lockstep, so one rank's chunk deep in a long prompt sets the step period of
+every rank. Decodes are never clipped. A clipped chunk ends on the
+``_ATTN_CAP_GRID`` token grid. The step's first prefill chunk always advances, to
+the next grid point at least; a later running chunk that would get nothing waits
+for a later step, and a waiting request is admitted up to the next grid point
+instead (upstream stops admitting at a request given no tokens). The cap
+protects decodes only, so it applies only while some DP rank decodes: this
+rank's running requests for the step being scheduled, the other ranks' as the
+runner reports them for the previous step. A prefill running alone is not
+clipped.
+
 Under KV pressure upstream preempts ``running[-1]``, which is the longest
 non-stalled prefill chunk, so a long prompt can be preempted repeatedly.
 
@@ -46,6 +61,7 @@ Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler``.
 """
 
+import math
 from itertools import chain
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -60,6 +76,16 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _MAX_BACKOFF_SHIFT = 6
+_LOG_EVERY_STEPS = 5000
+_ATTN_CAP_GRID = 16
+
+
+def _to_grid(start: int, n: int) -> int:
+    """The tokens of an n-token chunk from ``start`` that end on the
+    ``_ATTN_CAP_GRID`` grid. DeepSeek-V4 long-context outputs lost coherence
+    with clipped chunks ending off that grid (e.g. 52 tokens at 230k context)
+    and matched the uncapped server with chunks ending on it."""
+    return max((start + n) // _ATTN_CAP_GRID * _ATTN_CAP_GRID - start, 0)
 
 
 class SrptPrefillScheduler(AsyncScheduler):
@@ -74,25 +100,41 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._stalled_steps: dict[str, int] = {}
         # Target request id -> (failed holds, first step a hold may retry).
         self._hold_backoff: dict[str, tuple[int, int]] = {}
+        self.attn_work_cap = envs.VLLM_TPU_SRPT_ATTN_WORK_CAP
+        # Whether another DP rank decoded in the last step the runner reported.
+        self._other_rank_decoding = False
+        self._attn_cap_active = False
+        # Attention work and whether a prefill chunk got tokens, this step.
+        self._attn_work = 0.0
+        self._attn_prefill_scheduled = False
+        self._attn_clipped_chunks = 0
         logger.info(
-            "SrptPrefillScheduler active (max_consecutive_holds=%d)",
+            "SrptPrefillScheduler active (max_consecutive_holds=%d, attn_work_cap=%d)",
             self.max_consecutive_holds,
+            self.attn_work_cap,
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         held: list[Request] = []
         target = None
         prefilling: list[Request] = []
+        self._attn_cap_active = self._other_rank_decoding or any(
+            not r.is_prefill_chunk for r in self.running
+        )
         if not throttle_prefills and self.policy == SchedulingPolicy.FCFS:
             self._prune_hold_state()
             self._order_running()
             prefilling = [r for r in self.running if r.is_prefill_chunk]
+            # Planning runs the chunk hook; count only the scheduled step's clips.
+            clipped = self._attn_clipped_chunks
             held, target = self._select_chunks_to_hold()
+            self._attn_clipped_chunks = clipped
 
         held_ids = {r.request_id for r in held}
         self.running[:] = [r for r in self.running if r.request_id not in held_ids]
         self.max_num_running_reqs -= len(held)
         self.max_num_active_reqs -= len(held)
+        self._reset_attn_work()
         try:
             output = super().schedule(throttle_prefills)
         finally:
@@ -116,7 +158,72 @@ class SrptPrefillScheduler(AsyncScheduler):
                 )
         if target is not None:
             self._record_hold_outcome(target)
+        if self.attn_work_cap and self.current_step % _LOG_EVERY_STEPS == 0:
+            logger.info(
+                "SRPT step %d: attn_clipped_chunks=%d",
+                self.current_step,
+                self._attn_clipped_chunks,
+            )
         return output
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        # Absent on the runner's shared empty output (zero-token steps).
+        decoding = getattr(model_runner_output, "other_rank_decoding", None)
+        if decoding is not None:
+            self._other_rank_decoding = decoding
+        return super().update_from_output(scheduler_output, model_runner_output)
+
+    def _reset_attn_work(self) -> None:
+        self._attn_work = 0.0
+        self._attn_prefill_scheduled = False
+
+    def _reserve_prefill_lookahead(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        """Upstream's per-request chunk hook, which both of its queues and
+        _plan_running pass through once a request's tokens are budgeted; with
+        an attention-work cap, clip prefill chunks to the step's work left."""
+        prefill = num_computed_tokens < request.num_prompt_tokens
+        if (
+            self.attn_work_cap
+            and self._attn_cap_active
+            and prefill
+            and num_new_tokens > 0
+        ):
+            fit = _to_grid(num_computed_tokens, self._attn_fit(num_computed_tokens))
+            if fit < num_new_tokens:
+                self._attn_clipped_chunks += 1
+                if fit > 0:
+                    num_new_tokens = fit
+                elif (
+                    request.status == RequestStatus.RUNNING
+                    and self._attn_prefill_scheduled
+                ):
+                    num_new_tokens = 0  # upstream skips it this step
+                else:
+                    # The step's first chunk always advances, or a chunk whose
+                    # context alone exceeds the cap would never run; a waiting
+                    # request given 0 tokens would stop admission.
+                    num_new_tokens = min(
+                        num_new_tokens, _to_grid(num_computed_tokens, _ATTN_CAP_GRID)
+                    )
+        num_new_tokens = super()._reserve_prefill_lookahead(
+            request, num_computed_tokens, num_new_tokens
+        )
+        if self.attn_work_cap:
+            self._attn_prefill_scheduled |= prefill and num_new_tokens > 0
+            self._attn_work += num_new_tokens * (
+                num_computed_tokens + num_new_tokens / 2
+            )
+        return num_new_tokens
+
+    def _attn_fit(self, context: int) -> int:
+        """Most tokens n of a chunk starting at ``context`` with
+        n * (context + n / 2) within the step's remaining attention work."""
+        room = self.attn_work_cap - self._attn_work
+        if room <= 0:
+            return 0
+        return int(math.sqrt(context * context + 2 * room) - context)
 
     @staticmethod
     def _remaining(request: Request) -> int:
@@ -188,6 +295,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         Encoder, Mamba-alignment and KV-allocation limits are not modelled, so
         a misestimate only makes a hold miss, which the backoff absorbs.
         """
+        self._reset_attn_work()
         next_step = self.current_step + 1
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0

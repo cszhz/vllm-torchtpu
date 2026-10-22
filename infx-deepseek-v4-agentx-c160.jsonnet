@@ -322,6 +322,12 @@ local stepTimingLogSteps = cdk.var('TPU_STEP_TIMING_LOG_STEPS', '2000');
 // each EP16 rank holds a load-balanced set of experts instead of a contiguous block. Bitexact. Removing it
 // cost -4.6% total tok/s at c160 (n=3). Empty = contiguous blocks.
 local expertPlacement = cdk.var('TPU_EXPERT_PLACEMENT', 'dsv4_pro_agentx_ep16');
+// SrptPrefillScheduler caps each step's attention work (sum over scheduled tokens of their context) by
+// clipping prefill chunks while some DP rank decodes, so one rank's chunk deep in a long prompt stops
+// setting every rank's step. Empty = off.
+// c=160: full stack + 25M, n=3 vs n=4: intvty p90 46.4-47.8 vs 45.1-45.8, TTFT mean 19.8-20.3 vs
+// 21.4-23.5 s, tok/s/chip +2% (in noise).
+local srptAttnWorkCap = cdk.var('VLLM_TPU_SRPT_ATTN_WORK_CAP', '25000000');
 // Each TensorCore keeps half of wq_b/wo_a/wo_b and the chip pair exchanges activations; the freed HBM goes
 // to KV (1.875M -> 3.14M tokens/rank in j-02810869, 361,390 vs ~310k total tok/s). Tolerance tier:
 // mmlu_pro 0.8386 vs 0.845 off (McNemar p=0.40). Empty = off.
@@ -796,6 +802,7 @@ local serverJob = cdk.job(
         TPU_LOG_HOST_TENSORS_AFTER_LOAD: logHostTensorsAfterLoad,
         TPU_STEP_TIMING_LOG_STEPS: stepTimingLogSteps,
         [if expertPlacement != '' then 'TPU_EXPERT_PLACEMENT']: expertPlacement,
+        [if srptAttnWorkCap != '' then 'VLLM_TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
         [if hcaKvPagesPerBlock != '' then 'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK']: hcaKvPagesPerBlock,
         [if indexerKvPagesPerBlock != '' then 'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK']: indexerKvPagesPerBlock,
         [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
