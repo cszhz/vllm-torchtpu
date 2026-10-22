@@ -904,6 +904,22 @@ def fused_conv1d_gdn(
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
 
+    def call_per_seq(in_states, in_act):
+        def run(states, act):
+            act, *states = call_kernel(*states, act, config.GDNMode.PER_SEQ)
+            return act, tuple(states)
+
+        if in_act is None:
+            return run(in_states, in_act)
+        # Decode-only steps leave the PER_SEQ segment empty; skip its launch.
+        return jax.lax.cond(
+            distribution[-1] > distribution[0],
+            run,
+            lambda states, act: (act, states),
+            in_states,
+            in_act,
+        )
+
     if pooled:
         out_act, out_source = None, state_source
         if not prefill_only:
@@ -911,9 +927,7 @@ def fused_conv1d_gdn(
                 state_source, None, None, config.GDNMode.BATCHED
             )
         if not batched_only:
-            out_act, out_source, _ = call_kernel(
-                out_source, None, out_act, config.GDNMode.PER_SEQ
-            )
+            out_act, (out_source, _) = call_per_seq((out_source, None), out_act)
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 
@@ -925,8 +939,8 @@ def fused_conv1d_gdn(
             conv_state, recurrent_state, None, config.GDNMode.BATCHED
         )
     if not batched_only:
-        out_act, out_conv_state, out_recurrent_state = call_kernel(
-            out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ
+        out_act, (out_conv_state, out_recurrent_state) = call_per_seq(
+            (out_conv_state, out_recurrent_state), out_act
         )
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
