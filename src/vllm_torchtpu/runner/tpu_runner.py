@@ -164,6 +164,8 @@ from vllm_torchtpu.utils import fresh_buffer, synchronize_device, synchronize_te
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
+    from vllm_torchtpu.runner.hidden_nan_flags import HiddenNaNDetector
+
 
 @dataclass
 class ExecuteModelState:
@@ -958,6 +960,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
+        self._hidden_nan_detector: HiddenNaNDetector | None = None
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
@@ -3604,6 +3607,8 @@ class TPUModelRunner(GPUModelRunner):
             if has_kv_transfer_group()
             else None
         )
+        if self._hidden_nan_detector is not None:
+            self._hidden_nan_detector.begin_round(self.input_batch.req_ids)
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:
                 assert self._dp_target_bucket is not None
@@ -3687,6 +3692,8 @@ class TPUModelRunner(GPUModelRunner):
                 # Later stages start from the previous stage's hidden
                 # states; the token ids only size the forward.
                 inputs_embeds = None
+            if self._hidden_nan_detector is not None and input_ids is None:
+                self._hidden_nan_detector.record_input_ids(draft_input_ids_src)
             # Run the decoder
             # set_forward_context: vLLM's native context for attention metadata
             # set_vllm_model_wrapper_context: TPU-specific context for mesh info
@@ -4772,11 +4779,15 @@ class TPUModelRunner(GPUModelRunner):
                 kv_connector_output=kv_connector_output,
             )
 
+            hidden_nan_readback = None
+            if self._hidden_nan_detector is not None and copy_state is not None:
+                hidden_nan_readback = self._hidden_nan_detector.readback()
             async_output = AsyncTPUModelRunnerOutput(
                 model_runner_output=model_runner_output,
                 copy_state=copy_state,
                 discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
                 kv_ready_event=kv_ready_event,
+                hidden_nan_readback=hidden_nan_readback,
             )
 
         if not self.scheduler_config.async_scheduling:
@@ -5908,6 +5919,47 @@ class TPUModelRunner(GPUModelRunner):
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
         self._add_pipeline_chunk_buckets()
+        if envs.TPU_NAN_LOG_LEVEL >= envs.NanLogLevel.DETAIL:
+            from vllm_torchtpu.runner.hidden_nan_flags import (
+                install_hidden_nan_detector,
+            )
+
+            if (
+                self.parallel_config.pipeline_parallel_size != 1
+                or self.is_pooling_model
+            ):
+                raise ValueError("Hidden NaN detection requires PP=1 and a causal LM")
+            if (
+                self.scheduler_config.async_scheduling
+                and self.parallel_config.tensor_parallel_size
+                * self.parallel_config.prefill_context_parallel_size
+                > 1
+                and self.vllm_config.kv_transfer_config is None
+            ):
+                raise ValueError(
+                    "Async multi-rank hidden NaN detection requires all-rank output "
+                    "consumption through a KV connector"
+                )
+            models = [("target", self.model, self.model_config, self.max_num_tokens)]
+            if self._is_async_drafter:
+                draft_model = self._async_drafter.draft_model
+                assert draft_model is not None, "Draft is loaded before capture_model"
+                assert self.speculative_config is not None, (
+                    "Loaded async draft model must have a speculative configuration"
+                )
+                models.append(
+                    (
+                        "draft",
+                        draft_model,
+                        self.speculative_config.draft_model_config,
+                        max(
+                            self.max_num_tokens,
+                            self.max_num_reqs
+                            * (self.speculative_config.num_speculative_tokens + 1),
+                        ),
+                    )
+                )
+            self._hidden_nan_detector = install_hidden_nan_detector(models, self.device)
         if self.parallel_config.pipeline_parallel_size > 1 and self._pp_wave is None:
             self._pp_intermediate_tensors(1, zeros=True)
             assert self._pp_intermediate_template is not None
@@ -5925,6 +5977,8 @@ class TPUModelRunner(GPUModelRunner):
             )
             self._pp_wave.warmup()
         if self.enforce_eager:
+            if self._hidden_nan_detector is not None:
+                self._hidden_nan_detector.arm()
             return
         with (
             self.maybe_setup_dummy_loras(self.lora_config),
@@ -5971,6 +6025,9 @@ class TPUModelRunner(GPUModelRunner):
                     # request would otherwise compile new graphs. Warm those
                     # through the real two-phase spec-decode path.
                     self._warmup_spec_decode()
+
+        if self._hidden_nan_detector is not None:
+            self._hidden_nan_detector.arm()
 
     def _warmup_pp_mtp_prefill(self) -> None:
         """Warm the producer path collectively; only the last stage runs MTP."""

@@ -165,6 +165,7 @@ def _fake_runner(method, is_async, verify, propose):
         scheduler_config=SimpleNamespace(async_scheduling=is_async),
         vllm_config=SimpleNamespace(kv_transfer_config=None, speculative_config=None),
         _is_async_drafter=method == "mtp",
+        _hidden_nan_detector=None,
         is_pooling_model=False,
         drafter=SimpleNamespace(),
         spec_decode_manager=SimpleNamespace(propose_draft_token_ids=propose),

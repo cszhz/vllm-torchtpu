@@ -34,6 +34,27 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 )
 
 
+@pytest.mark.parametrize("field", ["hidden_nan_readback"])
+def test_diagnostic_consumption_follows_existing_sampled_token_wait(field):
+    order = []
+    copy_state = MagicMock()
+    copy_state.wait.side_effect = lambda: order.append("token_wait")
+    copy_state.sampled_token_ids_cpu = torch.tensor([[7]])
+    readback = MagicMock()
+    readback.consume.side_effect = lambda: order.append("diagnostic")
+    output = AsyncTPUModelRunnerOutput(
+        ModelRunnerOutput(
+            req_ids=["r"], req_id_to_index={"r": 0}, sampled_token_ids=[]
+        ),
+        copy_state,
+        [],
+        **{field: readback},
+    )
+    assert output.get_output().sampled_token_ids == [[7]]
+    output.get_output()
+    assert order == ["token_wait", "diagnostic", "token_wait"]
+
+
 def test_assemble_spec_next_tokens(device):
     # 2 requests, K=3. Rejection rows: req0 has 2 accepted drafts + bonus (3
     # valid cols), req1 has bonus only (1 valid). Bonus = last non-(-1) col.
