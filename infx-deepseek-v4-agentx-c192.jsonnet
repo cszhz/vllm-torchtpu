@@ -313,6 +313,10 @@ local logHostTensorsAfterLoad = cdk.var('TPU_LOG_HOST_TENSORS_AFTER_LOAD', '1');
 // Steps between each rank's "step timing" log line (step period by DP token bucket, vllm-torchtpu
 // runner/step_timing_log.py); 0 turns it off.
 local stepTimingLogSteps = cdk.var('TPU_STEP_TIMING_LOG_STEPS', '2000');
+// Fused-EP expert placement shipped with vllm-torchtpu (src/vllm_torchtpu/expert_placements/<name>.json):
+// each EP16 rank holds a load-balanced set of experts instead of a contiguous block. Bitexact. Removing it
+// cost -4.6% total tok/s at c160 (n=3). Empty = contiguous blocks.
+local expertPlacement = cdk.var('TPU_EXPERT_PLACEMENT', 'dsv4_pro_agentx_ep16');
 // Each TensorCore keeps half of wq_b/wo_a/wo_b and the chip pair exchanges activations; the freed HBM goes
 // to KV (1.875M -> 3.14M tokens/rank in j-02810869, 361,390 vs ~310k total tok/s). Tolerance tier:
 // mmlu_pro 0.8386 vs 0.845 off (McNemar p=0.40). Empty = off.
@@ -753,6 +757,7 @@ local serverJob = cdk.job(
           'TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES',
           'TPU_LOG_HOST_TENSORS_AFTER_LOAD',
           'TPU_STEP_TIMING_LOG_STEPS',
+          'TPU_EXPERT_PLACEMENT',
           'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK',
           'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK',
           'TPU_DSV4_ATTN_INTRA_CHIP_TP',
@@ -785,6 +790,7 @@ local serverJob = cdk.job(
         [if premappedBufferSize != 'none' then 'TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES']: premappedBufferSize,
         TPU_LOG_HOST_TENSORS_AFTER_LOAD: logHostTensorsAfterLoad,
         TPU_STEP_TIMING_LOG_STEPS: stepTimingLogSteps,
+        [if expertPlacement != '' then 'TPU_EXPERT_PLACEMENT']: expertPlacement,
         [if hcaKvPagesPerBlock != '' then 'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK']: hcaKvPagesPerBlock,
         [if indexerKvPagesPerBlock != '' then 'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK']: indexerKvPagesPerBlock,
         [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
