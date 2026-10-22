@@ -117,7 +117,7 @@ class ParamTransform:
     fuse_axis: int = -1
     split_from: str | None = None
     split_slice: tuple[int, int] | None = None
-    transpose: tuple[int, ...] | bool = False
+    transpose: tuple[int, ...] | None = None
     pad: tuple[tuple[int, int], ...] | None = None
     quantize: str | None = None
     scale_for: str | None = None
@@ -128,6 +128,18 @@ class ParamTransform:
     channel_splits: tuple[int, ...] | None = None
     flatten_tail: bool = False
     expert_axis: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.transpose is not None and (
+            not isinstance(self.transpose, tuple)
+            or not all(
+                isinstance(i, int) and not isinstance(i, bool) for i in self.transpose
+            )
+        ):
+            raise TypeError(
+                f"ParamTransform.transpose must be an int permutation tuple or None, "
+                f"got {self.transpose!r}"
+            )
 
 
 _TRANSFORM_FIELD_NAMES = frozenset(f.name for f in dataclasses.fields(ParamTransform))
@@ -167,7 +179,7 @@ class HFParamDecl:
 
     def __post_init__(self) -> None:
         perm = self.transform.transpose
-        if isinstance(perm, tuple) and sorted(perm) != list(range(len(self.shape))):
+        if perm is not None and sorted(perm) != list(range(len(self.shape))):
             raise ValueError(
                 f"HFParamDecl {self.name!r}: transpose={perm} is not a valid "
                 f"rank-{len(self.shape)} permutation for shape={self.shape}"
@@ -175,7 +187,7 @@ class HFParamDecl:
         if self.hf_shape is None:
             hf_sh = (
                 tuple(self.shape[perm.index(i)] for i in range(len(perm)))
-                if isinstance(perm, tuple)
+                if perm is not None
                 else self.shape
             )
             object.__setattr__(self, "hf_shape", hf_sh)

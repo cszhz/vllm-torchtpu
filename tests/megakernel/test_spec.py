@@ -198,6 +198,13 @@ def test_switch_slot_and_model_spec_all_blocks():
     )
     assert ms.all_blocks() == [b, ffn]
 
+    with pytest.raises(ValueError, match="distinct blocks sharing name"):
+        ModelSpec(
+            name="dup_model",
+            config=None,
+            layer_type=LayerType("dup_layer", slots=(_BranchA(), _BranchA())),
+        ).all_blocks()
+
     with pytest.raises(AssertionError):
         SwitchSlot("bad", branches=(a, b), branch_counts=(1,))
     with pytest.raises(AssertionError):

@@ -170,7 +170,7 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
     assert gdn_by_name["lin_a"].hf_name == "linear_attn.in_proj_a.weight"
     assert gdn_by_name["alog"].transform.pad is None
     assert gdn_by_name["dtb"].transform.pad is None
-    assert gdn_by_name["conv"].transform.transpose is False
+    assert gdn_by_name["conv"].transform.transpose is None
 
     # Every canonical parameter in every block is covered by at least one VLLMAlias.
     for blk, sub in (

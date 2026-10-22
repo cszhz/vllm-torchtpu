@@ -67,7 +67,9 @@ class WeightDecl:
     dtype: Any
     stream_ring: Literal["static", "dynamic", "hbm"] = "static"
     layout: Literal["stacked", "per_layer"] = "stacked"
-    lead_dims: tuple[int, ...] = ()  # Extra per-layer leading dims (e.g. `(EW,)`)
+    lead_dims: tuple[
+        int, ...
+    ] = ()  # Extra per-layer leading dims (e.g. `(EW,)` for experts)
 
 
 @dataclass(frozen=True)
@@ -144,11 +146,30 @@ class Block:
     prefix: str = ""
     options: Mapping[str, Any] = FrozenDict()
 
+    def __init__(
+        self,
+        prefix: str = "",
+        *,
+        geometry: Any = None,
+        **options: Any,
+    ) -> None:
+        unknown = set(options) - set(self.OPTIONS)
+        if unknown:
+            raise TypeError(
+                f"{type(self).__name__}() got unexpected option(s) {sorted(unknown)}"
+            )
+        merged = {**self.OPTIONS, **options}
+        self._validate_options(merged)
+        self.prefix = prefix
+        self.geometry = geometry
+        self.options = FrozenDict(merged)
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         if cls.Tunables is not None and (
             "Tunables" in cls.__dict__ or "name" in cls.__dict__
         ):
+            # Deferred: declarations do not import the exec config at load time.
             from .exec_spec import register_tunables
 
             register_tunables(cls.name, cls.Tunables)
@@ -160,10 +181,12 @@ class Block:
             register_debug(cls.name, cls.Debug)
 
     def tunables(self, ex: ExecSpec) -> Any:
+        """This block's `Tunables` in `ex`'s tiles (class defaults when unset)."""
         assert self.Tunables is not None, f"block {self.name!r} declares no Tunables"
         return ex.resolved_tiles.block(self.name, self.Tunables)
 
     def debug_flags(self, ex: ExecSpec) -> Any:
+        """This block's `Debug` flags in `ex.debug.blocks` (defaults when unset)."""
         assert self.Debug is not None, f"block {self.name!r} declares no Debug"
         val = ex.debug.blocks.get(self.name)
         if val is None:
@@ -185,15 +208,18 @@ class Block:
         return []
 
     def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
+        """Positional inputs after the states (see `ExtraInput`)."""
         return []
 
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
         return []
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
+        """Minimum column widths required on shared core VMEM buffers."""
         return {}
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> Any:
+        """Optional block-specific derived parameters computed at build time."""
         return None
 
     def scratch(
@@ -211,6 +237,7 @@ class Block:
         """Executed at the start of layer `lyr` alongside `smalls` double-buffering."""
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
+        """Execute block for layer `l` and return partial `[MB, H]` output."""
         raise NotImplementedError
 
     def epilogue(self, ctx: Any) -> None:
@@ -224,6 +251,7 @@ class Block:
         states: dict[str, Any],
         raw_outputs: dict[str, Any],
     ) -> dict[str, Any]:
+        """Host-side state update inside `shard_map` after `pallas_call` returns."""
         return {}
 
     @classmethod
@@ -345,7 +373,10 @@ class SwitchSlot:
     def __post_init__(self) -> None:
         if not self.branch_counts:
             object.__setattr__(self, "branch_counts", (1,) * len(self.branches))
-        assert len(self.branches) == len(self.branch_counts)
+        assert len(self.branches) == len(self.branch_counts), (
+            self.branches,
+            self.branch_counts,
+        )
         assert all(c >= 0 for c in self.branch_counts) and sum(self.branch_counts) > 0
 
     @property
@@ -387,11 +418,17 @@ class ModelSpec:
 
     def all_blocks(self) -> list[Block]:
         """Return unique active blocks in deterministic declaration order."""
-        seen: set[str] = set()
+        seen: dict[str, Block] = {}
         out: list[Block] = []
         for s in self.layer_type.slots:
             for b in s.active_branches if isinstance(s, SwitchSlot) else (s,):
-                if b.name not in seen:
-                    seen.add(b.name)
+                prev = seen.get(b.name)
+                if prev is None:
+                    seen[b.name] = b
                     out.append(b)
+                elif prev != b:
+                    raise ValueError(
+                        f"ModelSpec {self.name!r} has distinct blocks sharing "
+                        f"name {b.name!r}: {prev!r} vs {b!r}"
+                    )
         return out
