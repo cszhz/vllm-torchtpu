@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import jax
@@ -37,15 +38,15 @@ _TILES = Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64)
 G = qwen38.TINY
 
 
-def _run(T: int, key: int = 40, L: int = qwen38.SEGMENT_LAYERS):
+def _run(T: int, key: int = 40, L: int = qwen38.SEGMENT_LAYERS, g: Any = G):
     R, B = 2, 2 * T
     ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=True, tiles=_TILES)
-    spec = qwen38.segment_spec(G, R, L=L)
-    inp = random_segment_inputs(jax.random.PRNGKey(key), G, ex, L)
+    spec = qwen38.segment_spec(g, R, L=L)
+    inp = random_segment_inputs(jax.random.PRNGKey(key), g, ex, L)
     ref, _ = segment_reference(
-        G, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L
+        g, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L
     )
-    w_mk, states, attn = pack_segment(spec, G, ex, inp)
+    w_mk, states, attn = pack_segment(spec, g, ex, inp)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, inp.pos, inp.x, w_mk, states)
     attn_mk = jax.device_put(kernel.fold(attn), NamedSharding(mesh, P("tp")))
@@ -70,6 +71,14 @@ def _assert_within_budget(res: np.ndarray, ref: np.ndarray) -> None:
 def test_qwen38_segment_kernel_matches_reference(T: int, L: int):
     res, ref, x = _run(T, L=L)
     # Every sublayer must move the residual, or the comparison is vacuous.
+    assert float(np.std(ref - x)) > 0.05
+    _assert_within_budget(res, ref)
+
+
+def test_qwen38_segment_hidden_not_a_multiple_of_1024():
+    """H = 1280 (like 2560) takes the 640-column MoE output chunk."""
+    g = dataclasses.replace(G, H=1280)
+    res, ref, x = _run(1, g=g, L=1)
     assert float(np.std(ref - x)) > 0.05
     _assert_within_budget(res, ref)
 
