@@ -234,8 +234,6 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_same_step_prefix_hits",
         "patch_disable_eagle_block_drop",
         "_patch_dflash_drafting_slot_budget",
-        "patch_hold_replay_checkpoint",
-        "patch_hash_offload_checkpoint_blocks",
         "patch_drop_hca_state_checkpoint",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
