@@ -2314,7 +2314,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # Verify CP scaling invariant: scheduler chunks at the logical all-CP-rank
         # block span, whereas KV cache specs are rank-local. Ensure tokens_per_block
         # scales by pcp_size * dcp_size so OffloadKey spans match scheduler blocks.
-        for group_config, group in zip(config.groups, kv_cache_config.kv_cache_groups):
+        # config.groups holds only the offloaded groups (vLLM leaves out groups
+        # that are not prefix-cacheable), so pair them by group id.
+        for group_config in config.groups:
+            group = kv_cache_config.kv_cache_groups[group_config.group_id]
             if isinstance(group.kv_cache_spec, AttentionSpec):
                 expected_cp_scale = parallel.pcp_size * parallel.dcp_size
                 assert group_config.tokens_per_block == (

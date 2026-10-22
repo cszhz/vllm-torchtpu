@@ -2724,7 +2724,9 @@ def _worker_config(bytes_per_block, *, num_blocks=1):
     )
 
 
-def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1):
+def _build_spec(
+    extra_config, *, tp_size=4, pp_size=1, pcp_size=1, groups=None, kv_cache_groups=None
+):
     """A real TPURaidenStoreOffloadingSpec over stub configs, with kernel
     geometry, the block-major contract, and the namespace patched out. Under
     pipeline parallelism the spec needs the recorded all-ranks bytes, so
@@ -2740,7 +2742,7 @@ def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1):
     config = SimpleNamespace(
         extra_config={"cpu_bytes_to_use": 1 << 20, **extra_config},
         enable_kv_cache_events=False,
-        groups=[SimpleNamespace(tokens_per_block=64)],
+        groups=groups or [SimpleNamespace(group_id=0, tokens_per_block=64)],
         cache=SimpleNamespace(tokens_per_hash=64, blocks_per_chunk=1),
         parallel=SimpleNamespace(
             tp_size=tp_size,
@@ -2759,7 +2761,7 @@ def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1):
     vllm_config.parallel_config.data_parallel_rank = 0
     vllm_config.parallel_config.data_parallel_rank_local = 0
     kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())],
+        kv_cache_groups=kv_cache_groups or [SimpleNamespace(kv_cache_spec=object())],
         kv_cache_tensors=[object()],
     )
     with (
@@ -2772,6 +2774,31 @@ def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1):
         patch.object(rs, "derive_offload_namespace", return_value=b"\0" * 16),
     ):
         return rs.TPURaidenStoreOffloadingSpec(config, vllm_config, kv_cache_config)
+
+
+class TestOffloadedGroupSubset(unittest.TestCase):
+    """vLLM offloads only the prefix-cacheable groups, so the spec's group
+    configs can skip a KV cache group; each is checked against its own."""
+
+    def test_groups_are_matched_by_group_id(self):
+        import torch
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        def group(block_size):
+            spec = FullAttentionSpec(
+                block_size=block_size, num_kv_heads=1, head_size=8, dtype=torch.uint8
+            )
+            return SimpleNamespace(kv_cache_spec=spec)
+
+        spec = _build_spec(
+            {"cpu_bytes_to_use": 1 << 20},
+            groups=[
+                SimpleNamespace(group_id=0, tokens_per_block=64),
+                SimpleNamespace(group_id=2, tokens_per_block=16),
+            ],
+            kv_cache_groups=[group(64), group(32), group(16)],
+        )
+        self.assertIsNotNone(spec)
 
 
 class TestAllRanksKvBytesPerBlock(unittest.TestCase):
