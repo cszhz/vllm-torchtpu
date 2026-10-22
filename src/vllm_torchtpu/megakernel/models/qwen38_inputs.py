@@ -60,18 +60,28 @@ def _hc_params(key: jax.Array, g: Qwen38Geometry, n: int) -> dict[str, jax.Array
 
 
 def random_segment_inputs(
-    key: jax.Array, g: Qwen38Geometry, ex: ExecSpec, L: int = SEGMENT_LAYERS
+    key: jax.Array,
+    g: Qwen38Geometry,
+    ex: ExecSpec,
+    L: int = SEGMENT_LAYERS,
+    *,
+    gain: float = 1.0,
+    zero: tuple[str, ...] = (),
 ) -> SegmentInputs:
     """Random inputs whose sublayers each move the residual visibly.
 
     The library's random output scales give near-zero sublayer deltas, so the
     output projection scales are raised; a test against such inputs would
-    otherwise compare the residual with itself.
+    otherwise compare the residual with itself. `gain` scales those output
+    gains (larger geometries need smaller ones).
     """
     R, B = ex.R, ex.B
     keys = jax.random.split(key, 7)
     pos, _, w_l, st_l = qwen35.random_logical_inputs(keys[0], g.inner(R, L), ex)
-    gains = {"e2_s": 2000.0, "sh2_s": 400.0, "lin_out_s": 50.0}
+    gains = {"e2_s": 2000.0 * gain, "sh2_s": 400.0 * gain, "lin_out_s": 50.0 * gain}
+    # `zero` silences a sublayer kind ("gdn", "moe") to isolate the others.
+    for k in {"gdn": ("lin_out_s",), "moe": ("e2_s", "sh2_s")}.get(zero[0], ()) if zero else ():
+        gains[k] = 0.0
     w_l = {k: v * gains[k] if k in gains else v for k, v in w_l.items()}
     hc = {
         "qsa_out": _hc_params(keys[1], g, 1),

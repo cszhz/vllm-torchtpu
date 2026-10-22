@@ -62,14 +62,22 @@ def _fold_put(x: Any, mesh: Mesh) -> Any:
 
 
 def run_bucket(
-    g: Any, B: int, T: int, L: int, mesh: Mesh, chains: list[int], tiles: Any = None
+    g: Any,
+    B: int,
+    T: int,
+    L: int,
+    mesh: Mesh,
+    chains: list[int],
+    tiles: Any = None,
+    gain: float = 1.0,
+    zero: tuple[str, ...] = (),
 ) -> dict:
     R = mesh.size
     ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=tiles is not None, tiles=tiles)
     spec = qwen38.segment_spec(g, R, L=L)
 
     def gen(key):
-        return random_segment_inputs(key, g, ex, L)
+        return random_segment_inputs(key, g, ex, L, gain=gain, zero=zero)
 
     shapes = jax.eval_shape(gen, jax.random.PRNGKey(0))
     inp = jax.jit(gen, out_shardings=_shardings(shapes, R, mesh))(jax.random.PRNGKey(B))
@@ -135,6 +143,8 @@ def run_bucket(
         "rows": B,
         "T": T,
         "L": L,
+        "gain": gain,
+        "zero": list(zero),
         "tiles": str(info["exec"].resolved_tiles),
         "compile_s": round(compile_s, 1),
         "parity": parity,
@@ -154,6 +164,8 @@ def main() -> None:
     ap.add_argument("--layers", type=int, nargs="+", default=[4, 1])
     ap.add_argument("--chains", type=int, nargs="+", default=[4, 16, 64])
     ap.add_argument("--tiny", action="store_true", help="CPU interpret smoke run")
+    ap.add_argument("--gain", type=float, nargs="+", default=[1.0])
+    ap.add_argument("--zero", nargs="+", default=["none"], help="none | gdn | moe")
     args = ap.parse_args()
     g, tiles = qwen38.FULL, None
     devs = jax.devices()
@@ -165,10 +177,15 @@ def main() -> None:
     print("devices", len(devs), devs[0].device_kind, "jax", jax.__version__, flush=True)
     mesh = Mesh(np.array(devs), ("tp",))
     out = []
+    arms = [(gn, z) for gn in args.gain for z in args.zero]
     for L in args.layers:
         for B in args.rows:
+          for gn, z in arms:
             try:
-                r = run_bucket(g, B, args.T, L, mesh, args.chains, tiles)
+                r = run_bucket(
+                    g, B, args.T, L, mesh, args.chains, tiles, gn,
+                    () if z == "none" else (z,),
+                )
             except Exception as e:  # noqa: BLE001 — report and continue to the next bucket
                 r = {"rows": B, "L": L, "error": f"{type(e).__name__}: {e}"[:2000]}
             print("RESULT", json.dumps(r), flush=True)
