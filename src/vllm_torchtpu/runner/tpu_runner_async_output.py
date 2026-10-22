@@ -16,6 +16,7 @@ from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.hidden_nan_flags import HiddenNaNReadback
+    from vllm_torchtpu.runner.kv_cache_nan_flags import KVCacheNaNReadback
 
 logger = init_logger(__name__)
 
@@ -179,12 +180,14 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         discard_sampled_tokens_req_indices: list[int],
         kv_ready_event: Any | None = None,
         hidden_nan_readback: "HiddenNaNReadback | None" = None,
+        kv_cache_nan_readback: "KVCacheNaNReadback | None" = None,
     ):
         self._model_runner_output: ModelRunnerOutput = model_runner_output
         self.copy_state = copy_state
         self.discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
         self.kv_ready_event = kv_ready_event
         self._hidden_nan_readback = hidden_nan_readback
+        self._kv_cache_nan_readback = kv_cache_nan_readback
 
     def get_output(self) -> ModelRunnerOutput:
         if self.kv_ready_event is not None:
@@ -205,6 +208,9 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         if self._hidden_nan_readback is not None:
             self._hidden_nan_readback.consume()
             self._hidden_nan_readback = None
+        if self._kv_cache_nan_readback is not None:
+            self._kv_cache_nan_readback.consume()
+            self._kv_cache_nan_readback = None
         selected_token_ids = self.copy_state.sampled_token_ids_cpu
         if selected_token_ids.numel() == 0:
             self._model_runner_output.sampled_token_ids = []

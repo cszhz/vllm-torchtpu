@@ -34,7 +34,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 )
 
 
-@pytest.mark.parametrize("field", ["hidden_nan_readback"])
+@pytest.mark.parametrize("field", ["hidden_nan_readback", "kv_cache_nan_readback"])
 def test_diagnostic_consumption_follows_existing_sampled_token_wait(field):
     order = []
     copy_state = MagicMock()
