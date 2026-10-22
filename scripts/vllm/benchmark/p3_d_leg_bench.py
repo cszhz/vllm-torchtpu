@@ -158,10 +158,14 @@ D_LEG_ENV = {
 class Case:
     ctx: int
     reqs: int
+    real: bool = False  # with --decode-fill: prefill this case for real (A/B against the fill)
 
     @classmethod
     def parse(cls, text: str) -> Case:
-        ctx, reqs = (int(x) for x in text.split(":"))
+        parts = text.split(":")
+        if len(parts) == 3 and parts[2] == "real":
+            return cls(int(parts[0]), int(parts[1]), True)
+        ctx, reqs = (int(x) for x in parts)
         return cls(ctx, reqs)
 
 
@@ -198,6 +202,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--warm-steps", type=int, default=20)
     p.add_argument("--prof-steps", type=int, default=30)
     p.add_argument("--meas-steps", type=int, default=100)
+    p.add_argument("--windows", type=int, default=1,
+                   help="measured windows per case on the resident batch (one prefill); each window "
+                   "is reported as its own case record (a repeat)")
     p.add_argument("--profile", action="store_true", help="profile PROF steps per case")
     p.add_argument("--max-num-batched-tokens", type=int, default=2048)
     p.add_argument("--max-num-seqs", type=int, default=0, help="0: the largest case's REQS")
@@ -239,7 +246,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="VLLM_TPU_QWEN35_MTP_MK (0 works around the 0.2.0rc1 warmup hang)")
     p.add_argument("--num-hosts", type=int, default=1)
     p.add_argument("--distributed-executor-backend", default="")
-    p.add_argument("--routing", choices=("hash", "model", "trace"), default="model",
+    p.add_argument("--routing", choices=("hash", "model", "trace", "idx"), default="model",
                    help="fused EP routing override for the prefill of the prompts and any "
                    "non-megakernel decode path (the megakernel routes on its own)")
     p.add_argument("--routing-file", default="")
@@ -259,6 +266,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--cache-root", default="/workspace/tmp/p3-harness/compile-cache/d-leg")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--decode-fill", action="store_true",
+        help="skip the real prefill: a DecodeBenchConnector (p3_decode_fill.py) reports the prompt "
+        "as loaded and fills its KV blocks and GDN state with a constant; cases written "
+        "CTX:REQS:real still prefill for real (in-job A/B)",
+    )
+
     a = p.parse_args(argv)
     if not a.case:
         a.case = [Case(92160, 8), Case(92160, 24)]
@@ -335,6 +349,24 @@ def build_env(a: argparse.Namespace, out_dir: str) -> tuple[dict[str, str], list
     if a.distributed_executor_backend == "ray":
         env["TPU_MULTIHOST_BACKEND"] = "ray"
     env, more = common.parse_env_overrides(a.env, env)
+    if a.decode_fill:
+        # The fill connector runs as kv_both: kv_producer would clamp MTP to K=1
+        # (tpu_platform.py prefill clamp). PrefixAwareScheduler treats any connector
+        # that is not a producer as a KV consumer; pin the settings a connector-less
+        # engine uses so the decode step matches the control harness: hybrid-state
+        # retention on (also sets retention interval 0 / match unit 128 in the
+        # platform), no consumer KV prefetch reserve, SRPF on, the non-disagg step
+        # and cold-chunk caps.
+        total_cap = max(1024, a.max_num_batched_tokens // 2)
+        pinned = {
+            "TPU_HYBRID_STATE_RETENTION": "1",
+            "TPU_SCHED_KV_PREFETCH_WAITING": "0",
+            "TPU_SCHED_SRPF_RUNNING": "1",
+            "TPU_SCHED_STEP_TOTAL_CAP": str(total_cap),
+            "TPU_SCHED_COLD_CHUNK_CAP": str(max(512, total_cap // 2)),
+        }
+        env.update(pinned)
+        env["P3_DECODE_FILL_PINNED"] = ",".join(f"{k}={v}" for k, v in pinned.items())
     # an --env KEY=VALUE wins over the layout's unset of KEY (e.g. a TP16 placement table)
     unset = [k for k in unset if k not in env] + more
     src = common.source_identity()
@@ -387,6 +419,11 @@ def build_env(a: argparse.Namespace, out_dir: str) -> tuple[dict[str, str], list
         )
     else:
         env["PYTHONPATH"] = os.pathsep.join(x for x in (site_dir, inherited) if x)
+    if a.decode_fill:
+        # p3_decode_fill must import in the engine core and every worker.
+        env["PYTHONPATH"] = os.pathsep.join(
+            x for x in (env["PYTHONPATH"], os.path.dirname(os.path.abspath(__file__))) if x
+        )
     env["P3_CACHE_KEY"] = key
     return env, unset
 
@@ -452,6 +489,13 @@ def engine_argv(a: argparse.Namespace, profile_dir: str) -> list[str]:
         argv += ["--speculative-config", json.dumps(spec)]
     if a.distributed_executor_backend:
         argv += ["--distributed-executor-backend", a.distributed_executor_backend]
+    if a.decode_fill:
+        argv += ["--kv-transfer-config", json.dumps({
+            "kv_connector": "DecodeBenchConnector",
+            "kv_connector_module_path": "p3_decode_fill",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {"fill_mean": 0.015, "fill_std": 0.0},
+        })]
     return argv
 
 
@@ -627,7 +671,7 @@ def run(a: argparse.Namespace, out_dir: str, timeline: common.Timeline) -> dict:
     print(f"[p3_d_leg] kv_cache {json.dumps(kv_cache)}", flush=True)
     rng = np.random.default_rng(a.seed)
     k1 = a.mtp + 1
-    n_steps = a.warm_steps + (a.prof_steps if a.profile else 0) + a.meas_steps
+    n_steps = a.warm_steps + (a.prof_steps if a.profile else 0) + a.meas_steps * max(1, a.windows)
     records = None
     if a.prompt_file:
         records = []
@@ -719,7 +763,8 @@ def run(a: argparse.Namespace, out_dir: str, timeline: common.Timeline) -> dict:
         current_case = case
         reqs = case_reqs(a, case)
         # REQS requests on every data-parallel engine; the id names the engine.
-        ids = [f"case{ci}-e{e}-req{i}" for e in range(dp) for i in range(reqs)]
+        tag = "-real" if (case.real and a.decode_fill) else ""
+        ids = [f"case{ci}{tag}-e{e}-req{i}" for e in range(dp) for i in range(reqs)]
         ctx_lens = [add_one(rid) for rid in ids]
         finished_before = counters["finished"]
         t0 = time.time()
@@ -742,9 +787,12 @@ def run(a: argparse.Namespace, out_dir: str, timeline: common.Timeline) -> dict:
             tp1 = time.time()
             eng.stop_profile()
             prof_window = (tp0, tp1)
-        tm0 = time.time()
-        steps(a.meas_steps)
-        tm1 = time.time()
+        meas = []
+        for _w in range(max(1, a.windows)):
+            tm0 = time.time()
+            steps(a.meas_steps)
+            tm1 = time.time()
+            meas.append((tm0, tm1))
         replaced = counters["finished"] - finished_before
         # Abort everything still running (including replacements) before the next case.
         eng.abort_request(sorted(live_ids))
@@ -752,37 +800,40 @@ def run(a: argparse.Namespace, out_dir: str, timeline: common.Timeline) -> dict:
         while unfinished():
             eng.step()
         log = common.step_records(common.read_jsonl(step_log))
-        case_out = {
-            "ctx": case.ctx if not (records or shapes_pool) else round(statistics.mean(ctx_lens)),
-            "ctx_min": min(ctx_lens), "ctx_max": max(ctx_lens),
-            "reqs": reqs,
-            "reqs_arg": case.reqs,
-            "replicas": dp,
-            "reqs_all_replicas": reqs * dp,
-            "chips": chips,
-            "batch_mode": a.batch_mode,
-            "hold_running": a.hold_running,
-            "replaced_requests": replaced,
-            "k": a.mtp,
-            "acceptance": a.acceptance,
-            "synthetic_acceptance": a.synthetic_acceptance if a.acceptance == "synthetic" else None,
-            "sampling": {"temperature": a.temperature, "top_k": a.top_k, "top_p": a.top_p},
-            "prefill_s": round(prefill_s, 1),
-            "prefill_steps": n_prefill_steps,
-            "all_started": len(started) == reqs * dp,
-            "warm_window_s": round(tw1 - tw0, 2),
-            "warm": _window_stats(log, tw0, tw1, reqs, k1),
-            "measured": _window_stats(log, tm0, tm1, reqs, k1),
-            "measured_wall_s": round(tm1 - tm0, 3),
-        }
-        if prof_window:
-            case_out["profiled"] = _window_stats(log, *prof_window, reqs, k1)
-        for key in ("warm", "measured", "profiled"):
-            w = case_out.get(key)
-            if w and w.get("tokens_per_s_all_replicas"):
-                w["tokens_per_s_per_chip"] = round(w["tokens_per_s_all_replicas"] / chips)
-        print(f"[p3_d_leg] case {ci}: {json.dumps(case_out)}", flush=True)
-        cases.append(case_out)
+        for wi, (tm0, tm1) in enumerate(meas):
+            case_out = {
+                "ctx": case.ctx if not (records or shapes_pool) else round(statistics.mean(ctx_lens)),
+                "ctx_min": min(ctx_lens), "ctx_max": max(ctx_lens),
+                "decode_fill": bool(a.decode_fill and not case.real),
+                "reqs": reqs,
+                "reqs_arg": case.reqs,
+                "replicas": dp,
+                "reqs_all_replicas": reqs * dp,
+                "chips": chips,
+                "batch_mode": a.batch_mode,
+                "hold_running": a.hold_running,
+                "replaced_requests": replaced,
+                "k": a.mtp,
+                "acceptance": a.acceptance,
+                "synthetic_acceptance": a.synthetic_acceptance if a.acceptance == "synthetic" else None,
+                "sampling": {"temperature": a.temperature, "top_k": a.top_k, "top_p": a.top_p},
+                "prefill_s": round(prefill_s, 1),
+                "prefill_steps": n_prefill_steps,
+                "all_started": len(started) == reqs * dp,
+                "warm_window_s": round(tw1 - tw0, 2),
+                "warm": _window_stats(log, tw0, tw1, reqs, k1),
+                "measured": _window_stats(log, tm0, tm1, reqs, k1),
+                "measured_wall_s": round(tm1 - tm0, 3),
+                "window": wi,
+            }
+            if prof_window:
+                case_out["profiled"] = _window_stats(log, *prof_window, reqs, k1)
+            for key in ("warm", "measured", "profiled"):
+                w = case_out.get(key)
+                if w and w.get("tokens_per_s_all_replicas"):
+                    w["tokens_per_s_per_chip"] = round(w["tokens_per_s_all_replicas"] / chips)
+            print(f"[p3_d_leg] case {ci}: {json.dumps(case_out)}", flush=True)
+            cases.append(case_out)
     timeline.mark("timed_end")
     watchdog_stop.set()
     return {"startup_s": round(startup_s, 1), "kv_cache": kv_cache, "cases": cases}
