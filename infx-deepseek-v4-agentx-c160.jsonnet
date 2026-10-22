@@ -275,7 +275,7 @@ local specDraftSample = cdk.var('SPEC_DRAFT_SAMPLE', 'probabilistic');
 // SPEC_DISABLE_EAGLE_BLOCK_DROP=true turns off the EAGLE prefix-cache block drop with vLLM's own
 // speculative-config flag, which also leaves the draft groups unannotated, so KV offload stores no
 // EAGLE peek chunk. Pair it with VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP=0 to measure it alone.
-local specDisableEagleBlockDrop = cdk.boolVar('SPEC_DISABLE_EAGLE_BLOCK_DROP', false);
+local specDisableEagleBlockDrop = cdk.boolVar('SPEC_DISABLE_EAGLE_BLOCK_DROP', true);
 local specConfig =
   if specMethod == 'none' then ''
   else if specMethod == 'dspark' then
@@ -291,7 +291,10 @@ local specConfig =
 // DeepSeek-V4 groups included): ~BLOCK_SIZE more prefill tokens per request. DSpark's draft KV for verified
 // tokens is projected from the target's hidden states, so the dropped block protects nothing. 1 keeps it
 // (vllm-torchtpu #1530); empty leaves vLLM's behaviour.
-local disableEagleBlockDrop = cdk.var('VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP', '1');
+local disableEagleBlockDrop = cdk.var('VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP', if specDisableEagleBlockDrop then '' else '1');
+// DeepSeek-V4's 128-ratio compressor state as a non-prefix-cacheable KV group: never cached or
+// host-offloaded, so its blocks go to the KV pool. Bitexact. Empty = off.
+local dropHcaStateCheckpoint = cdk.var('TPU_KV_DROP_HCA_STATE_CHECKPOINT', '1');
 // --- Profiling ----------------------------------------------------------------
 local enableXprof = cdk.boolVar('ENABLE_XPROF', false);
 local enablePerfetto = cdk.boolVar('ENABLE_PERFETTO', false);
@@ -768,6 +771,7 @@ local serverJob = cdk.job(
           'TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES',
           'TPU_LOG_HOST_TENSORS_AFTER_LOAD',
           'TPU_STEP_TIMING_LOG_STEPS',
+          'TPU_KV_DROP_HCA_STATE_CHECKPOINT',
           'TPU_EXPERT_PLACEMENT',
           'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK',
           'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK',
@@ -812,7 +816,9 @@ local serverJob = cdk.job(
         // DSv4 multi-shape KV tensors require VLLM_TPU_BLOCK_MAJOR_KV=0 (PR #787)
         VLLM_TPU_BLOCK_MAJOR_KV: '0',
         // Read by the scheduler in the EngineCore processes.
-        [if disableEagleBlockDrop != '' then 'VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP']: disableEagleBlockDrop,        [if kvOffload then 'RAIDEN_EXPECTED_WORKERS_TIMEOUT_S']: cdk.var('RAIDEN_EXPECTED_WORKERS_TIMEOUT_S', '900'),
+        [if disableEagleBlockDrop != '' then 'VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP']: disableEagleBlockDrop,
+        [if dropHcaStateCheckpoint != '' then 'TPU_KV_DROP_HCA_STATE_CHECKPOINT']: dropHcaStateCheckpoint,
+               [if kvOffload then 'RAIDEN_EXPECTED_WORKERS_TIMEOUT_S']: cdk.var('RAIDEN_EXPECTED_WORKERS_TIMEOUT_S', '900'),
         [if kvOffload then 'RAIDEN_NUMA_POLICY']: cdk.var('RAIDEN_NUMA_POLICY', 'preferred'),
         [if kvOffload then 'TPU_EVICT_WEIGHTS_PAGE_CACHE']: cdk.var('TPU_EVICT_WEIGHTS_PAGE_CACHE', 'true'),
         [if enableProfiling then 'TPU_PJRT_EVENT_TRACE_ENABLE']: '1',
