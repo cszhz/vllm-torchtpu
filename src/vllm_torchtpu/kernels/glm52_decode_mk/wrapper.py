@@ -85,11 +85,17 @@ def metadata(
 
 def rope_table(cfg, cos_sin_rows):
     """cos_sin_rows [T, DR] (bf16 values: cos | sin halves) -> f32 [4, M, 128]: (cos, signed sin) with the rope pairs
-    in lanes 0..DR-1 (0, 1) and in lanes 128-DR..127 (2, 3); identity elsewhere (glm5_mk_dcp adapter)."""
+    in lanes 0..DR-1 (0, 1) and in lanes 128-DR..127 (2, 3); identity elsewhere (glm5_mk_dcp adapter). Pairs are GPT-J
+    interleaved (c0 c0 c1 c1 ..., -s0 s0 -s1 s1 ...), or half-split with cfg.rope_neox (c0..c31 c0..c31,
+    -s0..-s31 s0..s31), matching kernel.rope's partner lane."""
     DR, M, TMAX = cfg.DR, cfg.M, cfg.TMAX
     cs = cos_sin_rows.astype(F32)
-    c = jnp.repeat(cs[:, : DR // 2], 2, axis=1)
-    s = jnp.stack([-cs[:, DR // 2 :], cs[:, DR // 2 :]], -1).reshape(TMAX, DR)
+    if cfg.rope_neox:
+        c = jnp.concatenate([cs[:, : DR // 2], cs[:, : DR // 2]], axis=1)
+        s = jnp.concatenate([-cs[:, DR // 2 :], cs[:, DR // 2 :]], axis=1)
+    else:
+        c = jnp.repeat(cs[:, : DR // 2], 2, axis=1)
+        s = jnp.stack([-cs[:, DR // 2 :], cs[:, DR // 2 :]], -1).reshape(TMAX, DR)
     ones = jnp.ones((TMAX, 128 - DR), F32)
     zeros = jnp.zeros((TMAX, 128 - DR), F32)
     tab = jnp.stack(

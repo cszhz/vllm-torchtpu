@@ -48,6 +48,12 @@ class MKConfig:
     idx_eps: float = 1e-6
     routed_scale: float = 2.5
     QB: int = 512  # moe_tp_decode / gmm_v2 activation quant block
+    # Rope pair layout of the served weights and caches. False: GPT-J interleaved pairs (2i, 2i+1), the checkpoint's
+    # layout. True: half-split (i, i + DR/2) -- glm-agentx's TPU_MLA_ROPE_NEOX_PERMUTE / TPU_INDEXER_ROPE_NEOX_PERMUTE
+    # permute the rope output columns of q_b / fused_qkv_a / indexer wq_b / wk (and k_norm) at load, so q, k_pe and
+    # the indexer q / k arrive (and the caches hold k_pe / k) in that order. Same per-element rope arithmetic on the
+    # same operand pairs (bit-identical rope values, permuted); only the partner lane differs (kernel.rope).
+    rope_neox: bool = False
 
     # ---- per rank ----
     @property

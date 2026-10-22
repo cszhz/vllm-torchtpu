@@ -19,7 +19,9 @@ The step_ok guard (WHITEBOARD.v3 §8 W4). The megakernel engages only when every
 runs the stock graphs, and every decline is counted under a named reason (no silent decline):
 - load time (else no megakernel is built; logged): GLM-5.2 DSA, TP == DCP == world == 16 with the DCP group = the TP
   group = ranks 0..15 in rank order (the megakernel's mesh position, DCP KV ownership and rank operand coincide),
-  interleave 4, EP off, qrep 0 (no q_b_proj replicated, the served column-parallel q_b), MTP 3, block 256, and the
+  interleave 4, EP off, qrep 0 (no q_b_proj replicated, the served column-parallel q_b), MTP 3, block 256, one rope
+  pair layout for every layer, MLA and indexer alike (`rope_layout`: glm-agentx's NeoX permutes -> MKConfig.rope_neox),
+  and the
   A0-10 pool guard (a max_model_len request's rank-0 pages <= Tiles.pool, else the DSA wave overflows: `check_pool`);
 - bind time (else every step declines 'unbound'; logged): the served cache form. The runner-stacked groups
   (`runner.glm5_kv_stack_groups`, GLM5_MKD_STACK_C; allocated by default when this megakernel is built) in equal
@@ -149,6 +151,24 @@ def _own(t: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _rope_cache_operand(cs: torch.Tensor) -> torch.Tensor:
+    """The rope cache as a step operand. The served buffer when it owns its storage: glm-agentx's
+    TPU_ROPE_CACHE_ROW_MAJOR re-materializes it {1,0} and pins that entry layout for every graph input of its
+    (dtype, shape), so a fresh default-layout copy would fail at the step's entry (RuntimeProgramInputMismatch). A view
+    (e.g. a truncated cache) is copied once (`_own`), re-laid out {1,0} when that (dtype, shape) is pinned."""
+    if _owns_storage(cs):
+        return cs
+    out = _own(cs)
+    try:
+        from vllm_torchtpu.runner import utils as runner_utils
+    except Exception:  # noqa: BLE001 - a tree (or host) without the relayout: nothing is pinned
+        return out
+    pinned = getattr(runner_utils, "_PINNED_ENTRY_LAYOUTS", {})
+    if (out.dtype, tuple(out.shape)) in pinned:
+        out = runner_utils._to_row_major(out)
+    return out
+
+
 def _owns_storage(t: torch.Tensor) -> bool:
     try:
         return (
@@ -182,6 +202,36 @@ def _attn_module(self_attn):
         if hasattr(m, "W_UK_T") and hasattr(m, "W_UV") and hasattr(m, "kv_cache"):
             return m
     raise Unsupported("no MLA attention module with W_UK_T / W_UV / kv_cache")
+
+
+def rope_layout(layers) -> bool:
+    """The rope pair layout the served weights and caches use -> MKConfig.rope_neox. glm-agentx permutes the rope
+    output columns at load (TPU_MLA_ROPE_NEOX_PERMUTE on the MLA wrapper: q_b / fused_qkv_a k_pe columns, cache k_pe;
+    TPU_INDEXER_ROPE_NEOX_PERMUTE on the indexer: wq_b / wk / k_norm, cache k) and marks each module
+    `_rope_neox_permuted`; an older tree has no marker (= interleaved). The kernel takes one layout for every layer and
+    for MLA and indexer alike (one rope table), so a mixed model declines."""
+    modes = set()
+    for l, ly in enumerate(layers):
+        sa = ly.self_attn
+        idx = getattr(sa, "indexer", None)
+        mla = [
+            m
+            for m in sa.modules()
+            if hasattr(m, "_rope_neox_permuted") and m is not idx
+        ]
+        _need(
+            len(mla) <= 1,
+            f"layer {l}: {len(mla)} MLA modules carry a rope-permute marker",
+        )
+        modes.add(("mla", bool(mla[0]._rope_neox_permuted) if mla else False))
+        if idx is not None:
+            modes.add(("indexer", bool(getattr(idx, "_rope_neox_permuted", False))))
+    vals = {v for _, v in modes}
+    _need(
+        len(vals) == 1,
+        f"rope layouts differ (MLA / indexer, neox-permuted?): {sorted(modes)}; the megakernel takes one",
+    )
+    return vals.pop()
 
 
 def _routed(mlp):
@@ -497,6 +547,7 @@ class Glm52DecodeMK:
         freq, skip = index_pattern(
             has_idx, int(hf.index_topk_freq), int(hf.index_skip_topk_offset)
         )
+        rope_neox = rope_layout(bb.layers)
         base = dataclasses.replace(
             FULL,
             R=R,
@@ -512,6 +563,7 @@ class Glm52DecodeMK:
             QMAX=qmax,
             TMAX=self.rows[-1],
             BM=int(runner.scheduler_config.max_num_seqs),
+            rope_neox=rope_neox,
         )
         for got, want, what in (
             (hf.kv_lora_rank, base.KL, "kv_lora_rank"),
@@ -569,7 +621,7 @@ class Glm52DecodeMK:
         rot = bb.layers[0].self_attn.rotary_emb
         _need(rot.cos_sin_cache.shape[-1] == cfg.DR, "rope cache width")
         with torch.no_grad():
-            self.cos_sin = _own(rot.cos_sin_cache.detach())
+            self.cos_sin = _rope_cache_operand(rot.cos_sin_cache.detach())
             self.k_scales = [
                 float(
                     getattr(_attn_module(bb.layers[l].self_attn), "_k_scale_float", 1.0)
@@ -597,7 +649,7 @@ class Glm52DecodeMK:
         self.mla_layer_name = _attn_module(bb.layers[0].self_attn).layer_name
         logger.info(
             "GLM-5.2 decode megakernel: built for rows %s, L %d (fresh indexer layers %s, freq %d skip %d), "
-            "rope cache rows %d (max_model_len %d), k_scales %s, trace %s, enabled %s, levers %s",
+            "rope cache rows %d (max_model_len %d), k_scales %s, trace %s, enabled %s, levers %s, rope %s",
             self.rows,
             cfg.L,
             LY.layers_of(cfg, "iwq"),
@@ -609,6 +661,7 @@ class Glm52DecodeMK:
             self.tiles.trace,
             self.enabled,
             ",".join(self.levers) or "stage A",
+            "neox (half-split)" if cfg.rope_neox else "interleaved",
         )
 
     @staticmethod
@@ -899,6 +952,13 @@ class Glm52DecodeMK:
 
     def _bind_caches(self, runner) -> None:
         cfg = self.cfg
+        spec = getattr(
+            _attn_module(self.backbone.layers[0].self_attn), "mla_kv_spec", None
+        )
+        _need(
+            not (spec and getattr(spec[1], "packed_rope", False)),
+            "TPU_SPARSE_MLA_PACKED_ROPE: the rope cache is 64 B/token packed; the megakernel reads 128 B rows",
+        )
         per = {l: self._module_caches(l) for l in range(cfg.L)}
         groups = getattr(runner, "glm5_kv_stack_groups", None) or {}
         stacked = any(v[1] is not None for d in per.values() for v in d.values())
@@ -1340,6 +1400,7 @@ class Glm52DecodeMK:
             "calls": self.calls,
             "cache_views": getattr(self, "cache_views", None),
             "k_scales": sorted(set(self.k_scales)),
+            "rope_neox": self.cfg.rope_neox,
             "counts": dict(self.counts),
             "decisions": self.decisions,
             "consumed": self.consumed,

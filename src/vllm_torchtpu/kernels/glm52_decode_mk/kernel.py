@@ -208,9 +208,19 @@ def lane_swap(x):
     )
 
 
-def rope(x, cos, sin_signed):
-    """GPT-J interleaved rope with torch bf16 rounding: bf16(bf16(x*cos) + bf16(swap(x)*sin))."""
-    return bf(bf(x * cos) + bf(lane_swap(x) * sin_signed))
+def half_swap(x):
+    """NeoX (half-split) rope partner: lane l <-> l +- 32 inside each 64-lane rope segment (DR = 64)."""
+    n = x.shape[-1]
+    lane = lax.broadcasted_iota(I32, x.shape, x.ndim - 1)
+    return jnp.where(
+        lane % 64 < 32, pltpu.roll(x, n - 32, x.ndim - 1), pltpu.roll(x, 32, x.ndim - 1)
+    )
+
+
+def rope(x, cos, sin_signed, neox=False):
+    """Rope with torch bf16 rounding: bf16(bf16(x*cos) + bf16(swap(x)*sin)). GPT-J interleaved pairs (lane_swap), or
+    with `neox` (MKConfig.rope_neox) half-split pairs (half_swap; the table from wrapper.rope_table in that order)."""
+    return bf(bf(x * cos) + bf((half_swap(x) if neox else lane_swap(x)) * sin_signed))
 
 
 def fp8_bytes(x8):
@@ -1233,7 +1243,12 @@ def build(
             kw = bf(a2)
             wts = jnp.zeros((M, 128), F32)
             for h_ in range(IH):
-                v = rope(iq[:, h_ * IDIM : (h_ + 1) * IDIM], rope_tab[0], rope_tab[1])
+                v = rope(
+                    iq[:, h_ * IDIM : (h_ + 1) * IDIM],
+                    rope_tab[0],
+                    rope_tab[1],
+                    cfg.rope_neox,
+                )
                 s = bf(jnp.max(jnp.abs(v), axis=1, keepdims=True) * (1.0 / FP8_MAX))
                 inv = jnp.where(s == 0, 0.0, bf(1.0 / jnp.where(s == 0, 1.0, s)))
                 qv = jnp.clip(bf(v * inv), -FP8_MAX, FP8_MAX).astype(FP8).astype(F32)
@@ -1252,7 +1267,7 @@ def build(
                 (kx - mu) * lax.rsqrt(var + cfg.idx_eps) * sm(slot, "idx_kn_w")
                 + sm(slot, "idx_kn_b")
             )
-            kr = rope(kn, rope_tab[0], rope_tab[1])
+            kr = rope(kn, rope_tab[0], rope_tab[1], cfg.rope_neox)
             s = jnp.max(jnp.abs(kr), axis=1, keepdims=True) * (1.0 / FP8_MAX)
             sb = lax.bitcast_convert_type(s, I32)
             e = (shr(sb, 23) & 0xFF) - 127
@@ -1488,7 +1503,7 @@ def build(
                 kpe_raw = jnp.where(
                     lax.broadcasted_iota(I32, (M, 128), 1) < cfg.DR, kpe_raw, 0.0
                 )
-                kpe = rope(kpe_raw, rope_tab[0], rope_tab[1]) * rvalid
+                kpe = rope(kpe_raw, rope_tab[0], rope_tab[1], cfg.rope_neox) * rvalid
                 scr["qc"][...] = qc
                 scr["kvc"][...] = kvc
                 scr["kpe"][...] = kpe
@@ -1510,7 +1525,7 @@ def build(
                     qn = q[:, hh * DQ : hh * DQ + DN].astype(BF16)
                     ql = bf(lax.dot_general(qn, wb[hh], NN, preferred_element_type=F32))
                     win = q[:, hh * DQ + DQ - 128 : hh * DQ + DQ]
-                    wr = rope(win, rope_tab[2], rope_tab[3])
+                    wr = rope(win, rope_tab[2], rope_tab[3], cfg.rope_neox)
                     qpe = jnp.where(
                         lax.broadcasted_iota(I32, (M, 128), 1) < cfg.DR,
                         pltpu.roll(wr, cfg.DR, 1),
