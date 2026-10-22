@@ -1,0 +1,10 @@
+# Serve configs for scorers/serve_e2e.py (perfkit/scorer_configs.py). The campaign
+# freezes `deepseek-v4-flash-dp8-ep@layers`, the variant the scorer derives from this one.
+[configs."deepseek-v4-flash-dp8-ep"]
+config = "deepseek-v4-flash-dp8-ep"
+target = "vllm-torchtpu-dsv4-flash"
+cell = "3b70fb2b39e4"
+remote = "cdk"
+# Where a layer arm reads the model's config.json to plan its cut; the pods serve the
+# same copy (the target's MODEL_URI).
+weights = "gs://cloud-devkit/ckpt/hf/deepseek-ai/DeepSeek-V4-Flash-0731"
