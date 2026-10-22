@@ -72,7 +72,7 @@ MOE_FIELD_ALIASES: dict[str, str] = {
     "rms_norm_eps": "eps",
 }
 
-MOE_OPTIONS: dict[str, Any] = {"shared_gate": True, "moe_tp": True, "e_slots": 0}
+MOE_OPTIONS: dict[str, Any] = {"shared_gate": True, "moe_tp": None, "e_slots": None}
 
 
 def _moe_ew(g: Any, R: int) -> int:
@@ -107,7 +107,7 @@ def resolve_moe_binding(
     cls: Any, binding: BlockBinding, resolved: ResolvedBlockGeometry
 ) -> ResolvedBlockGeometry:
     vals = dict(resolved.values)
-    opts = dict(binding.options)
+    opts = {k: v for k, v in binding.options.items() if v is not None}
     vals.update(
         {
             "H": int(vals["hidden"]),
