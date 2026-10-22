@@ -311,6 +311,10 @@ local logHostTensorsAfterLoad = cdk.var('TPU_LOG_HOST_TENSORS_AFTER_LOAD', '1');
 // Steps between each rank's "step timing" log line (step period by DP token bucket, vllm-torchtpu
 // runner/step_timing_log.py); 0 turns it off.
 local stepTimingLogSteps = cdk.var('TPU_STEP_TIMING_LOG_STEPS', '2000');
+// SrptPrefillScheduler caps each step's attention work (sum over scheduled tokens of their context) by
+// clipping prefill chunks while some DP rank decodes, so one rank's chunk deep in a long prompt stops
+// setting every rank's step. Empty = off.
+local srptAttnWorkCap = cdk.var('VLLM_TPU_SRPT_ATTN_WORK_CAP', '');
 
 // --- Benchmark client --------------------------------------------------------
 local fastMode = cdk.boolVar('FAST', false) || cdk.boolVar('FAST_MODE', false);
@@ -773,6 +777,7 @@ local serverJob = cdk.job(
         [if premappedBufferSize != 'none' then 'TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES']: premappedBufferSize,
         TPU_LOG_HOST_TENSORS_AFTER_LOAD: logHostTensorsAfterLoad,
         TPU_STEP_TIMING_LOG_STEPS: stepTimingLogSteps,
+        [if srptAttnWorkCap != '' then 'VLLM_TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
         [if hcaKvPagesPerBlock != '' then 'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK']: hcaKvPagesPerBlock,
         [if indexerKvPagesPerBlock != '' then 'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK']: indexerKvPagesPerBlock,
         // Read by the scheduler in the EngineCore processes, not by Ray workers.

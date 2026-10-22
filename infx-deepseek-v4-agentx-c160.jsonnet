@@ -313,6 +313,12 @@ local logHostTensorsAfterLoad = cdk.var('TPU_LOG_HOST_TENSORS_AFTER_LOAD', '1');
 // Steps between each rank's "step timing" log line (step period by DP token bucket, vllm-torchtpu
 // runner/step_timing_log.py); 0 turns it off.
 local stepTimingLogSteps = cdk.var('TPU_STEP_TIMING_LOG_STEPS', '2000');
+// SrptPrefillScheduler caps each step's attention work (sum over scheduled tokens of their context) by
+// clipping prefill chunks while some DP rank decodes, so one rank's chunk deep in a long prompt stops
+// setting every rank's step. Empty = off.
+// c=160: full stack + 25M, n=3 vs n=4: intvty p90 46.4-47.8 vs 45.1-45.8, TTFT mean 19.8-20.3 vs
+// 21.4-23.5 s, tok/s/chip +2% (in noise).
+local srptAttnWorkCap = cdk.var('VLLM_TPU_SRPT_ATTN_WORK_CAP', '25000000');
 // Each TensorCore keeps half of wq_b/wo_a/wo_b and the chip pair exchanges activations; the freed HBM goes
 // to KV (1.875M -> 3.14M tokens/rank in j-02810869, 361,390 vs ~310k total tok/s). Tolerance tier:
 // mmlu_pro 0.8386 vs 0.845 off (McNemar p=0.40). Empty = off.
@@ -785,6 +791,7 @@ local serverJob = cdk.job(
         [if premappedBufferSize != 'none' then 'TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES']: premappedBufferSize,
         TPU_LOG_HOST_TENSORS_AFTER_LOAD: logHostTensorsAfterLoad,
         TPU_STEP_TIMING_LOG_STEPS: stepTimingLogSteps,
+        [if srptAttnWorkCap != '' then 'VLLM_TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
         [if hcaKvPagesPerBlock != '' then 'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK']: hcaKvPagesPerBlock,
         [if indexerKvPagesPerBlock != '' then 'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK']: indexerKvPagesPerBlock,
         [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
