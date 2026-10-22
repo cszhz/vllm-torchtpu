@@ -83,7 +83,7 @@ import os
 import socket
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -425,10 +425,6 @@ class RaidenOffloadingManager(OffloadingManager):
         # probes the directory itself.
         self._inflight_store_keys: set[OffloadKey] = set()
 
-        # Scheduler-installed veto on what `prepare_store` admits (see
-        # `set_store_key_filter`); None admits every key.
-        self._store_key_filter: Callable[[OffloadKey, ReqContext], bool] | None = None
-
         # Per request: the keys of a load that prepare_load could not pin, or
         # whose transfer failed to launch or failed in flight. Later lookups
         # for that request answer MISS for them, so the request recomputes
@@ -757,17 +753,6 @@ class RaidenOffloadingManager(OffloadingManager):
         self._pending_remote_slices.update(remote_slices)
         return RaidenLoadStoreSpec(keys)
 
-    def set_store_key_filter(
-        self, key_filter: Callable[[OffloadKey, ReqContext], bool] | None
-    ) -> None:
-        """Install a predicate `prepare_store` consults per key; False skips it.
-
-        A skipped key is reported neither stored nor to-store, so the
-        scheduler builds no transfer for it and moves past it, exactly as for
-        a key that is already resident.
-        """
-        self._store_key_filter = key_filter
-
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
         # The Raiden directory is the sole authority on what is stored: probe
         # it per key, so a key whose entries were displaced from the LRU is
@@ -787,11 +772,8 @@ class RaidenOffloadingManager(OffloadingManager):
             self._block_status.HOST_AND_HBM,
             self._block_status.REMOTE,
         )
-        key_filter = self._store_key_filter
         for key in keys:
             if key in self._inflight_store_keys:
-                continue
-            if key_filter is not None and not key_filter(key, req_context):
                 continue
             sub_hashes = self._sub_hashes(key)
             matches = self._probe(sub_hashes)
@@ -2332,7 +2314,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # Verify CP scaling invariant: scheduler chunks at the logical all-CP-rank
         # block span, whereas KV cache specs are rank-local. Ensure tokens_per_block
         # scales by pcp_size * dcp_size so OffloadKey spans match scheduler blocks.
-        for group_config, group in zip(config.groups, kv_cache_config.kv_cache_groups):
+        # config.groups holds only the offloaded groups (vLLM leaves out groups
+        # that are not prefix-cacheable), so pair them by group id.
+        for group_config in config.groups:
+            group = kv_cache_config.kv_cache_groups[group_config.group_id]
             if isinstance(group.kv_cache_spec, AttentionSpec):
                 expected_cp_scale = parallel.pcp_size * parallel.dcp_size
                 assert group_config.tokens_per_block == (

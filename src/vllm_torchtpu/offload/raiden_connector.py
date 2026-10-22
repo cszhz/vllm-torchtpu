@@ -48,7 +48,6 @@ Core mechanisms:
 
 from __future__ import annotations
 
-import dataclasses
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -78,8 +77,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import (
@@ -88,13 +85,10 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
     OffloadKey,
-    ReqContext,
-    get_offload_group_idx,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.core import hca_state_checkpoint
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
@@ -105,12 +99,8 @@ from vllm_torchtpu.offload.raiden_store import (
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
-    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
-
-_NULL_BLOCK = KVCacheBlock(block_id=0)
-_NULL_BLOCK.is_null = True
 
 
 def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
@@ -221,51 +211,6 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
-
-        # Groups a hit never needs (TPU_KV_DROP_HCA_STATE_CHECKPOINT): never
-        # stored, looked up or loaded.
-        self._skipped_groups: frozenset[int] = frozenset()
-        if hca_state_checkpoint.enabled():
-            self._skipped_groups = hca_state_checkpoint.hca_state_group_ids(
-                kv_cache_config
-            )
-            configs = self.config.kv_group_configs
-            self._lookup_groups = tuple(
-                i
-                for i in self._lookup_groups
-                if configs[i].group_idx not in self._skipped_groups
-            )
-            self._sliding_window_groups = tuple(
-                i
-                for i in self._sliding_window_groups
-                if configs[i].group_idx not in self._skipped_groups
-            )
-            self._raiden_manager.set_store_key_filter(self._admit_store_key)
-            logger.info(
-                "TPURaidenOffloadingConnector: KV cache groups %s are never "
-                "offloaded (TPU_KV_DROP_HCA_STATE_CHECKPOINT)",
-                sorted(self._skipped_groups),
-            )
-
-    def update_state_after_alloc(
-        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
-    ):
-        if num_external_tokens and self._skipped_groups:
-            # Null placeholders read as already present, so no load is built
-            # for these groups' freshly allocated blocks.
-            blocks = dataclasses.replace(
-                blocks,
-                blocks=tuple(
-                    [_NULL_BLOCK] * len(group_blocks)
-                    if group_idx in self._skipped_groups
-                    else group_blocks
-                    for group_idx, group_blocks in enumerate(blocks.blocks)
-                ),
-            )
-        super().update_state_after_alloc(request, blocks, num_external_tokens)
-
-    def _admit_store_key(self, key: OffloadKey, req_context: ReqContext) -> bool:
-        return get_offload_group_idx(key) not in self._skipped_groups
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

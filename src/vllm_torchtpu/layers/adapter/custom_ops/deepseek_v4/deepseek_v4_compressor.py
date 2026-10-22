@@ -25,8 +25,10 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4 import compressor as dsv4_compressor
 from vllm.models.deepseek_v4.compressor import CompressorStateCache, DeepseekCompressor
-from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.core.hca_state_checkpoint import state_spec_cls
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config as compressor_config,
 )
@@ -332,7 +334,13 @@ class VllmCompressorStateCache(CompressorStateCache):
         # the packed layout the host array actually uses. The physical overlay
         # onto that host is done by the runner.
         bytes_per_row = self.state_dim * 4
-        return SlidingWindowMLASpec(
+        spec_cls = state_spec_cls(
+            self.compress_ratio,
+            self.sliding_window,
+            vllm_config.cache_config.block_size,
+            envs.TPU_KV_DROP_HCA_STATE_CHECKPOINT,
+        )
+        return spec_cls(
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=align_to(bytes_per_row, 128),

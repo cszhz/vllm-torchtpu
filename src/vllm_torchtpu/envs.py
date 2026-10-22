@@ -80,9 +80,7 @@ if TYPE_CHECKING:
     TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
     TPU_STEP_TIMING_LOG_STEPS: int = 0
-    TPU_KV_HOLD_REPLAY_CHECKPOINT: bool = False
     TPU_KV_DROP_HCA_STATE_CHECKPOINT: bool = False
-    TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -739,21 +737,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.
     "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),
-    # Engine core: sliding-window groups keep each request's replay-boundary
-    # prefix-cache checkpoint until the request is freed, and the freed request
-    # queues it with the prefix it serves (core/checkpoint_free_order.py).
-    "TPU_KV_HOLD_REPLAY_CHECKPOINT": env_bool("TPU_KV_HOLD_REPLAY_CHECKPOINT"),
-    # Engine core: DeepSeek-V4's 128-ratio compressor state needs no prefix-cache
-    # checkpoint (never cached, held or host-offloaded); see
+    # Model workers: DeepSeek-V4's 128-ratio compressor state cache is declared
+    # not prefix-cacheable (no checkpoint cached, held or host-offloaded); see
     # core/hca_state_checkpoint.py.
     "TPU_KV_DROP_HCA_STATE_CHECKPOINT": env_bool("TPU_KV_DROP_HCA_STATE_CHECKPOINT"),
-    # Engine core: hash every sliding-window block the host offload stores (each
-    # checkpoint's EAGLE peek block included). Unhashed, a freed one is reused
-    # at once and cancels its store job before it launches, with every
-    # full-attention chunk in that job (core/checkpoint_free_order.py).
-    "TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS": env_bool(
-        "TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS"
-    ),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
