@@ -148,6 +148,28 @@ def run_bucket(
         h.block_until_ready()
         return time.perf_counter() - t
 
+    # Device clock: n chained calls inside one jit; the residual is the loop
+    # carry, so XLA cannot hoist the kernel out of the loop.
+    def dev_chain(n: int):
+        def body(_, h):
+            return step(pos, h, w_mk, states, attn)[1][RESIDUAL_OUT]
+
+        return jax.jit(lambda h: jax.lax.fori_loop(0, n, body, h))
+
+    dev_fns = {n: dev_chain(n) for n in chains}
+    for f in dev_fns.values():
+        f(hid).block_until_ready()
+
+    def dev_time(n: int) -> float:
+        t = time.perf_counter()
+        dev_fns[n](hid).block_until_ready()
+        return time.perf_counter() - t
+
+    dbest = {n: min(dev_time(n) for _ in range(5)) for n in chains}
+    d_slope, d_icpt = np.polyfit(
+        np.array(list(dbest), np.float64), np.array(list(dbest.values()), np.float64), 1
+    )
+
     chain(2)
     # Host dispatch jitter is one-sided, so fit the minimum of 5 reps per length.
     best = {n: min(chain(n) for _ in range(5)) for n in chains}
@@ -165,6 +187,8 @@ def run_bucket(
         "tiles": str(info["exec"].resolved_tiles),
         "compile_s": round(compile_s, 1),
         "parity": parity,
+        "dev_us_per_call": round(d_slope * 1e6, 1),
+        "dev_intercept_us": round(d_icpt * 1e6, 1),
         "us_per_call": round(slope * 1e6, 1),
         "intercept_us": round(icpt * 1e6, 1),
         "fit_resid_us": round(float(np.std(resid)) * 1e6, 1),
