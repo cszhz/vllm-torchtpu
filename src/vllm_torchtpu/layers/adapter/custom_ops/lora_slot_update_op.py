@@ -39,6 +39,10 @@ def _compute_slot_update(
             )
         )
         offset += slot_size
+    assert offset == slot_weights.shape[0], (
+        f"slot_weights holds {slot_weights.shape[0]} elements but the slots "
+        f"of stacked_weights hold {offset}"
+    )
     return updated
 
 
