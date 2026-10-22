@@ -609,17 +609,31 @@ def decode_kq_head_matmul(
 
     The heads' states sit side by side as one [kq_head_dim, n * v_head_dim]
     MXU weight, so a weight load fills the 256-lane MXU instead of leaving
-    half of it empty for a 128-lane head.
+    half of it empty for a 128-lane head. A bf16 state is an exact MXU
+    weight, so identity rows under [k; q] return each S in fp32 exactly (one
+    nonzero product per output), which moves the bf16 -> fp32 unpack off the
+    VPU, the slot that bounds the decode state loop. An fp32 state would be
+    rounded as a weight, so it is unpacked on the VPU.
     """
+    dim = kq_rows.shape[-1]
+    exact = all(jnp.dtype(s.dtype) == jnp.bfloat16 for s in states)
+    # Whole sublane tiles of [k; q] keep the identity block's rows aligned.
+    pad = -kq_rows.shape[0] % 8
+    lhs = [kq_rows, jnp.zeros((pad, dim), jnp.float32)]
+    if exact:
+        rows = jax.lax.broadcasted_iota(jnp.int32, (dim, dim), 0)
+        cols = jax.lax.broadcasted_iota(jnp.int32, (dim, dim), 1)
+        lhs.append(jnp.where(rows == cols, 1.0, 0.0).astype(jnp.float32))
     res = jax.lax.dot(
-        kq_rows,
+        jnp.concat(lhs, axis=0),
         jnp.concat(states, axis=1).astype(jnp.float32),
         preferred_element_type=jnp.float32,
     )
-    return [
-        (part, state.astype(jnp.float32))
-        for state, part in zip(states, jnp.split(res, len(states), axis=1))
-    ]
+    out = []
+    for state, part in zip(states, jnp.split(res, len(states), axis=1)):
+        state_f32 = part[2 + pad :] if exact else state.astype(jnp.float32)
+        out.append((part[:2], state_f32))
+    return out
 
 
 def decode_row_table_rows(cfg: config.GDNConfig) -> int:
