@@ -366,7 +366,8 @@ class Glm52DecodeMK:
         _need(dist.is_initialized() and dist.get_world_size() == R, "world != TP")
         _need(int(getattr(pc, "cp_kv_cache_interleave_size", 1)) == FULL.ILV, "interleave != 4")
         _need(not bool(getattr(pc, "enable_expert_parallel", False)), "EP is on (stage A is TP16 MoE, EP off)")
-        _need(not bool(getattr(pc, "dcp_q_replicate", False)), "qrep 1 (dcp_q_replicate): the megakernel is qrep 0")
+        # qrep is judged per layer below (q_b_proj.qrep_active), not from parallel_config.dcp_q_replicate: vLLM's GLM
+        # config hook sets that field True even when VLLM_DCP_Q_REPLICATE=0 turns runtime q-replication off.
         self.rank_layout = self._check_rank_layout(R)
         spec = runner.speculative_config
         _need(spec is not None and getattr(spec, "method", "") == "mtp", "MTP is off")

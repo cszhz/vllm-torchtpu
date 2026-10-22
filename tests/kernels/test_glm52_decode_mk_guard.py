@@ -154,6 +154,85 @@ def test_pool_guard_is_wired_at_load():
     assert "self.pool_pages = check_pool(mml, {t: tl.pool for t, tl in self.tiles_by_rows.items()}" in src
 
 
+# ------------------------------------------------------------------ load guard: qrep is judged per layer
+
+
+class _PastLoadGuards(Exception):
+    """Raised by the stubbed dist.get_rank, which __init__ first calls right after its last load-time guard."""
+
+
+def _glm52_hf(cfg=C.FULL):
+    return types.SimpleNamespace(
+        model_type="glm_moe_dsa", num_hidden_layers=cfg.L, first_k_dense_replace=cfg.first_dense,
+        hidden_size=cfg.H, num_attention_heads=cfg.NH, q_lora_rank=cfg.QL, index_topk_freq=cfg.idx_freq,
+        index_skip_topk_offset=cfg.idx_skip, rms_norm_eps=cfg.eps, routed_scaling_factor=cfg.routed_scale,
+        kv_lora_rank=cfg.KL, qk_nope_head_dim=cfg.DN, qk_rope_head_dim=cfg.DR, v_head_dim=cfg.DV,
+        n_routed_experts=cfg.E, num_experts_per_tok=cfg.TOPK, moe_intermediate_size=cfg.I,
+        n_shared_experts=cfg.IS // cfg.I, intermediate_size=cfg.ID, index_n_heads=cfg.IH, index_head_dim=cfg.IDIM,
+        index_topk=cfg.KT, scoring_func="sigmoid", n_group=1, topk_group=1, norm_topk_prob=True,
+        rope_interleave=True, indexer_rope_interleave=True, rope_parameters={"rope_type": "default"})
+
+
+def _glm52_runner(qrep_layers=(), dcp_q_replicate=True, cfg=C.FULL):
+    """A served GLM-5.2 runner (TP16 x DCP16 il4, EP off, MTP 3) whose layer l's q_b_proj has qrep_active = l in
+    qrep_layers. dcp_q_replicate is the parallel_config field vLLM's GLM config hook sets True by default."""
+    layers = torch.nn.ModuleList()
+    for l in range(cfg.L):
+        ly = torch.nn.Module()
+        ly.self_attn = torch.nn.Module()
+        ly.self_attn.q_b_proj = torch.nn.Module()
+        ly.self_attn.q_b_proj.qrep_active = l in qrep_layers
+        if cfg.full_indexer(l):
+            ly.self_attn.indexer = torch.nn.Module()
+        layers.append(ly)
+    bb = torch.nn.Module()
+    bb.layers, bb.embed_tokens, bb.norm = layers, torch.nn.Identity(), torch.nn.Identity()
+    model = torch.nn.Module()
+    model.model = bb
+    pc = types.SimpleNamespace(pipeline_parallel_size=1, data_parallel_size=1, tensor_parallel_size=cfg.R,
+                               decode_context_parallel_size=cfg.R, cp_kv_cache_interleave_size=cfg.ILV,
+                               enable_expert_parallel=False, dcp_q_replicate=dcp_q_replicate)
+    return types.SimpleNamespace(
+        model_config=types.SimpleNamespace(hf_config=_glm52_hf(cfg), max_model_len=1 << 20), parallel_config=pc,
+        speculative_config=types.SimpleNamespace(method="mtp", num_speculative_tokens=cfg.QMAX - 1),
+        block_size=cfg.page, scheduler_config=types.SimpleNamespace(max_num_seqs=cfg.BM), model=model)
+
+
+@pytest.fixture
+def load_env(monkeypatch):
+    import torch.distributed as dist
+
+    def past_guards():
+        raise _PastLoadGuards
+    monkeypatch.setenv("GLM52_DECODE_MK", "1")
+    monkeypatch.setenv("GLM52_DECODE_MK_ROWS", "16,32")
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: C.FULL.R)
+    monkeypatch.setattr(dist, "get_rank", past_guards)
+    monkeypatch.setattr(Glm52DecodeMK, "_check_rank_layout", staticmethod(lambda R: {"rank": 0, "tp": 0, "dcp": 0}))
+
+
+@pytest.mark.parametrize("field", [True, False])
+def test_load_guard_ignores_config_qrep_field(load_env, field):
+    # the production template sets VLLM_DCP_Q_REPLICATE=0 (runtime qrep off, q_b_proj column-parallel) while vLLM's
+    # GLM config hook leaves parallel_config.dcp_q_replicate True: the megakernel must still build
+    with pytest.raises(_PastLoadGuards):
+        Glm52DecodeMK(_glm52_runner(qrep_layers=(), dcp_q_replicate=field))
+
+
+@pytest.mark.parametrize("qrep_layers", [(0,), (40,), (C.FULL.L - 1,), tuple(range(C.FULL.L))])
+def test_load_guard_refuses_replicated_q_b(load_env, qrep_layers):
+    with pytest.raises(Unsupported, match=rf"layer {qrep_layers[0]}: q_b_proj is replicated \(qrep_active\)"):
+        Glm52DecodeMK(_glm52_runner(qrep_layers=qrep_layers, dcp_q_replicate=False))
+    assert Glm52DecodeMK.maybe_create(_glm52_runner(qrep_layers=qrep_layers)) is None      # logged, stock forever
+
+
+def test_load_guard_does_not_read_the_config_qrep_field():
+    src = __import__("inspect").getsource(VA.Glm52DecodeMK.__init__)
+    assert 'getattr(pc, "dcp_q_replicate"' not in src and "pc.dcp_q_replicate" not in src
+    assert '"qrep_active"' in src
+
+
 # ------------------------------------------------------------------ bind_caches on fake modules
 
 L, NB, NBI = 6, 2, 3
