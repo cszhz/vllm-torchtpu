@@ -48,7 +48,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v2_ffn import make_ffn_configs
 
 # Most weight slots: the expert being computed plus experts in flight. Fewer
 # are used when the token-sized buffers leave no room for this many.
-MAX_NBUF = 3
+MAX_NBUF = 2
 # Most routed rows one expert matmul takes; an expert with more runs in chunks.
 ROW_CHUNK = 128
 # Indices into an expert's (w1, w1 scale, w2, w2 scale) copies.
