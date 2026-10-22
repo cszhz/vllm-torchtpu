@@ -1,17 +1,17 @@
 # DeepSeek-V4-Flash-0731 on one tpu7x 2x2x1 node (DP8, EP), served on Cloud DevKit.
-# A scorer arm retargets `repo` to its own tree, and every value below that starts with
-# `repo` moves with it, so the arm's src/ and this directory's shim are its own.
+# `repo` is relative: a scorer arm runs with its own tree as the working directory, so
+# the arm's benchmark config, src/ and dry-run shim are read from that tree on any host.
 [target]
 adapter = "vllm_torchtpu"
 role = "baseline"
-repo = "~/vllm-torchtpu"
+repo = "."
 kernel_dirs = ["src/vllm_torchtpu/kernels", "src/vllm_torchtpu/layers"]
 source_dirs = ["src"]
 
 [target.env]
-PYTHONPATH = "~/vllm-torchtpu/src"
+PYTHONPATH = "src"
 # The dry run perfkit reads the serve command from needs a findable vllm package.
-PATH = "~/vllm-torchtpu/scripts/kernel_evolve/dsv4_flash_layers/shim/bin:/usr/local/bin:/usr/bin:/bin"
+PATH = "scripts/kernel_evolve/dsv4_flash_layers/shim/bin:/usr/local/bin:/usr/bin:/bin"
 
 [target.cdk]
 # A copy of the CI image vllm-torchtpu:2d241c2e9c9ccc6e9d8b349139d471b117eef8e1-v0.32.0
