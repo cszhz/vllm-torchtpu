@@ -682,3 +682,161 @@ def test_adapter_module_has_no_silent_paths():
     src = __import__("inspect").getsource(VA.Glm52DecodeMK._decide)
     for why in ("off", "unbound"):
         assert f'"{why}"' in src
+
+
+# ------------------------------------------------------------------ token rows: runner buckets below the MK's (4, 8)
+
+
+class _RecStep:
+    """A stand-in compiled step that records the token operands it is handed and returns a row function of them
+    (row i = ids[i] + 1000 * pos[i]), so the rows the runner keeps can be compared with an unpadded computation."""
+
+    def __init__(self, T):
+        self.T, self.seen = T, []
+
+    def __call__(self, ids, pos, qsl, seq, bt, smalls, weights, caches):
+        self.seen.append((tuple(ids.shape), tuple(pos.shape), ids.dtype, pos.dtype))
+        assert ids.shape == (self.T,) and pos.shape == (self.T,)
+        return (ids.float() + 1000.0 * pos.float())[:, None].expand(self.T, 8).clone()
+
+
+def _bound_rec():
+    mk, md = _bound()
+    mk._steps = {t: _RecStep(t) for t in ROWS}
+    return mk, md
+
+
+@pytest.mark.parametrize(
+    "nums, n_pad, bucket",
+    [
+        ([4], 4, 16),  # TPU_TOKEN_BUCKET_EXTRA=4: one request
+        ([3], 4, 16),
+        ([4, 4], 8, 16),  # TPU_TOKEN_BUCKET_EXTRA=8: two requests
+        ([2, 3, 2], 8, 16),
+        ([4] * 4, 16, 16),  # the default 16 bucket
+        # 15 tokens but 5 requests > 16 // 4: the b32 program on a 16-row runner bucket
+        ([3] * 5, 16, 32),
+        ([4] * 8, 32, 32),
+        ([2] * 8, 16, 32),
+    ],
+)
+def test_runner_buckets_map_to_warmed_programs(nums, n_pad, bucket):
+    mk, _ = _bound_rec()
+    sched = _sched(nums)
+    b = mk.step_ok(_runner_for(sched), sched, 1)
+    assert b == bucket
+    T = sum(nums)
+    ids = torch.zeros(n_pad, dtype=torch.int32)
+    pos = torch.zeros(n_pad, dtype=torch.int32)
+    ids[:T] = torch.arange(1, T + 1, dtype=torch.int32)
+    pos[:T] = torch.arange(100, 100 + T, dtype=torch.int32)
+    out = mk.try_call(None, b, ids, pos)
+    assert out is not None and tuple(out.shape) == (n_pad, 8)
+    assert mk._steps[bucket].seen == [((bucket,), (bucket,), torch.int32, torch.int32)]
+    assert all(not s.seen for t, s in mk._steps.items() if t != bucket)
+    want = (ids.float() + 1000.0 * pos.float())[:, None].expand(n_pad, 8)
+    # every row the runner keeps, incl. its own padding rows (zeros in -> zeros out)
+    assert torch.equal(out, want)
+    assert mk.counts["shape"] == 0 and mk.calls == 1
+
+
+def test_to_bucket_rows_pads_like_the_in_step_fit():
+    x = torch.arange(1, 5, dtype=torch.int32)
+    for t in (16, 32):
+        y = VA.to_bucket_rows(x, t)
+        assert y.shape == (t,) and y.dtype == torch.int32 and y.is_contiguous()
+        assert torch.equal(y, VA.fit_rows(x, t))
+        assert not y[4:].any()
+    full = torch.arange(16, dtype=torch.int32)
+    # the runner's tensor untouched at n == t
+    assert VA.to_bucket_rows(full, 16) is full
+
+
+@pytest.mark.parametrize(
+    "ids, pos, bucket, msg",
+    [
+        (torch.zeros(32, dtype=torch.int32), None, 16, "32 token rows not in 1..16"),
+        (torch.zeros(33, dtype=torch.int32), None, 32, "33 token rows not in 1..32"),
+        (torch.zeros(0, dtype=torch.int32), None, 16, "0 token rows not in 1..16"),
+        (torch.zeros(2, 8, dtype=torch.int32), None, 16, "is not 1-D"),
+        (
+            torch.zeros(8, dtype=torch.int32),
+            torch.zeros(16, dtype=torch.int32),
+            16,
+            "positions shape (16,) != input_ids (8,)",
+        ),
+        (
+            torch.zeros(8, dtype=torch.int64),
+            None,
+            16,
+            "input_ids dtype torch.int64 != int32",
+        ),
+        (
+            torch.zeros(8, dtype=torch.int32),
+            torch.zeros(8, dtype=torch.int64),
+            16,
+            "positions dtype torch.int64 != int32",
+        ),
+    ],
+)
+def test_unexpected_token_rows_decline_with_reason(ids, pos, bucket, msg, monkeypatch):
+    mk, _ = _bound_rec()
+    pos = ids if pos is None else pos
+    warned = []
+    # the module logger directly: vLLM's logging config may not propagate to caplog's root handler
+    monkeypatch.setattr(VA.logger, "warning", lambda f, *a: warned.append(f % a))
+    assert mk.try_call(None, bucket, ids, pos) is None
+    assert mk.try_call(None, bucket, ids, pos) is None
+    assert mk.counts["shape"] == 2 and mk.calls == 0
+    # never reached a compiled program
+    assert all(not s.seen for s in mk._steps.values())
+    why = VA.token_rows_mismatch(bucket, ids, pos)
+    assert why and msg in why
+    # loud, once per distinct reason
+    assert len(warned) == 1 and msg in warned[0], warned
+    assert "unexpected shape would recompile" in warned[0]
+
+
+def test_token_rows_padding_never_recompiles_the_step():
+    """The real mechanism on CPU: a torch.compile(fullgraph, dynamic=False) step that pads with the adapter's own
+    `fit_rows`, warmed at 16 and 32 rows like `warmup`. Through `to_bucket_rows`, runner buckets 4 / 8 / 16 / 32 run
+    the two warmed graphs (no new compile) and keep exactly the rows of an in-step pad; handing the step the raw 4 rows
+    (the e8301f284 behaviour) compiles a third graph (positive control)."""
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(
+            tuple(tuple(x.shape) for x in example_inputs if isinstance(x, torch.Tensor))
+        )
+        return gm.forward
+
+    torch._dynamo.reset()
+    emb = torch.nn.Embedding(64, 8)
+    steps = {}
+    for T in ROWS:
+
+        def step(ids, positions, T=T):
+            p = VA.fit_rows(positions.reshape(-1).to(torch.int32), T)
+            h = emb(VA.fit_rows(ids.reshape(-1), T)).float()
+            return h * (1.0 + p.float()[:, None])
+
+        steps[T] = torch.compile(step, backend=backend, fullgraph=True, dynamic=False)
+    with torch.no_grad():
+        for T in ROWS:  # warmup: [T] int32
+            steps[T](
+                torch.zeros(T, dtype=torch.int32),
+                torch.arange(T, dtype=torch.int32) % 4,
+            )
+        warm = len(graphs)
+        assert warm == 2
+        for n, T in ((4, 16), (8, 16), (16, 16), (16, 32), (8, 32), (32, 32)):
+            ids = torch.randint(1, 64, (n,), dtype=torch.int32)
+            pos = torch.randint(0, 1000, (n,), dtype=torch.int32)
+            got = steps[T](VA.to_bucket_rows(ids, T), VA.to_bucket_rows(pos, T))[:n]
+            ref = emb(ids).float() * (1.0 + pos.float()[:, None])
+            assert torch.equal(got, ref), (n, T)
+            assert len(graphs) == warm, (n, T, graphs)
+        raw = torch.zeros(4, dtype=torch.int32)
+        steps[16](raw, raw)  # the raw 4 rows: a new graph
+        assert len(graphs) == warm + 1
+    torch._dynamo.reset()

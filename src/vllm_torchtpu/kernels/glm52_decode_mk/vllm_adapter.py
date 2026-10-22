@@ -33,8 +33,10 @@ runs the stock graphs, and every decline is counted under a named reason (no sil
   every request a verify request (1 + its scheduled draft tokens, >= 1 draft, past its prompt) with 2..QMAX rows,
   <= BMAX requests, and a row bucket holding the tokens and the requests (<= bucket // QMAX); prefill and mixed steps
   decline;
-- call time (`try_call`): the forward carries no inputs_embeds / intermediate tensors and the attention metadata has
-  the shapes the bucket was compiled for (else 'embeds' / 'shape': stock, counted).
+- call time (`try_call`): the forward carries no inputs_embeds / intermediate tensors, the token operands are 1-D
+  int32 with 1..bucket rows (a runner bucket below the megakernel's, TPU_TOKEN_BUCKET_EXTRA=4,8, is padded up outside
+  the compiled step, so only the warmed 16 / 32-row programs ever run) and the attention metadata has the shapes the
+  bucket was compiled for (else 'embeds' / 'shape': stock, counted, the shape reason logged as a warning).
 Counts: `counts` (per reason, mk per bucket), logged by rank 0 on the first step of each new reason and every
 GLM52_DECODE_MK_LOG_EVERY decisions (default 2000); `status()` returns them.
 
@@ -393,6 +395,46 @@ def sched_reqs(runner, scheduler_output) -> list:
         in_prompt = int(ib.num_computed_tokens_cpu[i]) < int(ib.num_prompt_tokens[i])
         out.append((int(n), len(spec.get(req_id) or ()), in_prompt))
     return out
+
+
+def fit_rows(x: torch.Tensor, n: int) -> torch.Tensor:
+    """x's leading dim cut or zero-padded to n rows (the step's pad-to-TMAX)."""
+    k = x.shape[0]
+    if k >= n:
+        return x[:n]
+    return torch.nn.functional.pad(x, [0, 0] * (x.dim() - 1) + [0, n - k])
+
+
+def to_bucket_rows(x: torch.Tensor, t: int) -> torch.Tensor:
+    """input_ids / positions as the compiled step's [t] operand. The step is torch.compile(dynamic=False): a
+    different input length is a different program, so the runner's own token buckets below the megakernel's
+    (TPU_TOKEN_BUCKET_EXTRA=4,8) are padded here, outside the compiled region, with the zeros the step's pad
+    inserted before (`fit_rows`); the step then only ever sees t rows (its `fit` is the identity). n == t passes the
+    runner's tensor untouched."""
+    if x.dim() == 1 and x.shape[0] == t:
+        return x
+    return fit_rows(x.reshape(-1), t).contiguous()
+
+
+def token_rows_mismatch(bucket: int, input_ids, positions) -> str:
+    """The call-time tripwire on the token operands (rank-uniform: every rank gets the same padded token count).
+    `to_bucket_rows` maps any 1..bucket rows onto the bucket's warmed [bucket] int32 program; anything else would
+    compile a new 78-layer program mid-serving (or cut real rows), so it declines ('shape') with this reason."""
+    shp = tuple(input_ids.shape)
+    if len(shp) != 1:
+        return f"b{bucket}: input_ids shape {shp} is not 1-D"
+    if positions is not None and tuple(positions.shape) != shp:
+        return f"b{bucket}: positions shape {tuple(positions.shape)} != input_ids {shp}"
+    n = shp[0]
+    if not 1 <= n <= bucket:
+        return (
+            f"b{bucket}: {n} token rows not in 1..{bucket} (the runner padded past the megakernel bucket; "
+            "only smaller runner buckets are padded up)"
+        )
+    for name, x in (("input_ids", input_ids), ("positions", positions)):
+        if x is not None and x.dtype != torch.int32:
+            return f"b{bucket}: {name} dtype {x.dtype} != int32 (the warmed program's)"
+    return ""
 
 
 N_FIX = 10  # pos [TMAX], seq [S], qsl [S+1], bt [S, W], cs rows [TMAX, DR], h0 [M, H], ltab, dtab (replicated),
@@ -1151,11 +1193,7 @@ class Glm52DecodeMK:
                 torch.empty_like(c) for c in caches
             ]
 
-        def fit(x, n):
-            k = x.shape[0]
-            if k >= n:
-                return x[:n]
-            return torch.nn.functional.pad(x, [0, 0] * (x.dim() - 1) + [0, n - k])
+        fit = fit_rows  # identity here: __call__ hands the step ids / positions already at TMAX rows
 
         cos_sin = self.cos_sin
         n_pos = int(cos_sin.shape[0])
@@ -1314,20 +1352,33 @@ class Glm52DecodeMK:
             self._count("embeds", "inputs_embeds / intermediate tensors", None)
             return None
         md = self._metadata()
-        why = self._shape_mismatch(decision, input_ids, md)
+        why = self._shape_mismatch(decision, input_ids, md, positions)
         if why:
             self._count("shape", why, None)
+            warned = self.__dict__.setdefault("_shape_warned", set())
+            if self.rank == 0 and why not in warned:
+                warned.add(why)
+                logger.warning(
+                    "GLM-5.2 decode megakernel: step declined to stock, an unexpected shape would recompile "
+                    "the step program: %s",
+                    why,
+                )
             return None
         return self(runner, input_ids, positions, bucket=decision, md=md)
 
-    def _shape_mismatch(self, bucket: int, input_ids, md) -> str:
-        """The step program is compiled with static shapes (torch.compile dynamic=False). The first served call of a
-        bucket fixes its metadata shapes (logged, with whether they equal the warmup's: if not, that call compiles
-        once); a later call with other shapes declines ('shape') instead of recompiling mid-serving. The runner's
-        shapes are config-static (query_start_loc is max_num_reqs + 1 under use_max_model_len), so this is a
+    def _shape_mismatch(self, bucket: int, input_ids, md, positions=None) -> str:
+        """The step program is compiled with static shapes (torch.compile dynamic=False). Token operands: any 1..bucket
+        rows are padded to the bucket outside the compiled step (`to_bucket_rows`: the runner's smaller buckets,
+        TPU_TOKEN_BUCKET_EXTRA=4,8), anything else declines (`token_rows_mismatch`). Metadata: the first served call
+        of a bucket fixes its metadata shapes (logged, with whether they equal the warmup's: if not, that call
+        compiles once); a later call with other shapes declines ('shape') instead of recompiling mid-serving. The
+        runner's shapes are config-static (query_start_loc is max_num_reqs + 1 under use_max_model_len), so this is a
         tripwire, rank-uniform like the shapes themselves."""
         if bucket not in self._steps:
             return f"b{bucket} not built"
+        why = token_rows_mismatch(bucket, input_ids, positions)
+        if why:
+            return why
         got = (
             tuple(md.query_start_loc.shape),
             tuple(md.seq_lens.shape),
@@ -1366,8 +1417,8 @@ class Glm52DecodeMK:
         assert t is not None, (n, self.rows)
         md = md if md is not None else self._metadata()
         out = self._steps[t](
-            input_ids,
-            positions,
+            to_bucket_rows(input_ids, t),
+            to_bucket_rows(positions, t),
             md.query_start_loc,
             md.seq_lens,
             md.block_tables,
