@@ -464,6 +464,16 @@ def has_initial_states(
     ]
 
 
+def load_head_rows(slot_ref: jax.Ref, head_dim: int) -> jax.Array:
+    """One sequence's [..., dim_size] activation as [dim_size / head_dim, head_dim].
+
+    With head_dim a multiple of the lane count, each head is one row and the
+    rows load as whole vregs.
+    """
+    rows = slot_ref.shape[-1] // head_dim
+    return slot_ref.reshape(rows, head_dim)[...]
+
+
 def load_activation_as_compact(
     qkv_vreg: jax.Array | None,
     qkv_vmem_ref: jax.Ref,

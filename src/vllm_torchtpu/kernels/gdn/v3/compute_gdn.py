@@ -599,3 +599,83 @@ def recurrent_gdn_decode_fused(
         # [1, num_v_heads, v_head_dim]
         out_list.append(jnp.concat(head_out_list, axis=0)[jnp.newaxis])
     return jnp.stack(out_list, axis=0)
+
+
+def recurrent_gdn_decode_dense(
+    real_sizes: jax.Array,
+    load_qkv: Callable[[int], jax.Array],
+    b: jax.Array,
+    a: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    load_state: Callable[[int, int], jax.Array],
+    store_state: Callable[[int, int, jax.Array], None],
+    store_out: Callable[[int, jax.Array], None],
+    cfg: config.GDNConfig,
+) -> None:
+    """recurrent_gdn_decode_fused on dense per-sequence rows, one head per row.
+
+    Each head is one row of the post-SiLU qkv tile, so q and k are dense
+    [num_kq_heads, head_dim] blocks and v is [num_v_heads, head_dim]: masking,
+    l2norm, scaling and q.k run on a few full vregs per sequence instead of one
+    vreg per head row. Gating runs on the tile's [seq, aligned_num_v_heads]
+    rows. Every element sees recurrent_gdn_decode_fused's operations in its
+    order, so the results are identical.
+
+    Args:
+        load_qkv: seq -> its post-SiLU qkv [2 * num_kq_heads + num_v_heads,
+            head_dim] rows.
+        b, a: [seq, aligned_num_v_heads].
+        a_log, dt_bias: [aligned_num_v_heads].
+        load_state, store_state: as for recurrent_gdn_decode_fused.
+        store_out: (seq, out [num_v_heads, v_head_dim]) -> None.
+    """
+    assert cfg.chunk_size == 1 and cfg.window_size == 1 and not cfg.is_kda
+    assert cfg.kq_head_dim == cfg.v_head_dim
+    compute = cfg.dtypes.compute
+
+    # [seq, 1]
+    mask = 0 < real_sizes.reshape(-1, 1)
+    b = b.astype(compute)
+    a = a.astype(compute)
+    a_log = a_log.reshape(1, -1).astype(compute)
+    dt_bias = dt_bias.reshape(1, -1).astype(compute)
+    # [seq, aligned_num_v_heads]
+    beta = jax.nn.sigmoid(b)
+    gating_log = -jnp.exp(a_log) * jax.nn.softplus(a + dt_bias)
+    beta = jnp.where(mask, beta, 0)
+    gating = jnp.exp(jnp.where(mask, gating_log, 0))
+
+    n_kq = cfg.num_kq_heads
+    q_scale = cfg.kq_head_dim**-0.5
+    for idx in range(cfg.seq_tile_size):
+        qkv = jnp.where(mask[idx], load_qkv(idx).astype(compute), 0)
+        q = l2_norm(qkv[:n_kq])
+        q *= q_scale
+        k = l2_norm(qkv[n_kq : 2 * n_kq])
+        v = qkv[2 * n_kq :]
+        # [num_kq_heads, 1]
+        q_dot_k = jnp.sum(q * k, axis=-1, keepdims=True)
+        head_out_list = []
+        for kq_head in range(n_kq):
+            q_row = q[kq_head : kq_head + 1]
+            k_row = k[kq_head : kq_head + 1]
+            kq_rows = jnp.concat([k_row, q_row], axis=0)
+            qk = q_dot_k[kq_head : kq_head + 1]
+            k_cols = jnp.transpose(
+                jnp.broadcast_to(k_row, (cfg.v_head_dim, cfg.kq_head_dim))
+            )
+            for v_head in range(
+                kq_head * cfg.v_per_kq_head, (kq_head + 1) * cfg.v_per_kq_head
+            ):
+                gating_curr = gating[idx : idx + 1, v_head : v_head + 1]
+                beta_curr = beta[idx : idx + 1, v_head : v_head + 1]
+                state = load_state(idx, v_head).astype(jnp.float32)
+                k_state_q_state = jax.lax.dot(
+                    kq_rows, state, preferred_element_type=jnp.float32
+                )
+                k_state, q_state = jnp.split(k_state_q_state, 2, axis=0)
+                v_new = beta_curr * (v[v_head : v_head + 1] - gating_curr * k_state)
+                head_out_list.append(gating_curr * q_state + qk * v_new)
+                store_state(idx, v_head, gating_curr * state + k_cols * v_new)
+        store_out(idx, jnp.concat(head_out_list, axis=0))

@@ -108,6 +108,50 @@ def _decode_conv1d_dense(
         )
 
 
+def _gdn_decode_dense(
+    qkv_slot_ref: jax.Ref,
+    b_slot_ref: jax.Ref,
+    a_slot_ref: jax.Ref,
+    recurrent_slot_ref: jax.Ref,
+    out_slot_ref: jax.Ref,
+    metadata_ref: memory_ref.MetadataRef,
+    real_sizes: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+) -> None:
+    """Single-token GDN of a BATCHED tile on dense head rows.
+
+    qkv_slot_ref holds the post-SiLU activation
+    (compute_gdn.recurrent_gdn_decode_dense).
+    """
+    padding_size = cfg.aligned_num_v_heads - cfg.num_v_heads
+    heads = (cfg.seq_tile_size, cfg.aligned_num_v_heads)
+    load_state, store_state = _decode_state_head_ldst(
+        recurrent_slot_ref, metadata_ref, p_id, cfg
+    )
+
+    def load_qkv(idx: int) -> jax.Array:
+        return vmem_ldst.load_head_rows(qkv_slot_ref.at[idx], cfg.kq_head_dim)
+
+    def store_out(idx: int, out: jax.Array) -> None:
+        out_slot_ref[idx, 0] = out.astype(out_slot_ref.dtype)
+
+    compute_gdn.recurrent_gdn_decode_dense(
+        real_sizes=real_sizes,
+        load_qkv=load_qkv,
+        b=b_slot_ref[...].reshape(heads),
+        a=a_slot_ref[...].reshape(heads),
+        a_log=jnp.pad(a_log, ((0, padding_size))),
+        dt_bias=jnp.pad(dt_bias, ((0, padding_size))),
+        load_state=load_state,
+        store_state=store_state,
+        store_out=store_out,
+        cfg=cfg,
+    )
+
+
 def _gdn_decode_fused(
     qkv_vreg: jax.Array | None,
     qkv_slot_ref: jax.Ref,
@@ -222,8 +266,7 @@ def inner_kernel(
         _decode_conv1d_dense(
             qkv_slot_ref, conv_state_slot_ref, weights_ref, metadata_ref, p_id, cfg
         )
-        _gdn_decode_fused(
-            None,
+        _gdn_decode_dense(
             qkv_slot_ref,
             b_slot_ref,
             a_slot_ref,
