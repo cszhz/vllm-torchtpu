@@ -21,9 +21,11 @@ keep the selected one with a one-hot mask.
 import torch
 
 
-def _one_hot(idx: torch.Tensor, num_slots: int, dtype: torch.dtype) -> torch.Tensor:
-    """Returns a [T, num_slots] mask; slots outside the range, such as -1,
-    get an all-zero row."""
+def one_hot_slots(
+    idx: torch.Tensor, num_slots: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Returns a [T, num_slots] mask of each token's slot; slots outside the
+    range, such as -1, get an all-zero row."""
     slots = torch.arange(num_slots, device=idx.device, dtype=idx.dtype)
     return (idx[:, None] == slots).to(dtype)
 
@@ -31,7 +33,7 @@ def _one_hot(idx: torch.Tensor, num_slots: int, dtype: torch.dtype) -> torch.Ten
 def bgmv_shrink(
     x: torch.Tensor,
     lora_a_stacked: torch.Tensor,
-    idx: torch.Tensor,
+    onehot: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
     """Projects each token into the rank space of its adapter.
@@ -39,7 +41,7 @@ def bgmv_shrink(
     Args:
         x: [T, d] activations.
         lora_a_stacked: [L, 1, r, d] LoRA A weights, one per slot.
-        idx: [T] slot of each token, -1 for none.
+        onehot: [T, L] mask from one_hot_slots, in the dtype of x.
         scale: Factor applied to the result.
 
     Returns:
@@ -51,21 +53,20 @@ def bgmv_shrink(
     )
     a = lora_a_stacked.squeeze(1)
     xa = torch.einsum("td,lrd->tlr", x, a)
-    onehot = _one_hot(idx, a.shape[0], x.dtype)
     return (xa * onehot[:, :, None]).sum(dim=1) * scale
 
 
 def bgmv_expand(
     buf: torch.Tensor,
     lora_b_stacked: torch.Tensor,
-    idx: torch.Tensor,
+    onehot: torch.Tensor,
 ) -> torch.Tensor:
     """Projects each token from rank space back out through its adapter.
 
     Args:
         buf: [T, r] output of bgmv_shrink.
         lora_b_stacked: [L, 1, out, r] LoRA B weights, one per slot.
-        idx: [T] slot of each token, -1 for none.
+        onehot: [T, L] mask from one_hot_slots, in the dtype of buf.
 
     Returns:
         [T, out], the LoRA delta alone; the caller adds it to the base output.
@@ -75,5 +76,4 @@ def bgmv_expand(
         f"{buf.dtype}; lora_dtype must match the model dtype"
     )
     b = lora_b_stacked.squeeze(1)
-    onehot = _one_hot(idx, b.shape[0], buf.dtype)
     return torch.einsum("tlr,lor->to", buf[:, None, :] * onehot[:, :, None], b)

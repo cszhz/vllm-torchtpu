@@ -16,7 +16,7 @@
 import pytest
 import torch
 
-from vllm_torchtpu.lora.lora_ops import bgmv_expand, bgmv_shrink
+from vllm_torchtpu.lora.lora_ops import bgmv_expand, bgmv_shrink, one_hot_slots
 
 NUM_SLOTS, RANK, HIDDEN, OUT = 3, 4, 16, 24
 # Every slot, -1 for no adapter, and NUM_SLOTS, which is out of range.
@@ -49,9 +49,10 @@ def test_shrink_and_expand_match_per_token_reference(dtype):
     lora_a = _stacked(RANK, HIDDEN, dtype)
     lora_b = _stacked(OUT, RANK, dtype)
     tol = {} if dtype == torch.float32 else {"rtol": 2e-2, "atol": 2e-2}
+    onehot = one_hot_slots(IDX, NUM_SLOTS, dtype)
 
-    shrunk = bgmv_shrink(x, lora_a, IDX, 0.5)
-    expanded = bgmv_expand(shrunk, lora_b, IDX)
+    shrunk = bgmv_shrink(x, lora_a, onehot, 0.5)
+    expanded = bgmv_expand(shrunk, lora_b, onehot)
 
     assert shrunk.dtype == dtype and shrunk.shape == (len(IDX), RANK)
     assert expanded.dtype == dtype and expanded.shape == (len(IDX), OUT)
@@ -65,9 +66,10 @@ def test_rows_without_a_slot_are_exactly_zero(dtype):
     the last slot the way a gather would."""
     x = torch.ones(len(IDX), HIDDEN, dtype=dtype)
     buf = torch.ones(len(IDX), RANK, dtype=dtype)
+    onehot = one_hot_slots(IDX, NUM_SLOTS, dtype)
 
-    shrunk = bgmv_shrink(x, _stacked(RANK, HIDDEN, dtype), IDX, 1.0)
-    expanded = bgmv_expand(buf, _stacked(OUT, RANK, dtype), IDX)
+    shrunk = bgmv_shrink(x, _stacked(RANK, HIDDEN, dtype), onehot, 1.0)
+    expanded = bgmv_expand(buf, _stacked(OUT, RANK, dtype), onehot)
 
     assert not shrunk[NO_SLOT].any()
     assert not expanded[NO_SLOT].any()
@@ -79,8 +81,9 @@ def test_dtype_mismatch_points_at_lora_dtype():
     lora_b = _stacked(OUT, RANK, torch.bfloat16)
     x = torch.randn(len(IDX), HIDDEN)
     buf = torch.randn(len(IDX), RANK)
+    onehot = one_hot_slots(IDX, NUM_SLOTS, x.dtype)
 
     with pytest.raises(AssertionError, match="lora_dtype must match the model dtype"):
-        bgmv_shrink(x, lora_a, IDX, 1.0)
+        bgmv_shrink(x, lora_a, onehot, 1.0)
     with pytest.raises(AssertionError, match="lora_dtype must match the model dtype"):
-        bgmv_expand(buf, lora_b, IDX)
+        bgmv_expand(buf, lora_b, onehot)

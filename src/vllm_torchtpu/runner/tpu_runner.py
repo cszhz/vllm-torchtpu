@@ -6544,13 +6544,13 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, self.max_num_tokens, self._pp_intermediate_template
             )
             self._pp_wave.warmup()
+        if self.enforce_eager:
+            return
         if self.lora_config is not None:
             lora_manager = self.lora_manager
             assert isinstance(lora_manager, TPUWorkerLoRAManager)
             with self._precompile_timed("LoRA adapter activation"):
                 lora_manager.precompile_activation()
-        if self.enforce_eager:
-            return
         with self.maybe_setup_dummy_loras(self.lora_config):
             with self._precompile_timed("model backbone"):
                 self._precompile_backbone()

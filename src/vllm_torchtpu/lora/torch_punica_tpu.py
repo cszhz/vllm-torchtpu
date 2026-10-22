@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 
-from vllm_torchtpu.lora.lora_ops import bgmv_expand, bgmv_shrink
+from vllm_torchtpu.lora.lora_ops import bgmv_expand, bgmv_shrink, one_hot_slots
 
 if TYPE_CHECKING:
     from vllm.lora.layers import LoRAMapping
@@ -109,7 +109,8 @@ class PunicaWrapperTPU(PunicaWrapperBase):
             (n_slices, num_tokens, max_lora_rank)
         """
         idx = self._token_lora_indices[: x.size(0)]
-        return torch.stack([bgmv_shrink(x, a, idx, scale) for a in lora_a_stacked])
+        onehot = one_hot_slots(idx, lora_a_stacked[0].shape[0], x.dtype)
+        return torch.stack([bgmv_shrink(x, a, onehot, scale) for a in lora_a_stacked])
 
     def add_expand(
         self,
@@ -149,8 +150,9 @@ class PunicaWrapperTPU(PunicaWrapperBase):
             f"output_slices {output_slices} do not match the LoRA B widths"
         )
         idx = self._token_lora_indices[: y.size(0)]
+        onehot = one_hot_slots(idx, lora_b_stacked[0].shape[0], x[0].dtype)
         delta = torch.cat(
-            [bgmv_expand(x[i], b, idx) for i, b in enumerate(lora_b_stacked)], dim=-1
+            [bgmv_expand(x[i], b, onehot) for i, b in enumerate(lora_b_stacked)], dim=-1
         )
         return _add_delta(y, delta, offset_start, add_inputs)
 
@@ -179,7 +181,9 @@ class PunicaWrapperTPU(PunicaWrapperBase):
         Returns:
             The updated y as a new tensor.
         """
-        delta = bgmv_expand(x, lora_b_stacked, self._token_lora_indices[: x.size(0)])
+        idx = self._token_lora_indices[: x.size(0)]
+        onehot = one_hot_slots(idx, lora_b_stacked.shape[0], x.dtype)
+        delta = bgmv_expand(x, lora_b_stacked, onehot)
         return _add_delta(y, delta, 0, add_inputs)
 
     def add_lora_linear(
@@ -252,8 +256,9 @@ class PunicaWrapperTPU(PunicaWrapperBase):
             The updated y as a new tensor.
         """
         idx = self._sampler_indices[: x.size(0)]
+        onehot = one_hot_slots(idx, lora_a_stacked.shape[0], x.dtype)
         delta = bgmv_expand(
-            bgmv_shrink(x, lora_a_stacked, idx, scale), lora_b_stacked, idx
+            bgmv_shrink(x, lora_a_stacked, onehot, scale), lora_b_stacked, onehot
         )
         return _add_delta(y, delta, 0, True)
 
