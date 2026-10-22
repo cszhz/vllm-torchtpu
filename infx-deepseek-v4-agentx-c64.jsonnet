@@ -105,6 +105,9 @@ local useVllmRouter =
 local vllmRouterVersion = cdk.var('VLLM_ROUTER_VERSION', '0.1.14');
 local vllmRouterPort = cdk.numVar('VLLM_ROUTER_PORT', 8090);
 local enablePrefixRouting = cdk.boolVar('ENABLE_PREFIX_ROUTING', !useVllmRouter);
+// c=160 release candidate, n=3 vs a same-batch n=3 control: 53.9/54.1/53.6k vs 51.4/51.3/50.8k tok/s/chip,
+// TTFT mean 15.4-16.2 vs 18.5-20.2 s, interactivity unchanged. Empty = off.
+local prefixRoutingNewSessionAffinity = cdk.var('PREFIX_ROUTING_NEW_SESSION_AFFINITY', '1');
 
 // --- Serving -----------------------------------------------------------------
 local port = cdk.numVar('PORT', 47903);
@@ -797,6 +800,7 @@ local serverJob = cdk.job(
         [if premappedBufferSize != 'none' then 'TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES']: premappedBufferSize,
         TPU_LOG_HOST_TENSORS_AFTER_LOAD: logHostTensorsAfterLoad,
         TPU_STEP_TIMING_LOG_STEPS: stepTimingLogSteps,
+        [if prefixRoutingNewSessionAffinity != '' then 'PREFIX_ROUTING_NEW_SESSION_AFFINITY']: prefixRoutingNewSessionAffinity,
         [if expertPlacement != '' then 'TPU_EXPERT_PLACEMENT']: expertPlacement,
         [if srptAttnWorkCap != '' then 'VLLM_TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
         [if hcaKvPagesPerBlock != '' then 'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK']: hcaKvPagesPerBlock,
