@@ -114,3 +114,76 @@ def test_moe_routed_ffn_matches_grouped_path(num_tokens, seed, rank, concentrate
     np.testing.assert_allclose(got, want, rtol=1e-2, atol=1e-2 * np.abs(want).max())
     assert np.mean(got == want) > 0.99
     assert np.all(got[(ids < 0).all(axis=1)] == 0)
+
+
+@pytest.mark.parametrize("num_tokens", [16, 128, 512])
+@pytest.mark.parametrize("ranks", [1, 8])
+def test_prequantized_dispatch_is_bitexact(num_tokens, ranks):
+    """Rows quantized per rank and dispatched give the bf16 path's exact output."""
+    _require_tpu()
+    from vllm_torchtpu.kernels.megablox import moe_local_dispatch as dispatch
+    from vllm_torchtpu.kernels.megablox.moe_routed_ffn import (
+        _f32_scale,
+        make_routed_ffn_configs,
+        quantize_rows,
+    )
+
+    rng = np.random.default_rng(num_tokens)
+    x = rng.standard_normal((num_tokens, SIZE_K)) * rng.choice(
+        [1e-3, 1, 30], (num_tokens, 1)
+    )
+    x[1] = 0  # zero block scale
+    x = jnp.asarray(x, jnp.bfloat16)
+    w1 = jnp.asarray(
+        rng.standard_normal((NUM_EXPERTS, SIZE_K, 2 * SIZE_I)) * 0.5, jnp.float8_e4m3fn
+    )
+    w2 = jnp.asarray(
+        rng.standard_normal((NUM_EXPERTS, SIZE_I, SIZE_K)) * 0.5, jnp.float8_e4m3fn
+    )
+    w1_scale = jnp.asarray(
+        rng.uniform(0.02, 0.2, (NUM_EXPERTS, 1, 1, 2 * SIZE_I)), jnp.float32
+    )
+    w2_scale = jnp.asarray(
+        rng.uniform(0.01, 0.1, (NUM_EXPERTS, 1, 1, SIZE_K)), jnp.float32
+    )
+    ids = np.stack(
+        [rng.permutation(EP * NUM_EXPERTS)[:TOPK] for _ in range(num_tokens)]
+    ).astype(np.int32)
+    ids = jnp.asarray(ids)
+    weights = jnp.asarray(rng.uniform(0, 0.5, (num_tokens, TOPK)), jnp.bfloat16)
+    start = jnp.int32(NUM_EXPERTS)
+    lhs = make_routed_ffn_configs(
+        x, w1, _f32_scale(w1_scale), w2, _f32_scale(w2_scale), fuse_act="silu"
+    )[0].lhs_cfgs
+
+    words = []
+    for part in np.split(np.arange(num_tokens), ranks):
+        x_q, scales = quantize_rows(
+            x[part], q_dtype=lhs.quant_dtype, block=lhs.quant_block_size
+        )
+        meta = dispatch._meta(scales, ids[part], weights[part], x.dtype)
+        words.append(dispatch._pack_words(x_q, meta))
+    rows = dispatch._unpack_words(
+        jnp.concatenate(words), SIZE_K, lhs.quant_dtype, x.dtype
+    )
+    _, got_ids, got_weights = dispatch.split_dispatched(rows, SIZE_K, TOPK)
+    np.testing.assert_array_equal(np.asarray(got_ids), np.asarray(ids))
+
+    want = moe_routed_ffn(
+        x, ids, weights, w1, w1_scale, w2, w2_scale, start, fuse_act="silu"
+    )
+    got = moe_routed_ffn(
+        rows,
+        got_ids,
+        got_weights,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        start,
+        fuse_act="silu",
+        prequantized=True,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
+    )

@@ -26,6 +26,10 @@ accumulated in f32. No EP mask, sort, permute or combine runs around it.
 Each route's expert output is rounded to the out dtype before weighting, as
 the grouped-GEMM path rounds `gmm2_res`, and a token's experts are summed in
 ascending expert id, the order of that path's expert-sorted combine rows.
+
+With `prequantized`, the tokens arrive already quantized by `quantize_rows`,
+which is the kernel's own lhs quantization run where the tokens are produced,
+so a caller can move the quantized rows instead of the bf16 ones.
 """
 
 import functools
@@ -42,6 +46,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     WeightsRef,
     align_to,
     apply_act_fn,
+    quantize_lhs_block,
     tile_matmul,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2_ffn import make_ffn_configs
@@ -56,6 +61,9 @@ _UP, _DOWN = (0, 1), (2, 3)
 # A route is stored as token << _K_BITS | top-k slot.
 _K_BITS = 5
 MAX_TOPK = 1 << _K_BITS
+# Lanes after the hidden size in a prequantized token row; the first hold the
+# row's lhs block scales.
+LHS_SCALE_LANES = 128
 
 
 def _default_vmem_limit() -> int:
@@ -72,7 +80,9 @@ def _chunk_rows(num_tokens: int, dtype: jnp.dtype) -> int:
     return min(ROW_CHUNK, 1 << (rows - 1).bit_length())
 
 
-def _vmem_estimate(up: GmmConfigs, down: GmmConfigs, nbuf: int) -> int:
+def _vmem_estimate(
+    up: GmmConfigs, down: GmmConfigs, nbuf: int, prequantized: bool = False
+) -> int:
     tokens = up.dims.size_m
     rows = _chunk_rows(tokens, up.lhs_cfgs.dtype)
     hidden, inter = down.out_size_n, up.out_size_n
@@ -88,6 +98,9 @@ def _vmem_estimate(up: GmmConfigs, down: GmmConfigs, nbuf: int) -> int:
     total += rows * hidden * 4  # one chunk's gathered rows, then its outputs
     total += rows * 2 * inter * (4 + 4) + rows * hidden * 4  # tile values
     total += 2 * align_to(tokens, 8) * 128 * 4  # routing ids and weights
+    if prequantized:
+        # The scale lanes ride along in the token buffers and gathered rows.
+        total += LHS_SCALE_LANES * (tokens * (2 + 4) + rows * 4)
     return int(total)
 
 
@@ -100,6 +113,7 @@ def make_routed_ffn_configs(
     *,
     fuse_act: str,
     vmem_limit_bytes: int | None = None,
+    prequantized: bool = False,
 ) -> tuple[GmmConfigs, GmmConfigs, int] | None:
     """gmm_v2 configs for both legs over all padded token rows and the number
     of expert weight slots, or None.
@@ -130,10 +144,53 @@ def make_routed_ffn_configs(
     )
     if cfgs is None:
         return None
+    up = cfgs[0]
+    if prequantized and not (
+        up.lhs_cfgs.should_quantize
+        and up.tiles.tile_k == size_k
+        and size_k // up.lhs_cfgs.quant_block_size <= LHS_SCALE_LANES
+    ):
+        return None
     for nbuf in range(MAX_NBUF, 1, -1):
-        if _vmem_estimate(*cfgs, nbuf) <= vmem_limit_bytes:
+        if _vmem_estimate(*cfgs, nbuf, prequantized) <= vmem_limit_bytes:
             return (*cfgs, nbuf)
     return None
+
+
+def _quantize_rows_kernel(x_ref, q_ref, s_ref, *, q_dtype: jnp.dtype, block: int):
+    for b in range(x_ref.shape[1] // block):
+        cols = pl.ds(b * block, block)
+        q, scale = quantize_lhs_block(x_ref[:, cols], q_dtype)
+        q_ref[:, cols] = q
+        s_ref[:, b : b + 1] = scale
+
+
+@jax.jit(static_argnames=["q_dtype", "block"])
+def quantize_rows(
+    hidden_states: jax.Array,  # [T, H]
+    *,
+    q_dtype: jnp.dtype,
+    block: int,
+) -> tuple[jax.Array, jax.Array]:
+    """The routed kernel's gate/up lhs quantization of each token row.
+
+    `q_dtype` and `block` are the gate/up config's `lhs_cfgs.quant_dtype` and
+    `quant_block_size` from `make_routed_ffn_configs`. Returns the quantized
+    rows [T, H] and their block scales [T, H / block], the values the kernel
+    computes from these rows, so `moe_routed_ffn` with `prequantized` gives the
+    same output. Row-local: a token's result does not depend on which or how
+    many other tokens are quantized with it. It runs the kernel's own
+    quantization code as a Pallas kernel, so both are compiled the same way.
+    """
+    num_tokens, hidden = hidden_states.shape
+    return pl.pallas_call(
+        functools.partial(_quantize_rows_kernel, q_dtype=q_dtype, block=block),
+        out_shape=(
+            jax.ShapeDtypeStruct((num_tokens, hidden), q_dtype),
+            jax.ShapeDtypeStruct((num_tokens, hidden // block), hidden_states.dtype),
+        ),
+        name=f"moe_routed_ffn_quantize_rows-m_{num_tokens}-k_{hidden}",
+    )(hidden_states)
 
 
 def _row_buckets(rows: int, base: int) -> list[int]:
@@ -194,7 +251,7 @@ def _routed_ffn_kernel(
     # In
     ids_hbm: jax.Array,  # int32[T, topk]: global expert ids
     rw_hbm: jax.Array,  # [T, topk]: routing weights
-    x_hbm: jax.Array,  # [T, H]
+    x_hbm: jax.Array,  # [T, H], or prequantized [T, H + LHS_SCALE_LANES]
     w1_hbm: jax.Array,  # [E, H, 2 * I]: gate then up
     s1_hbm: jax.Array,  # f32[E, blocks, 1, 2 * I]
     w2_hbm: jax.Array,  # [E, I, H]
@@ -207,10 +264,10 @@ def _routed_ffn_kernel(
     w2_vm: jax.Array,  # [nbuf, I, H]
     s2_vm: jax.Array,  # [nbuf, blocks, 1, H]
     sems: jax.Array,  # DMA[4, nbuf]
-    x_vm: jax.Array,  # [T, H]: the tokens, then the output
+    x_vm: jax.Array,  # like x_hbm: the tokens, then the output
     x_sem: jax.Array,  # DMA
-    x32_vm: jax.Array,  # f32[T, H]
-    rows_vm: jax.Array,  # f32[rows, H]: one chunk's gathered rows, then outputs
+    x32_vm: jax.Array,  # f32, like x_hbm
+    rows_vm: jax.Array,  # f32[rows, x_hbm width]: a chunk's gathered rows, then outputs
     acc_vm: jax.Array,  # f32[T, H]
     ids_vm: jax.Array,  # int32[T, topk]
     rw_vm: jax.Array,  # [T, topk]
@@ -234,6 +291,9 @@ def _routed_ffn_kernel(
     num_experts = visit_sm.shape[0]
     num_rows = rows_vm.shape[0]
     inter = up.out_size_n
+    hidden = out_hbm.shape[1]
+    prequantized = x_vm.shape[1] > hidden
+    num_scales = hidden // up.lhs_cfgs.quant_block_size
     pairs = ((w1_hbm, w1_vm), (s1_hbm, s1_vm), (w2_hbm, w2_vm), (s2_hbm, s2_vm))
 
     def copy(i, expert, slot):
@@ -366,17 +426,26 @@ def _routed_ffn_kernel(
                 matmul = functools.partial(
                     tile_matmul, bucket_m=bucket_m, is_last_k_step=True
                 )
-                lhs = rows_vm[:bucket_m, :].astype(x_vm.dtype)
-                hidden = apply_act_fn(matmul(lhs, w13, cfgs=up), up.fuse_act)
+                lhs = rows_vm[:bucket_m, :hidden].astype(x_vm.dtype)
+                lhs_scale = (
+                    rows_vm[:bucket_m, hidden : hidden + num_scales].astype(x_vm.dtype)
+                    if prequantized
+                    else None
+                )
+                act = apply_act_fn(
+                    matmul(lhs, w13, cfgs=up, lhs_scale=lhs_scale), up.fuse_act
+                )
 
                 # The last expert's gate/up runs while its down weights land.
                 @pl.when(c == 0)
                 def _():
                     wait(slot, _DOWN)
 
-                acc = matmul(hidden.astype(up.out_dtype), w2, cfgs=down)
+                acc = matmul(act.astype(up.out_dtype), w2, cfgs=down)
                 # The per-route output is rounded where the grouped path stores it.
-                rows_vm[:bucket_m, :] = acc.astype(down.out_dtype).astype(jnp.float32)
+                rows_vm[:bucket_m, :hidden] = acc.astype(down.out_dtype).astype(
+                    jnp.float32
+                )
 
             bucket_idx = sum((n > b).astype(jnp.int32) for b in buckets[:-1])
             lax.switch(bucket_idx, [functools.partial(run_rows, b) for b in buckets])
@@ -392,7 +461,7 @@ def _routed_ffn_kernel(
                 route = route_sm[first + i]
                 token, k = route >> _K_BITS, route & ((1 << _K_BITS) - 1)
                 acc_vm[pl.ds(token, 1), :] += (
-                    weights_sm[k, token] * rows_vm[pl.ds(i, 1), :]
+                    weights_sm[k, token] * rows_vm[pl.ds(i, 1), :hidden]
                 )
 
             return carry
@@ -401,8 +470,9 @@ def _routed_ffn_kernel(
         return carry
 
     lax.fori_loop(0, n_visit, visit, 0)
-    x_vm[...] = acc_vm[...].astype(x_vm.dtype)
-    out_copy = pltpu.make_async_copy(x_vm, out_hbm, x_sem)
+    out_vm = x_vm.at[:, pl.ds(0, hidden)]
+    out_vm[...] = acc_vm[...].astype(x_vm.dtype)
+    out_copy = pltpu.make_async_copy(out_vm, out_hbm, x_sem)
     out_copy.start()
     out_copy.wait()
 
@@ -413,9 +483,16 @@ def _f32_scale(scale: jax.Array) -> jax.Array:
     return scale.astype(jnp.float32)
 
 
-@jax.jit(static_argnames=["fuse_act", "skip_zero_weights", "vmem_limit_bytes"])
+@jax.jit(
+    static_argnames=[
+        "fuse_act",
+        "skip_zero_weights",
+        "vmem_limit_bytes",
+        "prequantized",
+    ]
+)
 def moe_routed_ffn(
-    hidden_states: jax.Array,  # [T, H]
+    hidden_states: jax.Array,  # [T, H], or prequantized [T, H + LHS_SCALE_LANES]
     topk_ids: jax.Array,  # int32[T, topk]: global expert ids
     topk_weights: jax.Array,  # [T, topk]
     w1: jax.Array,  # [E, H, 2 * I]: gate then up along the last dim
@@ -427,24 +504,32 @@ def moe_routed_ffn(
     fuse_act: str,
     skip_zero_weights: bool = False,
     vmem_limit_bytes: int | None = None,
+    prequantized: bool = False,
 ) -> jax.Array:
     """sum_k w[t, k] * ffn_{ids[t, k]}(x[t]) over the routes local to this rank.
 
     A route is local if its id is in [experts_start, experts_start + E) and,
     with `skip_zero_weights`, its weight is nonzero. Only for shapes
-    `make_routed_ffn_configs` accepts.
+    `make_routed_ffn_configs` accepts. With `prequantized`, a token row is
+    `quantize_rows`'s values, then its block scales, then unread lanes, all in
+    the hidden dtype; the output is [T, H].
     """
     if vmem_limit_bytes is None:
         vmem_limit_bytes = _default_vmem_limit()
     w1_scale, w2_scale = _f32_scale(w1_scale), _f32_scale(w2_scale)
+    num_tokens, width = hidden_states.shape
+    hidden = w1.shape[1]
+    if width != hidden + (LHS_SCALE_LANES if prequantized else 0):
+        raise ValueError(f"moe_routed_ffn: {hidden_states.shape=} for {w1.shape=}")
     cfgs = make_routed_ffn_configs(
-        hidden_states,
+        jax.ShapeDtypeStruct((num_tokens, hidden), hidden_states.dtype),
         w1,
         w1_scale,
         w2,
         w2_scale,
         fuse_act=fuse_act,
         vmem_limit_bytes=vmem_limit_bytes,
+        prequantized=prequantized,
     )
     if cfgs is None or topk_ids.shape[1] > MAX_TOPK:
         raise ValueError(
@@ -453,7 +538,6 @@ def moe_routed_ffn(
             "MAX_TOPK before calling it."
         )
     up, down, nbuf = cfgs
-    num_tokens, hidden = hidden_states.shape
     topk = topk_ids.shape[1]
     num_experts = w1.shape[0]
     rows = _chunk_rows(num_tokens, hidden_states.dtype)
@@ -466,10 +550,10 @@ def moe_routed_ffn(
         pltpu.VMEM((nbuf, *w2.shape[1:]), w2.dtype),
         pltpu.VMEM((nbuf, *w2_scale.shape[1:]), jnp.float32),
         pltpu.SemaphoreType.DMA((4, nbuf)),
-        pltpu.VMEM((num_tokens, hidden), hidden_states.dtype),
+        pltpu.VMEM((num_tokens, width), hidden_states.dtype),
         pltpu.SemaphoreType.DMA(()),
-        pltpu.VMEM((num_tokens, hidden), jnp.float32),
-        pltpu.VMEM((rows, hidden), jnp.float32),
+        pltpu.VMEM((num_tokens, width), jnp.float32),
+        pltpu.VMEM((rows, width), jnp.float32),
         pltpu.VMEM((num_tokens, hidden), jnp.float32),
         pltpu.VMEM((num_tokens, topk), jnp.int32),
         pltpu.VMEM((num_tokens, topk), topk_weights.dtype),
@@ -490,6 +574,7 @@ def moe_routed_ffn(
     name = (
         f"gmm_v2_routed_ffn-g_{num_experts}-m_{num_tokens}-k_{hidden}"
         f"-i_{up.out_size_n}-n_{down.out_size_n}-act_{fuse_act}-b_{nbuf}"
+        f"{'-q' if prequantized else ''}"
     )
     return pl.pallas_call(
         functools.partial(
