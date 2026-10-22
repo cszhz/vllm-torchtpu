@@ -1,3 +1,4 @@
+import dataclasses
 import functools
 import math
 from collections.abc import Callable
@@ -1195,6 +1196,7 @@ def sparse_mla_attention_dcp(
     dcp_lane_ids: jax.Array | None = None,
     fused_merge: bool = False,
     merge_pieces: bool = True,
+    kv_stack: tuple[int, int] | None = None,
 ) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1245,6 +1247,16 @@ def sparse_mla_attention_dcp(
       merge_pieces: TPU_DCP_MLA_MERGE_PIECES may split the output into the
         merge's chunks. False for a caller that reads it whole: joining the
         pieces is a copy.
+
+      kv_stack: GLM5_MKD_STACK_C. `(row, num_blocks)` when the caches are the
+        stacked `[n_layers, num_blocks, ...]` pair shared by every layer
+        (each rank's shard is its own stack) and this layer is `row`; the
+        specs still describe one layer. Each rank merges its stack into one
+        `[n_layers * num_blocks, ...]` page pool (a bitcast) and rewrites the
+        block table into this layer's pages (`stack_page_table_dcp`), so the
+        writer, the gather (incl. TPU_MLA_KV_WRITE_IN_GATHER) and the kernel
+        run unchanged on specs whose `num_pages` is the merged pool; the
+        returned caches are the whole stacks. None: per-layer caches.
 
     TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
     write is not a kernel of its own; the SparseCore gather that feeds the
@@ -1356,7 +1368,9 @@ def sparse_mla_attention_dcp(
     cache_layout = nope_spec.layout.value
     packed_rope_kwargs = {"packed_rope": True} if rope_spec.packed_rope else {}
 
-    def _local(
+    def _local_layer(
+        nope_spec,
+        rope_spec,
         ql_nope,
         q_pe,
         kv_c_normed,
@@ -1370,6 +1384,8 @@ def sparse_mla_attention_dcp(
         request_distribution_,
         *extra_,
     ):
+        # `nope_spec` / `rope_spec` shadow the outer specs: `_local` passes
+        # them, with `num_pages` the merged pool under GLM5_MKD_STACK_C.
         # Trailing operands, in order: the q rope table (TPU_MLA_DECODE_PROLOGUE),
         # then this shard's DCP rank (TPU_DCP_RANK_OPERAND), then its lane
         # (TPU_MLA_FUSED_SMALL_A2A).
@@ -1657,6 +1673,67 @@ def sparse_mla_attention_dcp(
             lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)
+
+    def _local(
+        ql_nope,
+        q_pe,
+        kv_c_normed,
+        k_pe,
+        kv_cache_nope,
+        kv_cache_rope,
+        topk_idx,
+        seq_lens_,
+        block_tables_,
+        *rest_,
+    ):
+        if kv_stack is None:
+            return _local_layer(
+                nope_spec,
+                rope_spec,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                seq_lens_,
+                block_tables_,
+                *rest_,
+            )
+        # GLM5_MKD_STACK_C: this rank's stacks as one page pool (bitcasts), the
+        # block table rewritten into this layer's pages; every return path of
+        # `_local_layer` leads with the two caches, split back here.
+        stacked_shapes = (kv_cache_nope.shape, kv_cache_rope.shape)
+        kv_cache_nope = kv_cache_utils.merge_kv_stack(kv_cache_nope, kv_stack)
+        kv_cache_rope = kv_cache_utils.merge_kv_stack(kv_cache_rope, kv_stack)
+        block_tables_ = kv_cache_utils.stack_page_table_dcp(block_tables_, kv_stack)
+        # Same per-page geometry, a pool of n_layers * num_blocks pages.
+        local_nope_spec = dataclasses.replace(
+            nope_spec, num_pages=kv_cache_nope.shape[0]
+        )
+        local_rope_spec = dataclasses.replace(
+            rope_spec, num_pages=kv_cache_rope.shape[0]
+        )
+        outs = _local_layer(
+            local_nope_spec,
+            local_rope_spec,
+            ql_nope,
+            q_pe,
+            kv_c_normed,
+            k_pe,
+            kv_cache_nope,
+            kv_cache_rope,
+            topk_idx,
+            seq_lens_,
+            block_tables_,
+            *rest_,
+        )
+        return (
+            kv_cache_utils.split_kv_stack(outs[0], stacked_shapes[0]),
+            kv_cache_utils.split_kv_stack(outs[1], stacked_shapes[1]),
+            *outs[2:],
+        )
 
     rank_args = () if dcp_rank_ids is None else (dcp_rank_ids,)
     if rank_args:

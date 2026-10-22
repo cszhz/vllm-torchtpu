@@ -1,0 +1,434 @@
+# Copyright 2026 Google LLC
+# SPDX-License-Identifier: Apache-2.0
+"""CPU checks of the glm52_decode_mk W4 step guard and the served cache-form binding (WHITEBOARD.v3 §8 W4).
+
+The predicate is `classify_step` (pure), the served cache form is `stacked_groups_plan` + `bind_caches`, and the
+runner contract is `step_ok` (one counted decision per scheduled step) + `try_call` (consumes it, falls back to
+stock on a call-time mismatch). None of this needs a TPU: the megakernel's step program is stubbed.
+"""
+
+import dataclasses
+import types
+
+import pytest
+import torch
+
+from vllm_torchtpu.kernels.glm52_decode_mk import config as C
+from vllm_torchtpu.kernels.glm52_decode_mk import vllm_adapter as VA
+from vllm_torchtpu.kernels.glm52_decode_mk.vllm_adapter import (
+    REASONS,
+    Glm52DecodeMK,
+    Unsupported,
+    classify_step,
+    stacked_groups_plan,
+)
+
+ROWS = [16, 32]
+
+
+def _cls(reqs, **kw):
+    a = dict(num_chunks=1, has_encoder=False, qmax=4, rows=ROWS, bmax=8)
+    a.update(kw)
+    return classify_step(reqs, **a)
+
+
+def V(n):                       # a verify request with n rows (n - 1 drafts), past its prompt
+    return (n, n - 1, False)
+
+
+# ------------------------------------------------------------------ classify_step
+
+
+@pytest.mark.parametrize("reqs, bucket", [
+    ([V(4)] * 4, 16),           # dec-b16: 4 requests x 4 rows
+    ([V(4)], 16),
+    ([V(2), V(3), V(4)], 16),   # ragged verify rows
+    ([V(4)] * 5, 32),           # 20 tokens
+    ([V(4)] * 8, 32),           # dec-b32
+    ([V(3)] * 5, 32),           # 15 tokens fit 16, but 5 requests > 16 // QMAX: the kernel's row contract
+    ([V(2)] * 4, 16),
+])
+def test_eligible_steps_engage(reqs, bucket):
+    assert _cls(reqs)[:2] == (bucket, "mk")
+
+
+@pytest.mark.parametrize("reqs, kw, reason", [
+    ([(1500, 0, True)], {}, "prefill"),                     # prefill chunk
+    ([(3, 0, True)], {}, "prefill"),                        # a 3-token prompt tail after a prefix-cache hit
+    ([(4, 0, True), (4, 0, True)], {}, "prefill"),          # verify-sized prefill chunks: no drafts
+    ([V(4), V(4), (900, 0, True)], {}, "mixed"),            # decode + a new request's prefill
+    ([V(4), (1, 0, False)], {}, "mixed"),                   # one request lost its drafts
+    ([(1, 0, False)] * 3, {}, "no_draft"),                  # plain decode, q_len 1
+    ([(4, 3, True)], {}, "prefill"),                        # drafts on a request still in its prompt: never verify
+    ([(3, 3, False)], {}, "prefill"),                       # scheduled != 1 + drafts
+    ([V(5)], {}, "q_len"),                                  # more rows than MTP 3 verify
+    ([V(4)] * 9, {"bmax": 8}, "over_reqs"),
+    ([V(4)] * 4, {"rows": [16]}, "mk"),
+    ([V(4)] * 5, {"rows": [16]}, "over_bucket"),            # only the 16 bucket built
+    ([V(4)] * 4, {"num_chunks": 2}, "multi_chunk"),
+    ([V(4)] * 4, {"has_encoder": True}, "encoder"),
+    ([], {}, "no_draft"),
+])
+def test_ineligible_steps_decline(reqs, kw, reason):
+    bucket, why, detail = _cls(reqs, **kw)
+    assert why == reason, detail
+    assert (bucket is None) == (reason != "mk")
+    assert why in REASONS
+
+
+def test_every_reason_is_named():
+    assert len(set(REASONS)) == len(REASONS)
+
+
+# ------------------------------------------------------------------ stacked_groups_plan
+
+
+def _binds(n_layers, gs):
+    return [(i // gs, i % gs) for i in range(n_layers)]
+
+
+def test_served_groups_2x39_1x21():
+    b = {"nope": _binds(78, 39), "rope": _binds(78, 39), "idx": _binds(21, 21)}
+    s = {"nope": [39, 39], "rope": [39, 39], "idx": [21]}
+    assert stacked_groups_plan(b, s) == {"nope": 2, "rope": 2, "idx": 1}
+
+
+@pytest.mark.parametrize("mutate, msg", [
+    (lambda b, s: s.update(nope=[40, 38], rope=[40, 38]), "not equal"),                  # unequal split
+    (lambda b, s: b["nope"].__setitem__(5, (0, 6)), "want 0 row 5"),                     # a layer on the wrong row
+    (lambda b, s: b["idx"].__setitem__(0, (1, 0)), "want 0 row 0"),
+    (lambda b, s: (s.update(rope=[78]), b.update(rope=_binds(78, 78))), "nope groups"),  # nope / rope differ
+    (lambda b, s: s.pop("idx"), "no idx"),
+    (lambda b, s: b["nope"].pop(), "77 layers bound"),
+    (lambda b, s: (s.update(nope=[13] * 6, rope=[13] * 6), b.update(nope=_binds(78, 13), rope=_binds(78, 13))),
+     "untimed"),
+])
+def test_bad_groups_decline(mutate, msg):
+    b = {"nope": _binds(78, 39), "rope": _binds(78, 39), "idx": _binds(21, 21)}
+    s = {"nope": [39, 39], "rope": [39, 39], "idx": [21]}
+    mutate(b, s)
+    with pytest.raises(Unsupported, match=msg):
+        stacked_groups_plan(b, s)
+
+
+# ------------------------------------------------------------------ the A0-10 pool guard (load time)
+
+
+def _owner_pages_bruteforce(seq, page=256, R=16, ilv=4):
+    # rank 0 owns position p iff (p % (R * ilv)) // ilv == 0 (config.FullCfg.owner): count, then pages
+    n = sum(1 for p in range(seq) if (p % (R * ilv)) // ilv == 0)
+    return -(-n // page)
+
+
+@pytest.mark.parametrize("seq", [1, 3, 4, 5, 63, 64, 65, 68, 69, 4095, 4096, 4097, 16383, 16384, 16385, 65536, 65537,
+                                 131072, 131073])
+def test_rank0_pages_matches_ownership(seq):
+    assert VA.rank0_pages(seq, page=256, R=16, ilv=4) == _owner_pages_bruteforce(seq)
+    assert VA.rank0_pages(seq, page=1, R=16, ilv=4) == _owner_pages_bruteforce(seq, page=1)   # token-exact
+
+
+def test_rank0_pages_monotone():
+    p = [VA.rank0_pages(s, page=256, R=16, ilv=4) for s in range(1, 40000, 7)]
+    assert all(a <= b for a, b in zip(p, p[1:]))
+
+
+def test_pool_guard_served_lengths_pass():
+    # 640K served, the 1M twin: 160 / 256 rank-0 pages against the production pool 1344
+    assert VA.check_pool(655360, {16: 1344, 32: 1344}, page=256, R=16, ilv=4) == 160
+    assert VA.check_pool(1 << 20, {16: 1344, 32: 1344}, page=256, R=16, ilv=4) == 256
+
+
+def test_pool_guard_refuses_overflow():
+    # a request one page past the pool: the DSA wave would overflow b_keys / b_blk (A0-10) -> no megakernel
+    mml = 1344 * 256 * 16 + 1          # 1345 rank-0 pages
+    assert VA.rank0_pages(mml, page=256, R=16, ilv=4) == 1345
+    with pytest.raises(Unsupported, match="pool guard"):
+        VA.check_pool(mml, {16: 1344, 32: 1344}, page=256, R=16, ilv=4)
+    with pytest.raises(Unsupported, match=r"b32"):     # any bucket's smaller pool refuses
+        VA.check_pool(1 << 20, {16: 1344, 32: 255}, page=256, R=16, ilv=4)
+    assert VA.check_pool(1344 * 256 * 16, {16: 1344}, page=256, R=16, ilv=4) == 1344   # exactly full: allowed
+
+
+def test_pool_guard_is_wired_at_load():
+    src = __import__("inspect").getsource(VA.Glm52DecodeMK.__init__)
+    assert "self.pool_pages = check_pool(mml, {t: tl.pool for t, tl in self.tiles_by_rows.items()}" in src
+
+
+# ------------------------------------------------------------------ bind_caches on fake modules
+
+L, NB, NBI = 6, 2, 3
+CFG = dataclasses.replace(C.FULL, L=L, first_dense=1, idx_freq=4, idx_skip=3)   # fresh indexer layers 0, 1, 2
+IDX = [l for l in range(L) if CFG.full_indexer(l)]
+
+
+class _Attn(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.W_UK_T = self.W_UV = None
+        self.kv_cache = None
+        self.kv_stack = None
+
+
+class _KCache(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.kv_cache = None
+        self.kv_stack = None
+
+
+class _SelfAttn(torch.nn.Module):
+    def __init__(self, has_idx):
+        super().__init__()
+        self.attn = _Attn()
+        if has_idx:
+            self.indexer = torch.nn.Module()
+            self.indexer.k_cache = _KCache()
+
+
+def _shape(kind, nb):
+    return {"nope": (nb, 256, 128), "rope": (nb, 64, 128), "idx": (nb, CFG.IREC // 4, 4, 256)}[kind]
+
+
+def _dtype(kind):
+    return torch.uint8 if kind == "idx" else torch.uint32
+
+
+def _mk(stack=None, perlayer=False, groups_nope=2):
+    """A Glm52DecodeMK with fake layers; stack: runner-stacked groups (nope / rope `groups_nope`, idx 1)."""
+    mk = object.__new__(Glm52DecodeMK)
+    mk.cfg = CFG
+    mk.rows = ROWS
+    mk.cfgs = {t: dataclasses.replace(CFG, TMAX=t) for t in ROWS}
+    mk.rank = 0
+    mk.enabled = True
+    mk.counts = {r: 0 for r in REASONS}
+    mk.decisions = mk.consumed = mk.calls = 0
+    mk.log_every = 0
+    mk.unbound = "capture_model has not bound the caches"
+    mk.cache_form = None
+    mk.call_shapes, mk.warm_shapes = {}, {}
+    mk._steps = {}
+    mk.dense, mk.experts, mk.max_pages = [], [], 256
+    mk.smalls = torch.zeros(1)
+    layers = [types.SimpleNamespace(self_attn=_SelfAttn(l in IDX)) for l in range(L)]
+    mk.backbone = types.SimpleNamespace(layers=layers)
+    runner = types.SimpleNamespace(glm5_kv_stack_groups={})
+    if stack is None:
+        for l, ly in enumerate(layers):
+            sa = ly.self_attn
+            sa.attn.kv_cache = (torch.zeros(_shape("nope", NB), dtype=torch.uint32),
+                                torch.zeros(_shape("rope", NB), dtype=torch.uint32))
+            if l in IDX:
+                sa.indexer.k_cache.kv_cache = torch.zeros(_shape("idx", NBI), dtype=torch.uint8)
+    else:
+        gs = L // groups_nope
+        g = {k: [] for k in ("nope", "rope", "idx")}
+        for gi in range(groups_nope):
+            names = list(range(gi * gs, (gi + 1) * gs))
+            for k in ("nope", "rope"):
+                g[k].append((torch.zeros((gs,) + _shape(k, NB), dtype=torch.uint32), names))
+        g["idx"].append((torch.zeros((len(IDX),) + _shape("idx", NBI), dtype=torch.uint8), IDX))
+        for l, ly in enumerate(layers):
+            sa = ly.self_attn
+            sa.attn.kv_cache = (g["nope"][l // gs][0], g["rope"][l // gs][0])
+            sa.attn.kv_stack = (l % gs, NB)
+            if l in IDX:
+                sa.indexer.k_cache.kv_cache = g["idx"][0][0]
+                sa.indexer.k_cache.kv_stack = (IDX.index(l), NBI)
+        runner.glm5_kv_stack_groups = g
+        stack(g, layers)
+    built = []
+    mk._build_op = lambda cfg: built.append(cfg.TMAX) or _FakeStep(mk, cfg.TMAX)
+    return mk, runner, built
+
+
+class _FakeStep:
+    def __init__(self, mk, T):
+        self.mk, self.T = mk, T
+        self.n = 0
+
+    def __call__(self, ids, pos, qsl, seq, bt, smalls, weights, caches):
+        self.n += 1
+        assert caches is self.mk.caches
+        return torch.full((self.T, 8), 7.0)
+
+
+def test_bind_stacked_served_form():
+    mk, runner, built = _mk(stack=lambda g, layers: None)
+    mk.bind_caches(runner)
+    assert mk.unbound is None and mk.cache_form == "stacked"
+    assert mk.groups == {"nope": 2, "rope": 2, "idx": 1}
+    g = runner.glm5_kv_stack_groups
+    want = [t for k in ("nope", "rope", "idx") for t, _ in g[k]]
+    assert len(mk.caches) == len(want) and all(a is b for a, b in zip(mk.caches, want))   # operand order
+    assert built == ROWS
+
+
+def test_bind_stacked_one_group():
+    mk, runner, _ = _mk(stack=lambda g, layers: None, groups_nope=1)
+    mk.bind_caches(runner)
+    assert mk.unbound is None and mk.groups == {"nope": 1, "rope": 1, "idx": 1}
+
+
+def _swap_rows(g, layers):
+    layers[1].self_attn.attn.kv_stack, layers[2].self_attn.attn.kv_stack = (2, NB), (1, NB)
+
+
+def _partial(g, layers):
+    layers[4].self_attn.attn.kv_stack = None
+
+
+def _foreign(g, layers):
+    t = g["nope"][0][0]
+    layers[0].self_attn.attn.kv_cache = (t.clone(), layers[0].self_attn.attn.kv_cache[1])
+
+
+@pytest.mark.parametrize("stack, msg", [
+    (_swap_rows, "row 2, want 0 row 1"),
+    (_partial, "partly stacked"),
+    (_foreign, "not bound to a runner group tensor"),
+])
+def test_bind_stacked_mismatch_stays_unbound(stack, msg):
+    mk, runner, built = _mk(stack=stack)
+    mk.bind_caches(runner)                         # never raises
+    assert mk.unbound is not None and msg in mk.unbound, mk.unbound
+    assert mk.caches is None and built == []
+    sched = _sched([4, 4])
+    assert mk.step_ok(_runner_for(sched), sched, 1) is None
+    assert mk.counts["unbound"] == 1 and mk.counts["mk"] == 0
+
+
+def test_bind_perlayer_small_model():
+    mk, runner, built = _mk()
+    mk.bind_caches(runner)
+    assert mk.unbound is None and mk.cache_form == "per-layer"
+    assert mk.groups == {"nope": L, "rope": L, "idx": len(IDX)}
+
+
+def test_bind_perlayer_blocked_past_limit(monkeypatch):
+    monkeypatch.setenv("GLM52_DECODE_MK_PERLAYER_MAX_L", str(L - 1))
+    mk, runner, built = _mk()
+    mk.bind_caches(runner)
+    assert mk.unbound is not None and "263,806 bundles" in mk.unbound
+    assert built == []
+
+
+# ------------------------------------------------------------------ step_ok + try_call (the runner contract)
+
+
+def _sched(nums, spec=None, prompt=None, chunks_encoder=None):
+    """A SchedulerOutput stand-in: nums = scheduled tokens per request; spec = drafts per request (default n - 1);
+    prompt = still-in-prompt flags."""
+    ids = [f"r{i}" for i in range(len(nums))]
+    spec = [n - 1 for n in nums] if spec is None else spec
+    return types.SimpleNamespace(
+        num_scheduled_tokens=dict(zip(ids, nums)),
+        scheduled_spec_decode_tokens={i: [-1] * k for i, k in zip(ids, spec) if k},
+        scheduled_encoder_inputs={}, total_num_scheduled_tokens=sum(nums),
+        _prompt=[False] * len(nums) if prompt is None else prompt)
+
+
+def _runner_for(sched):
+    ids = list(sched.num_scheduled_tokens)
+    return types.SimpleNamespace(input_batch=types.SimpleNamespace(
+        req_id_to_index={r: i for i, r in enumerate(ids)},
+        num_computed_tokens_cpu=[0 if p else 100 for p in sched._prompt],
+        num_prompt_tokens=[50] * len(ids)))
+
+
+class _MD:
+    def __init__(self, S=8, W=256):
+        self.query_start_loc = torch.zeros(S + 1, dtype=torch.int32)
+        self.seq_lens = torch.zeros(S, dtype=torch.int32)
+        self.block_tables = torch.zeros(S * W, dtype=torch.int32)
+
+
+def _bound():
+    mk, runner, built = _mk(stack=lambda g, layers: None)
+    mk.bind_caches(runner)
+    md = {"md": _MD()}
+    mk._metadata = lambda: md["md"]
+    return mk, md
+
+
+def _forward(mk, pending, n_pad, **kw):
+    """runner.forward_model's hook: consume the pending decision, MK or stock."""
+    ids = torch.zeros(n_pad, dtype=torch.int32)
+    out = mk.try_call(None, pending[1], ids, ids, **kw)
+    return "stock" if out is None else ("mk", tuple(out.shape))
+
+
+def test_runner_contract_counts_every_step():
+    mk, md = _bound()
+    steps = [
+        (_sched([1500, 700], spec=[0, 0], prompt=[True, True]), 2048, "stock"),     # prefill
+        (_sched([4, 4]), 8, ("mk", (8, 8))),                                         # B16
+        (_sched([4, 4, 900], spec=[3, 3, 0], prompt=[False, False, True]), 1024, "stock"),   # mixed
+        (_sched([4] * 6), 24, ("mk", (24, 8))),                                      # B32
+        (_sched([3], spec=[0], prompt=[True]), 16, "stock"),                         # prefix-hit prompt tail
+        (_sched([1, 1], spec=[0, 0]), 8, "stock"),                                   # no drafts
+        (_sched([4] * 3), 16, ("mk", (16, 8))),
+    ]
+    for sched, n_pad, want in steps:
+        pending = ("step", mk.step_ok(_runner_for(sched), sched, 1))
+        assert _forward(mk, pending, n_pad) == want, sched.num_scheduled_tokens
+    c = mk.counts
+    assert (c["mk"], c["mk_b16"], c["mk_b32"]) == (3, 2, 1)
+    assert (c["prefill"], c["mixed"], c["no_draft"]) == (2, 1, 1)
+    assert mk.decisions == mk.consumed == len(steps) == sum(c[r] for r in REASONS if r not in ("embeds", "shape"))
+    assert mk.calls == 3
+
+
+def test_toggle_off_declines_and_counts():
+    mk, _ = _bound()
+    mk.enabled = False
+    sched = _sched([4, 4])
+    assert mk.step_ok(_runner_for(sched), sched, 1) is None
+    assert mk.counts["off"] == 1
+
+
+def test_call_time_declines_fall_back_to_stock():
+    mk, md = _bound()
+    sched = _sched([4, 4])
+    b = mk.step_ok(_runner_for(sched), sched, 1)
+    assert _forward(mk, ("step", b), 8) == ("mk", (8, 8))                     # fixes b16's shapes
+    b = mk.step_ok(_runner_for(sched), sched, 1)
+    assert _forward(mk, ("step", b), 8, inputs_embeds=torch.zeros(1)) == "stock"
+    md["md"] = _MD(S=16)                                                       # metadata no longer the bucket's
+    b = mk.step_ok(_runner_for(sched), sched, 1)
+    assert _forward(mk, ("step", b), 8) == "stock"
+    assert (mk.counts["embeds"], mk.counts["shape"], mk.calls) == (1, 1, 1)
+    assert mk.decisions == mk.consumed == 3
+
+
+def test_harness_path_is_not_a_decision():
+    mk, _ = _bound()
+    ids = torch.zeros(16, dtype=torch.int32)
+    out = mk.try_call(None, mk.bucket_for(16), ids, ids, harness=True)
+    assert out is not None and mk.consumed == 0 and mk.decisions == 0 and mk.calls == 1
+
+
+def test_rows_ok_matches_classify():
+    mk, _ = _bound()
+    assert mk.rows_ok([4, 4, 4, 4], 16) and mk.rows_ok([4] * 8, 32)
+    assert not mk.rows_ok([4, 4, 4, 4], 32)          # the twin pads exactly to the bucket
+    assert not mk.rows_ok([5], 16) and not mk.rows_ok([1, 4], 16) and not mk.rows_ok([3] * 5, 16)
+
+
+def test_periodic_log(caplog):
+    mk, _ = _bound()
+    mk.log_every = 2
+    seen = []
+    mk.log_counts = lambda: seen.append(dict(mk.counts))
+    sched = _sched([4, 4])
+    for _ in range(5):
+        mk.step_ok(_runner_for(sched), sched, 1)
+    assert len(seen) == 2 and seen[-1]["mk"] == 4
+
+
+def test_adapter_module_has_no_silent_paths():
+    # every early return of _decide maps to a REASONS entry (guards against an added branch that returns a bare
+    # None without counting)
+    src = __import__("inspect").getsource(VA.Glm52DecodeMK._decide)
+    for why in ("off", "unbound"):
+        assert f'"{why}"' in src
