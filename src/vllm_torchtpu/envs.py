@@ -221,6 +221,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     TPU_SMALL_ALL_REDUCE: bool = True
+    TPU_DP_PACKED_ROUTER_GATHER: bool = False
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 128
     TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_ATTN_MOE_OVERLAP_MIN_TOKENS: int = 64
@@ -1339,6 +1340,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run small decode-step TP all-reduces and DP MoE combines as Pallas
     # kernels (kernels/experimental/small_collectives) instead of XLA's.
     "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE", default=True),
+    # A replicated sequence-parallel MoE step under DP>1 gathers the hidden rows
+    # and the router logits in one DP all-gather (packed along the last dim)
+    # instead of two. Lossless: the split returns the same values.
+    "TPU_DP_PACKED_ROUTER_GATHER": env_bool(
+        "TPU_DP_PACKED_ROUTER_GATHER", default=False
+    ),
     "TPU_EXPERT_PLACEMENT_MTP": env_bool("TPU_EXPERT_PLACEMENT_MTP", default=True),
     "TPU_OFFLOAD_MIN_HBM_USAGE": env_float("TPU_OFFLOAD_MIN_HBM_USAGE", 0.0),
     "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
