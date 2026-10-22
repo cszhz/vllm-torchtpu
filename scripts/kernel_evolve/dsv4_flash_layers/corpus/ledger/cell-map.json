@@ -1,0 +1,36 @@
+{
+  "cells": {
+    "3b70fb2b39e4": {
+      "fields": {
+        "async-scheduling": "true",
+        "attention-backend": "CUSTOM",
+        "concurrency": "2048",
+        "dp": "8",
+        "enable-expert-parallel": "true",
+        "ep": "true",
+        "gpu-memory-utilization": "0.9",
+        "isl_osl": "8192:1024",
+        "kv-cache-dtype": "fp8_e4m3",
+        "max-model-len": "9216",
+        "max-num-batched-tokens": "1024",
+        "max-num-seqs": "256",
+        "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "no-enable-prefix-caching": "true",
+        "num_prompts": "2048",
+        "quantization": "deepseek_v4_fp8",
+        "tp": "1"
+      },
+      "members": [
+        {
+          "config": "deepseek-v4-flash-dp8-ep",
+          "entries": 1,
+          "serve_cmd": "vllm serve deepseek-ai/DeepSeek-V4-Flash-0731 --tensor-parallel-size=1 --data-parallel-size=8 --max-model-len=9216 --max-num-batched-tokens=1024 --max-num-seqs=256 --port 8000 --async-scheduling --no-enable-prefix-caching --gpu-memory-utilization=0.9 --kv-cache-dtype=fp8_e4m3 --enable-expert-parallel --quantization deepseek_v4_fp8 --attention-backend CUSTOM --api-server-count=1 --trust-remote-code --generation-config=vllm --override-generation-config={\"do_sample\":false,\"temperature\":0.0,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\"} --profiler-config.profiler torch --profiler-config.torch_profiler_dir /var/tmp/tpu-perf-forge/dry-run/profile --profiler-config.ignore_frontend true",
+          "serve_fingerprint": "96ceb1f00d2e",
+          "target": "vllm-torchtpu-dsv4-flash"
+        }
+      ]
+    }
+  },
+  "note": "Derived, MOSTLY regenerable, and NOT authoritative over experiments.jsonl. The ledger is append-only: back-filling a cell key by rewriting 200 recorded lines would destroy the property that makes the record worth having. This map is the side table instead \u2014 review it in a diff, regenerate it with `perfkit results backfill-cells`, and read `unmapped` as data rather than as an error. A member marked `carried_from_map` is the part that is NOT regenerable: its target no longer resolves, so the row is the only surviving statement of which cell those entries belong to and the regeneration keeps it rather than recomputing it away.",
+  "schema": 1
+}

@@ -1,0 +1,1209 @@
+# Cell 3b70fb2b39e4: deepseek-v4-flash-dp8-ep on tpu7x 2x2x1 (DP8 EP), scored on layer runs.
+# Rules written by scoping run 1tspnats from golden's 5- and 7-layer captures; first match wins.
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "MoE grouped matmul: gmm_v2"
+family = "gmm_v.*"
+why = "the routed experts' gate_up and down grouped matmuls (pallas gmm_v2, src/vllm_torchtpu/kernels/megablox)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "MoE EP combine: sc_ragged_gather_reduce_v2"
+family = "sc_ragged_gather_reduce_v.*"
+why = "SparseCore combine of the experts' outputs (src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v2)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "MoE EP dispatch: sc_ragged_gather_v2"
+family = "sc_ragged_gather_v"
+why = "SparseCore gather of the tokens each local expert reads (src/vllm_torchtpu/kernels/sparse_core/ragged_gather_v2.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "MoE routing"
+category = "moe_routing"
+why = "router top-k kernel and the sorts that order tokens by expert"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "collective reduce_scatter"
+family = "reduce-scatter.*"
+why = "the EP/DP reduce-scatters XLA emits (tpu_communicator.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "collective all_gather"
+family = "all-gather.*|distributed_all_gather_into_tensor"
+why = "the EP dispatch all-gathers and their staging copies (tpu_communicator.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "collective other"
+category = "collective"
+why = "every other collective (all-reduce and the like)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "attention CSA: SparseMLA"
+family = "SparseMLA.*"
+why = "sparse MLA over the top-k compressed KV on the 4x-compressed layers (core_attention/sparse_mla.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "attention CSA: indexer StreamIdxTC"
+family = "StreamIdxTC.*"
+why = "the lightning indexer's top-k (streamindex_topk)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "attention CSA: sc_csa_gather"
+family = "sc_csa_gather.*"
+why = "SparseCore gather of the top-k compressed KV rows (core_attention/csa_gather.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "attention SWA"
+family = "SWA.*"
+why = "sliding-window attention on every layer (core_attention/mla_swa.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "attention HCA: MLA"
+family = "MLA-.*"
+why = "dense MLA over the 128x-compressed KV (core_attention/mla.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "mHC kernels"
+family = "tpu_custom_call"
+why = "the unnamed pallas_calls of the hyper-connection pre/post kernels (deepseek_v4/mhc/*_kernel.py): operands x_ref, res, post_ref, comb_ref, fn_*_ref"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "o-projection: wo_a"
+family = "wo_a_projection.*"
+why = "the grouped wo_a projection with inverse rope (deepseek_v4/o_projection.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "KV compress and store"
+family = "compress_norm_rope_store.*|proj_and_save_state.*"
+why = "the KV compressor's state projection and compressed-entry store (deepseek_v4/compress_and_store)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "q norm and rope"
+family = "qnorm_rope.*|rope|rope_quant"
+why = "q/kv norm, rope and the rope-time quantization (deepseek_v4/rope.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "XLA matmul fusions"
+category = "matmul"
+why = "compiler fusions with a dot or reduce: the dense fp8 linears (quantized_matmul/util.py) and the mHC glue (mhc/utils.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "XLA quantize fusions"
+category = "quantize"
+why = "activation quantization fusions in front of the fp8 linears"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "XLA data movement"
+category = "data_movement"
+why = "copies, reshapes and gathers the compiler emits"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "XLA norm and activation fusions"
+category = "norm_act"
+why = "elementwise norm and activation fusions"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "decode"
+block = "XLA other ops"
+category = "other"
+why = "every remaining op of the main programs"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "MoE grouped matmul: gmm_v2"
+family = "gmm_v.*"
+why = "the routed experts' gate_up and down grouped matmuls (pallas gmm_v2, src/vllm_torchtpu/kernels/megablox)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "MoE EP combine: sc_ragged_gather_reduce_v2"
+family = "sc_ragged_gather_reduce_v.*"
+why = "SparseCore combine of the experts' outputs (src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v2)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "MoE EP dispatch: sc_ragged_gather_v2"
+family = "sc_ragged_gather_v"
+why = "SparseCore gather of the tokens each local expert reads (src/vllm_torchtpu/kernels/sparse_core/ragged_gather_v2.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "MoE routing"
+category = "moe_routing"
+why = "router top-k kernel and the sorts that order tokens by expert"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "collective reduce_scatter"
+family = "reduce-scatter.*"
+why = "the EP/DP reduce-scatters XLA emits (tpu_communicator.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "collective all_gather"
+family = "all-gather.*|distributed_all_gather_into_tensor"
+why = "the EP dispatch all-gathers and their staging copies (tpu_communicator.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "collective other"
+category = "collective"
+why = "every other collective (all-reduce and the like)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "attention CSA: SparseMLA"
+family = "SparseMLA.*"
+why = "sparse MLA over the top-k compressed KV on the 4x-compressed layers (core_attention/sparse_mla.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "attention CSA: indexer StreamIdxTC"
+family = "StreamIdxTC.*"
+why = "the lightning indexer's top-k (streamindex_topk)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "attention CSA: sc_csa_gather"
+family = "sc_csa_gather.*"
+why = "SparseCore gather of the top-k compressed KV rows (core_attention/csa_gather.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "attention SWA"
+family = "SWA.*"
+why = "sliding-window attention on every layer (core_attention/mla_swa.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "attention HCA: MLA"
+family = "MLA-.*"
+why = "dense MLA over the 128x-compressed KV (core_attention/mla.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "mHC kernels"
+family = "tpu_custom_call"
+why = "the unnamed pallas_calls of the hyper-connection pre/post kernels (deepseek_v4/mhc/*_kernel.py): operands x_ref, res, post_ref, comb_ref, fn_*_ref"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "o-projection: wo_a"
+family = "wo_a_projection.*"
+why = "the grouped wo_a projection with inverse rope (deepseek_v4/o_projection.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "KV compress and store"
+family = "compress_norm_rope_store.*|proj_and_save_state.*"
+why = "the KV compressor's state projection and compressed-entry store (deepseek_v4/compress_and_store)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "q norm and rope"
+family = "qnorm_rope.*|rope|rope_quant"
+why = "q/kv norm, rope and the rope-time quantization (deepseek_v4/rope.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "XLA matmul fusions"
+category = "matmul"
+why = "compiler fusions with a dot or reduce: the dense fp8 linears (quantized_matmul/util.py) and the mHC glue (mhc/utils.py)"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "XLA quantize fusions"
+category = "quantize"
+why = "activation quantization fusions in front of the fp8 linears"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "XLA data movement"
+category = "data_movement"
+why = "copies, reshapes and gathers the compiler emits"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "XLA norm and activation fusions"
+category = "norm_act"
+why = "elementwise norm and activation fusions"
+
+[[rule]]
+cell = "3b70fb2b39e4"
+phase = "prefill"
+block = "XLA other ops"
+category = "other"
+why = "every remaining op of the main programs"
+
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "MoE grouped matmul: gmm_v2"
+phase = "decode"
+ms_per_step = 8.2584
+calls = 86
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 8.2584 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/megablox/gmm_v2.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 8.2584 ms/step over 86 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "XLA matmul fusions"
+phase = "decode"
+ms_per_step = 4.6870
+calls = 9740
+floor_ms = 2.0045
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.5959 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 4.6870 ms/step over 9740 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "attention HCA: MLA"
+phase = "decode"
+ms_per_step = 2.5593
+calls = 60
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 2.5593 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/core_attention/mla.py", "src/vllm_torchtpu/kernels/mla/masked_dense/kernel.py", "src/vllm_torchtpu/kernels/mla/sparse/kernel.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 2.5593 ms/step over 60 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "collective all_gather"
+phase = "decode"
+ms_per_step = 2.3421
+calls = 87
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 2.3421 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 2.3421 ms/step over 87 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "attention CSA: indexer StreamIdxTC"
+phase = "decode"
+ms_per_step = 2.0934
+calls = 63
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 2.0934 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/streamindex_topk.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 2.0934 ms/step over 63 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "XLA data movement"
+phase = "decode"
+ms_per_step = 1.9600
+calls = 10260
+floor_ms = 0.2673
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.7131 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/core_attention/sparse_mla.py", "src/vllm_torchtpu/kernels/mla/sparse/kernel.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 1.9600 ms/step over 10260 calls per step of the full model, \
+of 32.535 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "MoE EP combine: sc_ragged_gather_reduce_v2"
+phase = "decode"
+ms_per_step = 1.4360
+calls = 86
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 1.4360 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 1.4360 ms/step over 86 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "attention SWA"
+phase = "decode"
+ms_per_step = 1.3747
+calls = 86
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 1.3747 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/core_attention/mla_swa.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 1.3747 ms/step over 86 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "KV compress and store"
+phase = "decode"
+ms_per_step = 1.3151
+calls = 124
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 1.3151 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/kernel.py", "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/proj_and_save_state.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 1.3151 ms/step over 124 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "attention CSA: SparseMLA"
+phase = "decode"
+ms_per_step = 1.0944
+calls = 84
+floor_ms = 0.9696
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.0000 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/core_attention/sparse_mla.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 1.0944 ms/step over 84 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "MoE EP dispatch: sc_ragged_gather_v2"
+phase = "decode"
+ms_per_step = 1.0735
+calls = 277
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 1.0735 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 1.0735 ms/step over 277 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "mHC kernels"
+phase = "decode"
+ms_per_step = 1.0446
+calls = 87
+floor_ms = 0.3583
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.0000 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/experimental/export/validator.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 1.0446 ms/step over 87 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "o-projection: wo_a"
+phase = "decode"
+ms_per_step = 0.8908
+calls = 45
+floor_ms = 0.6132
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.0062 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/o_projection.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 0.8908 ms/step over 45 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "MoE routing"
+phase = "decode"
+ms_per_step = 0.6974
+calls = 168
+floor_ms = 0.0004
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.2405 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/router_topk.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 0.6974 ms/step over 168 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "q norm and rope"
+phase = "decode"
+ms_per_step = 0.6346
+calls = 107
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.6346 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/rope.py", "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 0.6346 ms/step over 107 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "collective reduce_scatter"
+phase = "decode"
+ms_per_step = 0.4459
+calls = 86
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.4459 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 0.4459 ms/step over 86 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "XLA quantize fusions"
+phase = "decode"
+ms_per_step = 0.3615
+calls = 440
+floor_ms = 0.0504
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.0956 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 0.3615 ms/step over 440 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "XLA other ops"
+phase = "decode"
+ms_per_step = 0.2602
+calls = 3081
+floor_ms = 0.0086
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.0551 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 0.2602 ms/step over 3081 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "attention CSA: sc_csa_gather"
+phase = "decode"
+ms_per_step = 0.0064
+calls = 168
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.0064 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 0.0064 ms/step over 168 calls per step of the full model, of \
+32.535 ms of op time per step. An op that recurs with the layers counts as the \
+5-layer cut's time and 19 more of what one more period added; one that does \
+not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "MoE grouped matmul: gmm_v2"
+phase = "prefill"
+ms_per_step = 16.2821
+calls = 86
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 16.2821 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/megablox/gmm_v2.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 16.2821 ms/step over 86 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "collective reduce_scatter"
+phase = "prefill"
+ms_per_step = 15.0921
+calls = 86
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 15.0921 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 15.0921 ms/step over 86 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "attention CSA: SparseMLA"
+phase = "prefill"
+ms_per_step = 11.7224
+calls = 168
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 11.7224 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/core_attention/sparse_mla.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 11.7224 ms/step over 168 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "collective all_gather"
+phase = "prefill"
+ms_per_step = 10.9666
+calls = 130
+floor_ms = 0.0003
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 10.8782 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 10.9666 ms/step over 130 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "KV compress and store"
+phase = "prefill"
+ms_per_step = 9.6678
+calls = 124
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 9.6678 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/kernel.py", "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/proj_and_save_state.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 9.6678 ms/step over 124 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "XLA matmul fusions"
+phase = "prefill"
+ms_per_step = 8.8093
+calls = 9633
+floor_ms = 4.5147
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 1.8017 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 8.8093 ms/step over 9633 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "MoE EP combine: sc_ragged_gather_reduce_v2"
+phase = "prefill"
+ms_per_step = 8.7011
+calls = 86
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 8.7011 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 8.7011 ms/step over 86 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "XLA quantize fusions"
+phase = "prefill"
+ms_per_step = 7.2079
+calls = 572
+floor_ms = 2.3136
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 4.6087 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 7.2079 ms/step over 572 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "XLA data movement"
+phase = "prefill"
+ms_per_step = 6.5088
+calls = 15206
+floor_ms = 0.2767
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 3.7916 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/core_attention/sparse_mla.py", "src/vllm_torchtpu/kernels/mla/sparse/kernel.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 6.5088 ms/step over 15206 calls per step of the full model, \
+of 125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "mHC kernels"
+phase = "prefill"
+ms_per_step = 6.1779
+calls = 87
+floor_ms = 2.4086
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.0000 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/experimental/export/validator.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 6.1779 ms/step over 87 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "attention SWA"
+phase = "prefill"
+ms_per_step = 4.0778
+calls = 86
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 4.0778 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/core_attention/mla_swa.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 4.0778 ms/step over 86 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "attention HCA: MLA"
+phase = "prefill"
+ms_per_step = 3.4230
+calls = 60
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 3.4230 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/core_attention/mla.py", "src/vllm_torchtpu/kernels/mla/masked_dense/kernel.py", "src/vllm_torchtpu/kernels/mla/sparse/kernel.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 3.4230 ms/step over 60 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "o-projection: wo_a"
+phase = "prefill"
+ms_per_step = 3.3085
+calls = 45
+floor_ms = 1.6440
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.0215 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/o_projection.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 3.3085 ms/step over 45 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "q norm and rope"
+phase = "prefill"
+ms_per_step = 3.1603
+calls = 107
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 3.1603 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/rope.py", "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 3.1603 ms/step over 107 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "MoE EP dispatch: sc_ragged_gather_v2"
+phase = "prefill"
+ms_per_step = 2.7235
+calls = 361
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 2.7235 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 2.7235 ms/step over 361 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "MoE routing"
+phase = "prefill"
+ms_per_step = 2.7109
+calls = 168
+floor_ms = 0.0032
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.4149 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/router_topk.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 2.7109 ms/step over 168 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "attention CSA: indexer StreamIdxTC"
+phase = "prefill"
+ms_per_step = 2.2541
+calls = 63
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 2.2541 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = ["src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/streamindex_topk.py"]
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 2.2541 ms/step over 63 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "attention CSA: sc_csa_gather"
+phase = "prefill"
+ms_per_step = 1.5555
+calls = 336
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 1.5555 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 1.5555 ms/step over 336 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "XLA other ops"
+phase = "prefill"
+ms_per_step = 0.7679
+calls = 3127
+floor_ms = 0.0268
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.3753 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 0.7679 ms/step over 3127 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[block]]
+cell = "3b70fb2b39e4"
+name = "unclaimed: moe_sparsecore ops in the main program"
+phase = "prefill"
+ms_per_step = 0.0009
+calls = 88
+floor_ms = 0.0000
+floor_note = """\
+Derived: the sum of the block's priced op floors from `perfkit profile price`, \
+from operand bytes and FLOPs at the hardware's constants. 0.0009 ms of the \
+block's time is in ops with no floor, so this is a lower bound."""
+kernel_files = []
+measured_from = "1tspnats"
+measured_on = "2026-10-22"
+measured_tree = "b10fdabe9"
+how = """\
+PROJECTED 2026-10-22 by `perfkit layers budget` from run 1tspnats's captures \
+of b10fdabe9, cut to 5 and 7 of its 43 layers (1 planes), with this cell's \
+[[rule]] tables: 0.0009 ms/step over 88 calls per step of the full model, of \
+125.118 ms of op time per step. An op that recurs with the layers counts as \
+the 5-layer cut's time and 19 more of what one more period added; one that \
+does not, as the cut's."""
+
+[[census]]
+cell = "3b70fb2b39e4"
+arm = "golden's layer runs of deepseek-v4-flash-dp8-ep at 5 and 7 of 43 layers, jobs 1tspnats-golden-layers-b and 1tspnats-golden-layers-b-long"
+taken_by = "1tspnats, 2026-10-22"
+decode_steps = 4026.0000
+prefill_steps = 18734.0000
+decode_ms = 32.5352
+prefill_ms = 125.1185
+note = """\
+PROJECTED by `perfkit layers budget`: the steps are the 5-layer cut's profiled \
+sweep, counted from the server's step counters; each class's op time per step \
+is the cut's, projected to the full model's 20 periods. Device time, pooled \
+over the planes as the rows are: a step the host paces is worth less end to \
+end than this says."""
