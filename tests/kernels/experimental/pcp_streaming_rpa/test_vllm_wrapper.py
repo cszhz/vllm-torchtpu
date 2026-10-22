@@ -2,15 +2,6 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import inspect
 from types import SimpleNamespace
@@ -190,11 +181,8 @@ def test_seq_along_lane_layout_validation_accepts_fp8_multi_head():
 def test_prepare_packed_kv_accepts_equivalent_tail_layout(monkeypatch):
     packed_kv = jnp.arange(3 * 8 * 2 * 8, dtype=jnp.float32).reshape(3, 8, 2, 8)
 
-    def fake_prepare_inputs(*_args, **_kwargs):
-        return None, packed_kv
-
     monkeypatch.setattr(
-        pcp_wrapper.batched_rpa_wrapper, "prepare_inputs", fake_prepare_inputs
+        pcp_wrapper, "_pack_kv_for_cache", lambda *_args, **_kwargs: packed_kv
     )
 
     kv_cache = jnp.zeros((2, 4, 16, 1, 8), dtype=jnp.float32)
@@ -205,30 +193,18 @@ def test_prepare_packed_kv_accepts_equivalent_tail_layout(monkeypatch):
     np.testing.assert_array_equal(np.asarray(prepared), np.asarray(expected))
 
 
-def test_seq_along_lane_kv_packing_pads_inside_pcp_wrapper(monkeypatch):
-    packed_kv = jnp.ones((2, 32, 4, 384), dtype=jnp.bfloat16)
-    captured = {}
-
-    def fake_prepare_inputs(*_args, **kwargs):
-        captured["kwargs"] = kwargs
-        return None, packed_kv
-
-    monkeypatch.setattr(
-        pcp_wrapper.batched_rpa_wrapper, "prepare_inputs", fake_prepare_inputs
-    )
-
-    k = jnp.zeros((384, 1, 128), dtype=jnp.bfloat16)
+def test_seq_along_lane_kv_packing_pads_inside_pcp_wrapper():
+    k = jnp.ones((384, 1, 128), dtype=jnp.bfloat16)
     padded = pcp_wrapper._pack_kv_for_cache(
         k,
-        jnp.zeros_like(k),
+        jnp.ones_like(k),
         jnp.float8_e4m3fn,
         kv_layout=pcp_wrapper.KVLayout.SEQ_ALONG_LANE,
         page_size=256,
     )
 
-    assert "page_size" not in captured["kwargs"]
     assert padded.shape == (2, 32, 4, 512)
-    np.testing.assert_array_equal(np.asarray(padded[..., :384]), np.asarray(packed_kv))
+    np.testing.assert_array_equal(np.asarray(padded[..., :384]), 1)
     np.testing.assert_array_equal(np.asarray(padded[..., 384:]), 0)
 
 
@@ -640,28 +616,21 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(monkeypatch
         _current_kv,
         kv_cache,
         _kv_lens,
-        _page_indices,
         _cu_q_lens,
         _distribution,
         segment_descriptors,
         num_segments,
+        *,
+        stage_plan,
         **_kwargs,
     ):
         captured["segment_descriptors"] = segment_descriptors
         captured["num_segments"] = num_segments
+        captured["is_valid"] = stage_plan.query_row_valid
         return jnp.full_like(q_streaming, 5), kv_cache
 
     def fake_prepare_current(k_local, _v_local, cache, **_kwargs):
         return jnp.zeros((k_local.shape[0], *cache.shape[2:]), dtype=cache.dtype)
-
-    def fake_select_replicated_shard(tensor, _pcp_axis, _pcp_size, *, axis):
-        assert axis == 0
-        token_start = pcp_rank * local_padded_tokens
-        token_end = token_start + local_padded_tokens
-        local = tensor[token_start:token_end]
-        if tensor.shape[1] == 4:
-            captured["is_valid"] = local[:, 3].astype(jnp.bool_)
-        return local
 
     def fake_shard_map(fn, *, mesh, in_specs, out_specs, check_vma):
         del mesh, in_specs, out_specs, check_vma
@@ -689,9 +658,9 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(monkeypatch
         fake_streaming,
     )
     monkeypatch.setattr(
-        pcp_wrapper,
-        "_select_replicated_shard_for_pcp_rank",
-        fake_select_replicated_shard,
+        pcp_wrapper._stage_plan_mod,
+        "get_pcp_rank_without_axis_index",
+        lambda _axis, _size: jnp.asarray(pcp_rank, dtype=jnp.int32),
     )
     monkeypatch.setattr(pcp_wrapper.jax, "shard_map", fake_shard_map)
 
@@ -723,6 +692,7 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(monkeypatch
         pcp_wrapper._build_writeback_segment_descriptors(
             jnp.asarray(expected),
             jnp.asarray(expected_writeback.writeback_counts[pcp_rank]),
+            max_segments=local_padded_tokens,
         )
     )
     np.testing.assert_array_equal(
@@ -752,16 +722,11 @@ def test_sharded_wrapper_masks_output_with_query_validity(monkeypatch):
     def fake_compute_query_rows(*_args, **_kwargs):
         return query_rows
 
-    def fake_select_query_rows(mapping, _pcp_axis, _pcp_size):
-        assert mapping is query_rows
-        return mapping
-
     def fake_streaming(
         q_streaming,
         _current_kv,
         kv_cache,
         _kv_lens,
-        _page_indices,
         _cu_q_lens,
         _distribution,
         _segment_descriptors,
@@ -779,14 +744,14 @@ def test_sharded_wrapper_masks_output_with_query_validity(monkeypatch):
         return fn
 
     monkeypatch.setattr(
-        pcp_wrapper,
-        "_compute_pcp_rank_major_query_row_mapping_from_metadata",
-        fake_compute_query_rows,
+        pcp_wrapper._stage_plan_mod,
+        "get_pcp_rank_without_axis_index",
+        lambda _axis, _size: jnp.asarray(0, dtype=jnp.int32),
     )
     monkeypatch.setattr(
-        pcp_wrapper,
-        "_select_replicated_query_row_mapping_for_pcp_rank",
-        fake_select_query_rows,
+        pcp_wrapper._stage_plan_mod,
+        "_compute_pcp_local_query_row_mapping",
+        fake_compute_query_rows,
     )
     monkeypatch.setattr(
         pcp_wrapper, "_prepare_packed_kv_for_cache", fake_prepare_current
