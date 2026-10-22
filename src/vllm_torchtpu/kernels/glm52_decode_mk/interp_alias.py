@@ -31,7 +31,10 @@ _INSTALLED = {}
 
 
 def _is_view(transforms):
-    return any(isinstance(t, (stypes.BitcastTransform, stypes.ReshapeTransform)) for t in transforms)
+    return any(
+        isinstance(t, (stypes.BitcastTransform, stypes.ReshapeTransform))
+        for t in transforms
+    )
 
 
 def _resolve(content, transforms):
@@ -41,14 +44,26 @@ def _resolve(content, transforms):
     while i < len(transforms):
         t = transforms[i]
         if isinstance(t, stypes.BitcastTransform):
-            assert arr.flags.c_contiguous, ("bitcast of a non-contiguous window", arr.shape, arr.strides)
+            assert arr.flags.c_contiguous, (
+                "bitcast of a non-contiguous window",
+                arr.shape,
+                arr.strides,
+            )
             dt = np.dtype(t.dtype)
             flat = arr.reshape(-1).view(dt)
             # Mosaic semantics: the second-minor dim scales with the itemsize ratio (pool_alias always follows a
             # bitcast with a Reinterpret, which fixes the final shape; this intermediate shape is only a placeholder)
-            arr = flat.reshape(-1, arr.shape[-1]) if arr.ndim >= 2 and flat.size % arr.shape[-1] == 0 else flat
+            arr = (
+                flat.reshape(-1, arr.shape[-1])
+                if arr.ndim >= 2 and flat.size % arr.shape[-1] == 0
+                else flat
+            )
         elif isinstance(t, stypes.ReshapeTransform):
-            assert arr.flags.c_contiguous, ("reshape of a non-contiguous window", arr.shape, arr.strides)
+            assert arr.flags.c_contiguous, (
+                "reshape of a non-contiguous window",
+                arr.shape,
+                arr.strides,
+            )
             shp = tuple(t.shape)
             # pool_alias views never pad: ReshapeTransform validates prod(shape) == window elements at trace time
             assert arr.size == int(np.prod(shp)), ("window != view", arr.shape, shp)
@@ -78,37 +93,108 @@ def install():
     o_get, o_store, o_swap = ipc.get, ipc.store, ipc.swap
     r_get, r_store, r_swap = o_get.__wrapped__, o_store.__wrapped__, o_swap.__wrapped__
 
-    def get_(token, device_id, local_core_id, memory_space, buffer_id, transforms, *a, **kw):
+    def get_(
+        token, device_id, local_core_id, memory_space, buffer_id, transforms, *a, **kw
+    ):
         transforms = tuple(transforms)
         if not _is_view(transforms):
-            return r_get(token, device_id, local_core_id, memory_space, buffer_id, transforms, *a, **kw)
+            return r_get(
+                token,
+                device_id,
+                local_core_id,
+                memory_space,
+                buffer_id,
+                transforms,
+                *a,
+                **kw,
+            )
         sm = ipc._get_shared_memory()
         with sm.lock:
-            v = _resolve(_buffer(sm, device_id, local_core_id, memory_space, buffer_id).content,
-                         _ints(transforms)).copy()
+            v = _resolve(
+                _buffer(sm, device_id, local_core_id, memory_space, buffer_id).content,
+                _ints(transforms),
+            ).copy()
         return token, v
 
-    def store_(token, device_id, local_core_id, memory_space, buffer_id, transforms, val, *a, **kw):
+    def store_(
+        token,
+        device_id,
+        local_core_id,
+        memory_space,
+        buffer_id,
+        transforms,
+        val,
+        *a,
+        **kw,
+    ):
         transforms = tuple(transforms)
         if not _is_view(transforms):
-            return r_store(token, device_id, local_core_id, memory_space, buffer_id, transforms, val, *a, **kw)
+            return r_store(
+                token,
+                device_id,
+                local_core_id,
+                memory_space,
+                buffer_id,
+                transforms,
+                val,
+                *a,
+                **kw,
+            )
         sm = ipc._get_shared_memory()
         val = np.asarray(val)
         with sm.lock:
-            v = _resolve(_buffer(sm, device_id, local_core_id, memory_space, buffer_id).content, _ints(transforms))
-            assert v.shape == val.shape and v.dtype == val.dtype, (v.shape, v.dtype, val.shape, val.dtype)
+            v = _resolve(
+                _buffer(sm, device_id, local_core_id, memory_space, buffer_id).content,
+                _ints(transforms),
+            )
+            assert v.shape == val.shape and v.dtype == val.dtype, (
+                v.shape,
+                v.dtype,
+                val.shape,
+                val.dtype,
+            )
             v[...] = val
         return token
 
-    def swap_(token, device_id, local_core_id, memory_space, buffer_id, transforms, val, mask, *a, **kw):
+    def swap_(
+        token,
+        device_id,
+        local_core_id,
+        memory_space,
+        buffer_id,
+        transforms,
+        val,
+        mask,
+        *a,
+        **kw,
+    ):
         transforms = tuple(transforms)
         if not _is_view(transforms):
-            return r_swap(token, device_id, local_core_id, memory_space, buffer_id, transforms, val, mask, *a, **kw)
+            return r_swap(
+                token,
+                device_id,
+                local_core_id,
+                memory_space,
+                buffer_id,
+                transforms,
+                val,
+                mask,
+                *a,
+                **kw,
+            )
         sm = ipc._get_shared_memory()
         val = np.asarray(val)
         with sm.lock:
-            v = _resolve(_buffer(sm, device_id, local_core_id, memory_space, buffer_id).content, _ints(transforms))
-            assert v.shape == val.shape and v.dtype == val.dtype, (v.shape, v.dtype, val.shape, val.dtype)
+            v = _resolve(
+                _buffer(sm, device_id, local_core_id, memory_space, buffer_id).content,
+                _ints(transforms),
+            )
+            assert v.shape == val.shape and v.dtype == val.dtype, (
+                v.shape,
+                v.dtype,
+                val.shape,
+                val.dtype,
+            )
             old = v.copy()
             if mask is None:
                 v[...] = val
@@ -125,4 +211,5 @@ def install():
 
 def _ints(transforms):
     import jax
+
     return tuple(jax.tree.map(int, transforms))

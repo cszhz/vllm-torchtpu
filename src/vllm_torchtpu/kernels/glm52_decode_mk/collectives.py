@@ -22,8 +22,11 @@ MESH = pl.DeviceIdType.MESH
 def ar_scratch(R, M, H):
     """Scratch of one all-reduce slot set: recv [R, M, H/R] bf16, red [M, H/R] bf16, 4 x DMA((R,)), DMA((2,))."""
     cw = H // R
-    return [pltpu.VMEM((R, M, cw), BF16), pltpu.VMEM((M, cw), BF16)] + \
-        [pltpu.SemaphoreType.DMA((R,)) for _ in range(4)] + [pltpu.SemaphoreType.DMA((2,))]
+    return (
+        [pltpu.VMEM((R, M, cw), BF16), pltpu.VMEM((M, cw), BF16)]
+        + [pltpu.SemaphoreType.DMA((R,)) for _ in range(4)]
+        + [pltpu.SemaphoreType.DMA((2,))]
+    )
 
 
 AR_NAMES = ("recv", "red", "rs_send", "rs_recv", "ag_send", "ag_recv", "loc")
@@ -37,8 +40,14 @@ def _send_all(R, me, src_of, dst_of, send_sem, recv_sem):
     sends = []
     for step in range(1, R):
         t = lax.rem(me + step, R)
-        c = pltpu.make_async_remote_copy(src_of(t), dst_of(me), send_sem.at[step], recv_sem.at[me],
-                                         device_id=(t,), device_id_type=MESH)
+        c = pltpu.make_async_remote_copy(
+            src_of(t),
+            dst_of(me),
+            send_sem.at[step],
+            recv_sem.at[me],
+            device_id=(t,),
+            device_id_type=MESH,
+        )
         c.start()
         sends.append(c)
     return sends
@@ -86,7 +95,7 @@ def all_reduce(R, me, buf, rows, cols, s, drop_last=False, early_read=False, mid
             v = jnp.zeros_like(v)
         acc = acc + v
     red[...] = acc.astype(red.dtype)
-    if early_read:                                # the sum is materialised before the receives are waited
+    if early_read:  # the sum is materialised before the receives are waited
         _recv_all(R, me, slot, s["rs_recv"])
     own_ag = pltpu.make_async_copy(red, chunk(me), s["loc"].at[1])
     own_ag.start()
@@ -115,26 +124,40 @@ def exchange(R, me, src_fn, dst_fn, send_sem, recv_sem, wait=True, scope=None):
     if R == 1:
         return None if wait else (lambda: None)
     for d in range(R):
+
         @pl.when(me != d)
         def _(d=d):
-            pltpu.make_async_remote_copy(src_ref=src_fn(d), dst_ref=dst_fn(me), send_sem=send_sem,
-                                         recv_sem=recv_sem, device_id=(jnp.int32(d),),
-                                         device_id_type=MESH).start()
+            pltpu.make_async_remote_copy(
+                src_ref=src_fn(d),
+                dst_ref=dst_fn(me),
+                send_sem=send_sem,
+                recv_sem=recv_sem,
+                device_id=(jnp.int32(d),),
+                device_id_type=MESH,
+            ).start()
 
     def finish():
-        desc = pltpu.make_async_remote_copy(src_ref=src_fn(0), dst_ref=dst_fn(0), send_sem=send_sem,
-                                            recv_sem=recv_sem, device_id=(me,), device_id_type=MESH)
+        desc = pltpu.make_async_remote_copy(
+            src_ref=src_fn(0),
+            dst_ref=dst_fn(0),
+            send_sem=send_sem,
+            recv_sem=recv_sem,
+            device_id=(me,),
+            device_id_type=MESH,
+        )
 
         def waits():
             for _ in range(R - 1):
                 desc.wait_recv()
             for _ in range(R - 1):
                 desc.wait_send()
+
         if scope is not None:
             with scope("X_wait"):
                 waits()
         else:
             waits()
+
     if not wait:
         return finish
     finish()
@@ -146,11 +169,17 @@ def start_all(R, me, src_fn, dst_fn, send_sem, recv_sem):
     if R == 1:
         return
     for d in range(R):
+
         @pl.when(me != d)
         def _(d=d):
-            pltpu.make_async_remote_copy(src_ref=src_fn(d), dst_ref=dst_fn(me), send_sem=send_sem,
-                                         recv_sem=recv_sem, device_id=(jnp.int32(d),),
-                                         device_id_type=MESH).start()
+            pltpu.make_async_remote_copy(
+                src_ref=src_fn(d),
+                dst_ref=dst_fn(me),
+                send_sem=send_sem,
+                recv_sem=recv_sem,
+                device_id=(jnp.int32(d),),
+                device_id_type=MESH,
+            ).start()
 
 
 def wait_pieces(R, me, pieces, send_sem, recv_sem, scope=None):
@@ -161,8 +190,20 @@ def wait_pieces(R, me, pieces, send_sem, recv_sem, scope=None):
         return
 
     def waits():
-        descs = [(pltpu.make_async_remote_copy(src_ref=s_, dst_ref=d_, send_sem=send_sem, recv_sem=recv_sem,
-                                               device_id=(me,), device_id_type=MESH), n) for s_, d_, n in pieces]
+        descs = [
+            (
+                pltpu.make_async_remote_copy(
+                    src_ref=s_,
+                    dst_ref=d_,
+                    send_sem=send_sem,
+                    recv_sem=recv_sem,
+                    device_id=(me,),
+                    device_id_type=MESH,
+                ),
+                n,
+            )
+            for s_, d_, n in pieces
+        ]
         for kind in ("recv", "send"):
             for desc, n in descs:
                 tot = n * (R - 1)
@@ -171,10 +212,13 @@ def wait_pieces(R, me, pieces, send_sem, recv_sem, scope=None):
                     for _ in range(tot):
                         fn()
                 else:
+
                     def body(i, c, fn=fn):
                         fn()
                         return c
+
                     lax.fori_loop(0, tot, body, 0)
+
     if scope is not None:
         with scope("X_wait"):
             waits()
@@ -184,4 +228,6 @@ def wait_pieces(R, me, pieces, send_sem, recv_sem, scope=None):
 
 def spin(n, ref):
     """F-DELAY: a data-dependent busy loop of n iterations on a (8, 128) f32 VMEM ref (csq_proto spin, :538)."""
-    ref[...] = lax.fori_loop(0, n, lambda it, a: a * 0.9990234375 + 0.0009765625, ref[...])
+    ref[...] = lax.fori_loop(
+        0, n, lambda it, a: a * 0.9990234375 + 0.0009765625, ref[...]
+    )

@@ -65,28 +65,53 @@ F32 = jnp.float32
 I32 = jnp.int32
 U32 = jnp.uint32
 U8 = jnp.uint8
-INT_MIN = np.int32(-(2 ** 31))
-INT_MAX = np.int32(2 ** 31 - 1)
+INT_MIN = np.int32(-(2**31))
+INT_MAX = np.int32(2**31 - 1)
 NT = (((1,), (1,)), ((), ()))
 NN = (((1,), (0,)), ((), ()))
 
-FAULTS = ("", "digit", "tierank", "nofix", "kscale", "page", "ropeseg", "sharedsem",
-          # composed-kernel oracle faults (glm_ref names where the semantics match)
-          "causal_mask", "page_off_by_one", "kv_read_before_write", "scale_twice", "topk_swap",
-          # delay-exposed race control: count-exchange payloads read before their receives are waited
-          "f_cx_earlyread",
-          # path-activation controls for the forced-path variants (WHITEBOARD.v1 §11.2 C-THR2 / C-WAVE / C-WRAP):
-          # each perturbs only its path, so n/a at a build that never takes it and RED where it does
-          "f_thr2",     # digit + 1, 2-bit threshold rounds only (Sigma np > thr_switch)
-          "f_wave",     # digit + 1, waves after the first only (rows of a wave starting at row > 0)
-          "f_wrap",     # granules r >= GR read ring slot (r + 1) % GR (the gather ring has wrapped)
-          # L4 (stage B, a2a_lse="tile"): the lse of row t is written at lane t + 1 of the per-peer lse tile
-          "f_lse_tile_row",
-          # stage-B L2 `gearly` control: the early (previous-layer) issue reads layer l - 1's caches -> RED
-          "f_early_stale")
+FAULTS = (
+    "",
+    "digit",
+    "tierank",
+    "nofix",
+    "kscale",
+    "page",
+    "ropeseg",
+    "sharedsem",
+    # composed-kernel oracle faults (glm_ref names where the semantics match)
+    "causal_mask",
+    "page_off_by_one",
+    "kv_read_before_write",
+    "scale_twice",
+    "topk_swap",
+    # delay-exposed race control: count-exchange payloads read before their receives are waited
+    "f_cx_earlyread",
+    # path-activation controls for the forced-path variants (WHITEBOARD.v1 §11.2 C-THR2 / C-WAVE / C-WRAP):
+    # each perturbs only its path, so n/a at a build that never takes it and RED where it does
+    "f_thr2",  # digit + 1, 2-bit threshold rounds only (Sigma np > thr_switch)
+    "f_wave",  # digit + 1, waves after the first only (rows of a wave starting at row > 0)
+    "f_wrap",  # granules r >= GR read ring slot (r + 1) % GR (the gather ring has wrapped)
+    # L4 (stage B, a2a_lse="tile"): the lse of row t is written at lane t + 1 of the per-peer lse tile
+    "f_lse_tile_row",
+    # stage-B L2 `gearly` control: the early (previous-layer) issue reads layer l - 1's caches -> RED
+    "f_early_stale",
+)
 # layer-transient buffers: produced and consumed between layer entry and routing (WHITEBOARD.v1 §5.3 / §7.1)
-ALIASED = ("b_keys", "b_memb", "b_pre", "b_xacc", "b_xcc", "g_nope", "g_rope", "kvb", "qb", "qrb", "b_sbuf",
-           "att_acc")
+ALIASED = (
+    "b_keys",
+    "b_memb",
+    "b_pre",
+    "b_xacc",
+    "b_xcc",
+    "g_nope",
+    "g_rope",
+    "kvb",
+    "qb",
+    "qrb",
+    "b_sbuf",
+    "att_acc",
+)
 
 
 def shl(x, n):
@@ -103,19 +128,40 @@ def geometry(cfg, tiles, max_pages, bmax):
     BMAX = bmax or TMAX
     KT = cfg.KT
     KR_ = KT // 128
-    TR = max(8, (TMAX + 7) // 8 * 8)                      # per-row state rows
-    NG = TR // 8                                          # 8-row threshold groups
-    UR_ = TMAX * KR_ + BMAX                               # union rows (sum of ceil(nu / 128)) <= this
+    TR = max(8, (TMAX + 7) // 8 * 8)  # per-row state rows
+    NG = TR // 8  # 8-row threshold groups
+    UR_ = TMAX * KR_ + BMAX  # union rows (sum of ceil(nu / 128)) <= this
     XKC = tiles.xkc
-    UR2 = UR_ + XKC // 128                                # + the extraction's last-chunk spill
-    MEMBR = max(128, (2 * max_pages + 127) // 128 * 128)  # membership rows (2 per page), 128-row blocks
+    UR2 = UR_ + XKC // 128  # + the extraction's last-chunk spill
+    MEMBR = max(
+        128, (2 * max_pages + 127) // 128 * 128
+    )  # membership rows (2 per page), 128-row blocks
     POOL = tiles.pool
     NPG = tiles.scan_np
-    NBLK = POOL // NPG + BMAX + 1                         # scan blocks per wave (upper bound)
-    PB = max(1, int(math.ceil(math.log2(max(2, max_pages * cfg.page)))))   # position bits (tie bound)
+    NBLK = POOL // NPG + BMAX + 1  # scan blocks per wave (upper bound)
+    PB = max(
+        1, int(math.ceil(math.log2(max(2, max_pages * cfg.page))))
+    )  # position bits (tie bound)
     QN = cfg.QMAX * cfg.NH
-    return dict(TMAX=TMAX, BMAX=BMAX, KT=KT, KR_=KR_, TR=TR, NG=NG, UR_=UR_, UR2=UR2, XKC=XKC, MEMBR=MEMBR,
-                POOL=POOL, NPG=NPG, SD=tiles.scan_sd, NBLK=NBLK, PB=PB, GR=tiles.gring, QN=QN)
+    return dict(
+        TMAX=TMAX,
+        BMAX=BMAX,
+        KT=KT,
+        KR_=KR_,
+        TR=TR,
+        NG=NG,
+        UR_=UR_,
+        UR2=UR2,
+        XKC=XKC,
+        MEMBR=MEMBR,
+        POOL=POOL,
+        NPG=NPG,
+        SD=tiles.scan_sd,
+        NBLK=NBLK,
+        PB=PB,
+        GR=tiles.gring,
+        QN=QN,
+    )
 
 
 def scratch(cfg, tiles, max_pages, bmax):
@@ -126,21 +172,31 @@ def scratch(cfg, tiles, max_pages, bmax):
     qdt = FP8 if tiles.dot == "fp8" else BF16
     return {
         # scan
-        "b_kring": pltpu.VMEM((g["SD"], g["NPG"], IR4, 4, pg), U8), "b_kring_sem": pltpu.SemaphoreType.DMA((g["SD"],)),
+        "b_kring": pltpu.VMEM((g["SD"], g["NPG"], IR4, 4, pg), U8),
+        "b_kring_sem": pltpu.SemaphoreType.DMA((g["SD"],)),
         "b_keys": pltpu.VMEM((g["POOL"], 8, 128), I32),
         "b_qblk": pltpu.VMEM((cfg.IH * 8, 128), qdt),
-        "b_wb": pltpu.VMEM((cfg.IH, 4, pg), F32), "b_lim": pltpu.VMEM((4, pg), I32),   # per-request head weights / row limits
-        "b_qblk4": pltpu.VMEM((cfg.IH * 4, 128), qdt),                                 # scan q block, 4 rows per head
-        "b_knew": pltpu.VMEM((128, 128), FP8), "b_snew": pltpu.VMEM((8, 128), F32),
+        "b_wb": pltpu.VMEM((cfg.IH, 4, pg), F32),
+        "b_lim": pltpu.VMEM((4, pg), I32),  # per-request head weights / row limits
+        "b_qblk4": pltpu.VMEM((cfg.IH * 4, 128), qdt),  # scan q block, 4 rows per head
+        "b_knew": pltpu.VMEM((128, 128), FP8),
+        "b_snew": pltpu.VMEM((8, 128), F32),
         # threshold: per (group, parity) send / receive buffers and semaphores
-        "b_csend": pltpu.VMEM((g["NG"], 2, 8, 128), I32), "b_crecv": pltpu.VMEM((g["NG"], 2, R, 8, 128), I32),
-        "b_csem_s": pltpu.SemaphoreType.DMA((g["NG"], 2)), "b_csem_r": pltpu.SemaphoreType.DMA((g["NG"], 2)),
+        "b_csend": pltpu.VMEM((g["NG"], 2, 8, 128), I32),
+        "b_crecv": pltpu.VMEM((g["NG"], 2, R, 8, 128), I32),
+        "b_csem_s": pltpu.SemaphoreType.DMA((g["NG"], 2)),
+        "b_csem_r": pltpu.SemaphoreType.DMA((g["NG"], 2)),
         # per-row state (lane-broadcast): 0 mode, 1 prefix, 2 T, 3 P, 4 allowance
-        "b_row": pltpu.VMEM((6 if getattr(tiles, "thr_early", False) else 5, g["TR"], 128), I32),
+        "b_row": pltpu.VMEM(
+            (6 if getattr(tiles, "thr_early", False) else 5, g["TR"], 128), I32
+        ),
         # union extraction
-        "b_memb": pltpu.VMEM((g["MEMBR"], 128), I32), "b_pre": pltpu.VMEM((g["MEMBR"], 128), I32),
-        "b_xacc": pltpu.VMEM((g["XKC"], 384), F32), "b_xcc": pltpu.VMEM((2, 128, 128), F32),
-        "own_u": pltpu.SMEM((g["UR2"], 128), I32), "own_uv": pltpu.VMEM((g["UR2"], 128), I32),
+        "b_memb": pltpu.VMEM((g["MEMBR"], 128), I32),
+        "b_pre": pltpu.VMEM((g["MEMBR"], 128), I32),
+        "b_xacc": pltpu.VMEM((g["XKC"], 384), F32),
+        "b_xcc": pltpu.VMEM((2, 128, 128), F32),
+        "own_u": pltpu.SMEM((g["UR2"], 128), I32),
+        "own_uv": pltpu.VMEM((g["UR2"], 128), I32),
         # per request: 0 nu, 1 uo, 2 nuo, 3 np (local pages), 4 pbase, 5 seq, 6 nold, 7 t0, 8 nq, 9 p0,
         # 10 valid, 11 npmax (rank-0 pages: the wave partition), 12 needs tie bound
         "b_req": pltpu.SMEM((g["BMAX"], 16), I32),
@@ -151,18 +207,28 @@ def scratch(cfg, tiles, max_pages, bmax):
         "b_wave": pltpu.SMEM((g["BMAX"] + 2,), I32),
         "b_blk": pltpu.SMEM((2, g["NBLK"]), I32),
         "b_grp": pltpu.SMEM((2, g["NG"]), I32),
-        **({"b_tg": pltpu.SMEM((2, g["NG"]), I32)} if getattr(tiles, "thr_early", False) else {}),  # L1-E: done, parity base
+        **(
+            {"b_tg": pltpu.SMEM((2, g["NG"]), I32)}
+            if getattr(tiles, "thr_early", False)
+            else {}
+        ),  # L1-E: done, parity base
         # gather ring + attention
-        "g_nope": pltpu.VMEM((g["GR"] * 128, 128), U32), "g_rope": pltpu.VMEM((g["GR"] * 128, 128), U32),
+        "g_nope": pltpu.VMEM((g["GR"] * 128, 128), U32),
+        "g_rope": pltpu.VMEM((g["GR"] * 128, 128), U32),
         "g_sem": pltpu.SemaphoreType.DMA((g["GR"], 2)),
-        "kvb": pltpu.VMEM((2, 128, KL), BF16), "b_sbuf": pltpu.VMEM((2, g["QN"], 128), F32),
-        "qb": pltpu.VMEM((g["QN"], KL), BF16), "qrb": pltpu.VMEM((g["QN"], 128), BF16),
+        "kvb": pltpu.VMEM((2, 128, KL), BF16),
+        "b_sbuf": pltpu.VMEM((2, g["QN"], 128), F32),
+        "qb": pltpu.VMEM((g["QN"], KL), BF16),
+        "qrb": pltpu.VMEM((g["QN"], 128), BF16),
         "att_acc": pltpu.VMEM((g["QN"], KL), F32),
-        "m_s": pltpu.VMEM((g["QN"], 1), F32), "l_s": pltpu.VMEM((g["QN"], 1), F32),
+        "m_s": pltpu.VMEM((g["QN"], 1), F32),
+        "l_s": pltpu.VMEM((g["QN"], 1), F32),
     }
 
 
-def extract_union(keys_ref, nbk, out_ref, row0, pre_ref, acc_ref, cc_ref, kc, mb_sh, max_rows=None):
+def extract_union(
+    keys_ref, nbk, out_ref, row0, pre_ref, acc_ref, cc_ref, kc, mb_sh, max_rows=None
+):
     """Counting extraction (topk2.extract_payload's math, one payload plane): every position with
     key > 0 over the first nbk 128-row blocks of keys_ref (position = row * 128 + lane), ascending, as
     out_ref rows [row0, row0 + ceil(n / 128)): position | key << mb_sh (keys are < 2^(31 - mb_sh)), -1 past
@@ -177,9 +243,14 @@ def extract_union(keys_ref, nbk, out_ref, row0, pre_ref, acc_ref, cc_ref, kc, mb
         r0 = pl.multiple_of(b * 128, 128)
         kb = keys_ref[pl.ds(r0, 128), :]
         selb = (kb > 0).astype(F32).astype(BF16)
-        cc_ref[0, pl.ds(b, 1), :] = lax.dot_general(ones8, selb, NT, preferred_element_type=F32)[0:1]
-        pre_ref[pl.ds(r0, 128), :] = lax.dot_general(selb, upper, NN, preferred_element_type=F32).astype(I32)
+        cc_ref[0, pl.ds(b, 1), :] = lax.dot_general(
+            ones8, selb, NT, preferred_element_type=F32
+        )[0:1]
+        pre_ref[pl.ds(r0, 128), :] = lax.dot_general(
+            selb, upper, NN, preferred_element_type=F32
+        ).astype(I32)
         return c
+
     lax.fori_loop(0, nbk, sel_blk, 0)
     C = cc_ref[0]
     n_sel = jnp.sum(C).astype(I32)
@@ -188,8 +259,17 @@ def extract_union(keys_ref, nbk, out_ref, row0, pre_ref, acc_ref, cc_ref, kc, mb
     th = jnp.floor(tot * (1.0 / 128))
     tl = tot - 128 * th
     Ls = (li < ri).astype(BF16)
-    off = (128 * lax.dot_general(Ls, jnp.broadcast_to(th, (128, 128)).astype(BF16), NN, preferred_element_type=F32)
-           + lax.dot_general(Ls, jnp.broadcast_to(tl, (128, 128)).astype(BF16), NN, preferred_element_type=F32))
+    off = 128 * lax.dot_general(
+        Ls,
+        jnp.broadcast_to(th, (128, 128)).astype(BF16),
+        NN,
+        preferred_element_type=F32,
+    ) + lax.dot_general(
+        Ls,
+        jnp.broadcast_to(tl, (128, 128)).astype(BF16),
+        NN,
+        preferred_element_type=F32,
+    )
     CI = W + off
     CE = CI - C
     cc_ref[0] = CE
@@ -207,28 +287,41 @@ def extract_union(keys_ref, nbk, out_ref, row0, pre_ref, acc_ref, cc_ref, kc, mb
         def body(b, c2):
             ce_r = cc_ref[0, pl.ds(b, 1), :]
             ci_r = cc_ref[1, pl.ds(b, 1), :]
-            oht = ((ce_r <= kr) & (kr < ci_r)).astype(F32).astype(BF16)          # (kc, 128)
+            oht = ((ce_r <= kr) & (kr < ci_r)).astype(F32).astype(BF16)  # (kc, 128)
             r0 = pl.multiple_of(b * 128, 128)
             pre = pre_ref[pl.ds(r0, 128), :].astype(F32).astype(BF16)
             ce_c = jnp.transpose(jnp.broadcast_to(ce_r, (128, 128)))
             ceh = jnp.floor(ce_c * (1.0 / 128))
-            tail = jnp.where(li == 0, b.astype(F32), jnp.where(li == 1, ri.astype(F32), jnp.where(
-                li == 2, ceh, jnp.where(li == 3, ce_c - 128 * ceh, 0.0)))).astype(BF16)
+            tail = jnp.where(
+                li == 0,
+                b.astype(F32),
+                jnp.where(
+                    li == 1,
+                    ri.astype(F32),
+                    jnp.where(li == 2, ceh, jnp.where(li == 3, ce_c - 128 * ceh, 0.0)),
+                ),
+            ).astype(BF16)
             plane = (keys_ref[pl.ds(r0, 128), :] & 0xFF).astype(F32).astype(BF16)
-            parts = (lax.dot_general(oht, pre, NN, preferred_element_type=F32),
-                     lax.dot_general(oht, tail, NN, preferred_element_type=F32),
-                     lax.dot_general(oht, plane, NN, preferred_element_type=F32))
+            parts = (
+                lax.dot_general(oht, pre, NN, preferred_element_type=F32),
+                lax.dot_general(oht, tail, NN, preferred_element_type=F32),
+                lax.dot_general(oht, plane, NN, preferred_element_type=F32),
+            )
 
-            @pl.when(b == b_lo)                  # first block assigns: no zero fill, no read-modify-write
+            @pl.when(
+                b == b_lo
+            )  # first block assigns: no zero fill, no read-modify-write
             def _():
                 for i_, v_ in enumerate(parts):
-                    acc_ref[:, 128 * i_:128 * (i_ + 1)] = v_
+                    acc_ref[:, 128 * i_ : 128 * (i_ + 1)] = v_
 
             @pl.when(b > b_lo)
             def _():
                 for i_, v_ in enumerate(parts):
-                    acc_ref[:, 128 * i_:128 * (i_ + 1)] += v_
+                    acc_ref[:, 128 * i_ : 128 * (i_ + 1)] += v_
+
             return c2
+
         lax.fori_loop(b_lo, b_hi, body, 0)
         RT = acc_ref[...]
         rr = 128 * RT[:, 128:129] + RT[:, 129:130]
@@ -237,13 +330,20 @@ def extract_union(keys_ref, nbk, out_ref, row0, pre_ref, acc_ref, cc_ref, kc, mb
         live = kr < n_sel.astype(F32)
         lsel = lax.broadcasted_iota(I32, (kc, 128), 1).astype(F32) == lane
         key = jnp.sum(jnp.where(lsel, RT[:, 256:384], 0.0), axis=1, keepdims=True)
-        ent = jnp.where(live, (rr * 128 + lane).astype(I32) | shl(key.astype(I32), mb_sh), -1)   # (kc, 1)
-        entr = jnp.transpose(jnp.broadcast_to(ent, (kc, 128)))[0:1]                  # (1, kc)
+        ent = jnp.where(
+            live, (rr * 128 + lane).astype(I32) | shl(key.astype(I32), mb_sh), -1
+        )  # (kc, 1)
+        entr = jnp.transpose(jnp.broadcast_to(ent, (kc, 128)))[0:1]  # (1, kc)
         for q in range(kc // 128):
-            out_ref[pl.ds(row0 + ci * (kc // 128) + q, 1), :] = entr[:, q * 128:(q + 1) * 128]
+            out_ref[pl.ds(row0 + ci * (kc // 128) + q, 1), :] = entr[
+                :, q * 128 : (q + 1) * 128
+            ]
         return c
+
     nch = (n_sel + kc - 1) // kc
-    if max_rows is not None:                 # never write past the output (only a corrupt selection gets here)
+    if (
+        max_rows is not None
+    ):  # never write past the output (only a corrupt selection gets here)
         cap = jnp.maximum(max_rows - kc // 128, 0) // (kc // 128)
         nch = jnp.minimum(nch, cap)
         n_sel = jnp.minimum(n_sel, nch * kc)
@@ -257,25 +357,47 @@ def make(E):
     g = geometry(cfg, tiles, E.max_pages, E.BMAX)
     R, me = cfg.R, E.me
     TMAX, BMAX, TR, NG, UR2 = g["TMAX"], g["BMAX"], g["TR"], g["NG"], g["UR2"]
-    KT, POOL, NPG, SD, NBLK, PB, GR, QN, XKC = (g["KT"], g["POOL"], g["NPG"], g["SD"], g["NBLK"], g["PB"],
-                                                 g["GR"], g["QN"], g["XKC"])
+    KT, POOL, NPG, SD, _NBLK, PB, GR, QN, XKC = (
+        g["KT"],
+        g["POOL"],
+        g["NPG"],
+        g["SD"],
+        g["NBLK"],
+        g["PB"],
+        g["GR"],
+        g["QN"],
+        g["XKC"],
+    )
     pg, lg_pg = cfg.page, int(math.log2(cfg.page))
-    assert pg == 256 and cfg.QMAX == 4, (pg, cfg.QMAX)       # (8, 128) key tile = 4 rows x 2 chunks
+    assert pg == 256 and cfg.QMAX == 4, (
+        pg,
+        cfg.QMAX,
+    )  # (8, 128) key tile = 4 rows x 2 chunks
     ILV, G_ = cfg.ILV, cfg.ILV * R
     IH, IDIM, NH, KL, HR = cfg.IH, cfg.IDIM, cfg.NH, cfg.KL, cfg.HR
     assert IH * 8 <= 512 and NH <= 128
     MB_SH, SRC_MASK = E.MB_SH, E.SRC_MASK
-    QA, QH, OH = E.QA, E.QH, E.OH
+    QA, QH = E.QA, E.QH
     rmeta, qmeta, bt, rvec = E.rmeta, E.qmeta, E.bt, E.rvec
-    bti = E.bti                                          # index-K cache pages (its own modulus)
+    bti = E.bti  # index-K cache pages (its own modulus)
     MAXP = E.max_pages
     skip = E.skip
     fault = tiles.fault
     # kernel.FAULTS validates the name; faults outside FAULTS belong to the host kernel and are no-ops here
-    PSH = 1 if fault == "page_off_by_one" else 0         # FAULT: virtual page + 1 in the scan and the gather
+    PSH = (
+        1 if fault == "page_off_by_one" else 0
+    )  # FAULT: virtual page + 1 in the scan and the gather
     sm_scale = E.sm_scale
-    Phases, csel, mxu, fp8_decode_hw, mono_key, pack2, unpack_lo, unpack_hi = (
-        E.Phases, E.csel, E.mxu, E.fp8_decode_hw, E.mono_key, E.pack2, E.unpack_lo, E.unpack_hi)
+    Phases, csel, mxu, _fp8_decode_hw, mono_key, pack2, unpack_lo, unpack_hi = (
+        E.Phases,
+        E.csel,
+        E.mxu,
+        E.fp8_decode_hw,
+        E.mono_key,
+        E.pack2,
+        E.unpack_lo,
+        E.unpack_hi,
+    )
     req = scr["b_req"]
     st = scr["b_st"]
     row = scr["b_row"]
@@ -285,24 +407,49 @@ def make(E):
     sub128 = lax.broadcasted_iota(I32, (128, 1), 0)
     UNR = max(1, tiles.gunroll)
     MAXP_OK = E.max_pages <= 256
-    SCAN_UNROLL = int(tiles.scan_unroll)        # per-lane tile counts <= 256: exact bf16 MXU lane sums
+    SCAN_UNROLL = int(
+        tiles.scan_unroll
+    )  # per-lane tile counts <= 256: exact bf16 MXU lane sums
     LSE_TILE = getattr(tiles, "a2a_lse", "lanes") == "tile"
-    HPAD = max(8, -(-cfg.HR // 8) * 8)          # lse tile rows per owner (kernel.build: the same rule)
-    THR_U = max(1, int(tiles.thr_unroll))       # L1-U: count-loop tiles per iteration (1 = stage A)
-    THR_SWAR = bool(getattr(tiles, "thr_swar", False))   # L1-S: 4-bit counts from packed 8-bit digit histograms
-    SW_CH = 248                                 # SWAR flush period (tiles): an 8-bit counter gains <= 1 per tile
-    DSEND = bool(getattr(tiles, "thr_dsend", False))     # L1-D: count-exchange send waits deferred by two rounds
-    EARLY = bool(getattr(tiles, "thr_early", False))     # L1-E: a group stops once #(key >= its prefix) == KT
-    MSLOT = 32                                  # L1-M: lanes per group in the merged count payload
+    HPAD = max(
+        8, -(-cfg.HR // 8) * 8
+    )  # lse tile rows per owner (kernel.build: the same rule)
+    THR_U = max(
+        1, int(tiles.thr_unroll)
+    )  # L1-U: count-loop tiles per iteration (1 = stage A)
+    THR_SWAR = bool(
+        getattr(tiles, "thr_swar", False)
+    )  # L1-S: 4-bit counts from packed 8-bit digit histograms
+    SW_CH = 248  # SWAR flush period (tiles): an 8-bit counter gains <= 1 per tile
+    DSEND = bool(
+        getattr(tiles, "thr_dsend", False)
+    )  # L1-D: count-exchange send waits deferred by two rounds
+    EARLY = bool(
+        getattr(tiles, "thr_early", False)
+    )  # L1-E: a group stops once #(key >= its prefix) == KT
+    MSLOT = 32  # L1-M: lanes per group in the merged count payload
     # L1-M dispatch: merged exchange when the wave's rank-0 page count <= thr_merge (0: never = stage A; >= POOL:
     # always, the per-group form is not compiled). L1-W: thr_switch >= POOL compiles only the 4-bit body.
-    MERGE = "never" if tiles.thr_merge <= 0 else ("always" if tiles.thr_merge >= POOL else "dispatch")
+    MERGE = (
+        "never"
+        if tiles.thr_merge <= 0
+        else ("always" if tiles.thr_merge >= POOL else "dispatch")
+    )
     if MERGE != "never":
-        assert NG * MSLOT <= 128, ("merged count payload holds <= 4 groups (TMAX <= 32)", NG)
-        assert not DSEND, "thr_dsend is implemented for the per-group (pipelined) exchange only"
-        assert not EARLY, "thr_early is implemented for the per-group (pipelined) exchange only"
+        assert NG * MSLOT <= 128, (
+            "merged count payload holds <= 4 groups (TMAX <= 32)",
+            NG,
+        )
+        assert not DSEND, (
+            "thr_dsend is implemented for the per-group (pipelined) exchange only"
+        )
+        assert not EARLY, (
+            "thr_early is implemented for the per-group (pipelined) exchange only"
+        )
     ONLY4 = tiles.thr_switch >= POOL
-    THR_GIVEN = bool(tiles.thr_given) or bool(tiles.union_given)   # timing-only backing arms (WHITEBOARD.v3 §6.1)
+    THR_GIVEN = bool(tiles.thr_given) or bool(
+        tiles.union_given
+    )  # timing-only backing arms (WHITEBOARD.v3 §6.1)
     UNION_GIVEN = bool(tiles.union_given)
 
     def T_():
@@ -335,26 +482,42 @@ def make(E):
             nl0 = (seq // G_) * ILV + jnp.clip(seq % G_, 0, ILV)
             p0 = seq - nq
             nold = (p0 // G_) * ILV + jnp.clip(p0 % G_ - ILV * me, 0, ILV)
-            vals = {3: jnp.where(ok, (nloc + pg - 1) >> lg_pg, 0), 5: seq, 6: nold, 7: t0,
-                    8: jnp.where(ok, nq, 0), 9: p0, 10: ok.astype(I32),
-                    11: jnp.where(ok, (nl0 + pg - 1) >> lg_pg, 0), 0: 0, 1: 0, 2: 0, 4: 0, 12: 0}
+            vals = {
+                3: jnp.where(ok, (nloc + pg - 1) >> lg_pg, 0),
+                5: seq,
+                6: nold,
+                7: t0,
+                8: jnp.where(ok, nq, 0),
+                9: p0,
+                10: ok.astype(I32),
+                11: jnp.where(ok, (nl0 + pg - 1) >> lg_pg, 0),
+                0: 0,
+                1: 0,
+                2: 0,
+                4: 0,
+                12: 0,
+            }
             for k_, v_ in vals.items():
                 req[b, k_] = jnp.asarray(v_, I32)
             return c
+
         lax.fori_loop(0, BMAX, per_req, 0)
         # per-row modes: 0 inactive, 1 short (pos + 1 <= KT: every valid key), 2 radix
-        valid = jnp.logical_and(rvec[0:TR, 0:1] > 0, lax.broadcasted_iota(I32, (TR, 1), 0) < T)
+        valid = jnp.logical_and(
+            rvec[0:TR, 0:1] > 0, lax.broadcasted_iota(I32, (TR, 1), 0) < T
+        )
         pos = rvec[0:TR, 1:2]
         mode = jnp.where(valid, jnp.where(pos + 1 <= KT, 1, 2), 0)
         row[0] = jnp.broadcast_to(mode, (TR, 128))
 
-        def zring(i, c):                                 # once per step: no NaN bytes in a never-written slot
+        def zring(i, c):  # once per step: no NaN bytes in a never-written slot
             r8 = pl.multiple_of(i * 64, 64)
             scr["g_nope"][pl.ds(r8, 64), :] = jnp.zeros((64, 128), U32)
             scr["g_rope"][pl.ds(r8, 64), :] = jnp.zeros((64, 128), U32)
             return c
+
         lax.fori_loop(0, GR * 2, zring, 0)
-        if EARLY:                                        # L1-E: per-group parity base, alternating across calls
+        if EARLY:  # L1-E: per-group parity base, alternating across calls
             for gi_ in range(NG):
                 scr["b_tg"][1, gi_] = jnp.int32(0)
         # waves: consecutive requests whose rank-0 page counts fit the pool (identical on every rank)
@@ -368,7 +531,9 @@ def make(E):
             @pl.when(new)
             def _():
                 scr["b_wave"][nw2] = b
+
             return jnp.where(new, npm, acc + npm), nw2
+
         scr["b_wave"][0] = jnp.int32(0)
         _, nw = lax.fori_loop(0, B, wv, (jnp.int32(0), jnp.int32(0)))
         st[1] = nw + 1
@@ -381,12 +546,17 @@ def make(E):
         sr = scr["b_csem_s"].at[gi, par]
         rr = scr["b_csem_r"].at[gi, 0 if fault == "sharedsem" else par]
         for d in range(R):
+
             @pl.when(me != d)
             def _(d=d):
                 pltpu.make_async_remote_copy(
-                    src_ref=scr["b_csend"].at[gi, par], dst_ref=scr["b_crecv"].at[gi, par, me],
-                    send_sem=sr, recv_sem=rr, device_id=(jnp.int32(d),),
-                    device_id_type=pl.DeviceIdType.MESH).start()
+                    src_ref=scr["b_csend"].at[gi, par],
+                    dst_ref=scr["b_crecv"].at[gi, par, me],
+                    send_sem=sr,
+                    recv_sem=rr,
+                    device_id=(jnp.int32(d),),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
 
     def cx_finish(gi, par):
         if R == 1 or "coll" in skip:
@@ -394,15 +564,23 @@ def make(E):
         sr = scr["b_csem_s"].at[gi, par]
         rr = scr["b_csem_r"].at[gi, 0 if fault == "sharedsem" else par]
         desc = pltpu.make_async_remote_copy(
-            src_ref=scr["b_csend"].at[gi, par], dst_ref=scr["b_crecv"].at[gi, par, 0], send_sem=sr,
-            recv_sem=rr, device_id=(me,), device_id_type=pl.DeviceIdType.MESH)
+            src_ref=scr["b_csend"].at[gi, par],
+            dst_ref=scr["b_crecv"].at[gi, par, 0],
+            send_sem=sr,
+            recv_sem=rr,
+            device_id=(me,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
 
         def waits():
             for _ in range(R - 1):
                 desc.wait_recv()
-            if not DSEND:                    # L1-D: the send completions are waited 2 rounds later (cx_wait_send)
+            if (
+                not DSEND
+            ):  # L1-D: the send completions are waited 2 rounds later (cx_wait_send)
                 for _ in range(R - 1):
                     desc.wait_send()
+
         if tiles.trace:
             with jax.named_scope("X_wait"):
                 waits()
@@ -415,13 +593,18 @@ def make(E):
         if R == 1 or "coll" in skip:
             return
         desc = pltpu.make_async_remote_copy(
-            src_ref=scr["b_csend"].at[gi, par], dst_ref=scr["b_crecv"].at[gi, par, 0], send_sem=scr["b_csem_s"].at[gi, par],
-            recv_sem=scr["b_csem_r"].at[gi, 0 if fault == "sharedsem" else par], device_id=(me,),
-            device_id_type=pl.DeviceIdType.MESH)
+            src_ref=scr["b_csend"].at[gi, par],
+            dst_ref=scr["b_crecv"].at[gi, par, 0],
+            send_sem=scr["b_csem_s"].at[gi, par],
+            recv_sem=scr["b_csem_r"].at[gi, 0 if fault == "sharedsem" else par],
+            device_id=(me,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
 
         def waits():
             for _ in range(R - 1):
                 desc.wait_send()
+
         if tiles.trace:
             with jax.named_scope("X_wsend"):
                 waits()
@@ -445,7 +628,9 @@ def make(E):
         wq = jnp.where(sub8 < 4, wq, 0.0)
         acc = jnp.maximum(st_[0:8], 0.0) * wq[:, 0:1]
         for h_ in range(1, IH):
-            acc = acc + jnp.maximum(st_[h_ * 8:(h_ + 1) * 8], 0.0) * wq[:, h_:h_ + 1]
+            acc = (
+                acc + jnp.maximum(st_[h_ * 8 : (h_ + 1) * 8], 0.0) * wq[:, h_ : h_ + 1]
+            )
         return acc
 
     def qdot(a, b):
@@ -454,13 +639,17 @@ def make(E):
     def scan_req_setup(t0, nq, seq):
         """Per request (first block): q block, lane-broadcast head weights and the per-row position limit
         (min(pos_q, seq - 1), -1 for rows >= nq) -> VMEM, so the page loop holds no broadcasts."""
-        q4 = jnp.concatenate([scr["iqv"][h_, pl.ds(t0, 4), :] for h_ in range(IH)], axis=0)   # rows 4h + q
+        q4 = jnp.concatenate(
+            [scr["iqv"][h_, pl.ds(t0, 4), :] for h_ in range(IH)], axis=0
+        )  # rows 4h + q
         scr["b_qblk4"][...] = q4.astype(FP8).astype(scr["b_qblk4"].dtype)
         wq = scr["wts"][pl.ds(t0, 4), :]
         for h_ in range(IH):
-            scr["b_wb"][h_] = jnp.broadcast_to(wq[:, h_:h_ + 1], (4, pg))
+            scr["b_wb"][h_] = jnp.broadcast_to(wq[:, h_ : h_ + 1], (4, pg))
         pos_q = rvec[pl.ds(t0, 4), 1:2]
-        vis = (seq - 1) if fault == "causal_mask" else jnp.minimum(pos_q, seq - 1)    # FAULT: no causal limit
+        vis = (
+            (seq - 1) if fault == "causal_mask" else jnp.minimum(pos_q, seq - 1)
+        )  # FAULT: no causal limit
         lim = jnp.where(lax.broadcasted_iota(I32, (4, 1), 0) < nq, vis, -1)
         scr["b_lim"][...] = jnp.broadcast_to(lim, (4, pg))
 
@@ -476,11 +665,16 @@ def make(E):
                 npb = req[b, 3]
                 slot = i % SD
                 for p in range(NPG):
+
                     @pl.when(j * NPG + p < npb)
                     def _(p=p):
                         pj = jnp.minimum(j * NPG + p + PSH, MAXP - 1)
-                        pltpu.make_async_copy(ref.at[bti[b, pj]], ring.at[slot, p], ksem.at[slot]).start()
+                        pltpu.make_async_copy(
+                            ref.at[bti[b, pj]], ring.at[slot, p], ksem.at[slot]
+                        ).start()
+
             for i0 in range(SD - 1):
+
                 @pl.when(i0 < nblk)
                 def _(i0=i0):
                     issue_blk(jnp.int32(i0))
@@ -489,6 +683,7 @@ def make(E):
                 @pl.when(i + SD - 1 < nblk)
                 def _():
                     issue_blk(i + SD - 1)
+
                 b = scr["b_blk"][0, i]
                 j = scr["b_blk"][1, i]
                 slot = i % SD
@@ -496,63 +691,87 @@ def make(E):
                 nlive = jnp.minimum(NPG, npb - j * NPG)
 
                 def wbody(k, c2):
-                    pltpu.make_async_copy(ref.at[0], ring.at[slot, 0], ksem.at[slot]).wait()
+                    pltpu.make_async_copy(
+                        ref.at[0], ring.at[slot, 0], ksem.at[slot]
+                    ).wait()
                     return c2
+
                 lax.fori_loop(0, nlive, wbody, 0)
 
                 @pl.when(j == 0)
                 def _():
                     scan_req_setup(req[b, 7], req[b, 8], req[b, 5])
+
                 pbase = req[b, 4]
                 lane_r4 = lax.broadcasted_iota(I32, (4, pg), 1)
 
                 def page(p):
-                    blk = ring[slot, p]                                          # [IR4, 4, pg] u8
-                    kT = pltpu.bitcast(blk[0:IDIM // 4].reshape(IDIM, pg), FP8)
-                    scale = pltpu.bitcast(blk[IDIM // 4:IDIM // 4 + 1].reshape(4, pg)[0:1],
-                                          jnp.float8_e8m0fnu).astype(BF16).astype(F32)   # [1, pg]
-                    st_ = qdot(scr["b_qblk4"][...], kT)                          # [4 * IH, pg]
+                    blk = ring[slot, p]  # [IR4, 4, pg] u8
+                    kT = pltpu.bitcast(blk[0 : IDIM // 4].reshape(IDIM, pg), FP8)
+                    scale = (
+                        pltpu.bitcast(
+                            blk[IDIM // 4 : IDIM // 4 + 1].reshape(4, pg)[0:1],
+                            jnp.float8_e8m0fnu,
+                        )
+                        .astype(BF16)
+                        .astype(F32)
+                    )  # [1, pg]
+                    st_ = qdot(scr["b_qblk4"][...], kT)  # [4 * IH, pg]
                     acc = jnp.maximum(st_[0:4], 0.0) * scr["b_wb"][0]
-                    for h_ in range(1, IH):                                      # production order
-                        acc = acc + jnp.maximum(st_[h_ * 4:(h_ + 1) * 4], 0.0) * scr["b_wb"][h_]
+                    for h_ in range(1, IH):  # production order
+                        acc = (
+                            acc
+                            + jnp.maximum(st_[h_ * 4 : (h_ + 1) * 4], 0.0)
+                            * scr["b_wb"][h_]
+                        )
                     score = acc * scale
                     lidx = (j * NPG + p) * pg + lane_r4
                     gpos = (lidx // ILV) * G_ + me * ILV + lidx % ILV
                     ok = (gpos <= scr["b_lim"][...]) & (score != -jnp.inf)
-                    key = jnp.where(ok, mono_key(score), jnp.int32(INT_MIN))    # [4, 256]
+                    key = jnp.where(ok, mono_key(score), jnp.int32(INT_MIN))  # [4, 256]
                     tile = jnp.concatenate([key[:, 0:128], key[:, 128:256]], axis=0)
                     scr["b_keys"][pbase + j * NPG + p] = tile
 
                 PU = SCAN_UNROLL
 
-                def pageu(pp, c2):                       # PU independent pages per iteration (PU head-sum chains)
+                def pageu(
+                    pp, c2
+                ):  # PU independent pages per iteration (PU head-sum chains)
                     for u in range(PU):
                         page(PU * pp + u)
                     return c2
+
                 lax.fori_loop(0, nlive // PU, pageu, 0)
 
                 def page1(p, c2):
                     page(p)
                     return c2
+
                 lax.fori_loop(nlive // PU * PU, nlive, page1, 0)
                 return c
+
             lax.fori_loop(0, nblk, blk_body, 0)
+
         if "index" not in skip:
             csel(("idx",), l, run)
 
     def knew_prep():
         """The step's new index records (rec_v [TMAX, 256] bytes) as fp8 columns [128 dims, tokens] and
         their ue8m0 scales [1, tokens] (lanes past TMAX zero)."""
-        rec = scr["rec_v"][...]                                                  # [TMAX, 256] i32
+        rec = scr["rec_v"][...]  # [TMAX, 256] i32
         k8 = rec[:, 0:128]
         eb = rec[:, 128:129]
         if TMAX < 128:
             k8 = jnp.concatenate([k8, jnp.zeros((128 - TMAX, 128), I32)], axis=0)
             eb = jnp.concatenate([eb, jnp.zeros((128 - TMAX, 1), I32)], axis=0)
-        kT = jnp.transpose(k8)                                                   # [dims, tokens]
+        kT = jnp.transpose(k8)  # [dims, tokens]
         scr["b_knew"][...] = lax.bitcast_convert_type(kT.astype(U8), FP8)
-        e_row = jnp.transpose(jnp.broadcast_to(eb, (128, 128)))[0:8]            # [8, tokens] ue8m0 bytes
-        scr["b_snew"][...] = lax.bitcast_convert_type(shl(e_row, 23), F32)      # 2^(byte - 127) (byte 0: 0)
+        e_row = jnp.transpose(jnp.broadcast_to(eb, (128, 128)))[
+            0:8
+        ]  # [8, tokens] ue8m0 bytes
+        scr["b_snew"][...] = lax.bitcast_convert_type(
+            shl(e_row, 23), F32
+        )  # 2^(byte - 127) (byte 0: 0)
 
     def fix(bw0, bw1):
         """Patch the keys of this step's own new tokens (not in the HBM index cache yet) into the pool."""
@@ -565,10 +784,14 @@ def make(E):
             def _():
                 t0, nq, pbase = req[b, 7], req[b, 8], req[b, 4]
                 build_qblk(t0)
-                st_ = qdot(scr["b_qblk"][...], scr["b_knew"][...])                # [8 * IH, 128 tokens]
+                st_ = qdot(
+                    scr["b_qblk"][...], scr["b_knew"][...]
+                )  # [8 * IH, 128 tokens]
                 score = head_sum(st_, t0) * scr["b_snew"][0:1, :]
                 pos_q = dup4(rvec[pl.ds(t0, 4), 1:2])
-                key = jnp.where(score != -jnp.inf, mono_key(score), jnp.int32(INT_MIN))   # [8, tokens]
+                key = jnp.where(
+                    score != -jnp.inf, mono_key(score), jnp.int32(INT_MIN)
+                )  # [8, tokens]
                 for qq in range(cfg.QMAX):
                     t2 = jnp.minimum(t0 + qq, TMAX - 1)
                     pos2 = rmeta[t2, 1]
@@ -577,15 +800,27 @@ def make(E):
 
                     @pl.when(hit)
                     def _(t2=t2, lo2=lo2, pos2=pos2):
-                        kc = pltpu.roll(key, (128 - t2) % 128, 1)[:, 0:1]          # [8, 1] token t2
+                        kc = pltpu.roll(key, (128 - t2) % 128, 1)[
+                            :, 0:1
+                        ]  # [8, 1] token t2
                         kc = jnp.where(sub8[:, 0:1] < 4, kc, pltpu.roll(kc, 4, 0))
-                        caus = (pos_q[:, 0:1] >= pos2) if fault != "causal_mask" else (pos_q[:, 0:1] >= 0)
-                        kc = jnp.where(caus & (sub8[:, 0:1] % 4 < nq), kc, jnp.int32(INT_MIN))
+                        caus = (
+                            (pos_q[:, 0:1] >= pos2)
+                            if fault != "causal_mask"
+                            else (pos_q[:, 0:1] >= 0)
+                        )
+                        kc = jnp.where(
+                            caus & (sub8[:, 0:1] % 4 < nq), kc, jnp.int32(INT_MIN)
+                        )
                         ti = pbase + (lo2 >> lg_pg)
                         cc = (lo2 >> 7) & 1
                         old = scr["b_keys"][ti]
-                        scr["b_keys"][ti] = jnp.where((sub8 // 4 == cc) & (tok_l == (lo2 & 127)), kc, old)
+                        scr["b_keys"][ti] = jnp.where(
+                            (sub8 // 4 == cc) & (tok_l == (lo2 & 127)), kc, old
+                        )
+
             return c
+
         lax.fori_loop(bw0, bw1, per_req, 0)
 
     def grp_ranges(bw0, bw1):
@@ -597,30 +832,36 @@ def make(E):
         def body(b, c):
             t0, nq = req[b, 7], req[b, 8]
             for gi in range(NG):
-                hit = jnp.logical_and(nq > 0, jnp.logical_and(t0 < 8 * gi + 8, t0 + nq > 8 * gi))
+                hit = jnp.logical_and(
+                    nq > 0, jnp.logical_and(t0 < 8 * gi + 8, t0 + nq > 8 * gi)
+                )
 
                 @pl.when(hit)
                 def _(gi=gi):
                     scr["b_grp"][0, gi] = jnp.minimum(scr["b_grp"][0, gi], b)
                     scr["b_grp"][1, gi] = jnp.maximum(scr["b_grp"][1, gi], b + 1)
+
             return c
+
         lax.fori_loop(bw0, bw1, body, 0)
 
     ones_bf = jnp.ones((128, 128), BF16)
-    cur_l = [None]                                       # the layer of the running indexer_tail (fault controls)
+    cur_l = [None]  # the layer of the running indexer_tail (fault controls)
     FIRST_FRESH = min([l_ for l_ in range(cfg.L) if cfg.full_indexer(l_)] or [0])
 
     def lane_sum_small(a):
         """(n, 128) i32 with entries <= 256 -> per-row lane sums broadcast to all lanes (exact: bf16 holds
         integers <= 256, f32 accumulation), on the MXU instead of XLU reduces + converts."""
-        return lax.dot_general(a.astype(BF16), ones_bf, NN, preferred_element_type=F32).astype(I32)
+        return lax.dot_general(
+            a.astype(BF16), ones_bf, NN, preferred_element_type=F32
+        ).astype(I32)
 
     def thr_parts(DW, rt0, rt1):
         """The radix threshold's per-group pieces for digit width DW over the rows [rt0, rt1) of the current wave:
         count_payload (count, no send), count_send (stage A: count + send group gi), finish (stage A: wait group gi's
         exchange + decide) and finish_from (L1-M: decide group gi from already-received payloads, lane offset off)."""
         NK = (1 << DW) - 1
-        KMAX = NK + 1                                    # last round: k = 0 .. 2^DW
+        KMAX = NK + 1  # last round: k = 0 .. 2^DW
 
         def parity(gi, r):
             """Stage A: r % 2. L1-E: a group may stop after any round, so its parity continues across calls
@@ -650,14 +891,18 @@ def make(E):
                 def tile_parts(t_):
                     ab = t_ >= cend
                     inb = (t_ >= cpref) & ~ab
-                    d = shr(t_ - cpref, sh)                       # in-bracket digit in [0, 16)
+                    d = shr(t_ - cpref, sh)  # in-bracket digit in [0, 16)
                     inc = jnp.where(inb, shl(one, shl(d & 3, 3)), 0)
                     wi = shr(d, 2)
-                    return [jnp.where(wi == w_, inc, 0) for w_ in range(4)] + [ab.astype(I32)]
+                    return [jnp.where(wi == w_, inc, 0) for w_ in range(4)] + [
+                        ab.astype(I32)
+                    ]
 
                 def tsum(xs):
                     while len(xs) > 1:
-                        xs = [xs[j] + xs[j + 1] for j in range(0, len(xs) - 1, 2)] + ([xs[-1]] if len(xs) % 2 else [])
+                        xs = [xs[j] + xs[j + 1] for j in range(0, len(xs) - 1, 2)] + (
+                            [xs[-1]] if len(xs) % 2 else []
+                        )
                     return xs[0]
 
                 def chunk(c, carry):
@@ -668,22 +913,30 @@ def make(E):
 
                     def tbu(i, st):
                         base = pbase + lo + i * THR_U
-                        parts = [tile_parts(scr["b_keys"][base + u]) for u in range(THR_U)]
-                        return tuple(st[j] + tsum([pp[j] for pp in parts]) for j in range(5))
+                        parts = [
+                            tile_parts(scr["b_keys"][base + u]) for u in range(THR_U)
+                        ]
+                        return tuple(
+                            st[j] + tsum([pp[j] for pp in parts]) for j in range(5)
+                        )
 
                     def tb1(i, st):
                         parts = tile_parts(scr["b_keys"][pbase + i])
                         return tuple(st[j] + parts[j] for j in range(5))
+
                     st = lax.fori_loop(0, nfull, tbu, (z, z, z, z, z))
                     st = lax.fori_loop(lo + nfull * THR_U, hi, tb1, st)
                     for j in range(16):
                         bins[j] = bins[j] + (shr(st[j >> 2], 8 * (j & 3)) & 0xFF)
                     return tuple(bins) + (abt + st[4],)
+
                 nch = (npb + SW_CH - 1) // SW_CH
                 fin = lax.fori_loop(0, nch, chunk, tuple(z for _ in range(17)))
                 if MAXP_OK:
-                    sums = lane_sum_small(jnp.concatenate(list(fin), axis=0))           # [8 * 17, 128]
-                    bt = [sums[8 * i:8 * i + 8, 0:1] for i in range(17)]
+                    sums = lane_sum_small(
+                        jnp.concatenate(list(fin), axis=0)
+                    )  # [8 * 17, 128]
+                    bt = [sums[8 * i : 8 * i + 8, 0:1] for i in range(17)]
                 else:
                     bt = [jnp.sum(a, axis=1, keepdims=True) for a in fin]
                 S = [None] * 17
@@ -697,26 +950,37 @@ def make(E):
                 pref = rows4(1, t0)
                 mode = rows4(0, t0)
                 trow = t0 + (sub8 % 4)
-                en = (mode == 2) & (sub8 % 4 < nq) & (trow >= 8 * gi) & (trow < 8 * gi + 8)
-                if THR_SWAR and DW == 4:         # L1-S: digit histogram in packed 8-bit counters (exact)
+                en = (
+                    (mode == 2)
+                    & (sub8 % 4 < nq)
+                    & (trow >= 8 * gi)
+                    & (trow < 8 * gi + 8)
+                )
+                if (
+                    THR_SWAR and DW == 4
+                ):  # L1-S: digit histogram in packed 8-bit counters (exact)
                     tots = swar_tots(pref, en, sh, pbase, npb, ks)
                     return place(tots, ks, t0, nq, payload)
                 cs = []
                 for k in ks:
                     cu = pref + shl(jnp.int32(k), sh) if k else pref
                     if last and k == KMAX:
-                        wrap = (cu ^ INT_MIN) < (pref ^ INT_MIN)                 # unsigned overflow
+                        wrap = (cu ^ INT_MIN) < (pref ^ INT_MIN)  # unsigned overflow
                         cs.append(jnp.where(en & ~wrap, cu ^ INT_MIN, INT_MAX))
                     else:
                         cs.append(jnp.where(en, cu ^ INT_MIN, INT_MAX))
 
                 def tbody(i, accs):
                     tile = scr["b_keys"][pbase + i]
-                    return tuple(a + (tile >= c_).astype(I32) for a, c_ in zip(accs, cs))
+                    return tuple(
+                        a + (tile >= c_).astype(I32) for a, c_ in zip(accs, cs)
+                    )
+
                 z = jnp.zeros((8, 128), I32)
-                if THR_U == 1:                   # stage A: one tile per iteration
+                if THR_U == 1:  # stage A: one tile per iteration
                     accs = lax.fori_loop(0, npb, tbody, tuple(z for _ in ks))
-                else:                            # L1-U: THR_U tiles per iteration, per-splitter tree sum (exact)
+                else:  # L1-U: THR_U tiles per iteration, per-splitter tree sum (exact)
+
                     def tbodyu(i, accs):
                         base = pbase + i * THR_U
                         tl = [scr["b_keys"][base + u] for u in range(THR_U)]
@@ -724,17 +988,21 @@ def make(E):
                         for a, c_ in zip(accs, cs):
                             ms = [(t_ >= c_).astype(I32) for t_ in tl]
                             while len(ms) > 1:
-                                ms = [ms[j] + ms[j + 1] for j in range(0, len(ms) - 1, 2)] + (
-                                    [ms[-1]] if len(ms) % 2 else [])
+                                ms = [
+                                    ms[j] + ms[j + 1] for j in range(0, len(ms) - 1, 2)
+                                ] + ([ms[-1]] if len(ms) % 2 else [])
                             outs.append(a + ms[0])
                         return tuple(outs)
+
                     nfull = npb // THR_U
                     accs = lax.fori_loop(0, nfull, tbodyu, tuple(z for _ in ks))
                     accs = lax.fori_loop(nfull * THR_U, npb, tbody, accs)
                 mb = jnp.zeros((8, 128), I32)
-                if MAXP_OK:                      # all lane sums in one MXU pass (weights pushed once)
-                    sums = lane_sum_small(jnp.concatenate(list(accs), axis=0))      # [8 * len(ks), 128]
-                    tots = [sums[8 * i:8 * i + 8, 0:1] for i in range(len(ks))]
+                if MAXP_OK:  # all lane sums in one MXU pass (weights pushed once)
+                    sums = lane_sum_small(
+                        jnp.concatenate(list(accs), axis=0)
+                    )  # [8 * len(ks), 128]
+                    tots = [sums[8 * i : 8 * i + 8, 0:1] for i in range(len(ks))]
                 else:
                     tots = [jnp.sum(a, axis=1, keepdims=True) for a in accs]
                 return place(tots, ks, t0, nq, payload, mb)
@@ -748,22 +1016,31 @@ def make(E):
                 o = t0 - 8 * gi
                 rolled = pltpu.roll(mb, (o + 8) % 8, 0)
                 m = (sub8 >= o) & (sub8 < o + jnp.minimum(nq, 4))
-                if off is not None:              # merged payload: leave the other groups' lane slots alone
+                if (
+                    off is not None
+                ):  # merged payload: leave the other groups' lane slots alone
                     m = m & (lane8 >= off) & (lane8 < off + MSLOT)
                 return jnp.where(m, rolled, payload)
-            return lax.fori_loop(scr["b_grp"][0, gi], scr["b_grp"][1, gi], per_req,
-                                 jnp.zeros((8, 128), I32) if payload0 is None else payload0), par
+
+            return lax.fori_loop(
+                scr["b_grp"][0, gi],
+                scr["b_grp"][1, gi],
+                per_req,
+                jnp.zeros((8, 128), I32) if payload0 is None else payload0,
+            ), par
 
         def count_send(gi, r, last):
             payload, par = count_payload(gi, r, last)
-            if DSEND:                            # L1-D: b_csend[gi, par] was last sent in round r - 2
+            if DSEND:  # L1-D: b_csend[gi, par] was last sent in round r - 2
                 if isinstance(r, int):
                     if r >= 2:
                         cx_wait_send(gi, par)
                 else:
+
                     @pl.when(r >= 2)
                     def _():
                         cx_wait_send(gi, par)
+
             scr["b_csend"][gi, par] = payload
             scr["b_crecv"][gi, par, me] = payload
             if getattr(E, "delay", None) is not None:
@@ -775,7 +1052,7 @@ def make(E):
             per-rank payloads crecv, whose lanes [off, off + K) are this group's (sh: the round's digit shift)."""
             lo_, hi_ = (1, NK) if off is None else (1 + off, NK + off)
             ge = (Gs >= KT) & (lane8 >= lo_) & (lane8 <= hi_)
-            d = jnp.sum(ge.astype(I32), axis=1, keepdims=True)                     # (8, 1) digit
+            d = jnp.sum(ge.astype(I32), axis=1, keepdims=True)  # (8, 1) digit
             if fault == "digit" or (fault == "f_thr2" and DW == 2):
                 d = jnp.minimum(d + 1, NK)
             if fault == "f_wave":
@@ -785,7 +1062,7 @@ def make(E):
             if not last:
                 newp = pref | shl(jnp.broadcast_to(d, (8, 128)), sh)
                 row[1, pl.ds(r8, 8), :] = newp
-                if EARLY:                        # L1-E: exact early stop of this group
+                if EARLY:  # L1-E: exact early stop of this group
                     # #(key >= new prefix) is the summed count at splitter d (d >= 1), else unchanged
                     gsel = jnp.sum(jnp.where(lane8 == d, Gs, 0), axis=1, keepdims=True)
                     nlo = jnp.where(d >= 1, gsel, row[5, pl.ds(r8, 8), 0:1])
@@ -801,18 +1078,27 @@ def make(E):
                     # so T = prefix with P = all ranks' ties selects the same set as the full radix.
                     @pl.when(allok == 1)
                     def _():
-                        T_f = jnp.where(mode == 2, newp[:, 0:1] ^ INT_MIN, jnp.where(mode == 1, INT_MIN, INT_MAX))
+                        T_f = jnp.where(
+                            mode == 2,
+                            newp[:, 0:1] ^ INT_MIN,
+                            jnp.where(mode == 1, INT_MIN, INT_MAX),
+                        )
                         P_f = jnp.where(mode == 2, INT_MAX, 0)
                         for k_, v_ in ((2, T_f), (3, P_f), (4, jnp.zeros((8, 1), I32))):
                             old = row[k_, pl.ds(r8, 8), :]
-                            row[k_, pl.ds(r8, 8), :] = jnp.where(inw, jnp.broadcast_to(v_, (8, 128)), old)
+                            row[k_, pl.ds(r8, 8), :] = jnp.where(
+                                inw, jnp.broadcast_to(v_, (8, 128)), old
+                            )
                         scr["b_tg"][0, gi] = jnp.int32(1)
-                        if DSEND:                # this group's pending sends: rounds r - 1 and r
+                        if DSEND:  # this group's pending sends: rounds r - 1 and r
+
                             @pl.when(r >= 1)
                             def _():
                                 cx_wait_send(gi, parity(gi, r - 1))
+
                             cx_wait_send(gi, parity(gi, r))
                         scr["b_tg"][1, gi] = scr["b_tg"][1, gi] + r + 1
+
                 return
             Tu = pref[:, 0:1] | d
             Ts = Tu ^ INT_MIN
@@ -820,8 +1106,12 @@ def make(E):
             ge_s, gt_s = [], []
             for s_ in range(R):
                 P_ = crecv[s_]
-                ge_s.append(jnp.sum(jnp.where(lane8 == dl, P_, 0), axis=1, keepdims=True))
-                gt_s.append(jnp.sum(jnp.where(lane8 == dl + 1, P_, 0), axis=1, keepdims=True))
+                ge_s.append(
+                    jnp.sum(jnp.where(lane8 == dl, P_, 0), axis=1, keepdims=True)
+                )
+                gt_s.append(
+                    jnp.sum(jnp.where(lane8 == dl + 1, P_, 0), axis=1, keepdims=True)
+                )
             n_gt = gt_s[0]
             for x in gt_s[1:]:
                 n_gt = n_gt + x
@@ -838,33 +1128,52 @@ def make(E):
             a = jnp.clip(need - before, 0, eq_me)
             mode = row[0, pl.ds(r8, 8), 0:1]
             T_f = jnp.where(mode == 2, Ts, jnp.where(mode == 1, INT_MIN, INT_MAX))
-            P_f = jnp.where(mode == 2, jnp.where(a == eq_me, INT_MAX, jnp.where(a == 0, 0, -1)), 0)
+            P_f = jnp.where(
+                mode == 2, jnp.where(a == eq_me, INT_MAX, jnp.where(a == 0, 0, -1)), 0
+            )
             trow = gi * 8 + lax.broadcasted_iota(I32, (8, 1), 0)
             inw = (trow >= rt0) & (trow < rt1)
             for k_, v_ in ((2, T_f), (3, P_f), (4, a)):
                 old = row[k_, pl.ds(r8, 8), :]
-                row[k_, pl.ds(r8, 8), :] = jnp.where(inw, jnp.broadcast_to(v_, (8, 128)), old)
+                row[k_, pl.ds(r8, 8), :] = jnp.where(
+                    inw, jnp.broadcast_to(v_, (8, 128)), old
+                )
 
         def finish(gi, r, last):
             sh = 32 - DW * (r + 1)
             par = parity(gi, r)
-            early = fault == "f_cx_earlyread"    # FAULT: read the peers' payloads before waiting their receives
+            early = (
+                fault == "f_cx_earlyread"
+            )  # FAULT: read the peers' payloads before waiting their receives
             if early:
                 crecv = [scr["b_crecv"][gi, par, s_] for s_ in range(R)]
             cx_finish(gi, par)
-            if "coll" in skip:                   # removal arm (timing only): pretend every rank counted like me
+            if (
+                "coll" in skip
+            ):  # removal arm (timing only): pretend every rank counted like me
                 for s_ in range(R):
+
                     @pl.when(me != s_)
                     def _(s_=s_):
                         scr["b_crecv"][gi, par, s_] = scr["b_crecv"][gi, par, me]
+
             if not early:
                 crecv = [scr["b_crecv"][gi, par, s_] for s_ in range(R)]
             Gs = crecv[0]
             for s_ in range(1, R):
                 Gs = Gs + crecv[s_]
             decide(gi, sh, last, crecv, Gs, None, r=r)
-        return dict(NR=32 // DW, NK=NK, KMAX=KMAX, count_payload=count_payload, count_send=count_send,
-                    finish=finish, decide=decide, parity=parity)
+
+        return dict(
+            NR=32 // DW,
+            NK=NK,
+            KMAX=KMAX,
+            count_payload=count_payload,
+            count_send=count_send,
+            finish=finish,
+            decide=decide,
+            parity=parity,
+        )
 
     def threshold(DW, rt0, rt1, g0, g1, after_group):
         """Exact distributed radix threshold for the radix rows of groups [g0, g1) restricted to rows
@@ -879,6 +1188,7 @@ def make(E):
             r8 = pl.multiple_of(gi * 8, 8)
             row[1, pl.ds(r8, 8), :] = jnp.zeros((8, 128), I32)
             return c
+
         lax.fori_loop(g0, g1, init, 0)
 
         def rbody(r, c):
@@ -886,10 +1196,13 @@ def make(E):
                 @pl.when(r > 0)
                 def _():
                     finish(gi, r - 1, False)
+
                 count_send(gi, r, False)
                 return c2
+
             lax.fori_loop(g0, g1, gbody, 0)
             return c
+
         lax.fori_loop(0, NR - 1, rbody, 0)
 
         def glast(gi, c):
@@ -897,15 +1210,17 @@ def make(E):
                 finish(gi, NR - 2, False)
             count_send(gi, NR - 1, True)
             return c
+
         lax.fori_loop(g0, g1, glast, 0)
 
         def gfin(gi, c):
             finish(gi, NR - 1, True)
-            if DSEND:                            # L1-D: drain the last two rounds' sends of this group
+            if DSEND:  # L1-D: drain the last two rounds' sends of this group
                 cx_wait_send(gi, (NR - 2) % 2)
                 cx_wait_send(gi, (NR - 1) % 2)
-            after_group(gi)                      # overlaps the union with later groups' exchanges
+            after_group(gi)  # overlaps the union with later groups' exchanges
             return c
+
         lax.fori_loop(g0, g1, gfin, 0)
 
     def threshold_early(cp, rt0, rt1, g0, g1, after_group):
@@ -921,6 +1236,7 @@ def make(E):
             row[5, pl.ds(r8, 8), :] = jnp.full((8, 128), INT_MAX, I32)
             tg[0, gi] = jnp.int32(0)
             return c
+
         lax.fori_loop(g0, g1, init, 0)
 
         def rbody(r, c):
@@ -932,9 +1248,12 @@ def make(E):
                 @pl.when(tg[0, gi] == 0)
                 def _():
                     count_send(gi, r, False)
+
                 return c2
+
             lax.fori_loop(g0, g1, gbody, 0)
             return c
+
         lax.fori_loop(0, NR - 1, rbody, 0)
 
         def glast(gi, c):
@@ -945,7 +1264,9 @@ def make(E):
             @pl.when(tg[0, gi] == 0)
             def _():
                 count_send(gi, NR - 1, True)
+
             return c
+
         lax.fori_loop(g0, g1, glast, 0)
 
         def gfin(gi, c):
@@ -956,8 +1277,10 @@ def make(E):
                     cx_wait_send(gi, cp_parity(gi, NR - 2))
                     cx_wait_send(gi, cp_parity(gi, NR - 1))
                 tg[1, gi] = tg[1, gi] + NR
+
             after_group(gi)
             return c
+
         cp_parity = cp["parity"]
         lax.fori_loop(g0, g1, gfin, 0)
 
@@ -973,6 +1296,7 @@ def make(E):
             r8 = pl.multiple_of(gi * 8, 8)
             row[1, pl.ds(r8, 8), :] = jnp.zeros((8, 128), I32)
             return c
+
         lax.fori_loop(g0, g1, init, 0)
 
         def round_(r, last):
@@ -980,22 +1304,31 @@ def make(E):
             par = r % 2
 
             def gcount(gi, merged):
-                return cp["count_payload"](gi, r, last, off=MSLOT * gi, payload0=merged)[0]
+                return cp["count_payload"](
+                    gi, r, last, off=MSLOT * gi, payload0=merged
+                )[0]
+
             merged = lax.fori_loop(g0, g1, gcount, jnp.zeros((8, 128), I32))
             scr["b_csend"][0, par] = merged
             scr["b_crecv"][0, par, me] = merged
             if getattr(E, "delay", None) is not None:
                 E.delay(0, r)
             cx_start(0, par)
-            early = fault == "f_cx_earlyread"    # FAULT: read the peers' payloads before waiting their receives
+            early = (
+                fault == "f_cx_earlyread"
+            )  # FAULT: read the peers' payloads before waiting their receives
             if early:
                 crecv = [scr["b_crecv"][0, par, s_] for s_ in range(R)]
             cx_finish(0, par)
-            if "coll" in skip:                   # removal arm (timing only): pretend every rank counted like me
+            if (
+                "coll" in skip
+            ):  # removal arm (timing only): pretend every rank counted like me
                 for s_ in range(R):
+
                     @pl.when(me != s_)
                     def _(s_=s_):
                         scr["b_crecv"][0, par, s_] = scr["b_crecv"][0, par, me]
+
             if not early:
                 crecv = [scr["b_crecv"][0, par, s_] for s_ in range(R)]
             Gs = crecv[0]
@@ -1005,16 +1338,20 @@ def make(E):
             def gfin(gi, c):
                 cp["decide"](gi, sh, last, crecv, Gs, MSLOT * gi)
                 return c
+
             lax.fori_loop(g0, g1, gfin, 0)
-            if last:                             # unions after every group's rows are final (no exchange left)
+            if last:  # unions after every group's rows are final (no exchange left)
+
                 def gu(gi, c):
                     after_group(gi)
                     return c
+
                 lax.fori_loop(g0, g1, gu, 0)
 
         def rbody(r, c):
             round_(r, False)
             return c
+
         lax.fori_loop(0, NR - 1, rbody, 0)
         round_(NR - 1, True)
 
@@ -1043,16 +1380,19 @@ def make(E):
                 tile = scr["b_keys"][pbase + p]
                 pos = p * pg + 128 * (sub8 // 4) + lane8
                 return acc + ((tile == Tc) & (pos < trial)).astype(I32)
+
             acc = lax.fori_loop(0, npb, tb, jnp.zeros((8, 128), I32))
             tot = jnp.sum(acc, axis=1, keepdims=True)
             tot = tot + pltpu.roll(tot, 4, 0)
             return jnp.where(tot <= ac, trial, cand)
+
         cand = lax.fori_loop(0, PB, bit, jnp.zeros((8, 128), I32))
         newP = jnp.where(need_tb, cand, Pc)
         for q in range(4):
+
             @pl.when(q < nq)
             def _(q=q):
-                row[3, pl.ds(t0 + q, 1), :] = newP[q:q + 1]
+                row[3, pl.ds(t0 + q, 1), :] = newP[q : q + 1]
 
     def union_req(b):
         """Request b: tie bounds, membership bits -> extraction -> own_uv rows at st[4]; then each entry is
@@ -1073,6 +1413,7 @@ def make(E):
             @pl.when(jnp.max(jnp.where(need, 1, 0)) > 0)
             def _():
                 tie_bound(b)
+
             Tc = rows4(2, t0)
             Pc = rows4(3, t0)
             live = sub8 % 4 < nq
@@ -1097,15 +1438,37 @@ def make(E):
                     pf, km = c
                     tile, pos, sel = selm(p)
                     pf = jnp.minimum(pf, jnp.min(jnp.where(r0m & sel, pos, BIGP)))
-                    km = jnp.minimum(km, jnp.min(jnp.where(r0m & ~sel & (tile > INT_MIN), tile, INT_MAX)))
+                    km = jnp.minimum(
+                        km,
+                        jnp.min(
+                            jnp.where(r0m & ~sel & (tile > INT_MIN), tile, INT_MAX)
+                        ),
+                    )
                     return pf, km
+
                 pfirst, kmin = lax.fori_loop(0, npb, pass1, (BIGP, jnp.int32(INT_MAX)))
 
                 def pass2(p, c):
                     tile, pos, sel = selm(p)
-                    return jnp.minimum(c, jnp.min(jnp.where(r0m & ~sel & (tile == kmin) & (tile > INT_MIN), pos, BIGP)))
+                    return jnp.minimum(
+                        c,
+                        jnp.min(
+                            jnp.where(
+                                r0m & ~sel & (tile == kmin) & (tile > INT_MIN),
+                                pos,
+                                BIGP,
+                            )
+                        ),
+                    )
+
                 pmin = lax.fori_loop(0, npb, pass2, BIGP)
-                tgt = (cur_l[0] == FIRST_FRESH) & (b == 0) & (me == 0) & (pfirst < BIGP) & (pmin < BIGP)
+                tgt = (
+                    (cur_l[0] == FIRST_FRESH)
+                    & (b == 0)
+                    & (me == 0)
+                    & (pfirst < BIGP)
+                    & (pmin < BIGP)
+                )
                 swap = (r0m, jnp.where(tgt, pfirst, -1), jnp.where(tgt, pmin, -1))
 
             def mb(p4, cnt):
@@ -1117,62 +1480,105 @@ def make(E):
                     sel = ((tile > Tc) | ((tile == Tc) & (pos < Pc))) & (p < npb)
                     if swap is not None:
                         r0m_, drop_, add_ = swap
-                        sel = (sel & ~(r0m_ & (pos == drop_))) | (r0m_ & (pos == add_) & (p < npb))
+                        sel = (sel & ~(r0m_ & (pos == drop_))) | (
+                            r0m_ & (pos == add_) & (p < npb)
+                        )
                     bits = jnp.where(sel, bitv, 0)
                     for c_ in range(2):
-                        rr = jnp.sum(bits[4 * c_:4 * c_ + 4], axis=0, keepdims=True)
+                        rr = jnp.sum(bits[4 * c_ : 4 * c_ + 4], axis=0, keepdims=True)
                         rws.append(rr)
-                        cnt = cnt + jnp.where((rr > 0) & (p * pg + 128 * c_ + lane1 < nold), 1, 0)
-                scr["b_memb"][pl.ds(pl.multiple_of(p4 * 8, 8), 8), :] = jnp.concatenate(rws, axis=0)
+                        cnt = cnt + jnp.where(
+                            (rr > 0) & (p * pg + 128 * c_ + lane1 < nold), 1, 0
+                        )
+                scr["b_memb"][pl.ds(pl.multiple_of(p4 * 8, 8), 8), :] = jnp.concatenate(
+                    rws, axis=0
+                )
                 return cnt
+
             n4 = (npb + 3) // 4
             cnt = lax.fori_loop(0, n4, mb, jnp.zeros((1, 128), I32))
             nuo = jnp.sum(cnt)
             nbk = (2 * npb + 127) // 128
 
             def zr(i, c):
-                scr["b_memb"][pl.ds(pl.multiple_of(i * 8, 8), 8), :] = jnp.zeros((8, 128), I32)
+                scr["b_memb"][pl.ds(pl.multiple_of(i * 8, 8), 8), :] = jnp.zeros(
+                    (8, 128), I32
+                )
                 return c
+
             lax.fori_loop(n4, nbk * 16, zr, 0)
-            n = extract_union(scr["b_memb"], nbk, scr["own_uv"], r0, scr["b_pre"], scr["b_xacc"],
-                              scr["b_xcc"], XKC, MB_SH, max_rows=UR2 - r0)
+            n = extract_union(
+                scr["b_memb"],
+                nbk,
+                scr["own_uv"],
+                r0,
+                scr["b_pre"],
+                scr["b_xacc"],
+                scr["b_xcc"],
+                XKC,
+                MB_SH,
+                max_rows=UR2 - r0,
+            )
             nrow = (n + 127) // 128
             p0 = req[b, 9]
             BIG = jnp.int32(1 << 30)
 
-            def rrow(i, c):                     # resolve in place, vector (pages: compare-select over the row's range)
+            def rrow(
+                i, c
+            ):  # resolve in place, vector (pages: compare-select over the row's range)
                 e = scr["own_uv"][pl.ds(r0 + i, 1), :]
                 m = e & SRC_MASK
                 kk = i * 128 + lane1
                 lv = kk < n
-                if getattr(E, "dbg_uv", None) is not None:   # debug: the pre-resolution entry (idx | bits << MB_SH)
+                if (
+                    getattr(E, "dbg_uv", None) is not None
+                ):  # debug: the pre-resolution entry (idx | bits << MB_SH)
                     E.dbg_uv[pl.ds(r0 + i, 1), :] = e
-                old = (lv & (m < nold)) if fault != "kv_read_before_write" else lv   # FAULT: new rows read stale
+                old = (
+                    (lv & (m < nold)) if fault != "kv_read_before_write" else lv
+                )  # FAULT: new rows read stale
                 pidx = jnp.where(old, m >> lg_pg, -1)
                 lo = jnp.min(jnp.where(old, pidx, BIG))
                 hi = jnp.max(pidx)
 
                 def pgb(jj, pv):
-                    return jnp.where(pidx == jj, bt[b, jnp.minimum(jj + PSH, MAXP - 1)], pv)
-                page = lax.fori_loop(jnp.minimum(lo, hi + 1), hi + 1, pgb, jnp.zeros((1, 128), I32))
+                    return jnp.where(
+                        pidx == jj, bt[b, jnp.minimum(jj + PSH, MAXP - 1)], pv
+                    )
+
+                page = lax.fori_loop(
+                    jnp.minimum(lo, hi + 1), hi + 1, pgb, jnp.zeros((1, 128), I32)
+                )
                 if fault == "page":
-                    page = jnp.where(page + 1 < E.nb, page + 1, 0)       # stays in bounds (no UB on device)
+                    page = jnp.where(
+                        page + 1 < E.nb, page + 1, 0
+                    )  # stays in bounds (no UB on device)
                 gpos = (m // ILV) * G_ + me * ILV + m % ILV
                 t2 = jnp.clip(t0 + (gpos - p0), 0, TMAX - 1)
-                src = jnp.where(old, shl(page, 8) | (m & (pg - 1)), shl(t2, 2) | (m & 3))
-                scr["own_uv"][pl.ds(r0 + i, 1), :] = jnp.where(lv, src | (e & ~SRC_MASK), e)
+                src = jnp.where(
+                    old, shl(page, 8) | (m & (pg - 1)), shl(t2, 2) | (m & 3)
+                )
+                scr["own_uv"][pl.ds(r0 + i, 1), :] = jnp.where(
+                    lv, src | (e & ~SRC_MASK), e
+                )
                 scr["b_greq"][r0 + i] = b
                 return c
+
             lax.fori_loop(0, nrow, rrow, 0)
             req[b, 0] = n
-            req[b, 2] = n if fault == "kv_read_before_write" else nuo   # FAULT: every entry resolved as an old row
+            req[b, 2] = (
+                n if fault == "kv_read_before_write" else nuo
+            )  # FAULT: every entry resolved as an old row
             st[4] = r0 + nrow
 
     def union_upto(bw0, bw1, limit_row):
         """Unions of the wave's requests st[5].. whose last row is < limit_row (their rows are final); requests
         are ordered by first row, so this is a prefix (a fori + when: Mosaic rejected the while form)."""
+
         def body(b, c):
-            go = jnp.logical_and(b >= st[5], req[b, 7] + jnp.maximum(req[b, 8], 1) - 1 < limit_row)
+            go = jnp.logical_and(
+                b >= st[5], req[b, 7] + jnp.maximum(req[b, 8], 1) - 1 < limit_row
+            )
 
             @pl.when(go)
             def _():
@@ -1182,7 +1588,9 @@ def make(E):
                 else:
                     union_req(b)
                 st[5] = b + 1
+
             return c
+
         lax.fori_loop(bw0, bw1, body, 0)
 
     def udma(U):
@@ -1196,13 +1604,24 @@ def make(E):
             off = U & ~(2 * n_ - 1)
             cps.append((n_, off))
         for n_, off in cps:
+
             @pl.when((U & n_) != 0)
             def _(n_=n_, off=off):
-                pltpu.make_async_copy(scr["own_uv"].at[pl.ds(off, n_)], scr["own_u"].at[pl.ds(off, n_)], sem).start()
+                pltpu.make_async_copy(
+                    scr["own_uv"].at[pl.ds(off, n_)],
+                    scr["own_u"].at[pl.ds(off, n_)],
+                    sem,
+                ).start()
+
         for n_, off in cps:
+
             @pl.when((U & n_) != 0)
             def _(n_=n_, off=off):
-                pltpu.make_async_copy(scr["own_uv"].at[pl.ds(off, n_)], scr["own_u"].at[pl.ds(off, n_)], sem).wait()
+                pltpu.make_async_copy(
+                    scr["own_uv"].at[pl.ds(off, n_)],
+                    scr["own_u"].at[pl.ds(off, n_)],
+                    sem,
+                ).wait()
 
     def indexer_tail(l):
         """After I_proj / record: the batched index path for every wave -> union rows (own_uv, own_u)."""
@@ -1229,10 +1648,14 @@ def make(E):
                     scr["b_blk"][0, nb_ + j] = b
                     scr["b_blk"][1, nb_ + j] = j
                     return c2
+
                 lax.fori_loop(0, nbb, bl, 0)
                 return acc + npb, nb_ + nbb, tm + req[b, 11]
+
             # tot: rank-0 page count of the wave (replicated: every rank picks the same digit width)
-            _, nblk, tot = lax.fori_loop(bw0, bw1, pb, (jnp.int32(0), jnp.int32(0), jnp.int32(0)))
+            _, nblk, tot = lax.fori_loop(
+                bw0, bw1, pb, (jnp.int32(0), jnp.int32(0), jnp.int32(0))
+            )
             st[2] = nblk
             scan(l)
             pw.mark("I_fix")
@@ -1249,7 +1672,9 @@ def make(E):
             grp_ranges(bw0, bw1)
 
             st[5] = bw0
-            after = lambda gi: union_upto(bw0, bw1, 8 * (gi + 1))
+
+            def after(gi):
+                return union_upto(bw0, bw1, 8 * (gi + 1))
 
             def thr(DW):
                 if MERGE == "never":
@@ -1257,6 +1682,7 @@ def make(E):
                 elif MERGE == "always":
                     threshold_merged(DW, rt0, rt1, g0, g1, after)
                 else:
+
                     @pl.when(tot <= tiles.thr_merge)
                     def _():
                         threshold_merged(DW, rt0, rt1, g0, g1, after)
@@ -1266,11 +1692,13 @@ def make(E):
                         threshold(DW, rt0, rt1, g0, g1, after)
 
             if not THR_GIVEN:
+
                 @pl.when(anyr > 0)
                 def _():
                     if ONLY4:
                         thr(4)
                     else:
+
                         @pl.when(tot <= tiles.thr_switch)
                         def _():
                             thr(4)
@@ -1282,30 +1710,57 @@ def make(E):
                 @pl.when(anyr == 0)
                 def _():
                     set_short(rt0, rt1)
+
             pw.mark("I_union")
             if not UNION_GIVEN:
                 union_upto(bw0, bw1, jnp.int32(1 << 30))
             pw.end()
             return row0
+
         st[4] = jnp.int32(0)
         if THR_GIVEN or E.xout is not None:
-            fp = jnp.clip(jnp.where(l < cfg.idx_skip, l, cfg.idx_skip + (l - cfg.idx_skip) // cfg.idx_freq), 0,
-                          max(E.Lf, 1) - 1)
-        if THR_GIVEN and not UNION_GIVEN:        # thr_given: this layer's recorded T / P / allowance -> b_row[2:5]
-            cpy = pltpu.make_async_copy(E.xin["thr"].at[fp], row.at[pl.ds(2, 3)], E.misc_sem)
+            fp = jnp.clip(
+                jnp.where(
+                    l < cfg.idx_skip,
+                    l,
+                    cfg.idx_skip + (l - cfg.idx_skip) // cfg.idx_freq,
+                ),
+                0,
+                max(E.Lf, 1) - 1,
+            )
+        if (
+            THR_GIVEN and not UNION_GIVEN
+        ):  # thr_given: this layer's recorded T / P / allowance -> b_row[2:5]
+            cpy = pltpu.make_async_copy(
+                E.xin["thr"].at[fp], row.at[pl.ds(2, 3)], E.misc_sem
+            )
             cpy.start()
             cpy.wait()
         lax.fori_loop(0, nw, wave, jnp.int32(0))
-        if UNION_GIVEN:                          # union_given: the recorded union table (resolved entries, request
-            for nm, dst in (("uv", scr["own_uv"]), ("req", req), ("greq", scr["b_greq"])):   # and granule maps)
+        if (
+            UNION_GIVEN
+        ):  # union_given: the recorded union table (resolved entries, request
+            for nm, dst in (
+                ("uv", scr["own_uv"]),
+                ("req", req),
+                ("greq", scr["b_greq"]),
+            ):  # and granule maps)
                 cpy = pltpu.make_async_copy(E.xin[nm].at[fp], dst, E.misc_sem)
                 cpy.start()
                 cpy.wait()
             st[4] = scr["b_greq"][UR2 - 1]
-        if E.xout is not None:                   # rec build: export what the given arms load (output unchanged)
-            scr["b_greq"][UR2 - 1] = st[4]       # past every written granule (U <= UR_ = UR2 - XKC / 128)
-            for nm, src in (("thr", row.at[pl.ds(2, 3)]), ("uv", scr["own_uv"]), ("req", req),
-                            ("greq", scr["b_greq"])):
+        if (
+            E.xout is not None
+        ):  # rec build: export what the given arms load (output unchanged)
+            scr["b_greq"][UR2 - 1] = st[
+                4
+            ]  # past every written granule (U <= UR_ = UR2 - XKC / 128)
+            for nm, src in (
+                ("thr", row.at[pl.ds(2, 3)]),
+                ("uv", scr["own_uv"]),
+                ("req", req),
+                ("greq", scr["b_greq"]),
+            ):
                 cpy = pltpu.make_async_copy(src, E.xout[nm].at[fp], E.misc_sem)
                 cpy.start()
                 cpy.wait()
@@ -1333,31 +1788,47 @@ def make(E):
             def old_one(k):
                 v = own[r, k] & SRC_MASK
                 page, sl = v >> 8, v & 255
-                pltpu.make_async_copy(rn.at[page, pl.ds(sl, 1)], scr["g_nope"].at[pl.ds(base + k, 1)],
-                                      gs.at[slot, 0]).start()
-                pltpu.make_async_copy(rr.at[page, pl.ds(sl >> 2, 1)], scr["g_rope"].at[pl.ds(base + k, 1)],
-                                      gs.at[slot, 1]).start()
+                pltpu.make_async_copy(
+                    rn.at[page, pl.ds(sl, 1)],
+                    scr["g_nope"].at[pl.ds(base + k, 1)],
+                    gs.at[slot, 0],
+                ).start()
+                pltpu.make_async_copy(
+                    rr.at[page, pl.ds(sl >> 2, 1)],
+                    scr["g_rope"].at[pl.ds(base + k, 1)],
+                    gs.at[slot, 1],
+                ).start()
 
             def u_body(i, c):
                 for u in range(UNR):
                     old_one(i * UNR + u)
                 return c
+
             nu16 = n_old // UNR
             lax.fori_loop(0, nu16, u_body, 0)
 
             def r_body(k, c):
                 old_one(k)
                 return c
+
             lax.fori_loop(nu16 * UNR, n_old, r_body, 0)
 
             def new_one(k, c):
                 t2 = (own[r, k] & SRC_MASK) >> 2
-                pltpu.make_async_copy(E.wrow.at[pl.ds(t2, 1)], scr["g_nope"].at[pl.ds(base + k, 1)],
-                                      gs.at[slot, 0]).start()
-                pltpu.make_async_copy(E.rwrow.at[pl.ds(t2, 1)], scr["g_rope"].at[pl.ds(base + k, 1)],
-                                      gs.at[slot, 1]).start()
+                pltpu.make_async_copy(
+                    E.wrow.at[pl.ds(t2, 1)],
+                    scr["g_nope"].at[pl.ds(base + k, 1)],
+                    gs.at[slot, 0],
+                ).start()
+                pltpu.make_async_copy(
+                    E.rwrow.at[pl.ds(t2, 1)],
+                    scr["g_rope"].at[pl.ds(base + k, 1)],
+                    gs.at[slot, 1],
+                ).start()
                 return c
+
             lax.fori_loop(n_old, n, new_one, 0)
+
         if "gather" not in skip:
             csel(("nope", "rope"), l, go)
 
@@ -1376,43 +1847,64 @@ def make(E):
         own = scr["own_u"]
         gs = scr["g_sem"]
         if part == "old":
-            if fault == "f_early_stale":                 # FAULT: the early issue reads the PREVIOUS layer's caches
+            if (
+                fault == "f_early_stale"
+            ):  # FAULT: the early issue reads the PREVIOUS layer's caches
                 l = jnp.maximum(l - 1, 0)
 
             def go(rn, rr):
                 def old_one(k):
                     v = own[r, k] & SRC_MASK
                     page, sl = v >> 8, v & 255
-                    pltpu.make_async_copy(rn.at[page, pl.ds(sl, 1)], scr["g_nope"].at[pl.ds(base + k, 1)],
-                                          gs.at[slot, 0]).start()
-                    pltpu.make_async_copy(rr.at[page, pl.ds(sl >> 2, 1)], scr["g_rope"].at[pl.ds(base + k, 1)],
-                                          gs.at[slot, 1]).start()
+                    pltpu.make_async_copy(
+                        rn.at[page, pl.ds(sl, 1)],
+                        scr["g_nope"].at[pl.ds(base + k, 1)],
+                        gs.at[slot, 0],
+                    ).start()
+                    pltpu.make_async_copy(
+                        rr.at[page, pl.ds(sl >> 2, 1)],
+                        scr["g_rope"].at[pl.ds(base + k, 1)],
+                        gs.at[slot, 1],
+                    ).start()
 
                 def u_body(i, c):
                     for u in range(UNR):
                         old_one(i * UNR + u)
                     return c
+
                 nu16 = n_old // UNR
                 lax.fori_loop(0, nu16, u_body, 0)
 
                 def r_body(k, c):
                     old_one(k)
                     return c
+
                 lax.fori_loop(nu16 * UNR, n_old, r_body, 0)
+
             if "gather" not in skip:
                 csel(("nope", "rope"), l, go)
         else:
+
             def new_one(k, c):
                 t2 = (own[r, k] & SRC_MASK) >> 2
-                pltpu.make_async_copy(E.wrow.at[pl.ds(t2, 1)], scr["g_nope"].at[pl.ds(base + k, 1)],
-                                      gs.at[slot, 0]).start()
-                pltpu.make_async_copy(E.rwrow.at[pl.ds(t2, 1)], scr["g_rope"].at[pl.ds(base + k, 1)],
-                                      gs.at[slot, 1]).start()
+                pltpu.make_async_copy(
+                    E.wrow.at[pl.ds(t2, 1)],
+                    scr["g_nope"].at[pl.ds(base + k, 1)],
+                    gs.at[slot, 0],
+                ).start()
+                pltpu.make_async_copy(
+                    E.rwrow.at[pl.ds(t2, 1)],
+                    scr["g_rope"].at[pl.ds(base + k, 1)],
+                    gs.at[slot, 1],
+                ).start()
                 return c
+
             if "gather" not in skip:
                 lax.fori_loop(n_old, n, new_one, 0)
 
-    GE = tuple(int(x) for x in getattr(tiles, "gearly", ()) or ())   # (granules in the RS wait, ... + AG wait)
+    GE = tuple(
+        int(x) for x in getattr(tiles, "gearly", ()) or ()
+    )  # (granules in the RS wait, ... + AG wait)
     if GE:
         assert len(GE) == 2 and 0 <= GE[0] <= GE[1] <= GR, (GE, GR)
 
@@ -1425,6 +1917,7 @@ def make(E):
         def body(r, c):
             issue_part(l_next, r, "old")
             return c
+
         lax.fori_loop(jnp.minimum(lo, U), jnp.minimum(hi, U), body, 0)
 
     GREC_IN = getattr(E, "grec_in", None)
@@ -1439,18 +1932,28 @@ def make(E):
         n = jnp.clip(req[b, 0] - 128 * j, 0, 128)
         slot = r % GR
         base = slot * 128
-        for s_, (src, dst) in enumerate(((GREC_IN[0], scr["g_nope"]), (GREC_IN[1], scr["g_rope"]))):
+        for s_, (src, dst) in enumerate(
+            ((GREC_IN[0], scr["g_nope"]), (GREC_IN[1], scr["g_rope"]))
+        ):
+
             @pl.when(n == 128)
             def _(s_=s_, src=src, dst=dst):
-                pltpu.make_async_copy(src.at[l, pl.ds(r * 128, 128)], dst.at[pl.ds(base, 128)],
-                                      scr["g_sem"].at[slot, s_]).start()
+                pltpu.make_async_copy(
+                    src.at[l, pl.ds(r * 128, 128)],
+                    dst.at[pl.ds(base, 128)],
+                    scr["g_sem"].at[slot, s_],
+                ).start()
 
             for k in range(6, -1, -1):
+
                 @pl.when(jnp.logical_and(n < 128, (n & (1 << k)) != 0))
                 def _(s_=s_, src=src, dst=dst, k=k):
                     off = n & ~((2 << k) - 1)
-                    pltpu.make_async_copy(src.at[l, pl.ds(r * 128 + off, 1 << k)], dst.at[pl.ds(base + off, 1 << k)],
-                                          scr["g_sem"].at[slot, s_]).start()
+                    pltpu.make_async_copy(
+                        src.at[l, pl.ds(r * 128 + off, 1 << k)],
+                        dst.at[pl.ds(base + off, 1 << k)],
+                        scr["g_sem"].at[slot, s_],
+                    ).start()
 
     def record_rows(l, r):
         """Record build: granule r's ring rows (after its wait) -> the record outputs (r < grec)."""
@@ -1459,8 +1962,14 @@ def make(E):
 
         @pl.when(r < GRECN)
         def _():
-            for s_, (src, dst) in enumerate(((scr["g_nope"], GREC_OUT[0]), (scr["g_rope"], GREC_OUT[1]))):
-                cp = pltpu.make_async_copy(src.at[pl.ds(base, 128)], dst.at[l, pl.ds(r * 128, 128)], E.rec_sem.at[1])
+            for s_, (src, dst) in enumerate(
+                ((scr["g_nope"], GREC_OUT[0]), (scr["g_rope"], GREC_OUT[1]))
+            ):
+                cp = pltpu.make_async_copy(
+                    src.at[pl.ds(base, 128)],
+                    dst.at[l, pl.ds(r * 128, 128)],
+                    E.rec_sem.at[1],
+                )
                 cp.start()
                 cp.wait()
 
@@ -1472,15 +1981,24 @@ def make(E):
         if "gather" in skip:
             return
         for s_, buf in ((0, scr["g_nope"]), (1, scr["g_rope"])):
+
             @pl.when(n == 128)
             def _(s_=s_, buf=buf):
-                pltpu.make_async_copy(buf.at[pl.ds(0, 128)], buf.at[pl.ds(0, 128)], scr["g_sem"].at[slot, s_]).wait()
+                pltpu.make_async_copy(
+                    buf.at[pl.ds(0, 128)],
+                    buf.at[pl.ds(0, 128)],
+                    scr["g_sem"].at[slot, s_],
+                ).wait()
 
             for k in range(6, -1, -1):
+
                 @pl.when(jnp.logical_and(n < 128, (n & (1 << k)) != 0))
                 def _(s_=s_, buf=buf, k=k):
-                    pltpu.make_async_copy(buf.at[pl.ds(0, 1 << k)], buf.at[pl.ds(0, 1 << k)],
-                                          scr["g_sem"].at[slot, s_]).wait()
+                    pltpu.make_async_copy(
+                        buf.at[pl.ds(0, 1 << k)],
+                        buf.at[pl.ds(0, 1 << k)],
+                        scr["g_sem"].at[slot, s_],
+                    ).wait()
 
     # ------------------------------------------------------------------ attention
     lane_h = lax.broadcasted_iota(I32, (NH, 128), 1)
@@ -1495,17 +2013,25 @@ def make(E):
         stg = scr["b_sbuf"]
         for qq in range(cfg.QMAX):
             t_ = jnp.minimum(t0 + qq, TMAX - 1)
-            blk = scr["qall"][:, pl.ds(t_, 1), :].reshape(R, QH)                  # [R, QH] u32
-            full = jnp.concatenate([unpack_lo(blk), unpack_hi(blk)], axis=1)      # [R, HR * QA] f32
+            blk = scr["qall"][:, pl.ds(t_, 1), :].reshape(R, QH)  # [R, QH] u32
+            full = jnp.concatenate(
+                [unpack_lo(blk), unpack_hi(blk)], axis=1
+            )  # [R, HR * QA] f32
             for hh in range(HR):
                 for c in range(QA // 128):
                     dst = stg.at[0] if c < 4 else stg.at[1]
                     r_ = (c * NH if c < 4 else 0) + hh
-                    dst[pl.ds(r_, R, stride=HR), :] = full[:, hh * QA + c * 128:hh * QA + (c + 1) * 128]
+                    dst[pl.ds(r_, R, stride=HR), :] = full[
+                        :, hh * QA + c * 128 : hh * QA + (c + 1) * 128
+                    ]
             r0 = qq * NH
-            qn = jnp.concatenate([stg[0, c * NH:(c + 1) * NH, :] for c in range(4)], axis=1)   # [NH, KL]
-            scr["qb"][r0:r0 + NH, :] = qn.astype(BF16)
-            scr["qrb"][r0:r0 + NH, :] = jnp.where(lane_h < cfg.DR, stg[1, 0:NH, :], 0.0).astype(BF16)
+            qn = jnp.concatenate(
+                [stg[0, c * NH : (c + 1) * NH, :] for c in range(4)], axis=1
+            )  # [NH, KL]
+            scr["qb"][r0 : r0 + NH, :] = qn.astype(BF16)
+            scr["qrb"][r0 : r0 + NH, :] = jnp.where(
+                lane_h < cfg.DR, stg[1, 0:NH, :], 0.0
+            ).astype(BF16)
 
     def reset():
         scr["m_s"][...] = jnp.full((QN, 1), NEG, F32)
@@ -1529,32 +2055,47 @@ def make(E):
         j = r - req[b, 1]
         nu = req[b, 0]
         slot = r % GR
-        if fault == "f_wrap":                            # FAULT: after the ring wraps, read the next slot
+        if fault == "f_wrap":  # FAULT: after the ring wraps, read the next slot
             slot = jnp.where(r >= GR, (r + 1) % GR, slot)
         base = pl.multiple_of(slot * 128, 128)
         w = lax.bitcast_convert_type(scr["g_nope"][pl.ds(base, 128), :], I32)
-        if fault != "f_alias_poison_nan_noguard":         # FAULT (with the kernel's 0xFF poison): no tail zeroing
-            w = jnp.where(j * 128 + sub128 < nu, w, 0)    # stale tail rows -> fp8 0 (dec8); valid rows unchanged
+        if (
+            fault != "f_alias_poison_nan_noguard"
+        ):  # FAULT (with the kernel's 0xFF poison): no tail zeroing
+            w = jnp.where(
+                j * 128 + sub128 < nu, w, 0
+            )  # stale tail rows -> fp8 0 (dec8); valid rows unchanged
         for b_ in range(4):
-            scr["kvb"][buf, :, b_ * 128:(b_ + 1) * 128] = dec8(shr(w, 8 * b_) & 0xFF)
+            scr["kvb"][buf, :, b_ * 128 : (b_ + 1) * 128] = dec8(shr(w, 8 * b_) & 0xFF)
         s = jnp.zeros((QN, 128), F32)
         for b_ in range(4):
-            s = s + lax.dot_general(scr["qb"][:, b_ * 128:(b_ + 1) * 128],
-                                    scr["kvb"][buf, :, b_ * 128:(b_ + 1) * 128], NT, preferred_element_type=F32)
-        iv = scr["own_uv"][pl.ds(r, 1), :]                                       # [1, 128] entries
-        seg = iv & 3                                     # rope quarter (local index & 3 == slot & 3)
+            s = s + lax.dot_general(
+                scr["qb"][:, b_ * 128 : (b_ + 1) * 128],
+                scr["kvb"][buf, :, b_ * 128 : (b_ + 1) * 128],
+                NT,
+                preferred_element_type=F32,
+            )
+        iv = scr["own_uv"][pl.ds(r, 1), :]  # [1, 128] entries
+        seg = iv & 3  # rope quarter (local index & 3 == slot & 3)
         if fault == "ropeseg":
             seg = (seg + 1) & 3
-        segc = jnp.transpose(jnp.broadcast_to(seg, (8, 128)))[:, 0:1]             # [128, 1]
+        segc = jnp.transpose(jnp.broadcast_to(seg, (8, 128)))[:, 0:1]  # [128, 1]
         rw = lax.bitcast_convert_type(scr["g_rope"][pl.ds(base, 128), :], I32)
-        A = jnp.where(segc == 0, rw, jnp.where(segc == 1, pltpu.roll(rw, 96, 1), jnp.where(
-            segc == 2, pltpu.roll(rw, 64, 1), pltpu.roll(rw, 32, 1))))
+        A = jnp.where(
+            segc == 0,
+            rw,
+            jnp.where(
+                segc == 1,
+                pltpu.roll(rw, 96, 1),
+                jnp.where(segc == 2, pltpu.roll(rw, 64, 1), pltpu.roll(rw, 32, 1)),
+            ),
+        )
         W0 = A & 0xFF
         W1 = shr(pltpu.roll(A, 32, 1), 8) & 0xFF
         Wb = dec8(jnp.where(lane128 < 32, W0, jnp.where(lane128 < 64, W1, 0)))
         s = s + lax.dot_general(scr["qrb"][...], Wb, NT, preferred_element_type=F32)
         s = s * sm_scale
-        if fault != "kscale":                            # served order: s * sm_scale * k_scale (x 1.0 exact)
+        if fault != "kscale":  # served order: s * sm_scale * k_scale (x 1.0 exact)
             s = s * ks
         if fault == "scale_twice":
             s = s * ks
@@ -1573,9 +2114,13 @@ def make(E):
         p = jnp.where(mask, jnp.exp(s - m_new), 0.0)
         scr["l_s"][...] = alpha * scr["l_s"][...] + jnp.sum(p, axis=1, keepdims=True)
         if tiles.pv == "f32":
-            pv = lax.dot_general(p, scr["kvb"][buf].astype(F32), NN, preferred_element_type=F32)
+            pv = lax.dot_general(
+                p, scr["kvb"][buf].astype(F32), NN, preferred_element_type=F32
+            )
         else:
-            pv = lax.dot_general(p.astype(BF16), scr["kvb"][buf], NN, preferred_element_type=F32)
+            pv = lax.dot_general(
+                p.astype(BF16), scr["kvb"][buf], NN, preferred_element_type=F32
+            )
         scr["att_acc"][...] = alpha * scr["att_acc"][...] + pv
         scr["m_s"][...] = m_new
 
@@ -1585,11 +2130,20 @@ def make(E):
         s0 = scr["b_sbuf"][0]
         s1 = scr["b_sbuf"][1]
         m_old = scr["m_s"][...]
-        m_new = jnp.maximum(m_old, jnp.maximum(jnp.max(s0, axis=1, keepdims=True), jnp.max(s1, axis=1, keepdims=True)))
+        m_new = jnp.maximum(
+            m_old,
+            jnp.maximum(
+                jnp.max(s0, axis=1, keepdims=True), jnp.max(s1, axis=1, keepdims=True)
+            ),
+        )
         alpha = jnp.exp(m_old - m_new)
         p0 = jnp.where(s0 > NEG, jnp.exp(s0 - m_new), 0.0)
         p1 = jnp.where(s1 > NEG, jnp.exp(s1 - m_new), 0.0)
-        scr["l_s"][...] = alpha * scr["l_s"][...] + jnp.sum(p0, axis=1, keepdims=True) + jnp.sum(p1, axis=1, keepdims=True)
+        scr["l_s"][...] = (
+            alpha * scr["l_s"][...]
+            + jnp.sum(p0, axis=1, keepdims=True)
+            + jnp.sum(p1, axis=1, keepdims=True)
+        )
         p = jnp.concatenate([p0, p1], axis=1)
         kv = jnp.concatenate([scr["kvb"][0], scr["kvb"][1]], axis=0)
         if tiles.pv == "f32":
@@ -1605,19 +2159,25 @@ def make(E):
             out = jnp.zeros((NH, KL), F32)
             lse = jnp.full((NH, 1), -jnp.inf, F32)
         else:
-            lsum = scr["l_s"][r0:r0 + NH, 0:1]
-            mx = scr["m_s"][r0:r0 + NH, 0:1]
-            pv = scr["att_acc"][r0:r0 + NH, :]
+            lsum = scr["l_s"][r0 : r0 + NH, 0:1]
+            mx = scr["m_s"][r0 : r0 + NH, 0:1]
+            pv = scr["att_acc"][r0 : r0 + NH, :]
             if fault != "kscale":
                 pv = pv * ks
             has = lsum > 0
             rl = jnp.maximum(lsum, 1e-30)
-            inv = pltpu.reciprocal(rl, approx=True) if getattr(tiles, "recip", "approx") == "approx" else 1.0 / rl
+            inv = (
+                pltpu.reciprocal(rl, approx=True)
+                if getattr(tiles, "recip", "approx") == "approx"
+                else 1.0 / rl
+            )
             out = jnp.where(has, E.bf(pv * inv), 0.0)
             lse = jnp.where(has, mx + jnp.log(jnp.maximum(lsum, 1e-30)), -jnp.inf)
         lse_b = jnp.broadcast_to(lse, (NH, 128))
         if NH < 128:
-            lse_b = jnp.concatenate([lse_b, jnp.full((128 - NH, 128), -jnp.inf, F32)], axis=0)
+            lse_b = jnp.concatenate(
+                [lse_b, jnp.full((128 - NH, 128), -jnp.inf, F32)], axis=0
+            )
         lse_row = jnp.transpose(lse_b)[0:1]
         if getattr(E, "debug", False):
             scr["dbgl"][pl.ds(t_, 1), :] = lse_row
@@ -1627,11 +2187,18 @@ def make(E):
         # sublane-strided loads give each head index hh's 16 owners at once (lane-blocked staging in b_sbuf)
         stg = scr["b_sbuf"]
         for c in range(4):
-            stg[0, c * NH:(c + 1) * NH, :] = out[:, c * 128:(c + 1) * 128]
+            stg[0, c * NH : (c + 1) * NH, :] = out[:, c * 128 : (c + 1) * 128]
         H = []
         for hh in range(HR):
-            H.append(jnp.concatenate([stg[0, pl.ds(c * NH + hh, R, stride=HR), :] for c in range(4)], axis=1))   # [R, KL]
-        P = pack2(jnp.concatenate(H[:HR // 2], axis=1), jnp.concatenate(H[HR // 2:], axis=1))            # [R, OH]
+            H.append(
+                jnp.concatenate(
+                    [stg[0, pl.ds(c * NH + hh, R, stride=HR), :] for c in range(4)],
+                    axis=1,
+                )
+            )  # [R, KL]
+        P = pack2(
+            jnp.concatenate(H[: HR // 2], axis=1), jnp.concatenate(H[HR // 2 :], axis=1)
+        )  # [R, OH]
         stg[1, 0:NH, :] = jnp.broadcast_to(lse, (NH, 128))
         lane_r = lax.broadcasted_iota(I32, (R, 128), 1)
         if LSE_TILE:
@@ -1640,20 +2207,24 @@ def make(E):
             tl = (t_ + 1) % TMAX if fault == "f_lse_tile_row" else t_
             for hh in range(HR):
                 cur = scr["lsend"][pl.ds(hh, R, stride=HPAD), :]
-                scr["lsend"][pl.ds(hh, R, stride=HPAD), :] = jnp.where(lane_r == tl,
-                                                                        stg[1, pl.ds(hh, R, stride=HR), :], cur)
-            blk = P                                                                                      # [R, OH]
+                scr["lsend"][pl.ds(hh, R, stride=HPAD), :] = jnp.where(
+                    lane_r == tl, stg[1, pl.ds(hh, R, stride=HR), :], cur
+                )
+            blk = P  # [R, OH]
         else:
             L16 = jnp.full((R, 128), -jnp.inf, F32)
-            for hh in range(HR):                             # lane hh of owner d's row = lse of head d * HR + hh
+            for hh in range(HR):  # lane hh of owner d's row = lse of head d * HR + hh
                 L16 = jnp.where(lane_r == hh, stg[1, pl.ds(hh, R, stride=HR), :], L16)
-            blk = jnp.concatenate([P, lax.bitcast_convert_type(L16, U32)], axis=1)                       # [R, OW]
+            blk = jnp.concatenate(
+                [P, lax.bitcast_convert_type(L16, U32)], axis=1
+            )  # [R, OW]
         for d in range(R):
-            scr["osend"][d, pl.ds(t_, 1), :] = blk[d:d + 1]
+            scr["osend"][d, pl.ds(t_, 1), :] = blk[d : d + 1]
 
     def emit(b, empty, ks):
         t0, nq = req[b, 7], req[b, 8]
         for qq in range(cfg.QMAX):
+
             @pl.when(qq < nq)
             def _(qq=qq):
                 emit_row(t0 + qq, qq, empty, ks)
@@ -1665,13 +2236,14 @@ def make(E):
         rows are emitted.
         early (L2 `gearly`, traced bool): the old entries of granules [0, GE[1]) were issued during the previous
         layer's AR#2 (`early_issue`); only their new entries are issued here."""
-        del fresh                                        # one issue path: sources are resolved per fresh layer
-        ks = E.ks()                                      # this layer's k_scale, [1, 1] f32
+        del fresh  # one issue path: sources are resolved per fresh layer
+        ks = E.ks()  # this layer's k_scale, [1, 1] f32
         U = st[0]
         pa = Phases(tiles.trace)
         pa.mark("A_issue")
 
         if GREC_IN is not None:
+
             def issue_at(r):
                 @pl.when(r < GRECN)
                 def _():
@@ -1685,6 +2257,7 @@ def make(E):
                 issue_at(r)
                 return c
         elif GE and early is not None:
+
             def pre(r, c):
                 done = jnp.logical_and(early, r < GE[1])
 
@@ -1695,14 +2268,17 @@ def make(E):
                 @pl.when(jnp.logical_not(done))
                 def _():
                     issue(l, r)
+
                 return c
         else:
+
             def pre(r, c):
                 issue(l, r)
                 return c
+
         QM = int(getattr(tiles, "qmid", 0) or 0)
         qmid_fn = getattr(q_wait, "mid", None) if QM else None
-        if qmid_fn is not None:                          # pair q AG: forward to the sibling after QM granules
+        if qmid_fn is not None:  # pair q AG: forward to the sibling after QM granules
             n_pre = jnp.minimum(U, GR)
             lax.fori_loop(0, jnp.minimum(n_pre, QM), pre, 0)
             qmid_fn()
@@ -1729,13 +2305,20 @@ def make(E):
                     reset()
                     compute = "attn" not in skip
 
-                    def wait_full(r):                # a granule before the request's last is always full
+                    def wait_full(
+                        r,
+                    ):  # a granule before the request's last is always full
                         if "gather" not in skip:
                             for s_, buf_ in ((0, scr["g_nope"]), (1, scr["g_rope"])):
-                                pltpu.make_async_copy(buf_.at[pl.ds(0, 128)], buf_.at[pl.ds(0, 128)],
-                                                      scr["g_sem"].at[r % GR, s_]).wait()
+                                pltpu.make_async_copy(
+                                    buf_.at[pl.ds(0, 128)],
+                                    buf_.at[pl.ds(0, 128)],
+                                    scr["g_sem"].at[r % GR, s_],
+                                ).wait()
 
-                    def refill(r):                   # the slot of granule r is free once front(r) read it
+                    def refill(
+                        r,
+                    ):  # the slot of granule r is free once front(r) read it
                         @pl.when(r + GR < U)
                         def _():
                             if GREC_IN is not None:
@@ -1756,15 +2339,18 @@ def make(E):
 
                     npair = nrow // 2
 
-                    def pbody(i, c2):                # granule pairs: two independent fronts, one back
+                    def pbody(i, c2):  # granule pairs: two independent fronts, one back
                         r = r0 + 2 * i
                         fr(r, 0, False)
                         fr(r + 1, 1, False)
                         if compute:
                             back2()
                         return c2
+
                     # every pair but a last one that ends the request (its second granule may be partial)
-                    lax.fori_loop(0, jnp.where(nrow % 2 == 0, npair - 1, npair), pbody, 0)
+                    lax.fori_loop(
+                        0, jnp.where(nrow % 2 == 0, npair - 1, npair), pbody, 0
+                    )
 
                     @pl.when(jnp.logical_and(nrow % 2 == 0, nrow > 0))
                     def _():
@@ -1779,12 +2365,20 @@ def make(E):
                         fr(r0 + nrow - 1, 0, True)
                         if compute:
                             back(0)
+
                     emit(b, False, ks)
+
             if after_req is not None:
                 after_req(b)
             return c
+
         lax.fori_loop(0, B_(), per_req, 0)
         pa.end()
 
-    return dict(step_init=step_init, indexer_tail=indexer_tail, attention=attention, geometry=g,
-                early_issue=early_issue)
+    return dict(
+        step_init=step_init,
+        indexer_tail=indexer_tail,
+        attention=attention,
+        geometry=g,
+        early_issue=early_issue,
+    )

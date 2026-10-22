@@ -15,7 +15,13 @@ to stage A (A0 TPU oracle per lane, and in the compose correctness jobs).
        the stacked form (stack_e=True has no cascade)
 """
 
-ORDER = ("L4", "L1", "L2", "L3", "L1e")      # forward-ladder order, ranked by measured lane gain (compose README)
+ORDER = (
+    "L4",
+    "L1",
+    "L2",
+    "L3",
+    "L1e",
+)  # forward-ladder order, ranked by measured lane gain (compose README)
 
 
 def lever(name, T):
@@ -26,7 +32,9 @@ def lever(name, T):
     if name == "L1e":
         return dict(thr_early=True)
     if name == "L2":
-        return dict(qag="pair", gearly=(4, 8) if T <= 16 else (6, 12), qmid=0 if T <= 16 else 28)
+        return dict(
+            qag="pair", gearly=(4, 8) if T <= 16 else (6, 12), qmid=0 if T <= 16 else 28
+        )
     if name == "L3":
         return dict(ecas="cond")
     raise ValueError(f"unknown lever {name!r}")

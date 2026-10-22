@@ -30,7 +30,14 @@ from vllm_torchtpu.kernels.glm52_decode_mk import pool_alias
 def test_admission():
     C.FULL.check()
     C.FULL_B16.check()
-    for bad in (dict(ILV=2), dict(page=128), dict(QMAX=5), dict(QMAX=2), dict(TMAX=24), dict(R=3)):
+    for bad in (
+        dict(ILV=2),
+        dict(page=128),
+        dict(QMAX=5),
+        dict(QMAX=2),
+        dict(TMAX=24),
+        dict(R=3),
+    ):
         with pytest.raises(AssertionError):
             dataclasses.replace(C.FULL, **bad).check()
 
@@ -54,10 +61,15 @@ def test_stream_tables_decode():
             d = int(dtab[g0 + i])
             assert LY.DKINDS[d >> 20] == k and (d & 255) == t
             assert ((d >> 8) & 4095) == LY.layers_of(cfg, k).index(l)
-        assert bool(ltab[l, 1]) == cfg.full_indexer(l) and bool(ltab[l, 2]) == cfg.is_moe(l)
+        assert bool(ltab[l, 1]) == cfg.full_indexer(l) and bool(
+            ltab[l, 2]
+        ) == cfg.is_moe(l)
     assert len(dtab) == int(ltab[-1, 0]) + len(LY.layer_tiles(cfg, cfg.L - 1, plan))
     # rule 5: padded minor dims (no ENTRY layout copy of a 2624- / 160-wide operand)
-    assert LY.dense_shapes(cfg)["qkva"][0][1] == 2688 and LY.dense_shapes(cfg)["iwk"][0][1] == 256
+    assert (
+        LY.dense_shapes(cfg)["qkva"][0][1] == 2688
+        and LY.dense_shapes(cfg)["iwk"][0][1] == 256
+    )
 
 
 @pytest.mark.parametrize("tmax", [16, 32])
@@ -95,11 +107,18 @@ def test_wrapper_metadata_roundtrip():
     pos = jnp.asarray([96, 97, 98, 99, 3, 4, 5, 6, 297, 298, 299] + [0] * 5, jnp.int32)
     bt = jnp.arange(5 * 3, dtype=jnp.int32).reshape(5, 3) + 40
     with jax.default_device(jax.devices("cpu")[0]):
-        scal, rmeta, qmeta, btl, bti, rvec = W.metadata(cfg, 16, pos, seq, qsl, bt, 13, 14, 3, 2)
+        scal, rmeta, qmeta, btl, bti, rvec = W.metadata(
+            cfg, 16, pos, seq, qsl, bt, 13, 14, 3, 2
+        )
     assert int(scal[0]) == 11 and int(scal[1]) == 3 and int(scal[2]) == 2
-    assert np.array_equal(np.asarray(qmeta[:4]), [[0, 4, 100, 1], [4, 4, 7, 1], [8, 3, 300, 1], [11, 0, 5, 0]])
-    assert np.array_equal(np.asarray(rmeta[8:12, :4]), [[1, 297, 2, 300], [1, 298, 2, 300], [1, 299, 2, 300],
-                                                        [0, 0, 0, 0]])
+    assert np.array_equal(
+        np.asarray(qmeta[:4]),
+        [[0, 4, 100, 1], [4, 4, 7, 1], [8, 3, 300, 1], [11, 0, 5, 0]],
+    )
+    assert np.array_equal(
+        np.asarray(rmeta[8:12, :4]),
+        [[1, 297, 2, 300], [1, 298, 2, 300], [1, 299, 2, 300], [0, 0, 0, 0]],
+    )
     assert np.array_equal(np.asarray(btl[:2]), np.asarray(bt[:2]) % 13)
     assert np.array_equal(np.asarray(bti[:2]), np.asarray(bt[:2]) % 14)
 
@@ -121,11 +140,22 @@ ORACLE = textwrap.dedent("""
 """)
 
 
-@pytest.mark.skipif(not os.environ.get("GLM52_MK_INSTRUMENTS"), reason="set GLM52_MK_INSTRUMENTS=<instruments dir>")
+@pytest.mark.skipif(
+    not os.environ.get("GLM52_MK_INSTRUMENTS"),
+    reason="set GLM52_MK_INSTRUMENTS=<instruments dir>",
+)
 @pytest.mark.parametrize("R", [2])
 def test_instruments_oracle_tiny(R):
     env = dict(os.environ, JAX_PLATFORMS="cpu")
-    r = subprocess.run([sys.executable, "-c", ORACLE, str(R)], capture_output=True, text=True, env=env,
-                       timeout=3600)
+    r = subprocess.run(
+        [sys.executable, "-c", ORACLE, str(R)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=3600,
+    )
     line = [ln for ln in r.stdout.splitlines() if ln.startswith("VERDICT")]
-    assert line and line[0].startswith("VERDICT True"), (r.stdout[-2000:], r.stderr[-4000:])
+    assert line and line[0].startswith("VERDICT True"), (
+        r.stdout[-2000:],
+        r.stderr[-4000:],
+    )

@@ -100,8 +100,11 @@ def check_pool(max_model_len: int, pools, *, page: int, R: int, ilv: int) -> int
     max_model_len request at load time bounds every step. -> that page count; raises Unsupported (no megakernel)."""
     need = rank0_pages(max_model_len, page=page, R=R, ilv=ilv)
     for t, pool in pools.items():
-        _need(need <= int(pool), f"pool guard (A0-10): a {max_model_len}-token request has {need} rank-0 pages > "
-              f"Tiles.pool {pool} (b{t}): the DSA wave would overflow")
+        _need(
+            need <= int(pool),
+            f"pool guard (A0-10): a {max_model_len}-token request has {need} rank-0 pages > "
+            f"Tiles.pool {pool} (b{t}): the DSA wave would overflow",
+        )
     return need
 
 
@@ -114,7 +117,10 @@ def _unwrap(x):
 def _kn(weight: torch.Tensor, k: int, n: int, what: str) -> torch.Tensor:
     if tuple(weight.shape) == (k, n):
         return weight
-    _need(tuple(weight.shape) == (n, k), f"{what}: shape {tuple(weight.shape)}, want ({k}, {n})")
+    _need(
+        tuple(weight.shape) == (n, k),
+        f"{what}: shape {tuple(weight.shape)}, want ({k}, {n})",
+    )
     return weight.t().contiguous()
 
 
@@ -127,7 +133,10 @@ def _scale(layer, n: int, what: str) -> torch.Tensor:
     for name in ("weight_scale", "weight_scale_inv"):
         s = getattr(layer, name, None)
         if s is not None:
-            _need(s.numel() == n, f"{what}.{name}: {tuple(s.shape)} is not per-channel [{n}]")
+            _need(
+                s.numel() == n,
+                f"{what}.{name}: {tuple(s.shape)} is not per-channel [{n}]",
+            )
             return s.reshape(-1).float()
     raise Unsupported(f"{what}: no weight_scale")
 
@@ -142,9 +151,12 @@ def _own(t: torch.Tensor) -> torch.Tensor:
 
 def _owns_storage(t: torch.Tensor) -> bool:
     try:
-        return (t.storage_offset() == 0 and t.is_contiguous()
-                and t.untyped_storage().nbytes() == t.numel() * t.element_size())
-    except Exception:                                    # noqa: BLE001
+        return (
+            t.storage_offset() == 0
+            and t.is_contiguous()
+            and t.untyped_storage().nbytes() == t.numel() * t.element_size()
+        )
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -154,6 +166,7 @@ def _dt(x) -> str:
     if isinstance(d, torch.dtype):
         return str(d).replace("torch.", "")
     import numpy as np
+
     return np.dtype(d).name
 
 
@@ -185,7 +198,9 @@ def q_b_local(weight_kn: torch.Tensor, scale: torch.Tensor, cfg, rank: int):
         _need(scale.numel() == nqb, f"q_b scale {tuple(scale.shape)} != local [{nqb}]")
         return weight_kn, scale
     # W4 guard: the timed and verified form is qrep 0 only (a replicated q_b is X's layout, not this kernel's)
-    raise Unsupported(f"q_b_proj N {n} is not this rank's {nqb} columns (qrep 1 / replicated q_b): qrep 0 only")
+    raise Unsupported(
+        f"q_b_proj N {n} is not this rank's {nqb} columns (qrep 1 / replicated q_b): qrep 0 only"
+    )
 
 
 def index_pattern(has_indexer: list[bool], freq0: int, skip0: int) -> tuple[int, int]:
@@ -197,20 +212,29 @@ def index_pattern(has_indexer: list[bool], freq0: int, skip0: int) -> tuple[int,
     def pat(fr, sk):
         return [max(l - sk + 1, 0) % fr == 0 for l in range(L)]
 
-    cands = ([(freq0, skip0)] + [(freq0, sk) for sk in range(0, L + 1)]
-             + [(fr, sk) for fr in range(1, max(L, 4) + 1) for sk in range(0, L + 1)])
+    cands = (
+        [(freq0, skip0)]
+        + [(freq0, sk) for sk in range(0, L + 1)]
+        + [(fr, sk) for fr in range(1, max(L, 4) + 1) for sk in range(0, L + 1)]
+    )
     for fr, sk in cands:
         if fr >= 1 and pat(fr, sk) == list(has_indexer):
             return fr, sk
-    raise Unsupported(f"indexer pattern {has_indexer} is not max(l - skip + 1, 0) % freq == 0 for any (freq, skip)")
+    raise Unsupported(
+        f"indexer pattern {has_indexer} is not max(l - skip + 1, 0) % freq == 0 for any (freq, skip)"
+    )
 
 
-PERLAYER_BLOCKED = ("per-layer cache groups at 78 layers are 263,806 bundles against the 65,536 limit (stageB/"
-                    "L3-served-form RESULTS §0.5): serve from runner-stacked caches (GLM5_MKD_STACK_C)")
-MAX_CACHE_GROUPS = 4          # the timed served form is nope / rope 2 groups, idx 1 (probe 15 bench_mkb FORM=srv)
+PERLAYER_BLOCKED = (
+    "per-layer cache groups at 78 layers are 263,806 bundles against the 65,536 limit (stageB/"
+    "L3-served-form RESULTS §0.5): serve from runner-stacked caches (GLM5_MKD_STACK_C)"
+)
+MAX_CACHE_GROUPS = 4  # the timed served form is nope / rope 2 groups, idx 1 (probe 15 bench_mkb FORM=srv)
 
 
-def stacked_groups_plan(bindings: dict, sizes: dict, max_groups: int = MAX_CACHE_GROUPS) -> dict:
+def stacked_groups_plan(
+    bindings: dict, sizes: dict, max_groups: int = MAX_CACHE_GROUPS
+) -> dict:
     """Validate the runner-stacked cache groups against the kernel's group contract (kernel.cache_groups / csel):
     per kind, equal groups of consecutive layers, the kind's i-th layer at row i % gs of group i // gs; nope and rope
     grouped alike. bindings: {kind: [(group index, row) of each layer of the kind, in layer order]}; sizes: {kind:
@@ -219,26 +243,54 @@ def stacked_groups_plan(bindings: dict, sizes: dict, max_groups: int = MAX_CACHE
     for kind in ("nope", "rope", "idx"):
         _need(kind in bindings and kind in sizes, f"stacked caches: no {kind} groups")
         sz, bd = list(sizes[kind]), list(bindings[kind])
-        _need(bool(sz) and len(set(sz)) == 1, f"stacked caches: {kind} groups are not equal: {sz}")
+        _need(
+            bool(sz) and len(set(sz)) == 1,
+            f"stacked caches: {kind} groups are not equal: {sz}",
+        )
         gs, n = sz[0], len(sz)
-        _need(n <= max_groups, f"stacked caches: {kind} in {n} groups (> {max_groups}, untimed)")
-        _need(len(bd) == gs * n, f"stacked caches: {kind} {len(bd)} layers bound, groups hold {gs * n}")
+        _need(
+            n <= max_groups,
+            f"stacked caches: {kind} in {n} groups (> {max_groups}, untimed)",
+        )
+        _need(
+            len(bd) == gs * n,
+            f"stacked caches: {kind} {len(bd)} layers bound, groups hold {gs * n}",
+        )
         for i, (gi, row) in enumerate(bd):
-            _need((gi, row) == (i // gs, i % gs),
-                  f"stacked caches: {kind} layer #{i} bound to group {gi} row {row}, want {i // gs} row {i % gs}")
+            _need(
+                (gi, row) == (i // gs, i % gs),
+                f"stacked caches: {kind} layer #{i} bound to group {gi} row {row}, want {i // gs} row {i % gs}",
+            )
         G[kind] = n
-    _need(G["nope"] == G["rope"] and list(sizes["nope"]) == list(sizes["rope"]),
-          f"stacked caches: nope groups {sizes['nope']} != rope groups {sizes['rope']}")
+    _need(
+        G["nope"] == G["rope"] and list(sizes["nope"]) == list(sizes["rope"]),
+        f"stacked caches: nope groups {sizes['nope']} != rope groups {sizes['rope']}",
+    )
     return G
 
 
 # ------------------------------------------------------------------ the step guard (pure: CPU-tested)
 
-REASONS = ("mk", "off", "unbound", "multi_chunk", "encoder", "prefill", "mixed", "no_draft", "q_len", "over_reqs",
-           "over_bucket", "embeds", "shape")
+REASONS = (
+    "mk",
+    "off",
+    "unbound",
+    "multi_chunk",
+    "encoder",
+    "prefill",
+    "mixed",
+    "no_draft",
+    "q_len",
+    "over_reqs",
+    "over_bucket",
+    "embeds",
+    "shape",
+)
 
 
-def classify_step(reqs, *, num_chunks: int, has_encoder: bool, qmax: int, rows, bmax: int):
+def classify_step(
+    reqs, *, num_chunks: int, has_encoder: bool, qmax: int, rows, bmax: int
+):
     """The step-time preconditions, from the scheduler's view (identical on every rank).
     reqs: [(scheduled tokens, scheduled draft tokens, still in its prompt)] per request.
     -> (row bucket or None, reason, detail). A request is a verify request iff it has >= 1 draft token, its scheduled
@@ -293,8 +345,8 @@ def sched_reqs(runner, scheduler_output) -> list:
     return out
 
 
-N_FIX = 10     # pos [TMAX], seq [S], qsl [S+1], bt [S, W], cs rows [TMAX, DR], h0 [M, H], ltab, dtab (replicated),
-               # rank i32[1], smalls (per rank)
+N_FIX = 10  # pos [TMAX], seq [S], qsl [S+1], bt [S, W], cs rows [TMAX, DR], h0 [M, H], ltab, dtab (replicated),
+# rank i32[1], smalls (per rank)
 
 
 def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups, stacked=False):
@@ -311,8 +363,18 @@ def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups, stacked=False):
     from . import wrapper as W
     from .writer import build_writer
 
-    call, info = K.build(cfg, max_pages=max_pages, nb=nb, nbi=nbi, tiles=tiles, stack_e=False, groups=groups)
-    writer, winfo = build_writer(cfg, max_pages=max_pages, nb=nb, nbi=nbi, groups=groups)
+    call, info = K.build(
+        cfg,
+        max_pages=max_pages,
+        nb=nb,
+        nbi=nbi,
+        tiles=tiles,
+        stack_e=False,
+        groups=groups,
+    )
+    writer, winfo = build_writer(
+        cfg, max_pages=max_pages, nb=nb, nbi=nbi, groups=groups
+    )
     assert len(info["c_names"]) == len(winfo["c_names"])
     n_d, n_e, n_c = len(info["dkinds"]), len(info["e_names"]), len(info["c_names"])
     TMAX = cfg.TMAX
@@ -322,19 +384,42 @@ def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups, stacked=False):
 
     def body(*a):
         pos, seq, qsl, btv, csr, h0, ltab_, dtab_, rank, smalls = a[:N_FIX]
-        dw = a[N_FIX:N_FIX + n_d]
-        ew = a[N_FIX + n_d:N_FIX + n_d + n_e]
-        cs = a[N_FIX + n_d + n_e:]
-        r = rank[0]          # an operand, not lax.axis_index: partition-id does not lower in torch_tpu's export
-        scal, rmeta, qmeta, bt, bti, rvec = W.metadata(cfg, TMAX, pos, seq, qsl, btv, nb, nbi, max_pages, r)
+        dw = a[N_FIX : N_FIX + n_d]
+        ew = a[N_FIX + n_d : N_FIX + n_d + n_e]
+        cs = a[N_FIX + n_d + n_e :]
+        r = rank[
+            0
+        ]  # an operand, not lax.axis_index: partition-id does not lower in torch_tpu's export
+        scal, rmeta, qmeta, bt, bti, rvec = W.metadata(
+            cfg, TMAX, pos, seq, qsl, btv, nb, nbi, max_pages, r
+        )
         tab = W.rope_table(cfg, csr)
-        c1 = list(cs) if stacked else [c[None] for c in cs]      # per-layer: [1, ...], a one-layer group
-        outs = call(scal, rmeta, qmeta, bt, bti, ltab_, dtab_, rvec, h0, tab, smalls, *dw, *ew, *c1)
+        c1 = (
+            list(cs) if stacked else [c[None] for c in cs]
+        )  # per-layer: [1, ...], a one-layer group
+        outs = call(
+            scal,
+            rmeta,
+            qmeta,
+            bt,
+            bti,
+            ltab_,
+            dtab_,
+            rvec,
+            h0,
+            tab,
+            smalls,
+            *dw,
+            *ew,
+            *c1,
+        )
         out, nrow, rrow, irec = outs[:4]
         new = writer(scal, rmeta, bt, bti, nrow, rrow, irec, *c1)
         return (out, *(new if stacked else [c[0] for c in new]))
 
-    smap = jax.shard_map(body, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
+    smap = jax.shard_map(
+        body, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
+    )
     return smap, in_specs, out_specs, info
 
 
@@ -356,16 +441,28 @@ class Glm52DecodeMK:
 
         hf = runner.model_config.hf_config
         pc = runner.parallel_config
-        _need(type(hf).__name__.startswith("GlmMoeDsa") or getattr(hf, "model_type", "") == "glm_moe_dsa",
-              f"model_type {hf.model_type}")
+        _need(
+            type(hf).__name__.startswith("GlmMoeDsa")
+            or getattr(hf, "model_type", "") == "glm_moe_dsa",
+            f"model_type {hf.model_type}",
+        )
         _need(pc.pipeline_parallel_size == 1, "pipeline parallel")
         _need(getattr(pc, "data_parallel_size", 1) == 1, "data parallel")
         R = int(pc.tensor_parallel_size)
-        _need(R == FULL.R, f"TP {R}: the megakernel is built and verified for TP = DCP = {FULL.R} only")
+        _need(
+            R == FULL.R,
+            f"TP {R}: the megakernel is built and verified for TP = DCP = {FULL.R} only",
+        )
         _need(int(getattr(pc, "decode_context_parallel_size", 1)) == R, "DCP != TP")
         _need(dist.is_initialized() and dist.get_world_size() == R, "world != TP")
-        _need(int(getattr(pc, "cp_kv_cache_interleave_size", 1)) == FULL.ILV, "interleave != 4")
-        _need(not bool(getattr(pc, "enable_expert_parallel", False)), "EP is on (stage A is TP16 MoE, EP off)")
+        _need(
+            int(getattr(pc, "cp_kv_cache_interleave_size", 1)) == FULL.ILV,
+            "interleave != 4",
+        )
+        _need(
+            not bool(getattr(pc, "enable_expert_parallel", False)),
+            "EP is on (stage A is TP16 MoE, EP off)",
+        )
         # qrep is judged per layer below (q_b_proj.qrep_active), not from parallel_config.dcp_q_replicate: vLLM's GLM
         # config hook sets that field True even when VLLM_DCP_Q_REPLICATE=0 turns runtime q-replication off.
         self.rank_layout = self._check_rank_layout(R)
@@ -374,10 +471,17 @@ class Glm52DecodeMK:
         qmax = 1 + int(spec.num_speculative_tokens)
         _need(qmax == 4, f"{qmax} rows per request")
         _need(getattr(hf, "scoring_func", None) == "sigmoid", "router scoring")
-        _need(getattr(hf, "n_group", 1) in (1, None) and getattr(hf, "topk_group", 1) in (1, None), "grouped routing")
+        _need(
+            getattr(hf, "n_group", 1) in (1, None)
+            and getattr(hf, "topk_group", 1) in (1, None),
+            "grouped routing",
+        )
         _need(bool(getattr(hf, "norm_topk_prob", True)), "unnormalized top-k")
-        _need(bool(getattr(hf, "rope_interleave", False)) and bool(getattr(hf, "indexer_rope_interleave", False)),
-              "non-interleaved rope")
+        _need(
+            bool(getattr(hf, "rope_interleave", False))
+            and bool(getattr(hf, "indexer_rope_interleave", False)),
+            "non-interleaved rope",
+        )
         rp = getattr(hf, "rope_parameters", None) or {}
         _need(rp.get("rope_type", "default") == "default", f"rope {rp}")
         _need(runner.block_size == FULL.page, f"block_size {runner.block_size}")
@@ -386,22 +490,47 @@ class Glm52DecodeMK:
         self.backbone = bb
         L = int(hf.num_hidden_layers)
         _need(len(bb.layers) == L, f"{len(bb.layers)} layers")
-        has_idx = [getattr(bb.layers[l].self_attn, "indexer", None) is not None for l in range(L)]
-        freq, skip = index_pattern(has_idx, int(hf.index_topk_freq), int(hf.index_skip_topk_offset))
+        has_idx = [
+            getattr(bb.layers[l].self_attn, "indexer", None) is not None
+            for l in range(L)
+        ]
+        freq, skip = index_pattern(
+            has_idx, int(hf.index_topk_freq), int(hf.index_skip_topk_offset)
+        )
         base = dataclasses.replace(
-            FULL, R=R, L=L, first_dense=hf.first_k_dense_replace, H=hf.hidden_size,
-            NH=hf.num_attention_heads, QL=hf.q_lora_rank, idx_freq=freq, idx_skip=skip, eps=hf.rms_norm_eps,
-            routed_scale=float(hf.routed_scaling_factor), QMAX=qmax, TMAX=self.rows[-1],
-            BM=int(runner.scheduler_config.max_num_seqs))
+            FULL,
+            R=R,
+            L=L,
+            first_dense=hf.first_k_dense_replace,
+            H=hf.hidden_size,
+            NH=hf.num_attention_heads,
+            QL=hf.q_lora_rank,
+            idx_freq=freq,
+            idx_skip=skip,
+            eps=hf.rms_norm_eps,
+            routed_scale=float(hf.routed_scaling_factor),
+            QMAX=qmax,
+            TMAX=self.rows[-1],
+            BM=int(runner.scheduler_config.max_num_seqs),
+        )
         for got, want, what in (
-                (hf.kv_lora_rank, base.KL, "kv_lora_rank"), (hf.qk_nope_head_dim, base.DN, "qk_nope"),
-                (hf.qk_rope_head_dim, base.DR, "qk_rope"), (hf.v_head_dim, base.DV, "v_head_dim"),
-                (hf.n_routed_experts, base.E, "experts"), (hf.num_experts_per_tok, base.TOPK, "top-k"),
-                (hf.moe_intermediate_size, base.I, "moe_intermediate"),
-                (hf.moe_intermediate_size * hf.n_shared_experts, base.IS, "shared intermediate"),
-                (hf.intermediate_size, base.ID, "dense intermediate"),
-                (hf.index_n_heads, base.IH, "index heads"), (hf.index_head_dim, base.IDIM, "index dim"),
-                (hf.index_topk, base.KT, "index_topk")):
+            (hf.kv_lora_rank, base.KL, "kv_lora_rank"),
+            (hf.qk_nope_head_dim, base.DN, "qk_nope"),
+            (hf.qk_rope_head_dim, base.DR, "qk_rope"),
+            (hf.v_head_dim, base.DV, "v_head_dim"),
+            (hf.n_routed_experts, base.E, "experts"),
+            (hf.num_experts_per_tok, base.TOPK, "top-k"),
+            (hf.moe_intermediate_size, base.I, "moe_intermediate"),
+            (
+                hf.moe_intermediate_size * hf.n_shared_experts,
+                base.IS,
+                "shared intermediate",
+            ),
+            (hf.intermediate_size, base.ID, "dense intermediate"),
+            (hf.index_n_heads, base.IH, "index heads"),
+            (hf.index_head_dim, base.IDIM, "index dim"),
+            (hf.index_topk, base.KT, "index_topk"),
+        ):
             _need(got == want, f"{what} {got} != kernel {want}")
         self.cfgs = {}
         for t in self.rows:
@@ -415,8 +544,12 @@ class Glm52DecodeMK:
         for l in range(L):
             _need(has_idx[l] == cfg.full_indexer(l), f"layer {l}: indexer pattern")
         for l in range(L):
-            _need(not bool(getattr(bb.layers[l].self_attn.q_b_proj, "qrep_active", False)),
-                  f"layer {l}: q_b_proj is replicated (qrep_active); the megakernel is qrep 0")
+            _need(
+                not bool(
+                    getattr(bb.layers[l].self_attn.q_b_proj, "qrep_active", False)
+                ),
+                f"layer {l}: q_b_proj is replicated (qrep_active); the megakernel is qrep 0",
+            )
         self.rank = int(dist.get_rank())
         self.counts = {r: 0 for r in REASONS}
         self.decisions = 0
@@ -429,6 +562,7 @@ class Glm52DecodeMK:
         self.enabled = os.environ.get("GLM52_DECODE_MK_OFF", "0") != "1"
         self.calls = 0
         from torch_tpu._internal.pallas import get_pallas_mesh
+
         self.mesh = get_pallas_mesh(axis_names=(AXIS,), mesh_shape=(R,))
         mml = int(runner.model_config.max_model_len)
         self.max_pages = -(-mml // (cfg.page * R))
@@ -436,23 +570,46 @@ class Glm52DecodeMK:
         _need(rot.cos_sin_cache.shape[-1] == cfg.DR, "rope cache width")
         with torch.no_grad():
             self.cos_sin = _own(rot.cos_sin_cache.detach())
-            self.k_scales = [float(getattr(_attn_module(bb.layers[l].self_attn), "_k_scale_float", 1.0))
-                             for l in range(cfg.L)]
+            self.k_scales = [
+                float(
+                    getattr(_attn_module(bb.layers[l].self_attn), "_k_scale_float", 1.0)
+                )
+                for l in range(cfg.L)
+            ]
             self.dense, self.experts = self._collect_weights()
             self.smalls = self._build_smalls().detach()
         self.tiles = K.Tiles(trace=os.environ.get("GLM52_DECODE_MK_TRACE", "0") == "1")
         # stage-B levers (presets.py): GLM52_DECODE_MK_LEVERS = "" / "A" (stage A) | "B" (all) | "L4,L1,..."
         self.levers = PR.parse(os.environ.get("GLM52_DECODE_MK_LEVERS", ""))
-        self.tiles_by_rows = {t: dataclasses.replace(self.tiles, **PR.tiles_kwargs(t, self.levers)) for t in self.rows}
-        self.pool_pages = check_pool(mml, {t: tl.pool for t, tl in self.tiles_by_rows.items()}, page=cfg.page, R=R,
-                                     ilv=cfg.ILV)
+        self.tiles_by_rows = {
+            t: dataclasses.replace(self.tiles, **PR.tiles_kwargs(t, self.levers))
+            for t in self.rows
+        }
+        self.pool_pages = check_pool(
+            mml,
+            {t: tl.pool for t, tl in self.tiles_by_rows.items()},
+            page=cfg.page,
+            R=R,
+            ilv=cfg.ILV,
+        )
         self.caches = None
         self._steps = {}
         self.mla_layer_name = _attn_module(bb.layers[0].self_attn).layer_name
-        logger.info("GLM-5.2 decode megakernel: built for rows %s, L %d (fresh indexer layers %s, freq %d skip %d), "
-                    "rope cache rows %d (max_model_len %d), k_scales %s, trace %s, enabled %s, levers %s", self.rows, cfg.L,
-                    LY.layers_of(cfg, "iwq"), freq, skip, int(self.cos_sin.shape[0]), mml, sorted(set(self.k_scales)),
-                    self.tiles.trace, self.enabled, ",".join(self.levers) or "stage A")
+        logger.info(
+            "GLM-5.2 decode megakernel: built for rows %s, L %d (fresh indexer layers %s, freq %d skip %d), "
+            "rope cache rows %d (max_model_len %d), k_scales %s, trace %s, enabled %s, levers %s",
+            self.rows,
+            cfg.L,
+            LY.layers_of(cfg, "iwq"),
+            freq,
+            skip,
+            int(self.cos_sin.shape[0]),
+            mml,
+            sorted(set(self.k_scales)),
+            self.tiles.trace,
+            self.enabled,
+            ",".join(self.levers) or "stage A",
+        )
 
     @staticmethod
     def _check_rank_layout(R: int) -> dict:
@@ -468,7 +625,10 @@ class Glm52DecodeMK:
             g = get()
             ranks = tuple(int(x) for x in g.ranks)
             _need(ranks == tuple(range(R)), f"{name} group ranks {ranks} != 0..{R - 1}")
-            _need(int(g.rank_in_group) == rank, f"{name} rank_in_group {g.rank_in_group} != rank {rank}")
+            _need(
+                int(g.rank_in_group) == rank,
+                f"{name} rank_in_group {g.rank_in_group} != rank {rank}",
+            )
             out[name] = int(g.rank_in_group)
         return out
 
@@ -480,39 +640,79 @@ class Glm52DecodeMK:
         Ly = self.backbone.layers[l]
         sa = Ly.self_attn
         at = _attn_module(sa)
-        qb_w, qb_s = q_b_local(_kn(sa.q_b_proj.weight, cfg.QL, sa.q_b_proj.weight.numel() // cfg.QL, "q_b_proj"),
-                               _scale(sa.q_b_proj, sa.q_b_proj.weight.numel() // cfg.QL, "q_b_proj"), cfg, r)
-        d = {"qkva": _pad_n(_kn(sa.fused_qkv_a_proj.weight, H, cfg.QKVA, "fused_qkv_a_proj"), cfg.QKVP),
-             "qb": qb_w, "q_b_s": qb_s, "wuk": at.W_UK_T, "wuv": at.W_UV,
-             "wo": _kn(sa.o_proj.weight, cfg.KR, H, "o_proj")}
+        qb_w, qb_s = q_b_local(
+            _kn(
+                sa.q_b_proj.weight,
+                cfg.QL,
+                sa.q_b_proj.weight.numel() // cfg.QL,
+                "q_b_proj",
+            ),
+            _scale(sa.q_b_proj, sa.q_b_proj.weight.numel() // cfg.QL, "q_b_proj"),
+            cfg,
+            r,
+        )
+        d = {
+            "qkva": _pad_n(
+                _kn(sa.fused_qkv_a_proj.weight, H, cfg.QKVA, "fused_qkv_a_proj"),
+                cfg.QKVP,
+            ),
+            "qb": qb_w,
+            "q_b_s": qb_s,
+            "wuk": at.W_UK_T,
+            "wuv": at.W_UV,
+            "wo": _kn(sa.o_proj.weight, cfg.KR, H, "o_proj"),
+        }
         idx = getattr(sa, "indexer", None)
         _need((idx is not None) == cfg.full_indexer(l), f"layer {l}: indexer pattern")
         if idx is not None:
             d["iwq"] = _kn(idx.wq_b.weight, cfg.QL, cfg.IH * cfg.IDIM, "indexer.wq_b")
-            d["iwk"] = _pad_n(_kn(idx.wk_weights_proj.weight, H, cfg.IDIM + cfg.IH, "indexer.wk_weights_proj"),
-                              cfg.IKW)
+            d["iwk"] = _pad_n(
+                _kn(
+                    idx.wk_weights_proj.weight,
+                    H,
+                    cfg.IDIM + cfg.IH,
+                    "indexer.wk_weights_proj",
+                ),
+                cfg.IKW,
+            )
         mlp = Ly.mlp
         if cfg.is_moe(l):
             d["gate"] = self._gate_kn(l)
             rt = _routed(mlp)
             d["ew13"], d["ew2"] = rt.w13_weight, rt.w2_weight
             d["es13"], d["es2"] = rt.w13_weight_scale_inv, rt.w2_weight_scale_inv
-            for k_, shp in (("ew13", (cfg.E, H, 2 * cfg.IR)), ("ew2", (cfg.E, cfg.IR, H)),
-                            ("es13", (cfg.E, 1, 1, 2 * cfg.IR)), ("es2", (cfg.E, 1, 1, H))):
-                _need(tuple(d[k_].shape) == shp, f"layer {l} {k_}: {tuple(d[k_].shape)} != {shp} (TP16 layout)")
+            for k_, shp in (
+                ("ew13", (cfg.E, H, 2 * cfg.IR)),
+                ("ew2", (cfg.E, cfg.IR, H)),
+                ("es13", (cfg.E, 1, 1, 2 * cfg.IR)),
+                ("es2", (cfg.E, 1, 1, H)),
+            ):
+                _need(
+                    tuple(d[k_].shape) == shp,
+                    f"layer {l} {k_}: {tuple(d[k_].shape)} != {shp} (TP16 layout)",
+                )
             for k_ in ("ew13", "ew2", "es13", "es2"):
-                _need(_owns_storage(d[k_]), f"layer {l} {k_}: a view operand (would be re-materialized per call)")
+                _need(
+                    _owns_storage(d[k_]),
+                    f"layer {l} {k_}: a view operand (would be re-materialized per call)",
+                )
             se = mlp.shared_experts
-            d["sh13"] = _kn(se.gate_up_proj.weight, H, 2 * cfg.ISR, "shared.gate_up_proj")
+            d["sh13"] = _kn(
+                se.gate_up_proj.weight, H, 2 * cfg.ISR, "shared.gate_up_proj"
+            )
             d["sh2"] = _kn(se.down_proj.weight, cfg.ISR, H, "shared.down_proj")
         else:
-            d["dw13"] = _kn(mlp.gate_up_proj.weight, H, 2 * cfg.IDR, "dense.gate_up_proj")
+            d["dw13"] = _kn(
+                mlp.gate_up_proj.weight, H, 2 * cfg.IDR, "dense.gate_up_proj"
+            )
             d["dw2"] = _kn(mlp.down_proj.weight, cfg.IDR, H, "dense.down_proj")
         return d
 
     def _gate_kn(self, l: int) -> torch.Tensor:
         cfg = self.cfg
-        return _pad_n(_kn(self.backbone.layers[l].mlp.gate.weight, cfg.H, cfg.E, "gate"), cfg.EPAD)
+        return _pad_n(
+            _kn(self.backbone.layers[l].mlp.gate.weight, cfg.H, cfg.E, "gate"), cfg.EPAD
+        )
 
     def _collect_weights(self):
         cfg = self.cfg
@@ -526,12 +726,18 @@ class Glm52DecodeMK:
                 continue
             ts = [per[l][k].detach() for l in ls]
             for l, t in zip(ls, ts):
-                _need(tuple(t.shape) == tuple(dsh[k][0]), f"{k}[{l}]: {tuple(t.shape)} != {dsh[k][0]}")
-                _need(_dt(t) == _dt(dsh[k][1]), f"{k}[{l}]: dtype {t.dtype} != {dsh[k][1]}")
+                _need(
+                    tuple(t.shape) == tuple(dsh[k][0]),
+                    f"{k}[{l}]: {tuple(t.shape)} != {dsh[k][0]}",
+                )
+                _need(
+                    _dt(t) == _dt(dsh[k][1]),
+                    f"{k}[{l}]: dtype {t.dtype} != {dsh[k][1]}",
+                )
             self._dense_kind[k] = len(dense)
-            dense.append(_own(torch.stack(ts)))                       # load-time stacked copy
+            dense.append(_own(torch.stack(ts)))  # load-time stacked copy
         experts = []
-        for l in LY.layers_of(cfg, "gate"):                           # served tensors, per layer, zero-copy
+        for l in LY.layers_of(cfg, "gate"):  # served tensors, per layer, zero-copy
             experts += [per[l]["ew13"], per[l]["ew2"], per[l]["es13"], per[l]["es2"]]
         return dense, experts
 
@@ -540,12 +746,20 @@ class Glm52DecodeMK:
         lay, S = LY.smalls_layout(cfg)
         rows = []
         for l in range(cfg.L + 1):
-            f = self._small_fields(l) if l < cfg.L else {"in_ln": self.backbone.norm.weight}
+            f = (
+                self._small_fields(l)
+                if l < cfg.L
+                else {"in_ln": self.backbone.norm.weight}
+            )
             dev = next(iter(f.values())).device
             parts = []
             for name, (_, n) in lay.items():
                 v = f.get(name)
-                v = torch.zeros(n, dtype=torch.float32, device=dev) if v is None else v.reshape(-1).float()
+                v = (
+                    torch.zeros(n, dtype=torch.float32, device=dev)
+                    if v is None
+                    else v.reshape(-1).float()
+                )
                 if name == "k_scale":
                     v = v[:1].expand(n)
                 _need(v.numel() == n, f"smalls {name}[{l}]: {v.numel()} != {n}")
@@ -558,12 +772,21 @@ class Glm52DecodeMK:
         Ly = self.backbone.layers[l]
         sa = Ly.self_attn
         dev = Ly.input_layernorm.weight.device
-        f = {"in_ln": Ly.input_layernorm.weight, "post_ln": Ly.post_attention_layernorm.weight,
-             "q_a_ln": sa.q_a_layernorm.weight, "kv_a_ln": sa.kv_a_layernorm.weight,
-             "qkv_a_s": torch.nn.functional.pad(_scale(sa.fused_qkv_a_proj, cfg.QKVA, "fused_qkv_a_proj"),
-                                                (0, cfg.QKVP - cfg.QKVA)),
-             "q_b_s": self._per_layer[l]["q_b_s"], "o_proj_s": _scale(sa.o_proj, cfg.H, "o_proj"),
-             "k_scale": torch.full((1,), self.k_scales[l], dtype=torch.float32, device=dev)}
+        f = {
+            "in_ln": Ly.input_layernorm.weight,
+            "post_ln": Ly.post_attention_layernorm.weight,
+            "q_a_ln": sa.q_a_layernorm.weight,
+            "kv_a_ln": sa.kv_a_layernorm.weight,
+            "qkv_a_s": torch.nn.functional.pad(
+                _scale(sa.fused_qkv_a_proj, cfg.QKVA, "fused_qkv_a_proj"),
+                (0, cfg.QKVP - cfg.QKVA),
+            ),
+            "q_b_s": self._per_layer[l]["q_b_s"],
+            "o_proj_s": _scale(sa.o_proj, cfg.H, "o_proj"),
+            "k_scale": torch.full(
+                (1,), self.k_scales[l], dtype=torch.float32, device=dev
+            ),
+        }
         idx = getattr(sa, "indexer", None)
         if idx is not None:
             f["idx_wq_s"] = _scale(idx.wq_b, cfg.IH * cfg.IDIM, "indexer.wq_b")
@@ -572,9 +795,11 @@ class Glm52DecodeMK:
         mlp = Ly.mlp
         if cfg.is_moe(l):
             gb = torch.full((cfg.EPAD,), -1e30, dtype=torch.float32, device=dev)
-            gb[:cfg.E] = mlp.gate.e_score_correction_bias.float()
+            gb[: cfg.E] = mlp.gate.e_score_correction_bias.float()
             f["gate_bias"] = gb
-            f["sw13_s"] = _scale(mlp.shared_experts.gate_up_proj, 2 * cfg.ISR, "shared.gate_up_proj")
+            f["sw13_s"] = _scale(
+                mlp.shared_experts.gate_up_proj, 2 * cfg.ISR, "shared.gate_up_proj"
+            )
             f["sw2_s"] = _scale(mlp.shared_experts.down_proj, cfg.H, "shared.down_proj")
         else:
             f["w13_s"] = _scale(mlp.gate_up_proj, 2 * cfg.IDR, "dense.gate_up_proj")
@@ -601,12 +826,31 @@ class Glm52DecodeMK:
             off += rup(n)
         gate_d = bias_d = 0.0
         for j, l in enumerate(LY.layers_of(cfg, "gate")):
-            gate_d = max(gate_d, float((g[j].float() - self._gate_kn(l).float()).abs().max().cpu()))
+            gate_d = max(
+                gate_d,
+                float((g[j].float() - self._gate_kn(l).float()).abs().max().cpu()),
+            )
             if o_gb is not None:
-                b = self.smalls[l, 0, o_gb[0]:o_gb[0] + cfg.E]
-                bias_d = max(bias_d, float((b - self.backbone.layers[l].mlp.gate.e_score_correction_bias.float())
-                                           .abs().max().cpu()))
-        return {"gate_maxdiff": gate_d, "bias_maxdiff": bias_d, "moe_layers": len(LY.layers_of(cfg, "gate"))}
+                b = self.smalls[l, 0, o_gb[0] : o_gb[0] + cfg.E]
+                bias_d = max(
+                    bias_d,
+                    float(
+                        (
+                            b
+                            - self.backbone.layers[
+                                l
+                            ].mlp.gate.e_score_correction_bias.float()
+                        )
+                        .abs()
+                        .max()
+                        .cpu()
+                    ),
+                )
+        return {
+            "gate_maxdiff": gate_d,
+            "bias_maxdiff": bias_d,
+            "moe_layers": len(LY.layers_of(cfg, "gate")),
+        }
 
     # ----------------------------------------------------------------- caches
 
@@ -628,17 +872,29 @@ class Glm52DecodeMK:
             self.unbound = str(e)
             self.caches = None
             self._steps = {}
-            logger.warning("GLM-5.2 decode megakernel: NOT bound, every step will run stock ('unbound'): %s", e)
+            logger.warning(
+                "GLM-5.2 decode megakernel: NOT bound, every step will run stock ('unbound'): %s",
+                e,
+            )
 
     def _module_caches(self, l: int):
         sa = self.backbone.layers[l].self_attn
         at = _attn_module(sa)
         kv = _unwrap(at.kv_cache)
-        _need(isinstance(kv, (tuple, list)) and len(kv) == 2, f"layer {l}: MLA cache is not (nope, rope)")
-        out = {"nope": (kv[0], getattr(at, "kv_stack", None)), "rope": (kv[1], getattr(at, "kv_stack", None))}
+        _need(
+            isinstance(kv, (tuple, list)) and len(kv) == 2,
+            f"layer {l}: MLA cache is not (nope, rope)",
+        )
+        out = {
+            "nope": (kv[0], getattr(at, "kv_stack", None)),
+            "rope": (kv[1], getattr(at, "kv_stack", None)),
+        }
         idx = getattr(sa, "indexer", None)
         if idx is not None:
-            out["idx"] = (_unwrap(idx.k_cache.kv_cache), getattr(idx.k_cache, "kv_stack", None))
+            out["idx"] = (
+                _unwrap(idx.k_cache.kv_cache),
+                getattr(idx.k_cache, "kv_stack", None),
+            )
         return out
 
     def _bind_caches(self, runner) -> None:
@@ -648,30 +904,48 @@ class Glm52DecodeMK:
         stacked = any(v[1] is not None for d in per.values() for v in d.values())
         caches, views = [], []
         if groups or stacked:
-            _need(bool(groups) and all(v[1] is not None for d in per.values() for v in d.values()),
-                  "caches partly stacked (runner groups %s; module kv_stack on some layers only)" % sorted(groups))
+            _need(
+                bool(groups)
+                and all(v[1] is not None for d in per.values() for v in d.values()),
+                f"caches partly stacked (runner groups {sorted(groups)}; module kv_stack on "
+                "some layers only)",
+            )
             g0 = groups["nope"][0][0]
             nb = int(g0.shape[1])
             nbi = int(groups["idx"][0][0].shape[1]) if groups.get("idx") else nb
             ck = LY.cache_kinds(cfg, nb, nbi)
             bindings, sizes = {}, {}
             for kind in ("nope", "rope", "idx"):
-                _need(bool(groups.get(kind)), f"stacked caches: the runner stacked no {kind}")
+                _need(
+                    bool(groups.get(kind)),
+                    f"stacked caches: the runner stacked no {kind}",
+                )
                 tens = [t for t, _ in groups[kind]]
                 sizes[kind] = [int(t.shape[0]) for t in tens]
                 bd = []
                 for l in ck[kind][0]:
                     t, st = per[l][kind]
                     gi = next((i for i, g in enumerate(tens) if g is t), None)
-                    _need(gi is not None, f"stacked caches: layer {l} {kind} is not bound to a runner group tensor")
-                    _need(st is not None and int(st[1]) == int(t.shape[1]),
-                          f"stacked caches: layer {l} {kind} kv_stack {st} vs group nb {int(t.shape[1])}")
+                    _need(
+                        gi is not None,
+                        f"stacked caches: layer {l} {kind} is not bound to a runner group tensor",
+                    )
+                    _need(
+                        st is not None and int(st[1]) == int(t.shape[1]),
+                        f"stacked caches: layer {l} {kind} kv_stack {st} vs group nb {int(t.shape[1])}",
+                    )
                     bd.append((gi, int(st[0])))
                 bindings[kind] = bd
                 for t in tens:
                     want = (sizes[kind][0],) + tuple(ck[kind][1])
-                    _need(tuple(t.shape) == want, f"stacked {kind} group {tuple(t.shape)} != {want}")
-                    _need(_dt(t) == _dt(ck[kind][2]), f"stacked {kind} dtype {t.dtype} != {ck[kind][2]}")
+                    _need(
+                        tuple(t.shape) == want,
+                        f"stacked {kind} group {tuple(t.shape)} != {want}",
+                    )
+                    _need(
+                        _dt(t) == _dt(ck[kind][2]),
+                        f"stacked {kind} dtype {t.dtype} != {ck[kind][2]}",
+                    )
                     if not _owns_storage(t):
                         views.append(f"{kind}-group")
                     caches.append(t)
@@ -679,7 +953,10 @@ class Glm52DecodeMK:
             form = "stacked"
         else:
             maxl = int(os.environ.get("GLM52_DECODE_MK_PERLAYER_MAX_L", "10"))
-            _need(cfg.L <= maxl, f"{cfg.L} layers on per-layer caches (> {maxl}): {PERLAYER_BLOCKED}")
+            _need(
+                maxl >= cfg.L,
+                f"{cfg.L} layers on per-layer caches (> {maxl}): {PERLAYER_BLOCKED}",
+            )
             nb = int(per[0]["nope"][0].shape[0])
             nbi = int(next(d["idx"][0] for d in per.values() if "idx" in d).shape[0])
             ck = LY.cache_kinds(cfg, nb, nbi)
@@ -689,18 +966,36 @@ class Glm52DecodeMK:
                 G[kind] = len(ls)
                 for l in ls:
                     t = per[l][kind][0]
-                    _need(tuple(t.shape) == tuple(ck[kind][1]), f"cache {kind}[{l}]: {tuple(t.shape)} != {ck[kind][1]}")
-                    _need(_dt(t) == _dt(ck[kind][2]), f"cache {kind}[{l}]: dtype {t.dtype} != {ck[kind][2]}")
+                    _need(
+                        tuple(t.shape) == tuple(ck[kind][1]),
+                        f"cache {kind}[{l}]: {tuple(t.shape)} != {ck[kind][1]}",
+                    )
+                    _need(
+                        _dt(t) == _dt(ck[kind][2]),
+                        f"cache {kind}[{l}]: dtype {t.dtype} != {ck[kind][2]}",
+                    )
                     if not _owns_storage(t):
                         views.append(f"{kind}{l}")
                     caches.append(t)
             form = "per-layer"
-        _need(not views, f"view cache operands {views} (re-materialized by torch_tpu on every call)")
+        _need(
+            not views,
+            f"view cache operands {views} (re-materialized by torch_tpu on every call)",
+        )
         self.caches, self.groups, self.nb, self.nbi = caches, G, nb, nbi
         self.cache_form, self.cache_views = form, views
-        logger.info("GLM-5.2 decode megakernel: %d dense + %d expert (served per-layer) + %d cache operands, cache form "
-                    "%s, groups %s, %d blocks (idx %d), max_pages %d", len(self.dense), len(self.experts), len(caches),
-                    form, G, nb, nbi, self.max_pages)
+        logger.info(
+            "GLM-5.2 decode megakernel: %d dense + %d expert (served per-layer) + %d cache operands, cache form "
+            "%s, groups %s, %d blocks (idx %d), max_pages %d",
+            len(self.dense),
+            len(self.experts),
+            len(caches),
+            form,
+            G,
+            nb,
+            nbi,
+            self.max_pages,
+        )
         for t in self.rows:
             self._steps[t] = self._build_op(self.cfgs[t])
 
@@ -713,10 +1008,20 @@ class Glm52DecodeMK:
         from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 
         n_d, n_e, n_c = len(self.dense), len(self.experts), len(self.caches)
-        smap, in_specs, out_specs, info = build_spmd(cfg, self.mesh, max_pages=self.max_pages, nb=self.nb,
-                                                     nbi=self.nbi, tiles=self.tiles_by_rows[cfg.TMAX],
-                                                     groups=self.groups, stacked=self.cache_form == "stacked")
-        assert list(info["dkinds"]) == list(self._dense_kind), (info["dkinds"], list(self._dense_kind))
+        smap, in_specs, out_specs, info = build_spmd(
+            cfg,
+            self.mesh,
+            max_pages=self.max_pages,
+            nb=self.nb,
+            nbi=self.nbi,
+            tiles=self.tiles_by_rows[cfg.TMAX],
+            groups=self.groups,
+            stacked=self.cache_form == "stacked",
+        )
+        assert list(info["dkinds"]) == list(self._dense_kind), (
+            info["dkinds"],
+            list(self._dense_kind),
+        )
         assert len(info["e_names"]) == n_e, (len(info["e_names"]), n_e)
         assert len(info["c_names"]) == n_c
         TMAX, M = cfg.TMAX, cfg.M
@@ -729,27 +1034,62 @@ class Glm52DecodeMK:
         args = [f"x{i}" for i in range(n_in)]
         ret = "tuple[" + ", ".join(["jax.Array"] * len(out_specs)) + "]"
         fname = f"glm52_decode_mk_b{TMAX}"
-        src = (f"def {fname}({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"
-               f"    return _smap({', '.join(args)})\n")
+        src = (
+            f"def {fname}({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"
+            f"    return _smap({', '.join(args)})\n"
+        )
         ns: dict[str, Any] = {"jax": jax, "_smap": smap}
         exec(compile(src, f"<{fname}>", "exec"), ns)  # noqa: S102 - arity is data
         name = f"glm52_decode_mk::step_b{TMAX}"
         # unregistered callable (sharded_jax_op register=False): the operand count exceeds a torch op schema's 64;
         # the op below takes the weights and caches as Tensor[] arguments (glm5_mk_dcp)
-        flat = sharded_jax_op(name + "_flat", ns[fname], mesh=self.mesh, input_partition_specs=in_specs,
-                              output_partition_specs=out_specs, donate_argnums=tuple(range(n_in - n_c, n_in)),
-                              register=False)
+        flat = sharded_jax_op(
+            name + "_flat",
+            ns[fname],
+            mesh=self.mesh,
+            input_partition_specs=in_specs,
+            output_partition_specs=out_specs,
+            donate_argnums=tuple(range(n_in - n_c, n_in)),
+            register=False,
+        )
 
         @torch.library.custom_op(name, mutates_args=())
-        def op(pos: torch.Tensor, seq: torch.Tensor, qsl: torch.Tensor, btv: torch.Tensor, csr: torch.Tensor,
-               h0: torch.Tensor, ltab_: torch.Tensor, dtab_: torch.Tensor, rank: torch.Tensor, smalls: torch.Tensor,
-               weights: list[torch.Tensor], caches: list[torch.Tensor]) -> list[torch.Tensor]:
-            return list(flat(pos, seq, qsl, btv, csr, h0, ltab_, dtab_, rank, smalls, *weights, *caches))
+        def op(
+            pos: torch.Tensor,
+            seq: torch.Tensor,
+            qsl: torch.Tensor,
+            btv: torch.Tensor,
+            csr: torch.Tensor,
+            h0: torch.Tensor,
+            ltab_: torch.Tensor,
+            dtab_: torch.Tensor,
+            rank: torch.Tensor,
+            smalls: torch.Tensor,
+            weights: list[torch.Tensor],
+            caches: list[torch.Tensor],
+        ) -> list[torch.Tensor]:
+            return list(
+                flat(
+                    pos,
+                    seq,
+                    qsl,
+                    btv,
+                    csr,
+                    h0,
+                    ltab_,
+                    dtab_,
+                    rank,
+                    smalls,
+                    *weights,
+                    *caches,
+                )
+            )
 
         @op.register_fake
         def _(pos, seq, qsl, btv, csr, h0, ltab_, dtab_, rank, smalls, weights, caches):
-            return ([torch.empty((M, cfg.H), dtype=torch.bfloat16, device=h0.device)]
-                    + [torch.empty_like(c) for c in caches])
+            return [torch.empty((M, cfg.H), dtype=torch.bfloat16, device=h0.device)] + [
+                torch.empty_like(c) for c in caches
+            ]
 
         def fit(x, n):
             k = x.shape[0]
@@ -768,15 +1108,31 @@ class Glm52DecodeMK:
             T = qsl[-1].to(i32)
             valid = torch.arange(TMAX, device=p.device, dtype=i32) < T
             pc = torch.clamp(p * valid.to(i32), 0, n_pos - 1)
-            csr = cos_sin[pc.long()].to(torch.bfloat16).float()                  # [TMAX, DR], bf16 values
+            csr = (
+                cos_sin[pc.long()].to(torch.bfloat16).float()
+            )  # [TMAX, DR], bf16 values
             h0 = self.backbone.embed_tokens(fit(ids.reshape(-1), TMAX)).float()
-            outs = op(p, seq_lens.to(i32), qsl.to(i32), btv, csr, h0, ltab, dtab, rank_t, smalls, list(weights),
-                      list(caches))
-            for dst, src in zip(caches, outs[1:1 + len(caches)]):
+            outs = op(
+                p,
+                seq_lens.to(i32),
+                qsl.to(i32),
+                btv,
+                csr,
+                h0,
+                ltab,
+                dtab,
+                rank_t,
+                smalls,
+                list(weights),
+                list(caches),
+            )
+            for dst, src in zip(caches, outs[1 : 1 + len(caches)]):
                 dst.copy_(src)
             return outs[0][:TMAX]
 
-        logger.info("GLM-5.2 decode megakernel: step b%d built (%d operands)", TMAX, n_in)
+        logger.info(
+            "GLM-5.2 decode megakernel: step b%d built (%d operands)", TMAX, n_in
+        )
         return torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
 
     # ------------------------------------------------------------------- run
@@ -801,9 +1157,14 @@ class Glm52DecodeMK:
         if self.unbound is not None or not self._steps:
             return None, "unbound", str(self.unbound)
         cfg = self.cfg
-        return classify_step(sched_reqs(runner, scheduler_output), num_chunks=num_chunks,
-                             has_encoder=bool(scheduler_output.scheduled_encoder_inputs), qmax=cfg.QMAX,
-                             rows=[t for t in self.rows if t in self._steps], bmax=cfg.BMAX)
+        return classify_step(
+            sched_reqs(runner, scheduler_output),
+            num_chunks=num_chunks,
+            has_encoder=bool(scheduler_output.scheduled_encoder_inputs),
+            qmax=cfg.QMAX,
+            rows=[t for t in self.rows if t in self._steps],
+            bmax=cfg.BMAX,
+        )
 
     def _count(self, why: str, detail: str = "", bucket: int | None = None) -> None:
         c = self.counts
@@ -814,28 +1175,53 @@ class Glm52DecodeMK:
         if why != "embeds" and why != "shape":
             self.decisions += 1
         if self.rank == 0 and first:
-            logger.info("GLM-5.2 decode megakernel: first '%s' step (%s)%s", why, detail,
-                        "" if why == "mk" else ": runs stock")
-        if self.rank == 0 and self.log_every and self.decisions % self.log_every == 0 and why not in ("embeds",
-                                                                                                    "shape"):
+            logger.info(
+                "GLM-5.2 decode megakernel: first '%s' step (%s)%s",
+                why,
+                detail,
+                "" if why == "mk" else ": runs stock",
+            )
+        if (
+            self.rank == 0
+            and self.log_every
+            and self.decisions % self.log_every == 0
+            and why not in ("embeds", "shape")
+        ):
             self.log_counts()
 
     def log_counts(self) -> None:
         c = {k: v for k, v in self.counts.items() if v}
-        logger.info("GLM-5.2 decode megakernel engagement: %d decisions, mk %d (%s), declined %s; calls %d, "
-                    "decisions consumed %d", self.decisions, c.get("mk", 0),
-                    ", ".join(f"{k} {v}" for k, v in c.items() if k.startswith("mk_b")) or "-",
-                    {k: v for k, v in c.items() if k != "mk" and not k.startswith("mk_b")} or "none", self.calls,
-                    self.consumed)
+        logger.info(
+            "GLM-5.2 decode megakernel engagement: %d decisions, mk %d (%s), declined %s; calls %d, "
+            "decisions consumed %d",
+            self.decisions,
+            c.get("mk", 0),
+            ", ".join(f"{k} {v}" for k, v in c.items() if k.startswith("mk_b")) or "-",
+            {k: v for k, v in c.items() if k != "mk" and not k.startswith("mk_b")}
+            or "none",
+            self.calls,
+            self.consumed,
+        )
 
     def rows_ok(self, q_lens: list[int], num_tokens: int) -> bool:
         """The same predicate from host-known rows (the twin harness, which calls forward_model directly): every row
         group a verify request, through classify_step; the twin also needs its padded size to be the bucket."""
-        if not self.enabled or self.unbound is not None or not self._steps or not q_lens:
+        if (
+            not self.enabled
+            or self.unbound is not None
+            or not self._steps
+            or not q_lens
+        ):
             return False
         cfg = self.cfg
-        bucket, _, _ = classify_step([(int(q), int(q) - 1, False) for q in q_lens], num_chunks=1, has_encoder=False,
-                                     qmax=cfg.QMAX, rows=[t for t in self.rows if t in self._steps], bmax=cfg.BMAX)
+        bucket, _, _ = classify_step(
+            [(int(q), int(q) - 1, False) for q in q_lens],
+            num_chunks=1,
+            has_encoder=False,
+            qmax=cfg.QMAX,
+            rows=[t for t in self.rows if t in self._steps],
+            bmax=cfg.BMAX,
+        )
         return bucket is not None and bucket == num_tokens
 
     def _metadata(self):
@@ -847,8 +1233,16 @@ class Glm52DecodeMK:
         assert md is not None and hasattr(md, "query_start_loc"), type(md)
         return md
 
-    def try_call(self, runner, decision, input_ids, positions, inputs_embeds=None, intermediate_tensors=None,
-                 harness=False):
+    def try_call(
+        self,
+        runner,
+        decision,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        intermediate_tensors=None,
+        harness=False,
+    ):
         """forward_model's hook. `decision` is step_ok's bucket for this step (consumed by the caller; `harness`:
         the twin harness's rows_ok bucket, not a step decision and not counted). -> the backbone hidden states
         [n, H], or None = run stock. Counts the call-time declines ('embeds' / 'shape')."""
@@ -874,46 +1268,88 @@ class Glm52DecodeMK:
         tripwire, rank-uniform like the shapes themselves."""
         if bucket not in self._steps:
             return f"b{bucket} not built"
-        got = (tuple(md.query_start_loc.shape), tuple(md.seq_lens.shape), int(md.block_tables.numel()))
+        got = (
+            tuple(md.query_start_loc.shape),
+            tuple(md.seq_lens.shape),
+            int(md.block_tables.numel()),
+        )
         want = self.call_shapes.get(bucket)
         if want is None:
             self.call_shapes[bucket] = got
             warm = self.warm_shapes.get(bucket)
             if self.rank == 0:
                 (logger.info if got == warm else logger.warning)(
-                    "GLM-5.2 decode megakernel: b%d served metadata shapes %s (warmup %s%s)", bucket, got, warm,
-                    "" if got == warm else ": this first call compiles once")
+                    "GLM-5.2 decode megakernel: b%d served metadata shapes %s (warmup %s%s)",
+                    bucket,
+                    got,
+                    warm,
+                    "" if got == warm else ": this first call compiles once",
+                )
             return ""
         if got != want:
-            return f"b{bucket}: qsl / seq_lens / block_tables {got} != the bucket's {want}"
+            return (
+                f"b{bucket}: qsl / seq_lens / block_tables {got} != the bucket's {want}"
+            )
         return ""
 
     @torch.no_grad()
-    def __call__(self, runner, input_ids: torch.Tensor, positions: torch.Tensor, bucket=None, md=None) -> torch.Tensor:
+    def __call__(
+        self,
+        runner,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        bucket=None,
+        md=None,
+    ) -> torch.Tensor:
         n = input_ids.shape[0]
         t = bucket if bucket is not None else self.bucket_for(n)
         assert t is not None, (n, self.rows)
         md = md if md is not None else self._metadata()
-        out = self._steps[t](input_ids, positions, md.query_start_loc, md.seq_lens, md.block_tables, self.smalls,
-                             self.dense + self.experts, self.caches)
+        out = self._steps[t](
+            input_ids,
+            positions,
+            md.query_start_loc,
+            md.seq_lens,
+            md.block_tables,
+            self.smalls,
+            self.dense + self.experts,
+            self.caches,
+        )
         self.calls += 1
         if n <= out.shape[0]:
             return out[:n]
         return torch.nn.functional.pad(out, (0, 0, 0, n - out.shape[0]))
 
     def status(self) -> dict:
-        return {"rank": self.rank, "enabled": self.enabled, "rows": self.rows, "built": sorted(self._steps),
-                "L": self.cfg.L, "fresh_layers": LY.layers_of(self.cfg, "iwq"),
-                "idx_freq_skip": [self.cfg.idx_freq, self.cfg.idx_skip], "n_dense": len(self.dense),
-                "n_experts": len(self.experts), "n_caches": len(self.caches or []), "nb": getattr(self, "nb", None),
-                "max_pages": self.max_pages, "pool_pages": getattr(self, "pool_pages", None), "trace": self.tiles.trace,
-                "levers": list(self.levers), "calls": self.calls,
-                "cache_views": getattr(self, "cache_views", None), "k_scales": sorted(set(self.k_scales)),
-                "counts": dict(self.counts), "decisions": self.decisions, "consumed": self.consumed,
-                "cache_form": self.cache_form, "groups": dict(getattr(self, "groups", {}) or {}),
-                "unbound": self.unbound, "rank_layout": self.rank_layout,
-                "call_shapes": {str(k): v for k, v in self.call_shapes.items()},
-                "warm_shapes": {str(k): v for k, v in self.warm_shapes.items()}}
+        return {
+            "rank": self.rank,
+            "enabled": self.enabled,
+            "rows": self.rows,
+            "built": sorted(self._steps),
+            "L": self.cfg.L,
+            "fresh_layers": LY.layers_of(self.cfg, "iwq"),
+            "idx_freq_skip": [self.cfg.idx_freq, self.cfg.idx_skip],
+            "n_dense": len(self.dense),
+            "n_experts": len(self.experts),
+            "n_caches": len(self.caches or []),
+            "nb": getattr(self, "nb", None),
+            "max_pages": self.max_pages,
+            "pool_pages": getattr(self, "pool_pages", None),
+            "trace": self.tiles.trace,
+            "levers": list(self.levers),
+            "calls": self.calls,
+            "cache_views": getattr(self, "cache_views", None),
+            "k_scales": sorted(set(self.k_scales)),
+            "counts": dict(self.counts),
+            "decisions": self.decisions,
+            "consumed": self.consumed,
+            "cache_form": self.cache_form,
+            "groups": dict(getattr(self, "groups", {}) or {}),
+            "unbound": self.unbound,
+            "rank_layout": self.rank_layout,
+            "call_shapes": {str(k): v for k, v in self.call_shapes.items()},
+            "warm_shapes": {str(k): v for k, v in self.warm_shapes.items()},
+        }
 
     def warmup(self, runner) -> None:
         """Compile and run each bucket once: one request of QMAX rows at positions 0..QMAX-1 on block 0 (the null
@@ -929,10 +1365,25 @@ class Glm52DecodeMK:
             pos = torch.arange(t, dtype=torch.int32, device=dev) % cfg.QMAX
             S = cfg.BMAX
             qsl = torch.tensor([0] + [cfg.QMAX] * S, dtype=torch.int32, device=dev)
-            seq = torch.tensor([cfg.QMAX] + [0] * (S - 1), dtype=torch.int32, device=dev)
+            seq = torch.tensor(
+                [cfg.QMAX] + [0] * (S - 1), dtype=torch.int32, device=dev
+            )
             bt = torch.zeros(S * self.max_pages, dtype=torch.int32, device=dev)
             t0 = time.monotonic()
-            out = self._steps[t](ids, pos, qsl, seq, bt, self.smalls, self.dense + self.experts, self.caches)
+            out = self._steps[t](
+                ids,
+                pos,
+                qsl,
+                seq,
+                bt,
+                self.smalls,
+                self.dense + self.experts,
+                self.caches,
+            )
             synchronize_tensors([out])
             self.warm_shapes[t] = (tuple(qsl.shape), tuple(seq.shape), int(bt.numel()))
-            logger.info("GLM-5.2 decode megakernel: b%d compiled and warmed in %.1f s", t, time.monotonic() - t0)
+            logger.info(
+                "GLM-5.2 decode megakernel: b%d compiled and warmed in %.1f s",
+                t,
+                time.monotonic() - t0,
+            )

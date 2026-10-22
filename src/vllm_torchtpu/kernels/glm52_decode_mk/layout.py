@@ -23,11 +23,22 @@ def smalls_layout(cfg):
     norm in `in_ln`. Per-rank fields: q_b_s (this rank's heads), o_proj_s / sw2_s / w2_s (scales over the local K),
     sw13_s / w13_s (this rank's gate | up columns)."""
     fields = [
-        ("in_ln", cfg.H), ("post_ln", cfg.H), ("q_a_ln", cfg.QL), ("kv_a_ln", cfg.KL),
-        ("qkv_a_s", cfg.QKVP), ("q_b_s", cfg.HR * cfg.DQ), ("o_proj_s", cfg.H),
-        ("idx_wq_s", cfg.IH * cfg.IDIM), ("idx_kn_w", cfg.IDIM), ("idx_kn_b", cfg.IDIM),
-        ("gate_bias", cfg.EPAD), ("sw13_s", 2 * cfg.ISR), ("sw2_s", cfg.H),
-        ("w13_s", 2 * cfg.IDR), ("w2_s", cfg.H), ("k_scale", 128),
+        ("in_ln", cfg.H),
+        ("post_ln", cfg.H),
+        ("q_a_ln", cfg.QL),
+        ("kv_a_ln", cfg.KL),
+        ("qkv_a_s", cfg.QKVP),
+        ("q_b_s", cfg.HR * cfg.DQ),
+        ("o_proj_s", cfg.H),
+        ("idx_wq_s", cfg.IH * cfg.IDIM),
+        ("idx_kn_w", cfg.IDIM),
+        ("idx_kn_b", cfg.IDIM),
+        ("gate_bias", cfg.EPAD),
+        ("sw13_s", 2 * cfg.ISR),
+        ("sw2_s", cfg.H),
+        ("w13_s", 2 * cfg.IDR),
+        ("w2_s", cfg.H),
+        ("k_scale", 128),
     ]
     off, lay = 0, {}
     for name, n in fields:
@@ -37,8 +48,21 @@ def smalls_layout(cfg):
 
 
 # dense stream kinds, in a layer's consumption order
-DKINDS = ("qkva", "qb", "wuk", "iwq", "iwk", "wuv", "wo", "gate", "sh13", "sh2", "dw13", "dw2")
-WHOLE = ("wuk", "wuv")                     # one tile = the whole per-layer tensor
+DKINDS = (
+    "qkva",
+    "qb",
+    "wuk",
+    "iwq",
+    "iwk",
+    "wuv",
+    "wo",
+    "gate",
+    "sh13",
+    "sh2",
+    "dw13",
+    "dw2",
+)
+WHOLE = ("wuk", "wuv")  # one tile = the whole per-layer tensor
 
 
 def layers_of(cfg, kind):
@@ -56,15 +80,15 @@ def dense_shapes(cfg):
     """kind -> (per-layer shape, dtype) of the stacked HBM operand [n_layers_of_kind, *shape]."""
     H = cfg.H
     return {
-        "qkva": ((H, cfg.QKVP), FP8),                       # replicated, N padded
-        "qb": ((cfg.QL, cfg.HR * cfg.DQ), FP8),             # this rank's HR heads (qrep 0)
-        "wuk": ((cfg.HR, cfg.DN, cfg.KL), BF16),            # W_UK_T of this rank's heads
-        "iwq": ((cfg.QL, cfg.IH * cfg.IDIM), FP8),          # replicated
-        "iwk": ((H, cfg.IKW), BF16),                        # replicated, N padded
-        "wuv": ((cfg.HR, cfg.KL, cfg.DV), BF16),            # this rank's heads
-        "wo": ((cfg.KR, H), FP8),                           # local K rows
-        "gate": ((H, cfg.EPAD), BF16),                      # replicated, E padded
-        "sh13": ((H, 2 * cfg.ISR), FP8),                    # TP slice [gate | up]
+        "qkva": ((H, cfg.QKVP), FP8),  # replicated, N padded
+        "qb": ((cfg.QL, cfg.HR * cfg.DQ), FP8),  # this rank's HR heads (qrep 0)
+        "wuk": ((cfg.HR, cfg.DN, cfg.KL), BF16),  # W_UK_T of this rank's heads
+        "iwq": ((cfg.QL, cfg.IH * cfg.IDIM), FP8),  # replicated
+        "iwk": ((H, cfg.IKW), BF16),  # replicated, N padded
+        "wuv": ((cfg.HR, cfg.KL, cfg.DV), BF16),  # this rank's heads
+        "wo": ((cfg.KR, H), FP8),  # local K rows
+        "gate": ((H, cfg.EPAD), BF16),  # replicated, E padded
+        "sh13": ((H, 2 * cfg.ISR), FP8),  # TP slice [gate | up]
         "sh2": ((cfg.ISR, H), FP8),
         "dw13": ((H, 2 * cfg.IDR), FP8),
         "dw2": ((cfg.IDR, H), FP8),
@@ -118,22 +142,36 @@ def tile_plan(cfg, bank):
 def bank_bytes(cfg, bank):
     """Bank size: the configured bank, raised to the largest tensor consumed as one tile (W_UK / W_UV / router gate /
     shared expert) if needed (FULL: no change)."""
-    need = max(pool_alias.storage_size(shp, jnp.dtype(dt)) for k, (shp, dt) in dense_shapes(cfg).items()
-               if k in WHOLE + ("gate", "sh13", "sh2"))
+    need = max(
+        pool_alias.storage_size(shp, jnp.dtype(dt))
+        for k, (shp, dt) in dense_shapes(cfg).items()
+        if k in WHOLE + ("gate", "sh13", "sh2")
+    )
     return max(bank, rup(need, 4096))
 
 
 def layer_tiles(cfg, l, plan):
     """Static tile order of layer l: [(kind, tile index)]."""
-    seq = [("qkva", t) for t in range(plan["qkva"][2])] + [("qb", t) for t in range(plan["qb"][2])] + [("wuk", 0)]
+    seq = (
+        [("qkva", t) for t in range(plan["qkva"][2])]
+        + [("qb", t) for t in range(plan["qb"][2])]
+        + [("wuk", 0)]
+    )
     if cfg.full_indexer(l):
-        seq += [("iwq", t) for t in range(plan["iwq"][2])] + [("iwk", t) for t in range(plan["iwk"][2])]
+        seq += [("iwq", t) for t in range(plan["iwq"][2])] + [
+            ("iwk", t) for t in range(plan["iwk"][2])
+        ]
     seq += [("wuv", 0)] + [("wo", t) for t in range(plan["wo"][2])]
     if cfg.is_moe(l):
-        seq += [("gate", t) for t in range(plan["gate"][2])] + [("sh13", t) for t in range(plan["sh13"][2])] + \
-               [("sh2", t) for t in range(plan["sh2"][2])]
+        seq += (
+            [("gate", t) for t in range(plan["gate"][2])]
+            + [("sh13", t) for t in range(plan["sh13"][2])]
+            + [("sh2", t) for t in range(plan["sh2"][2])]
+        )
     else:
-        seq += [("dw13", t) for t in range(plan["dw13"][2])] + [("dw2", t) for t in range(plan["dw2"][2])]
+        seq += [("dw13", t) for t in range(plan["dw13"][2])] + [
+            ("dw2", t) for t in range(plan["dw2"][2])
+        ]
     return seq
 
 
@@ -144,8 +182,12 @@ def stream_tables(cfg, plan):
     ltab = np.zeros((cfg.L, 4), np.int32)
     dt = []
     for l in range(cfg.L):
-        ltab[l] = (len(dt), int(cfg.full_indexer(l)), int(cfg.is_moe(l)),
-                   layers_of(cfg, "gate").index(l) if cfg.is_moe(l) else 0)
+        ltab[l] = (
+            len(dt),
+            int(cfg.full_indexer(l)),
+            int(cfg.is_moe(l)),
+            layers_of(cfg, "gate").index(l) if cfg.is_moe(l) else 0,
+        )
         for k, t in layer_tiles(cfg, l, plan):
             pos = layers_of(cfg, k).index(l)
             assert t < 256 and pos < 4096

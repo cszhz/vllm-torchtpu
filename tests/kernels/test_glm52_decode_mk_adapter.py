@@ -5,11 +5,16 @@
 import pytest
 
 from vllm_torchtpu.kernels.glm52_decode_mk import config as C
-from vllm_torchtpu.kernels.glm52_decode_mk.vllm_adapter import Unsupported, index_pattern
+from vllm_torchtpu.kernels.glm52_decode_mk.vllm_adapter import (
+    Unsupported,
+    index_pattern,
+)
 
 
 def _pat(fr, sk, L):
-    cfg = C.MKConfig(R=16, L=L, first_dense=1, H=6144, NH=64, QL=2048, idx_freq=fr, idx_skip=sk)
+    cfg = C.MKConfig(
+        R=16, L=L, first_dense=1, H=6144, NH=64, QL=2048, idx_freq=fr, idx_skip=sk
+    )
     return [cfg.full_indexer(l) for l in range(L)]
 
 

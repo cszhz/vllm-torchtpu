@@ -29,7 +29,20 @@ F32, BF16, I32, U32 = jnp.float32, jnp.bfloat16, jnp.int32, jnp.uint32
 
 # ------------------------------------------------------------------------------------------ metadata
 
-def metadata(cfg, ids_len, positions, seq_lens, qsl, bt_virtual, nb, nbi, max_pages, rank, delay=(-1, 0, -1)):
+
+def metadata(
+    cfg,
+    ids_len,
+    positions,
+    seq_lens,
+    qsl,
+    bt_virtual,
+    nb,
+    nbi,
+    max_pages,
+    rank,
+    delay=(-1, 0, -1),
+):
     """-> (scal i32[16], rmeta i32[T, 8], qmeta i32[BM, 4], bt i32[BM, MAXP], bti i32[BM, MAXP], rvec i32[M, 128]).
     qsl [S + 1] (padded entries repeat the total), seq_lens [S] (this step included), positions [>= T],
     bt_virtual [S, W] (DCP virtual page ordinals)."""
@@ -45,21 +58,23 @@ def metadata(cfg, ids_len, positions, seq_lens, qsl, bt_virtual, nb, nbi, max_pa
 
     qsl = qsl.astype(I32)
     T = qsl[-1]
-    qsl_b = fit(jnp.concatenate([qsl, jnp.broadcast_to(qsl[-1:], (BMAX + 1,))]), BMAX + 1)
+    qsl_b = fit(
+        jnp.concatenate([qsl, jnp.broadcast_to(qsl[-1:], (BMAX + 1,))]), BMAX + 1
+    )
     seq_b = fit(seq_lens.astype(I32), BMAX)
     btv = fit(fit(bt_virtual.astype(I32), BMAX, 0), max_pages, 1)
     bt = jnp.mod(btv, jnp.int32(nb))
     bti = jnp.mod(btv, jnp.int32(nbi))
     t = jnp.arange(TMAX, dtype=I32)
     valid = (t < T).astype(I32)
-    req = jnp.sum((qsl_b[1:BMAX + 1][None, :] <= t[:, None]).astype(I32), axis=1)
+    req = jnp.sum((qsl_b[1 : BMAX + 1][None, :] <= t[:, None]).astype(I32), axis=1)
     req = jnp.minimum(req, BMAX - 1)
     p = fit(positions.astype(I32), TMAX) * valid
     seq_t = seq_b[req] * valid
     z = jnp.zeros(TMAX, I32)
     rmeta = jnp.stack([valid, p, req * valid, seq_t, z, z, z, z], 1)
     t0 = qsl_b[:BMAX]
-    nq = qsl_b[1:BMAX + 1] - t0
+    nq = qsl_b[1 : BMAX + 1] - t0
     qmeta = jnp.stack([t0, nq, seq_b, (nq > 0).astype(I32)], 1)
     B = jnp.sum((nq > 0).astype(I32))
     scal = jnp.zeros(16, I32).at[0].set(T).at[1].set(B).at[2].set(rank)
@@ -73,19 +88,34 @@ def rope_table(cfg, cos_sin_rows):
     in lanes 0..DR-1 (0, 1) and in lanes 128-DR..127 (2, 3); identity elsewhere (glm5_mk_dcp adapter)."""
     DR, M, TMAX = cfg.DR, cfg.M, cfg.TMAX
     cs = cos_sin_rows.astype(F32)
-    c = jnp.repeat(cs[:, :DR // 2], 2, axis=1)
-    s = jnp.stack([-cs[:, DR // 2:], cs[:, DR // 2:]], -1).reshape(TMAX, DR)
+    c = jnp.repeat(cs[:, : DR // 2], 2, axis=1)
+    s = jnp.stack([-cs[:, DR // 2 :], cs[:, DR // 2 :]], -1).reshape(TMAX, DR)
     ones = jnp.ones((TMAX, 128 - DR), F32)
     zeros = jnp.zeros((TMAX, 128 - DR), F32)
-    tab = jnp.stack([jnp.concatenate([c, ones], 1), jnp.concatenate([s, zeros], 1),
-                     jnp.concatenate([ones, c], 1), jnp.concatenate([zeros, s], 1)])
+    tab = jnp.stack(
+        [
+            jnp.concatenate([c, ones], 1),
+            jnp.concatenate([s, zeros], 1),
+            jnp.concatenate([ones, c], 1),
+            jnp.concatenate([zeros, s], 1),
+        ]
+    )
     if M > TMAX:
-        tab = jnp.concatenate([tab, jnp.broadcast_to(jnp.array([1.0, 0.0, 1.0, 0.0], F32)[:, None, None],
-                                                     (4, M - TMAX, 128))], axis=1)
+        tab = jnp.concatenate(
+            [
+                tab,
+                jnp.broadcast_to(
+                    jnp.array([1.0, 0.0, 1.0, 0.0], F32)[:, None, None],
+                    (4, M - TMAX, 128),
+                ),
+            ],
+            axis=1,
+        )
     return tab
 
 
 # ------------------------------------------------------------------------------------------ weights
+
 
 def smalls_rows(cfg, layers, final_norm, k_scales):
     """Per-rank f32 [L + 1, 1, S] from reference-layout layer dicts (instruments/inputs.py `_layer_shard`)."""
@@ -95,13 +125,26 @@ def smalls_rows(cfg, layers, final_norm, k_scales):
         f = {}
         if l < cfg.L:
             p = layers[l]
-            f = {"in_ln": p["in_norm"], "post_ln": p["post_norm"], "q_a_ln": p["q_a_norm"],
-                 "kv_a_ln": p["kv_a_norm"], "qkv_a_s": p["qkv_a_s"], "q_b_s": p["q_b_s"], "o_proj_s": p["o_s"],
-                 "k_scale": jnp.full((1,), k_scales[l], F32)}
+            f = {
+                "in_ln": p["in_norm"],
+                "post_ln": p["post_norm"],
+                "q_a_ln": p["q_a_norm"],
+                "kv_a_ln": p["kv_a_norm"],
+                "qkv_a_s": p["qkv_a_s"],
+                "q_b_s": p["q_b_s"],
+                "o_proj_s": p["o_s"],
+                "k_scale": jnp.full((1,), k_scales[l], F32),
+            }
             if cfg.full_indexer(l):
-                f.update(idx_wq_s=p["wq_b_s"], idx_kn_w=p["k_norm_w"], idx_kn_b=p["k_norm_b"])
+                f.update(
+                    idx_wq_s=p["wq_b_s"], idx_kn_w=p["k_norm_w"], idx_kn_b=p["k_norm_b"]
+                )
             if cfg.is_moe(l):
-                gb = jnp.full((cfg.EPAD,), -1e30, F32).at[:cfg.E].set(p["gate_b"].astype(F32))
+                gb = (
+                    jnp.full((cfg.EPAD,), -1e30, F32)
+                    .at[: cfg.E]
+                    .set(p["gate_b"].astype(F32))
+                )
                 f.update(gate_bias=gb, sw13_s=p["ss13"], sw2_s=p["ss2"])
             else:
                 f.update(w13_s=p["gu_s"], w2_s=p["dn_s"])
@@ -140,7 +183,9 @@ def dense_operands(cfg, layers, dkinds):
         "dw13": lambda p: p["gu_w"],
         "dw2": lambda p: p["dn_w"],
     }
-    return [jnp.stack([get[k](layers[l]) for l in LY.layers_of(cfg, k)]) for k in dkinds]
+    return [
+        jnp.stack([get[k](layers[l]) for l in LY.layers_of(cfg, k)]) for k in dkinds
+    ]
 
 
 def expert_operands(cfg, layers, stack_e=True):
@@ -161,7 +206,9 @@ def cache_operands(cfg, caches, G):
         ls = LY.layers_of(cfg, "iwq") if kind == "idx" else list(range(cfg.L))
         gs = len(ls) // G[kind]
         for gi in range(G[kind]):
-            out.append(jnp.stack([caches[l][kind] for l in ls[gi * gs:(gi + 1) * gs]]))
+            out.append(
+                jnp.stack([caches[l][kind] for l in ls[gi * gs : (gi + 1) * gs]])
+            )
     return out
 
 
@@ -172,7 +219,7 @@ def unstack_caches(cfg, ops, G):
         ls = LY.layers_of(cfg, "iwq") if kind == "idx" else list(range(cfg.L))
         gs = len(ls) // G[kind]
         for gi in range(G[kind]):
-            for j, l in enumerate(ls[gi * gs:(gi + 1) * gs]):
+            for j, l in enumerate(ls[gi * gs : (gi + 1) * gs]):
                 per[l][kind] = ops[i][j]
             i += 1
     return per
@@ -180,13 +227,30 @@ def unstack_caches(cfg, ops, G):
 
 # ------------------------------------------------------------------------------------------ the step
 
+
 @functools.lru_cache(maxsize=32)
 def _built(cfg, max_pages, nb, nbi, tiles, interpret, debug, stack_e, groups_items):
     groups = dict(groups_items) if groups_items else None
-    call, info = K.build(cfg, max_pages=max_pages, nb=nb, nbi=nbi, tiles=tiles, interpret=interpret, debug=debug,
-                         stack_e=stack_e, groups=groups)
-    writer, winfo = build_writer(cfg, max_pages=max_pages, nb=nb, nbi=nbi, interpret=interpret, groups=groups,
-                                 fault="dcp_owner" if tiles.fault == "dcp_owner" else "")
+    call, info = K.build(
+        cfg,
+        max_pages=max_pages,
+        nb=nb,
+        nbi=nbi,
+        tiles=tiles,
+        interpret=interpret,
+        debug=debug,
+        stack_e=stack_e,
+        groups=groups,
+    )
+    writer, winfo = build_writer(
+        cfg,
+        max_pages=max_pages,
+        nb=nb,
+        nbi=nbi,
+        interpret=interpret,
+        groups=groups,
+        fault="dcp_owner" if tiles.fault == "dcp_owner" else "",
+    )
     return call, info, writer, winfo
 
 
@@ -196,7 +260,9 @@ def unpack_qall(cfg, qall):
     QA = cfg.KL + 128
     lo = lax.bitcast_convert_type(lax.shift_left(qall, jnp.uint32(16)), F32)
     hi = lax.bitcast_convert_type(qall & jnp.uint32(0xFFFF0000), F32)
-    full = jnp.concatenate([lo, hi], axis=-1).reshape(L_, R, T, cfg.HR, QA)[..., :cfg.KL + cfg.DR]
+    full = jnp.concatenate([lo, hi], axis=-1).reshape(L_, R, T, cfg.HR, QA)[
+        ..., : cfg.KL + cfg.DR
+    ]
     return jnp.transpose(full, (0, 2, 1, 3, 4)).reshape(L_, T, cfg.NH, cfg.KL + cfg.DR)
 
 
@@ -214,7 +280,9 @@ def tables_from_union(cfg, uv, ureq, rmeta, qmeta, T):
     k = jnp.arange(W, dtype=I32)
     idx = jnp.clip(uo[:, None] * 128 + k[None, :], 0, flat.shape[0] - 1)
     e = flat[idx]
-    live = (k[None, :] < nu[:, None]) & ((lax.shift_right_logical(e, K.MB_SH + q[:, None]) & 1) == 1)
+    live = (k[None, :] < nu[:, None]) & (
+        (lax.shift_right_logical(e, K.MB_SH + q[:, None]) & 1) == 1
+    )
     live = live & (t[:, None] < T)
     key = jnp.where(live, k[None, :], W + 1)
     order = jnp.argsort(key, axis=1)[:, :KT]
@@ -230,11 +298,18 @@ def router_ids(cfg, wtab):
     n = wtab.shape[-1]
     e = jnp.arange(n, dtype=I32)
     key = jnp.where(wtab > 0, e[None, :], n + e[None, :])
-    return (jnp.sort(key, axis=1)[:, :cfg.TOPK] % min(n, cfg.E)).astype(I32)
+    return (jnp.sort(key, axis=1)[:, : cfg.TOPK] % min(n, cfg.E)).astype(I32)
 
 
-def candidate_factory(tiles=None, interpret=True, stack_e=True, groups=None, delay=(-1, 0, -1),
-                      debug=True, embed_from_ref=True):
+def candidate_factory(
+    tiles=None,
+    interpret=True,
+    stack_e=True,
+    groups=None,
+    delay=(-1, 0, -1),
+    debug=True,
+    embed_from_ref=True,
+):
     """A per-rank step with glm_ref.step's signature for the instruments (check.check_candidate /
     test_accuracy.run_candidate_suite). `force` / `fault` are ignored; the kernel-side fault is tiles.fault."""
     gi = tuple(sorted(groups.items())) if groups else None
@@ -255,7 +330,9 @@ def candidate_factory(tiles=None, interpret=True, stack_e=True, groups=None, del
         bt2 = bt_flat.reshape(Sl, -1)
         max_pages = int(bt2.shape[1])
         r = lax.axis_index(axis).astype(I32)
-        call, info, writer, winfo = _built(cfg, max_pages, nb, nbi, tiles, interpret, debug, stack_e, gi)
+        call, info, writer, winfo = _built(
+            cfg, max_pages, nb, nbi, tiles, interpret, debug, stack_e, gi
+        )
         # vocab-parallel embedding + all-reduce (out of the block; glm_ref E0/E1 op for op)
         vloc = d.vocab // R
         lid = ids - r * vloc
@@ -267,10 +344,13 @@ def candidate_factory(tiles=None, interpret=True, stack_e=True, groups=None, del
         for k_ in range(1, R):
             acc = acc + allp[k_].astype(F32)
         h0 = acc.astype(BF16).astype(F32)
-        scal, rmeta, qmeta, bt, bti, rvec = metadata(cfg, B, positions, seq_lens, qsl, bt2, nb, nbi, max_pages, r,
-                                                     delay=delay)
+        scal, rmeta, qmeta, bt, bti, rvec = metadata(
+            cfg, B, positions, seq_lens, qsl, bt2, nb, nbi, max_pages, r, delay=delay
+        )
         rpos = positions + (1 if tiles.fault == "rope_off_by_one" else 0)
-        rows = params["rope_table"][jnp.clip(rpos, 0, params["rope_table"].shape[0] - 1)]
+        rows = params["rope_table"][
+            jnp.clip(rpos, 0, params["rope_table"].shape[0] - 1)
+        ]
         tab = rope_table(cfg, rows)
         layers = params["layers"]
         sm = smalls_rows(cfg, layers, params["final_norm"], meta.k_scales)
@@ -279,14 +359,43 @@ def candidate_factory(tiles=None, interpret=True, stack_e=True, groups=None, del
         cops = cache_operands(cfg, caches, info["groups"])
         ltab = jnp.asarray(info["ltab"])
         dtab = jnp.asarray(info["dtab"])
-        with jax.enable_x64(False):      # the instruments run with x64 on; the kernel body is 32-bit
-            outs = call(scal, rmeta, qmeta, bt, bti, ltab, dtab, rvec, h0, tab, sm, *dw, *ew, *cops)
+        with jax.enable_x64(
+            False
+        ):  # the instruments run with x64 on; the kernel body is 32-bit
+            outs = call(
+                scal,
+                rmeta,
+                qmeta,
+                bt,
+                bti,
+                ltab,
+                dtab,
+                rvec,
+                h0,
+                tab,
+                sm,
+                *dw,
+                *ew,
+                *cops,
+            )
             out, nrow, rrow, irec = outs[:4]
             new = writer(scal, rmeta, bt, bti, nrow, rrow, irec, *cops)
         new_caches = unstack_caches(cfg, list(new), info["groups"])
         aux = {}
         if debug:
-            (d_state, d_attn, d_xin, d_xffn, d_qc, d_kvcn, d_qall, d_oloc, d_wtab, d_uv, d_ureq) = outs[4:15]
+            (
+                d_state,
+                d_attn,
+                d_xin,
+                d_xffn,
+                d_qc,
+                d_kvcn,
+                d_qall,
+                d_oloc,
+                d_wtab,
+                d_uv,
+                d_ureq,
+            ) = outs[4:15]
             aux["state_h"] = d_state[:, 0]
             aux["state_res"] = d_state[:, 1]
             aux["attn_h"] = d_attn
@@ -297,9 +406,14 @@ def candidate_factory(tiles=None, interpret=True, stack_e=True, groups=None, del
             aux["q_all"] = unpack_qall(cfg, d_qall)
             aux["o_loc"] = jnp.transpose(d_oloc, (0, 2, 1, 3))
             T = qsl[-1]
-            aux["router_ids"] = {l: router_ids(cfg, d_wtab[l]) for l in range(cfg.L) if cfg.is_moe(l)}
+            aux["router_ids"] = {
+                l: router_ids(cfg, d_wtab[l]) for l in range(cfg.L) if cfg.is_moe(l)
+            }
             fl = LY.layers_of(cfg, "iwq")
-            aux["topk"] = {l: tables_from_union(cfg, d_uv[i], d_ureq[i], rmeta, qmeta, T) for i, l in enumerate(fl)}
+            aux["topk"] = {
+                l: tables_from_union(cfg, d_uv[i], d_ureq[i], rmeta, qmeta, T)
+                for i, l in enumerate(fl)
+            }
         return out[:B], new_caches, aux
 
     return step_fn

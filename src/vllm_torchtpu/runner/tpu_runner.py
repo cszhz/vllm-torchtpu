@@ -3769,9 +3769,10 @@ class TPUModelRunner(GPUModelRunner):
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
         )
         self._dp_step_num_chunks = target_num_chunks
-        # GLM52_DECODE_MK: the whole verify-step backbone as one megakernel on eligible steps. step_ok is the W4
-        # guard (rank-uniform: scheduler output + static facts); every decision is counted, and the next target
-        # forward_model consumes it (("step", bucket or None)).
+        # GLM52_DECODE_MK: the whole verify-step backbone as one megakernel on eligible
+        # steps. step_ok is the W4 guard (rank-uniform: scheduler output + static
+        # facts); every decision is counted, and the next target forward_model
+        # consumes it (("step", bucket or None)).
         mk = getattr(self, "_glm52_mk", None)
         self._glm52_mk_step = (
             ("step", mk.step_ok(self, scheduler_output, target_num_chunks))
@@ -5401,7 +5402,8 @@ class TPUModelRunner(GPUModelRunner):
 
                 arm_runner_models(self)
 
-        # GLM52_DECODE_MK (after moe_tp_decode arming: it reads the served TP16 expert tensors by reference)
+        # GLM52_DECODE_MK (after moe_tp_decode arming: it reads the served TP16 expert
+        # tensors by reference)
         from vllm_torchtpu.kernels.glm52_decode_mk.vllm_adapter import Glm52DecodeMK
 
         self._glm52_mk = Glm52DecodeMK.maybe_create(self)
@@ -7670,7 +7672,8 @@ class TPUModelRunner(GPUModelRunner):
         pending = getattr(self, "_glm52_mk_step", None)
         if mk is not None and pending is not None and pending is not False:
             if pending is True:
-                # the twin harness (stageB/L5 forward_run.py): rows_ok held over its timed iterations, not consumed
+                # the twin harness (stageB/L5 forward_run.py): rows_ok held over its
+                # timed iterations, not consumed
                 out = mk.try_call(
                     self,
                     mk.bucket_for(input_ids.shape[0]) if mk.enabled else None,
