@@ -67,10 +67,23 @@ def _load_module(monkeypatch):
             "vllm_torchtpu.models.vllm",
             "vllm_torchtpu.models.vllm.deepseek_v4",
             "vllm_torchtpu.models.vllm.deepseek_v4.attention",
+            "vllm_torchtpu.envs",
+            "vllm_torchtpu.kernels",
+            "vllm_torchtpu.kernels.deepseek_v4",
+            "vllm_torchtpu.kernels.deepseek_v4.o_projection",
+            "torch_tpu",
+            "torch_tpu._internal",
         )
     }
+    stubs["vllm_torchtpu.envs"].TPU_DSV4_PAIR_SWAP = False
+    stubs["vllm_torchtpu"].envs = stubs["vllm_torchtpu.envs"]
+    o_projection = stubs["vllm_torchtpu.kernels.deepseek_v4.o_projection"]
+    o_projection.PAIR_MAX_TOKENS = 1024
+    o_projection.fused_reverse_rope_wo_a_projection_pair_swap = None
+    stubs["torch_tpu._internal"].pallas = None
     attention = stubs["vllm_torchtpu.models.vllm.deepseek_v4.attention"]
     attention.VllmDeepseekV4MLAAttention = _FakeBaseAttention
+    attention._pallas_op_cache = {}
     stubs["vllm.distributed"].parallel_state = types.SimpleNamespace()
     stubs["vllm.model_executor.layers.linear"].ColumnParallelLinear = object
     stubs["vllm.model_executor.layers.linear"].RowParallelLinear = object
