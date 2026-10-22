@@ -6,8 +6,10 @@ L5: the same-harness twin A/B; WHITEBOARD.v3 §6.5).
 Port of glm5_mk_dcp's adapter (vllm_adapter.py @ d41e70f6d; its rebased copy ran on main 9ffdb1eb4 in G0, j-31f97434)
 to this kernel's operand plan and deployment: TP = DCP = world, DP 1, **EP off** (TP16 MoE: the served routed experts are
 main's moe_tp_decode TP layout w13 [E, H, 2I/R], w2 [E, I/R, H], s13 [E, 1, 1, 2I/R], s2 [E, 1, 1, H], passed per layer,
-zero-copy = the served operand form), **qrep 0** (the served q_b_proj is column-parallel: this rank's HR heads and their
-scale slice are taken as they are), MTP verify rows. Enabled by GLM52_DECODE_MK=1.
+zero-copy = the served operand form), q_b: this rank's HR heads and their scale slice, taken as they are at qrep 0
+(column-parallel q_b_proj) or sliced out of the replicated q_b at qrep 1 (VLLM_DCP_Q_REPLICATE=1, q group = the world;
+`q_b_local`) into the megakernel's own stacked copy, so the kernel is the same either way, MTP verify rows. Enabled by
+GLM52_DECODE_MK=1.
 
 Runner contract (runner/tpu_runner.py): `maybe_create` at load_model, `bind_caches` + `warmup` at capture_model,
 `step_ok` per scheduled step (sets runner._glm52_mk_step to the step's row bucket, or None), `try_call` inside
@@ -19,7 +21,8 @@ The step_ok guard (WHITEBOARD.v3 §8 W4). The megakernel engages only when every
 runs the stock graphs, and every decline is counted under a named reason (no silent decline):
 - load time (else no megakernel is built; logged): GLM-5.2 DSA, TP == DCP == world == 16 with the DCP group = the TP
   group = ranks 0..15 in rank order (the megakernel's mesh position, DCP KV ownership and rank operand coincide),
-  interleave 4, EP off, qrep 0 (no q_b_proj replicated, the served column-parallel q_b), MTP 3, block 256, one rope
+  interleave 4, EP off, q_b column-parallel (qrep 0) or replicated over a q group = the world (qrep 1, sliced per
+  layer: `qrep_layer` / `q_b_local`), MTP 3, block 256, one rope
   pair layout for every layer, MLA and indexer alike (`rope_layout`: glm-agentx's NeoX permutes -> MKConfig.rope_neox),
   and the
   A0-10 pool guard (a max_model_len request's rank-0 pages <= Tiles.pool, else the DSA wave overflows: `check_pool`);
@@ -241,18 +244,64 @@ def _routed(mlp):
     return getattr(exp, "routed_experts", exp)
 
 
-def q_b_local(weight_kn: torch.Tensor, scale: torch.Tensor, cfg, rank: int):
-    """qrep 0: the served q_b_proj holds this rank's HR heads ([QL, HR*DQ], scale [HR*DQ]) -> as is. Anything else
-    (a replicated q_b, qrep 1: [QL, NH*DQ]) declines (W4 guard): only qrep 0 is timed and verified."""
-    nqb = cfg.HR * cfg.DQ
-    n = weight_kn.shape[1]
-    if n == nqb:
-        _need(scale.numel() == nqb, f"q_b scale {tuple(scale.shape)} != local [{nqb}]")
-        return weight_kn, scale
-    # W4 guard: the timed and verified form is qrep 0 only (a replicated q_b is X's layout, not this kernel's)
-    raise Unsupported(
-        f"q_b_proj N {n} is not this rank's {nqb} columns (qrep 1 / replicated q_b): qrep 0 only"
+def q_b_local(
+    weight: torch.Tensor, scale: torch.Tensor, cfg, rank: int, qrep: bool = False
+):
+    """This rank's q_b operand: (weight [QL, HR*DQ] fp8, per-channel scale [HR*DQ] f32), the megakernel's own heads.
+
+    - qrep 0 (column-parallel q_b_proj at TP16): the served weight holds this rank's HR heads -> as is.
+    - qrep 1 at DCP == TP (VLLM_DCP_Q_REPLICATE=1: DCPGroupColumnParallelLinear over a group = the TP world, tp_size
+      1): the served weight holds all NH heads in head order, and the column-parallel shard of rank r is heads
+      [r*HR, (r+1)*HR) = columns [r*HR*DQ, (r+1)*HR*DQ) of the weight and of the scale (vLLM's `_local_view` slices
+      q the same way). Every load step acts per output channel or per head: the block-scale dequant + per-channel
+      requant (fp8.py `_process_fp8_linear_weights`) and the NeoX rope permute (mla_attention_op
+      `permute_rope_to_half_split`, per head over all NH heads). So the slice is byte-identical to the qrep 0 shard
+      (tests/kernels/test_glm52_decode_mk_qrep.py). The megakernel copies it into its own stacked qb operand: the
+      kernel, its operands and its HBM stream are those of qrep 0.
+
+    weight: either orientation ([QL, N] flipped, or [N, QL]); scale: per-channel, N elements. The served N must be
+    the form `qrep` names (HR*DQ for qrep 0, NH*DQ for qrep 1), else Unsupported (no megakernel)."""
+    nqb, nall = cfg.HR * cfg.DQ, cfg.NH * cfg.DQ
+    want = nall if qrep else nqb
+    n = weight.numel() // cfg.QL
+    _need(
+        n == want and n * cfg.QL == weight.numel(),
+        f"q_b_proj {tuple(weight.shape)}: want N {want} "
+        + ("(qrep 1: all NH heads)" if qrep else "(qrep 0: this rank's HR heads)"),
     )
+    _need(
+        scale.numel() == n, f"q_b scale {tuple(scale.shape)} is not per-channel [{n}]"
+    )
+    s = scale.reshape(-1).float()
+    if not qrep:
+        return _kn(weight, cfg.QL, n, "q_b_proj"), s
+    c0 = rank * nqb
+    if tuple(weight.shape) == (cfg.QL, n):
+        w = weight[:, c0 : c0 + nqb]
+    else:
+        _need(
+            tuple(weight.shape) == (n, cfg.QL),
+            f"q_b_proj {tuple(weight.shape)} is not [{cfg.QL}, {n}] / [{n}, {cfg.QL}]",
+        )
+        w = weight[c0 : c0 + nqb]
+    # views of the served tensors: _collect_weights stacks them into its own copy (no per-layer copy is kept)
+    return _kn(w, cfg.QL, nqb, "q_b_proj (qrep slice)"), s[c0 : c0 + nqb]
+
+
+def qrep_layer(q_b_proj, R: int, tp_rank: int, layer: int) -> bool:
+    """Is this layer's q_b_proj replicated (vLLM sets `qrep_active` on DCPGroupColumnParallelLinear)? Accepted only
+    over a q group that is the whole TP = DCP world in rank order (group_size R, rank_in_group = this TP rank): then
+    the replicated weight is sliceable to this rank's column-parallel heads (`q_b_local`). Anything else raises."""
+    if not bool(getattr(q_b_proj, "qrep_active", False)):
+        return False
+    gs = int(getattr(q_b_proj, "group_size", 0) or 0)
+    rig = int(getattr(q_b_proj, "rank_in_group", -1))
+    _need(
+        gs == R and rig == tp_rank,
+        f"layer {layer}: q_b_proj is replicated (qrep_active) over a q group of {gs} at rank_in_group {rig}; the "
+        f"megakernel slices this rank's heads only from a group = the TP = DCP world ({R}, rank {tp_rank})",
+    )
+    return True
 
 
 def index_pattern(has_indexer: list[bool], freq0: int, skip0: int) -> tuple[int, int]:
@@ -637,13 +686,14 @@ class Glm52DecodeMK:
         cfg = self.cfg = self.cfgs[self.rows[-1]]
         for l in range(L):
             _need(has_idx[l] == cfg.full_indexer(l), f"layer {l}: indexer pattern")
-        for l in range(L):
-            _need(
-                not bool(
-                    getattr(bb.layers[l].self_attn.q_b_proj, "qrep_active", False)
-                ),
-                f"layer {l}: q_b_proj is replicated (qrep_active); the megakernel is qrep 0",
+        # qrep 1 (VLLM_DCP_Q_REPLICATE=1): each such layer's replicated q_b is sliced to this rank's heads at load
+        self.qrep_layers = [
+            l
+            for l in range(L)
+            if qrep_layer(
+                bb.layers[l].self_attn.q_b_proj, R, int(self.rank_layout["tp"]), l
             )
+        ]
         self.rank = int(dist.get_rank())
         self.counts = {r: 0 for r in REASONS}
         self.decisions = 0
@@ -691,7 +741,8 @@ class Glm52DecodeMK:
         self.mla_layer_name = _attn_module(bb.layers[0].self_attn).layer_name
         logger.info(
             "GLM-5.2 decode megakernel: built for rows %s, L %d (fresh indexer layers %s, freq %d skip %d), "
-            "rope cache rows %d (max_model_len %d), k_scales %s, trace %s, enabled %s, levers %s, rope %s",
+            "rope cache rows %d (max_model_len %d), k_scales %s, trace %s, enabled %s, levers %s, rope %s, "
+            "q_b %s",
             self.rows,
             cfg.L,
             LY.layers_of(cfg, "iwq"),
@@ -704,6 +755,9 @@ class Glm52DecodeMK:
             self.enabled,
             ",".join(self.levers) or "stage A",
             "neox (half-split)" if cfg.rope_neox else "interleaved",
+            f"qrep 1 (this rank's heads sliced, {len(self.qrep_layers)}/{cfg.L} layers)"
+            if self.qrep_layers
+            else "qrep 0 (column-parallel)",
         )
 
     @staticmethod
@@ -736,15 +790,11 @@ class Glm52DecodeMK:
         sa = Ly.self_attn
         at = _attn_module(sa)
         qb_w, qb_s = q_b_local(
-            _kn(
-                sa.q_b_proj.weight,
-                cfg.QL,
-                sa.q_b_proj.weight.numel() // cfg.QL,
-                "q_b_proj",
-            ),
+            sa.q_b_proj.weight,
             _scale(sa.q_b_proj, sa.q_b_proj.weight.numel() // cfg.QL, "q_b_proj"),
             cfg,
             r,
+            qrep=l in self.qrep_layers,
         )
         d = {
             "qkva": _pad_n(
@@ -1452,6 +1502,7 @@ class Glm52DecodeMK:
             "cache_views": getattr(self, "cache_views", None),
             "k_scales": sorted(set(self.k_scales)),
             "rope_neox": self.cfg.rope_neox,
+            "qrep_layers": len(getattr(self, "qrep_layers", []) or []),
             "counts": dict(self.counts),
             "decisions": self.decisions,
             "consumed": self.consumed,

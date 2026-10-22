@@ -265,15 +265,21 @@ def _glm52_hf(cfg=C.FULL):
     )
 
 
-def _glm52_runner(qrep_layers=(), dcp_q_replicate=True, cfg=C.FULL):
+def _glm52_runner(
+    qrep_layers=(), dcp_q_replicate=True, cfg=C.FULL, q_group=None, dcp=None
+):
     """A served GLM-5.2 runner (TP16 x DCP16 il4, EP off, MTP 3) whose layer l's q_b_proj has qrep_active = l in
-    qrep_layers. dcp_q_replicate is the parallel_config field vLLM's GLM config hook sets True by default."""
+    qrep_layers, over a q group of `q_group` (default the world, rank_in_group 0 = the stubbed TP rank).
+    dcp_q_replicate is the parallel_config field vLLM's GLM config hook sets True by default."""
     layers = torch.nn.ModuleList()
     for l in range(cfg.L):
         ly = torch.nn.Module()
         ly.self_attn = torch.nn.Module()
         ly.self_attn.q_b_proj = torch.nn.Module()
         ly.self_attn.q_b_proj.qrep_active = l in qrep_layers
+        if l in qrep_layers:  # vLLM DCPGroupColumnParallelLinear's attributes
+            ly.self_attn.q_b_proj.group_size = cfg.R if q_group is None else q_group
+            ly.self_attn.q_b_proj.rank_in_group = 0
         if cfg.full_indexer(l):
             ly.self_attn.indexer = torch.nn.Module()
         layers.append(ly)
@@ -289,7 +295,7 @@ def _glm52_runner(qrep_layers=(), dcp_q_replicate=True, cfg=C.FULL):
         pipeline_parallel_size=1,
         data_parallel_size=1,
         tensor_parallel_size=cfg.R,
-        decode_context_parallel_size=cfg.R,
+        decode_context_parallel_size=cfg.R if dcp is None else dcp,
         cp_kv_cache_interleave_size=cfg.ILV,
         enable_expert_parallel=False,
         dcp_q_replicate=dcp_q_replicate,
@@ -335,18 +341,29 @@ def test_load_guard_ignores_config_qrep_field(load_env, field):
         Glm52DecodeMK(_glm52_runner(qrep_layers=(), dcp_q_replicate=field))
 
 
-@pytest.mark.parametrize(
-    "qrep_layers", [(0,), (40,), (C.FULL.L - 1,), tuple(range(C.FULL.L))]
-)
-def test_load_guard_refuses_replicated_q_b(load_env, qrep_layers):
+QREP_SETS = [(0,), (40,), (C.FULL.L - 1,), tuple(range(C.FULL.L))]
+
+
+@pytest.mark.parametrize("qrep_layers", QREP_SETS)
+def test_load_guard_accepts_qrep_over_the_world(load_env, qrep_layers):
+    # VLLM_DCP_Q_REPLICATE=1 at DCP16: the replicated q_b is sliced to this rank's heads (q_b_local), not refused
+    with pytest.raises(_PastLoadGuards):
+        Glm52DecodeMK(_glm52_runner(qrep_layers=qrep_layers))
+
+
+@pytest.mark.parametrize("qrep_layers", QREP_SETS)
+@pytest.mark.parametrize("q_group", [8, 1, None])
+def test_load_guard_refuses_qrep_group_not_the_world(load_env, qrep_layers, q_group):
+    runner = _glm52_runner(qrep_layers=qrep_layers, q_group=q_group or 8)
+    if q_group is None:  # a replicated layer without the DCPGroup attributes
+        for l in qrep_layers:
+            del runner.model.model.layers[l].self_attn.q_b_proj.group_size
     with pytest.raises(
         Unsupported,
-        match=rf"layer {qrep_layers[0]}: q_b_proj is replicated \(qrep_active\)",
+        match=rf"layer {qrep_layers[0]}: q_b_proj is replicated \(qrep_active\) over a q group of",
     ):
-        Glm52DecodeMK(_glm52_runner(qrep_layers=qrep_layers, dcp_q_replicate=False))
-    assert (
-        Glm52DecodeMK.maybe_create(_glm52_runner(qrep_layers=qrep_layers)) is None
-    )  # logged, stock forever
+        Glm52DecodeMK(runner)
+    assert Glm52DecodeMK.maybe_create(runner) is None  # logged, stock forever
 
 
 def test_load_guard_does_not_read_the_config_qrep_field():
@@ -354,7 +371,9 @@ def test_load_guard_does_not_read_the_config_qrep_field():
     assert (
         'getattr(pc, "dcp_q_replicate"' not in src and "pc.dcp_q_replicate" not in src
     )
-    assert '"qrep_active"' in src
+    # judged per layer from the module (qrep_layer reads q_b_proj.qrep_active)
+    assert "qrep_layer(" in src
+    assert '"qrep_active"' in __import__("inspect").getsource(VA.qrep_layer)
 
 
 # ------------------------------------------------------------------ bind_caches on fake modules
