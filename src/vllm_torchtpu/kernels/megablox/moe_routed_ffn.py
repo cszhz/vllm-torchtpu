@@ -15,9 +15,10 @@
 
 With replicated tokens (TP + EP) every rank holds the whole batch and a decode
 step hits only a few of its local experts. This kernel takes the global expert
-ids and routing weights as they leave the router: a scalar pass over the ids
-picks out the local routes, builds the list of active experts and starts the
-first experts' weight DMAs while it runs, every listed expert's gate/up,
+ids and routing weights as they leave the router: the vector and matrix units
+place each local route in an expert-major route list while the first experts'
+weights stream in, the scalar unit stores the list and picks the active
+experts, every listed expert's gate/up,
 activation and down run with gmm_v2's tile arithmetic over the rows of the
 tokens routed to it, and each token's routing-weighted expert output is
 accumulated in f32. No EP mask, sort, permute or combine runs around it.
@@ -86,6 +87,7 @@ def _vmem_estimate(up: GmmConfigs, down: GmmConfigs, nbuf: int) -> int:
     total += tokens * hidden * (2 + 4 + 4)
     total += rows * hidden * 4  # one chunk's gathered rows, then its outputs
     total += rows * 2 * inter * (4 + 4) + rows * hidden * 4  # tile values
+    total += 2 * align_to(tokens, 8) * 128 * 4  # routing ids and weights
     return int(total)
 
 
@@ -142,12 +144,57 @@ def _row_buckets(rows: int, base: int) -> list[int]:
     return buckets
 
 
+def _route_slots(
+    ids: jax.Array,  # int32[topk, T]: global expert ids
+    weights: jax.Array,  # f32[topk, T]
+    first_expert: jax.Array,  # int32[]: global id of local expert 0
+    *,
+    num_experts: int,
+    skip_zero_weights: bool,
+) -> tuple[list[jax.Array], jax.Array]:
+    """Each route's index in the expert-major route list and the routes per expert.
+
+    Local routes of expert e fill e * T + [0, count) in token-major order, as a
+    serial scan over the routes would place them; every other route goes to the
+    spare entry E * T. Returns topk int32[T] index rows and int32[E] counts.
+    """
+    topk, num_tokens = ids.shape
+    local = ids - first_expert
+    valid = jnp.logical_and(local >= 0, local < num_experts)
+    if skip_zero_weights:
+        valid = jnp.logical_and(valid, weights != 0)
+    local = jnp.where(valid, local, num_experts)
+    expert = lax.broadcasted_iota(jnp.int32, (num_experts, num_tokens), 0)
+    hits = [(local[k : k + 1] == expert).astype(jnp.float32) for k in range(topk)]
+    routes = functools.reduce(jnp.add, hits)  # [E, T]: routes of token t on e
+    # Routes of earlier tokens, by a 0/1 matmul: exact in the f32 accumulator.
+    earlier = lax.broadcasted_iota(jnp.int32, (num_tokens, num_tokens), 0) < (
+        lax.broadcasted_iota(jnp.int32, (num_tokens, num_tokens), 1)
+    )
+    rank = jnp.dot(
+        routes.astype(jnp.bfloat16),
+        earlier.astype(jnp.bfloat16),
+        preferred_element_type=jnp.float32,
+    )
+    first_index = rank + (expert * num_tokens).astype(jnp.float32)
+    rows = []
+    for k in range(topk):
+        index = jnp.sum(hits[k] * first_index, axis=0, keepdims=True)
+        # Top-k ids are distinct, but a repeated id still gets its own entry.
+        for j in range(k):
+            index += (local[j : j + 1] == local[k : k + 1]).astype(jnp.float32)
+        index = jnp.where(valid[k : k + 1], index, num_experts * num_tokens)
+        rows.append(index.astype(jnp.int32).reshape(num_tokens))
+    return rows, jnp.sum(routes, axis=1).astype(jnp.int32)
+
+
 def _routed_ffn_kernel(
     # Scalar prefetch
     start_sm: jax.Array,  # int32[1]: global id of local expert 0
-    ids_sm: jax.Array,  # int32[T * topk]: global expert ids, token-major
     weights_sm: jax.Array,  # f32[T * topk] routing weights
     # In
+    ids_hbm: jax.Array,  # int32[T, topk]: global expert ids
+    rw_hbm: jax.Array,  # [T, topk]: routing weights
     x_hbm: jax.Array,  # [T, H]
     w1_hbm: jax.Array,  # [E, H, 2 * I]: gate then up
     s1_hbm: jax.Array,  # f32[E, blocks, 1, 2 * I]
@@ -166,9 +213,15 @@ def _routed_ffn_kernel(
     x32_vm: jax.Array,  # f32[T, H]
     rows_vm: jax.Array,  # f32[rows, H]: one chunk's gathered rows, then outputs
     acc_vm: jax.Array,  # f32[T, H]
+    ids_vm: jax.Array,  # int32[T, topk]
+    rw_vm: jax.Array,  # [T, topk]
+    index_vm: list[jax.Array],  # topk x int32[T]: staging for index_sm
+    count_vm: jax.Array,  # int32[E]: staging for count_sm
+    meta_sems: jax.Array,  # DMA[topk + 3]
+    index_sm: list[jax.Array],  # topk x int32[T]: each route's index in route_sm
     count_sm: jax.Array,  # int32[E]: routes per expert
     visit_sm: jax.Array,  # int32[E]
-    route_sm: jax.Array,  # int32[E * T]: each expert's routes, token-major
+    route_sm: jax.Array,  # int32[E * T + 1]: each expert's routes, token-major
     *,
     up: GmmConfigs,
     down: GmmConfigs,
@@ -177,7 +230,7 @@ def _routed_ffn_kernel(
     skip_zero_weights: bool,
 ):
     num_tokens = x_vm.shape[0]
-    num_experts = count_sm.shape[0]
+    num_experts = visit_sm.shape[0]
     num_rows = rows_vm.shape[0]
     inter = up.out_size_n
     pairs = ((w1_hbm, w1_vm), (s1_hbm, s1_vm), (w2_hbm, w2_vm), (s2_hbm, s2_vm))
@@ -194,41 +247,58 @@ def _routed_ffn_kernel(
         for i in operands:
             copy(i, 0, slot).wait()
 
-    # The token rows are first read after the scan, so their copy runs under it.
-    x_copy = pltpu.make_async_copy(x_hbm, x_vm, x_sem)
-    x_copy.start()
-
-    @pl.loop(0, num_experts, unroll=True)
-    def _(e):
-        count_sm[e] = 0
+    # The routing inputs gate everything else, so they are requested first.
+    ids_copy = pltpu.make_async_copy(ids_hbm, ids_vm, meta_sems.at[0])
+    rw_copy = pltpu.make_async_copy(rw_hbm, rw_vm, meta_sems.at[1])
+    ids_copy.start()
+    rw_copy.start()
 
     # The lowest local experts are the first visits whenever they are active,
     # which at decode batch sizes is almost always, so their weights are
-    # requested before the scan and land while it runs.
+    # requested before the routing and land while it runs.
     for slot in range(min(nbuf, num_experts)):
         start(slot, slot, _UP + _DOWN)
 
-    # A token's top-k routes are unrolled into one loop step, which halves the
-    # scan's bundles per route.
-    first_expert = start_sm[0]
+    # The token rows are first read after the routing, so their copy runs under it.
+    x_copy = pltpu.make_async_copy(x_hbm, x_vm, x_sem)
+    x_copy.start()
 
-    def scan_token(t, carry):
+    # Route indices and counts come from the vector and matrix units; the
+    # scalar unit then only stores each route at its index, with no
+    # read-modify-write of a counter between routes.
+    ids_copy.wait()
+    rw_copy.wait()
+    index, counts = _route_slots(
+        jnp.transpose(ids_vm[...]),
+        jnp.transpose(rw_vm[...].astype(jnp.float32)),
+        start_sm[0],
+        num_experts=num_experts,
+        skip_zero_weights=skip_zero_weights,
+    )
+    # One 1-D array per top-k slot keeps every scalar read at base + token.
+    meta_copies = [
+        pltpu.make_async_copy(src, dst, meta_sems.at[2 + i])
+        for i, (src, dst) in enumerate(
+            zip([*index_vm, count_vm], [*index_sm, count_sm], strict=True)
+        )
+    ]
+    for k in range(topk):
+        index_vm[k][...] = index[k]
+    count_vm[...] = counts
+    for c in meta_copies:
+        c.start()
+    x_copy.wait()
+    x32_vm[...] = x_vm[...].astype(jnp.float32)
+    acc_vm[...] = jnp.zeros_like(acc_vm)
+    for c in meta_copies:
+        c.wait()
+
+    def store_token(t, carry):
         for k in range(topk):
-            expert = ids_sm[t * topk + k] - first_expert
-            is_local = jnp.logical_and(expert >= 0, expert < num_experts)
-            if skip_zero_weights:
-                is_local = jnp.logical_and(is_local, weights_sm[t * topk + k] != 0)
-            clamped = jnp.where(is_local, expert, 0)
-            count = count_sm[clamped]
-
-            @pl.when(is_local)
-            def _():
-                route_sm[clamped * num_tokens + count] = (t << _K_BITS) | k
-                count_sm[clamped] = count + 1
-
+            route_sm[index_sm[k][t]] = (t << _K_BITS) | k
         return carry
 
-    lax.fori_loop(0, num_tokens, scan_token, 0)
+    lax.fori_loop(0, num_tokens, store_token, 0)
 
     # Visit order is ascending expert id: each token then accumulates its
     # experts in the order of the grouped path's expert-sorted rows.
@@ -250,9 +320,6 @@ def _routed_ffn_kernel(
             def _():
                 start(visit_sm[slot], slot, _UP + _DOWN)
 
-    x_copy.wait()
-    x32_vm[...] = x_vm[...].astype(jnp.float32)
-    acc_vm[...] = jnp.zeros_like(acc_vm)
     buckets = _row_buckets(num_rows, _padded_rows(1, x_vm.dtype))
     chunk_shift = num_rows.bit_length() - 1
 
@@ -382,6 +449,7 @@ def moe_routed_ffn(
     topk = topk_ids.shape[1]
     num_experts = w1.shape[0]
     rows = _chunk_rows(num_tokens, hidden_states.dtype)
+    topk_ids = topk_ids.astype(jnp.int32)
 
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     scratch_shapes = [
@@ -395,9 +463,15 @@ def moe_routed_ffn(
         pltpu.VMEM((num_tokens, hidden), jnp.float32),
         pltpu.VMEM((rows, hidden), jnp.float32),
         pltpu.VMEM((num_tokens, hidden), jnp.float32),
+        pltpu.VMEM((num_tokens, topk), jnp.int32),
+        pltpu.VMEM((num_tokens, topk), topk_weights.dtype),
+        [pltpu.VMEM((num_tokens,), jnp.int32)] * topk,
+        pltpu.VMEM((num_experts,), jnp.int32),
+        pltpu.SemaphoreType.DMA((topk + 3,)),
+        [pltpu.SMEM((num_tokens,), jnp.int32)] * topk,
         pltpu.SMEM((num_experts,), jnp.int32),
         pltpu.SMEM((num_experts,), jnp.int32),
-        pltpu.SMEM((num_experts * num_tokens,), jnp.int32),
+        pltpu.SMEM((num_experts * num_tokens + 1,), jnp.int32),
     ]
     weight_bytes = sum(
         a.size * jax.dtypes.itemsize_bits(a.dtype) // 8
@@ -418,8 +492,8 @@ def moe_routed_ffn(
         ),
         out_shape=jax.ShapeDtypeStruct((num_tokens, hidden), hidden_states.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
-            in_specs=[hbm, hbm, hbm, hbm, hbm],
+            num_scalar_prefetch=2,
+            in_specs=[hbm] * 7,
             out_specs=hbm,
             scratch_shapes=scratch_shapes,
         ),
@@ -437,8 +511,9 @@ def moe_routed_ffn(
         jnp.zeros((1,), jnp.int32)
         if experts_start is None
         else jnp.reshape(experts_start, (1,)).astype(jnp.int32),
-        topk_ids.astype(jnp.int32).reshape(-1),
         topk_weights.astype(jnp.float32).reshape(-1),
+        topk_ids,
+        topk_weights,
         hidden_states,
         w1,
         w1_scale,
