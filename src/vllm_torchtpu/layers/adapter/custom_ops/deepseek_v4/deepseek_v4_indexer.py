@@ -124,6 +124,7 @@ def _indexer_jax(
             chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
             kv_layout=KVLayout.SEQ_ALONG_LANE,
             uniform_q_len=verify_q_len,
+            strict_causal=envs.TPU_STREAMIDX_STRICT_CAUSAL,
         )
 
     return _indexer_local(
