@@ -36,6 +36,7 @@ from .qwen38 import SEGMENT_LAYERS, Qwen38Geometry
 from .qwen38_pack import pack_weights
 
 
+@jax.tree_util.register_dataclass
 @dataclass
 class SegmentInputs:
     pos: Any
