@@ -71,21 +71,36 @@ def run_bucket(
     tiles: Any = None,
     gain: float = 1.0,
     zero: tuple[str, ...] = (),
+    router_gain: float = 1.0,
 ) -> dict:
     R = mesh.size
     ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=tiles is not None, tiles=tiles)
     spec = qwen38.segment_spec(g, R, L=L)
 
     def gen(key):
-        return random_segment_inputs(key, g, ex, L, gain=gain, zero=zero)
+        return random_segment_inputs(
+            key, g, ex, L, gain=gain, zero=zero, router_gain=router_gain
+        )
 
     shapes = jax.eval_shape(gen, jax.random.PRNGKey(0))
     inp = jax.jit(gen, out_shardings=_shardings(shapes, R, mesh))(jax.random.PRNGKey(B))
 
     # The library references index with concrete values, so this runs eagerly.
+    moe_in: list = []
     ref, _ = segment_reference(
-        g, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L
+        g, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L,
+        moe_inputs=moe_in,
     )
+    # Per token, the smallest gap between the TOPK-th and next router logit over
+    # the segment's MoE layers: a near-tie the kernel may resolve differently.
+    gaps = []
+    for j, m in enumerate(moe_in):
+        r = inp.w_l["router"][j] if inp.w_l["router"].ndim == 3 else inp.w_l["router"]
+        lg = jnp.dot(m.astype(jnp.bfloat16), r.astype(jnp.bfloat16),
+                     preferred_element_type=jnp.float32)
+        top = jax.lax.top_k(lg, g.TOPK + 1)[0]
+        gaps.append(top[:, g.TOPK - 1] - top[:, g.TOPK])
+    min_gap = np.asarray(jnp.min(jnp.stack(gaps), axis=0), np.float32)
 
     def pack(i):
         return pack_segment(spec, g, ex, i)
@@ -117,6 +132,9 @@ def run_bucket(
         "max_rel": float(d.max() / scale),
         "row_max_rel": [round(float(v), 3) for v in row_max],
         "rows_over_10pct": int((row_max > 0.1).sum()),
+        "min_gap_outlier_rows": [round(float(v), 4) for v in min_gap[row_max > 0.1]][:16],
+        "min_gap_good_rows_p10": round(float(np.quantile(min_gap[row_max <= 0.1], 0.1)), 4)
+        if (row_max <= 0.1).any() else None,
         "moved_std": float(np.std(ref - np.asarray(inp.x, np.float32))),
     }
     parity["ok"] = parity["mean_rel"] < 1e-2 and parity["rows_over_10pct"] <= max(1, B // 32)
@@ -131,12 +149,10 @@ def run_bucket(
         return time.perf_counter() - t
 
     chain(2)
-    samples = []
-    for _ in range(3):
-        for n in chains:
-            samples.append((n, chain(n)))
-    n_arr = np.array([s[0] for s in samples], np.float64)
-    t_arr = np.array([s[1] for s in samples], np.float64)
+    # Host dispatch jitter is one-sided, so fit the minimum of 5 reps per length.
+    best = {n: min(chain(n) for _ in range(5)) for n in chains}
+    n_arr = np.array(list(best), np.float64)
+    t_arr = np.array(list(best.values()), np.float64)
     slope, icpt = np.polyfit(n_arr, t_arr, 1)
     resid = t_arr - (slope * n_arr + icpt)
     return {
@@ -144,6 +160,7 @@ def run_bucket(
         "T": T,
         "L": L,
         "gain": gain,
+        "router_gain": router_gain,
         "zero": list(zero),
         "tiles": str(info["exec"].resolved_tiles),
         "compile_s": round(compile_s, 1),
@@ -166,6 +183,7 @@ def main() -> None:
     ap.add_argument("--tiny", action="store_true", help="CPU interpret smoke run")
     ap.add_argument("--gain", type=float, nargs="+", default=[1.0])
     ap.add_argument("--zero", nargs="+", default=["none"], help="none | gdn | moe")
+    ap.add_argument("--router-gain", type=float, nargs="+", default=[1.0])
     args = ap.parse_args()
     g, tiles = qwen38.FULL, None
     devs = jax.devices()
@@ -177,14 +195,14 @@ def main() -> None:
     print("devices", len(devs), devs[0].device_kind, "jax", jax.__version__, flush=True)
     mesh = Mesh(np.array(devs), ("tp",))
     out = []
-    arms = [(gn, z) for gn in args.gain for z in args.zero]
+    arms = [(gn, z, rg) for gn in args.gain for z in args.zero for rg in args.router_gain]
     for L in args.layers:
         for B in args.rows:
-          for gn, z in arms:
+          for gn, z, rg in arms:
             try:
                 r = run_bucket(
                     g, B, args.T, L, mesh, args.chains, tiles, gn,
-                    () if z == "none" else (z,),
+                    () if z == "none" else (z,), rg,
                 )
             except Exception as e:  # noqa: BLE001 — report and continue to the next bucket
                 r = {"rows": B, "L": L, "error": f"{type(e).__name__}: {e}"[:2000]}
