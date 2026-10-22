@@ -157,10 +157,6 @@ if grep -Fq -- '--scheduler-cls' "${RUN_DIR}/prefill_vllm_args.quoted" \
   echo "Capacity test must run the upstream scheduler selected by async_scheduling" >&2
   exit 1
 fi
-if grep -Fq 'raiden_pd_send_completion' "${RUN_DIR}/prefill_vllm_args.quoted"; then
-  echo "Capacity test must leave producer send completion disabled" >&2
-  exit 1
-fi
 python scripts/vllm/integration/with_pd_capacity_preemption.py \
   --host "${P4D2_BIND_HOST}" \
   --prefill-port "${PREFILL_PORT}" \

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in Raiden send results carried by vLLM's worker metadata channel."""
+"""Raiden send results carried by vLLM's worker metadata channel."""
 
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -16,40 +16,14 @@ if TYPE_CHECKING:
 
 def raiden_pd_completion_modes(vllm_config: "VllmConfig") -> tuple[bool, bool]:
     """Select response contracts shared by scheduler and worker entry points."""
-    additional = vllm_config.additional_config
-    send = (
-        additional.get("raiden_pd_send_completion", False)
-        if isinstance(additional, dict)
-        else False
-    )
-    if not isinstance(send, bool):
-        raise ValueError("additional_config.raiden_pd_send_completion must be a bool")
-
     kv = vllm_config.kv_transfer_config
-    stage3 = str(envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() == "raiden"
-    decode = (
-        stage3
-        and kv is not None
-        and kv.kv_role == "kv_consumer"
-        and kv.kv_load_failure_policy == "fail"
-    )
-    if not send and not decode:
+    if kv is None or str(envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() != "raiden":
         return False, False
 
-    if send:
-        parallel = vllm_config.parallel_config
-        if (
-            not stage3
-            or kv is None
-            or kv.kv_role != "kv_producer"
-            or parallel.tensor_parallel_size != 1
-            or parallel.data_parallel_size != 1
-            or parallel.pipeline_parallel_size != 1
-        ):
-            raise ValueError(
-                "raiden_pd_send_completion requires a Raiden Stage-3 "
-                "kv_producer with TP1/DP1/PP1"
-            )
+    send = kv.is_kv_producer
+    decode = kv.kv_role == "kv_consumer" and kv.kv_load_failure_policy == "fail"
+    if not send and not decode:
+        return False, False
 
     connectors = (
         kv.kv_connector_extra_config["connectors"]
@@ -57,9 +31,10 @@ def raiden_pd_completion_modes(vllm_config: "VllmConfig") -> tuple[bool, bool]:
         else [{"kv_connector": kv.kv_connector}]
     )
     raiden_count = sum(c["kv_connector"] == "TPURaidenConnector" for c in connectors)
-    if (send and raiden_count != 1) or (decode and raiden_count > 1):
-        mode = "raiden_pd_send_completion" if send else "Raiden PD decode fail policy"
+    if raiden_count > 1:
+        mode = "Raiden PD send completion" if send else "Raiden PD decode fail policy"
         raise ValueError(f"{mode} requires exactly one TPURaidenConnector")
+    send = send and raiden_count == 1
     decode = decode and raiden_count == 1
     if decode and dist_utils.get_raiden_inline_load():
         raise ValueError(

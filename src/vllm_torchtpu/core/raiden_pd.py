@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
     MultiKVConnectorWorkerMetadata,
 )
+from vllm.sampling_params import RequestOutputKind
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
@@ -34,6 +35,7 @@ logger = init_logger(__name__)
 class _PendingResponse:
     client_index: int
     outcome: RaidenSendOutcome | None = None
+    finished_id_pending: bool = False
 
 
 _ERROR_BY_OUTCOME = {
@@ -54,7 +56,7 @@ _ERROR_BY_OUTCOME = {
 
 
 class _ProducerCompletion:
-    """Keep an opted-in P response open until the existing send barrier."""
+    """Keep a Raiden P response open until the existing send barrier."""
 
     def __init__(self, scheduler: Scheduler):
         from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
@@ -72,6 +74,7 @@ class _ProducerCompletion:
             "Raiden send completion requires a TPURaidenConnector"
         )
         self.connector = connector
+        self.scheduler = scheduler
         self.original_update = scheduler.update_from_output
         self.original_finish = scheduler.finish_requests
         self.pending_responses: dict[str, _PendingResponse] = {}
@@ -79,12 +82,24 @@ class _ProducerCompletion:
         scheduler.finish_requests = self.finish_requests
 
     def update_from_output(self, scheduler_output, model_runner_output):
+        # Upstream can free the Request on a same-step send completion.
+        streaming_req_ids = set()
+        for req_id in model_runner_output.req_ids:
+            request = self.scheduler.requests.get(req_id)
+            if (
+                request is not None
+                and request.sampling_params is not None
+                and request.sampling_params.output_kind
+                is not RequestOutputKind.FINAL_ONLY
+            ):
+                streaming_req_ids.add(req_id)
         outputs = self.original_update(scheduler_output, model_runner_output)
         for client_index, batch in outputs.items():
             for output in batch.outputs:
                 params = output.kv_transfer_params
                 if (
-                    output.finish_reason in (FinishReason.STOP, FinishReason.LENGTH)
+                    output.request_id in streaming_req_ids
+                    and output.finish_reason in (FinishReason.STOP, FinishReason.LENGTH)
                     and params
                     and params.get("kv_transfer_pending")
                 ):
@@ -93,6 +108,12 @@ class _ProducerCompletion:
                     )
                     output.finish_reason = None
                     output.stop_reason = None
+            if batch.finished_requests:
+                # Keep the DP client's abort route until the response terminates.
+                deferred = batch.finished_requests & self.pending_responses.keys()
+                for req_id in deferred:
+                    self.pending_responses[req_id].finished_id_pending = True
+                batch.finished_requests.difference_update(deferred)
 
         kv_output = model_runner_output.kv_connector_output
         if kv_output is None:
@@ -132,6 +153,10 @@ class _ProducerCompletion:
                     }
                 }
             batch = outputs.setdefault(pending.client_index, EngineCoreOutputs())
+            if pending.finished_id_pending:
+                if batch.finished_requests is None:
+                    batch.finished_requests = set()
+                batch.finished_requests.add(req_id)
             batch.outputs.append(
                 EngineCoreOutput(
                     request_id=req_id,
@@ -162,11 +187,18 @@ class _ProducerCompletion:
                 )
             )
             self.connector.abort_pending_sends(pending_request_ids)
-        if request_ids is None:
-            self.pending_responses.clear()
-        else:
-            for req_id in request_ids:
-                self.pending_responses.pop(req_id, None)
+        pending_ids = (
+            tuple(self.pending_responses) if request_ids is None else request_ids
+        )
+        for req_id in pending_ids:
+            pending = self.pending_responses.pop(req_id, None)
+            if pending is not None and pending.finished_id_pending:
+                finished_req_ids = self.scheduler.finished_req_ids_dict
+                assert finished_req_ids is not None, (
+                    "Deferred Raiden response completion requires client bookkeeping: "
+                    f"request_id={req_id}"
+                )
+                finished_req_ids[pending.client_index].add(req_id)
         # Expiry still requires an unclaimed registration or a native terminal.
         return self.original_finish(request_ids, finished_status)
 
@@ -282,11 +314,6 @@ def patch_scheduler_init() -> None:
             )
         original_init(self, vllm_config, *args, **kwargs)
         if send_completion:
-            if self.finished_req_ids_dict is not None:
-                raise ValueError(
-                    "Raiden PD send completion does not support multi-engine "
-                    "finished-request bookkeeping"
-                )
             _ProducerCompletion(self)
             logger.info("Enabled Raiden P send completion on %s", type(self).__name__)
         elif decode_fail:

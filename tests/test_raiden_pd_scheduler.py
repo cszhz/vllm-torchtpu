@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """P response lifetime and send-result contracts; no TPU execution required."""
 
+import asyncio
+from collections import defaultdict
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
     MultiKVConnectorWorkerMetadata,
@@ -17,10 +21,11 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.engine.core_client import DPLBAsyncMPClient
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu.core.raiden_pd import _ProducerCompletion
 from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
@@ -38,7 +43,18 @@ def scheduler_cls(request):
     return request.param
 
 
-def _scheduler(scheduler_cls, *, multi_connector=False):
+@pytest.fixture(params=[RequestOutputKind.DELTA, RequestOutputKind.CUMULATIVE])
+def output_kind(request):
+    return request.param
+
+
+def _scheduler(
+    scheduler_cls,
+    *,
+    multi_connector=False,
+    include_finished_set=False,
+    output_kind=RequestOutputKind.DELTA,
+):
     scheduler = scheduler_cls.__new__(scheduler_cls)
     connector = TPURaidenConnector.__new__(TPURaidenConnector)
     connector.connector_scheduler = TPURaidenConnectorScheduler.__new__(
@@ -51,6 +67,16 @@ def _scheduler(scheduler_cls, *, multi_connector=False):
     if multi_connector:
         scheduler.connector = MultiConnector.__new__(MultiConnector)
         scheduler.connector._connectors = [object(), connector]
+    scheduler.finished_req_ids_dict = defaultdict(set) if include_finished_set else None
+    scheduler.requests = {
+        "p-request": Request(
+            "p-request",
+            [1, 2, 3],
+            SamplingParams(max_tokens=1, output_kind=output_kind),
+            None,
+            client_index=3,
+        )
+    }
     scheduler._next_outputs = {}
     scheduler.update_from_output = lambda *_args: scheduler._next_outputs
     scheduler.finish_requests = lambda *_args: []
@@ -64,14 +90,21 @@ def _step(scheduler, outputs=None, results=None, finished=()):
             metadata=(results, None)
         ),
     )
-    runner_output = SimpleNamespace(kv_connector_output=kv_output)
     scheduler._next_outputs = outputs if outputs is not None else {}
+    runner_output = SimpleNamespace(
+        kv_connector_output=kv_output,
+        req_ids=[
+            output.request_id
+            for batch in scheduler._next_outputs.values()
+            for output in batch.outputs
+        ],
+    )
     return scheduler.update_from_output(None, runner_output)
 
 
-def _prefill(scheduler):
+def _prefill_output():
     stats = PrefillStats(num_cached_tokens=16384)
-    output = EngineCoreOutput(
+    return EngineCoreOutput(
         request_id="p-request",
         new_token_ids=[42],
         finish_reason=FinishReason.LENGTH,
@@ -82,8 +115,107 @@ def _prefill(scheduler):
             "kv_transfer_pending": True,
         },
     )
-    outputs = _step(scheduler, {3: EngineCoreOutputs(outputs=[output])})
+
+
+def _prefill(scheduler):
+    outputs = _step(
+        scheduler,
+        {
+            3: EngineCoreOutputs(
+                outputs=[_prefill_output()],
+                finished_requests=(
+                    {"p-request"}
+                    if scheduler.finished_req_ids_dict is not None
+                    else None
+                ),
+            )
+        },
+    )
     return outputs[3].outputs[0]
+
+
+def test_final_only_prefill_returns_handle_without_waiting_for_decode(scheduler_cls):
+    scheduler, state = _scheduler(
+        scheduler_cls,
+        include_finished_set=True,
+        output_kind=RequestOutputKind.FINAL_ONLY,
+    )
+    output = _prefill(scheduler)
+    assert output.finish_reason is FinishReason.LENGTH
+    assert output.kv_transfer_params["uuid"] == 7
+    assert scheduler._next_outputs[3].finished_requests == {"p-request"}
+    assert state.pending_responses == {}
+    assert (
+        _step(
+            scheduler,
+            results=RaidenSendResults({"p-request": RaidenSendOutcome.SUCCESS}),
+            finished=["p-request"],
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize("outcome", [*RaidenSendOutcome, None])
+def test_dp_keeps_request_route_until_send_terminal(
+    scheduler_cls, outcome, output_kind
+):
+    scheduler, _ = _scheduler(
+        scheduler_cls, include_finished_set=True, output_kind=output_kind
+    )
+    engine = b"engine-0"
+    client = SimpleNamespace(
+        reqs_in_flight={"p-request": engine, "ordinary": engine},
+        engine_inflight={engine: 2},
+    )
+    first = _step(
+        scheduler,
+        {
+            3: EngineCoreOutputs(
+                outputs=[_prefill_output()],
+                finished_requests={"p-request", "ordinary"},
+            ),
+            5: EngineCoreOutputs(finished_requests={"other-client"}),
+        },
+    )
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, first[3]))
+    assert client.reqs_in_flight == {"p-request": engine}
+    assert client.engine_inflight == {engine: 1}
+    assert first[5].finished_requests == {"other-client"}
+
+    results = RaidenSendResults({"p-request": outcome}) if outcome else None
+    if results is not None:
+        assert _step(scheduler, results=results) == {}
+    final = _step(scheduler, finished=["p-request"])
+    assert final[3].finished_requests == {"p-request"}
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, final[3]))
+    assert client.reqs_in_flight == {}
+    assert client.engine_inflight == {engine: 0}
+    assert _step(scheduler, results=results, finished=["p-request"]) == {}
+
+
+def test_send_terminal_waits_for_aggregated_workers(scheduler_cls):
+    scheduler, _ = _scheduler(scheduler_cls)
+    _prefill(scheduler)
+    scheduler._next_outputs = {}
+    aggregator = KVOutputAggregator(2)
+    for rank, outcome in enumerate(
+        (RaidenSendOutcome.SEND_FAILURE, RaidenSendOutcome.SUCCESS)
+    ):
+        workers = [
+            SimpleNamespace(kv_connector_output=KVConnectorOutput(), req_ids=[])
+            for _ in range(2)
+        ]
+        workers[rank].kv_connector_output = KVConnectorOutput(
+            finished_sending={"p-request"},
+            kv_connector_worker_meta=RaidenSendResults({"p-request": outcome}),
+        )
+        outputs = scheduler.update_from_output(None, aggregator.aggregate(workers))
+        if rank == 0:
+            assert outputs == {}
+        else:
+            (terminal,) = outputs[3].outputs
+            assert terminal.finish_reason is FinishReason.ERROR
+            assert "kv_transfer_done" not in terminal.kv_transfer_params
 
 
 def test_prefill_remains_open_until_success_without_replaying_tokens(scheduler_cls):
@@ -185,10 +317,31 @@ def test_rank_result_aggregation_prefers_failure_over_timeout():
     assert result.outcomes == {"p-request": RaidenSendOutcome.SEND_FAILURE}
 
 
-def test_cancelled_response_does_not_emit_late_pkg2(scheduler_cls):
-    scheduler, state = _scheduler(scheduler_cls)
+@pytest.mark.parametrize("include_finished_set", [False, True])
+@pytest.mark.parametrize("request_ids", ["p-request", ["p-request"], None])
+def test_cancelled_response_does_not_emit_late_pkg2(
+    scheduler_cls, include_finished_set, request_ids, output_kind
+):
+    scheduler, state = _scheduler(
+        scheduler_cls,
+        include_finished_set=include_finished_set,
+        output_kind=output_kind,
+    )
     _prefill(scheduler)
-    scheduler.finish_requests("p-request", RequestStatus.FINISHED_ABORTED)
+    scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+    if include_finished_set:
+        assert dict(scheduler.finished_req_ids_dict) == {3: {"p-request"}}
+        # The base scheduler drains this queue into its next output batch.
+        finished = scheduler.finished_req_ids_dict.pop(3)
+        batch = _step(scheduler, {3: EngineCoreOutputs(finished_requests=finished)})[3]
+        client = SimpleNamespace(
+            reqs_in_flight={"p-request": b"engine-0"},
+            engine_inflight={b"engine-0": 1},
+        )
+        asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, batch))
+        assert client.engine_inflight == {b"engine-0": 0}
+        scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+        assert not scheduler.finished_req_ids_dict
     assert (
         _step(
             scheduler,
@@ -202,8 +355,15 @@ def test_cancelled_response_does_not_emit_late_pkg2(scheduler_cls):
 
 @pytest.mark.parametrize("request_ids", [None, "p-request", ["p-request", "missing"]])
 @pytest.mark.parametrize("multi_connector", [False, True])
-def test_abort_reaches_model_finished_send(scheduler_cls, request_ids, multi_connector):
-    scheduler, state = _scheduler(scheduler_cls, multi_connector=multi_connector)
+@pytest.mark.parametrize("include_finished_set", [False, True])
+def test_abort_reaches_model_finished_send(
+    scheduler_cls, request_ids, multi_connector, include_finished_set
+):
+    scheduler, state = _scheduler(
+        scheduler_cls,
+        multi_connector=multi_connector,
+        include_finished_set=include_finished_set,
+    )
     _prefill(scheduler)
     scheduler.requests = {"p-request": SimpleNamespace(is_finished=lambda: True)}
     state.original_finish = Scheduler.finish_requests.__get__(scheduler)
@@ -221,6 +381,8 @@ def test_abort_reaches_model_finished_send(scheduler_cls, request_ids, multi_con
     assert connector.build_connector_meta(None).reqs_to_expire == {}
     assert state.pending_responses == {}
     assert "p-request" in scheduler.requests
+    if include_finished_set:
+        assert dict(scheduler.finished_req_ids_dict) == {3: {"p-request"}}
 
 
 def test_abort_keeps_model_running_registration_on_upstream_path(scheduler_cls):
@@ -238,17 +400,88 @@ def test_abort_keeps_model_running_registration_on_upstream_path(scheduler_cls):
     assert original_calls == [({"running"}, RequestStatus.FINISHED_ABORTED)]
 
 
-def test_prefill_and_send_completion_in_same_step(scheduler_cls):
+def test_dp_cancel_keeps_kv_until_native_send_completion(scheduler_cls, output_kind):
+    scheduler, state = _scheduler(
+        scheduler_cls, include_finished_set=True, output_kind=output_kind
+    )
+    req = Request(
+        "p-request",
+        [1, 2, 3],
+        SamplingParams(max_tokens=1, output_kind=output_kind),
+        None,
+    )
+    req.client_index = 3
+    req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    scheduler.requests = {req.request_id: req}
+    scheduler.finished_req_ids = {req.request_id}
+    scheduler.connector = None
+    scheduler.defer_block_free = False
+    scheduler.kv_cache_manager = MagicMock()
+    state.original_finish = Scheduler.finish_requests.__get__(scheduler)
+    _prefill(scheduler)
+
+    assert scheduler.finish_requests("p-request", RequestStatus.FINISHED_ABORTED) == []
+    assert dict(scheduler.finished_req_ids_dict) == {3: {"p-request"}}
+    assert scheduler.finished_req_ids == {"p-request"}
+    assert scheduler.requests == {"p-request": req}
+    assert req.status is RequestStatus.FINISHED_LENGTH_CAPPED
+    scheduler.kv_cache_manager.free.assert_not_called()
+
+    # The existing native barrier still owns delayed block reclamation.
+    kv_output = KVConnectorOutput(finished_sending={"p-request"})
+    scheduler._update_from_kv_xfer_finished(kv_output)
+    scheduler.kv_cache_manager.free.assert_called_once_with(req)
+    assert scheduler.requests == {}
+    assert (
+        _step(
+            scheduler,
+            results=RaidenSendResults({"p-request": RaidenSendOutcome.SUCCESS}),
+            finished=["p-request"],
+        )
+        == {}
+    )
+
+
+def test_cancelled_model_output_can_reference_an_already_removed_request(scheduler_cls):
     scheduler, state = _scheduler(scheduler_cls)
+    _prefill(scheduler)
+    scheduler.finish_requests("p-request", RequestStatus.FINISHED_ABORTED)
+    scheduler.requests.clear()
+    scheduler._next_outputs = {}
+    result = scheduler.update_from_output(
+        None,
+        SimpleNamespace(req_ids=["p-request"], kv_connector_output=None),
+    )
+    assert result == {}
+    assert state.pending_responses == {}
+
+
+@pytest.mark.parametrize("include_finished_set", [False, True])
+def test_prefill_and_send_completion_in_same_step(scheduler_cls, include_finished_set):
+    scheduler, state = _scheduler(
+        scheduler_cls, include_finished_set=include_finished_set
+    )
     first = EngineCoreOutput(
         request_id="p-request",
         new_token_ids=[42],
         finish_reason=FinishReason.LENGTH,
         kv_transfer_params={"kv_transfer_pending": True},
     )
+
+    def base_update(*_args):
+        # Native completion can reclaim the Request before the adapter runs.
+        scheduler.requests.pop("p-request")
+        return scheduler._next_outputs
+
+    state.original_update = base_update
     outputs = _step(
         scheduler,
-        {3: EngineCoreOutputs(outputs=[first])},
+        {
+            3: EngineCoreOutputs(
+                outputs=[first],
+                finished_requests={"p-request"} if include_finished_set else None,
+            )
+        },
         results=RaidenSendResults({"p-request": RaidenSendOutcome.SUCCESS}),
         finished=["p-request"],
     )[3].outputs
@@ -258,10 +491,13 @@ def test_prefill_and_send_completion_in_same_step(scheduler_cls):
     assert outputs[1].new_token_ids == []
     assert outputs[1].finish_reason == FinishReason.STOP
     assert outputs[1].kv_transfer_params == {"kv_transfer_done": True}
+    assert scheduler._next_outputs[3].finished_requests == (
+        {"p-request"} if include_finished_set else None
+    )
     assert state.pending_responses == {}
 
 
-def test_output_processor_keeps_cached_stats_until_pkg2(scheduler_cls):
+def test_output_processor_keeps_cached_stats_until_pkg2(scheduler_cls, output_kind):
     # Regression: finishing pkg1 deletes OutputProcessor's state, so a later
     # kv_transfer_done is silently dropped. Exercise the real processor.
     processor = OutputProcessor(tokenizer=None, log_stats=False)
@@ -272,7 +508,7 @@ def test_output_processor_keeps_cached_stats_until_pkg2(scheduler_cls):
             prompt_token_ids=[1] * 20000,
             mm_features=None,
             sampling_params=SamplingParams(
-                max_tokens=1, detokenize=False, output_kind=RequestOutputKind.DELTA
+                max_tokens=1, detokenize=False, output_kind=output_kind
             ),
             pooling_params=None,
             arrival_time=0,
@@ -282,12 +518,14 @@ def test_output_processor_keeps_cached_stats_until_pkg2(scheduler_cls):
         ),
         prompt=None,
     )
-    scheduler, _ = _scheduler(scheduler_cls)
+    scheduler, _ = _scheduler(scheduler_cls, output_kind=output_kind)
     first = processor.process_outputs(
         [_prefill(scheduler)], engine_core_timestamp=0
     ).request_outputs[0]
     assert not first.finished
     assert first.outputs[0].token_ids == [42]
+    assert first.kv_transfer_params["uuid"] == 7
+    assert first.kv_transfer_params["kv_transfer_pending"]
     assert first.num_cached_tokens == 16384
     assert processor.has_unfinished_requests()
     final_outputs = _step(
@@ -295,18 +533,24 @@ def test_output_processor_keeps_cached_stats_until_pkg2(scheduler_cls):
         results=RaidenSendResults({"p-request": RaidenSendOutcome.SUCCESS}),
         finished=["p-request"],
     )[3].outputs
+    assert len(final_outputs) == 1
+    assert final_outputs[0].new_token_ids == []
     final = processor.process_outputs(
         final_outputs, engine_core_timestamp=0
     ).request_outputs[0]
     assert final.request_id == "client-request"
     assert final.finished
-    assert final.outputs[0].token_ids == []
+    assert final.outputs[0].token_ids == (
+        [] if output_kind is RequestOutputKind.DELTA else [42]
+    )
     assert final.num_cached_tokens == 16384
     assert final.kv_transfer_params == {"kv_transfer_done": True}
     assert not processor.has_unfinished_requests()
 
 
-def test_output_processor_keeps_structured_error_after_prefill_output(scheduler_cls):
+def test_output_processor_keeps_structured_error_after_prefill_output(
+    scheduler_cls, output_kind
+):
     processor = OutputProcessor(tokenizer=None, log_stats=False)
     processor.add_request(
         EngineCoreRequest(
@@ -315,7 +559,7 @@ def test_output_processor_keeps_structured_error_after_prefill_output(scheduler_
             prompt_token_ids=[1] * 20000,
             mm_features=None,
             sampling_params=SamplingParams(
-                max_tokens=1, detokenize=False, output_kind=RequestOutputKind.DELTA
+                max_tokens=1, detokenize=False, output_kind=output_kind
             ),
             pooling_params=None,
             arrival_time=0,
@@ -325,7 +569,7 @@ def test_output_processor_keeps_structured_error_after_prefill_output(scheduler_
         ),
         prompt=None,
     )
-    scheduler, _ = _scheduler(scheduler_cls)
+    scheduler, _ = _scheduler(scheduler_cls, output_kind=output_kind)
     first = processor.process_outputs(
         [_prefill(scheduler)], engine_core_timestamp=0
     ).request_outputs[0]
@@ -341,7 +585,9 @@ def test_output_processor_keeps_structured_error_after_prefill_output(scheduler_
     ).request_outputs[0]
 
     assert terminal.finished
-    assert terminal.outputs[0].token_ids == []
+    assert terminal.outputs[0].token_ids == (
+        [] if output_kind is RequestOutputKind.DELTA else [42]
+    )
     assert terminal.kv_transfer_params == {
         "kv_transfer_error": {
             "status_code": 500,

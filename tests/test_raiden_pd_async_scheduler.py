@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Raiden completion installs on vLLM's official scheduler entrypoints."""
 
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
-from vllm.config import SchedulerConfig
+from vllm.config import KVTransferConfig, SchedulerConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -33,42 +35,69 @@ def test_default_entrypoint_selects_the_official_scheduler(async_scheduling, exp
     assert config.get_scheduler_cls() is expected
 
 
-def _config(*, async_scheduling, producer):
+def _config(*, async_scheduling, producer, multi_connector):
     return SimpleNamespace(
-        additional_config={
-            "raiden_pd_send_completion": producer,
-        },
+        additional_config={},
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1, data_parallel_size=1, pipeline_parallel_size=1
         ),
-        kv_transfer_config=SimpleNamespace(
-            kv_role="kv_producer" if producer else "kv_consumer",
+        kv_transfer_config=KVTransferConfig(
+            kv_role="kv_both"
+            if multi_connector
+            else ("kv_producer" if producer else "kv_consumer"),
             kv_load_failure_policy="recompute" if producer else "fail",
-            kv_connector="TPURaidenConnector",
-            kv_connector_extra_config={},
+            kv_connector="TPUMultiConnector"
+            if multi_connector
+            else "TPURaidenConnector",
+            kv_connector_extra_config={
+                "connectors": [
+                    {"kv_connector": "TPURaidenConnector", "kv_role": "kv_producer"},
+                    {"kv_connector": "TPUV6dObjectConnector", "kv_role": "kv_both"},
+                ]
+            }
+            if multi_connector
+            else {},
         ),
     )
 
 
 @pytest.mark.parametrize(
-    ("scheduler_cls", "producer", "expected_state"),
+    ("scheduler_cls", "producer", "multi_connector", "expected_state"),
     [
-        (Scheduler, True, _ProducerCompletion),
-        (AsyncScheduler, False, _DecodeLoadFailures),
+        (Scheduler, True, False, _ProducerCompletion),
+        (AsyncScheduler, True, False, _ProducerCompletion),
+        (AsyncScheduler, False, False, _DecodeLoadFailures),
+        (Scheduler, True, True, _ProducerCompletion),
+        (AsyncScheduler, True, True, _ProducerCompletion),
     ],
 )
+@pytest.mark.parametrize("include_finished_set", [False, True])
 def test_init_patch_installs_completion_on_official_schedulers(
-    scheduler_cls, producer, expected_state, monkeypatch
+    scheduler_cls,
+    producer,
+    multi_connector,
+    expected_state,
+    include_finished_set,
+    monkeypatch,
 ):
     async_scheduling = scheduler_cls is AsyncScheduler
-    config = _config(async_scheduling=async_scheduling, producer=producer)
+    config = _config(
+        async_scheduling=async_scheduling,
+        producer=producer,
+        multi_connector=multi_connector,
+    )
     monkeypatch.setattr(tpu_envs, "TPU_KV_RESHARD_TRANSPORT", "raiden")
     monkeypatch.setattr(dist_utils, "get_raiden_inline_load", lambda: False)
 
     def base_init(self, *_args, **_kwargs):
-        self.connector = TPURaidenConnector.__new__(TPURaidenConnector)
-        self.finished_req_ids_dict = None
+        raiden = TPURaidenConnector.__new__(TPURaidenConnector)
+        if multi_connector:
+            self.connector = MultiConnector.__new__(MultiConnector)
+            self.connector._connectors = [object(), raiden]
+        else:
+            self.connector = raiden
+        self.finished_req_ids_dict = defaultdict(set) if include_finished_set else None
         self.num_spec_tokens = 0
         self.parallel_config = config.parallel_config
         self.update_from_output = lambda *_args: {}

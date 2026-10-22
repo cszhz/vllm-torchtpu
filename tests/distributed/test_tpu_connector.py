@@ -22,6 +22,7 @@ from unittest.mock import ANY, MagicMock, patch
 import pytest
 import torch
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
@@ -372,7 +373,6 @@ def _make_raiden_worker(
     pp_size: int = 1,
     kv_ips: Any = "127.0.0.1",
     kv_ports: Any = 9100,
-    send_completion: bool = False,
     load_failure_policy: str = "recompute",
 ) -> TPURaidenConnectorWorker:
     cfg = _make_vllm_config(
@@ -386,7 +386,6 @@ def _make_raiden_worker(
         interleave_size=interleave_size,
         pp_size=pp_size,
     )
-    cfg.additional_config = {"raiden_pd_send_completion": send_completion}
     cfg.kv_transfer_config.kv_connector = "TPURaidenConnector"
     cfg.kv_transfer_config.kv_load_failure_policy = load_failure_policy
     with (
@@ -417,16 +416,13 @@ def test_pd_decode_failure_uses_request_metadata(block_ids, monkeypatch):
     assert connector.build_connector_worker_meta() is None
 
 
-@pytest.mark.parametrize("send_completion", [False, True])
-def test_pd_send_results_preserve_outcomes_without_changing_cleanup(
-    send_completion, monkeypatch
-):
+def test_pd_send_results_preserve_outcomes_without_changing_cleanup(monkeypatch):
     from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
         RaidenSendOutcome,
     )
 
     monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
-    worker = _make_raiden_worker(tp_rank=0, tp_size=1, send_completion=send_completion)
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1)
     worker._stage3_send_outcomes = {
         "ok": "done",
         "bad": "failed",
@@ -440,27 +436,64 @@ def test_pd_send_results_preserve_outcomes_without_changing_cleanup(
     connector = TPURaidenConnector.__new__(TPURaidenConnector)
     connector.connector_worker = worker
     results = connector.build_connector_worker_meta()
-    if send_completion:
-        assert results.outcomes == {
-            "ok": RaidenSendOutcome.SUCCESS,
-            "bad": RaidenSendOutcome.SEND_FAILURE,
-            "unused": RaidenSendOutcome.UNCLAIMED_TIMEOUT,
-        }
-    else:
-        assert results is None
+    assert results.outcomes == {
+        "ok": RaidenSendOutcome.SUCCESS,
+        "bad": RaidenSendOutcome.SEND_FAILURE,
+        "unused": RaidenSendOutcome.UNCLAIMED_TIMEOUT,
+    }
     assert connector.build_connector_worker_meta() is None
 
 
-@pytest.mark.parametrize("invalid", [None, 1, "true"])
-def test_pd_send_completion_requires_boolean_config(invalid):
+@pytest.mark.parametrize(
+    "additional", [{}, SimpleNamespace(compute_hash=lambda: "test")]
+)
+def test_pd_send_completion_is_automatic_without_additional_config(
+    additional, monkeypatch
+):
     from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
         raiden_pd_completion_modes,
     )
 
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
     cfg = _make_vllm_config()
-    cfg.additional_config = {"raiden_pd_send_completion": invalid}
-    with pytest.raises(ValueError, match="must be a bool"):
-        raiden_pd_completion_modes(cfg)
+    cfg.kv_transfer_config.kv_connector = "TPURaidenConnector"
+    cfg.additional_config = additional
+    assert raiden_pd_completion_modes(cfg) == (True, False)
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "send_completion"),
+    [("kv_producer", True), ("kv_both", True), ("kv_consumer", False)],
+)
+@pytest.mark.parametrize("multi_connector", [False, True])
+def test_pd_send_completion_uses_vllm_producer_role(
+    kv_role, send_completion, multi_connector, monkeypatch
+):
+    from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+        raiden_pd_completion_modes,
+    )
+
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    cfg = _make_vllm_config()
+    cfg.kv_transfer_config = KVTransferConfig(
+        kv_connector="TPUMultiConnector" if multi_connector else "TPURaidenConnector",
+        kv_role=kv_role,
+        kv_load_failure_policy="recompute",
+        kv_connector_extra_config={
+            "connectors": [
+                {
+                    "kv_connector": "TPURaidenConnector",
+                    "kv_role": "kv_producer" if kv_role == "kv_both" else kv_role,
+                },
+                {"kv_connector": "TPUV6dObjectConnector", "kv_role": "kv_both"},
+            ]
+        }
+        if multi_connector
+        else {},
+    )
+
+    assert raiden_pd_completion_modes(cfg) == (send_completion, False)
+    assert cfg.kv_transfer_config.kv_role == kv_role
 
 
 def test_pd_completion_preserves_hash_only_additional_config():
@@ -473,9 +506,7 @@ def test_pd_completion_preserves_hash_only_additional_config():
     assert raiden_pd_completion_modes(cfg) == (False, False)
 
 
-@pytest.mark.parametrize(
-    "unsupported", ["transport", "role", "tp", "dp", "pp", "connector"]
-)
+@pytest.mark.parametrize("unsupported", ["transport", "role", "connector"])
 def test_pd_send_completion_checks_its_deployment_boundary(unsupported, monkeypatch):
     from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
         raiden_pd_completion_modes,
@@ -484,25 +515,45 @@ def test_pd_send_completion_checks_its_deployment_boundary(unsupported, monkeypa
     monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
     cfg = _make_vllm_config(pcp_size=4)
     cfg.kv_transfer_config.kv_connector = "TPURaidenConnector"
-    cfg.additional_config = {"raiden_pd_send_completion": True}
     assert raiden_pd_completion_modes(cfg) == (True, False)
     if unsupported == "transport":
         monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "zmq")
     elif unsupported == "role":
         cfg.kv_transfer_config.kv_role = "kv_consumer"
+        cfg.kv_transfer_config.is_kv_producer = False
     elif unsupported == "connector":
-        cfg.kv_transfer_config.kv_connector = "TPUMultiConnector"
-        cfg.kv_transfer_config.kv_connector_extra_config = {
-            "connectors": [{"kv_connector": "TPURaidenConnector"}] * 2
-        }
-    else:
-        name = {"tp": "tensor", "dp": "data", "pp": "pipeline"}[unsupported]
-        setattr(cfg.parallel_config, f"{name}_parallel_size", 2)
-    with pytest.raises(ValueError, match="raiden_pd_send_completion requires"):
+        cfg.kv_transfer_config.kv_connector = "OtherConnector"
+    assert raiden_pd_completion_modes(cfg) == (False, False)
+
+
+def test_pd_send_completion_rejects_multiple_raiden_children(monkeypatch):
+    from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+        raiden_pd_completion_modes,
+    )
+
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    cfg = _make_vllm_config()
+    cfg.kv_transfer_config.kv_connector = "TPUMultiConnector"
+    cfg.kv_transfer_config.kv_connector_extra_config = {
+        "connectors": [{"kv_connector": "TPURaidenConnector"}] * 2
+    }
+    with pytest.raises(ValueError, match="exactly one TPURaidenConnector"):
         raiden_pd_completion_modes(cfg)
 
 
-@pytest.mark.parametrize("unrelated", ["transport", "connector", "role", "recompute"])
+@pytest.mark.parametrize("tp,dp,pp", [(2, 1, 1), (1, 4, 1), (1, 1, 2), (2, 4, 1)])
+def test_pd_send_completion_defers_topology_validation(tp, dp, pp, monkeypatch):
+    from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+        raiden_pd_completion_modes,
+    )
+
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    cfg = _make_vllm_config(tp_size=tp, dp_size=dp, pp_size=pp)
+    cfg.kv_transfer_config.kv_connector = "TPURaidenConnector"
+    assert raiden_pd_completion_modes(cfg) == (True, False)
+
+
+@pytest.mark.parametrize("unrelated", ["transport", "connector", "recompute"])
 def test_pd_decode_mode_keeps_other_configurations_unchanged(unrelated, monkeypatch):
     from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
         raiden_pd_completion_modes,
@@ -517,8 +568,6 @@ def test_pd_decode_mode_keeps_other_configurations_unchanged(unrelated, monkeypa
         monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "zmq")
     elif unrelated == "connector":
         cfg.kv_transfer_config.kv_connector = "OtherConnector"
-    elif unrelated == "role":
-        cfg.kv_transfer_config.kv_role = "kv_both"
     else:
         cfg.kv_transfer_config.kv_load_failure_policy = "recompute"
     assert raiden_pd_completion_modes(cfg) == (False, False)
