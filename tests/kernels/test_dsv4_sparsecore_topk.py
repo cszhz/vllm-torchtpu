@@ -453,21 +453,25 @@ SINGLE_STAGE = (64, N_SHORT, 2048)
 COOPERATIVE = (16, N_128K, 2048)
 
 
-def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
-    """The `scheduling_group_id` each `_sc_topk_direct` call receives, in order.
+def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[tuple[str, int | None]]:
+    """The `scheduling_group_id` each SparseCore call receives, in order.
 
     Calls `sparsecore_topk.__wrapped__` rather than the jitted wrapper so the
-    stub is guaranteed to be the function that runs: a cached trace from an
-    earlier test would otherwise re-run the real kernel and record nothing.
+    stubs are guaranteed to be the functions that run: a cached trace from an
+    earlier test would otherwise re-run the real kernels and record nothing.
     """
-    seen: list[int | None] = []
+    seen: list[tuple[str, int | None]] = []
 
-    def _stub(scores, k_, row_lengths, *, scheduling_group_id=None, **_):
-        seen.append(scheduling_group_id)
-        out = jnp.zeros((scores.shape[0], k_), jnp.int32)
-        return out, out
+    def _stub(name):
+        def stub(scores, k_, row_lengths, *, scheduling_group_id=None, **kw):
+            seen.append((name, scheduling_group_id))
+            out = jnp.zeros((scores.shape[0], k_), jnp.int32)
+            return (out, out) if kw.get("return_scores") else out
 
-    monkeypatch.setattr(sc_module, "_sc_topk_direct", _stub)
+        return stub
+
+    monkeypatch.setattr(sc_module, "_sc_topk_direct", _stub("cooperative"))
+    monkeypatch.setattr(sc_module, "_sc_topk_by_length", _stub("by_length"))
     sc_module.sparsecore_topk.__wrapped__(jnp.zeros((b, n), jnp.float32), k, **kwargs)
     return seen
 
@@ -475,10 +479,16 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
 @pytest.mark.parametrize(
     "shape,expected_p,kwargs,expected",
     [
-        (SINGLE_STAGE, 1, dict(scheduling_group_id=3), [3]),
-        (SINGLE_STAGE, 1, {}, [None]),
-        (COOPERATIVE, 4, dict(scheduling_group_id=3), [3]),
-        (COOPERATIVE, 4, {}, [None]),
+        (SINGLE_STAGE, 1, dict(scheduling_group_id=3), [("cooperative", 3)]),
+        (SINGLE_STAGE, 1, {}, [("cooperative", None)]),
+        # n > BY_LENGTH_SLOT_WORDS: rows that fit one subcore, then the rest.
+        (
+            COOPERATIVE,
+            4,
+            dict(scheduling_group_id=3),
+            [("by_length", 3), ("cooperative", 3)],
+        ),
+        (COOPERATIVE, 4, {}, [("by_length", None), ("cooperative", None)]),
     ],
     ids=["p1", "p1_none", "p4", "p4_none"],
 )
@@ -488,6 +498,36 @@ def test_each_stage_gets_the_group_id_it_was_given(
     b, n, k = shape
     assert _pick_partition(b, n, k) == expected_p
     assert _stage_group_ids(monkeypatch, b, n, k, **kwargs) == expected
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("kind", ["random", "heavy_ties"])
+@pytest.mark.parametrize("b", [16, 128, 200])
+def test_rows_by_length_select_the_cooperative_columns_in_order(kind, b):
+    """The by-length path and the cooperative one return the same index rows,
+    order included, whichever path a row takes: callers may depend on the
+    order (an attention over the selected rows sums in that order)."""
+    n, k = N_1M // 4, 1024
+    assert n > sc_module.BY_LENGTH_SLOT_WORDS
+    rng = np.random.default_rng(SEED + b)
+    scores = jnp.asarray(_scores(kind, b, n, rng))
+    lengths = rng.integers(0, n + 1, b).astype(np.int32)
+    # Pin the edges: empty, below k, at the slot, one past it, the full row.
+    edges = [
+        0,
+        k - 3,
+        sc_module.BY_LENGTH_SLOT_WORDS,
+        sc_module.BY_LENGTH_SLOT_WORDS + 1,
+        n,
+    ]
+    lengths[: len(edges)] = edges
+    lengths = jnp.asarray(lengths)
+    p = _pick_partition(b, n, k)
+    want = sc_module._sc_topk_direct(
+        scores, k, lengths, p=p, write_empty=True, return_scores=False
+    )
+    got = sparsecore_topk(scores, k, lengths)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
 @pytest.mark.tpu_test
