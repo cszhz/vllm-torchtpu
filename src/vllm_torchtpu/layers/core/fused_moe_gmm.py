@@ -25,6 +25,11 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.gmm_v2_ffn import gmm_v2_ffn, make_ffn_configs
+from vllm_torchtpu.kernels.megablox.moe_local_dispatch import (
+    QUANTIZE_ROUTED_ROWS,
+    dispatch_local_tokens,
+    split_dispatched,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -812,3 +817,175 @@ def fused_moe_func(
         rhs_quant_dtype=rhs_quant_dtype,
     )
     return x[:num_tokens, :hidden_size]
+
+
+def _scale_4d(scale: jax.Array) -> jax.Array | jax.ShapeDtypeStruct:
+    if scale.ndim != 3:
+        return scale
+    return jax.ShapeDtypeStruct((*scale.shape[:2], 1, scale.shape[2]), scale.dtype)
+
+
+def local_dispatch_lhs_quant(
+    num_tokens: int,
+    dtype: jnp.dtype,
+    w1: jax.Array,
+    w1_scale: jax.Array,
+    w2: jax.Array,
+    w2_scale: jax.Array,
+    *,
+    topk: int,
+    activation: str,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+) -> tuple[jnp.dtype, int] | None:
+    """`quantize_rows`'s (q_dtype, block) when a dispatched batch of
+    `num_tokens` runs `moe_routed_ffn` prequantized, else None (bf16 rows).
+
+    The dispatch and the expert op both ask this, so they agree on the rows.
+    """
+    if not QUANTIZE_ROUTED_ROWS:
+        return None
+    w1_scale, w2_scale = _scale_4d(w1_scale), _scale_4d(w2_scale)
+    tokens = jax.ShapeDtypeStruct((num_tokens, w1.shape[1]), dtype)
+    if not _use_routed_ffn(
+        tokens,
+        w1,
+        w1_scale,
+        None,
+        w2,
+        w2_scale,
+        None,
+        topk=topk,
+        activation=activation,
+        use_ep=True,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=None,
+    ):
+        return None
+    f32 = jnp.float32
+    cfgs = make_routed_ffn_configs(
+        tokens,
+        w1,
+        jax.ShapeDtypeStruct(w1_scale.shape, f32),
+        w2,
+        jax.ShapeDtypeStruct(w2_scale.shape, f32),
+        fuse_act=activation,
+        prequantized=True,
+    )
+    if cfgs is None:
+        return None
+    lhs = cfgs[0].lhs_cfgs
+    return lhs.quant_dtype, lhs.quant_block_size
+
+
+def fused_moe_local_dispatch_func(
+    hidden_states: jax.Array,  # [T, H]: this rank's tokens
+    topk_ids: jax.Array,  # int32[T, topk]
+    topk_weights: jax.Array,  # [T, topk]
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array,
+    w2_scale: jax.Array,
+    *,
+    topk: int,
+    activation: str,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+    num_shards: int,
+    axis_name: str,
+) -> jax.Array:
+    """The DP/EP dispatch of locally routed tokens, for `fused_moe_dispatched_func`.
+
+    The body of a shard_map over `axis_name`, whose shards are the DP ranks in
+    the order of vLLM's DP all-gather. The weights are this rank's experts and
+    are read for their shapes only.
+    """
+    lhs_quant = local_dispatch_lhs_quant(
+        hidden_states.shape[0] * num_shards,
+        hidden_states.dtype,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        topk=topk,
+        activation=activation,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+    )
+    return dispatch_local_tokens(
+        hidden_states,
+        topk_ids,
+        # The expert path rounds the weights to the hidden dtype; see fused_moe_func.
+        topk_weights.astype(hidden_states.dtype),
+        lhs_quant=lhs_quant,
+        axis_name=axis_name,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "topk",
+        "activation",
+        "use_sparse_core",
+        "onehot_moe_permute_threshold",
+    ),
+)
+def fused_moe_dispatched_func(
+    rows: jax.Array,  # [T, H + META_LANES]: fused_moe_local_dispatch_func's output
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array,
+    w2_scale: jax.Array,
+    experts_start: jax.Array,
+    *,
+    topk: int,
+    activation: str,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+) -> jax.Array:
+    """`fused_moe_func` over dispatched rows: this rank's experts on every token."""
+    hidden_states, topk_ids, topk_weights = split_dispatched(rows, w1.shape[1], topk)
+    lhs_quant = local_dispatch_lhs_quant(
+        rows.shape[0],
+        rows.dtype,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        topk=topk,
+        activation=activation,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+    )
+    if lhs_quant is not None:
+        return moe_routed_ffn(
+            rows,
+            topk_ids,
+            topk_weights,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            experts_start,
+            fuse_act=activation,
+            prequantized=True,
+        )
+    return fused_moe_func(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        None,
+        None,
+        topk_weights,
+        topk_ids,
+        experts_start,
+        topk=topk,
+        activation=activation,
+        use_ep=True,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+    )
