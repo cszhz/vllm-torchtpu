@@ -81,10 +81,13 @@ class Qwen38Geometry:
         return rup(self.IS, 128 * R)
 
     def inner(self, R: int, L: int = SEGMENT_LAYERS) -> Qwen35Geometry:
-        """Sublayer geometry seen by the GDN / MoE / o_proj blocks."""
+        """Sublayer geometry seen by the GDN / MoE / o_proj blocks.
+
+        A one-layer (tail) segment has no GDN layer: `att_every=1`.
+        """
         return Qwen35Geometry(
             L=L,
-            att_every=self.att_every,
+            att_every=self.att_every if L > 1 else 1,
             H=self.H,
             NH=self.NH,
             NKV=self.NKV,
