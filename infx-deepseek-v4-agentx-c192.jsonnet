@@ -1041,6 +1041,8 @@ local replayRewrites = [
   |||,
 ];
 
+local benchMemory = cdk.var('BENCH_MEMORY', '48Gi');
+local benchMemoryLimit = cdk.var('BENCH_MEMORY_LIMIT', '96Gi');
 local benchJob = agentx.benchJob(
   name=benchJobName,
   containerName='sidecar-bench',
@@ -1110,6 +1112,18 @@ local benchJob = agentx.benchJob(
           annotations+: {
             'gke-gcsfuse/volumes': 'true',
           },
+        },
+        // Client pod resources only (aiperf settings untouched). aiperf's memory grows with the requests it
+        // records: 34-37 GB peak cgroup memory at c=160 on the fastest server (j-a0f795bd, j-78d9e9b9). With no
+        // request, four runs were OOM-killed on shared CPU nodes (j-d58f115e, j-5156e56a, j-f1f982c8,
+        // j-bf945290). BENCH_MEMORY= (empty) leaves the container unbounded, as before.
+        spec+: {
+          containers: [
+            if ctr.name == 'sidecar-bench' && benchMemory != '' then
+              ctr + { resources+: { requests+: { memory: benchMemory }, limits+: { memory: benchMemoryLimit } } }
+            else ctr
+            for ctr in super.containers
+          ],
         },
       },
     },
