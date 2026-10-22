@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     TPU_FUSED_QK_NORM_ROPE: bool = True
     TPU_FUSED_QK_NORM_ROPE_MIN_ROWS: int = 0
     TPU_RPA_DECODE_BATCHED: bool = False
+    TPU_RPA_DECODE_LANES: int = 0
     TPU_RPA_DECODE_V2: bool = False
     TPU_RPA_KV_SPLIT: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -896,6 +897,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run batched RPA in token buckets of up to 64 rows with half the chip's
     # VMEM and a decode batch of min(8, max_num_seqs), at max_model_len <= 16k.
     "TPU_RPA_DECODE_BATCHED": env_bool("TPU_RPA_DECODE_BATCHED"),
+    # Sequences a batched RPA decode step works on concurrently (the kernel's
+    # decode_batch_size; 0 keeps the wrapper default of 8). Fewer lanes leave
+    # VMEM for a larger KV block: at DP4xTP2 (1 KV head per core, ~98K ctx)
+    # 4 lanes take 4096-token blocks instead of 2816 and run ~15% faster.
+    "TPU_RPA_DECODE_LANES": env_nonnegative_int("TPU_RPA_DECODE_LANES", 0),
     # The DCP CACHE_ONLY pass of a decode step runs the streaming kernel
     # batched_rpa/decode_v2.py (f32 softmax and LSE); steps with prefill or
     # mixed sequences keep the batched RPA kernel.

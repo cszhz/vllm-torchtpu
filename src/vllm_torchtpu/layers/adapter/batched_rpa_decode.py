@@ -94,7 +94,17 @@ def decode_tuning(vllm_config: VllmConfig) -> DecodeTuning | None:
 
 
 def kernel_kwargs(tuning: DecodeTuning | None, num_q_rows: int) -> dict[str, int]:
-    """Keyword arguments for the batched kernel of a program of ``num_q_rows``."""
+    """Keyword arguments for the batched kernel of a program of ``num_q_rows``.
+
+    ``TPU_RPA_DECODE_LANES`` > 0 sets the decode batch (lanes) of every
+    program, over the decode tuning's. The kernel entries and the hoisted
+    schedule all take their settings from here, so they agree.
+    """
     if tuning is None or num_q_rows > DECODE_PROGRAM_MAX_ROWS:
-        return {}
-    return dataclasses.asdict(tuning)
+        kwargs = {}
+    else:
+        kwargs = dataclasses.asdict(tuning)
+    lanes = envs.TPU_RPA_DECODE_LANES
+    if lanes > 0:
+        kwargs["decode_batch_size"] = lanes
+    return kwargs
