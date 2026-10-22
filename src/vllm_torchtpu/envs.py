@@ -4,7 +4,19 @@
 import functools
 import os
 from collections.abc import Callable
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any
+
+
+class NanLogLevel(IntEnum):
+    """Cumulative diagnostic scope shared with TPU Sync."""
+
+    OFF = 0
+    SUMMARY = 1
+    DETAIL = 2
+    DUMP = 3
+    ALL = 4
+
 
 if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
@@ -18,6 +30,7 @@ if TYPE_CHECKING:
     HOST_TRACER_LEVEL: int = 2
     DEVICE_TRACER_LEVEL: int = 1
     TPU_TRACE_MODE: str = "TRACE_COMPUTE"
+    TPU_NAN_LOG_LEVEL: NanLogLevel = NanLogLevel.OFF
     TPU_NUM_SPARSE_CORES_TO_TRACE: int = 1
     TPU_NUM_SPARSE_CORE_TILES_TO_TRACE: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
@@ -350,7 +363,17 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
     return _get_positive_int_or_none_env
 
 
+def _get_nan_log_level() -> NanLogLevel:
+    value = os.getenv("TPU_NAN_LOG_LEVEL", "0")
+    if value not in ("0", "1", "2", "3", "4"):
+        raise ValueError(
+            f"Invalid TPU_NAN_LOG_LEVEL '{value}': expected 0, 1, 2, 3 or 4."
+        )
+    return NanLogLevel(int(value))
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
+    "TPU_NAN_LOG_LEVEL": _get_nan_log_level,
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave

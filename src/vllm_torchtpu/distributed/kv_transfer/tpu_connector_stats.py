@@ -14,7 +14,7 @@
 """Stats and Prometheus metrics for the TPU KV connector."""
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -95,6 +95,12 @@ class TpuKVConnectorStats(KVConnectorStats):
         """Record a failed KV transfer operation."""
         self.data["num_failed_transfers"].append(1)
 
+    def record_model_nan(self, round_id: int, rank: int, has_nan: bool) -> None:
+        """Tag deferred results so different rounds never collapse during OR."""
+        self.data.setdefault("model_nan_detected", []).append(
+            (round_id, rank, int(has_nan))
+        )
+
     def record_prefill_queue_length(self, prefill_queue_length: int):
         """Record the prefill (send) queue length."""
         self.data["prefill_queue_length"].append(prefill_queue_length)
@@ -113,7 +119,9 @@ class TpuKVConnectorStats(KVConnectorStats):
 
     def reset(self):
         # Must be serializable
-        self.data: dict[str, list[float | int | tuple[str, str, float]]] = {
+        self.data: dict[
+            str, list[float | int | tuple[str, str, float] | tuple[int, int, int]]
+        ] = {
             "d2h_transfer_time": [],
             "h2d_transfer_time": [],
             "kv_pull_time": [],
@@ -140,7 +148,7 @@ class TpuKVConnectorStats(KVConnectorStats):
                 accumulator.extend(v)
         return self
 
-    def reduce(self) -> dict[str, int | float]:
+    def reduce(self) -> dict[str, Any]:
         d2h_transfer_time = np.asarray(self.data["d2h_transfer_time"])
         h2d_transfer_time = np.asarray(self.data["h2d_transfer_time"])
         kv_pull_time = np.asarray(self.data["kv_pull_time"])
@@ -201,6 +209,12 @@ class TpuKVConnectorStats(KVConnectorStats):
     @property
     def num_successful_transfers(self) -> int:
         return len(self.data["mb_transferred"])
+
+
+@dataclass
+class _ModelNaNRound:
+    ranks: set[int] = field(default_factory=set)
+    has_nan: bool = False
 
 
 class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
@@ -305,7 +319,25 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         self.counter_tpu_num_failed_transfers = create_metric_per_engine(
             counter_tpu_num_failed_transfers, self.per_engine_labelvalues
         )
-
+        counter_model_nan_rounds = self._counter_cls(
+            name="vllm:tpu_model_nan_rounds",
+            documentation=(
+                "Checked model execution rounds with NaN/Inf in final hidden "
+                "or logits; "
+                "worker results are ORed once per engine round."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_model_nan_rounds = create_metric_per_engine(
+            counter_model_nan_rounds, self.per_engine_labelvalues
+        )
+        parallel = vllm_config.parallel_config
+        self._model_nan_rank_count = (
+            parallel.tensor_parallel_size * parallel.prefill_context_parallel_size
+        )
+        self._model_nan_pending: dict[int, dict[int, _ModelNaNRound]] = {
+            engine_idx: {} for engine_idx in self.per_engine_labelvalues
+        }
         gauge_tpu_prefill_queue_length = self._gauge_cls(
             name="vllm:tpu_prefill_kv_queue_length",
             documentation="Current length of the TPU KV transfer prefill queue.",
@@ -393,6 +425,18 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         return metric_defs
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
+        pending = self._model_nan_pending[engine_idx]
+        for round_id, rank, has_nan in transfer_stats_data.get(
+            "model_nan_detected", []
+        ):
+            result = pending.setdefault(round_id, _ModelNaNRound())
+            result.ranks.add(rank)
+            result.has_nan |= bool(has_nan)
+            # Only the final PP stage checks; its TP x PCP workers each report
+            # once, potentially in different batches as their D2H copies finish.
+            if len(result.ranks) == self._model_nan_rank_count:
+                self.counter_model_nan_rounds[engine_idx].inc(int(result.has_nan))
+                del pending[round_id]
         engine_labels = self.per_engine_labelvalues[engine_idx]
         for rank, stage, seconds in transfer_stats_data.get(
             "runner_cpu_issue_seconds", []

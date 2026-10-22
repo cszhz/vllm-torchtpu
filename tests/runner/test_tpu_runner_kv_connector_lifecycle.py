@@ -179,6 +179,7 @@ def _fake_runner(method, is_async, verify, propose):
         _assemble_async_prefill_bootstrap=lambda *_args: async_source,
         _update_placeholder=lambda *_args: {"r0": 0},
         _stage_timing=MagicMock(),
+        _nan_checker=None,
     )
     runner._stage_timing.take_samples.return_value = ([], [])
     runner._async_drafter = runner.drafter

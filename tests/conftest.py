@@ -76,6 +76,34 @@ def _reset_warning_once():
 
 
 @pytest.fixture
+def model_nan_cpu(monkeypatch):
+    """Exercise the real JAX reduction with CPU-only transport for NaN tests."""
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.runner import model_nan_check
+
+    def reduce(tensor, valid_rows):
+        result = model_nan_check._has_nan_jax(
+            jnp.asarray(tensor.numpy()), jnp.asarray(valid_rows.numpy())
+        )
+        return torch.from_numpy(np.asarray(result).copy())
+
+    class CPUEvent:
+        def record(self):
+            pass
+
+        def query(self):
+            return True
+
+        def synchronize(self):
+            raise AssertionError("NaN polling must not synchronize")
+
+    monkeypatch.setattr(model_nan_check, "_get_has_nan_op", lambda: reduce)
+    monkeypatch.setattr(model_nan_check, "TpuEvent", CPUEvent)
+
+
+@pytest.fixture
 def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""
     from vllm.config import VllmConfig, set_current_vllm_config

@@ -24,6 +24,7 @@ is a launch-script bug and defaulting hides it.
 
 import pytest
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.envs import (
     env_bool,
     env_float,
@@ -34,6 +35,43 @@ from vllm_torchtpu.envs import (
 )
 
 VAR = "TPU_TEST_ONLY_KNOB"
+
+
+@pytest.mark.parametrize(
+    "value,name,enabled",
+    [
+        (None, "OFF", (False, False, False, False)),
+        ("0", "OFF", (False, False, False, False)),
+        ("1", "SUMMARY", (True, False, False, False)),
+        ("2", "DETAIL", (True, True, False, False)),
+        ("3", "DUMP", (True, True, True, False)),
+        ("4", "ALL", (True, True, True, True)),
+    ],
+)
+def test_nan_log_level_is_cumulative(monkeypatch, value, name, enabled):
+    for old_var in (
+        "TPU_CHECK_NAN",
+        "TPU_HIDDEN_NAN_LOG",
+        "TPU_RAIDEN_CHECK_RECV_FA_NAN",
+        "TPU_KV_CACHE_NAN_LOG",
+    ):
+        monkeypatch.setenv(old_var, "1")
+    if value is None:
+        monkeypatch.delenv("TPU_NAN_LOG_LEVEL", raising=False)
+    else:
+        monkeypatch.setenv("TPU_NAN_LOG_LEVEL", value)
+    level = envs.environment_variables["TPU_NAN_LOG_LEVEL"]()
+    assert level is envs.NanLogLevel[name]
+    assert (
+        tuple(level >= threshold for threshold in list(envs.NanLogLevel)[1:]) == enabled
+    )
+
+
+@pytest.mark.parametrize("value", ["", "-1", "5", "01", " 1", "1 ", "1.0", "ALL", "１"])
+def test_nan_log_level_rejects_invalid_config(monkeypatch, value):
+    monkeypatch.setenv("TPU_NAN_LOG_LEVEL", value)
+    with pytest.raises(ValueError, match="TPU_NAN_LOG_LEVEL"):
+        envs.environment_variables["TPU_NAN_LOG_LEVEL"]()
 
 
 @pytest.fixture(autouse=True)
