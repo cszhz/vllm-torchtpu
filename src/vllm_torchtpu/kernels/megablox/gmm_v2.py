@@ -924,6 +924,12 @@ DECODE_LHS_IN_HBM = True
 DECODE_OUT_IN_VMEM_FUSED = False
 DECODE_OUT_IN_VMEM_UNFUSED = True
 
+#: Whether an unfused decode call takes its lhs as a VMEM operand and reads it
+#: in place instead of fetching it: its lhs is the fused call's output, so with
+#: that output in VMEM it passes between the two calls without a copy.
+#: Overrides DECODE_LHS_IN_HBM for unfused calls.
+DECODE_LHS_IN_VMEM_UNFUSED = False
+
 #: Ablation switch of the decode path, False outside a diagnostic job. True
 #: starts and waits on no output DMA, so the output is wrong; it prices the
 #: writeback tail against the same tree in a scoring job.
@@ -937,6 +943,11 @@ def decode_out_in_vmem(cfgs: GmmConfigs) -> bool:
     return DECODE_OUT_IN_VMEM_FUSED
 
 
+def decode_lhs_in_vmem(cfgs: GmmConfigs) -> bool:
+    """Whether the decode path at `cfgs` reads lhs from a VMEM operand."""
+    return cfgs.fuse_act is None and DECODE_LHS_IN_VMEM_UNFUSED
+
+
 def decode_slots(cfgs: GmmConfigs) -> int:
     """Whole-expert weight buffers of the decode path at `cfgs`."""
     return DECODE_SLOTS_UNFUSED if cfgs.fuse_act is None else DECODE_SLOTS_FUSED
@@ -947,7 +958,7 @@ def decode_slots(cfgs: GmmConfigs) -> int:
 class DecodeRefs:
     """Scratch of the decode path (see `decode_kernel`)."""
 
-    lhs: Any  # [size_m, size_k]
+    lhs: Any  # [size_m, size_k], or None if lhs is a VMEM operand
     lhs_q: Any  # [size_m, size_k] in the lhs quant dtype
     lhs_scale: Any  # [size_k // lhs quant block, size_m, 1]
     weight: Any  # [decode_slots, size_k, size_n]
@@ -1096,7 +1107,7 @@ def decode_kernel(
     out_hbm_ref: jax.Array,  # [<= size_m, aligned out_size_n], VMEM if not dec.out
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group], HBM if dec has SMEM
     group_offset_ref: jax.Array,  # int32[1]
-    lhs_hbm_ref: jax.Array,  # [<= size_m, size_k]
+    lhs_hbm_ref: jax.Array,  # [<= size_m, size_k], VMEM if not dec.lhs
     rhs_hbm_ref: WeightsRef,  # [size_group, size_k, size_n]
     cfgs: GmmConfigs,
 ):
@@ -1129,6 +1140,8 @@ def decode_kernel(
     # owned rows end past them.
     lhs_rows = lhs_hbm_ref.shape[0]
     small_rows = decode_small_rows(cfgs, lhs_rows) if owned_only else None
+    lhs_in_vmem = dec.lhs is None
+    lhs_src = lhs_hbm_ref if lhs_in_vmem else dec.lhs
 
     def lhs_copy(part):
         split = small_rows or lhs_rows
@@ -1145,7 +1158,8 @@ def decode_kernel(
             lhs_group_sizes_ref, dec.group_sizes, dec.group_sizes_sem.at[0]
         )
         sizes_copy.start()
-        lhs_copy(0).start()
+        if not lhs_in_vmem:
+            lhs_copy(0).start()
         sizes_copy.wait()
         lhs_group_sizes_ref = dec.group_sizes
 
@@ -1176,10 +1190,10 @@ def decode_kernel(
                 if p == 0:
                     scale.start()
 
-    if dec.group_sizes is None:
+    if dec.group_sizes is None and not lhs_in_vmem:
         lhs_copy(0).start()
     m_hi = metadata_ref.gm_id_to_m_offset[num_gm]
-    if small_rows is not None:
+    if small_rows is not None and not lhs_in_vmem:
 
         @pl.when(m_hi > small_rows)
         def _():
@@ -1251,18 +1265,21 @@ def decode_kernel(
         out_r = min(rows, out_buf.shape[0])
         out_buf[:out_r] = jnp.zeros((out_r, out_buf.shape[1]), out_buf.dtype)
 
-        lhs_copy(0).wait()
-        if small_rows is not None and rows > small_rows:
-            lhs_copy(1).wait()
+        if not lhs_in_vmem:
+            lhs_copy(0).wait()
+            if small_rows is not None and rows > small_rows:
+                lhs_copy(1).wait()
+        # A VMEM lhs operand holds only the call's rows; the rest stay stale.
+        q_rows = min(rows, lhs_src.shape[0])
         for b_id, start_k in enumerate(range(0, dims.size_k, q_block_size)):
-            block_lhs = dec.lhs[:rows, pl.ds(start_k, q_block_size)]
+            block_lhs = lhs_src[:q_rows, pl.ds(start_k, q_block_size)]
             block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
             block_scale = block_abs_max / dtype_max
             block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-            dec.lhs_q[:rows, pl.ds(start_k, q_block_size)] = (
+            dec.lhs_q[:q_rows, pl.ds(start_k, q_block_size)] = (
                 block_lhs * block_scale_inv
             ).astype(lhs_q_dtype)
-            dec.lhs_scale[b_id, :rows] = block_scale
+            dec.lhs_scale[b_id, :q_rows] = block_scale
 
         def matmul_panel(slot, panel):
             """acc_dtype[rows, width] of `panels[panel]`'s weight columns."""
@@ -1929,7 +1946,10 @@ def gmm_v2(
     is_decode = use_decode_path(cfgs)
     if padded_size_m != size_m and not is_decode:
         lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
-    if is_decode and DECODE_LHS_IN_HBM:
+    lhs_in_vmem = is_decode and decode_lhs_in_vmem(cfgs)
+    if lhs_in_vmem:
+        lhs = pltpu.with_memory_space_constraint(lhs, pltpu.VMEM)
+    elif is_decode and DECODE_LHS_IN_HBM:
         lhs = pltpu.with_memory_space_constraint(lhs, pltpu.HBM)
 
     # Prepare block specs.
@@ -1988,7 +2008,9 @@ def gmm_v2(
         slots = decode_slots(cfgs)
         scratch_shapes.append(
             DecodeRefs(
-                lhs=pltpu.VMEM((dims.size_m, dims.size_k), cfgs.lhs_cfgs.dtype),
+                lhs=None
+                if lhs_in_vmem
+                else pltpu.VMEM((dims.size_m, dims.size_k), cfgs.lhs_cfgs.dtype),
                 lhs_q=pltpu.VMEM(
                     (dims.size_m, dims.size_k), cfgs.lhs_cfgs.quant_dtype
                 ),
@@ -2041,14 +2063,15 @@ def gmm_v2(
         bias=rhs_bias_spec,
     )
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    lhs_spec = pl.BlockSpec(memory_space=pltpu.VMEM) if lhs_in_vmem else hbm_spec
     if is_decode and DECODE_ASYNC_GROUP_SIZES:
         # Only group_offset is scalar prefetched; the body fetches group_sizes.
         kernel = functools.partial(decode_entry, cfgs=cfgs)
-        num_scalar_prefetch, in_specs = 1, [hbm_spec, hbm_spec, weights_spec]
+        num_scalar_prefetch, in_specs = 1, [hbm_spec, lhs_spec, weights_spec]
         operands = (group_offset, group_sizes, lhs, rhs_weights)
     else:
         kernel = functools.partial(kernel_main, cfgs=cfgs)
-        num_scalar_prefetch, in_specs = 2, [hbm_spec, weights_spec]
+        num_scalar_prefetch, in_specs = 2, [lhs_spec, weights_spec]
         operands = (group_sizes, group_offset, lhs, rhs_weights)
 
     return pl.pallas_call(
