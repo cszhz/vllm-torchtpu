@@ -1021,6 +1021,22 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # 'score_bias'`. Passing the operand at the call site is not
             # sufficient on its own; it has to exist.
             register_score_bias_buffer(layer)
+        from vllm_torchtpu.layers.adapter.fused_moe_local_dispatch import (
+            FUSED_MOE_LOCAL_DISPATCH_ATTR,
+            prebuild_fused_moe_local_dispatch,
+        )
+
+        setattr(
+            self,
+            FUSED_MOE_LOCAL_DISPATCH_ATTR,
+            None
+            if _ep_op is not None
+            else prebuild_fused_moe_local_dispatch(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+            ),
+        )
 
     def apply_monolithic(
         self,
@@ -1082,6 +1098,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+
+        from vllm_torchtpu.layers.adapter.fused_moe_local_dispatch import (
+            fused_moe_local_dispatch,
+            fused_moe_local_dispatch_supported,
+        )
+
+        # An armed layer's x and router_logits are this rank's own tokens: the
+        # runner skipped its dispatch, and the op gathers the routed tokens.
+        if fused_moe_local_dispatch_supported(self):
+            return fused_moe_local_dispatch(self, layer, x, topk_weights, topk_ids)
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(

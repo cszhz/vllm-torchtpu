@@ -385,6 +385,40 @@ def _patch_moe_explicit_pcp_collectives() -> None:
     )
 
 
+def _patch_moe_runner_local_dispatch() -> None:
+    """Skip the DP/EP dispatch of a layer that routes before it dispatches.
+
+    `prebuild_fused_moe_local_dispatch` arms a layer per quant method; that
+    method routes this rank's own tokens and gathers the routed rows itself,
+    so the runner's all-gather of hidden states and router logits is skipped.
+    The combine is unchanged. Decided per layer at load time, never per token
+    count, because the backbone is traced once with the token dimension
+    dynamic.
+    """
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
+
+    runner_cls = _moe_runner.MoERunner
+    if getattr(runner_cls, "_tpu_local_dispatch_patch", False):
+        return
+    upstream_dispatch = runner_cls._maybe_dispatch
+
+    def maybe_dispatch(self, hidden_states, router_logits):
+        from vllm_torchtpu.layers.adapter.fused_moe_local_dispatch import (
+            fused_moe_local_dispatch_supported,
+        )
+
+        if fused_moe_local_dispatch_supported(getattr(self, "_quant_method", None)):
+            return hidden_states, router_logits
+        return upstream_dispatch(self, hidden_states, router_logits)
+
+    runner_cls._maybe_dispatch = maybe_dispatch
+    runner_cls._tpu_local_dispatch_patch = True
+    logger.info(
+        "Applied TPU patch: a route-before-dispatch MoE layer skips the "
+        "runner's dispatch."
+    )
+
+
 def _patch_expert_map_host_lookup() -> None:
     """Serve expert-map lookups from a host-side copy of the expert map.
 

@@ -63,6 +63,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_disable_sequence_parallel_moe", _ACTIVE),
     Patch("vllm_torchtpu:_patch_expert_map_host_lookup", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_explicit_pcp_collectives", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_moe_runner_local_dispatch", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_runner_fused_output_is_reduced", _ACTIVE),
     # KV cache, scheduling, and offloading.
     Patch(
