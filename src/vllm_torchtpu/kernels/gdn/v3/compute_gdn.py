@@ -601,6 +601,27 @@ def recurrent_gdn_decode_fused(
     return jnp.stack(out_list, axis=0)
 
 
+def decode_kq_head_matmul(
+    kq_rows: jax.Array,  # [2, kq_head_dim]: k, q
+    states: list[jax.Array],  # v_per_kq_head x [kq_head_dim, v_head_dim]
+) -> list[tuple[jax.Array, jax.Array]]:
+    """([k.S; q.S], fp32 S) of each v head sharing one kq head, from one matmul.
+
+    The heads' states sit side by side as one [kq_head_dim, n * v_head_dim]
+    MXU weight, so a weight load fills the 256-lane MXU instead of leaving
+    half of it empty for a 128-lane head.
+    """
+    res = jax.lax.dot(
+        kq_rows,
+        jnp.concat(states, axis=1).astype(jnp.float32),
+        preferred_element_type=jnp.float32,
+    )
+    return [
+        (part, state.astype(jnp.float32))
+        for state, part in zip(states, jnp.split(res, len(states), axis=1))
+    ]
+
+
 def decode_row_table_rows(cfg: config.GDNConfig) -> int:
     """Rows of recurrent_gdn_decode_dense's per-sequence row table."""
     return 3 * cfg.num_kq_heads + 3 * cfg.num_v_heads
@@ -692,15 +713,15 @@ def recurrent_gdn_decode_dense(
             k_cols = jnp.transpose(
                 jnp.broadcast_to(k_row, (cfg.v_head_dim, cfg.kq_head_dim))
             )
-            for v_head in range(
+            v_heads = range(
                 kq_head * cfg.v_per_kq_head, (kq_head + 1) * cfg.v_per_kq_head
-            ):
+            )
+            head_results = decode_kq_head_matmul(
+                kq_rows, [load_state(idx, v_head) for v_head in v_heads]
+            )
+            for v_head, (k_state_q_state, state) in zip(v_heads, head_results):
                 gating_curr = load_row(idx, gating_row0 + v_head)
                 beta_curr = load_row(idx, beta_row0 + v_head)
-                state = load_state(idx, v_head).astype(jnp.float32)
-                k_state_q_state = jax.lax.dot(
-                    kq_rows, state, preferred_element_type=jnp.float32
-                )
                 k_state, q_state = jnp.split(k_state_q_state, 2, axis=0)
                 v_row = load_row(idx, 2 * n_kq + v_head)
                 v_new = beta_curr * (v_row - gating_curr * k_state)
