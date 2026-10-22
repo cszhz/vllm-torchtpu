@@ -27,6 +27,7 @@ several chain lengths; the per-call cost is the least-squares slope.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import time
@@ -38,7 +39,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.megakernel import kernel
+from vllm_torchtpu.megakernel import kernel, planner
 from vllm_torchtpu.megakernel.blocks.hc import RESIDUAL_OUT
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen38
@@ -114,6 +115,8 @@ def run_bucket(
     pos = jax.device_put(inp.pos, NamedSharding(mesh, P()))
 
     step, info = kernel.make_step(mesh, spec, ex)
+    mp = planner.plan(spec, info["exec"]).block_params["moe"]
+    moe_path = {k: getattr(mp, k) for k in ("T13", "T2", "TE", "NBE", "PIPE", "PIPE_EP", "CH", "IR", "ISR", "LAZY_MOE", "topk_packed", "route_vec", "unroll")}
     t0 = time.perf_counter()
     _, outs = step(pos, hid, w_mk, states, attn)
     res = outs[RESIDUAL_OUT].block_until_ready()
@@ -184,6 +187,9 @@ def run_bucket(
         "gain": gain,
         "router_gain": router_gain,
         "zero": list(zero),
+        "H": g.H,
+        "I": g.I,
+        "moe_path": moe_path,
         "tiles": str(info["exec"].resolved_tiles),
         "compile_s": round(compile_s, 1),
         "parity": parity,
@@ -208,6 +214,7 @@ def main() -> None:
     ap.add_argument("--gain", type=float, nargs="+", default=[1.0])
     ap.add_argument("--zero", nargs="+", default=["none"], help="none | gdn | moe")
     ap.add_argument("--router-gain", type=float, nargs="+", default=[1.0])
+    ap.add_argument("--geom", nargs="+", default=["2560:640"], help="H:I geometry overrides")
     args = ap.parse_args()
     g, tiles = qwen38.FULL, None
     devs = jax.devices()
@@ -220,7 +227,12 @@ def main() -> None:
     mesh = Mesh(np.array(devs), ("tp",))
     out = []
     arms = [(gn, z, rg) for gn in args.gain for z in args.zero for rg in args.router_gain]
-    for L in args.layers:
+    geoms = []
+    for gi_ in args.geom:
+        h_, i_ = (int(v) for v in gi_.split(":"))
+        geoms.append(g if (h_, i_) == (g.H, g.I) or args.tiny else dataclasses.replace(g, H=h_, I=i_))
+    for g in geoms:
+      for L in args.layers:
         for B in args.rows:
           for gn, z, rg in arms:
             try:
