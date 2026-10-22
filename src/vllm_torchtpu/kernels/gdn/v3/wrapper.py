@@ -135,20 +135,40 @@ def _gdn_decode_dense(
     def load_qkv(idx: int) -> jax.Array:
         return vmem_ldst.load_head_rows(qkv_slot_ref.at[idx], cfg.kq_head_dim)
 
-    def store_out(idx: int, out: jax.Array) -> None:
-        out_slot_ref[idx, 0] = out.astype(out_slot_ref.dtype)
+    def run(rows_ref: jax.Ref, out_ref: jax.Ref) -> None:
+        def stage_rows(idx: int, rows: jax.Array) -> None:
+            rows_ref[idx] = rows
 
-    compute_gdn.recurrent_gdn_decode_dense(
-        real_sizes=real_sizes,
-        load_qkv=load_qkv,
-        b=b_slot_ref[...].reshape(heads),
-        a=a_slot_ref[...].reshape(heads),
-        a_log=jnp.pad(a_log, ((0, padding_size))),
-        dt_bias=jnp.pad(dt_bias, ((0, padding_size))),
-        load_state=load_state,
-        store_state=store_state,
-        store_out=store_out,
-        cfg=cfg,
+        def load_row(idx: int, row: int) -> jax.Array:
+            return rows_ref[idx, pl.ds(row, 1)]
+
+        def store_out_row(idx: int, v_head: int, out: jax.Array) -> None:
+            out_ref[idx, pl.ds(v_head, 1)] = out
+
+        compute_gdn.recurrent_gdn_decode_dense(
+            real_sizes=real_sizes,
+            load_qkv=load_qkv,
+            b=b_slot_ref[...].reshape(heads),
+            a=a_slot_ref[...].reshape(heads),
+            a_log=jnp.pad(a_log, ((0, padding_size))),
+            dt_bias=jnp.pad(dt_bias, ((0, padding_size))),
+            load_state=load_state,
+            store_state=store_state,
+            stage_rows=stage_rows,
+            load_row=load_row,
+            store_out_row=store_out_row,
+            cfg=cfg,
+        )
+        for idx in range(cfg.seq_tile_size):
+            out_slot_ref[idx, 0] = out_ref[idx].astype(out_slot_ref.dtype)
+
+    pl.run_scoped(
+        run,
+        pltpu.VMEM(
+            (cfg.seq_tile_size, compute_gdn.decode_row_table_rows(cfg), cfg.v_head_dim),
+            jnp.float32,
+        ),
+        pltpu.VMEM((cfg.seq_tile_size, cfg.num_v_heads, cfg.v_head_dim), jnp.float32),
     )
 
 

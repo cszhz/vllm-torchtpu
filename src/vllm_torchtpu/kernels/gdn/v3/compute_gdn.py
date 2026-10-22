@@ -601,6 +601,11 @@ def recurrent_gdn_decode_fused(
     return jnp.stack(out_list, axis=0)
 
 
+def decode_row_table_rows(cfg: config.GDNConfig) -> int:
+    """Rows of recurrent_gdn_decode_dense's per-sequence row table."""
+    return 3 * cfg.num_kq_heads + 3 * cfg.num_v_heads
+
+
 def recurrent_gdn_decode_dense(
     real_sizes: jax.Array,
     load_qkv: Callable[[int], jax.Array],
@@ -610,7 +615,9 @@ def recurrent_gdn_decode_dense(
     dt_bias: jax.Array,
     load_state: Callable[[int, int], jax.Array],
     store_state: Callable[[int, int, jax.Array], None],
-    store_out: Callable[[int, jax.Array], None],
+    stage_rows: Callable[[int, jax.Array], None],
+    load_row: Callable[[int, int], jax.Array],
+    store_out_row: Callable[[int, int, jax.Array], None],
     cfg: config.GDNConfig,
 ) -> None:
     """recurrent_gdn_decode_fused on dense per-sequence rows, one head per row.
@@ -619,7 +626,10 @@ def recurrent_gdn_decode_dense(
     [num_kq_heads, head_dim] blocks and v is [num_v_heads, head_dim]: masking,
     l2norm, scaling and q.k run on a few full vregs per sequence instead of one
     vreg per head row. Gating runs on the tile's [seq, aligned_num_v_heads]
-    rows. Every element sees recurrent_gdn_decode_fused's operations in its
+    rows. The state loop reads each head's operands back one row at a time
+    from a per-sequence table in memory: a row loaded from memory starts at
+    sublane 0, where one sliced out of a register block is first rotated
+    there. Every element sees recurrent_gdn_decode_fused's operations in its
     order, so the results are identical.
 
     Args:
@@ -628,7 +638,9 @@ def recurrent_gdn_decode_dense(
         b, a: [seq, aligned_num_v_heads].
         a_log, dt_bias: [aligned_num_v_heads].
         load_state, store_state: as for recurrent_gdn_decode_fused.
-        store_out: (seq, out [num_v_heads, v_head_dim]) -> None.
+        stage_rows: (seq, [decode_row_table_rows, head_dim] table) -> None.
+        load_row: (seq, row) -> that table row [1, head_dim].
+        store_out_row: (seq, v_head, out [1, v_head_dim]) -> None.
     """
     assert cfg.chunk_size == 1 and cfg.window_size == 1 and not cfg.is_kda
     assert cfg.kq_head_dim == cfg.v_head_dim
@@ -646,36 +658,51 @@ def recurrent_gdn_decode_dense(
     beta = jnp.where(mask, beta, 0)
     gating = jnp.exp(jnp.where(mask, gating_log, 0))
 
-    n_kq = cfg.num_kq_heads
+    n_kq, n_v, dim = cfg.num_kq_heads, cfg.num_v_heads, cfg.v_head_dim
+    # Row table: q, k and v heads, then q.k per kq head and gating and beta
+    # per v head, each scalar repeated over the row.
+    qk_row0 = 2 * n_kq + n_v
+    gating_row0 = qk_row0 + n_kq
+    beta_row0 = gating_row0 + n_v
     q_scale = cfg.kq_head_dim**-0.5
     for idx in range(cfg.seq_tile_size):
         qkv = jnp.where(mask[idx], load_qkv(idx).astype(compute), 0)
         q = l2_norm(qkv[:n_kq])
         q *= q_scale
         k = l2_norm(qkv[n_kq : 2 * n_kq])
-        v = qkv[2 * n_kq :]
         # [num_kq_heads, 1]
         q_dot_k = jnp.sum(q * k, axis=-1, keepdims=True)
-        head_out_list = []
+        per_head = [
+            jnp.transpose(jnp.broadcast_to(x[idx : idx + 1], (dim, x.shape[-1])))[:n_v]
+            for x in (gating, beta)
+        ]
+        stage_rows(
+            idx,
+            jnp.concat(
+                [q, k, qkv[2 * n_kq :], jnp.broadcast_to(q_dot_k, (n_kq, dim))]
+                + per_head,
+                axis=0,
+            ),
+        )
         for kq_head in range(n_kq):
-            q_row = q[kq_head : kq_head + 1]
-            k_row = k[kq_head : kq_head + 1]
+            q_row = load_row(idx, kq_head)
+            k_row = load_row(idx, n_kq + kq_head)
             kq_rows = jnp.concat([k_row, q_row], axis=0)
-            qk = q_dot_k[kq_head : kq_head + 1]
+            qk = load_row(idx, qk_row0 + kq_head)
             k_cols = jnp.transpose(
                 jnp.broadcast_to(k_row, (cfg.v_head_dim, cfg.kq_head_dim))
             )
             for v_head in range(
                 kq_head * cfg.v_per_kq_head, (kq_head + 1) * cfg.v_per_kq_head
             ):
-                gating_curr = gating[idx : idx + 1, v_head : v_head + 1]
-                beta_curr = beta[idx : idx + 1, v_head : v_head + 1]
+                gating_curr = load_row(idx, gating_row0 + v_head)
+                beta_curr = load_row(idx, beta_row0 + v_head)
                 state = load_state(idx, v_head).astype(jnp.float32)
                 k_state_q_state = jax.lax.dot(
                     kq_rows, state, preferred_element_type=jnp.float32
                 )
                 k_state, q_state = jnp.split(k_state_q_state, 2, axis=0)
-                v_new = beta_curr * (v[v_head : v_head + 1] - gating_curr * k_state)
-                head_out_list.append(gating_curr * q_state + qk * v_new)
+                v_row = load_row(idx, 2 * n_kq + v_head)
+                v_new = beta_curr * (v_row - gating_curr * k_state)
+                store_out_row(idx, v_head, gating_curr * q_state + qk * v_new)
                 store_state(idx, v_head, gating_curr * state + k_cols * v_new)
-        store_out(idx, jnp.concat(head_out_list, axis=0))
