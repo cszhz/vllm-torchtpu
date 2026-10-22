@@ -784,14 +784,11 @@ def fused_conv1d_gdn(
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
-    def call_kernel(
+    def make_cfg(
+        mode: config.GDNMode,
         in_conv_state: jax.Array,
         in_recurrent_state: jax.Array | None,
-        in_act: jax.Array | None,
-        mode: config.GDNMode,
-    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
-        # With a state source, it rides the conv-state slot and the dense
-        # recurrent-state input is absent.
+    ) -> config.GDNConfig:
         if mode == config.GDNMode.PER_SEQ:
             tile_size = mixed_tile_size
             # Prefill / mixed sequences keep a single state checkpoint.
@@ -824,11 +821,13 @@ def fused_conv1d_gdn(
             ),
             state_plan=state_plan,
         )
+        return cfg
 
+    def make_metadata(cfg: config.GDNConfig) -> memory_ref.MetadataRef:
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
         # but will be CSEed by compiler.
-        if mode != config.GDNMode.PER_SEQ:
-            metadata_obj = metadata.compute_batched_seq_metadata(
+        if cfg.mode != config.GDNMode.PER_SEQ:
+            return metadata.compute_batched_seq_metadata(
                 cfg=cfg,
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
@@ -837,17 +836,29 @@ def fused_conv1d_gdn(
                 end_seq=distribution[0],
                 ckpt_indices=ckpt_indices,
             )
-        else:
-            metadata_obj = metadata.compute_per_seq_metadata(
-                cfg=cfg,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                read_offsets=read_offsets,
-                start_seq=distribution[0],
-                end_seq=distribution[-1],
-                ckpt_indices=ckpt_indices,
-            )
+        return metadata.compute_per_seq_metadata(
+            cfg=cfg,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            read_offsets=read_offsets,
+            start_seq=distribution[0],
+            end_seq=distribution[-1],
+            ckpt_indices=ckpt_indices,
+        )
+
+    def call_kernel(
+        in_conv_state: jax.Array,
+        in_recurrent_state: jax.Array | None,
+        in_act: jax.Array | None,
+        mode: config.GDNMode,
+        metadata_obj: memory_ref.MetadataRef | None = None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        # With a state source, it rides the conv-state slot and the dense
+        # recurrent-state input is absent.
+        cfg = make_cfg(mode, in_conv_state, in_recurrent_state)
+        if metadata_obj is None:
+            metadata_obj = make_metadata(cfg)
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
@@ -905,17 +916,27 @@ def fused_conv1d_gdn(
         raise ValueError("batched_only and prefill_only are mutually exclusive")
 
     def call_per_seq(in_states, in_act):
-        def run(states, act):
-            act, *states = call_kernel(*states, act, config.GDNMode.PER_SEQ)
+        # Built outside the cond so XLA still CSEs it across layers; inside a
+        # branch every layer would recompute it on mixed and prefill steps.
+        # The barrier stops conditional code motion sinking it into the branch.
+        per_seq_metadata = jax.lax.optimization_barrier(
+            make_metadata(make_cfg(config.GDNMode.PER_SEQ, *in_states))
+        )
+
+        def run(metadata_obj, states, act):
+            act, *states = call_kernel(
+                *states, act, config.GDNMode.PER_SEQ, metadata_obj
+            )
             return act, tuple(states)
 
         if in_act is None:
-            return run(in_states, in_act)
+            return run(per_seq_metadata, in_states, in_act)
         # Decode-only steps leave the PER_SEQ segment empty; skip its launch.
         return jax.lax.cond(
             distribution[-1] > distribution[0],
             run,
-            lambda states, act: (act, states),
+            lambda metadata_obj, states, act: (act, states),
+            per_seq_metadata,
             in_states,
             in_act,
         )
