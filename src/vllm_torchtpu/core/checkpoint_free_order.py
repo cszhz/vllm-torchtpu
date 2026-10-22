@@ -48,12 +48,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def replay_checkpoint_range(
-    manager, num_prompt_tokens: int, alignment: int | None = None
-) -> range:
+def replay_checkpoint_range(manager, num_prompt_tokens: int) -> range:
     """Block indices of a windowed group's replay-boundary checkpoint."""
-    if alignment is None:
-        alignment = manager.cache_hit_alignment_tokens
+    alignment = manager.cache_hit_alignment_tokens
     boundary = (num_prompt_tokens - 1) // alignment * alignment
     end = boundary // manager.block_size
     need = manager._contiguous_blocks_for_hit(
@@ -63,16 +60,11 @@ def replay_checkpoint_range(
 
 
 def held_checkpoint_indices(manager, num_prompt_tokens: int) -> set[int]:
-    """The replay checkpoint, plus the block-aligned one under fine prefix hits
-    (``fine_prefix_hits`` sets ``_tpu_coarse_alignment``); none for a group that
-    needs no checkpoint (``hca_state_checkpoint`` sets ``_tpu_no_checkpoint``)."""
+    """The replay checkpoint; none for a group that needs no checkpoint
+    (``hca_state_checkpoint`` sets ``_tpu_no_checkpoint``)."""
     if getattr(manager, "_tpu_no_checkpoint", False):
         return set()
-    held = set(replay_checkpoint_range(manager, num_prompt_tokens))
-    coarse = getattr(manager, "_tpu_coarse_alignment", None)
-    if coarse is not None:
-        held.update(replay_checkpoint_range(manager, num_prompt_tokens, coarse))
-    return held
+    return set(replay_checkpoint_range(manager, num_prompt_tokens))
 
 
 def _remove_skipped_blocks_holding_checkpoint(
@@ -114,8 +106,7 @@ def chain_ordered_blocks(kv_cache_manager, request: Request) -> list[KVCacheBloc
     full_mgr = managers[full[0]]
     alignment = full_mgr.cache_hit_alignment_tokens
     boundary = (request.num_prompt_tokens - 1) // alignment * alignment
-    # A boundary inside a block (fine prefix hits) keeps that block with the head.
-    split = -(-boundary // full_mgr.block_size)
+    split = boundary // full_mgr.block_size
 
     rest: list[KVCacheBlock] = []
     checkpoint: list[KVCacheBlock] = []

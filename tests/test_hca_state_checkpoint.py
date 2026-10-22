@@ -11,13 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_KV_DROP_HCA_STATE_CHECKPOINT on vLLM's KVCacheManager with DeepSeek-V4-shaped
-groups (layer names as the model registers them): hits are unchanged, and the
-128-ratio compressor-state group is satisfied by null blocks and caches nothing."""
+"""TPU_KV_DROP_HCA_STATE_CHECKPOINT and TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS on
+vLLM's KVCacheManager with DeepSeek-V4-shaped groups (layer names as the model
+registers them) at both served block sizes: hits are unchanged, the 128-ratio
+compressor-state group is satisfied by null blocks and caches nothing, and the
+offload's EAGLE peek block is hashed."""
 
 import pytest
-import test_fine_prefix_hits as fph_test
 import torch
+from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
@@ -32,14 +34,29 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+from vllm.v1.request import Request
 
 from vllm_torchtpu.core import checkpoint_free_order as cfo
-from vllm_torchtpu.core import fine_prefix_hits as fph
 from vllm_torchtpu.core import hca_state_checkpoint as hsc
 from vllm_torchtpu.core.eagle_block_drop import clear_eagle_block_drop
 
-FULL = 1024
 HCA_STATE = 4
+# --block-size -> (SWA block, CSA/indexer state block = hash block, HCA state
+# block), as the TPU DeepSeek-V4 layers page them.
+GEOMETRY = {1024: (128, 16, 32), 512: (64, 8, 16)}
+
+init_none_hash(sha256)
+_ids = iter(range(1, 1 << 30))
+# 40,333-token first turn: replay boundary 39,936 at either block size.
+TURN1 = list(range(1, 40_334))
+# The next turn shares all but the last two prompt tokens (the generation
+# prompt), as a chat template renders it.
+TURN2 = TURN1[:-2] + list(range(50_000_000, 50_003_000))
+
+
+@pytest.fixture(params=sorted(GEOMETRY), ids=lambda bs: f"bs{bs}")
+def block_size(request):
+    return request.param
 
 
 def _swa(block_size, window, head_size):
@@ -52,16 +69,17 @@ def _swa(block_size, window, head_size):
     )
 
 
-def _manager(num_blocks, eagle=False):
+def _manager(num_blocks, block_size, eagle=False):
+    swa, csa_state, hca_state = GEOMETRY[block_size]
     groups = [
-        KVCacheGroupSpec(["model.layers.0.attn.swa_cache"], _swa(128, 128, 512)),
+        KVCacheGroupSpec(["model.layers.0.attn.swa_cache"], _swa(swa, 128, 512)),
         KVCacheGroupSpec(
-            ["mtp.0.attn.swa_cache"], _swa(128, 128, 512), is_eagle_group=eagle
+            ["mtp.0.attn.swa_cache"], _swa(swa, 128, 512), is_eagle_group=eagle
         ),
         KVCacheGroupSpec(
             ["model.layers.0.attn", "model.layers.2.attn"],
             MLAAttentionSpec(
-                block_size=FULL,
+                block_size=block_size,
                 num_kv_heads=1,
                 head_size=64,
                 dtype=torch.uint8,
@@ -73,10 +91,10 @@ def _manager(num_blocks, eagle=False):
                 "model.layers.2.attn.compressor.state_cache",
                 "model.layers.2.attn.indexer.compressor.state_cache",
             ],
-            _swa(16, 8, 4096),
+            _swa(csa_state, 8, 4096),
         ),
         KVCacheGroupSpec(
-            ["model.layers.0.attn.compressor.state_cache"], _swa(32, 128, 2048)
+            ["model.layers.0.attn.compressor.state_cache"], _swa(hca_state, 128, 2048)
         ),
     ]
     config = KVCacheConfig(
@@ -85,70 +103,70 @@ def _manager(num_blocks, eagle=False):
         kv_cache_groups=groups,
         prefix_cache_retention_interval=32768,
     )
-    return KVCacheManager(
+    mgr = KVCacheManager(
         config,
         max_model_len=1 << 20,
-        scheduler_block_size=FULL,
-        hash_block_size=16,
+        scheduler_block_size=block_size,
+        hash_block_size=csa_state,
         enable_caching=True,
         use_eagle=False,
     )
+    mgr._test_hasher = get_request_block_hasher(csa_state, sha256)
+    return mgr
 
 
-init_none_hash(sha256)
-fph_test._HASHER = get_request_block_hasher(16, sha256)
-_request, _prefill, _decode, _run = (
-    fph_test._request,
-    fph_test._prefill,
-    fph_test._decode,
-    fph_test._run,
-)
-TURN1, TURN2 = fph_test.TURN1, fph_test.TURN2
+def _request(mgr, tokens, max_tokens):
+    return Request(
+        f"r{next(_ids)}",
+        list(tokens),
+        SamplingParams(max_tokens=max_tokens),
+        None,
+        block_hasher=mgr._test_hasher,
+    )
 
 
-def test_finds_only_the_128_ratio_state_group():
-    assert hsc.hca_state_group_ids(_manager(64).kv_cache_config) == {HCA_STATE}
+def _prefill(mgr, req, step=128):
+    blocks, hit, _ = mgr.get_computed_blocks(req)
+    first = True
+    while req.num_computed_tokens < req.num_prompt_tokens:
+        local = hit if first else 0
+        n = min(step, req.num_prompt_tokens - req.num_computed_tokens - local)
+        out = mgr.allocate_slots(
+            req,
+            n,
+            num_new_computed_tokens=local,
+            new_computed_blocks=blocks if first else None,
+        )
+        assert out is not None
+        req.num_computed_tokens += n + local
+        first = False
+    return hit
 
 
-def _scenario(mgr, held):
-    """Hits of: next turn, a truncated history, and a next turn after churn."""
-    hits = []
-    _run(mgr, TURN1, decode_steps=300)
-    hits.append(mgr.get_computed_blocks(_request(TURN2, 4))[1])
-    hits.append(mgr.get_computed_blocks(_request(TURN1[:40_100] + [3] * 900, 4))[1])
-    req = _request(TURN2, 1300)
-    hits.append(_prefill(mgr, req))
-    for step in range(300):
-        _decode(mgr, req, 1)
-        if step % 10 == 0:
-            base = 10_000_000 + step * 100_000
-            _run(mgr, range(base, base + 3000), decode_steps=5)
+def _decode(mgr, req, steps, accept=4):
+    for _ in range(steps):
+        for _ in range(accept):
+            req.append_output_token_ids(7_000_000 + len(req.output_token_ids))
+        assert mgr.allocate_slots(req, accept, num_lookahead_tokens=6) is not None
+        req.num_computed_tokens += accept
+
+
+def _run(mgr, tokens, decode_steps=50):
+    req = _request(mgr, tokens, decode_steps * 4)
+    hit = _prefill(mgr, req)
+    _decode(mgr, req, decode_steps)
     mgr.free(req)
-    turn3 = TURN2[:-2] + list(range(60_000_000, 60_002_000))
-    hits.append(mgr.get_computed_blocks(_request(turn3, 10))[1])
-    return hits
+    return hit
 
 
-@pytest.mark.parametrize("fine", [False, True], ids=["block-hits", "fine-hits"])
-def test_hits_are_unchanged_and_the_group_caches_nothing(fine, monkeypatch):
-    if fine:
-        fph.install(128, monkeypatch.setattr)
-    fph_test._hold(monkeypatch)
-    expected = _scenario(_manager(130), held=True)
-
-    hsc.install(monkeypatch.setattr)
-    mgr = _manager(130)
-    assert _scenario(mgr, held=True) == expected
-    assert expected[0] == (40_320 if fine else 39 * FULL)
-    manager = mgr.coordinator.single_type_managers[HCA_STATE]
-    assert cfo.held_checkpoint_indices(manager, len(TURN1)) == set()
-
-    fresh = _manager(130)
-    _run(fresh, TURN1)
-    blocks, hit, _ = fresh.get_computed_blocks(_request(TURN2, 4))
-    assert hit == expected[0]
-    assert blocks.blocks[HCA_STATE] and all(b.is_null for b in blocks.blocks[HCA_STATE])
-    assert _cached_blocks(fresh, HCA_STATE) == 0
+def _hold(monkeypatch):
+    monkeypatch.setattr(KVCacheManager, "free", cfo._free)
+    monkeypatch.setattr(KVCacheManager, "pop_blocks_for_free", cfo._pop_blocks_for_free)
+    monkeypatch.setattr(
+        SlidingWindowManager,
+        "remove_skipped_blocks",
+        cfo._remove_skipped_blocks_holding_checkpoint,
+    )
 
 
 def _cached_blocks(mgr, group):
@@ -158,14 +176,62 @@ def _cached_blocks(mgr, group):
     )
 
 
-def test_caches_and_holds_nothing_for_the_group(monkeypatch):
-    fph_test._hold(monkeypatch)
-    base = _manager(400)
+def test_finds_only_the_128_ratio_state_group(block_size):
+    mgr = _manager(64, block_size)
+    assert hsc.hca_state_group_ids(mgr.kv_cache_config) == {HCA_STATE}
+
+
+def _scenario(mgr):
+    """Hits of: next turn, a truncated history, and a next turn after churn."""
+    hits = []
+    _run(mgr, TURN1, decode_steps=300)
+    hits.append(mgr.get_computed_blocks(_request(mgr, TURN2, 4))[1])
+    truncated = TURN1[:40_100] + [3] * 900
+    hits.append(mgr.get_computed_blocks(_request(mgr, truncated, 4))[1])
+    req = _request(mgr, TURN2, 1300)
+    hits.append(_prefill(mgr, req))
+    for step in range(300):
+        _decode(mgr, req, 1)
+        if step % 10 == 0:
+            base = 10_000_000 + step * 100_000
+            _run(mgr, range(base, base + 3000), decode_steps=5)
+    mgr.free(req)
+    turn3 = TURN2[:-2] + list(range(60_000_000, 60_002_000))
+    hits.append(mgr.get_computed_blocks(_request(mgr, turn3, 10))[1])
+    return hits
+
+
+def test_hits_are_unchanged_and_the_group_caches_nothing(block_size, monkeypatch):
+    num_blocks = 130 * 1024 // block_size
+    _hold(monkeypatch)
+    expected = _scenario(_manager(num_blocks, block_size))
+
+    hsc.install(monkeypatch.setattr)
+    mgr = _manager(num_blocks, block_size)
+    assert _scenario(mgr) == expected
+    assert expected[0] == 39_936
+    manager = mgr.coordinator.single_type_managers[HCA_STATE]
+    assert cfo.held_checkpoint_indices(manager, len(TURN1)) == set()
+
+    fresh = _manager(num_blocks, block_size)
+    _run(fresh, TURN1)
+    blocks, hit, _ = fresh.get_computed_blocks(_request(fresh, TURN2, 4))
+    assert hit == expected[0]
+    assert blocks.blocks[HCA_STATE] and all(b.is_null for b in blocks.blocks[HCA_STATE])
+    assert _cached_blocks(fresh, HCA_STATE) == 0
+
+
+def test_caches_and_holds_nothing_for_the_group(block_size, monkeypatch):
+    num_blocks = 400 * 1024 // block_size
+    _hold(monkeypatch)
+    base = _manager(num_blocks, block_size)
     _run(base, TURN1)
     hsc.install(monkeypatch.setattr)
-    lean = _manager(400)
+    lean = _manager(num_blocks, block_size)
     _run(lean, TURN1)
-    assert _cached_blocks(base, HCA_STATE) == 8
+    # Two checkpoints (32k and the replay boundary), each a 128-token window.
+    hca_blocks_per_checkpoint = 128 // GEOMETRY[block_size][2]
+    assert _cached_blocks(base, HCA_STATE) == 2 * hca_blocks_per_checkpoint
     assert _cached_blocks(lean, HCA_STATE) == 0
     for group in range(4):
         assert _cached_blocks(lean, group) == _cached_blocks(base, group)
@@ -174,11 +240,12 @@ def test_caches_and_holds_nothing_for_the_group(monkeypatch):
         for m in lean.coordinator.single_type_managers
         if isinstance(m, SlidingWindowManager)
     ]
-    assert held == [1, 1, 1, 0]
+    swa_need = -(-127 // GEOMETRY[block_size][0])
+    assert held == [swa_need, swa_need, 1, 0]
 
 
 @pytest.mark.parametrize("hashed", [False, True], ids=["as-served", "hashed"])
-def test_offload_peek_block_survives_its_window(hashed, monkeypatch):
+def test_offload_peek_block_survives_its_window(block_size, hashed, monkeypatch):
     """The EAGLE peek block of the 32k offload checkpoint leaves the window two
     prefill steps after it is computed. Unhashed, it is reused at once, which
     cancels its store job if that has not launched yet, and every
@@ -194,10 +261,11 @@ def test_offload_peek_block_survives_its_window(hashed, monkeypatch):
     _patch_vllm_block_pool_lifo_free()
     if hashed:
         cfo.install_offload_checkpoint_hashing(monkeypatch.setattr)
-    mgr = _manager(400, eagle=True)
+    mgr = _manager(400 * 1024 // block_size, block_size, eagle=True)
     clear_eagle_block_drop(mgr)
-    req = _request(range(1, 40_001), 4)
+    req = _request(mgr, range(1, 40_001), 4)
     peek = mgr.coordinator.single_type_managers[1]
+    peek_idx = 32_768 // peek.block_size
     block = None
     while req.num_computed_tokens < req.num_prompt_tokens:
         n = min(100, req.num_prompt_tokens - req.num_computed_tokens)
@@ -205,8 +273,8 @@ def test_offload_peek_block_survives_its_window(hashed, monkeypatch):
         req.num_computed_tokens += n
         blocks = peek.req_to_blocks[req.request_id]
         if block is None and req.num_computed_tokens >= 32_900:
-            block = blocks[32_768 // 128]  # computed, still in the window
-    assert peek.req_to_blocks[req.request_id][256].is_null  # freed since
+            block = blocks[peek_idx]  # computed, still in the window
+    assert peek.req_to_blocks[req.request_id][peek_idx].is_null  # freed since
     if hashed:
         # Still free and cached, behind older blocks in the free queue.
         assert block.ref_cnt == 0 and block.block_hash is not None
@@ -215,19 +283,18 @@ def test_offload_peek_block_survives_its_window(hashed, monkeypatch):
         assert block.ref_cnt == 1 and block.block_hash is None
 
 
-def test_all_knobs_together_keep_the_hits(monkeypatch):
-    """Fine hits, held checkpoints, HCA-state drop and offload checkpoint
-    hashing on an EAGLE-annotated MTP group with the EAGLE block drop off."""
-    fph.install(128, monkeypatch.setattr)
-    fph_test._hold(monkeypatch)
+def test_all_knobs_together_keep_the_hits(block_size, monkeypatch):
+    """Held checkpoints, HCA-state drop and offload checkpoint hashing on an
+    EAGLE-annotated MTP group with the EAGLE block drop off."""
+    _hold(monkeypatch)
     hsc.install(monkeypatch.setattr)
 
     def manager():
-        mgr = _manager(130, eagle=True)
+        mgr = _manager(130 * 1024 // block_size, block_size, eagle=True)
         clear_eagle_block_drop(mgr)
         return mgr
 
-    expected = _scenario(manager(), held=True)
+    expected = _scenario(manager())
     cfo.install_offload_checkpoint_hashing(monkeypatch.setattr)
-    assert _scenario(manager(), held=True) == expected
-    assert expected[0] == 40_320
+    assert _scenario(manager()) == expected
+    assert expected[0] == 39_936

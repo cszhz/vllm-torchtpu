@@ -113,7 +113,6 @@ PATCHES = (
         "vllm_torchtpu.core.checkpoint_free_order:patch_hash_offload_checkpoint_blocks",
         _ENGINE,
     ),
-    Patch("vllm_torchtpu.core.fine_prefix_hits:patch_fine_prefix_hits", _ENGINE),
     Patch(
         "vllm_torchtpu.core.hca_state_checkpoint:patch_drop_hca_state_checkpoint",
         _ENGINE,
