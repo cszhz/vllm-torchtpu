@@ -921,14 +921,14 @@ DECODE_LHS_IN_HBM = True
 #: projection and an unfused one. The body then stores into the output itself
 #: and the call ends with its last multiply, with no writeback DMA to wait on;
 #: a consumer that needs the output in HBM gets an XLA copy instead.
-DECODE_OUT_IN_VMEM_FUSED = False
+DECODE_OUT_IN_VMEM_FUSED = True
 DECODE_OUT_IN_VMEM_UNFUSED = True
 
 #: Whether an unfused decode call takes its lhs as a VMEM operand and reads it
 #: in place instead of fetching it: its lhs is the fused call's output, so with
 #: that output in VMEM it passes between the two calls without a copy.
 #: Overrides DECODE_LHS_IN_HBM for unfused calls.
-DECODE_LHS_IN_VMEM_UNFUSED = False
+DECODE_LHS_IN_VMEM_UNFUSED = True
 
 #: Ablation switch of the decode path, False outside a diagnostic job. True
 #: starts and waits on no output DMA, so the output is wrong; it prices the
