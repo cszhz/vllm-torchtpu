@@ -206,6 +206,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="measured windows per case on the resident batch (one prefill); each window "
                    "is reported as its own case record (a repeat)")
     p.add_argument("--profile", action="store_true", help="profile PROF steps per case")
+    p.add_argument("--dump-tokens", type=int, default=0,
+                   help="write the first N generated token ids of every request to <out>/tokens.jsonl "
+                   "(numerics check: compare two layouts' greedy outputs on the same prompts)")
     p.add_argument("--max-num-batched-tokens", type=int, default=2048)
     p.add_argument("--max-num-seqs", type=int, default=0, help="0: the largest case's REQS")
     # The serving D leg's sizes (4 .. 256) plus the prefill chunks up to
@@ -688,6 +691,7 @@ def run(a: argparse.Namespace, out_dir: str, timeline: common.Timeline) -> dict:
     shape_iter = iter(shapes_pool)
     counters = {"added": 0, "finished": 0, "client_steps": 0, "last_output_t": time.time()}
     live_ids: set[str] = set()
+    dumped: dict[str, list[int]] = {}
 
     def unfinished() -> bool:
         # Under DP the sync client's engines_running flag never clears: the engines
@@ -744,6 +748,10 @@ def run(a: argparse.Namespace, out_dir: str, timeline: common.Timeline) -> dict:
         counters["client_steps"] += 1
         counters["last_output_t"] = time.time()
         for o in outs:
+            if a.dump_tokens and o.outputs and len(dumped.get(o.request_id, ())) < a.dump_tokens:
+                # Outputs are cumulative (the default RequestOutputKind): keep the first N.
+                import itertools
+                dumped[o.request_id] = list(itertools.islice(o.outputs[0].token_ids, a.dump_tokens))
             if o.finished:
                 live_ids.discard(o.request_id)
                 if a.hold_running == "replenish":
@@ -836,6 +844,11 @@ def run(a: argparse.Namespace, out_dir: str, timeline: common.Timeline) -> dict:
             cases.append(case_out)
     timeline.mark("timed_end")
     watchdog_stop.set()
+    if a.dump_tokens:
+        with open(os.path.join(out_dir, "tokens.jsonl"), "w") as f:
+            for rid in sorted(dumped):
+                f.write(json.dumps({"id": rid, "tokens": dumped[rid]}) + "\n")
+        print(f"[p3_d_leg] dumped tokens of {len(dumped)} requests", flush=True)
     return {"startup_s": round(startup_s, 1), "kv_cache": kv_cache, "cases": cases}
 
 
