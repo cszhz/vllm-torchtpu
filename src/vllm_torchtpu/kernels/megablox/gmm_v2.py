@@ -917,10 +917,24 @@ DECODE_ASYNC_GROUP_SIZES = True
 #: op before it (measured in a 16-call profile).
 DECODE_LHS_IN_HBM = True
 
+#: Whether the decode path returns its output in VMEM, for a fused gate/up
+#: projection and an unfused one. The body then stores into the output itself
+#: and the call ends with its last multiply, with no writeback DMA to wait on;
+#: a consumer that needs the output in HBM gets an XLA copy instead.
+DECODE_OUT_IN_VMEM_FUSED = False
+DECODE_OUT_IN_VMEM_UNFUSED = True
+
 #: Ablation switch of the decode path, False outside a diagnostic job. True
 #: starts and waits on no output DMA, so the output is wrong; it prices the
 #: writeback tail against the same tree in a scoring job.
 DECODE_DIAG_SKIP_WRITEBACK = False
+
+
+def decode_out_in_vmem(cfgs: GmmConfigs) -> bool:
+    """Whether the decode path at `cfgs` returns its output in VMEM."""
+    if cfgs.fuse_act is None:
+        return DECODE_OUT_IN_VMEM_UNFUSED
+    return DECODE_OUT_IN_VMEM_FUSED
 
 
 def decode_slots(cfgs: GmmConfigs) -> int:
@@ -941,8 +955,8 @@ class DecodeRefs:
     lhs_sem: Any  # DMA[2]: lhs rows before and past the small-row bucket
     weight_sems: Any  # DMA[decode_slots, panels]: one per weight column panel
     scale_sems: Any  # DMA[decode_slots]
-    out: Any  # [size_m, aligned out_size_n]
-    out_sems: Any  # DMA[output panels, output row slabs]
+    out: Any  # [size_m, aligned out_size_n], or None if the output is in VMEM
+    out_sems: Any  # DMA[output panels, output row slabs], or None
     group_sizes: Any  # int32[size_lhs_group] SMEM, or None if scalar prefetched
     group_sizes_sem: Any  # DMA[1], or None
 
@@ -1079,7 +1093,7 @@ def decode_kernel(
     metadata_ref: MetadataRef,
     dec: DecodeRefs,
     *,
-    out_hbm_ref: jax.Array,  # [<= size_m, aligned out_size_n]
+    out_hbm_ref: jax.Array,  # [<= size_m, aligned out_size_n], VMEM if not dec.out
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group], HBM if dec has SMEM
     group_offset_ref: jax.Array,  # int32[1]
     lhs_hbm_ref: jax.Array,  # [<= size_m, size_k]
@@ -1105,6 +1119,8 @@ def decode_kernel(
     lookahead = slots - 1
 
     out_rows = out_hbm_ref.shape[0]
+    out_in_vmem = dec.out is None
+    out_buf = out_hbm_ref if out_in_vmem else dec.out
     out_slabs = decode_out_slabs(out_rows, sublane)
     out_panels = decode_out_panels(cfgs)
     owned_only = DECODE_OWNED_SLABS and not cfgs.zero_init
@@ -1184,7 +1200,7 @@ def decode_kernel(
         return (slab * sublane < m_hi) & ((slab + 1) * sublane > m_lo)
 
     def write_back(o):
-        if DECODE_DIAG_SKIP_WRITEBACK:
+        if DECODE_DIAG_SKIP_WRITEBACK or out_in_vmem:
             return
         for slab in range(out_slabs):
 
@@ -1231,7 +1247,9 @@ def decode_kernel(
     def compute(rows):
         """Quantizes lhs rows [0, rows) and runs every tile over them."""
 
-        dec.out[:rows] = jnp.zeros((rows, dec.out.shape[1]), dec.out.dtype)
+        # A VMEM output holds only the rows the call returns.
+        out_r = min(rows, out_buf.shape[0])
+        out_buf[:out_r] = jnp.zeros((out_r, out_buf.shape[1]), out_buf.dtype)
 
         lhs_copy(0).wait()
         if small_rows is not None and rows > small_rows:
@@ -1282,8 +1300,8 @@ def decode_kernel(
         def store_out(gm, o, acc):
             """Keeps tile gm's rows of output panel o's acc in the VMEM output."""
             col, width = out_panels[o]
-            out_ref = dec.out.at[:rows, pl.ds(col, width)]
-            acc = acc.astype(out_ref.dtype)
+            out_ref = out_buf.at[:out_r, pl.ds(col, width)]
+            acc = acc[:out_r].astype(out_ref.dtype)
             m_start = metadata_ref.gm_id_to_m_offset[gm]
             m_end = metadata_ref.gm_id_to_m_offset[gm + 1]
             first_row = m_start - m_start % sublane
@@ -1335,7 +1353,7 @@ def decode_kernel(
         for o in range(len(out_panels)):
             write_back(o)
 
-    if DECODE_DIAG_SKIP_WRITEBACK:
+    if DECODE_DIAG_SKIP_WRITEBACK or out_in_vmem:
         return
     for o in range(len(out_panels)):
         for slab in range(out_slabs):
@@ -1964,6 +1982,7 @@ def gmm_v2(
     else:
         scratch_shapes += [None, None]
 
+    out_in_vmem = is_decode and decode_out_in_vmem(cfgs)
     if is_decode:
         num_q_blocks = dims.size_k // cfgs.lhs_cfgs.quant_block_size
         slots = decode_slots(cfgs)
@@ -1983,11 +2002,15 @@ def gmm_v2(
                     (slots, len(decode_panels(cfgs)))
                 ),
                 scale_sems=pltpu.SemaphoreType.DMA((slots,)),
-                out=pltpu.VMEM(
+                out=None
+                if out_in_vmem
+                else pltpu.VMEM(
                     (dims.size_m, align_to(cfgs.out_size_n, num_lanes)),
                     cfgs.out_dtype,
                 ),
-                out_sems=pltpu.SemaphoreType.DMA(
+                out_sems=None
+                if out_in_vmem
+                else pltpu.SemaphoreType.DMA(
                     (
                         len(decode_out_panels(cfgs)),
                         decode_out_slabs(size_m, dims.size_lhs_sublane),
@@ -2008,7 +2031,8 @@ def gmm_v2(
 
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_rows = size_m if is_decode else dims.size_m
-    out_init = jax.ShapeDtypeStruct((out_rows, aligned_n), cfgs.out_dtype)
+    out_type = pltpu.VMEM if out_in_vmem else jax.ShapeDtypeStruct
+    out_init = out_type((out_rows, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
     weights_spec = WeightsRef(
@@ -2033,7 +2057,7 @@ def gmm_v2(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=num_scalar_prefetch,
             in_specs=in_specs,
-            out_specs=hbm_spec,
+            out_specs=pl.BlockSpec(memory_space=pltpu.VMEM) if out_in_vmem else hbm_spec,
             scratch_shapes=scratch_shapes,
         ),
         compiler_params=pltpu.CompilerParams(
