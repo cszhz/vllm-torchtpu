@@ -226,6 +226,8 @@ if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_ATTN_MOE_OVERLAP_MIN_TOKENS: int = 64
     TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 64
+    TPU_MOE_FUSED_EP_V3_CONFIG: str = ""
+    TPU_MOE_FUSED_EP_V3_TILE_ROWS: int = 128
     TPU_SP_MIN_ROWS: int = 512
     TPU_SP_FP8_GATHER: bool = True
     TPU_SCHED_SRPF_RUNNING: bool = True
@@ -1356,6 +1358,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS", 64
     ),
     "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64),
+    # Fused EP v3: JSON object of kernels.fused_moe.v3.Config field overrides on top of
+    # Config.for_shape (e.g. '{"sorted_rows": false}'); empty = the shape's defaults.
+    "TPU_MOE_FUSED_EP_V3_CONFIG": env_str("TPU_MOE_FUSED_EP_V3_CONFIG", ""),
+    # Fused EP v3 FFN tile height (the kernel's tile_rows), a multiple of 8.
+    "TPU_MOE_FUSED_EP_V3_TILE_ROWS": env_int("TPU_MOE_FUSED_EP_V3_TILE_ROWS", 128),
     "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
     # --- PrefixAwareScheduler SRPF & cold-prefill chunk capping ---
