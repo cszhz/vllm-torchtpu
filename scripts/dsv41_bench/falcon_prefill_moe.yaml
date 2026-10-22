@@ -1,0 +1,117 @@
+name: moe-prefill-runtime-trace-20261022
+exp_type: PROFILING
+artifact_type: operator-profile
+cluster_name: gke-tpu-train-us-central1-1-prod
+profile: true
+tags:
+- profile
+- operator-optimization
+- moe-prefill
+model_version: moe-prefill-optimzied
+role_to_task_spec:
+  worker:
+    replica: 1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    sources:
+    - name: benchmark
+      type: git
+      repo: https://github.com/vllm-project/vllm-torchtpu.git
+      ref: moe-prefill-optimzied
+      path: /workspace/moe-source
+    - name: vllm
+      type: git
+      repo: https://github.com/vllm-project/vllm.git
+      ref: v0.31.1rc0
+      commit: e37e51dd246cf421c554e7d6f53e178e3fd29085
+      path: /workspace/vllm
+    envs:
+      MOE_RUN_NAME: moe-prefill-runtime-trace-20261022
+      TMPDIR: /tmp/tpu_logs/tmp
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-cache
+      PYTHONUNBUFFERED: '1'
+      TPU_RECLAIM_COMPILE_MEMORY: '0'
+    command: |
+      exec bash <<'ENTRYPOINT'
+      set -euo pipefail
+      debug_dir=/tmp/tpu_logs/moe-debug
+      phase=bootstrap
+      keep_alive_on_failure() {
+        status=$?
+        trap - EXIT
+        if [ "$status" -eq 0 ]; then
+          return
+        fi
+        set +e
+        echo "ENTRYPOINT_FAILED phase=$phase exit=$status" >&2
+        mkdir -p "$debug_dir"
+        printf '%s\n' "$status" > "$debug_dir/initial-exit-status"
+        for log in /workspace/moe-results/"${MOE_RUN_NAME:-}"/*/bench.log \
+                   /workspace/moe-results/"${MOE_RUN_NAME:-}"/*/results/workers.log; do
+          if [ -f "$log" ]; then
+            echo "===== $log (last 200 lines) ====="
+            tail -n 200 "$log"
+          fi
+        done
+        echo "DEBUG_READY exit=$status log=$debug_dir/entrypoint.log"
+        echo "Keeping the TPU worker alive for debugging; stop the experiment to release it."
+        while :; do
+          sleep 60
+        done
+      }
+      trap keep_alive_on_failure EXIT
+      mkdir -p "$debug_dir"
+      exec > >(tee -a "$debug_dir/entrypoint.log") 2>&1
+      ulimit -c 0
+      mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
+      mkdir -p /tmp/tpu_logs/moe-results
+      test ! -e /workspace/moe-results
+      ln -s /tmp/tpu_logs/moe-results /workspace/moe-results
+      phase=source-check
+      cd /workspace/moe-source
+      echo "SOURCE_COMMIT $(git rev-parse HEAD)"
+      git diff --exit-code HEAD
+      if [ -n "${MOE_SOURCE_PATCH:-}" ]; then
+        printf '%s\n' "$MOE_SOURCE_PATCH" | git apply -
+      fi
+      phase=source-manifest
+      python3 - <<'PY'
+      import hashlib
+      import json
+      import pathlib
+      import subprocess
+
+      root = pathlib.Path('.dsv41_bench')
+      root.mkdir(exist_ok=True)
+      commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+      paths = subprocess.check_output([
+          'git', 'ls-tree', '-r', '--name-only', 'HEAD', '--',
+          'src', 'scripts/dsv41_bench', 'pyproject.toml',
+      ], text=True).splitlines()
+      files = {
+          name: hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()
+          for name in paths
+      }
+      (root / 'git_sha').write_text(commit + '\n')
+      (root / 'source-files.json').write_text(json.dumps({
+          'git_sha': commit, 'files': files,
+          'source_diff': subprocess.check_output(['git', 'diff', 'HEAD'], text=True),
+      }, indent=2))
+      PY
+      phase=benchmark
+      bash scripts/dsv41_bench/run_prefill_moe.sh
+      ENTRYPOINT
+    shared_memory_size: 256Gi
+    mounts:
+    - name: wheel
+      type: gcs
+      bucket: tpu-for-training-falcon-logs
+      prefix: experiments/exp-lse1ka6s0e/artifacts/art-w7d7bv1j6m/wheels/cp312-linux-x86_64
+      mount_path: /wheels/torch-tpu
+      read_only: true
+      mount_options:
+      - implicit-dirs

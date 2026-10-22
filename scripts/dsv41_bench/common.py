@@ -489,6 +489,7 @@ def add_common_args(parser: argparse.ArgumentParser, subops: Sequence[str]) -> N
     parser.add_argument("--num-seqs", type=int, default=1)
     parser.add_argument("--kv-len", type=int, default=90112)
     parser.add_argument("--tp-size", type=int, default=WORLD_SIZE)
+    parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--subop", choices=list(subops), default=subops[0])
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
@@ -668,7 +669,7 @@ def run_main(
 ) -> None:
     args = parser.parse_args()
     if args.worker:
-        _worker_entry(args, worker_fn)
+        _worker_entry(args, worker_fn, dp_size=args.dp_size)
         return
     result_dir = resolve_result_dir(args, bench_name)
     argv = [a for a in sys.argv[1:]]
@@ -701,9 +702,10 @@ class WorkerContext:
     tp_size: int
     cpu_group: Any
     result_dir: pathlib.Path
+    dp_size: int = 1
 
 
-def _worker_entry(args: argparse.Namespace, worker_fn) -> None:
+def _worker_entry(args: argparse.Namespace, worker_fn, *, dp_size: int = 1) -> None:
     rank = int(os.environ["RANK"])
     if args.dump_llo is not None:
         _llo_env(args.dump_llo.resolve(), rank, os.environ)  # type: ignore[arg-type]
@@ -711,7 +713,7 @@ def _worker_entry(args: argparse.Namespace, worker_fn) -> None:
     result: dict[str, Any]
     initialized = False
     try:
-        ctx = init_worker(args)
+        ctx = init_worker(args, dp_size=dp_size)
         initialized = True
         result = {"rank": rank, **worker_fn(ctx, args)}
     except BaseException as exc:  # noqa: BLE001 - reported to the parent
@@ -729,7 +731,7 @@ def _worker_entry(args: argparse.Namespace, worker_fn) -> None:
         raise SystemExit(1)
 
 
-def init_worker(args: argparse.Namespace) -> WorkerContext:
+def init_worker(args: argparse.Namespace, *, dp_size: int = 1) -> WorkerContext:
     """Bring up ``tpu_dist`` plus vLLM's world and TP groups on this rank.
 
     vLLM collectives (``tensor_model_parallel_all_reduce`` etc.) used by the
@@ -738,7 +740,7 @@ def init_worker(args: argparse.Namespace) -> WorkerContext:
     import torch
     import torch.distributed as dist
     import torch_tpu  # noqa: F401
-    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed import (
         ensure_model_parallel_initialized,
         init_distributed_environment,
@@ -746,9 +748,12 @@ def init_worker(args: argparse.Namespace) -> WorkerContext:
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    if world_size % args.tp_size:
+    if args.tp_size < 1 or dp_size < 1:
+        raise ValueError("--tp-size and --dp-size must be positive")
+    if world_size % (args.tp_size * dp_size):
         raise ValueError(
-            f"world_size={world_size} not divisible by tp_size={args.tp_size}"
+            f"world_size={world_size} not divisible by tp_size={args.tp_size} "
+            f"* dp_size={dp_size}"
         )
     dist.init_process_group(backend="tpu_dist")
     torch.empty((1,), device="tpu").cpu()
@@ -759,7 +764,22 @@ def init_worker(args: argparse.Namespace) -> WorkerContext:
         distributed_init_method="env://",
         backend="tpu_dist",
     )
-    with set_current_vllm_config(VllmConfig()):
+    # torchrun supplies global ranks; a DP config here would offset them again.
+    if dp_size > 1:
+        dp_rank = (rank // args.tp_size) % dp_size
+        config = VllmConfig(
+            parallel_config=ParallelConfig(
+                tensor_parallel_size=args.tp_size,
+                data_parallel_size=dp_size,
+                data_parallel_size_local=dp_size,
+                data_parallel_rank=dp_rank,
+                data_parallel_rank_local=dp_rank,
+                enable_expert_parallel=True,
+            )
+        )
+    else:
+        config = VllmConfig()
+    with set_current_vllm_config(config):
         ensure_model_parallel_initialized(args.tp_size, 1)
     cpu_group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
     torch.manual_seed(args.seed)
@@ -769,6 +789,7 @@ def init_worker(args: argparse.Namespace) -> WorkerContext:
         tp_size=args.tp_size,
         cpu_group=cpu_group,
         result_dir=args.result_dir,
+        dp_size=dp_size,
     )
 
 
@@ -895,6 +916,9 @@ def profile_steps(
         for i in range(args.profile_steps):
             with torch.profiler.record_function(f"{label}_step{i}"):
                 synchronize(step())
+        if ctx.dp_size > 1:
+            # Finish EP work on every rank before any profiler stops recording.
+            dist.barrier(group=ctx.cpu_group)
     dist.barrier(group=ctx.cpu_group)
     profiler_trace.merge_rank_capture(
         capture_dir, profile_dir, canonical_ts, ctx.rank, world_size=ctx.world_size
