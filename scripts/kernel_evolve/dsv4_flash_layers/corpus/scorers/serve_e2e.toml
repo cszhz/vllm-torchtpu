@@ -8,3 +8,9 @@ remote = "cdk"
 # Where a layer arm reads the model's config.json to plan its cut; the pods serve the
 # same copy (the target's MODEL_URI).
 weights = "gs://cloud-devkit/ckpt/hf/deepseek-ai/DeepSeek-V4-Flash-0731"
+# The full model's step mix, which a layer arm weighs its two phases by instead of the
+# cut's own: the cut's count of decode-only steps moves between boots (golden read
+# 4026 and 7495 of them beside 18734 prefill-carrying steps, in two boots), its op time
+# per phase does not. 0.1543 = 374.6 decode-only lockstep steps of 2427.4 in a full-model
+# sweep of this config (scoping run f1nwnnms, cdk job j-7d4be6db-2a77-4086-8fb6).
+decode_share = 0.1543
