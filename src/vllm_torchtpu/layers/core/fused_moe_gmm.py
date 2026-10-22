@@ -40,7 +40,10 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     token_block_alignment,
 )
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import (
+    ragged_gather_v2,
+    unpack_row_pairs,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -296,6 +299,7 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
+    packed_hidden_states_local: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -391,10 +395,13 @@ def prepare_routed_gmm_inputs(
             # non-local rows are sorted after the valid prefix.
             valid_count = group_sizes_local.sum(dtype=jnp.int32)
             x = ragged_gather_v2(
-                hidden_states_local,
+                hidden_states_local
+                if packed_hidden_states_local is None
+                else packed_hidden_states_local,
                 token_indices_sorted,
                 jnp.array([0], dtype=jnp.int32),
                 valid_count[None],
+                out_dtype=hidden_states_local.dtype,
             )
     else:
         x = hidden_states_local[token_indices_sorted]
@@ -587,6 +594,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "hidden_packed",
     ),
 )
 def fused_moe_func(
@@ -607,8 +615,12 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    hidden_packed: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
+
+    ``hidden_packed`` says ``hidden_states`` holds bf16 rows as
+    `ragged_gather_v2.pack_row_pairs` int32.
 
     For linear EP placement, ``experts_start`` is the first global expert id
     owned by this shard, passed as a 0-d int32 array (real traced data, not a
@@ -627,6 +639,13 @@ def fused_moe_func(
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
     """
+
+    packed_hidden_states = None
+    if hidden_packed:
+        # Only the SparseCore gather reads the packed rows. The other paths
+        # read this unpacked view, which is dead code when none of them runs.
+        packed_hidden_states = hidden_states
+        hidden_states = unpack_row_pairs(hidden_states, jnp.bfloat16)
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
     # expected by gmm_v2.
@@ -702,6 +721,7 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
+        packed_hidden_states_local=packed_hidden_states,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(

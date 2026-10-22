@@ -28,7 +28,7 @@ from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
-from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
+from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm, pack_hidden_rows
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
 
@@ -204,6 +204,7 @@ def pipelined_fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    pack_gathered_rows: bool = False,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
 
@@ -237,6 +238,9 @@ def pipelined_fused_moe_gmm(
         activation: Gated activation function string (e.g., "silu" for SwiGLU).
         rhs_quant_dtype: Optional RHS quantization data type.
         skip_padded_tokens: Optional flag to skip padded tokens.
+        pack_gathered_rows: Gather bf16 activations as the int32 row pairs the
+            dispatch reads (`pack_hidden_rows`) on the unchunked, unquantized
+            path; the caller must have prebuilt with the same flag.
 
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
@@ -254,10 +258,16 @@ def pipelined_fused_moe_gmm(
     quantize_ag = parallel_size > 1 and envs.TPU_MOE_FP8_ALL_GATHER
 
     if num_chunks == 1 or parallel_size == 1:
+        hidden_packed = False
         if parallel_size > 1:
             # parallel_size > 1 only when collective_group is set.
             assert collective_group is not None
-            if quantize_ag:
+            hidden_packed = pack_gathered_rows and not quantize_ag
+            if hidden_packed:
+                ag_hidden_states = collective_group.all_gather(
+                    pack_hidden_rows(hidden_states), dim=0
+                )
+            elif quantize_ag:
                 ag_hidden_states = _quantized_all_gather(
                     collective_group, hidden_states
                 )
@@ -294,6 +304,7 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            hidden_packed=hidden_packed,
         )
 
         if parallel_size > 1:

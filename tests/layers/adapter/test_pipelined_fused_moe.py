@@ -528,12 +528,15 @@ class TestMoEForwardPrecisionBranches:
         Prevents changes to fused_moe_gmm parameter list that break
         pipelined_fused_moe_gmm.
         """
+        # The packed-activation handoff: the wrapper decides to pack before its
+        # gather, and tells the kernel call its input is packed.
+        fused_only, pipelined_only = {"hidden_packed"}, {"pack_gathered_rows"}
         sig_fused = inspect.signature(fused_moe_gmm)
         sig_pipelined = inspect.signature(pipelined_fused_moe_gmm)
 
-        assert list(sig_fused.parameters.keys()) == list(
-            sig_pipelined.parameters.keys()
-        ), (
+        assert [k for k in sig_fused.parameters if k not in fused_only] == [
+            k for k in sig_pipelined.parameters if k not in pipelined_only
+        ], (
             "Signature parameter mismatch between "
             f"fused_moe_gmm ({list(sig_fused.parameters.keys())}) "
             f"and pipelined_fused_moe_gmm ({list(sig_pipelined.parameters.keys())})."

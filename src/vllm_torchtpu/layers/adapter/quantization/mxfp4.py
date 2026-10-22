@@ -234,6 +234,10 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         """Whether apply routes this rank's tokens and then runs the DP collectives."""
         return enable_pipelined_collective_and_compute()
 
+    # Whether those collectives gather activations as packed row pairs; set
+    # only where process_weights_after_loading prebuilds for it.
+    packs_gathered_rows = False
+
     def __init__(self, moe: FusedMoEConfig):
         # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion)
         FusedMoEMethodBase.__init__(self, moe)
@@ -363,7 +367,9 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "rhs_quant_dtype": self.rhs_quant_dtype,
         }
         if self._gathers_routed_tokens():
-            return pipelined_fused_moe_gmm(**kwargs)
+            return pipelined_fused_moe_gmm(
+                **kwargs, pack_gathered_rows=self.packs_gathered_rows
+            )
 
         return fused_moe_gmm(**kwargs)
 
@@ -379,6 +385,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
 
     rhs_quant_dtype = jnp.float4_e2m1fn
+    packs_gathered_rows = True
 
     @property
     def supports_internal_mk(self) -> bool:
@@ -713,6 +720,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
             rhs_quant_dtype=jnp.float4_e2m1fn,
+            pack_gathered_rows=self.packs_gathered_rows,
         )
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)

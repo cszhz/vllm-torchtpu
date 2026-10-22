@@ -113,7 +113,10 @@ def main_kernel_v2(
     # SparseCore `.bitcast()` leverages hardware Row-Packing for
     # 16-bit -> 32-bit conversion.
     # The logical row count halves, while physical column dimensions remain unchanged.
-    in_hbm_i32 = in_hbm_ref.bitcast(jnp.int32)
+    # A row-pair-packed int32 input (`pack_row_pairs`) is already that view.
+    in_hbm_i32 = (
+        in_hbm_ref if in_hbm_ref.dtype == jnp.int32 else in_hbm_ref.bitcast(jnp.int32)
+    )
     out_hbm_i32 = out_hbm_ref.bitcast(jnp.int32)
 
     num_phys_cols = col_size
@@ -215,11 +218,59 @@ def main_kernel_v2(
     )(indices_hbm_ref)
 
 
-@jax.jit
+# Rows per pack_row_pairs grid step: 2 MiB of bf16 in, 2 MiB of int32 out.
+PACK_BLOCK_ROWS = 256
+
+
+def _pack_row_pairs_kernel(x_ref, o_ref):
+    o_ref[...] = pltpu.bitcast(x_ref[...], jnp.int32)
+
+
+def pack_row_pairs(x: jax.Array, interpret: bool = False) -> jax.Array:
+    """bf16 ``[2n, h]`` as ``[n, h]`` int32, row ``2i`` in the low half.
+
+    This is the int32 view the kernel reads a 16-bit input through, so a
+    packed input skips the kernel-side relayout. An int32 array also keeps its
+    native tiling through a collective, where a bf16 one is gathered in the
+    default tiling and relaid out afterwards at the gathered size. A Pallas
+    bitcast, because XLA lowers the same packing as several full passes.
+    """
+    rows, hidden = x.shape
+    assert x.dtype == jnp.bfloat16 and rows % 2 == 0, (x.dtype, rows)
+    block = min(PACK_BLOCK_ROWS, rows)
+    return pl.pallas_call(
+        _pack_row_pairs_kernel,
+        out_shape=jax.ShapeDtypeStruct((rows // 2, hidden), jnp.int32),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[pl.BlockSpec((block, hidden), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((block // 2, hidden), lambda i: (i, 0)),
+        interpret=interpret,
+        name="moe_pack_row_pairs",
+    )(x)
+
+
+def unpack_row_pairs(packed: jax.Array, dtype: jnp.dtype) -> jax.Array:
+    """Inverse of `pack_row_pairs`."""
+    pairs, hidden = packed.shape
+    bits = jax.lax.bitcast_convert_type(packed, jnp.uint32)
+    halves = jnp.stack([bits & 0xFFFF, jnp.right_shift(bits, 16)], axis=1)
+    halves = jax.lax.bitcast_convert_type(halves.astype(jnp.uint16), dtype)
+    return halves.reshape(2 * pairs, hidden)
+
+
+@functools.partial(jax.jit, static_argnames=("out_dtype",))
 def ragged_gather_v2(
-    x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
+    x: jax.Array,
+    indices: jax.Array,
+    start: jax.Array,
+    end: jax.Array,
+    out_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
-    """Perform gather on indices within dynamic array start and end using BlockSpec."""
+    """Perform gather on indices within dynamic array start and end using BlockSpec.
+
+    ``x`` may be a `pack_row_pairs` int32 array with ``out_dtype`` its 16-bit
+    dtype; ``indices`` then still name unpacked rows.
+    """
 
     assert x.ndim == 2, "Ragged gather only supports 2d inputs."
     assert indices.ndim == 1, "Ragged gather only supports 1d indices."
@@ -229,13 +280,18 @@ def ragged_gather_v2(
     if jnp.isscalar(end):
         end = end[None]
 
-    dtype = x.dtype
+    row_packed = out_dtype is not None and x.dtype != out_dtype
+    if row_packed and not (x.dtype == jnp.int32 and out_dtype == jnp.bfloat16):
+        raise ValueError(
+            f"a packed input must be int32 rows of bf16, got {x.dtype} -> {out_dtype}"
+        )
+    dtype = out_dtype if row_packed else x.dtype
     if dtype not in (jnp.bfloat16, jnp.float32, jnp.int8, jnp.int4):
         raise ValueError(f"dtype must be f32, bf16, int8, or int4, but got {dtype}")
 
     sc_info = pltpu.get_tpu_info().sparse_core
     if sc_info is None:
-        return x[indices]
+        return (unpack_row_pairs(x, dtype) if row_packed else x)[indices]
 
     hidden_size = x.shape[-1]
     out_size = indices.size

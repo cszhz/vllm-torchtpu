@@ -22,7 +22,11 @@ from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
 from vllm_torchtpu.kernels.sparse_core.ragged_gather import ragged_gather
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import (
+    pack_row_pairs,
+    ragged_gather_v2,
+    unpack_row_pairs,
+)
 
 pytestmark = pytest.mark.tpu_test
 
@@ -63,6 +67,28 @@ class GatherTest(jtu.JaxTestCase):
         desired = x[indices][start:end]
 
         self.assertArraysEqual(actual, desired)
+
+    @parameterized.product(in_size=[16, 512, 1024], hidden_size=[128, 4096])
+    def test_sc_gather_row_pair_packed(self, in_size, hidden_size):
+        """A packed bf16 input gathers the same bits as the bf16 input."""
+        key = jax.random.key(1)
+        bits = jax.random.bits(key, (in_size, hidden_size), jnp.uint16)
+        x = jax.lax.bitcast_convert_type(bits, jnp.bfloat16)
+        indices = jax.random.randint(key, (6 * in_size,), 0, in_size, jnp.int32)
+        start = jnp.array([0], jnp.int32)
+        end = jnp.array([5 * in_size], jnp.int32)
+
+        packed = pack_row_pairs(x)
+        np.testing.assert_array_equal(
+            np.asarray(unpack_row_pairs(packed, jnp.bfloat16)).view(np.uint16),
+            np.asarray(bits),
+        )
+        got = ragged_gather_v2(packed, indices, start, end, out_dtype=jnp.bfloat16)
+        want = ragged_gather_v2(x, indices, start, end)
+        np.testing.assert_array_equal(
+            np.asarray(got[: 5 * in_size]).view(np.uint16),
+            np.asarray(want[: 5 * in_size]).view(np.uint16),
+        )
 
     @pytest.mark.nightly
     def test_benchmark(self):
