@@ -142,6 +142,7 @@ def _indexer_impl(
             kv_split_rank=0 if split_rank is None else split_rank[0],
             row_window=row_window,
             row_window_tokens=row_window_tokens,
+            strict_causal=envs.TPU_STREAMIDX_STRICT_CAUSAL,
         )
         return out if kv_split == 1 else jnp.concatenate(out, axis=1)
 

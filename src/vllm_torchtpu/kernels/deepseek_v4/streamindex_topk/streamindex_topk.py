@@ -1442,8 +1442,14 @@ def _effective_row_lengths(
     cp_size: int = 1,
     interleave_c: int = 1,
     kv_window: tuple[jax.Array, jax.Array] | None = None,
+    strict_causal: bool = False,
 ) -> jax.Array:  # i32[num_tokens]
     """Visible compressed KV positions per token row of the score matrix.
+
+    With `strict_causal`, a token sees the (token_pos + 1) // compression_ratio
+    complete groups at or before it. Without it, it also sees its own group
+    whenever that group completes later in the same forward, i.e. the
+    compressed entry of up to compression_ratio - 1 tokens after it.
 
     Under context parallelism the score matrix is rank-local, so the row length
     is the number of globally-visible positions that *this* rank owns.
@@ -1460,7 +1466,10 @@ def _effective_row_lengths(
     seq_len = seq_lens[seq_ids]
     token_pos = seq_len - q_len + (token_ids - q_start)
     kv_len = seq_len // compression_ratio
-    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    if strict_causal:
+        visible = jnp.minimum(kv_len, (token_pos + 1) // compression_ratio)
+    else:
+        visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
     if kv_window is not None:
         win_start, win_len = kv_window
@@ -1491,6 +1500,7 @@ def _effective_row_lengths(
         "kv_split",
         "row_window_tokens",
         "verify_bd",
+        "strict_causal",
     ),
 )
 def streamindex_topk(
@@ -1527,6 +1537,7 @@ def streamindex_topk(
     row_window: tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None = None,
     row_window_tokens: int = 0,
     verify_bd: bool | None = None,
+    strict_causal: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1613,6 +1624,12 @@ def streamindex_topk(
         block-diagonal q and a packed bf16 head reduction (see `score_pipeline`).
         Not bit-exact: relu(q.k) and the weights are rounded to bf16, as in the
         mixed pass. None reads TPU_STREAMIDX_VERIFY_BD.
+      strict_causal: a token selects only among the compressed groups that are
+        complete at its own position, (pos + 1) // compression_ratio of them.
+        False keeps the previous bound, pos // compression_ratio + 1, under
+        which a multi-token forward (chunked prefill, speculative verify) lets
+        a token see its own group's entry when that group completes later in
+        the same forward.
       return_scores: also return the score of each selected position, which is
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
@@ -2058,6 +2075,7 @@ def streamindex_topk(
                 cp_size=cp_size,
                 interleave_c=interleave_c,
                 kv_window=kv_window,
+                strict_causal=strict_causal,
             )
         else:
             if cp_size > 1 or kv_window is not None:
@@ -2071,6 +2089,7 @@ def streamindex_topk(
                     num_tokens=row_window_tokens,
                     num_positions=num_positions,
                     compression_ratio=compression_ratio,
+                    strict_causal=strict_causal,
                 ),
                 (row_offset,),
                 (max_num_tokens,),
@@ -2215,7 +2234,9 @@ def streamindex_topk(
         q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
         max_valid_idx = jnp.minimum(
             seq_len // compression_ratio - 1,
-            q_abs_pos // compression_ratio,
+            (q_abs_pos + 1) // compression_ratio - 1
+            if strict_causal
+            else q_abs_pos // compression_ratio,
         )
         max_valid_idx = jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
