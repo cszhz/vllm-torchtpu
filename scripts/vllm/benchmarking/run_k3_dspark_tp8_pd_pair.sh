@@ -131,6 +131,7 @@ else
     decode_ip="$(<"$coord/decode.ip")"
     VLLM_TPU_REMOTE_DSPARK_SHADOW="$remote_dspark" \
       VLLM_TPU_REMOTE_DSPARK_BATCH_SIZE=8 \
+      VLLM_TPU_REMOTE_DSPARK_BYPASS_REQUESTS=1 \
       python3 examples/disagg/toy_proxy_server.py \
         --host 0.0.0.0 --port 8050 \
         --prefiller-hosts 127.0.0.1 --prefiller-ports 8000 \
@@ -150,7 +151,9 @@ else
         --model /models/Kimi-K3-pruned75
         --tokenizer /models/Kimi-K3-pruned75
         --trust-remote-code --host 127.0.0.1 --port 8050
-        --dataset-name random --random-input-len 1024 --random-output-len 256
+        --dataset-name random
+        --random-input-len "${K3_DSPARK_PD_INPUT_LEN:-1024}"
+        --random-output-len 256
         --random-range-ratio 0 --max-concurrency 8 --request-rate inf
         --percentile-metrics "ttft,tpot,itl,e2el" --ignore-eos --temperature 0
         --seed 42

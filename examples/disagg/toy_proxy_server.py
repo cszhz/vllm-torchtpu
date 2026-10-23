@@ -138,18 +138,24 @@ class _RemoteDraftAdmissionBarrier:
     proposals. Grouping one benchmark concurrency wave avoids that cycle.
     """
 
-    def __init__(self, parties: int):
+    def __init__(self, parties: int, bypass_requests: int = 0):
         if parties <= 0:
             raise ValueError("remote draft barrier parties must be positive")
+        if bypass_requests < 0:
+            raise ValueError("remote draft barrier bypass count must be nonnegative")
         self.parties = parties
         self._condition = asyncio.Condition()
         self._generation = 0
         self._waiting = 0
+        self._remaining_bypass = bypass_requests
 
     async def wait(self) -> None:
         if self.parties == 1:
             return
         async with self._condition:
+            if self._remaining_bypass:
+                self._remaining_bypass -= 1
+                return
             generation = self._generation
             self._waiting += 1
             if self._waiting == self.parties:
@@ -403,7 +409,8 @@ async def lifespan(app: FastAPI):
         _proxy_latency_interval(),
     )
     app.state.remote_draft_barrier = _RemoteDraftAdmissionBarrier(
-        _env_int("VLLM_TPU_REMOTE_DSPARK_BATCH_SIZE", 1)
+        _env_int("VLLM_TPU_REMOTE_DSPARK_BATCH_SIZE", 1),
+        _env_int("VLLM_TPU_REMOTE_DSPARK_BYPASS_REQUESTS", 0),
     )
 
     print(

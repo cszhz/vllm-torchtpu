@@ -64,6 +64,20 @@ def test_remote_draft_admission_barrier_releases_complete_waves() -> None:
     asyncio.run(run())
 
 
+def test_remote_draft_admission_barrier_bypasses_probe() -> None:
+    async def run() -> None:
+        barrier = _RemoteDraftAdmissionBarrier(2, bypass_requests=1)
+        await barrier.wait()
+
+        first = asyncio.create_task(barrier.wait())
+        await asyncio.sleep(0)
+        assert not first.done()
+        await barrier.wait()
+        await first
+
+    asyncio.run(run())
+
+
 def test_ascii_safe_stream_encoder_handles_split_utf8() -> None:
     encoder = _AsciiSafeStreamEncoder()
     text = "\u044f\U0001f600"

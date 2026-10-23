@@ -35,6 +35,7 @@ role_to_task_spec:
       K3_DSPARK_PD_COORD_DIR: /coord
       K3_DSPARK_PD_CONFIG: kimi-k3-pruned75-dspark-tp8-ep-1p1d
       K3_DSPARK_PD_CAPTURE_PROFILE: "0"
+      K3_DSPARK_PD_INPUT_LEN: "128"
       MODEL_OVERRIDE: /models/Kimi-K3-pruned75
       MODEL_URI: ""
       DRAFT_MODEL_OVERRIDE: /models/Inferact/Kimi-K3-DSpark-Block5
