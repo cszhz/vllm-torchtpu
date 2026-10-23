@@ -57,7 +57,14 @@ def test_policy_round_trips_to_worker_and_config_hash_input(execution, moe):
 
 @pytest.mark.parametrize(
     "policy",
-    [{"moe": "adaptive"}, {"tile": 48}, {"execution": True}, {"engram": "gpu"}],
+    [
+        {"moe": "adaptive"},
+        {"tile": 48},
+        {"execution": True},
+        {"engram": "gpu"},
+        {"engram_transfer": "copy"},
+        {"engram_transfer": "raw_dma"},
+    ],
 )
 def test_rejects_unknown_or_mistyped_options(policy):
     with pytest.raises((ValueError, TypeError)):
@@ -67,7 +74,10 @@ def test_rejects_unknown_or_mistyped_options(policy):
 def test_defaults_are_explicit_and_do_not_enable_approximation():
     cfg = config()
     verify_and_update_config(cfg)
-    assert cfg.additional_config["deepseek_v41"] == {"execution": "full", "moe": "gmm"}
+    assert cfg.additional_config["deepseek_v41"] == {
+        "execution": "full",
+        "moe": "gmm",
+    }
 
 
 def test_legacy_values_are_frozen_before_worker_env_changes(monkeypatch):

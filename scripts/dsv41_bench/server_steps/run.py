@@ -206,6 +206,7 @@ def main() -> None:
         "compile_sizes": buckets,
         "cache_mode": "disabled",
         "serialization": "enabled",
+        "engram_transfer": "raw_dma",
         "tier2": "disabled (public and internal)",
         "packages": {
             name: importlib.metadata.version(name)
@@ -218,6 +219,7 @@ def main() -> None:
     model = Path(env["MODEL_PATH"])
     identity = {
         "scenario": args.scenario,
+        "engram_transfer": "raw_dma",
         "compile_sizes": buckets,
         "packages": manifest["packages"],
         "torchtpu": source_identity(

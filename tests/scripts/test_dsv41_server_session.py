@@ -26,7 +26,13 @@ pytestmark = pytest.mark.cpu_test
 @pytest.mark.parametrize("profile", ["disabled", "passed", "failed"])
 @pytest.mark.parametrize("model_uri", [None, "gs://test-bucket/checkpoint"])
 def test_ci_launch_and_optional_profile_share_one_server(
-    tmp_path, monkeypatch, scenario, rounds, buckets, profile, model_uri
+    tmp_path,
+    monkeypatch,
+    scenario,
+    rounds,
+    buckets,
+    profile,
+    model_uri,
 ):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config.json").write_text("{}")
@@ -114,6 +120,8 @@ def test_ci_launch_and_optional_profile_share_one_server(
     manifest = json.loads((tmp_path / "results/manifest.json").read_text())
     assert manifest["cache_mode"] == "disabled"
     assert manifest["serialization"] == "enabled"
+    assert manifest["engram_transfer"] == "raw_dma"
+    assert manifest["identity"]["engram_transfer"] == "raw_dma"
     assert manifest["identity"]["model_weights"] == (model_uri or str(tmp_path))
     command = starts[0]
     assert json.loads(command[command.index("--compilation-config") + 1]) == {
