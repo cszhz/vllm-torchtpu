@@ -32,6 +32,11 @@ server_out="$out/$role"
 mkdir -p "$coord" "$server_out"
 
 role_ip="$(hostname -i | awk '{print $1}')"
+claim_dir="$coord/$role.claim"
+if ! mkdir "$claim_dir"; then
+    echo "A $role instance already claimed coordination directory $coord" >&2
+    exit 1
+fi
 printf '%s\n' "$role_ip" >"$coord/$role.ip"
 export VLLM_HOST_IP="$role_ip"
 export TPU_RAIDEN_ADVERTISE_HOST="$role_ip"
