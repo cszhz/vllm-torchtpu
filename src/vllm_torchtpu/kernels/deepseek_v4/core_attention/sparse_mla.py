@@ -69,72 +69,6 @@ def _largest_divisor(x: int, cap: int) -> int:
     return 1
 
 
-_GATHER_PAGE_CHUNK = 128
-
-
-def _gather_page_ids_kernel(windows_ref, logical_ref, out_ref, *, num_chunks):
-    logical = logical_ref[...]  # i32[block_tokens, topk]
-    out = jnp.zeros_like(logical)
-    for c in range(num_chunks):
-        window_chunk = windows_ref[
-            :, c * _GATHER_PAGE_CHUNK : (c + 1) * _GATHER_PAGE_CHUNK
-        ]  # i32[block_tokens, 128]
-        local = logical - c * _GATHER_PAGE_CHUNK
-        gathered = jnp.take_along_axis(
-            window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
-        )
-        out = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, out)
-    out_ref[...] = out
-
-
-def gather_page_ids(
-    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
-    seq_page_ids: jax.Array,  # i32[num_tokens, topk]  (logical page within seq)
-    seq_ids_segment: jax.Array,  # i32[num_tokens]  (token -> seq id)
-    max_num_seqs: int,
-    *,
-    block_tokens: int = 8,
-) -> jax.Array:
-    """Gathers physical page ids for the CSA top-k tokens."""
-    num_tokens, topk = seq_page_ids.shape
-    pages_per_seq = page_indices.shape[0] // max_num_seqs
-    num_chunks = cdiv(pages_per_seq, _GATHER_PAGE_CHUNK)
-    padded_pps = num_chunks * _GATHER_PAGE_CHUNK
-
-    page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
-    if padded_pps != pages_per_seq:
-        page_table = jnp.pad(page_table, ((0, 0), (0, padded_pps - pages_per_seq)))
-    # Per-token page-table window. This is a whole-row gather.
-    windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
-    logical = jnp.clip(seq_page_ids, 0, pages_per_seq - 1)
-
-    padded_tokens = align_to(num_tokens, block_tokens)
-    if padded_tokens != num_tokens:
-        pad = padded_tokens - num_tokens
-        windows = jnp.pad(windows, ((0, pad), (0, 0)))
-        logical = jnp.pad(logical, ((0, pad), (0, 0)))
-
-    out = pl.pallas_call(
-        functools.partial(_gather_page_ids_kernel, num_chunks=num_chunks),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=[
-                pl.BlockSpec((block_tokens, padded_pps), lambda t: (t, 0)),
-                pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
-            ],
-            out_specs=pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
-            grid=(padded_tokens // block_tokens,),
-        ),
-        out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",),
-            disable_bounds_checks=True,
-        ),
-        name="gather_page_ids",
-    )(windows, logical)
-    return out[:num_tokens]
-
-
 # DSV4 FP8 nope layout: 448 e4m3 values, then one e8m0 scale per lane of a
 # 64-lane period -- 64 quantization groups of 7 dims, group j holding the dims
 # {j, j + 64, ... j + 384}. The 64 scale bytes fill the row's padding, so the
@@ -1067,38 +1001,15 @@ def sparse_ragged_paged_attention(
         return kernel(*scalar_prefetches, *operands)
 
     tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
+    # Whole 32-byte DMA granules for the SparseCore's copy of it.
     seq_ids_segment = jnp.repeat(
-        jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=q.shape[0]
+        jnp.arange(max_num_seqs),
+        tokens_per_seq,
+        total_repeat_length=align_to(q.shape[0], 8),
     )
     assert topk_indices is not None
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
-
-    seq_page_ids = topk_indices // page_size
-    token_offset = topk_indices % page_size
     topk = topk_indices.shape[-1]
-    page_ids = gather_page_ids(
-        page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
-    )
-
-    # For the "-1" padding elements in topk_indices, we scatter the corresponding
-    # page_ids and token_offset to avoid gather memory access hotspotting.
-    is_padding = topk_indices == -1
-    total_num_pages = cache_kv_nope.shape[0]
-    flat_element_index = jnp.arange(q.shape[0] * topk, dtype=jnp.int32).reshape(
-        q.shape[0], topk
-    )
-    # 104729 and 15485863 are randomly chosen large prime numbers.
-    scattered_page_ids = (flat_element_index * 104729) % total_num_pages
-    scattered_token_offset = (flat_element_index * 15485863) % page_size
-    page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
-    token_offset = jnp.where(
-        is_padding,
-        scattered_token_offset,
-        token_offset,
-    )
-
-    assert page_ids.shape == (q.shape[0], topk)
-    gather_indices = (page_ids * page_size + token_offset).reshape(-1)
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
     swa_cache = None if swa_decode is None else swa_decode.cache_kv
 
@@ -1106,7 +1017,6 @@ def sparse_ragged_paged_attention(
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
         chunk_size = end_pos - start_pos
-        indices = gather_indices[start_pos * topk : end_pos * topk]
 
         # Batching
         kernel_batch_size = _largest_divisor(chunk_size, attention_kernel_batch_size)
@@ -1139,12 +1049,17 @@ def sparse_ragged_paged_attention(
         # based on their lengths. For the sequences-segment below certain length,
         # we use a different kernel (dense attention and mask), for the rest of
         # sequences, we use this gather-and-attention kernel.
-        gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
+        gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather_topk(
             cache_kv_nope,
             cache_kv_rope,
-            indices,
-            num_valid_indices=num_valid_indices,
+            topk_indices,
+            seq_ids_segment,
+            page_indices,
+            num_valid_indices,
+            token_start=start_pos,
+            num_tokens=chunk_size,
             top_k=topk,
+            pages_per_seq=num_page_indices // max_num_seqs,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, -1)
         gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk // 4, -1)

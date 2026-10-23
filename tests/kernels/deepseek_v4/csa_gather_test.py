@@ -21,7 +21,10 @@ from absl.testing import absltest, parameterized
 from jax import lax
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
-from vllm_torchtpu.kernels.deepseek_v4.core_attention.csa_gather import csa_gather
+from vllm_torchtpu.kernels.deepseek_v4.core_attention.csa_gather import (
+    csa_gather,
+    csa_gather_topk,
+)
 
 pytestmark = pytest.mark.tpu_test
 
@@ -47,6 +50,25 @@ def gather_ref_impl(nope_cache, rope_cache, indices, top_k=1024):
     nope_out = gather_nope_ref_impl(nope_cache, indices)
     rope_out = gather_rope_ref_impl(rope_cache, indices, top_k=top_k)
     return nope_out, rope_out
+
+
+def topk_rows_ref_impl(topk, page_indices, cu_q_lens, page_size, total_pages):
+    """The cache rows of `topk`'s entries, as the TensorCore index chain had them."""
+    num_tokens, top_k = topk.shape
+    num_seqs = cu_q_lens.shape[0] - 1
+    pages_per_seq = page_indices.shape[0] // num_seqs
+    seq_ids = jnp.repeat(
+        jnp.arange(num_seqs),
+        cu_q_lens[1:] - cu_q_lens[:-1],
+        total_repeat_length=num_tokens,
+    )
+    windows = page_indices.reshape(num_seqs, pages_per_seq)[seq_ids]
+    logical = jnp.clip(topk // page_size, 0, pages_per_seq - 1)
+    page_ids = jnp.take_along_axis(windows, logical, axis=1)
+    flat = jnp.arange(num_tokens * top_k, dtype=jnp.int32).reshape(num_tokens, top_k)
+    page_ids = jnp.where(topk == -1, (flat * 104729) % total_pages, page_ids)
+    offsets = jnp.where(topk == -1, (flat * 15485863) % page_size, topk % page_size)
+    return (page_ids * page_size + offsets).reshape(-1), seq_ids
 
 
 def _random_words(key, shape):
@@ -120,6 +142,53 @@ class GatherTest(parameterized.TestCase):
 
         np.testing.assert_array_equal(nope_ref, nope_sc[:num_valid])
         np.testing.assert_array_equal(rope_ref, rope_sc[: num_valid // 4])
+
+    @parameterized.parameters(
+        (40, 256, 32),
+        (128, 512, 32),
+        (256, 512, 128),
+        (24, 128, 16),
+    )
+    def test_topk_lookup(self, num_tokens, top_k, chunk):
+        nope_cache, perm_key = create_nope_cache()
+        rope_cache, _ = create_rope_cache()
+        total_pages, page_size, _ = nope_cache.shape
+        num_seqs, pages_per_seq = 6, 9
+        rng = np.random.default_rng(0)
+        cu_q_lens = np.concatenate(
+            [[0], np.sort(rng.choice(num_tokens - 3, num_seqs - 1, replace=False) + 1)]
+        )
+        cu_q_lens = jnp.asarray(np.append(cu_q_lens, num_tokens - 3), jnp.int32)
+        topk = rng.integers(0, pages_per_seq * page_size, (num_tokens, top_k))
+        for t in range(num_tokens):
+            topk[t, rng.integers(0, top_k + 1) :] = -1
+        topk = jnp.asarray(topk, jnp.int32)
+        page_indices = jax.random.randint(
+            perm_key, (num_seqs * pages_per_seq,), 0, total_pages, dtype=jnp.int32
+        )
+        rows, seq_ids = topk_rows_ref_impl(
+            topk, page_indices, cu_q_lens, page_size, total_pages
+        )
+
+        for start in range(0, num_tokens, chunk):
+            n = min(chunk, num_tokens - start)
+            nope_sc, rope_sc = csa_gather_topk(
+                nope_cache,
+                rope_cache,
+                topk,
+                seq_ids,
+                page_indices,
+                jnp.int32(n * top_k),
+                token_start=start,
+                num_tokens=n,
+                top_k=top_k,
+                pages_per_seq=pages_per_seq,
+            )
+            nope_ref, rope_ref = gather_ref_impl(
+                nope_cache, rope_cache, rows[start * top_k : (start + n) * top_k], top_k
+            )
+            np.testing.assert_array_equal(nope_ref, nope_sc)
+            np.testing.assert_array_equal(rope_ref, rope_sc)
 
 
 if __name__ == "__main__":
