@@ -151,6 +151,7 @@ if TYPE_CHECKING:
     TPU_DSV4_SWA_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
     TPU_DSV4_SWA_Q_COMPUTE_BLOCK_SIZE: int = 16
     TPU_DSV4_SWA_KV_BLOCK_TOKENS: int = 256
+    TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS: int = 0
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -1054,6 +1055,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_DSV4_SWA_KV_BLOCK_TOKENS": env_positive_int(
         "TPU_DSV4_SWA_KV_BLOCK_TOKENS", 256
+    ),
+    # DSv4 indexer: from this many tokens per bucket on, each TP rank scores
+    # only its contiguous 1/TP of every sequence's compressed positions; the
+    # ranks exchange their top-k candidates (all-to-all) and merge them (same
+    # indices, same order as the replicated indexer). 0 = replicated indexer.
+    # Ported from patemotter fdcc70a0d/cccc1c5b7/ec1c92c5f/9fb77a965.
+    "TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS": env_int(
+        "TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS", 0
     ),
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
