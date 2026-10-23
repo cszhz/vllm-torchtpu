@@ -164,6 +164,10 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     # into every bq block's SWA state and write the normalized output; no l/m.
     hca: "HcaDecodeRefs | None" = None,
     hca_bkv_p: int = 0,
+    # Queries per kv view: each `bq_view_sz` queries of a bq block attend
+    # over the bkv_sz-token window a block of that size would fetch, read
+    # from one longer fetch, so every score lands in the lane it would have.
+    bq_view_sz: int | None = None,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert sliding_window > 0
@@ -199,6 +203,15 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     max_bkv_blocks = cdiv(bq_sz + sliding_window - 1, bkv_sz)
     single_bkv_block = max_bkv_blocks == 1
 
+    if bq_view_sz is None:
+        bq_view_sz = bq_sz
+    assert bq_sz % bq_view_sz == 0
+    num_views = bq_sz // bq_view_sz
+    # A later view's window starts up to bq_sz - bq_view_sz tokens later.
+    bkv_fetch_sz = bkv_sz + bq_sz - bq_view_sz
+    if num_views > 1:
+        assert hca is not None and single_bkv_block
+
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
     seq_idx = pl.program_id(0) + start_seq_idx
@@ -232,6 +245,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         bkv_idx,
         start_offset,
         chunk_epilogue=None,
+        q_tok_offset=0,
     ):
         assert len(q.shape) == 2
         assert len(kv.shape) == 2
@@ -279,6 +293,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 kv_len
                 - q_len
                 + bq_idx * bq_sz
+                + q_tok_offset
                 + (start_row + lax.broadcasted_iota(jnp.int32, (chunk_size, 1), 0))
                 // num_q_heads
             )
@@ -307,7 +322,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
                 l_curr = jnp.sum(p, axis=1)
                 if chunk_epilogue is not None:
-                    chunk_epilogue(c * chunk_sz, chunk_sz, qc, pv, l_curr, m_curr)
+                    chunk_epilogue(
+                        q_tok_offset + c * chunk_sz, chunk_sz, qc, pv, l_curr, m_curr
+                    )
                     continue
                 cm_ref[...] = m_curr
                 cl_ref[...] = l_curr
@@ -344,7 +361,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             0,
         )
 
-    def _start_offset(seq_idx, bq_idx):
+    def _start_offset(seq_idx, bq_idx, q_tok_offset=0):
         # Exact start of the sliding window for this (seq, bq) block, in tokens.
         # The first query row of this bq block sits at position
         #   q_pos_min = kv_len - q_len + bq_idx * bq_sz
@@ -354,6 +371,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             _get_kv_len(seq_idx)
             - _get_q_len(seq_idx)
             + bq_idx * bq_sz
+            + q_tok_offset
             - sliding_window
             + 1,
             0,
@@ -389,8 +407,8 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         kv_left_frm_new = kv_left - kv_left_frm_cache
 
-        bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
-        bkv_sz_frm_new = jnp.minimum(bkv_sz - bkv_sz_frm_cache, kv_left_frm_new)
+        bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_fetch_sz)
+        bkv_sz_frm_new = jnp.minimum(bkv_fetch_sz - bkv_sz_frm_cache, kv_left_frm_new)
         page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
         new_kv_len_start = q_end - kv_left_frm_new
@@ -407,7 +425,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             # partial head page (starting at `page_off`), bkv_p - 1 full pages, and a
             # partial tail page contributing `page_off` tokens. When page_off == 0
             # the tail copy degenerates to size 0.
-            for i in range(bkv_p + 1):
+            for i in range(cdiv(page_size - 1 + bkv_fetch_sz, page_size)):
                 if i == 0:
                     # Head page: skip the first `page_off` tokens of the page.
                     in_page_off = page_off
@@ -641,8 +659,11 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     def load_bq(bq_sem_idx):
         return bq_x2_ref.at[bq_sem_idx][...].reshape(bq_sz * num_q_heads, head_dim)
 
-    def load_bkv(bkv_sem_idx, bkv_idx, start_offset):
-        bkv_u8 = bkv_x2_ref.at[bkv_sem_idx][...]
+    def load_bkv(bkv_sem_idx, bkv_idx, start_offset, row_off=None):
+        if row_off is None:
+            bkv_u8 = bkv_x2_ref.at[bkv_sem_idx][...]
+        else:
+            bkv_u8 = bkv_x2_ref.at[bkv_sem_idx, pl.ds(row_off, bkv_sz)][...]
         # [bkv_sz, slots_per_token * kv_packing, lkv_dim] -> [bkv_sz, token_bytes]
         # bkv_u8: [bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8. The bytes
         # were stored (see `prepare_kv_inputs`) so that each pair of consecutive
@@ -832,6 +853,27 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 # because the score of invalid Q.K^T pairs are masked (to be zero) in
                 # flash attention, so that the invalid kv entries
                 # (as long as they are not NaN or inf) won't affect to the output.
+                if num_views > 1:
+                    bq = load_bq(bq_sem_idx)
+                    view_rows = bq_view_sz * num_q_heads
+                    for v in range(num_views):
+                        view_start = _start_offset(seq_idx, bq_idx, v * bq_view_sz)
+                        flash_attention(
+                            bq[v * view_rows : (v + 1) * view_rows],
+                            load_bkv(
+                                bkv_sem_idx,
+                                bkv_idx,
+                                view_start,
+                                row_off=view_start - cur_start_offset,
+                            ),
+                            bq_idx=bq_idx,
+                            bkv_idx=bkv_idx,
+                            start_offset=view_start,
+                            chunk_epilogue=chunk_epilogue,
+                            q_tok_offset=v * bq_view_sz,
+                        )
+                    return
+
                 bkv = load_bkv(
                     bkv_sem_idx,
                     bkv_idx,
@@ -1059,6 +1101,8 @@ class HcaDecodeInputs(NamedTuple):
     page_indices: jax.Array  # i32[max_num_seqs * pages_per_seq]
     # Pages per kv block; every sequence's page table must fit in one.
     num_kv_pages_per_block: int
+    # Queries per kv view of a prefill/mixed bq block (see `bq_view_sz`).
+    num_queries_per_view: int | None = None
 
 
 class SwaDecodeInputs(NamedTuple):
@@ -2052,6 +2096,7 @@ def run_mla_batched_decode_kernel(
         "q_compute_block_size",
         "lane_padded_lm",
         "hca_num_kv_pages_per_block",
+        "hca_num_queries_per_view",
         "decode_by_caller",
     ),
     donate_argnames=("cache_kv",),
@@ -2093,6 +2138,7 @@ def mla_sliding_window_ragged_paged_attention(
     hca_kv_lens_to_attend: jax.Array | None = None,
     hca_page_indices: jax.Array | None = None,
     hca_num_kv_pages_per_block: int | None = None,
+    hca_num_queries_per_view: int | None = None,
     # Skip the decode rows and append their `SwaDecodeInputs` to the result:
     # a fused kernel runs them (see `sparse_mla.SwaDecodeRefs`).
     decode_by_caller: bool = False,
@@ -2251,8 +2297,12 @@ def mla_sliding_window_ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.HBM),  # m
         ]
 
+        bq_view_sz = bq_sz
+        if hca is not None and hca.num_queries_per_view is not None:
+            bq_view_sz = min(bq_sz, hca.num_queries_per_view)
+            assert bq_sz % bq_view_sz == 0, (bq_sz, bq_view_sz)
         bkv_double_buf = pltpu.VMEM(
-            (2, bkv_sz, slots_per_token * kv_packing, lkv_dim),
+            (2, bkv_sz + bq_sz - bq_view_sz, slots_per_token * kv_packing, lkv_dim),
             jnp.uint8,
         )
 
@@ -2336,6 +2386,9 @@ def mla_sliding_window_ragged_paged_attention(
             kernel_fn = _mla_sliding_window_hca_kernel
             hca_kwargs = {"hca_bkv_p": hca.num_kv_pages_per_block}
             scope_name += f"-hca_bkvp_{hca.num_kv_pages_per_block}"
+            if bq_view_sz != bq_sz:
+                hca_kwargs["bq_view_sz"] = bq_view_sz
+                scope_name += f"-view_{bq_view_sz}"
         base = len(scalar_prefetches)
         input_output_aliases = {
             base + (1 if in_output is None else 4): 0,  # q or in_output with out
@@ -2422,6 +2475,7 @@ def mla_sliding_window_ragged_paged_attention(
             hca_kv_lens_to_attend,
             hca_page_indices,
             hca_num_kv_pages_per_block,
+            hca_num_queries_per_view,
         )
 
     if decode_by_caller:

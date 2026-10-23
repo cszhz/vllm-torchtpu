@@ -45,6 +45,7 @@ BATCH_AXIS = None
 
 # Kernel tuning (decode, prefill, mixed), from microbenchmark results.
 SWA_KV_PAGES_PER_BLOCK = (2, 2, 2)
+SWA_QUERIES_PER_BLOCK = (1, 32, 32)
 HCA_KV_PAGES_PER_BLOCK = (128, 64, 64)
 # Largest HCA kv block the SWA batched decode kernel takes in: 256 tokens
 # overflows VMEM at 128 heads and 1024 tokens.
@@ -52,6 +53,9 @@ HCA_FUSED_MAX_KV_TOKENS = 128
 # Queries per q chunk of the HCA-fused SWA prefill/mixed kernel; the SWA-only
 # kernels keep 4.
 HCA_FUSED_Q_COMPUTE_BLOCK_SIZE = 16
+# Queries per block of the HCA-fused SWA mixed kernel. Each 32 of them attend
+# over the window a 32-query block would read (`hca_num_queries_per_view`).
+HCA_FUSED_QUERIES_PER_BLOCK = 128
 
 logger.info(
     "DeepSeek-V4 attention: HCA pass fused into the SWA kernels for kv blocks "
@@ -78,6 +82,7 @@ def _run_swa(
     verify_q_len: int | None = None,
     lane_padded_lm: bool = False,
     q_compute_block_size: int = 4,
+    num_queries_per_block: tuple[int, int, int] = SWA_QUERIES_PER_BLOCK,
     **hca,
 ) -> tuple[jax.Array, ...]:
     """Sliding-window pass: updates the SWA cache and returns its partials.
@@ -109,7 +114,7 @@ def _run_swa(
         logical_page_size=logical_page_size,
         # The following parameters are tuned based on microbenchmark results.
         num_kv_pages_per_block=SWA_KV_PAGES_PER_BLOCK,
-        num_queries_per_block=(1, 32, 32),
+        num_queries_per_block=num_queries_per_block,
         q_compute_block_size=q_compute_block_size,
         unnormalized_output=not swa_only,
         non_causal_block=non_causal_block,
@@ -228,7 +233,16 @@ def _attention_hca(
         verify_q_len=verify_q_len,
         # The HCA kernel reads l/m at 128 lanes; skip the slice-then-pad.
         lane_padded_lm=True,
-        **(dict(q_compute_block_size=HCA_FUSED_Q_COMPUTE_BLOCK_SIZE) if hca else {}),
+        **(
+            dict(
+                q_compute_block_size=HCA_FUSED_Q_COMPUTE_BLOCK_SIZE,
+                num_queries_per_block=SWA_QUERIES_PER_BLOCK[:2]
+                + (HCA_FUSED_QUERIES_PER_BLOCK,),
+                hca_num_queries_per_view=SWA_QUERIES_PER_BLOCK[2],
+            )
+            if hca
+            else {}
+        ),
         **hca,
     )
     if hca:
