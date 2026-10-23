@@ -68,13 +68,14 @@ def _run_swa(
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
     lane_padded_lm: bool = False,
-    **hca_decode,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    **hca,
+) -> tuple[jax.Array, ...]:
     """Sliding-window pass: updates the SWA cache and returns its partials.
 
     When a compressed-KV pass follows, the output is left unnormalized so
     that pass can fold `swa_l` / `swa_m` into its own softmax accumulation.
-    `hca_decode` (the kernel's `hca_*` arguments) fuses that pass for decode.
+    `hca` (the kernel's `hca_*` arguments) fuses that pass instead: the result
+    is then the final output and the updated cache.
     """
     if sw_cache.shape[0] == 0:
         # Profiling-shape trace: no cache to attend over.
@@ -104,11 +105,11 @@ def _run_swa(
         non_causal_block=non_causal_block,
         chunk_prefill_size=verify_q_len,
         lane_padded_lm=lane_padded_lm,
-        **hca_decode,
+        **hca,
     )
 
 
-def _hca_decode_kv_pages_per_block(
+def _hca_fused_kv_pages_per_block(
     main_cache_kv: jax.Array,
     main_page_indices: jax.Array,
     main_cu_q_lens: jax.Array,
@@ -117,8 +118,8 @@ def _hca_decode_kv_pages_per_block(
     logical_page_size: int,
     two_caches_same_buffer: bool,
 ) -> int | None:
-    """Pages per HCA kv block when the SWA batched decode kernel can run the
-    HCA decode pass too, else None. Decided from static shapes only."""
+    """Pages per HCA kv block when the SWA kernels can run the HCA pass too,
+    else None. Decided from static shapes only."""
     if two_caches_same_buffer or main_cache_kv.dtype != jnp.uint8:
         return None
     if not uses_batched_decode(
@@ -128,11 +129,15 @@ def _hca_decode_kv_pages_per_block(
     max_num_seqs = main_cu_q_lens.shape[0] - 1
     pages_per_seq = main_page_indices.shape[0] // max_num_seqs
     page_size = main_cache_kv.shape[1] // 2
-    bkv_p = clamp_kv_pages_per_block(
-        HCA_KV_PAGES_PER_BLOCK[0], main_page_indices.shape[0], max_num_seqs, page_size
+    bkv_p, *non_decode_bkv_p = (
+        clamp_kv_pages_per_block(p, main_page_indices.shape[0], max_num_seqs, page_size)
+        for p in HCA_KV_PAGES_PER_BLOCK
     )
-    # The fused kernel runs a single kv block per sequence.
+    # The fused kernels run a single kv block per sequence, of the size the
+    # standalone HCA kernel would use in every case.
     if pages_per_seq > bkv_p or bkv_p * page_size > HCA_FUSED_MAX_KV_TOKENS:
+        return None
+    if any(p != bkv_p for p in non_decode_bkv_p):
         return None
     return bkv_p
 
@@ -176,10 +181,10 @@ def _attention_hca(
     swa_page_indices = swa_page_indices.flatten()
     main_page_indices = main_page_indices.flatten()
 
-    hca_decode = {}
+    hca = {}
     hca_bkv_p = None
     if not swa_only and sw_cache.shape[0] > 0:
-        hca_bkv_p = _hca_decode_kv_pages_per_block(
+        hca_bkv_p = _hca_fused_kv_pages_per_block(
             main_cache_kv,
             main_page_indices,
             main_cu_q_lens,
@@ -188,7 +193,7 @@ def _attention_hca(
             two_caches_same_buffer=two_caches_same_buffer,
         )
     if hca_bkv_p is not None:
-        hca_decode = dict(
+        hca = dict(
             hca_cache_kv=main_cache_kv,
             hca_kv_lens=main_kv_lens,
             hca_kv_lens_to_attend=extra,
@@ -196,7 +201,7 @@ def _attention_hca(
             hca_num_kv_pages_per_block=hca_bkv_p,
         )
 
-    swa_output, updated_sw_cache, swa_l, swa_m, *decoded_q = _run_swa(
+    swa_results = _run_swa(
         q=q,
         new_kv=new_kv,
         sw_cache=sw_cache,
@@ -213,11 +218,12 @@ def _attention_hca(
         verify_q_len=verify_q_len,
         # The HCA kernel reads l/m at 128 lanes; skip the slice-then-pad.
         lane_padded_lm=True,
-        **hca_decode,
+        **hca,
     )
-    if decoded_q:
-        # The fused kernel wrote the decode rows' output over q.
-        (q,) = decoded_q
+    if hca:
+        # The SWA kernels ran the HCA pass too: the output is final.
+        return swa_results
+    swa_output, updated_sw_cache, swa_l, swa_m = swa_results
 
     if swa_only:
         return swa_output, updated_sw_cache
@@ -244,7 +250,6 @@ def _attention_hca(
         num_kv_pages_per_block=HCA_KV_PAGES_PER_BLOCK,
         num_queries_per_block=(1, 32, 32),
         chunk_prefill_size=verify_q_len,
-        decode_in_swa_kernel=hca_bkv_p is not None,
     )
     return output, updated_sw_cache
 

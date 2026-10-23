@@ -1863,8 +1863,8 @@ def mla_sliding_window_ragged_paged_attention(
     decode_seq_batch_size: int = 32,
     # Return l/m at the kernel's 128-lane width instead of slicing to the heads.
     lane_padded_lm: bool = False,
-    # Fuse the HCA pass into the batched decode kernel (see `HcaDecodeInputs`):
-    # a fifth result is q with the decode rows' final output written over it.
+    # Fuse the HCA pass into every case (see `HcaDecodeInputs`): the result is
+    # then (final output, updated cache), the output written over q.
     hca_cache_kv: jax.Array | None = None,
     hca_kv_lens: jax.Array | None = None,
     hca_kv_lens_to_attend: jax.Array | None = None,
@@ -2161,7 +2161,10 @@ def mla_sliding_window_ragged_paged_attention(
     m = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)
     # output of swa attn is consumed by csa, hca attn, padding tokens'
     # data won't be used downstream at all, so un-initialized buffer is fine.
-    in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
+    # With HCA fusion every case writes its final rows over q instead.
+    in_output = None
+    if hca_num_kv_pages_per_block is None:
+        in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
 
     hca_decode = None
     if hca_num_kv_pages_per_block is not None:
@@ -2170,7 +2173,7 @@ def mla_sliding_window_ragged_paged_attention(
         ):
             raise ValueError("HCA fusion needs the batched decode kernel.")
         if not unnormalized_output:
-            raise ValueError("HCA fusion leaves non-decode rows unnormalized.")
+            raise ValueError("HCA fusion folds the unnormalized SWA state.")
         assert hca_kv_lens.shape == (max_num_seqs,)
         assert hca_page_indices.shape[0] % max_num_seqs == 0
         hca_decode = HcaDecodeInputs(
@@ -2195,7 +2198,7 @@ def mla_sliding_window_ragged_paged_attention(
             num_queries_per_block=num_queries_per_blocks[0],
             start_seq_idx=jnp.array(0),
             end_seq_idx=distribution[0],
-            in_output=None if hca_decode is not None else in_output,
+            in_output=in_output,
             in_l=l,
             in_m=m,
             attention_sinks=attention_sinks,
@@ -2228,28 +2231,44 @@ def mla_sliding_window_ragged_paged_attention(
             case=MlaCase.DECODE,
         )
 
-    if hca_decode is not None:
-        # Decode rows are final in the buffer that held q, other rows still
-        # hold q: the other cases read q there and write their own buffer.
-        q, output = output, in_output
-
     def run_non_decode(output, updated_kv, out_l, out_m):
-        if chunk_prefill_size is not None:
-            # Handle prefill where the query length is fixed per sequence.
-            output, updated_kv, out_l, out_m = run_mla_kernel(
+        def run_case(**kwargs):
+            if hca_decode is not None:
+                # Finish the rows in `output`, the buffer that holds q with
+                # the decode rows already final.
+                return run_mla_kernel(
+                    output,
+                    new_kv,
+                    updated_kv,
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens,
+                    in_output=None,
+                    in_l=out_l,
+                    in_m=out_m,
+                    hca=hca_decode,
+                    **kwargs,
+                )
+            return run_mla_kernel(
                 q,
                 new_kv,
                 updated_kv,
                 kv_lens,
                 page_indices,
                 cu_q_lens,
+                in_output=output,
+                in_l=out_l,
+                in_m=out_m,
+                **kwargs,
+            )
+
+        if chunk_prefill_size is not None:
+            # Handle prefill where the query length is fixed per sequence.
+            output, updated_kv, out_l, out_m = run_case(
                 num_kv_pages_per_block=num_kv_pages_per_blocks[1],
                 num_queries_per_block=num_queries_per_blocks[1],
                 start_seq_idx=distribution[0],
                 end_seq_idx=distribution[1],
-                in_output=output,
-                in_l=out_l,
-                in_m=out_m,
                 attention_sinks=attention_sinks,
                 static_q_len=chunk_prefill_size,
                 unnormalized_output=unnormalized_output,
@@ -2257,20 +2276,11 @@ def mla_sliding_window_ragged_paged_attention(
             )
 
         # Handle mixed case where the query length per sequence is variable.
-        output, updated_kv, out_l, out_m = run_mla_kernel(
-            q,
-            new_kv,
-            updated_kv,
-            kv_lens,
-            page_indices,
-            cu_q_lens,
+        output, updated_kv, out_l, out_m = run_case(
             num_kv_pages_per_block=num_kv_pages_per_blocks[2],
             num_queries_per_block=num_queries_per_blocks[2],
             start_seq_idx=distribution[1],
             end_seq_idx=distribution[2],
-            in_output=output,
-            in_l=out_l,
-            in_m=out_m,
             attention_sinks=attention_sinks,
             static_q_len=None,
             unnormalized_output=unnormalized_output,
@@ -2296,11 +2306,9 @@ def mla_sliding_window_ragged_paged_attention(
     output = prepare_outputs(
         output, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
+    if hca_decode is not None:
+        return output, updated_kv
     if not lane_padded_lm:
         out_l = out_l[:, :actual_num_q_heads]
         out_m = out_m[:, :actual_num_q_heads]
-
-    if hca_decode is not None:
-        decoded_q = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
-        return output, updated_kv, out_l, out_m, decoded_q
     return output, updated_kv, out_l, out_m
