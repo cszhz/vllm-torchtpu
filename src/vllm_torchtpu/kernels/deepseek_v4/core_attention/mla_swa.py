@@ -2349,8 +2349,18 @@ def mla_sliding_window_ragged_paged_attention(
         return kernel(*scalar_prefetches, *operands, *hca_operands)
 
     num_l_heads = align_to(num_q_heads, 128)
-    l = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
-    m = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)
+    # The kernels only write l/m; rows they skip are padding tokens'. Those
+    # are dropped (normalized or HCA-fused output) or only feed the same
+    # padding rows of the sparse kernel, so only the standalone HCA kernel's
+    # input keeps the zero fill.
+    lm_feeds_hca_kernel = (
+        unnormalized_output
+        and hca_num_kv_pages_per_block is None
+        and not decode_by_caller
+    )
+    alloc_lm = jnp.zeros if lm_feeds_hca_kernel else jnp.empty
+    l = alloc_lm((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
+    m = alloc_lm((q.shape[0], num_l_heads), dtype=jnp.float32)
     # output of swa attn is consumed by csa, hca attn, padding tokens'
     # data won't be used downstream at all, so un-initialized buffer is fine.
     # With HCA fusion every case writes its final rows over q instead.
