@@ -31,13 +31,27 @@ out="$ARTIFACT_LOCAL_DIR/results"
 server_out="$out/$role"
 mkdir -p "$coord" "$server_out"
 
+read_nonempty_file() {
+    local path="$1"
+    local value=""
+    while [[ -z "$value" ]]; do
+        if [[ -s "$path" ]]; then
+            value="$(<"$path")" || value=""
+        fi
+        [[ -n "$value" ]] || sleep 2
+    done
+    printf '%s' "$value"
+}
+
 role_ip="$(hostname -i | awk '{print $1}')"
 claim_dir="$coord/$role.claim"
 if ! mkdir "$claim_dir"; then
     echo "A $role instance already claimed coordination directory $coord" >&2
     exit 1
 fi
-printf '%s\n' "$role_ip" >"$coord/$role.ip"
+ip_tmp="$coord/$role.ip.${FALCON_EXP_ID:-$$}.tmp"
+printf '%s\n' "$role_ip" >"$ip_tmp"
+mv "$ip_tmp" "$coord/$role.ip"
 export VLLM_HOST_IP="$role_ip"
 export TPU_RAIDEN_ADVERTISE_HOST="$role_ip"
 controller_port=28340
@@ -55,12 +69,12 @@ if [[ "$config" == kimi-k3-pruned75-dspark-tp8-ep-remote ]]; then
     remote_dspark=1
     peer=decode
     [[ "$role" == prefill ]] || peer=prefill
-    until [[ -f "$coord/$peer.ip" ]]; do sleep 2; done
+    peer_ip="$(read_nonempty_file "$coord/$peer.ip")"
     export VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST
     if [[ "$role" == prefill ]]; then
         VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST="$role_ip"
     else
-        VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST="$(<"$coord/prefill.ip")"
+        VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST="$peer_ip"
     fi
 fi
 
@@ -128,7 +142,7 @@ if [[ "$role" == decode ]]; then
         sleep 5
     done
 else
-    decode_ip="$(<"$coord/decode.ip")"
+    decode_ip="$(read_nonempty_file "$coord/decode.ip")"
     VLLM_TPU_REMOTE_DSPARK_SHADOW="$remote_dspark" \
       VLLM_TPU_REMOTE_DSPARK_BATCH_SIZE=7 \
       VLLM_TPU_REMOTE_DSPARK_BYPASS_REQUESTS=1 \
