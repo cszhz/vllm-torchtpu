@@ -168,6 +168,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     # over the bkv_sz-token window a block of that size would fetch, read
     # from one longer fetch, so every score lands in the lane it would have.
     bq_view_sz: int | None = None,
+    fold_chunks: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert sliding_window > 0
@@ -209,8 +210,11 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     num_views = bq_sz // bq_view_sz
     # A later view's window starts up to bq_sz - bq_view_sz tokens later.
     bkv_fetch_sz = bkv_sz + bq_sz - bq_view_sz
+    # Every q chunk is finished as soon as its SWA state exists (see
+    # `chunk_epilogue`); a bq block that needs several kv blocks accumulates.
+    chunk_folded = single_bkv_block and fold_chunks
     if num_views > 1:
-        assert hca is not None and single_bkv_block
+        assert chunk_folded
 
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
@@ -892,21 +896,58 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
 
             # Wait for cur bq if not ready yet
             wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
-            if hca is not None and single_bkv_block:
-                # Fold the HCA block into each q chunk as soon as its SWA state
-                # exists, writing the final rows to bo: no acc/l/m round trip
-                # through VMEM scratch for the whole bq block.
+            if chunk_folded:
+                # Finish each q chunk as soon as its SWA state exists (folding
+                # the HCA block in, if any) and write its rows to bo: no
+                # acc/l/m round trip through VMEM scratch for the bq block.
                 bo_sem_idx = sem_ids_ref[2]
                 sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
                 wait_send_bo(bo_sem_idx)
 
                 def chunk_epilogue(row_tok, num_tok, qc, pv, l_val, m_val):
-                    out = fold_hca(
-                        bq_idx, qc, pv, m_val, l_val, row_tok=row_tok, num_tok=num_tok
-                    )
+                    if hca is not None:
+                        out = fold_hca(
+                            bq_idx,
+                            qc,
+                            pv,
+                            m_val,
+                            l_val,
+                            row_tok=row_tok,
+                            num_tok=num_tok,
+                        )
+                    elif unnormalized_output:
+                        out = pv.astype(q_dtype)
+                    else:
+                        attention_sinks = jnp.concat(
+                            [attention_sinks_ref[...] for _ in range(num_tok)]
+                        )
+                        l = l_val + jnp.exp(attention_sinks - m_val)  # noqa: E741
+                        out = (
+                            lax.div(pv, l[:, None])
+                            if q_dtype == jnp.float32
+                            else (pv * pl.reciprocal(l[:, None], approx=True)).astype(
+                                q_dtype
+                            )
+                        )
                     bo_x2_ref.at[bo_sem_idx, pl.ds(row_tok, num_tok)][...] = (
                         out.reshape(num_tok, num_q_heads, head_dim)
                     )
+                    if hca is not None:
+                        return
+                    if num_q_heads % 128 == 0:
+                        rows = pl.ds(row_tok, num_tok)
+                        bl_x2_ref.at[bo_sem_idx, rows][...] = l_val.reshape(
+                            num_tok, num_q_heads
+                        )
+                        bm_x2_ref.at[bo_sem_idx, rows][...] = m_val.reshape(
+                            num_tok, num_q_heads
+                        )
+                        return
+                    for i in range(num_tok):
+                        heads = slice(i * num_q_heads, (i + 1) * num_q_heads)
+                        tok = row_tok + i
+                        bl_x2_ref.at[bo_sem_idx, tok][:num_q_heads] = l_val[heads]
+                        bm_x2_ref.at[bo_sem_idx, tok][:num_q_heads] = m_val[heads]
 
                 compute_with_bkv(0, None)
                 start_send_bo(seq_idx, bq_idx, bo_sem_idx)
@@ -1100,8 +1141,6 @@ class HcaDecodeInputs(NamedTuple):
     page_indices: jax.Array  # i32[max_num_seqs * pages_per_seq]
     # Pages per kv block; every sequence's page table must fit in one.
     num_kv_pages_per_block: int
-    # Queries per kv view of a prefill/mixed bq block (see `bq_view_sz`).
-    num_queries_per_view: int | None = None
 
 
 class SwaDecodeInputs(NamedTuple):
@@ -2095,7 +2134,7 @@ def run_mla_batched_decode_kernel(
         "q_compute_block_size",
         "lane_padded_lm",
         "hca_num_kv_pages_per_block",
-        "hca_num_queries_per_view",
+        "num_queries_per_view",
         "decode_by_caller",
     ),
     donate_argnames=("cache_kv",),
@@ -2137,7 +2176,9 @@ def mla_sliding_window_ragged_paged_attention(
     hca_kv_lens_to_attend: jax.Array | None = None,
     hca_page_indices: jax.Array | None = None,
     hca_num_kv_pages_per_block: int | None = None,
-    hca_num_queries_per_view: int | None = None,
+    # Finish each q chunk of the prefill/mixed kernels in place, and run their
+    # bq blocks as kv views of this many queries (see `bq_view_sz`).
+    num_queries_per_view: int | None = None,
     # Skip the decode rows and append their `SwaDecodeInputs` to the result:
     # a fused kernel runs them (see `sparse_mla.SwaDecodeRefs`).
     decode_by_caller: bool = False,
@@ -2296,9 +2337,16 @@ def mla_sliding_window_ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.HBM),  # m
         ]
 
+        # Chunk folding needs every bq block to read a single kv block; the
+        # HCA-fused kernel always folds there.
+        fold_chunks = (
+            (hca is not None or num_queries_per_view is not None)
+            and case != MlaCase.DECODE
+            and bq_sz + sliding_window - 1 <= bkv_sz
+        )
         bq_view_sz = bq_sz
-        if hca is not None and hca.num_queries_per_view is not None:
-            bq_view_sz = min(bq_sz, hca.num_queries_per_view)
+        if fold_chunks and num_queries_per_view is not None:
+            bq_view_sz = min(bq_sz, num_queries_per_view)
             assert bq_sz % bq_view_sz == 0, (bq_sz, bq_view_sz)
         bkv_double_buf = pltpu.VMEM(
             (2, bkv_sz + bq_sz - bq_view_sz, slots_per_token * kv_packing, lkv_dim),
@@ -2319,10 +2367,8 @@ def mla_sliding_window_ragged_paged_attention(
         )
         bm_double_buf = bl_double_buf
 
-        # The HCA-fused kernel folds every q chunk straight into bo when a bq
-        # block reads a single kv block; it then never touches these.
-        chunk_folded = hca is not None and bq_sz + sliding_window - 1 <= bkv_sz
-        scratch_rows = num_q_heads if chunk_folded else bq_sz * num_q_heads
+        # A chunk-folding kernel never touches these.
+        scratch_rows = num_q_heads if fold_chunks else bq_sz * num_q_heads
         l_scratch = pltpu.VMEM(
             (scratch_rows,),
             jnp.float32,
@@ -2389,9 +2435,11 @@ def mla_sliding_window_ragged_paged_attention(
             kernel_fn = _mla_sliding_window_hca_kernel
             hca_kwargs = {"hca_bkv_p": hca.num_kv_pages_per_block}
             scope_name += f"-hca_bkvp_{hca.num_kv_pages_per_block}"
-            if bq_view_sz != bq_sz:
-                hca_kwargs["bq_view_sz"] = bq_view_sz
-                scope_name += f"-view_{bq_view_sz}"
+        if fold_chunks:
+            hca_kwargs["fold_chunks"] = True
+        if bq_view_sz != bq_sz:
+            hca_kwargs["bq_view_sz"] = bq_view_sz
+            scope_name += f"-view_{bq_view_sz}"
         base = len(scalar_prefetches)
         input_output_aliases = {
             base + (1 if in_output is None else 4): 0,  # q or in_output with out
@@ -2478,7 +2526,6 @@ def mla_sliding_window_ragged_paged_attention(
             hca_kv_lens_to_attend,
             hca_page_indices,
             hca_num_kv_pages_per_block,
-            hca_num_queries_per_view,
         )
 
     if decode_by_caller:
