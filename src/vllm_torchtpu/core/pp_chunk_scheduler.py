@@ -31,6 +31,7 @@ time budget has clipped it.
 """
 
 import math
+import os
 import time
 from typing import Any, cast
 
@@ -69,6 +70,11 @@ def uses_dynamic_chunks(vllm_config: Any) -> bool:
 
 def _prefill_end(request: Any) -> int:
     return max(request.num_prompt_tokens, request.num_tokens - 1)
+
+
+def _env_switch(name: str) -> bool:
+    """An ix-unified-port switch: on unless the variable is set to 0 / false / off."""
+    return os.environ.get(name, "1").strip().lower() not in ("0", "false", "off")
 
 
 class TpuPipelineChunkScheduler(Scheduler):
@@ -156,7 +162,13 @@ class TpuPipelineChunkScheduler(Scheduler):
                 self._retention = retention
         self._enable_memo_xstep()
         self._init_paw_sort()
-        self._promote_waiting = True
+        # ix-unified-port switches, each default 1 = this branch's behaviour; 0 restores the
+        # scheduler the old trees ran: TPU_SCHED_PAW_PROMOTE_WARMEST (warmest-first promotion),
+        # TPU_PP_QUAD_COST (PR #2243 quadratic cost: keys, pending pairs, live target ceiling),
+        # TPU_PP_INFLIGHT_COST (in-flight step costing, 4ec32d152 / 06f7b9bf9).
+        self._promote_waiting = _env_switch("TPU_SCHED_PAW_PROMOTE_WARMEST")
+        self._quad = _env_switch("TPU_PP_QUAD_COST")
+        self._inflight_cost = _env_switch("TPU_PP_INFLIGHT_COST")
         logger.info(
             "Pipeline chunk scheduler: waiting for the step cost model "
             "(hybrid_state_retention=%s, single_step_prefill=%s, "
@@ -170,7 +182,7 @@ class TpuPipelineChunkScheduler(Scheduler):
 
     def _quad_cost(self, tokens: int, prefix: int) -> float:
         """Quadratic FLOPs-equivalent token cost under the step cost model."""
-        if self._cost is not None:
+        if self._cost is not None and getattr(self, "_quad", True):
             return self._cost.effective_tokens(tokens, prefix)
         return float(max(tokens, 0))
 
@@ -371,6 +383,8 @@ class TpuPipelineChunkScheduler(Scheduler):
 
     def _enter(self, step_ms: float) -> None:
         """Records a step entering the pipeline; the oldest one leaves."""
+        if not getattr(self, "_inflight_cost", True):
+            return
         self._inflight_ms = [step_ms, *self._inflight_ms][: max(self._pp_size - 1, 0)]
 
     def pipeline_advanced(self, pushes: int = 0, settled: bool = False) -> None:
@@ -380,6 +394,8 @@ class TpuPipelineChunkScheduler(Scheduler):
         nothing is in flight, leaves the pipeline empty. Without this a
         burst that follows a wait would be costed against steps that have
         long left the pipeline."""
+        if not getattr(self, "_inflight_cost", True):
+            return
         if settled:
             self._inflight_ms = []
             return
@@ -554,8 +570,11 @@ class TpuPipelineChunkScheduler(Scheduler):
             rem = max(_prefill_end(request) - request.num_computed_tokens, 0)
             pending += rem
             pending_pairs += float(rem) * request.num_computed_tokens
+        quad = getattr(self, "_quad", True)
         for request in self.waiting:
-            warmth = self._waiting_warmth(request)
+            warmth = (
+                self._waiting_warmth(request) if quad else request.num_computed_tokens
+            )
             rem = max(_prefill_end(request) - warmth, 0)
             pending += rem
             pending_pairs += float(rem) * warmth
@@ -572,7 +591,9 @@ class TpuPipelineChunkScheduler(Scheduler):
             # The last of the work leaves the pipeline a stage count minus
             # one steps after its step enters.
             steps = -(-pending // share) + self._pp_size - 1
-            share_pairs = pending_pairs * (min(share, pending) / pending)
+            share_pairs = (
+                pending_pairs * (min(share, pending) / pending) if quad else 0.0
+            )
             step_ms = self._cost.step_ms(bucket, share_pairs, float(share) * share)
             done_ms = 0.0
             for step in range(steps):
@@ -613,6 +634,8 @@ class TpuPipelineChunkScheduler(Scheduler):
             target_ms = (
                 max(self._cost.target_ms, *live) if live else self._cost.target_ms
             )
+            if not getattr(self, "_quad", True):
+                target_ms = None
             cap = self._cost.chunk(
                 start,
                 num_new_tokens,

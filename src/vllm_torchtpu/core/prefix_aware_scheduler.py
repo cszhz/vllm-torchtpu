@@ -766,6 +766,17 @@ class PrefixAwareScheduler(AsyncScheduler):
             return max(1, mk_max_verify_rows // (1 + num_spec))
         return 32
 
+    def _promote_warmest_on(self) -> bool:
+        on = getattr(self, "_promote_warmest_switch", None)
+        if on is None:
+            on = os.environ.get("TPU_SCHED_PAW_PROMOTE_WARMEST", "1").strip().lower() not in (
+                "0",
+                "false",
+                "off",
+            )
+            self._promote_warmest_switch = on
+        return on
+
     def _inflight_prefill_reserved_blocks(self) -> int:
         reserved = self._decode_inflight_reserved_blocks()
         if (
@@ -1146,7 +1157,10 @@ class PrefixAwareScheduler(AsyncScheduler):
         try:
             # vLLM's Scheduler walks the waiting queues without a selection
             # hook, so the warmest-first promotion runs here, once per step.
-            self._select_waiting_queue_for_scheduling()
+            # TPU_SCHED_PAW_PROMOTE_WARMEST=0 (ix-unified-port) skips it: FCFS
+            # admission, as the final-lineage trees ran on vLLM 0.31.
+            if self._promote_warmest_on():
+                self._select_waiting_queue_for_scheduling()
             out = super().schedule(*args, **kwargs)
             if getattr(out, "scheduled_new_reqs", None):
                 self._maybe_pack_prompt_ids(out)
