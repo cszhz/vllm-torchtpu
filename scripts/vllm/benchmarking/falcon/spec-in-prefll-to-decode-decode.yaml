@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: spec-in-prefll-to-decode-decode-20261023-r3
+name: spec-in-prefll-to-decode-decode-20261023-r4
 exp_type: PROFILING
 artifact_type: trace
 cluster_name: gke-tpu-train-us-central1-2-prod
@@ -38,6 +38,7 @@ role_to_task_spec:
       MODEL_URI: ""
       DRAFT_MODEL_OVERRIDE: /models/Inferact/Kimi-K3-DSpark-Block5
       DSPARK_NUM_SPECULATIVE_TOKENS: "5"
+      EXTRA_SERVE_ARGS: --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8
       PYTHONUNBUFFERED: "1"
       TMPDIR: /tmp/tpu_logs/tmp
       PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
@@ -63,7 +64,7 @@ role_to_task_spec:
       - name: coord
         type: gcs
         bucket: inference-model-storage-poc-tpu-hns
-        prefix: benchmarks/spec-in-prefll-to-decode/20261023-r3
+        prefix: benchmarks/spec-in-prefll-to-decode/20261023-r4
         mount_path: /coord
         mount_options: [implicit-dirs, metadata-cache:ttl-secs:0]
     sources:
