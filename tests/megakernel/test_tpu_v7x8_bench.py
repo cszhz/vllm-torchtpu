@@ -1088,8 +1088,13 @@ def _assert_driver_created_from_real_qwen35_config(mesh: Mesh, g: Any) -> None:
     from vllm_torchtpu.megakernel_runtime import driver as driver_mod
 
     frozen_cfg = load_frozen_qwen35_config_json()
+    fake_mlp = types.SimpleNamespace(
+        experts=types.SimpleNamespace(w13_weight=jnp.zeros((g.E // 8, 1, 1)))
+    )
     backbone = types.SimpleNamespace(
-        layers=[types.SimpleNamespace() for _ in range(g.L)],
+        layers=[types.SimpleNamespace(mlp=fake_mlp) for _ in range(g.L)],
+        norm=types.SimpleNamespace(),
+        embed_tokens=lambda x: x,
         aux_hidden_state_layers=(),
     )
     model = types.SimpleNamespace(model=backbone)
@@ -1132,7 +1137,7 @@ def _assert_driver_created_from_real_qwen35_config(mesh: Mesh, g: Any) -> None:
             drv = driver_mod.maybe_create(runner)
         assert drv is not None, "maybe_create silently returned None on real config"
         assert isinstance(drv, driver_mod.Qwen35Megakernel)
-        assert drv.geom == qwen35.FULL_EP
+        assert drv.geom == dataclasses.replace(qwen35.FULL_EP, e_slots=g.E // 8)
 
 
 def test_m3_tpu_v7x8_paged_eplb_tp_bench():

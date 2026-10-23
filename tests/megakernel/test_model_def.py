@@ -1066,18 +1066,18 @@ def _independent_qwen35_spec(
 ) -> mk.ModelSpec:
     """Build expected `ModelSpec` independently of `Qwen35.to_model_spec`."""
     play = _independent_qwen35_pool_layout(g, R=R)
-    gqa_blk = GQAModule(
+    gqa_mod = GQAModule(
         pool_layout=play, prefix="self_attn", qk_norm=True, output_gate=True
     )
-    moe_blk = MoEModule(prefix="mlp", shared_gate=True)
+    moe_mod = MoEModule(prefix="mlp", shared_gate=True)
     if g.att_every == 1:
-        mixer = mk.SwitchSlot("mixer", branches=(gqa_blk,), branch_counts=(1,))
+        mixer = mk.SwitchSlot("mixer", branches=(gqa_mod,), branch_counts=(1,))
     else:
-        gdn_blk = GDNModule(prefix="linear_attn") if gdn_module is None else gdn_module
+        gdn_mod = GDNModule(prefix="linear_attn") if gdn_module is None else gdn_module
         mixer = mk.SwitchSlot(
-            "mixer", branches=(gdn_blk, gqa_blk), branch_counts=(g.att_every - 1, 1)
+            "mixer", branches=(gdn_mod, gqa_mod), branch_counts=(g.att_every - 1, 1)
         )
-    lt = mk.LayerType(name="qwen35_layer", slots=(mixer, moe_blk))
+    lt = mk.LayerType(name="qwen35_layer", slots=(mixer, moe_mod))
     backend = mk.pool.make_pool_backend(
         play, check=g.check, rec_chunk=GDNModule.chunk_rows
     )
@@ -1188,7 +1188,7 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
 
     # Runner hf_config validation: consistent fail-closed policy (log differing fields
     # and return False / maybe_create returns None, never raising on mismatched configs)
-    from frozen_utils import dict_to_namespace, load_frozen_qwen35_config_json
+    from frozen_utils import dict_to_namespace
 
     def _make_runner(hf_cfg: Any) -> Any:
         mc = types.SimpleNamespace(hf_config=hf_cfg)
@@ -1198,8 +1198,7 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         return types.SimpleNamespace(model_config=mc, vllm_config=vc)
 
     # 1) Realistic nested VLM config with nested rope_parameters succeeds (both dict
-    #    and PretrainedConfig-like attribute-style SimpleNamespace), plus the real
-    #    frozen Qwen3.5 config.json
+    #    and PretrainedConfig-like attribute-style SimpleNamespace)
     nested_rope_text = {
         k: v
         for k, v in DEFAULT_HF_CONFIG.items()
@@ -1217,8 +1216,6 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     for valid_cfg in (
         nested_vlm,
         dict_to_namespace(nested_vlm),
-        load_frozen_qwen35_config_json(),
-        dict_to_namespace(load_frozen_qwen35_config_json()),
     ):
         assert driver_mod.Qwen35Megakernel._validate_runner_hf_config(
             _make_runner(valid_cfg)
@@ -1295,6 +1292,52 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
             )
             assert driver_mod.maybe_create(_make_runner(dense_cand)) is None
         assert "Qwen35 supports MoE checkpoints only" in caplog.text
+
+
+def test_validate_runner_hf_config_frozen_qwen35_config_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Frozen Qwen3.5 `config.json` passes `_validate_runner_hf_config` (skippable)."""
+    import json
+    import types
+
+    import frozen_utils
+
+    from vllm_torchtpu.megakernel_runtime import driver as driver_mod
+
+    def _make_runner(hf_cfg: Any) -> Any:
+        mc = types.SimpleNamespace(hf_config=hf_cfg)
+        vc = types.SimpleNamespace(
+            model_config=mc, additional_config={"megakernel": {"enabled": True}}
+        )
+        return types.SimpleNamespace(model_config=mc, vllm_config=vc)
+
+    frozen_cfg = frozen_utils.load_frozen_qwen35_config_json()
+    for valid_cfg in (frozen_cfg, frozen_utils.dict_to_namespace(frozen_cfg)):
+        assert driver_mod.Qwen35Megakernel._validate_runner_hf_config(
+            _make_runner(valid_cfg)
+        )
+
+    # Verify SHA-256 mismatch on first candidate falls back to DEFAULT_FROZEN_DIR
+    bad_dir = tmp_path / "bad_frozen"
+    bad_dir.mkdir()
+    (bad_dir / "config.json").write_text("{}", encoding="utf-8")
+    good_dir = tmp_path / "good_frozen"
+    good_dir.mkdir()
+    orig_dir = Path(
+        frozen_utils.os.environ.get(
+            "MK_FROZEN_QWEN35_DIR", frozen_utils.DEFAULT_FROZEN_DIR
+        )
+    )
+    (good_dir / "config.json").write_bytes((orig_dir / "config.json").read_bytes())
+    assert (
+        json.loads((good_dir / "config.json").read_text(encoding="utf-8")) == frozen_cfg
+    )
+    monkeypatch.setattr(frozen_utils, "DEFAULT_FROZEN_DIR", str(good_dir))
+    assert frozen_utils.load_frozen_qwen35_config_json(bad_dir) == frozen_cfg
+    monkeypatch.setattr(frozen_utils, "DEFAULT_FROZEN_DIR", str(bad_dir))
+    with pytest.raises(AssertionError, match="SHA-256 mismatch"):
+        frozen_utils.load_frozen_qwen35_config_json(bad_dir)
 
 
 def test_qwen35_model_def_derived_geometry_spec_and_pool_layout_equivalence():
@@ -1404,14 +1447,14 @@ def test_qwen35_model_def_composed_reference_matches_module_loop(
     )
 
     # Verify against an independent explicit layer loop (both out and final states)
-    in_norm_blk = Norm("input_layernorm", geometry=g, zero_centered=True, eps=g.eps)
-    post_norm_blk = Norm(
+    in_norm_mod = Norm("input_layernorm", geometry=g, zero_centered=True, eps=g.eps)
+    post_norm_mod = Norm(
         "post_attention_layernorm", geometry=g, zero_centered=True, eps=g.eps
     )
-    final_norm_blk = Norm("model.norm", geometry=g, zero_centered=True, eps=g.eps)
-    gqa_blk = GQAModule(geometry=g)
-    gdn_blk = GDNModule(geometry=g)
-    moe_blk = MoEModule(geometry=g)
+    final_norm_mod = Norm("model.norm", geometry=g, zero_centered=True, eps=g.eps)
+    gqa_mod = GQAModule(geometry=g)
+    gdn_mod = GDNModule(geometry=g)
+    moe_mod = MoEModule(geometry=g)
     lay_gdn = GDNModule.lin_in_layout(g, ex)
     cr, hr = mk.rup(3 * ex.B, 8), mk.rup(3 + ex.T, 8)
     conv_in = st_l["conv"].astype(BF16).astype(F32) if pool_io else st_l["conv"]
@@ -1434,9 +1477,9 @@ def test_qwen35_model_def_composed_reference_matches_module_loop(
     }
     res = hid[: ex.B].astype(F32)
     for lyr in range(g.L):
-        x_m, _ = in_norm_blk.reference(w_l["in_norm"][lyr], res, g=g)
+        x_m, _ = in_norm_mod.reference(w_l["in_norm"][lyr], res, g=g)
         if (lyr + 1) % g.att_every == 0:
-            d_m, step_state = gqa_blk.reference(
+            d_m, step_state = gqa_mod.reference(
                 w_l,
                 x_m,
                 step_state,
@@ -1448,7 +1491,7 @@ def test_qwen35_model_def_composed_reference_matches_module_loop(
                 paged_kv=False,
             )
         else:
-            d_m, step_state = gdn_blk.reference(
+            d_m, step_state = gdn_mod.reference(
                 w_l,
                 x_m,
                 step_state,
@@ -1459,12 +1502,12 @@ def test_qwen35_model_def_composed_reference_matches_module_loop(
                 multi_layer=True,
             )
         res = rnd(res + d_m)
-        x_f, _ = post_norm_blk.reference(w_l["post_norm"][lyr], res, g=g)
-        d_f, step_state = moe_blk.reference(
+        x_f, _ = post_norm_mod.reference(w_l["post_norm"][lyr], res, g=g)
+        d_f, step_state = moe_mod.reference(
             w_l, x_f, step_state, g=g, ex=ex, layer_idx=lyr
         )
         res = rnd(res + d_f)
-    out_hand, _ = final_norm_blk.reference(w_l["final_norm"], res, g=g, out_dtype=BF16)
+    out_hand, _ = final_norm_mod.reference(w_l["final_norm"], res, g=g, out_dtype=BF16)
     conv_out = (
         step_state["conv_out"].astype(BF16).astype(F32)
         if pool_io

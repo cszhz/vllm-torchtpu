@@ -99,7 +99,7 @@ def etake(m: MoEEmit, kind: str, u):
     W, mp, sc, stream = m.W, m.mp, m.sc, m.stream
     NBE = mp.NBE
     bank = u % NBE
-    with sc("ewait", 2):
+    with sc("ewait", 3):
         w0 = W[kind].at[0, 0, 0] if mp.stack_e else W[kind][0].at[0, 0]
         stream.ecopy(kind, w0, bank).wait()
     return stream.eview(kind, bank)
@@ -232,7 +232,7 @@ def es_wait(m: MoEEmit, i):
     W, mp, sc, scr = m.W, m.mp, m.sc, m.scr
     NSS = mp.NSS
     s = i % NSS
-    with sc("swait", 2):
+    with sc("swait", 3):
         pltpu.make_async_copy(
             W["es"].at[0, 0], scr["es"].at[s], scr["es_sem"].at[s]
         ).wait()

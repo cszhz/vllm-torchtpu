@@ -1003,10 +1003,7 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     import logging
     import sys
 
-    from tests.megakernel.frozen_utils import (
-        dict_to_namespace,
-        load_frozen_qwen35_config_json,
-    )
+    from tests.megakernel.frozen_utils import dict_to_namespace
     from vllm_torchtpu.megakernel import Profile, register_profile
     from vllm_torchtpu.megakernel import profile as profile_mod
 
@@ -1037,7 +1034,13 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
         profile_mod, "_MODEL_DEFAULTS", dict(profile_mod._MODEL_DEFAULTS)
     )
 
-    real_hf_cfg = dict_to_namespace(load_frozen_qwen35_config_json())
+    real_hf_cfg = dict_to_namespace(
+        {
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "text_config": qwen35.DEFAULT_HF_CONFIG,
+        }
+    )
     model_cfg = SimpleNamespace(hf_config=real_hf_cfg)
 
     # 1. Model default profile setting `buckets=(4, 16)` and `pool_gather=None`:

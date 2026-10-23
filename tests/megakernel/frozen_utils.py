@@ -57,22 +57,24 @@ def load_frozen_qwen35_config_json(
         cands.append(pathlib.Path(frozen_dir))
     elif env_dir := os.environ.get("MK_FROZEN_QWEN35_DIR"):
         cands.append(pathlib.Path(env_dir))
-    cands.extend(
-        [
-            pathlib.Path(DEFAULT_FROZEN_DIR),
-            pathlib.Path(_REPO_ROOT_DIR).parents[1] / "frozen" / "frozen_qwen35",
-            pathlib.Path(
-                "/mnt/nfs_test/agentx-cache/nanwei_mk_m5a2_bench3/frozen_qwen35"
-            ),
-            pathlib.Path("/mnt/nfs_test/tokenizer"),
-        ]
-    )
+    default_path = pathlib.Path(DEFAULT_FROZEN_DIR)
+    if default_path not in cands:
+        cands.append(default_path)
+    mismatched: list[tuple[pathlib.Path, str]] = []
     for d in cands:
         cfg_path = d / "config.json"
         if cfg_path.is_file():
             raw = cfg_path.read_bytes()
-            assert hashlib.sha256(raw).hexdigest() == FROZEN_CONFIG_JSON_SHA256
-            return json.loads(raw.decode("utf-8"))
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest == FROZEN_CONFIG_JSON_SHA256:
+                return json.loads(raw.decode("utf-8"))
+            mismatched.append((cfg_path, digest))
+    if mismatched:
+        bad_path, bad_digest = mismatched[0]
+        raise AssertionError(
+            f"SHA-256 mismatch for {bad_path}: {bad_digest} != "
+            f"{FROZEN_CONFIG_JSON_SHA256}"
+        )
     pytest.skip(f"Set MK_FROZEN_QWEN35_DIR with config.json (checked {cands[0]})")
 
 

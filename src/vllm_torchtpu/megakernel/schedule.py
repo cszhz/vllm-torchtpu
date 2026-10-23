@@ -235,11 +235,6 @@ def _derive_att_every_and_branch_indices(
         period = declared_period
     else:
         divs = [p for p in range(2, num_layers + 1) if num_layers % p == 0]
-        if not divs:
-            raise MegakernelConfigError(
-                f"Schedule.mixer: num_layers={num_layers} is not divisible by "
-                f"attention layer count={num_att} (at layer {num_layers - 1})"
-            )
         period = max(
             divs,
             key=lambda p: (

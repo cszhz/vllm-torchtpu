@@ -114,15 +114,13 @@ def build(
     tiles = ex.resolve_tiles(g)
     scopes_lvl = int(ex.scopes)
 
-    def mod_sc(mod: Any, phase: str):
+    def sc(name: str, level: int = 2):
         return (
-            jax.named_scope(f"{mod.name}/{phase}")
-            if scopes_lvl >= 1
-            else contextlib.nullcontext()
+            jax.named_scope(name) if scopes_lvl >= level else contextlib.nullcontext()
         )
 
-    def sc(name: str, level: int = 1):
-        return jax.named_scope(name) if scopes_lvl > level else contextlib.nullcontext()
+    def mod_sc(mod: Any, phase: str):
+        return sc(f"{mod.name}/{phase}", 1)
 
     core_plan, scratch = build_scratch(model_spec, ex)
     p = core_plan.plan

@@ -35,15 +35,7 @@ from .schedule import (
     _module_cls_of,
 )
 from .spec import LayerType, ModelSpec, Module, SwitchSlot
-from .validate import (
-    describe_binding as _describe_binding,
-)
-from .validate import (
-    model_label as _model_label,
-)
-from .validate import (
-    validate_norms as _validate_norms,
-)
+from .validate import describe_binding, model_label, validate_norms
 
 
 def _merged_cfg(hf_config: Any, extras: Mapping[str, Any]) -> dict[str, Any]:
@@ -96,7 +88,7 @@ def derive_model_geometry(
         object.__setattr__(g, "_model_def", cls)
         return g
 
-    mname = _model_label(cls)
+    mname = model_label(cls)
     if not isinstance(cls.schedule, Schedule):
         raise MegakernelConfigError(f"ModelDef {mname!r}: `schedule` must be Schedule")
     cfg = cls._effective_hf_config(hf_config)
@@ -155,7 +147,7 @@ def derive_model_geometry(
     moe_g = moe_b.resolve(merged)
     eff_tp = bool(moe_g.moe_tp) if moe_tp is None else bool(moe_tp)
     eff_slots = int(moe_g.e_slots) if e_slots is None else int(e_slots)
-    zc = _validate_norms(cls, sched, merged, eps, model_name=mname)
+    zc = validate_norms(cls, sched, merged, eps, model_name=mname)
     g = cls.geometry_cls(
         L=L,
         att_every=sched.att_every,
@@ -195,9 +187,9 @@ def derive_model_spec(
     """Derive `ModelSpec` (`LayerType` + `SwitchSlot`s), failing closed on overrides."""
     g = cls.derive_geometry(hf_config_or_geom, moe_tp=moe_tp, e_slots=e_slots)
     sched = cls.resolve_schedule(g)
-    mname = _model_label(cls)
+    mname = model_label(cls)
     ovs = cls.schedule.overrides if isinstance(cls.schedule, Schedule) else {}
-    _validate_norms(
+    validate_norms(
         cls, sched, None, g.eps, expected_zc=g.zero_centered_norm, model_name=mname
     )
     for slot_name, seq in (
@@ -209,8 +201,8 @@ def derive_model_spec(
         )
         for lyr, b in enumerate(seq):
             if b != canon_n:
-                got_desc = _describe_binding(b, canon_n)
-                exp_desc = _describe_binding(canon_n)
+                got_desc = describe_binding(b, canon_n)
+                exp_desc = describe_binding(canon_n)
                 raise MegakernelConfigError(
                     f"ModelDef {mname!r}: layer {lyr} slot {slot_name!r} binding "
                     f"{got_desc} cannot be represented in ModelSpec "
@@ -232,8 +224,8 @@ def derive_model_spec(
     for lyr, b in enumerate(sched.mixer):
         exp_m = canon_att if (lyr + 1) % p == 0 else canon_rec
         if b != exp_m:
-            got_desc = _describe_binding(b, exp_m)
-            exp_desc = _describe_binding(exp_m)
+            got_desc = describe_binding(b, exp_m)
+            exp_desc = describe_binding(exp_m)
             raise MegakernelConfigError(
                 f"ModelDef {mname!r}: layer {lyr} slot 'mixer' binding {got_desc} "
                 f"cannot be represented in ModelSpec (expected {exp_desc})"
@@ -250,7 +242,7 @@ def derive_model_spec(
     )
     for lyr, b in enumerate(sched.ffn):
         if canon_ffn is None or b != canon_ffn:
-            got_desc = _describe_binding(b, canon_ffn)
+            got_desc = describe_binding(b, canon_ffn)
             raise MegakernelConfigError(
                 f"ModelDef {mname!r}: layer {lyr} slot 'ffn' binding {got_desc} "
                 "cannot be represented in ModelSpec"
@@ -309,7 +301,7 @@ def _synth_layer_types(cls: Any, g: ModelGeometry) -> tuple[str, list[str]] | No
 
 def resolve_model_schedule(cls: Any, hf_config_or_geom: Any = None) -> ResolvedSchedule:
     """Resolve per-layer schedule for `hf_config_or_geom`."""
-    mname = _model_label(cls)
+    mname = model_label(cls)
     if not isinstance(cls.schedule, Schedule):
         raise MegakernelConfigError(
             f"ModelDef {mname!r}: `schedule` must be a Schedule"

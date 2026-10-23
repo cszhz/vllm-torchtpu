@@ -243,8 +243,8 @@ def test_kernel_per_module_profiling_scopes(monkeypatch):
         def emit(self, ctx, lyr, slot):
             del lyr, slot
             with (
-                ctx.sc("inner_l1"),
-                ctx.sc("inner_l2", 2),
+                ctx.sc("inner_l2"),
+                ctx.sc("inner_l3", 3),
                 ctx.stream.segment(lazy=False),
             ):
                 return ctx.stream.dmatmul("w", ctx.scr["xb"], ctx.g.H)
@@ -311,8 +311,9 @@ def test_kernel_per_module_profiling_scopes(monkeypatch):
         assert [lbl for lbl, _ in tv_l1] == ["layer"]
 
     s_l2, _ = _trace_scopes(2)
-    assert {"scoped_mod/emit", "inner_l1", "norm_in", "smalls_sync"} <= set(s_l2)
-    assert "inner_l2" not in set(s_l2)
+    assert {"scoped_mod/emit", "inner_l2", "norm_in", "smalls_sync"} <= set(s_l2)
+    assert "inner_l3" not in set(s_l2)
+    assert "dwait" not in set(s_l2)
 
     s_l3, _ = _trace_scopes(3)
-    assert {"scoped_mod/emit", "inner_l1", "inner_l2", "dwait"} <= set(s_l3)
+    assert {"scoped_mod/emit", "inner_l2", "inner_l3", "dwait"} <= set(s_l3)

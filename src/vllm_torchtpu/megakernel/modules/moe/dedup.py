@@ -29,7 +29,7 @@ def dedup_vec(m: MoEEmit, NCP: int, MROW: int, nb_picks: int) -> tuple[Any, Any,
     """Read the vectorized route tables back into `elist`/`wlist`/`cplist`."""
     scr, sc, me = m.scr, m.sc, m.me
     R, ER = m.ex.R, m.mp.ER
-    with sc("route_dedup", 2):
+    with sc("route_dedup", 3):
         for r in range(R):
             scr["rload"][r] = scr["hits"][MROW, NCP + r]
         n_tot = scr["hits"][MROW, NCP + R]
@@ -102,7 +102,7 @@ def dedup_ecopy(
             )
 
         n_tot = jnp.int32(0)
-        with sc("route_dedup", 2):
+        with sc("route_dedup", 3):
             if WIDE:
 
                 def row_uniq(b, nt_in):
@@ -153,7 +153,7 @@ def dedup_ecopy(
             )
 
         carry = (jnp.int32(0), jnp.int32(0), jnp.int32(0))
-        with sc("route_dedup", 2):
+        with sc("route_dedup", 3):
             if WIDE:
 
                 def row_ecopy(b, c_in):
@@ -184,7 +184,7 @@ def po2c(m: MoEEmit, slot_ec: Any, n_tot: Any, n_hit: Any, n_cp: Any) -> Any:
     """Power-of-two-choices placement of the experts with a redundant copy."""
     scr, sc, me = m.scr, m.sc, m.me
     R, ER, EXTRA = m.ex.R, m.mp.ER, m.mp.EXTRA
-    with sc("route_dedup", 2):
+    with sc("route_dedup", 3):
 
         def po2c_pass1(j, _):
             e = scr["cplist"][j]
@@ -263,7 +263,7 @@ def dedup_local(m: MoEEmit, stamp: Any) -> Any:
         return n + jnp.where(new, 1, 0).astype(I32)
 
     n_hit = jnp.int32(0)
-    with sc("route_dedup", 2):
+    with sc("route_dedup", 3):
         if WIDE:
 
             def row(b, n):

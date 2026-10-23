@@ -1148,20 +1148,11 @@ class MegakernelDriver:
 
     @classmethod
     def _validate_runner_hf_config(cls, runner: Any) -> bool:
-        model_cfg = getattr(runner, "model_config", None) or getattr(
-            getattr(runner, "vllm_config", None), "model_config", None
-        )
-        hf_cfg = (
-            getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
-        )
+        hf_cfg = _runner_hf_config(runner)
         if hf_cfg is None:
             return True
         mdef = cls._model_def()
-        tc = (
-            hf_cfg.get("text_config")
-            if isinstance(hf_cfg, dict)
-            else getattr(hf_cfg, "text_config", None)
-        )
+        tc = _cfg_get(hf_cfg, "text_config")
         root = tc if tc is not None else hf_cfg
         has_geom = (
             ("hidden_size" in root)
@@ -1194,11 +1185,7 @@ class MegakernelDriver:
                 )
                 return False
             return True
-        raw_e = (
-            root.get("num_experts")
-            if isinstance(root, dict)
-            else getattr(root, "num_experts", None)
-        )
+        raw_e = _cfg_get(root, "num_experts")
         if raw_e is not None and int(raw_e) <= 0:
             logger.warning(
                 "Megakernel disabled for %s: %s supports MoE checkpoints only; "
@@ -2534,6 +2521,17 @@ class MegakernelDriver:
         return False, None
 
 
+def _cfg_get(obj: Any, key: str) -> Any:
+    return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+
+def _runner_hf_config(runner: Any) -> Any:
+    model_cfg = getattr(runner, "model_config", None) or getattr(
+        getattr(runner, "vllm_config", None), "model_config", None
+    )
+    return getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
+
+
 class Qwen35Megakernel(MegakernelDriver):
     """Qwen3.5 (`Qwen3_5MoeForConditionalGeneration`) megakernel driver."""
 
@@ -2551,35 +2549,14 @@ class Qwen35Megakernel(MegakernelDriver):
     def _validate_runner_hf_config(cls, runner: Any) -> bool:
         if not super()._validate_runner_hf_config(runner):
             return False
-        model_cfg = getattr(runner, "model_config", None) or getattr(
-            getattr(runner, "vllm_config", None), "model_config", None
-        )
-        hf_cfg = (
-            getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
-        )
+        hf_cfg = _runner_hf_config(runner)
         if hf_cfg is None:
             return True
-        tc = (
-            hf_cfg.get("text_config")
-            if isinstance(hf_cfg, dict)
-            else getattr(hf_cfg, "text_config", None)
-        )
+        tc = _cfg_get(hf_cfg, "text_config")
         root = tc if tc is not None else hf_cfg
-        raw_e = (
-            root.get("num_experts")
-            if isinstance(root, dict)
-            else getattr(root, "num_experts", None)
-        )
-        archs = (
-            hf_cfg.get("architectures")
-            if isinstance(hf_cfg, dict)
-            else getattr(hf_cfg, "architectures", None)
-        ) or ()
-        mtype = (
-            hf_cfg.get("model_type")
-            if isinstance(hf_cfg, dict)
-            else getattr(hf_cfg, "model_type", None)
-        )
+        raw_e = _cfg_get(root, "num_experts")
+        archs = _cfg_get(hf_cfg, "architectures") or ()
+        mtype = _cfg_get(hf_cfg, "model_type")
         if (
             (
                 "Qwen3_5ForConditionalGeneration" in archs
@@ -2617,40 +2594,15 @@ def register_megakernel_driver(
 
 def maybe_create(runner: Any) -> Any:
     """Create a megakernel driver for `runner` if enabled for its model architecture."""
-    model_cfg = getattr(runner, "model_config", None) or getattr(
-        getattr(runner, "vllm_config", None), "model_config", None
-    )
-    hf_cfg = getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
+    hf_cfg = _runner_hf_config(runner)
     candidates: list[str] = []
     if hf_cfg is not None:
-        archs = (
-            hf_cfg.get("architectures")
-            if isinstance(hf_cfg, dict)
-            else getattr(hf_cfg, "architectures", None)
-        ) or ()
+        archs = _cfg_get(hf_cfg, "architectures") or ()
         candidates.extend(str(a) for a in archs)
-        mtype = (
-            hf_cfg.get("model_type")
-            if isinstance(hf_cfg, dict)
-            else getattr(hf_cfg, "model_type", None)
-        )
-        if mtype:
+        if mtype := _cfg_get(hf_cfg, "model_type"):
             candidates.append(str(mtype))
-        txt_cfg = (
-            hf_cfg.get("text_config")
-            if isinstance(hf_cfg, dict)
-            else getattr(hf_cfg, "text_config", None)
-        )
-        txt_mtype = (
-            (
-                txt_cfg.get("model_type")
-                if isinstance(txt_cfg, dict)
-                else getattr(txt_cfg, "model_type", None)
-            )
-            if txt_cfg is not None
-            else None
-        )
-        if txt_mtype:
+        txt_cfg = _cfg_get(hf_cfg, "text_config")
+        if txt_cfg is not None and (txt_mtype := _cfg_get(txt_cfg, "model_type")):
             candidates.append(str(txt_mtype))
     model_cls = type(getattr(runner, "model", None)).__name__
     if model_cls and model_cls != "NoneType":

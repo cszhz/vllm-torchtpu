@@ -49,15 +49,7 @@ from .schedule import (
     Schedule,
 )
 from .spec import ModelSpec, Module
-from .validate import (
-    model_label as _model_label,
-)
-from .validate import (
-    validate_model_def as _validate_model_def,
-)
-from .validate import (
-    validate_norms as _validate_norms,
-)
+from .validate import model_label, validate_model_def, validate_norms
 
 
 class ModelDef:
@@ -96,7 +88,7 @@ class ModelDef:
         if isinstance(raw, FromHF):
             return raw
         raise MegakernelConfigError(
-            f"ModelDef {_model_label(cls)} must declare `geometry = FromHF(...)`"
+            f"ModelDef {model_label(cls)} must declare `geometry = FromHF(...)`"
         )
 
     @classmethod
@@ -106,7 +98,7 @@ class ModelDef:
         if cls.default_hf_config is not None:
             return cls.default_hf_config
         raise MegakernelConfigError(
-            f"ModelDef {_model_label(cls)!r} has no default_hf_config; "
+            f"ModelDef {model_label(cls)!r} has no default_hf_config; "
             "pass an explicit hf_config"
         )
 
@@ -153,7 +145,7 @@ class ModelDef:
         if cls.pool_layout_override is not None:
             if not callable(cls.pool_layout_override):
                 raise MegakernelConfigError(
-                    f"ModelDef {_model_label(cls)!r}: pool_layout_override not callable"
+                    f"ModelDef {model_label(cls)!r}: pool_layout_override not callable"
                 )
             return cls.pool_layout_override(g, R=R)
         return pool.derive_pool_layout(cls.layer_cache_decls(g), R=R)
@@ -217,7 +209,7 @@ class ModelDef:
     @classmethod
     def default_profile(cls) -> Profile:
         """Return the registered default `Profile` for this model."""
-        return model_default_profile(_model_label(cls))
+        return model_default_profile(model_label(cls))
 
     @classmethod
     def get_profile(cls, name: str | None = None) -> Profile:
@@ -242,7 +234,7 @@ class ModelDef:
     ) -> tuple[jax.Array, dict[str, Any]]:
         """Composed pure-JAX multi-rank reference along `schedule`."""
         sched = cls.resolve_schedule(g)
-        _validate_norms(cls, sched, None, g.eps, expected_zc=g.zero_centered_norm)
+        validate_norms(cls, sched, None, g.eps, expected_zc=g.zero_centered_norm)
         return composed_reference_step(
             sched,
             cls.final_norm,
@@ -301,7 +293,7 @@ def register_model(
                     raise MegakernelConfigError(
                         f"{kind} {k!r} is already registered to {prev.name!r}"
                     )
-        _validate_model_def(cls, name, archs, mtypes, ModelDef)
+        validate_model_def(cls, name, archs, mtypes, ModelDef)
         if replace:
             old_cls = _MODEL_REGISTRY.get(name)
             for reg in (_ARCH_REGISTRY, _MODEL_TYPE_REGISTRY):

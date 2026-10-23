@@ -63,9 +63,9 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     slot_ec = l_idx % 2
     NCP = R * EXTRA
     MROW = E // 128
-    with sc("route_topk", 2):
+    with sc("route_topk", 3):
         route_topk(m, choice, p8, VEC, slot_ec, NCP, MROW)
-    with sc("route_dma", 2):
+    with sc("route_dma", 3):
         cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
         cp.start()
         cp.wait()
@@ -82,7 +82,7 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     if "experts" in skip:
         n_hit = jnp.int32(0)
     scr["st"][0] = n_hit * TE
-    with sc("route_fetch", 2):
+    with sc("route_fetch", 3):
         if mp.stack_e:
             for k in range(NBE):
 

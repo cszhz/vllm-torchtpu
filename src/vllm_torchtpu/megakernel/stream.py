@@ -392,7 +392,7 @@ class TwoRing:
     def dtake(self, kind: str, g):
         bank = g % self.sp.NBD
         if "dense" not in self.skip:
-            with self.sc("dwait", 2):
+            with self.sc("dwait", 3):
                 self.dcopy(kind, self.W[kind].at[0, 0], bank).wait()
         return self.dview(kind, bank)
 

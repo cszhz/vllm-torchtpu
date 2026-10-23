@@ -142,25 +142,25 @@ def test_derive_qwen35_pool_layout_from_module_cache_decls():
 def test_qwen35_hf_params_transforms_and_vllm_aliases():
     """`hf_params` transforms match `split_hf_weights` bitwise and cover aliases."""
     hf_cfg_tp = _make_mock_hf_config(qwen35.TINY)
-    in_norm_blk = Norm.bind("input_layernorm", zero_centered=True).resolve(hf_cfg_tp)
-    post_norm_blk = Norm.bind("post_attention_layernorm", zero_centered=True).resolve(
+    in_norm_mod = Norm.bind("input_layernorm", zero_centered=True).resolve(hf_cfg_tp)
+    post_norm_mod = Norm.bind("post_attention_layernorm", zero_centered=True).resolve(
         hf_cfg_tp
     )
-    final_norm_blk = Norm.bind("model.norm", zero_centered=True).resolve(hf_cfg_tp)
-    gqa_blk = GQAModule.bind("self_attn").resolve(hf_cfg_tp)
-    gdn_blk = GDNModule.bind("linear_attn").resolve(hf_cfg_tp)
-    moe_blk_tp = MoEModule.bind("mlp", moe_tp=True).resolve(hf_cfg_tp)
-    moe_blk_ep = MoEModule.bind("mlp", moe_tp=False).resolve(hf_cfg_tp)
+    final_norm_mod = Norm.bind("model.norm", zero_centered=True).resolve(hf_cfg_tp)
+    gqa_mod = GQAModule.bind("self_attn").resolve(hf_cfg_tp)
+    gdn_mod = GDNModule.bind("linear_attn").resolve(hf_cfg_tp)
+    moe_mod_tp = MoEModule.bind("mlp", moe_tp=True).resolve(hf_cfg_tp)
+    moe_mod_ep = MoEModule.bind("mlp", moe_tp=False).resolve(hf_cfg_tp)
 
     # Check real HF checkpoint names, shapes, hf_shapes, and derived pads.
-    gqa_by_name = {d.name: d for d in gqa_blk.hf_params("self_attn")}
+    gqa_by_name = {d.name: d for d in gqa_mod.hf_params("self_attn")}
     assert gqa_by_name["qn"].shape == (qwen35.TINY.NH, qwen35.TINY.HD)
     assert gqa_by_name["qn"].hf_shape == (qwen35.TINY.HD,)
     assert gqa_by_name["kn"].shape == (qwen35.TINY.NKV, qwen35.TINY.HD)
     assert gqa_by_name["kn"].hf_shape == (qwen35.TINY.HD,)
     assert gqa_by_name["k_proj"].transform.transpose == (0, 2, 1)
 
-    gdn_by_name = {d.name: d for d in gdn_blk.hf_params("linear_attn")}
+    gdn_by_name = {d.name: d for d in gdn_mod.hf_params("linear_attn")}
     assert gdn_by_name["lin_q"].hf_name == "linear_attn.in_proj_qkv.weight"
     assert gdn_by_name["lin_k"].hf_name == "linear_attn.in_proj_qkv.weight"
     assert gdn_by_name["lin_v"].hf_name == "linear_attn.in_proj_qkv.weight"
@@ -173,16 +173,16 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
     assert gdn_by_name["conv"].transform.transpose is None
 
     # Every canonical parameter in every module is covered by at least one VLLMAlias.
-    for blk, sub in (
-        (in_norm_blk, "input_layernorm"),
-        (gqa_blk, "self_attn"),
-        (gdn_blk, "linear_attn"),
-        (post_norm_blk, "post_attention_layernorm"),
-        (moe_blk_tp, "mlp"),
-        (moe_blk_ep, "mlp"),
-        (final_norm_blk, "model.norm"),
+    for mod, sub in (
+        (in_norm_mod, "input_layernorm"),
+        (gqa_mod, "self_attn"),
+        (gdn_mod, "linear_attn"),
+        (post_norm_mod, "post_attention_layernorm"),
+        (moe_mod_tp, "mlp"),
+        (moe_mod_ep, "mlp"),
+        (final_norm_mod, "model.norm"),
     ):
-        b_decls = blk.hf_params(sub)
+        b_decls = mod.hf_params(sub)
         canon_names = {d.name for d in b_decls}
         covered: set[str] = set()
         for d in b_decls:
@@ -196,20 +196,20 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
 
     # Check combined_hf_param_shapes on MoE and verify apply_hf_transforms matches
     # split_hf_weights bitwise for both moe_tp=True and moe_tp=False.
-    moe_fused = combined_hf_param_shapes(moe_blk_tp.hf_params("mlp"))
+    moe_fused = combined_hf_param_shapes(moe_mod_tp.hf_params("mlp"))
     assert set(moe_fused.keys()) == {"sh13", "sh13_s", "e13", "e13_s"}
 
     ex = ExecSpec(R=2, B=2, T=1, ctx=128)
     for g_case in (qwen35.TINY, qwen35.TINY_EP):
         hf_cfg_case = _make_mock_hf_config(g_case)
-        moe_blk_case = MoEModule.bind("mlp", moe_tp=g_case.moe_tp).resolve(hf_cfg_case)
+        moe_mod_case = MoEModule.bind("mlp", moe_tp=g_case.moe_tp).resolve(hf_cfg_case)
         rep_decls = (
-            in_norm_blk.hf_params("input_layernorm")
-            + gqa_blk.hf_params("self_attn")
-            + gdn_blk.hf_params("linear_attn")
-            + post_norm_blk.hf_params("post_attention_layernorm")
-            + moe_blk_case.hf_params("mlp")
-            + final_norm_blk.hf_params("model.norm")
+            in_norm_mod.hf_params("input_layernorm")
+            + gqa_mod.hf_params("self_attn")
+            + gdn_mod.hf_params("linear_attn")
+            + post_norm_mod.hf_params("post_attention_layernorm")
+            + moe_mod_case.hf_params("mlp")
+            + final_norm_mod.hf_params("model.norm")
         )
         hf = qwen35.random_hf_weights(jax.random.PRNGKey(0), g_case)
         transformed = apply_hf_transforms(rep_decls, hf, R=ex.R)
@@ -461,11 +461,11 @@ def _pack_single_module_step_inputs(
         if sm_key in logical_weights:
             set_sm(sm_key, logical_weights[sm_key])
 
-    blk_names = {b.name for b in spec.all_modules()}
-    if "gqa" in blk_names:
+    mod_names = {m.name for m in spec.all_modules()}
+    if "gqa" in mod_names:
         set_sm("in_s", logical_weights["att_in_s"])
         set_sm("out_s", logical_weights["att_out_s"])
-    if "gdn" in blk_names:
+    if "gdn" in mod_names:
         set_sm("in_s", logical_weights["lin_in_s"])
         set_sm("out_s", logical_weights["lin_out_s"])
 
@@ -592,15 +592,15 @@ def test_gqa_module_reference_matches_kernel_make_step_cpu(T: int, paged_kv: boo
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
         jax.random.PRNGKey(10 + T), g, ex
     )
-    gqa_blk = GQAModule(geometry=g)
-    in_norm_blk = Norm(
+    gqa_mod = GQAModule(geometry=g)
+    in_norm_mod = Norm(
         "input_layernorm", geometry=g, zero_centered=g.zero_centered_norm
     )
-    final_norm_blk = Norm("model.norm", geometry=g, zero_centered=g.zero_centered_norm)
+    final_norm_mod = Norm("model.norm", geometry=g, zero_centered=g.zero_centered_norm)
 
     res = hid_l[: ex.B].astype(F32)
-    x_norm, _ = in_norm_blk.reference(w_l["in_norm"][0], res, g=g)
-    att_delta, ref_states = gqa_blk.reference(
+    x_norm, _ = in_norm_mod.reference(w_l["in_norm"][0], res, g=g)
+    att_delta, ref_states = gqa_mod.reference(
         w_l,
         x_norm,
         {"kc": st_l["kc"], "vc": st_l["vc"]},
@@ -612,12 +612,12 @@ def test_gqa_module_reference_matches_kernel_make_step_cpu(T: int, paged_kv: boo
         paged_kv=paged_kv,
     )
     res = rnd(res + att_delta)
-    ref_out, _ = final_norm_blk.reference(w_l["final_norm"], res, g=g, out_dtype=BF16)
+    ref_out, _ = final_norm_mod.reference(w_l["final_norm"], res, g=g, out_dtype=BF16)
 
     spec = ModelSpec(
         name="gqa_single",
         config=g,
-        layer_type=LayerType(name="gqa_only", slots=(gqa_blk,)),
+        layer_type=LayerType(name="gqa_only", slots=(gqa_mod,)),
         cache_backend=qwen35.qwen35_pool.qwen35_pool_backend(g) if paged_kv else None,
     )
     pos_mk, hid_mk, w_mk, st_mk = _pack_single_module_step_inputs(
@@ -709,15 +709,15 @@ def test_gdn_module_reference_matches_kernel_make_step_cpu(T: int):
         "conv": st_l4["conv"][:, :1],
         "rec": st_l4["rec"][:, :1],
     }
-    gdn_blk = GDNModule(geometry=g)
-    in_norm_blk = Norm(
+    gdn_mod = GDNModule(geometry=g)
+    in_norm_mod = Norm(
         "input_layernorm", geometry=g, zero_centered=g.zero_centered_norm
     )
-    final_norm_blk = Norm("model.norm", geometry=g, zero_centered=g.zero_centered_norm)
+    final_norm_mod = Norm("model.norm", geometry=g, zero_centered=g.zero_centered_norm)
 
     res = hid_l[: ex.B].astype(F32)
-    x_norm, _ = in_norm_blk.reference(w_l["in_norm"][0], res, g=g)
-    gdn_delta, ref_states = gdn_blk.reference(
+    x_norm, _ = in_norm_mod.reference(w_l["in_norm"][0], res, g=g)
+    gdn_delta, ref_states = gdn_mod.reference(
         w_l,
         x_norm,
         {"conv": st_l["conv"], "rec": st_l["rec"]},
@@ -728,12 +728,12 @@ def test_gdn_module_reference_matches_kernel_make_step_cpu(T: int):
         multi_layer=True,
     )
     res = rnd(res + gdn_delta)
-    ref_out, _ = final_norm_blk.reference(w_l["final_norm"], res, g=g, out_dtype=BF16)
+    ref_out, _ = final_norm_mod.reference(w_l["final_norm"], res, g=g, out_dtype=BF16)
 
     spec = ModelSpec(
         name="gdn_single",
         config=g,
-        layer_type=LayerType(name="gdn_only", slots=(gdn_blk,)),
+        layer_type=LayerType(name="gdn_only", slots=(gdn_mod,)),
     )
     pos_mk, hid_mk, w_mk, st_mk = _pack_single_module_step_inputs(
         spec, g, ex, pos, hid_l, w_l, st_l, mesh
@@ -770,15 +770,15 @@ def test_moe_module_reference_matches_kernel_make_step_cpu(moe_tp: bool):
     mesh = _cpu_mesh(ex.R)
 
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.PRNGKey(30), g, ex)
-    moe_blk = MoEModule(geometry=g, moe_tp=moe_tp)
-    post_norm_blk = Norm(
+    moe_mod = MoEModule(geometry=g, moe_tp=moe_tp)
+    post_norm_mod = Norm(
         "post_attention_layernorm", geometry=g, zero_centered=g.zero_centered_norm
     )
-    final_norm_blk = Norm("model.norm", geometry=g, zero_centered=g.zero_centered_norm)
+    final_norm_mod = Norm("model.norm", geometry=g, zero_centered=g.zero_centered_norm)
 
     res = hid_l[: ex.B].astype(F32)
-    x_moe, _ = post_norm_blk.reference(w_l["post_norm"][0], res, g=g)
-    moe_delta, _ = moe_blk.reference(
+    x_moe, _ = post_norm_mod.reference(w_l["post_norm"][0], res, g=g)
+    moe_delta, _ = moe_mod.reference(
         w_l,
         x_moe,
         None,
@@ -787,12 +787,12 @@ def test_moe_module_reference_matches_kernel_make_step_cpu(moe_tp: bool):
         layer_idx=0,
     )
     res = rnd(res + moe_delta)
-    ref_out, _ = final_norm_blk.reference(w_l["final_norm"], res, g=g, out_dtype=BF16)
+    ref_out, _ = final_norm_mod.reference(w_l["final_norm"], res, g=g, out_dtype=BF16)
 
     spec = ModelSpec(
         name="moe_single",
         config=g,
-        layer_type=LayerType(name="moe_only", slots=(moe_blk,)),
+        layer_type=LayerType(name="moe_only", slots=(moe_mod,)),
     )
     pos_mk, hid_mk, w_mk, st_mk = _pack_single_module_step_inputs(
         spec, g, ex, pos, hid_l, w_l, st_l, mesh
