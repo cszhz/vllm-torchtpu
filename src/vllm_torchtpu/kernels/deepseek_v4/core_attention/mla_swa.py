@@ -1181,6 +1181,9 @@ def _swa_window_copy_chunks(
 # Rows `swa_decode_copy_table` adds past the last sequence, so a batch of up
 # to this many sequences may start at any sequence index without a clamp.
 SWA_COPY_TABLE_PAD = 32
+# Decode sequences per grid-step batch of the batched decode kernel; at most
+# SWA_COPY_TABLE_PAD.
+DECODE_SEQ_BATCH_SIZE = 32
 
 
 class SwaCopyCols:
@@ -2050,7 +2053,7 @@ def mla_sliding_window_ragged_paged_attention(
     # sequence attend bidirectionally within themselves (window still bounds
     # context keys). Requires q_len <= sliding_window.
     non_causal_block: bool = False,
-    decode_seq_batch_size: int = 32,
+    decode_seq_batch_size: int = DECODE_SEQ_BATCH_SIZE,
     # Return l/m at the kernel's 128-lane width instead of slicing to the heads.
     lane_padded_lm: bool = False,
     # Fuse the HCA pass into every case (see `HcaDecodeInputs`): the result is
