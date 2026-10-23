@@ -912,6 +912,11 @@ DECODE_SMALL_ROWS = 16
 #: DMA of the body waits behind.
 DECODE_ASYNC_GROUP_SIZES = True
 
+#: Whether the decode path takes group_sizes as a VMEM operand, so the body's
+#: copy into SMEM is a local DMA. Its producer is an XLA op that can write it
+#: to VMEM directly. Needs DECODE_ASYNC_GROUP_SIZES.
+DECODE_GROUP_SIZES_IN_VMEM = True
+
 #: Whether the decode path pins its unpadded lhs operand to HBM. Left to XLA,
 #: it can be placed in VMEM, and each call then starts ~0.65 us after the
 #: op before it (measured in a 16-call profile).
@@ -1105,7 +1110,7 @@ def decode_kernel(
     dec: DecodeRefs,
     *,
     out_hbm_ref: jax.Array,  # [<= size_m, aligned out_size_n], VMEM if not dec.out
-    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group], HBM if dec has SMEM
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group], HBM/VMEM if dec has SMEM
     group_offset_ref: jax.Array,  # int32[1]
     lhs_hbm_ref: jax.Array,  # [<= size_m, size_k], VMEM if not dec.lhs
     rhs_hbm_ref: WeightsRef,  # [size_group, size_k, size_n]
@@ -1153,7 +1158,7 @@ def decode_kernel(
         )
 
     if dec.group_sizes is not None:
-        # lhs_group_sizes_ref is in HBM; lhs needs no group size to start.
+        # lhs_group_sizes_ref is in HBM or VMEM; lhs needs no group size to start.
         sizes_copy = pltpu.make_async_copy(
             lhs_group_sizes_ref, dec.group_sizes, dec.group_sizes_sem.at[0]
         )
@@ -2063,11 +2068,16 @@ def gmm_v2(
         bias=rhs_bias_spec,
     )
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-    lhs_spec = pl.BlockSpec(memory_space=pltpu.VMEM) if lhs_in_vmem else hbm_spec
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+    lhs_spec = vmem_spec if lhs_in_vmem else hbm_spec
     if is_decode and DECODE_ASYNC_GROUP_SIZES:
         # Only group_offset is scalar prefetched; the body fetches group_sizes.
         kernel = functools.partial(decode_entry, cfgs=cfgs)
-        num_scalar_prefetch, in_specs = 1, [hbm_spec, lhs_spec, weights_spec]
+        sizes_spec = hbm_spec
+        if DECODE_GROUP_SIZES_IN_VMEM:
+            group_sizes = pltpu.with_memory_space_constraint(group_sizes, pltpu.VMEM)
+            sizes_spec = vmem_spec
+        num_scalar_prefetch, in_specs = 1, [sizes_spec, lhs_spec, weights_spec]
         operands = (group_offset, group_sizes, lhs, rhs_weights)
     else:
         kernel = functools.partial(kernel_main, cfgs=cfgs)
