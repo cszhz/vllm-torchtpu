@@ -161,7 +161,12 @@ def _dequant_dsv4_fp8(words: jax.Array):
         axis=1,
     )[:, :NOPE_DIM]
     # scales[d] = scales[d % 64]; the 64 scale bytes are the upper half of plane 3.
-    tail = pltpu.bitcast(planes[3], jnp.float8_e8m0fnu).astype(jnp.bfloat16)
+    # e8m0 is a bare exponent with f32's bias, so moving the byte into the f32
+    # exponent field is 2^(e - 127) exactly for every code the compressor
+    # writes (its amax clamp keeps e off 0 and 0xFF). That skips the e8m0
+    # convert's special-code selects; rows past kv_len are zeroed anyway.
+    scale_bits = lax.shift_left(lax.shift_right_logical(words, 24), 23)
+    tail = pltpu.bitcast(scale_bits, jnp.float32).astype(jnp.bfloat16)
     lane = lax.broadcasted_iota(jnp.int32, tail.shape, 1)
     tile = jnp.where(
         lane < NOPE_SCALE_PERIOD, pltpu.roll(tail, NOPE_SCALE_PERIOD, 1), tail
