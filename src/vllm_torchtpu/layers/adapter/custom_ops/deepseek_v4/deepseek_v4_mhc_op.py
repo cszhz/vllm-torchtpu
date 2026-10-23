@@ -199,8 +199,8 @@ def _mhc_fused_post_pre_shared_jax(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     routed_scale: float,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """The seam op on an MoE output given as (routed, shared)."""
+) -> tuple[jax.Array, ...]:
+    """``_mhc_fused_post_pre_jax`` on an MoE output given as (routed, shared)."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
         x,
         residual,
@@ -216,6 +216,7 @@ def _mhc_fused_post_pre_shared_jax(
         sinkhorn_repeat,
         shared=shared,
         routed_scale=routed_scale,
+        emit_sumsq=True,
     )
 
 
@@ -268,8 +269,9 @@ def _mhc_fused_post_pre_jax(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """One layer's post and the next layer's pre as a single kernel."""
+) -> tuple[jax.Array, ...]:
+    """One layer's post and the next layer's pre as a single kernel; the
+    layer input's squared row sum comes last, for the attention RMSNorm."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
         x,
         residual,
@@ -283,6 +285,7 @@ def _mhc_fused_post_pre_jax(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        emit_sumsq=True,
     )
 
 
@@ -346,9 +349,15 @@ def _fake_mhc_fused_post_pre(
     return (torch.empty_like(residual), *_fake_pre_outputs(residual))
 
 
+def _fake_mhc_fused_post_pre_sumsq(x, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    outs = _fake_mhc_fused_post_pre(x, *args, **kwargs)
+    return (*outs, torch.empty_like(outs[-1][..., :1], dtype=torch.float32))
+
+
 def _fake_mhc_fused_post_pre_shared(x, shared, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
-    return _fake_mhc_fused_post_pre(x, *args, **kwargs)
+    return _fake_mhc_fused_post_pre_sumsq(x, *args, **kwargs)
 
 
 def _fake_mhc_post_head_shared(x, shared, residual, *args, **kwargs):
@@ -527,7 +536,7 @@ def _mhc_fused_post_pre_shared_op(
     routed_scale: float,
 ):
     op_name = (
-        "pallas::deepseek_v4_mhc_fused_post_pre_shared_v1"
+        "pallas::deepseek_v4_mhc_fused_post_pre_shared_v2"
         + _gate_suffix(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         )
@@ -574,9 +583,9 @@ def _mhc_fused_post_pre_op(
     normed: bool = False,
 ):
     variant = ("_res1" if single_stream_residual else "") + (
-        "_normed" if normed else ""
+        "_normed_v1" if normed else "_v2"
     )
-    op_name = f"pallas::deepseek_v4_mhc_fused_post_pre{variant}_v1" + _gate_suffix(
+    op_name = f"pallas::deepseek_v4_mhc_fused_post_pre{variant}" + _gate_suffix(
         rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
     )
     residual_spec = (
@@ -608,7 +617,9 @@ def _mhc_fused_post_pre_op(
                 *([P()] if normed else []),  # norm_weight
             ),
         )
-        op.register_fake(_fake_mhc_fused_post_pre)
+        op.register_fake(
+            _fake_mhc_fused_post_pre if normed else _fake_mhc_fused_post_pre_sumsq
+        )
         _mhc_op_cache[op_name] = op
     return op
 
@@ -628,13 +639,14 @@ class MHCOps(NamedTuple):
         (..., hc_mult, hidden_size) bf16 out.
     ``fused(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base)``
         residual_cur -- the ``post`` output -- then ``pre``'s three outputs
-        computed from it.
+        computed from it, then layer_input's squared row sum (..., 1) f32
+        for the RMSNorm that follows (the attention's).
     ``fused_with_shared(routed, shared, residual, ...)``
         ``fused`` on an MoE output given as its routed sum (before the
         routed scale) and its f32 shared-expert output.
     ``fused_normed(..., norm_weight)``
-        ``fused`` returning the layer input through an RMSNorm with
-        ``norm_weight`` and epsilon ``rms_eps``.
+        ``fused``'s first four outputs, the layer input returned through an
+        RMSNorm with ``norm_weight`` and epsilon ``rms_eps``.
     ``pre_single_stream(x, ...)`` / ``fused_normed_from_single_stream(x, r, ...)``
         ``pre`` / ``fused_normed`` for a residual whose hc_mult streams are
         copies of one (..., hidden_size) stream, which is passed instead.

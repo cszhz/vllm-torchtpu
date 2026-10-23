@@ -169,6 +169,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         post_mix, res_mix, layer_input = self.mhc_ops.pre(x, hc_fn, hc_scale, hc_base)
         return layer_input, post_mix, res_mix
 
+    def _attn_norm(self, x: torch.Tensor, x_sumsq: torch.Tensor) -> torch.Tensor:
+        """``attn_norm(x)`` given x's squared row sum, which the seam kernel
+        computed in the reduce order XLA would use; the rest are the RMSNorm's
+        own ops, which XLA fuses into the projection's input quantization."""
+        norm = self.attn_norm
+        inv_rms = torch.rsqrt(x_sumsq * (1.0 / x.shape[-1]) + norm.variance_epsilon)
+        return (x.float() * inv_rms).to(x.dtype) * norm.weight
+
     def forward(
         self,
         x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -195,6 +203,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         returned as `(routed, shared)` (see `DeepseekV4MoE.forward_parts`)
         and the next seam adds the two; `x` may then arrive that way too.
         """
+        x_sumsq = None
         if residual is None and x.dim() == 2:
             # Chain start on the embedding: its hc_mult streams are copies
             # of x, so the pre (and the seam below) read x once.
@@ -218,13 +227,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_base,
             )
             if isinstance(x, tuple):
-                residual, post_mix, res_mix, x = self.mhc_ops.fused_with_shared(
-                    *x, *seam_args
-                )
+                seam_out = self.mhc_ops.fused_with_shared(*x, *seam_args)
             else:
-                residual, post_mix, res_mix, x = self.mhc_ops.fused(x, *seam_args)
-
-        x = self.attn_norm(x)
+                seam_out = self.mhc_ops.fused(x, *seam_args)
+            residual, post_mix, res_mix, x, x_sumsq = seam_out
+        x = self.attn_norm(x) if x_sumsq is None else self._attn_norm(x, x_sumsq)
         x = self.attn(positions, x)
 
         # The seam hands the MoE its input through ffn_norm already.
