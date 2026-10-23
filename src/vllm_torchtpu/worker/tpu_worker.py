@@ -579,6 +579,10 @@ class TPUWorker(WorkerBase):
     def pp_push(self):
         return self.model_runner.pp_push()
 
+    def pp_drains_before_handoff(self) -> bool:
+        """Whether this stage drains its device slice before hand-off."""
+        return bool(getattr(self.model_runner._pp_wave, "drain_before_handoff", False))
+
     def pp_settle(self):
         return self.model_runner.pp_settle()
 

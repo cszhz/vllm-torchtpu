@@ -41,6 +41,21 @@ def is_supported_pp_transfer(transfer: Any) -> bool:
     )
 
 
+def prefill_only_mtp(vllm_config: Any) -> bool:
+    """Whether the speculative config is the prefill-only MTP a pipeline
+    admits: one MTP token on a KV producer, which drafts to fill the draft
+    layer's KV for a decode peer and never verifies."""
+    spec = vllm_config.speculative_config
+    transfer = vllm_config.kv_transfer_config
+    return (
+        spec is not None
+        and spec.method == "mtp"
+        and spec.num_speculative_tokens == 1
+        and transfer is not None
+        and bool(transfer.is_kv_producer)
+    )
+
+
 def _stage_without_full_attention(vllm_config: Any) -> str | None:
     """Describe the first stage holding no full-attention layer, or None.
 

@@ -306,7 +306,14 @@ def test_only_final_stage_initializes_mtp(monkeypatch, last):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_cache_group_marker_excludes_target_mamba(monkeypatch, enabled):
+@pytest.mark.parametrize("disable_block_drop", [False, True])
+def test_cache_group_marker_excludes_target_mamba(
+    monkeypatch, enabled, disable_block_drop
+):
+    monkeypatch.setenv(
+        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", str(int(disable_block_drop))
+    )
+    protect_boundary = enabled and not disable_block_drop
     from vllm.v1.core import kv_cache_utils
     from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -353,13 +360,15 @@ def test_cache_group_marker_excludes_target_mamba(monkeypatch, enabled):
     )
     request = SimpleNamespace(num_prompt_tokens=511, num_computed_tokens=0)
     assert Scheduler._mamba_block_aligned_split(scheduler, request, 511) == (
-        256 if enabled else 511
+        (256 if protect_boundary else 384) if enabled else 511
     )
     request.num_computed_tokens = 256
-    assert Scheduler._mamba_block_aligned_split(scheduler, request, 255) == 511
+    assert Scheduler._mamba_block_aligned_split(scheduler, request, 255) == (
+        128 if enabled and disable_block_drop else 511
+    )
     manager = SimpleNamespace(block_pool=SimpleNamespace(hash_block_size=128))
     MambaManager._cache_partial_tail_block(manager, request, 256)
-    assert retained == ([256] if enabled else [])
+    assert retained == ([256] if protect_boundary else [])
     assert request.num_prompt_tokens == 511
 
 
@@ -436,8 +445,9 @@ def test_chunk_seed_uses_known_prompt_token_and_final_sample():
 
 @pytest.mark.parametrize("block_size", [16, 32])
 @pytest.mark.parametrize("prompt_tokens", [15, 16])
+@pytest.mark.parametrize("disable_block_drop", [False, True])
 def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(
-    monkeypatch, prompt_tokens, block_size
+    monkeypatch, prompt_tokens, block_size, disable_block_drop
 ):
     import inspect
 
@@ -461,6 +471,9 @@ def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(
     import vllm_torchtpu
 
     monkeypatch.setenv("TPU_MTP_PREFILL_ONLY", "1")
+    monkeypatch.setenv(
+        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", str(int(disable_block_drop))
+    )
     monkeypatch.setattr(kv_cache_utils, "get_kv_cache_groups", lambda *a: [])
     monkeypatch.setattr(Scheduler, "_mamba_block_aligned_split", lambda *a: 0)
     for cls in (FullAttentionManager, MambaManager):
@@ -496,7 +509,7 @@ def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(
         scheduler_block_size=block_size,
         hash_block_size=4,
         enable_caching=True,
-        use_eagle=True,
+        use_eagle=not disable_block_drop,
         num_prefill_lookahead=1,
     )
 
@@ -509,6 +522,11 @@ def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(
             block_hasher=kv_cache_utils.get_request_block_hasher(4, sha256),
         )
 
+    if disable_block_drop:
+        from vllm_torchtpu.core.eagle_block_drop import clear_eagle_block_drop
+
+        clear_eagle_block_drop(manager)
+
     ids = list(range(prompt_tokens))
     cold = request("cold", ids)
     for end in (4, 8, 12, prompt_tokens):
@@ -520,11 +538,17 @@ def test_real_hybrid_cache_reuses_mtp_and_rejects_changed_lookahead(
         manager.block_pool.free_blocks(retained)
     manager.free(cold)
     manager.coordinator.new_step_starts()
-    assert manager.get_computed_blocks(request("warm", ids))[1] == 8
+    expected_hit = 12 if disable_block_drop else 8
+    assert manager.get_computed_blocks(request("warm", ids))[1] == expected_hit
     changed = ids.copy()
-    changed[8] = 99
-    # KV at MTP row 7 depends on token 8, outside the otherwise matching prefix.
-    assert manager.get_computed_blocks(request("changed", changed))[1] < 8
+    changed[expected_hit] = 99
+    # Disabling block drop deliberately permits draft-KV reuse across a changed
+    # lookahead. Target KV remains exact; draft acceptance can change.
+    changed_hit = manager.get_computed_blocks(request("changed", changed))[1]
+    if disable_block_drop:
+        assert changed_hit == expected_hit
+    else:
+        assert changed_hit < expected_hit
     assert manager.reset_prefix_cache()
     assert manager.get_computed_blocks(request("reset", ids))[1] == 0
 
