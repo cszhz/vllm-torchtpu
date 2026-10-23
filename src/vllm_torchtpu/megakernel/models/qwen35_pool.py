@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3.5 raw-pool layout: `PoolLayout` / `PoolBackend` from `Qwen35Geometry`.
+"""Qwen3.5 raw-pool layout: `PoolLayout` / `PoolBackend` from `Qwen35`.
 
 Each of the `g.NATT` attention layers owns one raw pool holding its KV pages and
 the checkpoint slots of the `att_every - 1` GDN layers preceding it (see
@@ -26,8 +26,6 @@ from typing import Any
 import jax
 
 from .. import pool
-from ..blocks.gdn import GDNBlock
-from ..blocks.gqa import GQABlock
 from ..decls import KVCacheDecl, RecurrentCacheDecl
 from ..exec_spec import ExecSpec
 from ..pool import (
@@ -45,29 +43,24 @@ from ..pool.config import PoolBackend
 def qwen35_layer_cache_decls(
     g: Any,
 ) -> list[KVCacheDecl | RecurrentCacheDecl]:
-    """Build the per-layer cache declaration sequence for `Qwen35Geometry`."""
-    kv_decl = GQABlock(geometry=g).cache_decl(g)
-    if g.att_every == 1:
-        return [kv_decl] * g.NATT
-    rec_decl = GDNBlock(geometry=g).cache_decl(g)
-    group: list[KVCacheDecl | RecurrentCacheDecl] = [rec_decl] * (g.att_every - 1) + [
-        kv_decl
-    ]
-    return group * g.NATT
+    """Build the per-layer cache declaration sequence for `Qwen35`."""
+    from .qwen35 import Qwen35
+
+    return Qwen35.layer_cache_decls(g)
 
 
 def qwen35_pool_layout(g: Any, *, R: int = 8) -> PoolLayout:
-    """`PoolLayout` of `Qwen35Geometry`, derived from per-layer block cache decls."""
-    return pool.derive_pool_layout(qwen35_layer_cache_decls(g), R=R)
+    """`PoolLayout` of `Qwen35Geometry`, derived from `Qwen35` schedule cache decls."""
+    from .qwen35 import Qwen35
+
+    return Qwen35.pool_layout(g, R=R)
 
 
-def qwen35_pool_backend(g: Any) -> PoolBackend:
+def qwen35_pool_backend(g: Any, *, R: int = 8) -> PoolBackend:
     """Create the model-injected `PoolBackend` for `Qwen35Geometry`."""
-    return pool.make_pool_backend(
-        qwen35_pool_layout(g),
-        check=getattr(g, "check", None),
-        rec_chunk=GDNBlock.chunk_rows,
-    )
+    from .qwen35 import Qwen35
+
+    return Qwen35.pool_backend(g, R=R)
 
 
 def default_pool_layout(g: Any, ex: ExecSpec) -> tuple[Any, ...]:

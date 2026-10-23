@@ -13,6 +13,20 @@
 # limitations under the License.
 """Model specifications and reference oracles built on the TPU megakernel library."""
 
-from . import qwen35, qwen35_candidate30, qwen35_profile
+from . import (
+    qwen35,
+    qwen35_candidate30,
+    qwen35_pack,
+    qwen35_pool,
+    qwen35_profile,
+    qwen35_weights,
+)
 
-__all__ = ["qwen35", "qwen35_candidate30", "qwen35_profile"]
+__all__ = [
+    "qwen35",
+    "qwen35_candidate30",
+    "qwen35_pack",
+    "qwen35_pool",
+    "qwen35_profile",
+    "qwen35_weights",
+]
