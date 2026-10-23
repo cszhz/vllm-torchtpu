@@ -106,25 +106,9 @@ only_docs_changed() {
   [[ -n "${files}" && -z "${non_skippable}" ]]
 }
 
-INTEGRATION_SLUG="${VLLM_INTEGRATION_PIPELINE_SLUG:-vllm-torchtpu-integration}"
-pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
-has_perf_label=0
-has_full_ci_label=0
-if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
-  if grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}"; then
-    has_perf_label=1
-  fi
-  if grep -qx "run-full-ci" <<< "${pr_labels//,/$'\n'}"; then
-    has_full_ci_label=1
-    export NIGHTLY=1
-  fi
-fi
-
 FILES_CHANGED=""
-DIFF_RESOLVED=0
-if [[ "${NIGHTLY:-0}" == "1" || "${TORCHTPU_NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
-  : # Nightly and LKG integration builds test the full suite regardless of last commit diff.
-elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+PR_DIFF_RESOLVED=0
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
   BASE_BRANCH=${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-"main"}
   echo "PR detected. Target branch: ${BASE_BRANCH}"
 
@@ -137,7 +121,7 @@ elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_RE
 
   if FILES_CHANGED=$(git diff --name-only origin/"${BASE_BRANCH}"..."${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null) \
       && [[ -n "${FILES_CHANGED}" ]]; then
-    DIFF_RESOLVED=1
+    PR_DIFF_RESOLVED=1
   else
     FILES_CHANGED=$(git diff-tree --no-commit-id --name-only -r -m "${BUILDKITE_COMMIT:-HEAD}")
   fi
@@ -146,25 +130,24 @@ elif [[ "${BUILDKITE_SOURCE:-}" != "schedule" ]]; then
   # so its diff against its parent is the whole change. Not a scheduled build:
   # the nightly tests main as it stands, whatever its last commit touched.
   git fetch origin "${BUILDKITE_COMMIT:-HEAD}" --depth=2 --quiet || true
-  if FILES_CHANGED=$(git diff --name-only "${BUILDKITE_COMMIT:-HEAD}^" "${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null) \
-      && [[ -n "${FILES_CHANGED}" ]]; then
-    DIFF_RESOLVED=1
-  fi
+  FILES_CHANGED=$(git diff --name-only "${BUILDKITE_COMMIT:-HEAD}^" "${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null || true)
 fi
 
+pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
 if [[ -n "${FILES_CHANGED}" ]]; then
   echo "Files changed:"
   echo "${FILES_CHANGED}"
 
-  if [[ "${DIFF_RESOLVED}" == "1" ]] && only_docs_changed "${FILES_CHANGED}"; then
+  if only_docs_changed "${FILES_CHANGED}"; then
     echo "Only documentation/non-code files changed. Skipping CI build."
     exit 0
   fi
 
-  if [[ "${DIFF_RESOLVED}" == "1" && -z "${CI_LANES:-}" ]]; then
+  if [[ "${PR_DIFF_RESOLVED}" == "1" && -z "${CI_LANES:-}" ]] \
+      && ! grep -qx "run-full-ci" <<< "${pr_labels//,/$'\n'}"; then
     eval "$(printf '%s\n' "${FILES_CHANGED}" | python3 "${SCRIPT_DIR}/select_pr_tests.py" --shell)"
     if [[ "${PR_SKIP_ALL_CI:-0}" == "1" ]]; then
-      if [[ "${has_perf_label}" == "1" ]]; then
+      if grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}"; then
         PR_SELECTED_LANES="verify perf"
         PR_TEST_SELECTION_ANNOTATION="Diff-aware PR test selection: running verify + perf lanes (\`run-perf-eval\` label)."
       else
@@ -178,6 +161,9 @@ if [[ -n "${FILES_CHANGED}" ]]; then
 fi
 
 echo "--- Starting Buildkite Bootstrap"
+
+# Resolve and Publish Version Metadata
+INTEGRATION_SLUG="${VLLM_INTEGRATION_PIPELINE_SLUG:-vllm-torchtpu-integration}"
 
 if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   # Integration pipeline tests upstream HEAD
@@ -212,13 +198,16 @@ fi
 # run-full-ci; adding either label to a ready PR starts a build.
 ALL_LANES="verify perf integration tests"
 default_lanes="${PR_SELECTED_LANES:-verify integration tests}"
-if [[ "${has_full_ci_label}" == "1" ]]; then
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
+    && grep -qx "run-full-ci" <<< "${pr_labels//,/$'\n'}"; then
+  export NIGHTLY=1
   buildkite-agent annotate --style info --context full-ci \
     "Runs the full (nightly) suite (\`run-full-ci\` label)."
 fi
 if [[ "${NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   default_lanes="${ALL_LANES}"
-elif [[ "${has_perf_label}" == "1" ]]; then
+elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
+    && grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}"; then
   if [[ " ${default_lanes} " != *" perf "* ]]; then
     default_lanes="${default_lanes} perf"
   fi
