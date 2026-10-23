@@ -92,6 +92,7 @@ def run_bucket(
     router_gain: float = 1.0,
     interpret: bool = False,
     profile: str = "default",
+    ref_precision: str = "highest",
 ) -> dict:
     R = mesh.size
     ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=interpret, tiles=tiles)
@@ -107,10 +108,13 @@ def run_bucket(
 
     # The library references index with concrete values, so this runs eagerly.
     moe_in: list = []
-    ref, _ = segment_reference(
-        g, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L,
-        moe_inputs=moe_in,
-    )
+    # TPU's default f32 matmul precision is a single bf16 pass; the reference
+    # must not be less precise than the kernel it checks.
+    with jax.default_matmul_precision(ref_precision):
+        ref, _ = segment_reference(
+            g, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L,
+            moe_inputs=moe_in,
+        )
     # Per token, the smallest gap between the TOPK-th and next router logit over
     # the segment's MoE layers: a near-tie the kernel may resolve differently.
     gaps = []
@@ -211,6 +215,7 @@ def run_bucket(
         "router_gain": router_gain,
         "zero": list(zero),
         "profile": profile,
+        "ref_precision": ref_precision,
         "H": g.H,
         "I": g.I,
         "moe_path": moe_path,
@@ -240,6 +245,7 @@ def main() -> None:
     ap.add_argument("--router-gain", type=float, nargs="+", default=[1.0])
     ap.add_argument("--geom", nargs="+", default=["2560:640"], help="H:I geometry overrides")
     ap.add_argument("--profile", nargs="+", default=["default"], help="default | pipe_ep | pipe")
+    ap.add_argument("--ref-precision", nargs="+", default=["highest"], help="highest | default")
     args = ap.parse_args()
     g, tiny_tiles = qwen38.FULL, None
     devs = jax.devices()
@@ -259,12 +265,14 @@ def main() -> None:
     for g in geoms:
       for L in args.layers:
         for B in args.rows:
-          for (gn, z, rg), prof in [(a, pr) for a in arms for pr in args.profile]:
+          for (gn, z, rg), prof, rp in [
+              (a, pr, rp) for a in arms for pr in args.profile for rp in args.ref_precision
+          ]:
             tiles = tiny_tiles if args.tiny else tile_profile(prof, B)
             try:
                 r = run_bucket(
                     g, B, args.T, L, mesh, args.chains, tiles, gn,
-                    () if z == "none" else (z,), rg, args.tiny, prof,
+                    () if z == "none" else (z,), rg, args.tiny, prof, rp,
                 )
             except Exception as e:  # noqa: BLE001 — report and continue to the next bucket
                 r = {"rows": B, "L": L, "error": f"{type(e).__name__}: {e}"[:2000]}
