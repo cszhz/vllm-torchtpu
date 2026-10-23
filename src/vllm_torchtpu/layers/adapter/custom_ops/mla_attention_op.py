@@ -2055,6 +2055,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             # heads.
             setattr(self.o_proj, DCP_ROWS_ATTR, True)
             self.mla_attn.o_proj = self.o_proj
+        # TPU_DCP_MERGE_CHUNKED_OPROJ_AR: the V-space chunked merge hands its
+        # chunks over unjoined and forward runs o_proj per chunk. Not with an
+        # output gate, which multiplies the joined output.
+        self.mla_attn.oproj_per_chunk = bool(
+            envs.TPU_DCP_MERGE_CHUNKED_OPROJ_AR
+            and self.mla_attn.dcp_q_replicate
+            and self.g_proj is None
+            and not self.gate_is_fused
+        )
 
         self.prefix = prefix
 
@@ -2342,6 +2351,29 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         elif self.g_proj is not None:
             attn_out *= self.g_proj(hidden_states)[0].sigmoid()
         w_o = getattr(self.mla_attn, "W_O_dcp_qrep", None)
+        if isinstance(attn_out, list) and isinstance(attn_out[0], torch.Tensor):
+            # TPU_DCP_MERGE_CHUNKED_OPROJ_AR: this rank's heads, merged per
+            # token chunk. o_proj and its all-reduce per chunk, so a chunk's
+            # all-reduce runs under the later chunks' merge and o_proj; each
+            # all-reduce is ordered after the one before, or XLA combines them
+            # after the last o_proj. The same matmul and all-reduce as
+            # `self.o_proj(x)` on each chunk's rows.
+            outs: list[torch.Tensor] = []
+            for x in attn_out:
+                y = self.o_proj.quant_method.apply(self.o_proj, x, None)
+                if outs:
+                    y = _after(y, outs[-1])
+                outs.append(tensor_model_parallel_all_reduce(y))
+            out = outs[0] if len(outs) == 1 else torch.cat(outs)
+            # The other token-count branches' weights (_retain_buffers: no
+            # data is read), as the bucket warmup requires.
+            return _retain_buffers(
+                out,
+                w_o,
+                getattr(self.mla_attn, "W_O_dcp_qrep_scale", None),
+                getattr(self.o_proj, FP8_PALLAS_WEIGHT, None),
+                getattr(self.o_proj, FP8_PALLAS_SCALE, None),
+            )
         if w_o is not None:
             # TPU_DCP_MLA_OPROJ_ALL_REDUCE: the large buckets run the group's
             # o_proj (W_O_dcp_qrep), the others o_proj itself, as with the flag

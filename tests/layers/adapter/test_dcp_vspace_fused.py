@@ -108,6 +108,44 @@ def test_vspace_merge_is_the_latent_merge_then_w_uv(monkeypatch, lse_ag):
         )
 
 
+@pytest.mark.parametrize("lse_ag", [False, True])
+def test_vspace_merge_pieces_are_the_joined_merge(monkeypatch, lse_ag):
+    """TPU_DCP_MERGE_CHUNKED_OPROJ_AR: `pieces=True` hands the chunks over
+    unjoined, bit for bit the joined merge's rows, in token order."""
+    rng = np.random.default_rng(11)
+    outputs = torch.from_numpy(rng.standard_normal((D, T, H, C)).astype(np.float32))
+    lses = torch.from_numpy((rng.standard_normal((D, T, H)) * 3).astype(np.float32))
+    lses[2, 5] = float("-inf")
+    w_uv = torch.from_numpy(rng.standard_normal((H, C, V)).astype(np.float32))
+    for k, val in {
+        "TPU_DCP_MERGE_VSPACE_FUSED": True,
+        "TPU_DCP_LSE_MERGE_A2A": False,
+        "TPU_DCP_MERGE_CHUNKED": 2,
+        "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": 0,
+        "TPU_DCP_MERGE_CHUNKED_SMALL": 0,
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG": lse_ag,
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": 0,
+        "TPU_DCP_MLA_MERGE_PIECES": 0,
+        "TPU_DCP_MERGE_RS_BF16": 0,
+        "TPU_DCP_RS_OUT_PRECISION": False,
+    }.items():
+        monkeypatch.setattr(cp_mla.envs, k, val, raising=False)
+    for rank in range(D):
+        joined_group = _Group(outputs, lses, w_uv, rank)
+        monkeypatch.setattr(cp_mla, "get_dcp_group", lambda g=joined_group: g)
+        joined = cp_mla.merge_lse_partials_scatter_heads_vspace(
+            outputs[rank], lses[rank], w_uv, None
+        )
+        pieces_group = _Group(outputs, lses, w_uv, rank)
+        monkeypatch.setattr(cp_mla, "get_dcp_group", lambda g=pieces_group: g)
+        pieces = cp_mla.merge_lse_partials_scatter_heads_vspace(
+            outputs[rank], lses[rank], w_uv, None, pieces=True
+        )
+        assert isinstance(pieces, list) and len(pieces) == 2
+        assert [p.shape for p in pieces] == [(T // 2, LOCAL, V)] * 2
+        assert torch.equal(torch.cat(pieces), joined)
+
+
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("scaled", [False, True])
 def test_vspace_operand_kernel_matches_reference(scaled):

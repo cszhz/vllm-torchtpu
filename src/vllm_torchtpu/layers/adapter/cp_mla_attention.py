@@ -235,19 +235,30 @@ def merge_lse_partials_scatter_heads_vspace(
     w_uv: torch.Tensor,
     w_uv_scale: torch.Tensor | None,
     wire_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
+    pieces: bool = False,
+) -> torch.Tensor | list[torch.Tensor]:
     """`merge_lse_partials_scatter_heads` on a bucket `vspace_fused_applies`
     takes, merging in V space: every chunk projects this rank's latent
     partial `[T, H, C]` through W_UV `[H, C, V]` for all `H` heads, weights it
     and reduce-scatters the V-wide result. Returns `[T, H / world, V]`, this
-    rank's heads already through W_UV."""
+    rank's heads already through W_UV; with `pieces`
+    (TPU_DCP_MERGE_CHUNKED_OPROJ_AR), the chunks' `[T / chunks, H / world, V]`
+    results unjoined, in token order."""
     group = get_dcp_group()
     narrow = envs.TPU_DCP_RS_OUT_PRECISION
     rs_dtype = (wire_dtype or output.dtype) if narrow else None
     chunks = _merge_chunks(output.shape[0])
     merged = _merge_chunked(
-        output, lse, group, chunks, rs_dtype=rs_dtype, vspace=(w_uv, w_uv_scale)
+        output,
+        lse,
+        group,
+        chunks,
+        rs_dtype=rs_dtype,
+        vspace=(w_uv, w_uv_scale),
+        pieces=pieces,
     )
+    if pieces:
+        return [_retain_rank(merged[0]), *merged[1:]]
     return _retain_rank(merged)
 
 
@@ -283,10 +294,12 @@ def _merge_chunked(
     chunks: int,
     rs_dtype: torch.dtype | None = None,
     vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
-) -> torch.Tensor:
+    pieces: bool = False,
+) -> torch.Tensor | list[torch.Tensor]:
     """The reduce-scatter merge (`cp_lse_ag_out_rs`) over `chunks`
     independent token chunks. `vspace` (TPU_DCP_MERGE_VSPACE_FUSED):
     `(W_UV, scale)` over every head; the result is `[T, H / world, V]`.
+    `pieces`: the chunks' results as a list, not joined.
 
     Every token's merge depends on its own row alone (the lse all-gather,
     logsumexp, weight and reduce-scatter sum all run per token), so splitting
@@ -300,15 +313,15 @@ def _merge_chunked(
     step = output.shape[0] // chunks
     if _lse_gathered_once(output.shape[0]):
         return _merge_chunked_lse_gathered(
-            output, lse, group, chunks, rs_dtype, vspace=vspace
+            output, lse, group, chunks, rs_dtype, vspace=vspace, pieces=pieces
         )
     if envs.TPU_DCP_MERGE_RS_BF16 or envs.TPU_DCP_MERGE_WEIGHTED_HM or vspace:
         # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype
         # (RS_BF16) and/or the heads-major operand (WEIGHTED_HM).
         lse_f32 = lse.to(torch.float32)
-        pieces: list[torch.Tensor] = []
+        merged: list[torch.Tensor] = []
         for c in range(chunks):
-            pieces.append(
+            merged.append(
                 _weighted_reduce_scatter(
                     output[c * step : (c + 1) * step],
                     lse_f32[c * step : (c + 1) * step],
@@ -318,8 +331,8 @@ def _merge_chunked(
                     vspace=vspace,
                 )
             )
-        return torch.cat(pieces, dim=0)
-    pieces = [
+        return merged if pieces else torch.cat(merged, dim=0)
+    merged = [
         cp_lse_ag_out_rs(
             output[c * step : (c + 1) * step],
             lse[c * step : (c + 1) * step],
@@ -328,7 +341,7 @@ def _merge_chunked(
         )
         for c in range(chunks)
     ]
-    return torch.cat(pieces, dim=0)
+    return merged if pieces else torch.cat(merged, dim=0)
 
 
 def _lse_gathered_once(num_tokens: int) -> bool:
@@ -480,7 +493,8 @@ def _merge_chunked_lse_gathered(
     chunks: int,
     rs_dtype: torch.dtype | None = None,
     vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
-) -> torch.Tensor:
+    pieces: bool = False,
+) -> torch.Tensor | list[torch.Tensor]:
     """`_merge_chunked` with one lse all-gather for every chunk
     (`TPU_DCP_MERGE_CHUNKED_LSE_AG`).
 
@@ -508,9 +522,9 @@ def _merge_chunked_lse_gathered(
     else:
         gathered = _gather_lse(lse_f32, group)
         rows = [gathered[:, c * step : (c + 1) * step] for c in range(chunks)]
-    pieces: list[torch.Tensor] = []
+    merged: list[torch.Tensor] = []
     for c in range(chunks):
-        pieces.append(
+        merged.append(
             _weighted_reduce_scatter(
                 output[c * step : (c + 1) * step],
                 lse_f32[c * step : (c + 1) * step],
@@ -520,7 +534,7 @@ def _merge_chunked_lse_gathered(
                 vspace=vspace,
             )
         )
-    return torch.cat(pieces, dim=0)
+    return merged if pieces else torch.cat(merged, dim=0)
 
 
 def _fake_lse_rescale_quantize(

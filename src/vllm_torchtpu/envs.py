@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_VSPACE_FUSED: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = True
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
+    TPU_DCP_MLA_OPROJ_ALL_REDUCE_MAX_TOKENS: int = 0
+    TPU_DCP_MERGE_CHUNKED_OPROJ_AR: bool = False
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
@@ -815,6 +817,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS": env_int(
         "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS", 512
     ),
+    # Its largest bucket: steps of more tokens keep the merge. 0 = no cap.
+    # Where the merge is already chunked and hidden (TPU_DCP_MERGE_CHUNKED,
+    # V-space), the replicated o_proj's 8x matmul costs more than the
+    # reduce-scatter it removes: on the AgentX c16 twin it wins 1-3.5% up to
+    # 1024 tokens and loses 2.4% at 4096.
+    "TPU_DCP_MLA_OPROJ_ALL_REDUCE_MAX_TOKENS": env_int(
+        "TPU_DCP_MLA_OPROJ_ALL_REDUCE_MAX_TOKENS", 0
+    ),
+    # On the backbone buckets the V-space chunked merge serves
+    # (TPU_DCP_MERGE_VSPACE_FUSED), run o_proj and its TP all-reduce per merge
+    # chunk instead of once on the joined result, so each chunk's all-reduce
+    # (SparseCore-offloaded) runs under the next chunks' merge and o_proj.
+    # o_proj keeps this rank's heads (no replication); the per-row arithmetic
+    # is unchanged. The unchunked all-reduce is exposed: ~340 us of a ~1690 us
+    # attention layer at 4096 tokens on the AgentX c16 twin. Not with an
+    # output gate (applied to the joined output).
+    "TPU_DCP_MERGE_CHUNKED_OPROJ_AR": env_bool("TPU_DCP_MERGE_CHUNKED_OPROJ_AR"),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
     # them in VMEM and its output aliases q_nope (512 wide), instead of the

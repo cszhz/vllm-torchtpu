@@ -2824,11 +2824,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> torch.Tensor | list[tuple[torch.Tensor, torch.Tensor]]:
+    ) -> torch.Tensor | list[tuple[torch.Tensor, torch.Tensor]] | list[torch.Tensor]:
         """Executes complete TPU multi-head latent attention evaluation.
 
         A large qrep step under TPU_DCP_MLA_OPROJ_ALL_REDUCE returns the
-        unmerged, quantized `weight_lse_partials` instead of the output."""
+        unmerged, quantized `weight_lse_partials` instead of the output; a
+        V-space chunked merge under TPU_DCP_MERGE_CHUNKED_OPROJ_AR returns its
+        merged token chunks unjoined."""
         assert isinstance(q, tuple) and len(q) == 2, (
             "q must be a tuple of (q_nope, q_pe)"
         )
@@ -3059,6 +3061,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                             and partial.shape[0]
                             <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
                         )
+                        and (
+                            envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE_MAX_TOKENS <= 0
+                            or partial.shape[0]
+                            <= envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE_MAX_TOKENS
+                        )
                     )
                     if (
                         uv_first
@@ -3070,6 +3077,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         # Experimental TPU_DCP_MERGE_VSPACE_FUSED: the chunked
                         # merge builds its operand in V space (no pre-merge
                         # projection); same W_UV buffers as uv_first.
+                        # TPU_DCP_MERGE_CHUNKED_OPROJ_AR: the chunks go to the
+                        # wrapper unjoined, for o_proj + all-reduce per chunk.
+                        chunked_oproj = envs.TPU_DCP_MERGE_CHUNKED_OPROJ_AR and getattr(
+                            layer, "oproj_per_chunk", False
+                        )
                         outputs = (
                             _cp_mla_attention.merge_lse_partials_scatter_heads_vspace(
                                 partial,
@@ -3077,8 +3089,22 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                 layer.W_UV_dcp_qrep,
                                 layer.W_UV_dcp_qrep_scale,
                                 wire_dtype=wire_dtype,
+                                pieces=chunked_oproj,
                             )
                         )
+                        if chunked_oproj:
+                            rows = layer.num_heads * layer.v_head_dim
+                            pieces = [
+                                p.to(input_dtype).reshape(-1, rows) for p in outputs
+                            ]
+                            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS > 0:
+                                # The latent-merge buckets' W_UV, as at the end.
+                                pieces[0] = _retain_buffers(
+                                    pieces[0],
+                                    layer.W_UV,
+                                    getattr(layer, "W_UV_scale", None),
+                                )
+                            return pieces
                     else:
                         if uv_first:
                             # A narrowed merge rounds to the wire dtype anyway.
