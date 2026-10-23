@@ -3439,6 +3439,7 @@ def prepare_outputs(
         "out_pieces_fault",
         "out_pieces_gather_first",
         "packed_rope",
+        "kv_stack",
     ),
 )
 def sparse_ragged_paged_attention(
