@@ -146,6 +146,33 @@ else
         sleep 2
     done
 
+    if [[ "${K3_DSPARK_PD_DIAGNOSTIC:-0}" == 1 ]]; then
+        python3 - <<'PY'
+import json
+import os
+import urllib.request
+
+request = urllib.request.Request(
+    "http://127.0.0.1:8050/v1/completions",
+    data=json.dumps({
+        "model": "/models/Kimi-K3-pruned75",
+        "prompt": [1] * 128,
+        "max_tokens": 16,
+        "ignore_eos": True,
+        "temperature": 0,
+    }).encode(),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(request, timeout=600) as response:
+    result = response.read()
+path = os.path.join(os.environ["ARTIFACT_LOCAL_DIR"], "results", "diagnostic.json")
+with open(path, "wb") as output:
+    output.write(result)
+PY
+        touch "$coord/benchmark.done"
+        exit 0
+    fi
+
     bench=(
         vllm bench serve --backend vllm
         --model /models/Kimi-K3-pruned75
