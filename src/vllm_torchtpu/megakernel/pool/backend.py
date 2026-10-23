@@ -176,7 +176,7 @@ def check_ckpt_bounds(
                         f"maps to pages [{pb}, {pb + pps}), which exceeds pool "
                         f"capacity [0, {num_pages})"
                     )
-                if is_3d:
+                if is_3d and slot_i > 0:
                     prev_sub = seen_slots.get(slot_i)
                     if prev_sub is not None and prev_sub != sub:
                         raise ValueError(

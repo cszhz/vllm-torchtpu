@@ -96,7 +96,7 @@ def derive_model_geometry(
     L = int(top["layers"])
     H = int(top["hidden"])
     eps = float(top["eps"])
-    gdn_l2_eps = float(top.get("gdn_l2_eps", eps))
+    gdn_l2_eps = float(top["gdn_l2_eps"]) if "gdn_l2_eps" in top else 1e-6
     sched = cls.schedule.resolve(cfg, L)
     merged = _merged_cfg(
         cfg,
@@ -107,6 +107,19 @@ def derive_model_geometry(
             "partial_rotary_factor": top.get("rope_partial"),
         },
     )
+    for rope_key in ("rope_parameters", "rope_scaling"):
+        rope_sub = _sub_cfg(cfg, rope_key) or merged.get(rope_key)
+        if rope_sub is not None:
+            rtype = (
+                rope_sub.get("rope_type", rope_sub.get("type"))
+                if isinstance(rope_sub, Mapping)
+                else getattr(rope_sub, "rope_type", getattr(rope_sub, "type", None))
+            )
+            if rtype not in (None, "default"):
+                raise MegakernelConfigError(
+                    f"ModelDef {mname!r}: unsupported {rope_key} rope_type={rtype!r}; "
+                    "megakernel requires unscaled ('default') RoPE"
+                )
     gqa_b = cls._find_binding(GQAModule, sched)
     if gqa_b is None:
         raise MegakernelConfigError(f"ModelDef {mname!r} has no GQAModule in schedule")
@@ -123,7 +136,7 @@ def derive_model_geometry(
         gdn_g = gdn_b.resolve(merged)
         KH, VH = int(gdn_g.KH), int(gdn_g.VH)
         KD, VD = int(gdn_g.KD), int(gdn_g.VD)
-        if "gdn_l2_eps" in gdn_b.explicit_fields:
+        if "gdn_l2_eps" in gdn_b.explicit_fields or "gdn_l2_eps" not in top:
             gdn_l2_eps = float(gdn_g.gdn_l2_eps)
     else:
         KH = VH = KD = VD = 0

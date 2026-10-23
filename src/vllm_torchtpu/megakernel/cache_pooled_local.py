@@ -102,6 +102,7 @@ def run_local(
                 pb.layout,
                 act_mode=act_mode_l,
                 active_mask=active_mask_l,
+                read_offsets=read_offsets,
             )
         ckpt_2d_l = bool(ckpt_indices is not None and ckpt_indices.ndim == 2)
         ckpt_k_l = (
@@ -117,8 +118,8 @@ def run_local(
         if has_rec:
             st_map_f["ckpt_indices"] = ckpt_indices
             st_map_f["read_offsets"] = read_offsets
-            if act_mode_l == "ref":
-                st_map_f["active_seqs"] = active_mask_l
+        if act_mode_l == "ref":
+            st_map_f["active_seqs"] = active_mask_l
         s_args_f = [st_map_f[k] for k in p_l.s_names]
         out_vals_f = call_l(pos, hidden, *w, *s_args_f, *extra_tuple)
         if not isinstance(out_vals_f, (tuple, list)):

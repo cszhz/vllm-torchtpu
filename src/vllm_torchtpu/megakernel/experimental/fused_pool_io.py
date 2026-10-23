@@ -556,7 +556,13 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
         return ST["read_offsets"][sub, s] if gp.roff_is_2d else ST["read_offsets"][s]
 
     def _gdn_pb_in(sub, s):
-        roff = jnp.maximum(_gdn_roff(sub, s), jnp.int32(0))
+        raw_roff = _gdn_roff(sub, s)
+        _kernel_debug_check(
+            jnp.logical_and(raw_roff >= 0, raw_roff < gp.K_ckpt),
+            "GDN gather read_offsets outside [0, K)",
+            interpret=interpret,
+        )
+        roff = jnp.maximum(raw_roff, jnp.int32(0))
         if gp.ckpt_is_3d:
             pb = layout.page_base(ST["ckpt_indices"][sub, s, roff], sub, 3)
         else:

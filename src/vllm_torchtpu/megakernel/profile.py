@@ -244,28 +244,34 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
     # While the `default` profile itself is being built, its rule is the
     # library default with split pool I/O.
     ref_tiles = default_tiles if ref is None else ref.tiles_for
+    ref_rule = default_tiles if ref is None else ref.tile_rule()
     ref_fused = False if ref is None else ref.fused_pool_io
     ref_gather = False if ref is None else ref.pool_gather
     feats: set[str] = set()
-    approx_knobs = [k for k, v in tile_numerics().items() if v == "approx"]
-    for R in _NUMERICS_GRID_R:
-        for moe_tp in (False, True):
-            for B in _NUMERICS_GRID_B:
-                t = profile.tiles_for(B, moe_tp=moe_tp, R=R)
-                d = ref_tiles(B, moe_tp=moe_tp, R=R)
-                feats.update(
-                    f"tiles.{k}" for k in approx_knobs if _knob(t, k) != _knob(d, k)
-                )
+    if profile.tile_rule() is not ref_rule:
+        approx_knobs = [k for k, v in tile_numerics().items() if v == "approx"]
+        for R in _NUMERICS_GRID_R:
+            for moe_tp in (False, True):
+                for B in _NUMERICS_GRID_B:
+                    t = profile.tiles_for(B, moe_tp=moe_tp, R=R)
+                    d = ref_tiles(B, moe_tp=moe_tp, R=R)
+                    if t == d:
+                        continue
+                    feats.update(
+                        f"tiles.{k}" for k in approx_knobs if _knob(t, k) != _knob(d, k)
+                    )
     if (
-        profile.fused_pool_io is not False
-        and profile.fused_pool_io != ref_fused
+        profile.fused_pool_io != ref_fused
         and POOL_IO_NUMERICS["fused_pool_io"] == "approx"
     ):
         feats.add("fused_pool_io")
-    if profile.pool_gather is not False and profile.pool_gather != ref_gather:
-        mode = "pool_gather_eligible" if profile.pool_gather is True else "pool_gather"
-        if POOL_IO_NUMERICS[mode] == "approx":
-            feats.add(mode)
+    if profile.pool_gather != ref_gather:
+        for val in (profile.pool_gather, ref_gather):
+            if val is not False:
+                mode = "pool_gather_eligible" if val is True else "pool_gather"
+                if POOL_IO_NUMERICS[mode] == "approx":
+                    feats.add(mode)
+                    break
     return tuple(sorted(feats))
 
 

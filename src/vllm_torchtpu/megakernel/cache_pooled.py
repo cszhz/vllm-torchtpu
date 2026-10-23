@@ -227,6 +227,7 @@ def make_pooled_step(
                 pb.layout,
                 act_mode=act_m,
                 active_mask=act_arr,
+                read_offsets=read_offsets,
             )
         hid, new_raw = _jitted_step(
             pos,

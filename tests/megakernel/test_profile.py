@@ -163,6 +163,26 @@ def test_profile_validation_and_numerics_enforcement():
     assert exact_prof.numerics == "exact"
     assert approx_features(exact_prof) == ()
 
+    # Turning off an approx pool-I/O mode enabled on the model default is also detected.
+    register_profile(
+        Profile(
+            name="m-approx-ref",
+            model="m-io",
+            numerics="exact",
+            model_default=True,
+            pool_gather=True,
+            fused_pool_io="auto",
+        )
+    )
+    with pytest.raises(ValueError, match="fused_pool_io.*pool_gather_eligible"):
+        Profile(
+            name="m-off-exact",
+            model="m-io",
+            numerics="exact",
+            pool_gather=False,
+            fused_pool_io=False,
+        )
+
 
 def test_approx_features_against_default_and_model_reference():
     def _ref_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:

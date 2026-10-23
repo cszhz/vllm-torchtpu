@@ -176,6 +176,7 @@ def make_flat_pooled_step(
                     cache_exec(ex_paged).num_pages,
                     pb.layout,
                     act_mode=act_mode_l,
+                    read_offsets=read_offsets,
                 )
             ckpt_2d_l = bool(ckpt_indices is not None and ckpt_indices.ndim == 2)
             ckpt_k_l = (

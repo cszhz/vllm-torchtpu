@@ -1293,6 +1293,38 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
             assert driver_mod.maybe_create(_make_runner(dense_cand)) is None
         assert "Qwen35 supports MoE checkpoints only" in caplog.text
 
+    # 6) Scaled RoPE (YaRN in rope_parameters or linear in rope_scaling) is rejected
+    yarn_cfg = {
+        **nested_vlm,
+        "text_config": {
+            **nested_rope_text,
+            "rope_parameters": {
+                **nested_rope_text["rope_parameters"],
+                "rope_type": "yarn",
+                "factor": 4.0,
+            },
+        },
+    }
+    linear_cfg = {
+        **DEFAULT_HF_CONFIG,
+        "rope_scaling": {"rope_type": "linear", "factor": 2.0},
+    }
+    for scaled_cfg in (
+        yarn_cfg,
+        dict_to_namespace(yarn_cfg),
+        linear_cfg,
+        dict_to_namespace(linear_cfg),
+    ):
+        with pytest.raises(MegakernelConfigError, match="unsupported .* rope_type"):
+            Qwen35.derive_geometry(scaled_cfg)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert not driver_mod.Qwen35Megakernel._validate_runner_hf_config(
+                _make_runner(scaled_cfg)
+            )
+            assert driver_mod.maybe_create(_make_runner(scaled_cfg)) is None
+        assert "unsupported" in caplog.text and "rope_type" in caplog.text
+
 
 def test_validate_runner_hf_config_frozen_qwen35_config_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

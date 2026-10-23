@@ -17,27 +17,15 @@ from __future__ import annotations
 
 from typing import Any
 
-import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ...ops import BF16, U32, bswitch
+from ...pool.backend import kernel_debug_check
 from ...pool.config import cache_exec
 from .params import GDNParams
-
-
-def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
-    """Emit `pl.debug_check` and enforce it in CPU `interpret` mode when enabled."""
-    pl.debug_check(cond, msg)
-    if interpret and pl.enable_debug_checks.value:
-
-        def _cb(ok: Any) -> None:
-            if not bool(ok):
-                raise RuntimeError(msg)
-
-        jax.debug.callback(_cb, cond)
 
 
 def is_seq_active(ctx: Any, gp: GDNParams, s: Any) -> Any:
@@ -69,12 +57,18 @@ def has_gpr_input(ctx: Any, gp: GDNParams, o: Any, s: Any) -> Any:
 def gdn_pb_in(ctx: Any, gp: GDNParams, sub: Any, s: Any) -> Any:
     ex, ST = ctx.ex, ctx.ST
     GDN_PAGES = gp.GDN_PAGES
-    roff = jnp.maximum(gdn_roff(ctx, gp, sub, s), jnp.int32(0))
+    raw_roff = gdn_roff(ctx, gp, sub, s)
+    kernel_debug_check(
+        jnp.logical_and(raw_roff >= 0, raw_roff < gp.K_ckpt),
+        "GDN gather read_offsets outside [0, K)",
+        interpret=bool(ex.interpret),
+    )
+    roff = jnp.maximum(raw_roff, jnp.int32(0))
     if gp.ckpt_is_3d:
         pb = gp.pool_layout.page_base(ST["ckpt_indices"][sub, s, roff], sub, 3)
     else:
         pb = gp.pool_layout.page_base(ST["ckpt_indices"][s, roff], sub, 2)
-    _kernel_debug_check(
+    kernel_debug_check(
         jnp.logical_and(pb >= 0, pb + GDN_PAGES <= cache_exec(ex).num_pages),
         "GDN gather checkpoint slot maps outside [0, num_pages)",
         interpret=bool(ex.interpret),
