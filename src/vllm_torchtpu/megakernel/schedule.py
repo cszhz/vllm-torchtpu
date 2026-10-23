@@ -233,8 +233,6 @@ def _derive_att_every_and_branch_indices(
         return 1, tuple(branch_indices)
     if declared_period and declared_period >= 2 and num_layers % declared_period == 0:
         period = declared_period
-    elif num_layers % num_att == 0:
-        period = num_layers // num_att
     else:
         divs = [p for p in range(2, num_layers + 1) if num_layers % p == 0]
         if not divs:
@@ -369,13 +367,7 @@ class Schedule:
         post_l = _resolve_slot_spec(
             self.post_norm, hf_config, num_layers, "post_norm", allow_none=True
         )
-        base_att = sum(1 for b in mix_l if b is not None and _block_name_of(b) == "gqa")
-        if isinstance(self.mixer, Every):
-            decl_p: int | None = self.mixer.n
-        elif 0 < base_att < num_layers and num_layers % base_att == 0:
-            decl_p = num_layers // base_att
-        else:
-            decl_p = None
+        decl_p: int | None = self.mixer.n if isinstance(self.mixer, Every) else None
         for lyr, ov in self.overrides.items():
             if "mixer" in ov:
                 mix_l[lyr] = ov["mixer"]

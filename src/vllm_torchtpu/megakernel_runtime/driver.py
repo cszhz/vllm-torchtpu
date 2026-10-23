@@ -1194,27 +1194,12 @@ class MegakernelDriver:
                 )
                 return False
             return True
-        archs = (
-            hf_cfg.get("architectures")
-            if isinstance(hf_cfg, dict)
-            else getattr(hf_cfg, "architectures", None)
-        ) or ()
-        mtype = (
-            hf_cfg.get("model_type")
-            if isinstance(hf_cfg, dict)
-            else getattr(hf_cfg, "model_type", None)
-        )
         raw_e = (
             root.get("num_experts")
             if isinstance(root, dict)
             else getattr(root, "num_experts", None)
         )
-        if (raw_e is not None and int(raw_e) <= 0) or (
-            ("Qwen3_5ForConditionalGeneration" in archs or mtype == "qwen3_5")
-            and "Qwen3_5MoeForConditionalGeneration" not in archs
-            and mtype != "qwen3_5_moe"
-            and not raw_e
-        ):
+        if raw_e is not None and int(raw_e) <= 0:
             logger.warning(
                 "Megakernel disabled for %s: %s supports MoE checkpoints only; "
                 "skipping.",
@@ -2561,6 +2546,60 @@ class Qwen35Megakernel(MegakernelDriver):
         "qwen3_5_moe",
         "qwen3_5",
     )
+
+    @classmethod
+    def _validate_runner_hf_config(cls, runner: Any) -> bool:
+        if not super()._validate_runner_hf_config(runner):
+            return False
+        model_cfg = getattr(runner, "model_config", None) or getattr(
+            getattr(runner, "vllm_config", None), "model_config", None
+        )
+        hf_cfg = (
+            getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
+        )
+        if hf_cfg is None:
+            return True
+        tc = (
+            hf_cfg.get("text_config")
+            if isinstance(hf_cfg, dict)
+            else getattr(hf_cfg, "text_config", None)
+        )
+        root = tc if tc is not None else hf_cfg
+        raw_e = (
+            root.get("num_experts")
+            if isinstance(root, dict)
+            else getattr(root, "num_experts", None)
+        )
+        archs = (
+            hf_cfg.get("architectures")
+            if isinstance(hf_cfg, dict)
+            else getattr(hf_cfg, "architectures", None)
+        ) or ()
+        mtype = (
+            hf_cfg.get("model_type")
+            if isinstance(hf_cfg, dict)
+            else getattr(hf_cfg, "model_type", None)
+        )
+        if (
+            (
+                "Qwen3_5ForConditionalGeneration" in archs
+                or "Qwen3_5ForCausalLM" in archs
+                or mtype in ("qwen3_5", "qwen3_5_text")
+            )
+            and "Qwen3_5MoeForConditionalGeneration" not in archs
+            and "Qwen3_5MoeForCausalLM" not in archs
+            and mtype not in ("qwen3_5_moe", "qwen3_5_moe_text")
+            and not raw_e
+        ):
+            mdef = cls._model_def()
+            logger.warning(
+                "Megakernel disabled for %s: %s supports MoE checkpoints only; "
+                "skipping.",
+                mdef.__name__,
+                mdef.__name__,
+            )
+            return False
+        return True
 
 
 _MODEL_DRIVER_REGISTRY: dict[str, Callable[[Any], Any]] = {

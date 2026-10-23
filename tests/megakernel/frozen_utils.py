@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import os
 import pathlib
 import sys
 import types
+from collections.abc import Mapping
 from typing import Any
 
 import pytest
@@ -30,6 +32,48 @@ DEFAULT_FROZEN_DIR = os.path.join(_REPO_ROOT_DIR, "frozen_qwen35")
 FROZEN_MK_SHA256 = "db407b8fb41a9365bdb54c8bb4a9c7992167f642d75dcd04bab0d7d18293125a"
 FROZEN_PIO_SHA256 = "5acd73afccb9cea48382138f1428af2d1f1df5b43faa8817e0a8ed962d28bef6"
 FROZEN_PA_SHA256 = "25935a68f06a3231da24e92bcd7659d54fbf94d7a707b9d91854643466d7fad8"
+FROZEN_CONFIG_JSON_SHA256 = (
+    "9a142fc6c2d67703255ce6120ee04c4c720ec58dba6ae44bebb29c4a2d6e5db8"
+)
+
+
+def dict_to_namespace(obj: Any) -> Any:
+    """Recursively convert mappings into `SimpleNamespace` (`PretrainedConfig`-like)."""
+    if isinstance(obj, Mapping):
+        return types.SimpleNamespace(
+            **{str(k): dict_to_namespace(v) for k, v in obj.items()}
+        )
+    if isinstance(obj, list):
+        return [dict_to_namespace(x) for x in obj]
+    return obj
+
+
+def load_frozen_qwen35_config_json(
+    frozen_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Verify SHA-256 and load the frozen Qwen3.5 `config.json` dict."""
+    cands: list[pathlib.Path] = []
+    if frozen_dir is not None:
+        cands.append(pathlib.Path(frozen_dir))
+    elif env_dir := os.environ.get("MK_FROZEN_QWEN35_DIR"):
+        cands.append(pathlib.Path(env_dir))
+    cands.extend(
+        [
+            pathlib.Path(DEFAULT_FROZEN_DIR),
+            pathlib.Path(_REPO_ROOT_DIR).parents[1] / "frozen" / "frozen_qwen35",
+            pathlib.Path(
+                "/mnt/nfs_test/agentx-cache/nanwei_mk_m5a2_bench3/frozen_qwen35"
+            ),
+            pathlib.Path("/mnt/nfs_test/tokenizer"),
+        ]
+    )
+    for d in cands:
+        cfg_path = d / "config.json"
+        if cfg_path.is_file():
+            raw = cfg_path.read_bytes()
+            assert hashlib.sha256(raw).hexdigest() == FROZEN_CONFIG_JSON_SHA256
+            return json.loads(raw.decode("utf-8"))
+    pytest.skip(f"Set MK_FROZEN_QWEN35_DIR with config.json (checked {cands[0]})")
 
 
 def load_frozen_qwen35(

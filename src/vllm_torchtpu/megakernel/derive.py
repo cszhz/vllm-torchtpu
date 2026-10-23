@@ -27,7 +27,6 @@ from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .geometry import ModelGeometry
 from .pool import PoolLayout
-from .reference import _describe_binding, _model_label, _validate_norms
 from .schedule import (
     BlockOrBinding,
     FromHFLayerTypes,
@@ -36,6 +35,15 @@ from .schedule import (
     _block_cls_of,
 )
 from .spec import Block, LayerType, ModelSpec, SwitchSlot
+from .validate import (
+    describe_binding as _describe_binding,
+)
+from .validate import (
+    model_label as _model_label,
+)
+from .validate import (
+    validate_norms as _validate_norms,
+)
 
 
 def _merged_cfg(hf_config: Any, extras: Mapping[str, Any]) -> dict[str, Any]:

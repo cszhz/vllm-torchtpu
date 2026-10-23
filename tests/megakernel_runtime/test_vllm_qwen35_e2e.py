@@ -1003,6 +1003,10 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     import logging
     import sys
 
+    from tests.megakernel.frozen_utils import (
+        dict_to_namespace,
+        load_frozen_qwen35_config_json,
+    )
     from vllm_torchtpu.megakernel import Profile, register_profile
     from vllm_torchtpu.megakernel import profile as profile_mod
 
@@ -1020,6 +1024,7 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
             driver_mod.logger, "_logger", logging.getLogger(driver_mod.logger._name)
         )
     monkeypatch.setattr(MegakernelDriver, "_expected_num_layers", g.L)
+    monkeypatch.setattr(driver_mod.Qwen35Megakernel, "_expected_num_layers", g.L)
     monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 8)
     monkeypatch.setattr(driver_mod, "_build_tp_rank_mesh", lambda *_a, **_k: mesh8)
     monkeypatch.setattr(
@@ -1032,8 +1037,11 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
         profile_mod, "_MODEL_DEFAULTS", dict(profile_mod._MODEL_DEFAULTS)
     )
 
+    real_hf_cfg = dict_to_namespace(load_frozen_qwen35_config_json())
+    model_cfg = SimpleNamespace(hf_config=real_hf_cfg)
+
     # 1. Model default profile setting `buckets=(4, 16)` and `pool_gather=None`:
-    #    `maybe_create` inherits both without user overrides.
+    #    `maybe_create` inherits both without user overrides and validates real config.
     custom_default = Profile(
         name="qwen35-test-default",
         model="qwen3_5",
@@ -1045,15 +1053,18 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     register_profile(custom_default, replace=True)
     runner = SimpleNamespace(
         model=model,
+        model_config=model_cfg,
         mesh=mesh8,
         _unified_kv_layout=True,
         speculative_config=None,
         vllm_config=SimpleNamespace(
-            additional_config={"megakernel": {"enabled": True}}
+            model_config=model_cfg,
+            additional_config={"megakernel": {"enabled": True}},
         ),
     )
-    drv = MegakernelDriver.maybe_create(runner)
+    drv = driver_mod.maybe_create(runner)
     assert drv is not None
+    assert isinstance(drv, driver_mod.Qwen35Megakernel)
     assert drv.profile.name == "qwen35-test-default"
     assert drv.profile.pool_gather is None
     assert drv.buckets == (4, 16)

@@ -40,12 +40,7 @@ from .exec_spec import ExecSpec
 from .geometry import FromHF, LMHead, ModelGeometry, _BoundFromHF
 from .pool import PoolBackend, PoolLayout
 from .profile import Profile, get_profile, model_default_profile, register_profile
-from .reference import (
-    _model_label,
-    _validate_model_def,
-    _validate_norms,
-    composed_reference_step,
-)
+from .reference import composed_reference_step
 from .schedule import (
     BlockOrBinding,
     Every,
@@ -54,6 +49,15 @@ from .schedule import (
     Schedule,
 )
 from .spec import Block, ModelSpec
+from .validate import (
+    model_label as _model_label,
+)
+from .validate import (
+    validate_model_def as _validate_model_def,
+)
+from .validate import (
+    validate_norms as _validate_norms,
+)
 
 
 class ModelDef:

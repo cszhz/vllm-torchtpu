@@ -288,7 +288,7 @@ def _resolve_field_spec(
             return found
     if default is not REQUIRED:
         return default
-    raise ValueError(f"Cannot resolve field {canon!r} ({hf_key!r}) from {hf_config!r}")
+    raise ValueError(f"Cannot resolve field {canon!r} (missing HF key {hf_key!r})")
 
 
 def validate_rename_and_transforms(

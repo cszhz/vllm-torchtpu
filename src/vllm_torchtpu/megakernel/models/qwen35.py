@@ -22,7 +22,7 @@ from typing import Any
 from .. import cache, kernel
 from ..blocks import GDN, GQA, Embedding, GDNBlock, GQABlock, MoE, MoEBlock, Norm
 from ..exec_spec import ExecSpec
-from ..geometry import FromHF, ModelGeometry
+from ..geometry import _GEOM_FIELD_NAMES, FromHF, ModelGeometry
 from ..model_def import LMHead, ModelDef, register_model
 from ..schedule import FromHFLayerTypes, Schedule
 from ..spec import Block, ModelSpec
@@ -62,8 +62,9 @@ class Qwen35Geometry(ModelGeometry):
     """Architecture geometry for Qwen3.5-397B-A17B."""
 
     def __init__(self, **overrides: Any) -> None:
-        base = dataclasses.asdict(FULL) if "FULL" in globals() else {}
-        super().__init__(**(base | overrides))
+        if not set(_GEOM_FIELD_NAMES).issubset(overrides):
+            overrides = dataclasses.asdict(Qwen35.derive_geometry()) | overrides
+        super().__init__(**overrides)
 
     def to_model_spec(self) -> ModelSpec:
         """Convert this geometry into its declarative `ModelSpec`."""

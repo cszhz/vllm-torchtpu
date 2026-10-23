@@ -35,7 +35,11 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
-from frozen_utils import load_frozen_qwen35  # noqa: E402
+from frozen_utils import (  # noqa: E402
+    dict_to_namespace,
+    load_frozen_qwen35,
+    load_frozen_qwen35_config_json,
+)
 from jax import lax  # noqa: E402
 from jax.sharding import Mesh, NamedSharding  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
@@ -1076,6 +1080,61 @@ def _time_pooled_step_fn(
     return stats, raw_pools
 
 
+def _assert_driver_created_from_real_qwen35_config(mesh: Mesh, g: Any) -> None:
+    """Assert `megakernel_runtime.maybe_create` creates `Qwen35Megakernel` on TPU."""
+    import types
+    import unittest.mock as mock
+
+    from vllm_torchtpu.megakernel_runtime import driver as driver_mod
+
+    frozen_cfg = load_frozen_qwen35_config_json()
+    backbone = types.SimpleNamespace(
+        layers=[types.SimpleNamespace() for _ in range(g.L)],
+        aux_hidden_state_layers=(),
+    )
+    model = types.SimpleNamespace(model=backbone)
+    fake_dist = types.SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0)
+    for hf_cfg in (frozen_cfg, dict_to_namespace(frozen_cfg)):
+        mc = types.SimpleNamespace(hf_config=hf_cfg)
+        runner = types.SimpleNamespace(
+            model=model,
+            model_config=mc,
+            mesh=mesh,
+            _unified_kv_layout=True,
+            supports_mm_inputs=False,
+            lora_config=None,
+            _pp_is_first=True,
+            _pp_is_last=True,
+            _pcp_enabled=False,
+            _dcp_enabled=False,
+            parallel_config=types.SimpleNamespace(
+                tensor_parallel_size=8,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+            ),
+            _dp_lockstep_enabled=lambda: False,
+            speculative_config=None,
+            vllm_config=types.SimpleNamespace(
+                model_config=mc,
+                additional_config={"megakernel": {"enabled": True}},
+            ),
+        )
+        with (
+            mock.patch.dict(sys.modules, {"vllm.distributed": fake_dist}),
+            mock.patch.object(driver_mod, "_resolve_tp_size", return_value=8),
+            mock.patch.object(driver_mod, "_build_tp_rank_mesh", return_value=mesh),
+            mock.patch.object(
+                driver_mod.MegakernelDriver,
+                "_prepare_and_pack_weights",
+                return_value={"w_flat": []},
+            ),
+        ):
+            drv = driver_mod.maybe_create(runner)
+        assert drv is not None, "maybe_create silently returned None on real config"
+        assert isinstance(drv, driver_mod.Qwen35Megakernel)
+        assert drv.geom == qwen35.FULL_EP
+
+
 def test_m3_tpu_v7x8_paged_eplb_tp_bench():
     """Run M3 TPU v7x-8 benchmark: PallasWriter, stack_e=False, EPLB, and moe_tp."""
     if not _has_tpu_v7x8():
@@ -1086,6 +1145,7 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
     mesh = Mesh(tpu_devs[:8], ("tp",))
 
     g = dataclasses.replace(qwen35.FULL_EP, L=60, att_every=4)
+    _assert_driver_created_from_real_qwen35_config(mesh, g)
     ex_init = ExecSpec(B=4, T=1, R=8, ctx=4096, stack_e=True)
     c_f_init = frozen_mk.MKConfig(
         R=8,

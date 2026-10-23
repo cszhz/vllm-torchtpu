@@ -34,6 +34,7 @@ from vllm_torchtpu.megakernel import (
     profile,
     reference,
     schedule,
+    validate,
 )
 from vllm_torchtpu.megakernel.blocks import (
     GDN,
@@ -264,7 +265,7 @@ class _DenseMLPBlock(MoEBlock):
 
 def test_core_model_def_modules_have_no_qwen_literals_and_fit_line_budget():
     """Core `ModelDef` modules have no Qwen names, no fmt: skip, and <= 400 lines."""
-    for mod in (derive, geometry, schedule, reference, model_def):
+    for mod in (derive, geometry, schedule, reference, validate, model_def):
         path = Path(mod.__file__)
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines()
@@ -450,6 +451,23 @@ def test_schedule_validation_errors_name_layer_index_and_value(isolated_model_re
             4,
         )
 
+    # Irregular base layer_types with L % #attention == 0 uses max-match period
+    # heuristic (3/4 layers match period=2 vs 2/4 for period=4, so layer 3 is flagged)
+    with pytest.raises(
+        MegakernelConfigError, match=r"layer 3.*expected 'gqa' for period=2"
+    ):
+        sched_hf.resolve(
+            {
+                "layer_types": [
+                    "linear_attention",
+                    "full_attention",
+                    "linear_attention",
+                    "linear_attention",
+                ]
+            },
+            4,
+        )
+
     # 4. Override indices out of range (negative or >= num_layers)
     with pytest.raises(MegakernelConfigError, match=r"-1.*out of range"):
         Schedule(
@@ -602,7 +620,7 @@ def test_schedule_validation_errors_name_layer_index_and_value(isolated_model_re
             )
             final_norm = final_norm_b
 
-    with pytest.raises(MegakernelConfigError, match=r"slot 'final_norm' is None"):
+    with pytest.raises(MegakernelConfigError, match=r"final_norm is None"):
 
         @register_model(name="bad_missing_final_norm")
         class _BadMissingFinalNorm(ModelDef):
@@ -619,6 +637,25 @@ def test_schedule_validation_errors_name_layer_index_and_value(isolated_model_re
                 post_norm=post_norm,
             )
             final_norm = None
+
+    # Registration without default_hf_config compares only zero_centered on norms
+    # (does not fail on explicit non-1e-6 eps literals)
+    @register_model(name="no_def_cfg_custom_eps")
+    class _NoDefCfgCustomEps(ModelDef):
+        geometry = FromHF(
+            hidden="hidden_size",
+            layers=("num_hidden_layers", 2),
+            eps="rms_norm_eps",
+        )
+        schedule = Schedule(
+            mixer=Every(n=2, last=attn, rest=gdn),
+            ffn=moe,
+            pre_norm=Norm.bind("input_layernorm", zero_centered=True, eps=1e-5),
+            post_norm=Norm.bind(
+                "post_attention_layernorm", zero_centered=True, eps=1e-5
+            ),
+        )
+        final_norm = Norm.bind("model.norm", zero_centered=True, eps=1e-5)
 
     with pytest.raises(
         MegakernelConfigError, match=r"layer 1 slot 'post_norm' is None"
@@ -988,12 +1025,10 @@ def test_synthetic_model_def_every2_dense_override_cpu_kernel_vs_reference(
     ):
         with pytest.raises(
             MegakernelConfigError,
-            match=(
-                r"_UnregisteredSynthMissingFinalNorm"
-                r".*layer \d+ slot 'final_norm' is None"
-            ),
-        ):
+            match=r"_UnregisteredSynthMissingFinalNorm.*final_norm is None",
+        ) as fn_exc:
             fn_call()
+        assert "layer " not in str(fn_exc.value)
 
 
 def _independent_qwen35_pool_layout(
@@ -1131,12 +1166,15 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     ):
         with pytest.raises(
             MegakernelConfigError,
-            match=r"_UnregisteredMissingFinalNorm.*layer \d+ slot 'final_norm' is None",
-        ):
+            match=r"_UnregisteredMissingFinalNorm.*final_norm is None",
+        ) as fn_exc:
             fn_call()
+        assert "layer " not in str(fn_exc.value)
 
     # Runner hf_config validation: consistent fail-closed policy (log differing fields
     # and return False / maybe_create returns None, never raising on mismatched configs)
+    from frozen_utils import dict_to_namespace, load_frozen_qwen35_config_json
+
     def _make_runner(hf_cfg: Any) -> Any:
         mc = types.SimpleNamespace(hf_config=hf_cfg)
         vc = types.SimpleNamespace(
@@ -1144,7 +1182,9 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         )
         return types.SimpleNamespace(model_config=mc, vllm_config=vc)
 
-    # 1) Realistic nested VLM config with nested rope_parameters succeeds
+    # 1) Realistic nested VLM config with nested rope_parameters succeeds (both dict
+    #    and PretrainedConfig-like attribute-style SimpleNamespace), plus the real
+    #    frozen Qwen3.5 config.json
     nested_rope_text = {
         k: v
         for k, v in DEFAULT_HF_CONFIG.items()
@@ -1159,12 +1199,18 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         "architectures": ["Qwen3_5MoeForConditionalGeneration"],
         "text_config": nested_rope_text,
     }
-    assert driver_mod.Qwen35Megakernel._validate_runner_hf_config(
-        _make_runner(nested_vlm)
-    )
+    for valid_cfg in (
+        nested_vlm,
+        dict_to_namespace(nested_vlm),
+        load_frozen_qwen35_config_json(),
+        dict_to_namespace(load_frozen_qwen35_config_json()),
+    ):
+        assert driver_mod.Qwen35Megakernel._validate_runner_hf_config(
+            _make_runner(valid_cfg)
+        )
 
     # 2) Different layer count (48 vs 60) logs differing fields (L, NGDN, NATT) and
-    #    maybe_create returns None without raising
+    #    maybe_create returns None without raising (both dict and attribute-style)
     cfg_48l = {
         **nested_vlm,
         "text_config": {
@@ -1173,15 +1219,32 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
             "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 12,
         },
     }
+    for cand_48l in (cfg_48l, dict_to_namespace(cfg_48l)):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert not driver_mod.Qwen35Megakernel._validate_runner_hf_config(
+                _make_runner(cand_48l)
+            )
+            assert driver_mod.maybe_create(_make_runner(cand_48l)) is None
+        assert "L=48 (expected 60)" in caplog.text
+
+    # 3) Missing required key logs only the missing key (never embeds the config dict)
+    cfg_missing_theta = {
+        "model_type": "qwen3_5_moe",
+        "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+        "text_config": {
+            k: v
+            for k, v in DEFAULT_HF_CONFIG.items()
+            if k not in ("rope_theta", "partial_rotary_factor")
+        },
+    }
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        assert not driver_mod.Qwen35Megakernel._validate_runner_hf_config(
-            _make_runner(cfg_48l)
-        )
-        assert driver_mod.maybe_create(_make_runner(cfg_48l)) is None
-    assert "L=48 (expected 60)" in caplog.text
+        assert driver_mod.maybe_create(_make_runner(cfg_missing_theta)) is None
+    assert "missing HF key 'rope_theta'" in caplog.text
+    assert "num_attention_heads" not in caplog.text
 
-    # 3) Different hidden_size (2048 vs 4096) logs H mismatch and returns None
+    # 4) Different hidden_size (2048 vs 4096) logs H mismatch and returns None
     cfg_2048h = {
         **nested_vlm,
         "text_config": {**nested_rope_text, "hidden_size": 2048},
@@ -1191,9 +1254,9 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         assert driver_mod.maybe_create(_make_runner(cfg_2048h)) is None
     assert "H=2048 (expected 4096)" in caplog.text
 
-    # 4) Dense config WITH geometry (has hidden_size, no num_experts) and WITHOUT
+    # 5) Dense config WITH geometry (has hidden_size, no num_experts) and WITHOUT
     #    geometry (minimal stub without hidden_size) both log "supports MoE checkpoints
-    #    only" and return None without raising
+    #    only" and return None without raising (both dict and attribute-style)
     dense_with_geom = {
         "model_type": "qwen3_5",
         "architectures": ["Qwen3_5ForConditionalGeneration"],
@@ -1204,7 +1267,12 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "text_config": {"model_type": "qwen3_5_text"},
     }
-    for dense_cand in (dense_with_geom, dense_without_geom):
+    for dense_cand in (
+        dense_with_geom,
+        dict_to_namespace(dense_with_geom),
+        dense_without_geom,
+        dict_to_namespace(dense_without_geom),
+    ):
         caplog.clear()
         with caplog.at_level(logging.WARNING):
             assert not driver_mod.Qwen35Megakernel._validate_runner_hf_config(
