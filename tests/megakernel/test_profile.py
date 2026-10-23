@@ -118,8 +118,12 @@ def test_profile_validation_and_numerics_enforcement():
         Profile(name="bad-num", numerics="bitwise")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="fused_pool_io must be a bool or 'auto'"):
         Profile(name="bad-fused", fused_pool_io="sometimes")
+    with pytest.raises(ValueError, match="fused_pool_io must be a bool or 'auto'"):
+        Profile(name="bad-fused-int", fused_pool_io=1)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="pool_gather must be False, None or True"):
         Profile(name="bad-pg", pool_gather="eligible")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="pool_gather must be False, None or True"):
+        Profile(name="bad-pg-int", pool_gather=1)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="model default"):
         Profile(name="no-model-default", model_default=True)
     with pytest.raises(ValueError, match="model default"):

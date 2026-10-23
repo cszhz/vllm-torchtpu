@@ -63,15 +63,17 @@ def check_ckpt_bounds(
     *,
     act_mode: str = "from_ckpt",
     active_mask: Any = None,
+    read_offsets: Any = None,
 ) -> None:
     """Validate concrete (eager) active checkpoint slots fit in `[0, num_pages)`.
 
     Accepts 2D `[NS, K]`, 3D `[slots_per_pool, NS, K]` or rank-leading 4D
     `ckpt_indices` (see `PoolLayout.page_base`). 3D indices must use disjoint
-    slots across sub-layers of an active sequence. Under `jax.jit` (`Tracer`
-    inputs), this eager host check is a no-op and bounds are checked inside the
-    Pallas kernels via `pl.debug_check` when Pallas debug checks are enabled
-    (`jax_pallas_enable_debug_checks=True`).
+    slots across sub-layers of an active sequence. When `read_offsets` is
+    provided, also checks `read_offsets < K` for active sequences. Under
+    `jax.jit` (`Tracer` inputs), this eager host check is a no-op and bounds
+    are checked inside the Pallas kernels via `pl.debug_check` when Pallas
+    debug checks are enabled (`jax_pallas_enable_debug_checks=True`).
     """
     g_per_att = layout.slots_per_pool
     if (
@@ -85,11 +87,19 @@ def check_ckpt_bounds(
         ckpt_np = ckpt_np[0]
     is_3d = ckpt_np.ndim == 3
     ns = ckpt_np.shape[1] if is_3d else ckpt_np.shape[0]
+    ckpt_k = ckpt_np.shape[-1]
     mask_np = (
         None
         if (active_mask is None or isinstance(active_mask, jax.core.Tracer))
         else np.asarray(active_mask).reshape(-1)
     )
+    roff_np = (
+        None
+        if (read_offsets is None or isinstance(read_offsets, jax.core.Tracer))
+        else np.asarray(read_offsets)
+    )
+    if roff_np is not None and roff_np.ndim == 3:
+        roff_np = roff_np[0]
     pps = layout.pages_per_slot
     for s in range(ns):
         if act_mode == "from_ckpt":
@@ -102,6 +112,13 @@ def check_ckpt_bounds(
             continue
         seen_slots: dict[int, int] = {}
         for sub in range(g_per_att):
+            if roff_np is not None:
+                ro_val = int(roff_np[sub, s] if roff_np.ndim == 2 else roff_np[s])
+                if ro_val >= ckpt_k:
+                    raise ValueError(
+                        f"GDN read_offsets={ro_val} (sub={sub}, s={s}) is out of "
+                        f"bounds for ckpt_indices with K={ckpt_k}"
+                    )
             slots = ckpt_np[sub, s] if is_3d else ckpt_np[s]
             for slot in np.ravel(slots):
                 slot_i = int(slot)

@@ -107,12 +107,12 @@ class Profile:
                 f"profile {self.name!r}: numerics must be 'exact' or 'approx', "
                 f"got {self.numerics!r}"
             )
-        if isinstance(self.fused_pool_io, str) and self.fused_pool_io != "auto":
+        if not (isinstance(self.fused_pool_io, bool) or self.fused_pool_io == "auto"):
             raise ValueError(
                 f"profile {self.name!r}: fused_pool_io must be a bool or 'auto', "
                 f"got {self.fused_pool_io!r}"
             )
-        if self.pool_gather not in (False, None, True):
+        if not (self.pool_gather is None or isinstance(self.pool_gather, bool)):
             raise ValueError(
                 f"profile {self.name!r}: pool_gather must be False, None or True, "
                 f"got {self.pool_gather!r}"

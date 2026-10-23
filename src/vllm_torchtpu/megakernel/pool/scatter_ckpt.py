@@ -56,6 +56,11 @@ def prepare_ckpt(
         # to zero) when they fill the padded window exactly, else `taps` rows
         # padded with zero rows; it falls back to the packed copy when the
         # caller's conv tensor is too short.
+        if T > 1 and (conv.ndim != 4 or conv.shape[2] < taps + T):
+            raise ValueError(
+                f"conv has shape {conv.shape}, expected 4D "
+                f"(ngdn, {NS}, >={taps + T}, {QKV}) when T={T} > 1"
+            )
         tail_row = (taps + 1) * qkv_128 == conv_rows_pad
         min_direct_rows = taps + 1 + T if tail_row else taps + T
         direct_conv = (
@@ -96,10 +101,22 @@ def prepare_ckpt(
             conv_in = conv_flat.reshape(conv_4d.shape[0], NS * T * conv_rows_pad, LANES)
             conv_buf_shape = (2, T * conv_rows_pad, LANES)
             conv_buf_dt = BF16
+        if not (
+            (ckpt_indices.ndim == 2 and ckpt_indices.shape[0] == NS)
+            or (
+                ckpt_indices.ndim == 3
+                and ckpt_indices.shape[:2] == (layout.slots_per_pool, NS)
+            )
+        ):
+            raise ValueError(
+                f"ckpt_indices has shape {ckpt_indices.shape}, expected "
+                f"({layout.slots_per_pool}, {NS}, K) or ({NS}, K)"
+            )
         ckpt_is_3d = ckpt_indices.ndim == 3
         ckpt_k = ckpt_indices.shape[-1]
-        ckpt_t_off = 0 if ckpt_k == T else 1
-        assert ckpt_t_off + T <= ckpt_k, (ckpt_k, T)
+        if ckpt_k < T:
+            raise ValueError(f"ckpt_indices last dim K={ckpt_k} must be >= T ({T})")
+        ckpt_t_off = ckpt_k - T
     else:
         vh = KD = VD = QKV = 0
         ssm_u32_rows = conv_rows = conv_rows_pad = qkv_128 = 0

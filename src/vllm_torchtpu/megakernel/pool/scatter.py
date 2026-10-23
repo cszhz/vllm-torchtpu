@@ -76,7 +76,8 @@ def scatter_pool_states(
     if interpret is None:
         interpret = ex.interpret
     NATT = layout.num_pools
-    assert len(raw_pools) == NATT, (len(raw_pools), NATT)
+    if len(raw_pools) != NATT:
+        raise ValueError(f"expected {NATT} raw_pools, got {len(raw_pools)}")
 
     NS, B, T, MR = ex.NS, ex.B, ex.T, ex.MR
     G_PER_ATT = layout.slots_per_pool
@@ -84,6 +85,13 @@ def scatter_pool_states(
     HD = layout.hd
     h4 = HD // 4
     page_shape = layout.kv_page_shape
+    exp_pool_shape = (cache_exec(ex).num_pages, *page_shape)
+    for p_idx, pool_arr in enumerate(raw_pools):
+        if pool_arr.shape != exp_pool_shape:
+            raise ValueError(
+                f"raw_pools[{p_idx}] has shape {pool_arr.shape}, expected "
+                f"per-rank shape {exp_pool_shape}"
+            )
     pps = layout.pages_per_slot
     rec_pages = layout.rec_pages_per_slot
     rec_u32_cap = layout.rec_u32_rows
@@ -104,6 +112,15 @@ def scatter_pool_states(
     act_mode, active_mask = resolve_active_seqs(
         active_seqs, default_mode="from_ckpt" if has_gdn else "all"
     )
+    if not has_gdn and act_mode == "from_ckpt":
+        raise ValueError(
+            "active_seqs='from_ckpt' requires a layout with recurrent state "
+            "(slots_per_pool > 0); use active_seqs='all' or a mask array"
+        )
+    if active_mask is not None and active_mask.shape != (NS,):
+        raise ValueError(
+            f"active_seqs mask has shape {active_mask.shape}, expected ({NS},)"
+        )
     if has_gdn:
         check_ckpt_bounds(
             ckpt_indices,
@@ -186,6 +203,7 @@ def scatter_pool_states(
         n_hbm=n_hbm,
         s_names=tuple(s_names),
         n_pairs=n_pairs,
+        pt_cols=pt_cols,
         **ckpt_geom,
     )
 
@@ -223,7 +241,7 @@ def scatter_pool_states(
         input_output_aliases={r: r for r in range(NATT)},
         compiler_params=pltpu.CompilerParams(
             collective_id=None,
-            disable_bounds_checks=True,
+            disable_bounds_checks=not ex.resolved_tiles.bounds_checks,
             vmem_limit_bytes=ex.resolved_tiles.vmem_mib << 20,
         ),
         interpret=bool(interpret),

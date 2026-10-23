@@ -71,29 +71,61 @@ def gather_gdn_states(
       `(conv, rec)` per-rank recurrent and causal-conv state tensors.
     """
     layout.validate(ex)
+    if not layout.has_recurrent:
+        raise ValueError(
+            "gather_gdn_states requires a layout with recurrent state "
+            "(slots_per_pool > 0)"
+        )
     if interpret is None:
         interpret = ex.interpret
     NATT = layout.num_pools
-    assert len(raw_pools) == NATT, (len(raw_pools), NATT)
+    if len(raw_pools) != NATT:
+        raise ValueError(f"expected {NATT} raw_pools, got {len(raw_pools)}")
+    exp_pool_shape = (cache_exec(ex).num_pages, *layout.kv_page_shape)
+    for p_idx, pool_arr in enumerate(raw_pools):
+        if pool_arr.shape != exp_pool_shape:
+            raise ValueError(
+                f"raw_pools[{p_idx}] has shape {pool_arr.shape}, expected "
+                f"per-rank shape {exp_pool_shape}"
+            )
     G_PER_ATT = layout.slots_per_pool
-    act_mode, active_mask = resolve_active_seqs(
-        active_seqs, default_mode="from_ckpt" if G_PER_ATT > 0 else "all"
-    )
+    NS, B, T = ex.NS, ex.B, ex.T
+    if (
+        not (
+            (ckpt_indices.ndim == 2 and ckpt_indices.shape[0] == NS)
+            or (ckpt_indices.ndim == 3 and ckpt_indices.shape[:2] == (G_PER_ATT, NS))
+        )
+        or ckpt_indices.shape[-1] < 1
+    ):
+        raise ValueError(
+            f"ckpt_indices has shape {ckpt_indices.shape}, expected "
+            f"({G_PER_ATT}, {NS}, >=1) or ({NS}, >=1)"
+        )
+    if read_offsets.shape not in ((NS,), (G_PER_ATT, NS)):
+        raise ValueError(
+            f"read_offsets has shape {read_offsets.shape}, expected "
+            f"({G_PER_ATT}, {NS}) or ({NS},)"
+        )
+    act_mode, active_mask = resolve_active_seqs(active_seqs, default_mode="from_ckpt")
+    if active_mask is not None and active_mask.shape != (NS,):
+        raise ValueError(
+            f"active_seqs mask has shape {active_mask.shape}, expected ({NS},)"
+        )
     check_ckpt_bounds(
         ckpt_indices,
         cache_exec(ex).num_pages,
         layout,
         act_mode=act_mode,
         active_mask=active_mask,
+        read_offsets=read_offsets,
     )
 
     vh, KD, VD = layout.vh_per_rank(ex.R), layout.KD, layout.VD
     QKV = layout.qkv_per_rank(ex.R)
-    NS, B, T = ex.NS, ex.B, ex.T
     taps = layout.conv_taps
     CR = rup(taps * B, 8)
     HR = rup(taps + T, 8)
-    ngdn = max(1, layout.num_recurrent_layers)
+    ngdn = layout.num_recurrent_layers
     conv_shape = (ngdn, CR, QKV) if T == 1 else (ngdn, NS, HR, QKV)
     conv_dt = F32
     rec_shape = (ngdn, NS * vh, KD, VD)
@@ -108,23 +140,26 @@ def gather_gdn_states(
     conv_rows = (taps * QKV) // LANES
     conv_rows_pad = ((conv_rows + 15) // 16) * 16
     qkv_128 = QKV // LANES
-    direct_conv = T > 1 and ((HR * qkv_128) % 16 == 0 or bool(interpret))
+    direct_conv = (
+        T > 1
+        and (HR * qkv_128) <= conv_page_rows
+        and ((HR * qkv_128) % 16 == 0 or bool(interpret))
+    )
     hr_rows_128 = HR * qkv_128
     conv_raw_shape = conv_shape if direct_conv else (ngdn, NS * conv_rows_pad, LANES)
     conv_raw_dt = conv_dt if direct_conv else BF16
     ckpt_is_3d = ckpt_indices.ndim == 3
+    ckpt_k = ckpt_indices.shape[-1]
     roff_is_2d = read_offsets.ndim == 2
     n_pairs = NS // 2
 
-    coal_rec = (G_PER_ATT > 0) and (NS * vh <= 128)
-    rec_coal = max(1, G_PER_ATT) if coal_rec else 1
+    coal_rec = NS * vh <= 128
+    rec_coal = G_PER_ATT if coal_rec else 1
 
     scratch = {
         "page_buf": pltpu.VMEM((2, pps, *layout.kv_page_shape), FP8),
         "rec_buf": pltpu.VMEM((2, rec_coal, *rec_shape[1:]), rec_dt),
-        "conv_buf": pltpu.VMEM(
-            (2, max(1, G_PER_ATT), *conv_raw_shape[1:]), conv_raw_dt
-        ),
+        "conv_buf": pltpu.VMEM((2, G_PER_ATT, *conv_raw_shape[1:]), conv_raw_dt),
         "sem_in": pltpu.SemaphoreType.DMA((2,)),
         "sem_out": pltpu.SemaphoreType.DMA((2, 2)),
     }
@@ -165,9 +200,13 @@ def gather_gdn_states(
             return jnp.logical_and(is_active(s), roff >= 0)
 
         def page_base_for(sub, s):
-            roff = jnp.maximum(
-                roff_ref[sub, s] if roff_is_2d else roff_ref[s], jnp.int32(0)
+            raw_roff = roff_ref[sub, s] if roff_is_2d else roff_ref[s]
+            kernel_debug_check(
+                jnp.logical_and(raw_roff >= 0, raw_roff < ckpt_k),
+                "GDN gather read_offsets outside [0, K)",
+                interpret=bool(interpret),
             )
+            roff = jnp.clip(raw_roff, jnp.int32(0), jnp.int32(ckpt_k - 1))
             slot = ckpt_ref[sub, s, roff] if ckpt_is_3d else ckpt_ref[s, roff]
             pb = layout.page_base(slot, sub, ckpt_indices.ndim)
             kernel_debug_check(
@@ -243,13 +282,13 @@ def gather_gdn_states(
                     )
 
         total_gdn = NATT * G_PER_ATT
-        if total_gdn > 0 and NS >= 1:
+        if NS >= 1:
             start_page_read(raw_refs[0], 0, 0, 0)
 
         for g_idx in range(NATT):
             raw_ref = raw_refs[g_idx]
             g_slot = g_idx & 1
-            if G_PER_ATT > 0 and g_idx >= 2:
+            if g_idx >= 2:
                 o_prev = (g_idx - 2) * G_PER_ATT
                 pltpu.make_async_copy(
                     conv_buf.at[g_slot],
@@ -371,54 +410,41 @@ def gather_gdn_states(
                         sem_out.at[r_slot, 1],
                     ).start()
 
-            if G_PER_ATT > 0:
-                o_base = g_idx * G_PER_ATT
+            o_base = g_idx * G_PER_ATT
+            pltpu.make_async_copy(
+                conv_buf.at[g_slot],
+                conv_out_ref.at[pl.ds(o_base, G_PER_ATT)],
+                sem_out.at[g_slot, 0],
+            ).start()
+            if coal_rec:
                 pltpu.make_async_copy(
-                    conv_buf.at[g_slot],
-                    conv_out_ref.at[pl.ds(o_base, G_PER_ATT)],
-                    sem_out.at[g_slot, 0],
+                    rec_buf.at[g_slot],
+                    rec_out_ref.at[pl.ds(o_base, G_PER_ATT)],
+                    sem_out.at[g_slot, 1],
                 ).start()
-                if coal_rec:
-                    pltpu.make_async_copy(
-                        rec_buf.at[g_slot],
-                        rec_out_ref.at[pl.ds(o_base, G_PER_ATT)],
-                        sem_out.at[g_slot, 1],
-                    ).start()
 
-        if G_PER_ATT > 0:
-            for g_tail in range(max(0, NATT - 2), NATT):
-                tail_slot = g_tail & 1
-                o_tail = g_tail * G_PER_ATT
+        for g_tail in range(max(0, NATT - 2), NATT):
+            tail_slot = g_tail & 1
+            o_tail = g_tail * G_PER_ATT
+            pltpu.make_async_copy(
+                conv_buf.at[tail_slot],
+                conv_out_ref.at[pl.ds(o_tail, G_PER_ATT)],
+                sem_out.at[tail_slot, 0],
+            ).wait()
+            if coal_rec:
                 pltpu.make_async_copy(
-                    conv_buf.at[tail_slot],
-                    conv_out_ref.at[pl.ds(o_tail, G_PER_ATT)],
-                    sem_out.at[tail_slot, 0],
+                    rec_buf.at[tail_slot],
+                    rec_out_ref.at[pl.ds(o_tail, G_PER_ATT)],
+                    sem_out.at[tail_slot, 1],
                 ).wait()
-                if coal_rec:
-                    pltpu.make_async_copy(
-                        rec_buf.at[tail_slot],
-                        rec_out_ref.at[pl.ds(o_tail, G_PER_ATT)],
-                        sem_out.at[tail_slot, 1],
-                    ).wait()
-            if not coal_rec:
-                for o_tail in range(max(0, total_gdn - 2), total_gdn):
-                    r_tail = o_tail & 1
-                    pltpu.make_async_copy(
-                        rec_buf.at[r_tail, 0],
-                        rec_out_ref.at[o_tail],
-                        sem_out.at[r_tail, 1],
-                    ).wait()
-        else:
-            cp_c = pltpu.make_async_copy(
-                conv_buf.at[0, 0], conv_out_ref.at[0], sem_out.at[0, 0]
-            )
-            cp_r = pltpu.make_async_copy(
-                rec_buf.at[0, 0], rec_out_ref.at[0], sem_out.at[0, 1]
-            )
-            cp_c.start()
-            cp_r.start()
-            cp_c.wait()
-            cp_r.wait()
+        if not coal_rec:
+            for o_tail in range(max(0, total_gdn - 2), total_gdn):
+                r_tail = o_tail & 1
+                pltpu.make_async_copy(
+                    rec_buf.at[r_tail, 0],
+                    rec_out_ref.at[o_tail],
+                    sem_out.at[r_tail, 1],
+                ).wait()
 
     in_specs = [pl.BlockSpec(memory_space=pltpu.HBM)] * NATT + [
         pl.BlockSpec(memory_space=pltpu.SMEM)
@@ -446,7 +472,7 @@ def gather_gdn_states(
         scratch_shapes=[scratch[k] for k in s_names],
         compiler_params=pltpu.CompilerParams(
             collective_id=None,
-            disable_bounds_checks=True,
+            disable_bounds_checks=not ex.resolved_tiles.bounds_checks,
             vmem_limit_bytes=ex.resolved_tiles.vmem_mib << 20,
         ),
         interpret=bool(interpret),
