@@ -950,6 +950,12 @@ DECODE_LHS_IN_VMEM_FUSED = True
 #: writeback tail against the same tree in a scoring job.
 DECODE_DIAG_SKIP_WRITEBACK = False
 
+#: Ablation switch of the decode path, False outside a diagnostic job. True
+#: returns once tile 0's weights have landed, with no metadata fill, lhs work
+#: or multiplies, so the output is wrong; run with the head's placement knobs
+#: on and off, it prices the head before the first weight DMA in one job.
+DECODE_DIAG_STOP_AFTER_FIRST_FETCH = False
+
 
 def decode_out_in_vmem(cfgs: GmmConfigs) -> bool:
     """Whether the decode path at `cfgs` returns its output in VMEM."""
@@ -1213,6 +1219,19 @@ def decode_kernel(
     if sizes_copy is not None:
         sizes_copy.wait()
         lhs_group_sizes_ref = dec.group_sizes
+    if DECODE_DIAG_STOP_AFTER_FIRST_FETCH:
+
+        @pl.when(first_group < dims.size_group)
+        def _():
+            weights, scale = decode_weight_copies(
+                rhs_hbm_ref, dec, first_group, 0, decode_panels(cfgs)
+            )
+            for copy in (*weights, scale):
+                copy.wait()
+
+        if dec.group_sizes is not None and not lhs_in_vmem:
+            lhs_copy(0).wait()
+        return
     num_gm = fill_metadata_single_tile(
         lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs
     )
