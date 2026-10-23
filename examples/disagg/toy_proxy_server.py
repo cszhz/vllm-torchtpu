@@ -149,33 +149,56 @@ class _RemoteDraftAdmissionBarrier:
         self._waiting = 0
         self._bypass_requests = bypass_requests
         self._remaining_bypass = bypass_requests
+        self._bypass_inflight = 0
 
-    async def wait(self) -> None:
+    async def wait(self) -> bool:
         if self.parties == 1:
-            return
+            return False
         async with self._condition:
             if self._remaining_bypass:
                 self._remaining_bypass -= 1
+                self._bypass_inflight += 1
                 print(
                     "PERF PROXY remote_draft_barrier bypass "
-                    f"remaining={self._remaining_bypass}",
+                    f"remaining={self._remaining_bypass} "
+                    f"inflight={self._bypass_inflight}",
                     flush=True,
                 )
-                return
+                return True
             generation = self._generation
             self._waiting += 1
-            if self._waiting == self.parties:
-                self._waiting = 0
-                self._generation += 1
-                self._remaining_bypass = self._bypass_requests
-                print(
-                    "PERF PROXY remote_draft_barrier release "
-                    f"generation={self._generation} parties={self.parties}",
-                    flush=True,
-                )
-                self._condition.notify_all()
-                return
+            self._release_wave_if_ready()
             await self._condition.wait_for(lambda: self._generation != generation)
+            return False
+
+    async def complete_bypass(self) -> None:
+        async with self._condition:
+            if self._bypass_inflight <= 0:
+                raise RuntimeError("remote draft barrier has no bypass in flight")
+            self._bypass_inflight -= 1
+            print(
+                "PERF PROXY remote_draft_barrier bypass_complete "
+                f"inflight={self._bypass_inflight}",
+                flush=True,
+            )
+            self._release_wave_if_ready()
+
+    def _release_wave_if_ready(self) -> None:
+        if (
+            self._waiting != self.parties
+            or self._remaining_bypass
+            or self._bypass_inflight
+        ):
+            return
+        self._waiting = 0
+        self._generation += 1
+        self._remaining_bypass = self._bypass_requests
+        print(
+            "PERF PROXY remote_draft_barrier release "
+            f"generation={self._generation} parties={self.parties}",
+            flush=True,
+        )
+        self._condition.notify_all()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -685,6 +708,7 @@ async def _handle_completions(api: str, request: Request):
 
         remote_dspark = os.getenv("VLLM_TPU_REMOTE_DSPARK_SHADOW", "0") == "1"
         shadow_task = None
+        remote_draft_bypass = False
         # Send request to prefill service
         t_prefill_send = time.time()
         t_prefill_send_perf = time.perf_counter()
@@ -693,7 +717,7 @@ async def _handle_completions(api: str, request: Request):
             flush=True,
         )
         if remote_dspark:
-            await request.app.state.remote_draft_barrier.wait()
+            remote_draft_bypass = await request.app.state.remote_draft_barrier.wait()
             shadow_task = asyncio.create_task(
                 send_shadow_request_to_prefill(
                     prefill_client_info, api, req_data, request_id, forwarded
@@ -780,18 +804,22 @@ async def _handle_completions(api: str, request: Request):
                     yield chunk
             finally:
                 release_decode()
-                if shadow_task is not None:
-                    shadow_response = await shadow_task
-                    shadow_response.raise_for_status()
-                    shadow_text = _completion_text(shadow_response.content, False)
-                    decode_text = _completion_text(
-                        b"".join(decode_chunks), bool(req_data.get("stream"))
-                    )
-                    if shadow_text != decode_text:
-                        raise RuntimeError(
-                            "remote DSpark shadow/decode output mismatch for "
-                            f"request {request_id}"
+                try:
+                    if shadow_task is not None:
+                        shadow_response = await shadow_task
+                        shadow_response.raise_for_status()
+                        shadow_text = _completion_text(shadow_response.content, False)
+                        decode_text = _completion_text(
+                            b"".join(decode_chunks), bool(req_data.get("stream"))
                         )
+                        if shadow_text != decode_text:
+                            raise RuntimeError(
+                                "remote DSpark shadow/decode output mismatch for "
+                                f"request {request_id}"
+                            )
+                finally:
+                    if remote_draft_bypass:
+                        await request.app.state.remote_draft_barrier.complete_bypass()
 
         # text/event-stream when the caller asked for a stream, which is what
         # the decode instance is actually sending back. Declared as

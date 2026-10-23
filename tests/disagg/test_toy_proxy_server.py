@@ -68,13 +68,17 @@ def test_remote_draft_admission_barrier_bypasses_probe() -> None:
     async def run() -> None:
         barrier = _RemoteDraftAdmissionBarrier(2, bypass_requests=1)
         for _ in range(2):
-            await barrier.wait()
+            assert await barrier.wait()
 
             first = asyncio.create_task(barrier.wait())
+            second = asyncio.create_task(barrier.wait())
             await asyncio.sleep(0)
             assert not first.done()
-            await barrier.wait()
-            await first
+            assert not second.done()
+
+            await barrier.complete_bypass()
+            assert not await first
+            assert not await second
 
     asyncio.run(run())
 
