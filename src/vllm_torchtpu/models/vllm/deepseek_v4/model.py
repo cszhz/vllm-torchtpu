@@ -421,9 +421,8 @@ class DeepseekV4Model(nn.Module):
 
     @property
     def mhc_post_head_op(self) -> tuple:
-        """The deferred post fused with the hc head collapse and the final
-        norm, built once: (op on a combined MoE output, op on (routed,
-        shared))."""
+        """The deferred post fused with the hc head collapse, built once:
+        (op on a combined MoE output, op on (routed, shared))."""
         ops = self.__dict__.get("_mhc_post_head_op_instance")
         if ops is None:
             routed_scale = getattr(self.config, "routed_scaling_factor", 1.0)
@@ -552,7 +551,6 @@ class DeepseekV4Model(nn.Module):
             elif is_last_rank:
                 # Settle the deferred post and collapse the hc streams in one
                 # kernel; the [T, hc_mult, hidden] state never reaches HBM.
-                # self.norm is applied in the same kernel.
                 post_head, post_head_shared = self.mhc_post_head_op
                 head_args = (
                     residual,
@@ -561,7 +559,6 @@ class DeepseekV4Model(nn.Module):
                     self.hc_head_fn,
                     self.hc_head_scale,
                     self.hc_head_base,
-                    self.norm.weight,
                 )
                 if isinstance(hidden_states, tuple):
                     hidden_states = post_head_shared(*hidden_states, *head_args)
@@ -586,7 +583,7 @@ class DeepseekV4Model(nn.Module):
                 self.rms_norm_eps,
                 self.hc_eps,
             )
-            hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

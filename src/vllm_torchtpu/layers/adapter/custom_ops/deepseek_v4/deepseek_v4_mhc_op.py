@@ -135,13 +135,11 @@ def _mhc_post_head_jax(
     hc_fn: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
-    norm_weight: jax.Array,
     *,
     rms_eps: float,
     hc_eps: float,
 ) -> jax.Array:
-    """The last layer's post, the hc head collapse and the model's final
-    RMSNorm (weight ``norm_weight``, epsilon ``rms_eps``) as one kernel."""
+    """The last layer's post and the hc head collapse as one kernel."""
     return post_head_kernel.mhc_post_head(
         x,
         residual,
@@ -152,8 +150,6 @@ def _mhc_post_head_jax(
         hc_base,
         rms_eps,
         hc_eps,
-        norm_weight=norm_weight,
-        norm_eps=rms_eps,
     )
 
 
@@ -166,7 +162,6 @@ def _mhc_post_head_shared_jax(
     hc_fn: jax.Array,
     hc_scale: jax.Array,
     hc_base: jax.Array,
-    norm_weight: jax.Array,
     *,
     rms_eps: float,
     hc_eps: float,
@@ -185,8 +180,6 @@ def _mhc_post_head_shared_jax(
         hc_eps,
         shared=shared,
         routed_scale=routed_scale,
-        norm_weight=norm_weight,
-        norm_eps=rms_eps,
     )
 
 
@@ -468,13 +461,12 @@ def get_mhc_post_op():
 
 
 def get_mhc_post_head_op(rms_eps: float, hc_eps: float):
-    """``post`` fused with the model's hc head collapse and final RMSNorm,
-    whose weight is the op's last input.
+    """``post`` fused with the model's hc head collapse.
 
     Same outside-the-trace requirement as ``get_mhc_ops``.
     """
     op_name = (
-        "pallas::deepseek_v4_mhc_post_head_v2"
+        "pallas::deepseek_v4_mhc_post_head_v1"
         f"_r{_name_float(rms_eps)}_e{_name_float(hc_eps)}"
     )
     op = _mhc_op_cache.get(op_name)
@@ -491,7 +483,6 @@ def get_mhc_post_head_op(rms_eps: float, hc_eps: float):
                 P(),  # hc_fn
                 P(),  # hc_scale
                 P(),  # hc_base
-                P(),  # norm_weight
             ),
         )
         op.register_fake(_fake_mhc_post_head)
@@ -505,7 +496,7 @@ def get_mhc_post_head_shared_op(rms_eps: float, hc_eps: float, routed_scale: flo
     Same outside-the-trace requirement as ``get_mhc_ops``.
     """
     op_name = (
-        "pallas::deepseek_v4_mhc_post_head_shared_v2"
+        "pallas::deepseek_v4_mhc_post_head_shared_v1"
         f"_r{_name_float(rms_eps)}_e{_name_float(hc_eps)}"
         f"_rs{_name_float(routed_scale)}"
     )
@@ -529,7 +520,6 @@ def get_mhc_post_head_shared_op(rms_eps: float, hc_eps: float, routed_scale: flo
                 P(),  # hc_fn
                 P(),  # hc_scale
                 P(),  # hc_base
-                P(),  # norm_weight
             ),
         )
         op.register_fake(_fake_mhc_post_head_shared)
