@@ -727,9 +727,8 @@ class MhcGatesInKernelTpuTest(parameterized.TestCase):
 
 @pytest.mark.tpu_test
 class MhcStackedFnTpuTest(parameterized.TestCase):
-    """Stacked-chunk single-pass GEMM (utils.CatFn), the 128-token block, the
-    uncapped in-kernel gates and the in-kernel stream of fn vs the default
-    three-chunk path. Streams are bit-identical (they never see fn); the
+    """Stacked-chunk single-pass GEMM (utils.CatFn), the 128-token block and
+    the uncapped in-kernel gates vs the default three-chunk path. Streams are bit-identical (they never see fn); the
     gates differ only by GEMM partial-sum rounding (tolerance tier)."""
 
     def setUp(self):
@@ -739,7 +738,7 @@ class MhcStackedFnTpuTest(parameterized.TestCase):
 
     @parameterized.product(
         num_tokens=[8, 16, 17, 128, 600],
-        variant=["cat", "cat_tb128_gkall", "cat_stream"],
+        variant=["cat", "cat_tb128_gkall"],
     )
     def test_fused(self, num_tokens, variant):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
@@ -751,8 +750,6 @@ class MhcStackedFnTpuTest(parameterized.TestCase):
         kw = dict(gates_in_kernel=True, gates_max_tokens=0)
         if variant == "cat_tb128_gkall":
             kw["token_block_size"] = 128
-        if variant == "cat_stream":
-            kw.update(token_block_size=128, fn_prefetch=True, per_stream_dot=True)
         got = fused_fn(*args, **kw)
         np.testing.assert_array_equal(_to_np(got[0]), _to_np(want[0]))
         for g, w in zip(got[1:3], want[1:3]):

@@ -329,31 +329,6 @@ def sinkhorn(c, m: int, eps: float, sinkhorn_repeat: int):
     return c
 
 
-def gates_dense(mt, sc_ref, hb_ref, *, hc_mult: int, gates: GateConsts):
-    """post/comb gates on scaled mixes laid out (M3, G, L): every entry is a
-    dense (G, L) slab (tokens on sublanes and lanes), so the 2 * repeat
-    dependent Sinkhorn steps run on full vregs. Same ops, in the same
-    order, as ``gates_in_block``. Returns post (M, G, L), comb (M*M, G, L).
-    """
-    m = hc_mult
-    eps = gates.hc_sinkhorn_eps
-
-    def hb(k):
-        return hb_ref[0:1, k : k + 1]
-
-    post = [
-        (1.0 / (1.0 + jnp.exp(-(mt[m + j] * sc_ref[0, 1] + hb(m + j)))))
-        * gates.hc_post_mult_value
-        for j in range(m)
-    ]
-    c = [
-        [mt[2 * m + i * m + j] * sc_ref[0, 2] + hb(2 * m + i * m + j) for j in range(m)]
-        for i in range(m)
-    ]
-    c = sinkhorn(c, m, eps, gates.sinkhorn_repeat)
-    return jnp.stack(post), jnp.stack([c[i][j] for i in range(m) for j in range(m)])
-
-
 def finish_layer_input(lay: jax.Array, norm_w_ref, norm_eps: float | None) -> jax.Array:
     """The collapsed f32 layer input as the bf16 the sublayer consumes.
 
