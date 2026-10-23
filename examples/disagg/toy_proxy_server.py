@@ -147,6 +147,7 @@ class _RemoteDraftAdmissionBarrier:
         self._condition = asyncio.Condition()
         self._generation = 0
         self._waiting = 0
+        self._bypass_requests = bypass_requests
         self._remaining_bypass = bypass_requests
 
     async def wait(self) -> None:
@@ -155,12 +156,23 @@ class _RemoteDraftAdmissionBarrier:
         async with self._condition:
             if self._remaining_bypass:
                 self._remaining_bypass -= 1
+                print(
+                    "PERF PROXY remote_draft_barrier bypass "
+                    f"remaining={self._remaining_bypass}",
+                    flush=True,
+                )
                 return
             generation = self._generation
             self._waiting += 1
             if self._waiting == self.parties:
                 self._waiting = 0
                 self._generation += 1
+                self._remaining_bypass = self._bypass_requests
+                print(
+                    "PERF PROXY remote_draft_barrier release "
+                    f"generation={self._generation} parties={self.parties}",
+                    flush=True,
+                )
                 self._condition.notify_all()
                 return
             await self._condition.wait_for(lambda: self._generation != generation)
