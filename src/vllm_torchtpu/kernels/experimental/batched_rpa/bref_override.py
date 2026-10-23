@@ -353,6 +353,21 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                         vmem_dst.at[b, pl.ds(dst_off, sz)],
                         sem,
                     ).start()
+            elif self.cfgs.serve.compact_kv_schedule:
+                # Compact schedule: the lane-tile's first page-table index and
+                # token count; pages are full except the last nonempty one.
+                p0 = schedule_ref.dma_kv_cache[block_idx, b, 0, 0]
+                tokens = schedule_ref.dma_kv_cache[block_idx, b, 0, 2]
+                tokens = jnp.where(is_no_op, 0, tokens)
+                for i in range(self.cfgs.bkv_p_cache):
+                    sz = jnp.clip(tokens - i * page_size, 0, page_size)
+                    p_idx = jnp.minimum(p0 + i, last_index) if i else p0
+                    src_off = page_indices_ref[p_idx] * page_size
+                    pltpu.make_async_copy(
+                        kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
+                        vmem_dst.at[b, pl.ds(i * page_size, sz)],
+                        sem,
+                    ).start()
             else:
                 # Lean per-page fetch: a tile's cache pages are consecutive
                 # page-table entries landing at i * page_size, so only the

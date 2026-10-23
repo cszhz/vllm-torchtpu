@@ -72,6 +72,14 @@ def strided_load_bkv(
     )
     bitwidth = jax.dtypes.itemsize_bits(cfgs.serve.dtype_kv)
 
+    if cfgs.serve.kv_slot is not None:
+        # Only this slot's (K, V) pair: its 2 * bitwidth bits of each word.
+        pair_bits = 2 * bitwidth
+        shifted = kv >> (cfgs.serve.kv_slot * pair_bits)
+        pair = shifted.astype(jnp.dtype(f"uint{pair_bits}"))
+        return utils.convert_to_target_bitwidth(
+            pair, target_bitwidth=bitwidth, kv_dtype=cfgs.serve.dtype_kv
+        )
     return utils.convert_to_target_bitwidth(
         kv, target_bitwidth=bitwidth, kv_dtype=cfgs.serve.dtype_kv
     )
