@@ -3496,6 +3496,7 @@ def sparse_ragged_paged_attention(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    kv_stack: tuple[int, int] | None = None,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -3660,6 +3661,18 @@ def sparse_ragged_paged_attention(
         (`SparseMLAKVCacheSpec.packed_rope`); the gather expands it to the
         padded rows the attention body reads, so the scores are unchanged.
         `kv_write` then writes 16-word rope tokens.
+      kv_stack: GLM5_MKD_STACK_C. `(row, num_blocks)` when the caches are this
+        rank's `[n_layers * num_blocks, ...]` merged stacks
+        (`kv_cache_utils.merge_kv_stack`) and `page_indices` holds this
+        layer's own local pages (each < `num_blocks`, as on a per-layer
+        cache). The top-k -> row translation then runs on the per-layer
+        geometry (`total_num_pages = num_blocks`), so it is the same
+        computation in every layer that shares a top-k and XLA CSEs it as on
+        per-layer caches, and the row offset `row * num_blocks * page_size` is
+        added to its rows (the plain window prep and the uncapped prep). The
+        fused decode prep and the live-group preps take the stack-wide page
+        table `page_indices + row * num_blocks` instead. Every row a gather
+        reads is the per-layer row offset into this layer's part of the stack.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -3840,6 +3853,22 @@ def sparse_ragged_paged_attention(
     )
     window_indices_all: Any = None  # one array, or one per chunk
     chunk_window_rows = 0  # rows of `window_indices_all` per chunk
+    # GLM5_MKD_STACK_C: the per-layer prep geometry and the row offset added to
+    # its rows (plain window / uncapped prep), or the stack-wide page table
+    # (fused / live preps). Without a stack: the cache's own pages, no offset.
+    prep_num_pages = cache_kv_nope.shape[0]
+    stack_page_indices = page_indices
+    stack_row_offset = 0
+    if kv_stack is not None:
+        stack_row, stack_num_blocks = kv_stack
+        if page_indices is None or cache_kv_nope.shape[0] % stack_num_blocks:
+            raise ValueError(
+                f"kv_stack={kv_stack} needs a page table and a merged stack, got "
+                f"{cache_kv_nope.shape[0]} pages"
+            )
+        prep_num_pages = stack_num_blocks
+        stack_page_indices = page_indices + jnp.int32(stack_row * stack_num_blocks)
+        stack_row_offset = stack_row * stack_num_blocks * page_size
     group_tab = None
     group_num_live = None
     fused_prep = (
@@ -3874,7 +3903,7 @@ def sparse_ragged_paged_attention(
         )
         window_indices_all = prepare_capped_window_fused(
             topk_indices,
-            page_indices,
+            stack_page_indices,
             cu_q_lens,
             cu_q_lens[distribution[2]],
             topk_cap=topk_cap,
@@ -3925,7 +3954,7 @@ def sparse_ragged_paged_attention(
             window_indices_all, kv_lens, group_tab, group_num_live = (
                 prepare_capped_window_live_fused(
                     topk_indices,
-                    page_indices,
+                    stack_page_indices,
                     cu_q_lens,
                     token_end,
                     chunk_size=uniform_chunk,
@@ -3954,7 +3983,7 @@ def sparse_ragged_paged_attention(
             )
             window_indices_all = prepare_capped_window_live(
                 topk_indices,
-                page_indices,
+                stack_page_indices,
                 cu_q_lens,
                 live_windows,
                 group_tab,
@@ -3999,18 +4028,22 @@ def sparse_ragged_paged_attention(
             chunk_size=uniform_chunk,
             topk_cap=topk_cap,
             page_size=page_size,
-            total_num_pages=cache_kv_nope.shape[0],
+            total_num_pages=prep_num_pages,
         )
+        if stack_row_offset:
+            window_indices_all = window_indices_all + jnp.int32(stack_row_offset)
     else:
         kv_lens, physical_indices = prepare_gather_indices(
             topk_indices,
             page_indices,
             cu_q_lens,
             page_size=page_size,
-            total_num_pages=cache_kv_nope.shape[0],
+            total_num_pages=prep_num_pages,
             is_dcp_mode=is_dcp_mode,
             num_valid_tokens=cu_q_lens[distribution[2]],
         )
+        if stack_row_offset:
+            physical_indices = physical_indices + jnp.int32(stack_row_offset)
 
     # Rows the grid never reaches (padding past `batch_end`) keep this
     # sentinel, so a downstream merge weights them at exp(min - max) == 0

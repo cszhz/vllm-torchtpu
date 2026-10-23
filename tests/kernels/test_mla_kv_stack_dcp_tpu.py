@@ -99,9 +99,26 @@ def _step_inputs(step, layer, q_lens, num_tokens):
 
 
 def test_stacked_caches_match_per_layer_bitwise():
+    assert _run_stacked_vs_per_layer(fault=None) == []
+
+
+def test_wrong_stack_row_is_caught():
+    """Positive control: every stacked layer addressing row 0 (layers collide in
+    one row) must break the bitwise match -- outputs and caches."""
+    bad = _run_stacked_vs_per_layer(fault="row0")
+    assert any(b.startswith("out ") for b in bad), bad
+    assert any(b.startswith("cache ") for b in bad), bad
+
+
+def _run_stacked_vs_per_layer(fault=None):
+    """Runs the steps on per-layer and stacked caches. fault=None: asserts every
+    output and cache bitwise equal (returns []). fault="row0": the stacked arm's
+    kv_stack is (0, NUM_BLOCKS) for every layer; returns the mismatches."""
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
         streamidx_topk_dcp_step,
     )
+
+    bad = []
     from vllm_torchtpu.layers.core.attention_interface import (
         sparse_mla_attention_dcp,
     )
@@ -153,7 +170,7 @@ def test_stacked_caches_match_per_layer_bitwise():
             for stacked in (False, True):
                 if stacked:
                     nope, rope, idx = caches[True]
-                    kv_stack = (layer, NUM_BLOCKS)
+                    kv_stack = (0 if fault == "row0" else layer, NUM_BLOCKS)
                 else:
                     nope, rope, idx = caches[False][layer]
                     kv_stack = None
@@ -209,6 +226,10 @@ def test_stacked_caches_match_per_layer_bitwise():
             for name, a, b in zip(
                 ("local_topk", "out", "lse"), outs[False], outs[True]
             ):
+                if fault is not None:
+                    if not np.array_equal(a, b):
+                        bad.append(f"{name} step {step} layer {layer}")
+                    continue
                 np.testing.assert_array_equal(
                     b, a, err_msg=f"step {step} layer {layer}: {name}"
                 )
@@ -229,6 +250,11 @@ def test_stacked_caches_match_per_layer_bitwise():
             per = np.asarray(caches[False][layer][kind])
             per = per.reshape(dcp, *stack.shape[2:])
             assert per.any(), f"kind {kind} layer {layer}: nothing written"
+            if fault is not None:
+                if not np.array_equal(stack[:, layer], per):
+                    bad.append(f"cache kind {kind} layer {layer}")
+                continue
             np.testing.assert_array_equal(
                 stack[:, layer], per, err_msg=f"cache kind {kind} layer {layer}"
             )
+    return bad
