@@ -1284,10 +1284,33 @@ def _dma(src, dst, sem, *, wait=False):
         cp.start()
 
 
+def _swa_window_kv(bkv_ref, keep_rows):
+    """One decode token's window keys/values, bf16 [slots, head_dim], zero
+    where `keep_rows` is False.
+
+    Built from the 32-bit words of its uint8 slab rows `bkv_ref`
+    [>= slots, slots_per_token * kv_packing, lkv_dim]: word w of word row k
+    holds bf16 dims 256 k + w (low half) and 256 k + 128 + w (high half), the
+    values a uint8 -> bfloat16 bitcast of the rows reads, without its
+    sublane relayout.
+    """
+    num_slots, lanes = keep_rows.shape
+    _, rows, _ = bkv_ref.shape
+    word_rows = rows // 4
+    words = bkv_ref.reshape(bkv_ref.shape[0] * rows, lanes).bitcast(jnp.int32)
+    pieces = []
+    for k in range(word_rows):
+        w = jnp.where(keep_rows, words[pl.ds(k, num_slots, stride=word_rows), :], 0)
+        for half in (w << 16, w & jnp.int32(-65536)):
+            pieces.append(pltpu.bitcast(half, jnp.float32).astype(jnp.bfloat16))
+    return jnp.concatenate(pieces, axis=1)
+
+
 def swa_decode_window_partials(
     q_batch,  # [seq_batch_sz, num_q_heads, head_dim]
-    bkv_batch_vmem,  # [seq_batch_sz, >= bkv_sz, slots_per_token * kv_packing, lkv_dim]
-    kv_lens_batch,  # i32[seq_batch_sz]
+    # [seq_batch_sz, >= bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8
+    bkv_batch_ref,
+    kv_lens,  # seq_batch_sz i32 scalars
     *,
     bkv_sz: int,
     sliding_window: int,
@@ -1295,23 +1318,28 @@ def swa_decode_window_partials(
 ):
     """The unnormalized SWA softmax state of a batch of decode tokens over
     their single kv block: (pv [s, n, d], l [s, n], m [s, n]), all float32."""
-    seq_batch_sz, _, head_dim = q_batch.shape
-    bkv_batch = pltpu.bitcast(bkv_batch_vmem[:, :bkv_sz, ...], jnp.bfloat16).reshape(
-        seq_batch_sz, bkv_sz, head_dim
-    )
+    kv_lens_batch = jnp.stack(kv_lens)
 
-    cur_start_offset_batch = jnp.maximum(kv_lens_batch - sliding_window, jnp.int32(0))
-    m_vec = lax.broadcasted_iota(jnp.int32, (1, 1, bkv_sz), 2)
-    k_span_batch = cur_start_offset_batch[:, None, None] + m_vec
-    q_span_batch = (kv_lens_batch - 1)[:, None, None]
-    keep_batch = (
-        (q_span_batch - k_span_batch).astype(jnp.uint32) < jnp.uint32(sliding_window)
-    ) | (m_vec == 0)
+    def keep_mask(kv_len, shape, axis):
+        """Window slots a decode token attends to, along `axis`."""
+        m_vec = lax.broadcasted_iota(jnp.int32, shape, axis)
+        k_span = jnp.maximum(kv_len - sliding_window, jnp.int32(0)) + m_vec
+        q_span = kv_len - 1
+        return ((q_span - k_span).astype(jnp.uint32) < jnp.uint32(sliding_window)) | (
+            m_vec == 0
+        )
+
+    keep_batch = keep_mask(kv_lens_batch[:, None, None], (1, 1, bkv_sz), 2)
 
     # Slots past kv_left were not written this step and still hold whatever
     # the previous kernel left in VMEM. Masking their scores is not enough,
     # since 0 * NaN is NaN in the PV matmul, so zero the values too.
-    bkv_batch = jnp.where(jnp.swapaxes(keep_batch, 1, 2), bkv_batch, 0)
+    bkv_batch = jnp.stack(
+        [
+            _swa_window_kv(bkv_batch_ref.at[s], keep_mask(kv_len, (bkv_sz, 128), 0))
+            for s, kv_len in enumerate(kv_lens)
+        ]
+    )
 
     s_mat = jnp.einsum(
         "snd,smd->snm", q_batch, bkv_batch, preferred_element_type=jnp.float32
@@ -1552,21 +1580,19 @@ def _mla_batched_decode_kernel(
     def compute_batch(batch_idx, sem_idx):
         s_start = start_seq_idx + batch_idx * seq_batch_sz
 
-        kv_lens_batch = jnp.stack(
-            [
-                jnp.where(
-                    (s_start + s) < end_seq_idx,
-                    kv_lens_ref[jnp.minimum(s_start + s, max_num_seqs - 1)],
-                    0,
-                )
-                for s in range(seq_batch_sz)
-            ]
-        )
+        kv_lens_batch = [
+            jnp.where(
+                (s_start + s) < end_seq_idx,
+                kv_lens_ref[jnp.minimum(s_start + s, max_num_seqs - 1)],
+                0,
+            )
+            for s in range(seq_batch_sz)
+        ]
 
         q_batch = q_batch_x2_vmem[sem_idx]
         pv_batch, l_val, m_val = swa_decode_window_partials(
             q_batch,
-            bkv_batch_x2_vmem[sem_idx],
+            bkv_batch_x2_vmem.at[sem_idx],
             kv_lens_batch,
             bkv_sz=bkv_sz,
             sliding_window=sliding_window,

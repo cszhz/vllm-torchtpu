@@ -552,19 +552,17 @@ def _attention_kernel(
         handoff would have landed: acc in q_dtype, l/m in float32."""
         token_ids = [batch_start_seq_idx + b for b in range(batch_size)]
         max_num_seqs = swa.window.kv_lens_ref.shape[0]
-        kv_lens_batch = jnp.stack(
-            [
-                jnp.where(
-                    t < num_decode_tokens,
-                    swa.window.kv_lens_ref[jnp.minimum(t, max_num_seqs - 1)],
-                    0,
-                )
-                for t in token_ids
-            ]
-        )
+        kv_lens_batch = [
+            jnp.where(
+                t < num_decode_tokens,
+                swa.window.kv_lens_ref[jnp.minimum(t, max_num_seqs - 1)],
+                0,
+            )
+            for t in token_ids
+        ]
         pv, l_val, m_val = mla_swa.swa_decode_window_partials(
             bq_x2_ref[bq_sem_idx],
-            swa.bkv_x2_vmem[bq_sem_idx],
+            swa.bkv_x2_vmem.at[bq_sem_idx],
             kv_lens_batch,
             bkv_sz=swa.window.bkv_sz,
             sliding_window=swa.window.sliding_window,
