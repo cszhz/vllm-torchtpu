@@ -15,9 +15,9 @@ PATH = "scripts/kernel_evolve/dsv4_flash_layers/shim/bin:/usr/local/bin:/usr/bin
 
 [target.cdk]
 # A copy of the CI image vllm-torchtpu:2d241c2e9c9ccc6e9d8b349139d471b117eef8e1-v0.32.0
-# in a registry with no cleanup policy: the same image config (sha256:0c0f8d72f837...)
-# and layers as the CI index sha256:38737d12f645.... jax 0.11.2, libtpu 0.0.50.
-image = "us-central1-docker.pkg.dev/cloud-tpu-inference-test/forge-arms/vllm-torchtpu@sha256:082f4c6e241fb6e162d31f38168d6789f3269acb917d5e9aa64cbffe079474a7"
+# in a registry with no cleanup policy, pinned by the CI index digest the forge-arms tag
+# resolves to. jax 0.11.2, libtpu 0.0.50.
+image = "us-central1-docker.pkg.dev/cloud-tpu-inference-test/forge-arms/vllm-torchtpu@sha256:38737d12f645c60d4dd88e1fbc4d1dc296c4a4c7f1db1a9a7f2849fbed9ac311"
 topology = "2x2x1"
 timeout_minutes = 240
 

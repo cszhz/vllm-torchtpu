@@ -384,6 +384,10 @@ class DeepseekV4Model(nn.Module):
         )
 
         if get_pp_group().is_last_rank:
+            logger.info(
+                "DeepSeek-V4: the last mHC post is fused with the hc head "
+                "collapse (mhc post_head kernel)"
+            )
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,
