@@ -1164,6 +1164,15 @@ def _swa_decode_window_span(kv_len, *, sliding_window: int, bkv_sz: int):
     return start_offset, jnp.minimum(kv_left_frm_cache, bkv_sz)
 
 
+def _divmod_nonneg(x, d: int):
+    """`divmod` of a non-negative int32 scalar by a static divisor, without
+    the sign fix-ups of a signed floor division."""
+    if d & (d - 1) == 0:
+        shift = d.bit_length() - 1
+        return lax.shift_right_logical(x, jnp.int32(shift)), x & jnp.int32(d - 1)
+    return x // d, x % d
+
+
 class SwaDecodeWindowRefs(NamedTuple):
     """One decode sequence's sliding-window kv block, as the batched decode
     kernel moves it: the window keys from the paged cache plus the new token
@@ -1217,21 +1226,13 @@ class SwaDecodeWindowRefs(NamedTuple):
             _dma(bkv_s_ref.at[pl.ds(0, n)], bkv_s_ref.at[pl.ds(0, n)], sem, wait=True)
             return
 
-        kv_p_start = start_offset // lps
-        page_off = start_offset - kv_p_start * lps
-        page_indices_offset = jnp.minimum(
-            seq_idx_clamped * pages_per_seq + kv_p_start,
-            num_page_indices - 1,
-        )
+        kv_p_start, page_off = _divmod_nonneg(start_offset, lps)
+        page_indices_offset = seq_idx_clamped * pages_per_seq + kv_p_start
 
+        # An invalid sequence has no keys, so every chunk below is empty.
         vmem_off = 0
         for i in range(self.num_chunks):
-            avail = lps - page_off
-            chunk_sz = jnp.where(
-                valid,
-                jnp.clip(bkv_sz_frm_cache - vmem_off, jnp.int32(0), avail),
-                0,
-            )
+            chunk_sz = jnp.minimum(bkv_sz_frm_cache - vmem_off, lps - page_off)
             page_idx = self.page_indices_ref[
                 jnp.minimum(page_indices_offset + i, num_page_indices - 1)
             ]
@@ -1256,15 +1257,17 @@ class SwaDecodeWindowRefs(NamedTuple):
 
     def store_new_kv(self, seq_idx, valid, bkv_s_ref, sem, *, wait=False):
         """Copy (or wait for) the new token from `bkv_s_ref` into the cache."""
+        sz = jnp.where(valid, 1, 0)
+        if wait:
+            _dma(bkv_s_ref.at[pl.ds(0, sz)], bkv_s_ref.at[pl.ds(0, sz)], sem, wait=True)
+            return
         lps = self.logical_page_size
         num_page_indices = self.page_indices_ref.shape[0]
         pages_per_seq = num_page_indices // self.kv_lens_ref.shape[0]
         seq_idx_clamped, kv_len = self._seq_geometry(seq_idx, valid)
-        sz = jnp.where(valid, 1, 0)
 
         new_token_idx = jnp.maximum(kv_len - 1, 0)
-        new_token_p = new_token_idx // lps
-        new_token_off = new_token_idx - new_token_p * lps
+        new_token_p, new_token_off = _divmod_nonneg(new_token_idx, lps)
         new_token_page_idx = self.page_indices_ref[
             jnp.minimum(
                 seq_idx_clamped * pages_per_seq + new_token_p,
@@ -1283,7 +1286,6 @@ class SwaDecodeWindowRefs(NamedTuple):
                 )
             ],
             sem,
-            wait=wait,
         )
 
 
