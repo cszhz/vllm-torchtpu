@@ -173,22 +173,14 @@ def _discover_schedule(
 def plan(
     model_spec: ModelSpec,
     ex: ExecSpec,
-    *,
-    fit_vmem: bool = True,
 ) -> Plan:
     """Derive weight tile sizes, stream schedules, smalls layout, and metadata.
 
-    When `fit_vmem=True` (default), `ex.tiles=None` plans the default tiles
-    fitted to the model's VMEM budget, as `kernel.build` does
-    (`vmem.fit_default_tiles`). Callers that only need weight tile shapes and
-    smalls layout (e.g. `pack_weights`) pass `fit_vmem=False` to avoid querying
-    device budgets when no JAX backend is initialized.
+    Pure function of `model_spec` and `ex` (`ex.resolve_tiles(g)`): never fits
+    tiles or queries device budgets. VMEM ring-depth fitting lives in
+    `vmem.fit_default_tiles` (and `vmem.fitted_plan`), called by
+    `vmem.build_scratch` and `kernel.build`.
     """
-    if fit_vmem and ex.tiles is None:
-        # Local import: `vmem` builds on this module.
-        from .vmem import fit_default_tiles
-
-        ex = fit_default_tiles(model_spec, ex)
     active_modules = model_spec.all_modules()
     active_names = {m.name for m in active_modules}
     unknown_debug = sorted(set(ex.debug.modules) - active_names)
@@ -391,7 +383,7 @@ def weight_shapes(
 ) -> dict[str, Any]:
     """Per-rank HBM weight operand shapes derived from `Module.weights`."""
     if p is None:
-        p = plan(model_spec, ex, fit_vmem=False)
+        p = plan(model_spec, ex)
     g = model_spec.config
     out: dict[str, Any] = {}
     for name, w in p.weight_decls.items():

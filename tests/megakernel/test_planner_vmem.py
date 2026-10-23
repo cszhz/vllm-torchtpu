@@ -213,10 +213,10 @@ def test_unsupported_stream_ring_is_config_error(
         planner.plan(make_fake_model_spec(), fake_ex)
 
 
-def test_plan_fit_vmem_false_and_inactive_debug_module(
+def test_plan_is_pure_and_rejects_inactive_debug_module(
     fake_ex: ExecSpec, monkeypatch: pytest.MonkeyPatch
 ):
-    """`plan(..., fit_vmem=False)` and `weight_shapes` skip VMEM fitting;
+    """`plan` and `*_shapes` never fit VMEM or query device budgets;
     `plan` rejects `DebugOptions.modules` targeting a module not in `model_spec`."""
     import jax
 
@@ -228,13 +228,17 @@ def test_plan_fit_vmem_false_and_inactive_debug_module(
         jax,
         "devices",
         lambda *_a, **_k: (_ for _ in ()).throw(
-            AssertionError("jax.devices() must not be called when fit_vmem=False")
+            AssertionError("jax.devices() must not be called by planner")
         ),
     )
-    p = planner.plan(ms, ex_unset, fit_vmem=False)
+    p = planner.plan(ms, ex_unset)
     assert p.ex.tiles is None
     wsh = planner.weight_shapes(ms, ex_unset)
+    ssh = planner.state_shapes(ms, ex_unset)
+    osh = planner.kernel_out_shapes(ms, ex_unset)
     assert set(wsh) == set(p.w_names)
+    assert set(ssh) == set(p.s_names)
+    assert set(osh) == set(p.o_names)
 
     @dataclasses.dataclass(frozen=True)
     class _InactiveDebug:
@@ -249,3 +253,51 @@ def test_plan_fit_vmem_false_and_inactive_debug_module(
         MegakernelConfigError, match="unknown or inactive module.*fake_gdn"
     ):
         planner.plan(ms, ex_bad_dbg)
+
+
+def test_planner_transitive_imports_exclude_vmem_kernel_and_cache():
+    """`planner.py`'s transitive intra-package imports never reach `vmem`,
+    `kernel`, or `cache*`."""
+    import ast
+    from pathlib import Path
+
+    pkg_root = Path(planner.__file__).resolve().parent
+    queue = [pkg_root / "planner.py"]
+    reachable: set[str] = set()
+
+    while queue:
+        path = queue.pop()
+        rel = path.relative_to(pkg_root).as_posix()
+        if rel in reachable or path.name == "__init__.py":
+            continue
+        reachable.add(rel)
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level < 1:
+                continue
+            base = path.parent
+            for _ in range(node.level - 1):
+                base = base.parent
+            if not base.is_relative_to(pkg_root):
+                continue
+            candidates: list[Path] = []
+            if node.module:
+                mod_path = base / node.module.replace(".", "/")
+                candidates.append(mod_path.with_suffix(".py"))
+                for alias in node.names:
+                    candidates.append(mod_path / f"{alias.name}.py")
+            else:
+                for alias in node.names:
+                    candidates.append(base / f"{alias.name}.py")
+            for cand in candidates:
+                if cand.is_file() and cand.name != "__init__.py":
+                    queue.append(cand)
+
+    assert {"planner.py", "spec.py", "exec_spec.py", "ops.py"} <= reachable
+    forbidden = {
+        r
+        for r in reachable
+        if r in {"vmem.py", "kernel.py", "stream.py", "comm.py"}
+        or Path(r).name.startswith("cache")
+    }
+    assert not forbidden, f"planner transitively imports forbidden modules: {forbidden}"

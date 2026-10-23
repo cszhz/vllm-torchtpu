@@ -156,7 +156,7 @@ from .spec import (
     WeightDecl,
 )
 from .stream import TwoRing
-from .vmem import fit_default_tiles
+from .vmem import fit_default_tiles, fitted_plan
 
 __all__ = [
     "DEFAULT_PROFILE",
@@ -239,6 +239,7 @@ __all__ = [
     "experimental",
     "find_model",
     "fit_default_tiles",
+    "fitted_plan",
     "fold",
     "gather_gdn_states",
     "geometry",

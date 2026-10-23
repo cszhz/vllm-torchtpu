@@ -210,6 +210,11 @@ def _merge_scratch(
             )
 
 
+def fitted_plan(model_spec: ModelSpec, ex: ExecSpec) -> Plan:
+    """Fit default tiles to the device VMEM budget (`fit_default_tiles`) and plan."""
+    return plan(model_spec, fit_default_tiles(model_spec, ex))
+
+
 def build_scratch(
     model_spec: ModelSpec,
     ex: ExecSpec,
@@ -221,7 +226,7 @@ def build_scratch(
     as `kernel.build` does (`fit_default_tiles`).
     """
     ex = fit_default_tiles(model_spec, ex)
-    if p is None:
+    if p is None or p.ex != ex:
         p = plan(model_spec, ex)
     g = model_spec.config
     tiles = ex.resolve_tiles(g)

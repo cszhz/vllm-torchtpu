@@ -102,7 +102,9 @@ def test_plan_and_build_scratch_fit_unset_tiles_like_build():
     assert fitted.tiles != mk.default_tiles(64, R=8)  # the fit shrinks a ring
     core_plan, _ = vmem.build_scratch(spec, ex)  # unfitted rings would overflow
     assert core_plan.vmem_bytes == vmem.build_scratch(spec, fitted)[0].vmem_bytes
-    assert mk.planner.plan(spec, ex) == mk.planner.plan(spec, fitted)
+    assert vmem.fitted_plan(spec, ex) == mk.planner.plan(spec, fitted)
+    assert core_plan.plan == mk.planner.plan(spec, fitted)
+    assert mk.planner.plan(spec, ex).ex.tiles is None
 
 
 def test_fit_raises_instead_of_returning_an_over_budget_plan(monkeypatch):
