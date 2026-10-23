@@ -296,7 +296,16 @@ def _attention_csa(
     swa_page_indices = swa_page_indices.flatten()
     main_page_indices = main_page_indices.flatten()
 
-    swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
+    # The sparse kernel runs the decode rows' SWA pass itself, unless both
+    # caches are one buffer: its gathers must then see this pass's write.
+    swa_in_sparse = (
+        sw_cache.shape[0] > 0
+        and not two_caches_same_buffer
+        and uses_batched_decode(
+            sliding_window, logical_page_size, SWA_KV_PAGES_PER_BLOCK[0]
+        )
+    )
+    swa_results = _run_swa(
         q=q,
         new_kv=new_kv,
         sw_cache=sw_cache,
@@ -311,7 +320,17 @@ def _attention_csa(
         swa_only=False,
         non_causal_block=non_causal_block,
         verify_q_len=verify_q_len,
+        **({"decode_by_caller": True} if swa_in_sparse else {}),
     )
+    swa_output, updated_sw_cache, swa_l, swa_m = swa_results[:4]
+    swa_kwargs = {}
+    if swa_in_sparse:
+        swa_kwargs = dict(
+            swa_decode=swa_results[4],
+            swa_sliding_window=sliding_window,
+            swa_logical_page_size=logical_page_size,
+            swa_num_kv_pages_per_block=SWA_KV_PAGES_PER_BLOCK[0],
+        )
 
     if two_caches_same_buffer:
         main_cache_kv = updated_sw_cache
@@ -343,7 +362,10 @@ def _attention_csa(
         sm_scale=sm_scale,
         gather_and_attention_chunk_size=gather_and_attention_chunk_size,
         attention_kernel_batch_size=attention_kernel_batch_size,
+        **swa_kwargs,
     )
+    if swa_in_sparse:
+        output, updated_sw_cache = output
     return output, updated_sw_cache
 
 

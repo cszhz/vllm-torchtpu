@@ -1026,6 +1026,20 @@ class HcaDecodeInputs(NamedTuple):
     num_kv_pages_per_block: int
 
 
+class SwaDecodeInputs(NamedTuple):
+    """The decode rows `mla_sliding_window_ragged_paged_attention` leaves to
+    a fused kernel with `decode_by_caller=True`: the operands the batched
+    decode kernel would have taken (see `SwaDecodeWindowRefs`)."""
+
+    # [max_num_tokens, slots_per_token * kv_packing, lkv_dim] uint8
+    new_kv: jax.Array
+    # The cache with the other rows' new kv written.
+    cache_kv: jax.Array
+    kv_lens: jax.Array  # i32[max_num_seqs], narrowed
+    page_indices: jax.Array  # i32[max_num_seqs * window pages], narrowed
+    num_decode_tokens: jax.Array  # i32, one token per decode sequence
+
+
 class HcaDecodeRefs(NamedTuple):
     """The HCA compressed-KV block the SWA kernels fold in."""
 
@@ -1141,6 +1155,178 @@ def _mla_batched_decode_hca_kernel(
     )
 
 
+def _swa_decode_window_span(kv_len, *, sliding_window: int, bkv_sz: int):
+    """First window key of a decode token, and how many of its window keys
+    come from the cache (the new token itself comes from `new_kv`)."""
+    start_offset = jnp.maximum(kv_len - sliding_window, jnp.int32(0))
+    kv_left = jnp.maximum(kv_len - start_offset, jnp.int32(0))
+    kv_left_frm_cache = jnp.maximum(kv_left - 1, jnp.int32(0))
+    return start_offset, jnp.minimum(kv_left_frm_cache, bkv_sz)
+
+
+class SwaDecodeWindowRefs(NamedTuple):
+    """One decode sequence's sliding-window kv block, as the batched decode
+    kernel moves it: the window keys from the paged cache plus the new token
+    into VMEM, then the new token from VMEM into the cache."""
+
+    kv_lens_ref: Any  # [max_num_seqs]
+    page_indices_ref: Any  # [max_num_seqs * pages_per_seq]
+    # [total_num_pages * phys_tokens_per_page, slots_per_token * kv_packing,
+    #  lkv_dim] uint8 views of the cache and of the aliased updated cache.
+    cache_hbm_ref: Any
+    updated_cache_hbm_ref: Any
+    new_kv_hbm_ref: Any  # [max_num_tokens, token_bytes // 128, 128] uint8
+    sliding_window: int
+    logical_page_size: int
+    bkv_p: int
+    phys_tokens_per_page: int
+    token_bytes: int
+
+    @property
+    def bkv_sz(self) -> int:
+        return self.bkv_p * self.logical_page_size
+
+    def _seq_geometry(self, seq_idx, valid):
+        max_num_seqs = self.kv_lens_ref.shape[0]
+        seq_idx_clamped = jnp.minimum(seq_idx, max_num_seqs - 1)
+        kv_len = jnp.where(valid, self.kv_lens_ref[seq_idx_clamped], 0)
+        return seq_idx_clamped, kv_len
+
+    def fetch(self, seq_idx, valid, q_token_idx, bkv_s_ref, sem, *, wait=False):
+        """Copy (or wait for) the window keys and the new token into
+        `bkv_s_ref`, [bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8."""
+        lps = self.logical_page_size
+        num_page_indices = self.page_indices_ref.shape[0]
+        pages_per_seq = num_page_indices // self.kv_lens_ref.shape[0]
+        seq_idx_clamped, kv_len = self._seq_geometry(seq_idx, valid)
+        sz = jnp.where(valid, 1, 0)
+
+        start_offset, bkv_sz_frm_cache = _swa_decode_window_span(
+            kv_len, sliding_window=self.sliding_window, bkv_sz=self.bkv_sz
+        )
+        kv_p_start = start_offset // lps
+        page_off = start_offset - kv_p_start * lps
+        page_indices_offset = jnp.minimum(
+            seq_idx_clamped * pages_per_seq + kv_p_start,
+            num_page_indices - 1,
+        )
+
+        vmem_off = 0
+        for i in range(self.bkv_p + 1):
+            avail = lps - page_off
+            chunk_sz = jnp.where(
+                valid,
+                jnp.clip(bkv_sz_frm_cache - vmem_off, jnp.int32(0), avail),
+                0,
+            )
+            page_idx = self.page_indices_ref[
+                jnp.minimum(page_indices_offset + i, num_page_indices - 1)
+            ]
+            _dma(
+                self.cache_hbm_ref.at[
+                    pl.ds(page_idx * self.phys_tokens_per_page + page_off, chunk_sz)
+                ],
+                bkv_s_ref.at[pl.ds(vmem_off, chunk_sz)],
+                sem,
+                wait=wait,
+            )
+            page_off = 0
+            vmem_off += chunk_sz
+
+        new_kv_vmem_ref = bkv_s_ref.bitcast(jnp.uint8).reshape(
+            self.bkv_sz, self.token_bytes // 128, 128
+        )
+        _dma(
+            self.new_kv_hbm_ref.at[pl.ds(q_token_idx, sz)],
+            new_kv_vmem_ref.at[pl.ds(bkv_sz_frm_cache, sz)],
+            sem,
+            wait=wait,
+        )
+
+    def store_new_kv(self, seq_idx, valid, bkv_s_ref, sem, *, wait=False):
+        """Copy (or wait for) the new token from `bkv_s_ref` into the cache."""
+        lps = self.logical_page_size
+        num_page_indices = self.page_indices_ref.shape[0]
+        pages_per_seq = num_page_indices // self.kv_lens_ref.shape[0]
+        seq_idx_clamped, kv_len = self._seq_geometry(seq_idx, valid)
+        sz = jnp.where(valid, 1, 0)
+
+        new_token_idx = jnp.maximum(kv_len - 1, 0)
+        new_token_p = new_token_idx // lps
+        new_token_off = new_token_idx - new_token_p * lps
+        new_token_page_idx = self.page_indices_ref[
+            jnp.minimum(
+                seq_idx_clamped * pages_per_seq + new_token_p,
+                num_page_indices - 1,
+            )
+        ]
+        _, bkv_sz_frm_cache = _swa_decode_window_span(
+            kv_len, sliding_window=self.sliding_window, bkv_sz=self.bkv_sz
+        )
+        _dma(
+            bkv_s_ref.at[pl.ds(bkv_sz_frm_cache, sz)],
+            self.updated_cache_hbm_ref.at[
+                pl.ds(
+                    new_token_page_idx * self.phys_tokens_per_page + new_token_off,
+                    sz,
+                )
+            ],
+            sem,
+            wait=wait,
+        )
+
+
+def _dma(src, dst, sem, *, wait=False):
+    cp = pltpu.make_async_copy(src, dst, sem)
+    if wait:
+        cp.wait()
+    else:
+        cp.start()
+
+
+def swa_decode_window_partials(
+    q_batch,  # [seq_batch_sz, num_q_heads, head_dim]
+    bkv_batch_vmem,  # [seq_batch_sz, >= bkv_sz, slots_per_token * kv_packing, lkv_dim]
+    kv_lens_batch,  # i32[seq_batch_sz]
+    *,
+    bkv_sz: int,
+    sliding_window: int,
+    sm_scale: float,
+):
+    """The unnormalized SWA softmax state of a batch of decode tokens over
+    their single kv block: (pv [s, n, d], l [s, n], m [s, n]), all float32."""
+    seq_batch_sz, _, head_dim = q_batch.shape
+    bkv_batch = pltpu.bitcast(bkv_batch_vmem[:, :bkv_sz, ...], jnp.bfloat16).reshape(
+        seq_batch_sz, bkv_sz, head_dim
+    )
+
+    cur_start_offset_batch = jnp.maximum(kv_lens_batch - sliding_window, jnp.int32(0))
+    m_vec = lax.broadcasted_iota(jnp.int32, (1, 1, bkv_sz), 2)
+    k_span_batch = cur_start_offset_batch[:, None, None] + m_vec
+    q_span_batch = (kv_lens_batch - 1)[:, None, None]
+    keep_batch = (
+        (q_span_batch - k_span_batch).astype(jnp.uint32) < jnp.uint32(sliding_window)
+    ) | (m_vec == 0)
+
+    # Slots past kv_left were not written this step and still hold whatever
+    # the previous kernel left in VMEM. Masking their scores is not enough,
+    # since 0 * NaN is NaN in the PV matmul, so zero the values too.
+    bkv_batch = jnp.where(jnp.swapaxes(keep_batch, 1, 2), bkv_batch, 0)
+
+    s_mat = jnp.einsum(
+        "snd,smd->snm", q_batch, bkv_batch, preferred_element_type=jnp.float32
+    )
+    s_mat *= sm_scale
+
+    s_mat = jnp.where(keep_batch, s_mat, jnp.finfo(jnp.float32).min)
+    s_max = jnp.max(s_mat, axis=2, keepdims=True)
+    p_mat = jnp.exp(s_mat - s_max)
+    pv_batch = jnp.einsum(
+        "snm,smd->snd", p_mat, bkv_batch, preferred_element_type=jnp.float32
+    )
+    return pv_batch, jnp.sum(p_mat, axis=2), s_max[:, :, 0]
+
+
 def _mla_batched_decode_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_seqs]
@@ -1205,8 +1391,6 @@ def _mla_batched_decode_kernel(
     phys_tokens_per_page = physical_page_size_per_kv_packing // slots_per_token
 
     max_num_seqs = kv_lens_ref.shape[0]
-    num_page_indices = page_indices_ref.shape[0]
-    pages_per_seq = num_page_indices // max_num_seqs
 
     bkv_sz = bkv_p * logical_page_size
 
@@ -1241,11 +1425,18 @@ def _mla_batched_decode_kernel(
             lkv_dim,
         )
 
-    def get_bkv_sz_frm_cache(kv_len):
-        start_offset = jnp.maximum(kv_len - sliding_window, jnp.int32(0))
-        kv_left = jnp.maximum(kv_len - start_offset, jnp.int32(0))
-        kv_left_frm_cache = jnp.maximum(kv_left - 1, jnp.int32(0))
-        return start_offset, jnp.minimum(kv_left_frm_cache, bkv_sz)
+    window = SwaDecodeWindowRefs(
+        kv_lens_ref,
+        page_indices_ref,
+        reshaped_cache_hbm_ref,
+        reshaped_updated_cache_hbm_ref,
+        new_kv_hbm_ref,
+        sliding_window,
+        logical_page_size,
+        bkv_p,
+        phys_tokens_per_page,
+        token_bytes,
+    )
 
     def _fetch_bq(batch_idx, sem_idx, wait=False):
         s_start = start_seq_idx + batch_idx * seq_batch_sz
@@ -1270,63 +1461,18 @@ def _mla_batched_decode_kernel(
 
         for s in range(seq_batch_sz):
             seq_idx = s_start + s
-            seq_idx_clamped = jnp.minimum(seq_idx, max_num_seqs - 1)
-            sz = jnp.where(seq_idx < end_seq_idx, 1, 0)
-
-            sem_kv = sems.at[sem_idx, 4 + s]
-            bkv_s_ref = bkv_batch_x2_vmem.at[sem_idx, s]
-
-            kv_len = jnp.where(
-                seq_idx < end_seq_idx,
-                kv_lens_ref[seq_idx_clamped],
-                0,
-            )
-
-            start_offset, bkv_sz_frm_cache = get_bkv_sz_frm_cache(kv_len)
-            kv_p_start = start_offset // logical_page_size
-            page_off = start_offset - kv_p_start * logical_page_size
-            page_indices_offset = jnp.minimum(
-                seq_idx_clamped * pages_per_seq + kv_p_start,
-                num_page_indices - 1,
-            )
-
-            vmem_off = 0
-            for i in range(bkv_p + 1):
-                avail = logical_page_size - page_off
-                chunk_sz = jnp.where(
-                    seq_idx < end_seq_idx,
-                    jnp.clip(bkv_sz_frm_cache - vmem_off, jnp.int32(0), avail),
-                    0,
-                )
-                page_idx = page_indices_ref[
-                    jnp.minimum(page_indices_offset + i, num_page_indices - 1)
-                ]
-                async_copy(
-                    reshaped_cache_hbm_ref.at[
-                        pl.ds(
-                            page_idx * phys_tokens_per_page + page_off,
-                            chunk_sz,
-                        )
-                    ],
-                    bkv_s_ref.at[pl.ds(vmem_off, chunk_sz)],
-                    sem_kv,
-                    wait=wait,
-                )
-                page_off = 0
-                vmem_off += chunk_sz
-
-            new_kv_vmem_ref = bkv_s_ref.bitcast(jnp.uint8).reshape(
-                bkv_sz, token_bytes // 128, 128
-            )
+            valid = seq_idx < end_seq_idx
             q_token_idx = jnp.where(
-                seq_idx < end_seq_idx,
-                cu_q_lens_ref[seq_idx_clamped],
+                valid,
+                cu_q_lens_ref[jnp.minimum(seq_idx, max_num_seqs - 1)],
                 0,
             )
-            async_copy(
-                new_kv_hbm_ref.at[pl.ds(q_token_idx, sz)],
-                new_kv_vmem_ref.at[pl.ds(bkv_sz_frm_cache, sz)],
-                sem_kv,
+            window.fetch(
+                seq_idx,
+                valid,
+                q_token_idx,
+                bkv_batch_x2_vmem.at[sem_idx, s],
+                sems.at[sem_idx, 4 + s],
                 wait=wait,
             )
 
@@ -1417,44 +1563,15 @@ def _mla_batched_decode_kernel(
             ]
         )
 
-        bkv_batch_vmem = bkv_batch_x2_vmem[sem_idx]
-        q_batch_vmem = q_batch_x2_vmem[sem_idx]
-
-        bkv_batch = pltpu.bitcast(
-            bkv_batch_vmem[:, :bkv_sz, ...], jnp.bfloat16
-        ).reshape(seq_batch_sz, bkv_sz, head_dim)
-        q_batch = q_batch_vmem
-
-        cur_start_offset_batch = jnp.maximum(
-            kv_lens_batch - sliding_window, jnp.int32(0)
+        q_batch = q_batch_x2_vmem[sem_idx]
+        pv_batch, l_val, m_val = swa_decode_window_partials(
+            q_batch,
+            bkv_batch_x2_vmem[sem_idx],
+            kv_lens_batch,
+            bkv_sz=bkv_sz,
+            sliding_window=sliding_window,
+            sm_scale=sm_scale,
         )
-        m_vec = lax.broadcasted_iota(jnp.int32, (1, 1, bkv_sz), 2)
-        k_span_batch = cur_start_offset_batch[:, None, None] + m_vec
-        q_span_batch = (kv_lens_batch - 1)[:, None, None]
-        keep_batch = (
-            (q_span_batch - k_span_batch).astype(jnp.uint32)
-            < jnp.uint32(sliding_window)
-        ) | (m_vec == 0)
-
-        # Slots past kv_left were not written this step and still hold whatever
-        # the previous kernel left in VMEM. Masking their scores is not enough,
-        # since 0 * NaN is NaN in the PV matmul, so zero the values too.
-        bkv_batch = jnp.where(jnp.swapaxes(keep_batch, 1, 2), bkv_batch, 0)
-
-        s_mat = jnp.einsum(
-            "snd,smd->snm", q_batch, bkv_batch, preferred_element_type=jnp.float32
-        )
-        s_mat *= sm_scale
-
-        s_mat = jnp.where(keep_batch, s_mat, jnp.finfo(jnp.float32).min)
-        s_max = jnp.max(s_mat, axis=2, keepdims=True)
-        p_mat = jnp.exp(s_mat - s_max)
-        pv_batch = jnp.einsum(
-            "snm,smd->snd", p_mat, bkv_batch, preferred_element_type=jnp.float32
-        )
-
-        m_val = s_max[:, :, 0]
-        l_val = jnp.sum(p_mat, axis=2)
 
         if hca is not None:
             o_batch_x2_vmem[sem_idx, ...] = fold_hca(
@@ -1522,39 +1639,11 @@ def _mla_batched_decode_kernel(
 
         for s in range(seq_batch_sz):
             seq_idx = s_start + s
-            seq_idx_clamped = jnp.minimum(seq_idx, max_num_seqs - 1)
-            sz = jnp.where(seq_idx < end_seq_idx, 1, 0)
-
-            sem_kv = sems.at[sem_idx, 4 + s]
-            bkv_s_ref = bkv_batch_x2_vmem.at[sem_idx, s]
-
-            kv_len = jnp.where(
+            window.store_new_kv(
+                seq_idx,
                 seq_idx < end_seq_idx,
-                kv_lens_ref[seq_idx_clamped],
-                0,
-            )
-            new_token_idx = jnp.maximum(kv_len - 1, 0)
-            new_token_p = new_token_idx // logical_page_size
-            new_token_off = new_token_idx - new_token_p * logical_page_size
-
-            new_token_page_idx = page_indices_ref[
-                jnp.minimum(
-                    seq_idx_clamped * pages_per_seq + new_token_p,
-                    num_page_indices - 1,
-                )
-            ]
-
-            start_offset, bkv_sz_frm_cache = get_bkv_sz_frm_cache(kv_len)
-
-            async_copy(
-                bkv_s_ref.at[pl.ds(bkv_sz_frm_cache, sz)],
-                reshaped_updated_cache_hbm_ref.at[
-                    pl.ds(
-                        new_token_page_idx * phys_tokens_per_page + new_token_off,
-                        sz,
-                    )
-                ],
-                sem_kv,
+                bkv_batch_x2_vmem.at[sem_idx, s],
+                sems.at[sem_idx, 4 + s],
                 wait=wait,
             )
 
@@ -1830,6 +1919,7 @@ def run_mla_batched_decode_kernel(
         "q_compute_block_size",
         "lane_padded_lm",
         "hca_num_kv_pages_per_block",
+        "decode_by_caller",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -1870,6 +1960,9 @@ def mla_sliding_window_ragged_paged_attention(
     hca_kv_lens_to_attend: jax.Array | None = None,
     hca_page_indices: jax.Array | None = None,
     hca_num_kv_pages_per_block: int | None = None,
+    # Skip the decode rows and append their `SwaDecodeInputs` to the result:
+    # a fused kernel runs them (see `sparse_mla.SwaDecodeRefs`).
+    decode_by_caller: bool = False,
 ) -> tuple[
     jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     jax.Array,  # [total_num_pages, physical_page_size_per_kv_packing, 4, 128] uint8
@@ -2184,7 +2277,15 @@ def mla_sliding_window_ragged_paged_attention(
             hca_num_kv_pages_per_block,
         )
 
-    if uses_batched_decode(
+    if decode_by_caller:
+        if hca_decode is not None or not unnormalized_output:
+            raise ValueError("decode_by_caller hands over the unnormalized state.")
+        if not uses_batched_decode(
+            sliding_window, logical_page_size, num_kv_pages_per_blocks[0]
+        ):
+            raise ValueError("decode_by_caller needs single-block decode.")
+        output, updated_kv, out_l, out_m = in_output, cache_kv, l, m
+    elif uses_batched_decode(
         sliding_window, logical_page_size, num_kv_pages_per_blocks[0]
     ):
         output, updated_kv, out_l, out_m = run_mla_batched_decode_kernel(
@@ -2311,4 +2412,9 @@ def mla_sliding_window_ragged_paged_attention(
     if not lane_padded_lm:
         out_l = out_l[:, :actual_num_q_heads]
         out_m = out_m[:, :actual_num_q_heads]
+    if decode_by_caller:
+        decode = SwaDecodeInputs(
+            new_kv, updated_kv, kv_lens, page_indices, distribution[0]
+        )
+        return output, updated_kv, out_l, out_m, decode
     return output, updated_kv, out_l, out_m

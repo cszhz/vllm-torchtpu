@@ -14,6 +14,7 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel."""
 
 import functools
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +22,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather, mla_swa
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
@@ -156,10 +158,89 @@ def _dequant_dsv4_fp8(bkv_nope: jax.Array):
     return (nope_fp8 * nope_scales).astype(jnp.bfloat16)
 
 
+class SwaDecodeRefs(NamedTuple):
+    """The decode tokens' sliding-window pass the CSA kernel runs itself,
+    instead of reading the SWA kernel's state back from HBM."""
+
+    window: mla_swa.SwaDecodeWindowRefs
+    # [2, batch_size, bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8
+    bkv_x2_vmem: Any
+    sems: Any  # DMA [2, batch_size]
+
+
+def _attention_swa_decode_kernel(
+    kv_lens_ref,
+    start_end_seq_idx_ref,
+    sem_ids_ref,
+    bo_ids_ref,
+    swa_kv_lens_ref,  # [max_num_seqs]
+    swa_page_indices_ref,  # [max_num_seqs * pages_per_seq]
+    attention_sinks_ref,
+    q_hbm_ref,
+    cache_kv_nope_hbm_ref,
+    cache_kv_rope_hbm_ref,
+    swa_accumution_hbm_ref,
+    swa_l_hbm_ref,
+    swa_m_hbm_ref,
+    swa_new_kv_hbm_ref,  # [max_num_tokens, token_bytes // 128, 128] uint8
+    swa_cache_hbm_ref,  # SWA cache: uint8 slabs or an int32 CSA host array
+    o_hbm_ref,
+    updated_swa_cache_hbm_ref,
+    *scratch,
+    swa_sliding_window: int,
+    swa_logical_page_size: int,
+    swa_bkv_p: int,
+    **kwargs,
+):
+    """`_attention_kernel` that also runs the decode tokens' sliding-window
+    pass (see `SwaDecodeRefs`) and writes their new kv into the SWA cache.
+    Decode token t is decode sequence t; start_end_seq_idx_ref[3] holds the
+    number of decode tokens."""
+    *scratch, swa_bkv_x2_vmem, swa_sems = scratch
+    cache = csa_cache_layout.as_u8_slabs(swa_cache_hbm_ref)
+    updated_cache = csa_cache_layout.as_u8_slabs(updated_swa_cache_hbm_ref)
+    total_num_pages, phys_page_size_per_kv_packing, kv_packing, lkv_dim = cache.shape
+    slots = swa_bkv_x2_vmem.shape[3]
+    token_bytes = slots * lkv_dim
+    phys_tokens_per_page = phys_page_size_per_kv_packing * kv_packing // slots
+    flat_shape = (total_num_pages * phys_tokens_per_page, slots, lkv_dim)
+    window = mla_swa.SwaDecodeWindowRefs(
+        swa_kv_lens_ref,
+        swa_page_indices_ref,
+        cache.reshape(flat_shape),
+        updated_cache.reshape(flat_shape),
+        swa_new_kv_hbm_ref,
+        swa_sliding_window,
+        swa_logical_page_size,
+        swa_bkv_p,
+        phys_tokens_per_page,
+        token_bytes,
+    )
+    _attention_kernel(
+        kv_lens_ref,
+        start_end_seq_idx_ref,
+        sem_ids_ref,
+        bo_ids_ref,
+        attention_sinks_ref,
+        q_hbm_ref,
+        cache_kv_nope_hbm_ref,
+        cache_kv_rope_hbm_ref,
+        swa_accumution_hbm_ref,
+        swa_l_hbm_ref,
+        swa_m_hbm_ref,
+        o_hbm_ref,
+        *scratch,
+        swa=SwaDecodeRefs(window, swa_bkv_x2_vmem, swa_sems),
+        **kwargs,
+    )
+
+
 def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_seqs]
-    start_end_seq_idx_ref,  # [3] (start_seq_idx, end_seq_idx, num_valid_tokens)
+    # [3] (start_seq_idx, end_seq_idx, num_valid_tokens), [4] with
+    # `swa` (+ num_decode_tokens)
+    start_end_seq_idx_ref,
     sem_ids_ref,  # [2] (bi_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [2] seq_idx_start of the in-flight bo DMA per bo sem
     # Input
@@ -184,6 +265,7 @@ def _attention_kernel(
     *,
     sm_scale: float,
     batch_size: int = 1,
+    swa: SwaDecodeRefs | None = None,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
@@ -211,6 +293,8 @@ def _attention_kernel(
 
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
+    # Tokens below this run the SWA pass here; the rest read its HBM state.
+    num_decode_tokens = start_end_seq_idx_ref[3] if swa is not None else 0
 
     def flash_attention_step1_qk_softmax(
         q,  # [bq_sz * num_q_heads, head_dim]
@@ -331,7 +415,41 @@ def _attention_kernel(
         else:
             _async_copy(src=vmem_ref, dst=vmem_ref, sem=sem, wait=True)
 
+    def _swa_window_batch(seq_idx_start, slot, *, store, wait):
+        """Fetch the decode tokens' window kv blocks, or store their new kv."""
+        for b in range(batch_size):
+            token_idx = seq_idx_start + b
+            args = (swa.bkv_x2_vmem.at[slot, b], swa.sems.at[slot, b])
+
+            @pl.when(token_idx < num_decode_tokens)
+            def _():
+                if store:
+                    swa.window.store_new_kv(token_idx, True, *args, wait=wait)
+                else:
+                    swa.window.fetch(token_idx, True, token_idx, *args, wait=wait)
+
     def _fetch_swa_batch(seq_idx_start, bq_sem_idx, *, wait=False):
+        if swa is None:
+            _fetch_swa_state_batch(seq_idx_start, bq_sem_idx, wait=wait)
+            return
+
+        @pl.when(seq_idx_start + batch_size > num_decode_tokens)
+        def _():
+            _fetch_swa_state_batch(seq_idx_start, bq_sem_idx, wait=wait)
+
+        if wait:
+            _swa_window_batch(seq_idx_start, bq_sem_idx, store=False, wait=True)
+            return
+        # The slot's last batch stores its new kv from the window buffer.
+        prev_seq_idx_start = seq_idx_start - 2 * batch_size
+
+        @pl.when(prev_seq_idx_start >= start_seq_idx)
+        def _():
+            _swa_window_batch(prev_seq_idx_start, bq_sem_idx, store=True, wait=True)
+
+        _swa_window_batch(seq_idx_start, bq_sem_idx, store=False, wait=False)
+
+    def _fetch_swa_state_batch(seq_idx_start, bq_sem_idx, *, wait=False):
         sem_acc = sems.at[3, bq_sem_idx]
         sem_l = sems.at[4, bq_sem_idx]
         sem_m = sems.at[5, bq_sem_idx]
@@ -429,6 +547,52 @@ def _attention_kernel(
         bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
+    def run_swa_decode(bq_sem_idx):
+        """Write the decode tokens' unnormalized SWA state where the HBM
+        handoff would have landed: acc in q_dtype, l/m in float32."""
+        token_ids = [batch_start_seq_idx + b for b in range(batch_size)]
+        max_num_seqs = swa.window.kv_lens_ref.shape[0]
+        kv_lens_batch = jnp.stack(
+            [
+                jnp.where(
+                    t < num_decode_tokens,
+                    swa.window.kv_lens_ref[jnp.minimum(t, max_num_seqs - 1)],
+                    0,
+                )
+                for t in token_ids
+            ]
+        )
+        pv, l_val, m_val = mla_swa.swa_decode_window_partials(
+            bq_x2_ref[bq_sem_idx],
+            swa.bkv_x2_vmem[bq_sem_idx],
+            kv_lens_batch,
+            bkv_sz=swa.window.bkv_sz,
+            sliding_window=swa.window.sliding_window,
+            sm_scale=sm_scale,
+        )
+        num_l_heads = bl_x2_ref.shape[-1]
+        lane_pad = ((0, 0), (0, num_l_heads - num_q_heads))
+        state = (
+            (swa_acc_x2_ref, pv.astype(q_dtype)),
+            (bl_x2_ref, jnp.pad(l_val, lane_pad)),
+            (bm_x2_ref, jnp.pad(m_val, lane_pad)),
+        )
+        all_decode = batch_end_seq_idx < num_decode_tokens
+
+        @pl.when(all_decode)
+        def _():
+            for ref, val in state:
+                ref[bq_sem_idx] = val
+
+        @pl.when(jnp.logical_not(all_decode))
+        def _():
+            for ref, val in state:
+                token_ids = batch_start_seq_idx + lax.broadcasted_iota(
+                    jnp.int32, val.shape, 0
+                )
+                is_decode = token_ids < num_decode_tokens
+                ref[bq_sem_idx] = jnp.where(is_decode, val, ref[bq_sem_idx])
+
     def load_swa_output(bq_sem_idx, batch_idx):
         swa_acc = swa_acc_x2_ref[bq_sem_idx, batch_idx, ...]
         swa_l = bl_x2_ref[bq_sem_idx, batch_idx, :num_q_heads][..., None]
@@ -469,6 +633,13 @@ def _attention_kernel(
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
         wait_fetch_swa_batch(batch_start_seq_idx, bi_sem_idx)
         wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
+
+        if swa is not None:
+            _swa_window_batch(batch_start_seq_idx, bi_sem_idx, store=True, wait=False)
+
+            @pl.when(batch_start_seq_idx < num_decode_tokens)
+            def _():
+                run_swa_decode(bi_sem_idx)
 
         @pl.when(pl.program_id(0) >= 2)
         def _wait_send():
@@ -542,6 +713,21 @@ def _attention_kernel(
         @pl.when(pl.num_programs(0) >= 2)
         def _wait_1():
             wait_send_bo_batch(1)
+
+        if swa is not None:
+            # The last two batches' new kv stores; earlier ones were waited
+            # before their window slot was refilled.
+            last_slot = sem_ids_ref[0]
+            _swa_window_batch(batch_start_seq_idx, last_slot, store=True, wait=True)
+
+            @pl.when(pl.num_programs(0) >= 2)
+            def _():
+                _swa_window_batch(
+                    batch_start_seq_idx - batch_size,
+                    1 - last_slot,
+                    store=True,
+                    wait=True,
+                )
 
     ### ------- Kernel end ------- ###
 
@@ -622,6 +808,9 @@ def prepare_outputs(
         "attention_kernel_batch_size",
         "gather_and_attention_chunk_size",
         "vmem_limit_bytes",
+        "swa_sliding_window",
+        "swa_logical_page_size",
+        "swa_num_kv_pages_per_block",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -642,7 +831,15 @@ def sparse_ragged_paged_attention(
     gather_and_attention_chunk_size: int = 128,
     attention_kernel_batch_size: int = 16,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
-) -> jax.Array:
+    # Run the decode tokens' sliding-window pass here (see `SwaDecodeRefs`),
+    # from the operands `mla_swa.mla_sliding_window_ragged_paged_attention`
+    # returns with `decode_by_caller=True`; swa_accumution / swa_l / swa_m
+    # then only hold the other tokens. The result is (output, updated cache).
+    swa_decode: mla_swa.SwaDecodeInputs | None = None,
+    swa_sliding_window: int | None = None,
+    swa_logical_page_size: int | None = None,
+    swa_num_kv_pages_per_block: int | None = None,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
     Args:
@@ -702,6 +899,7 @@ def sparse_ragged_paged_attention(
         end_seq_idx: jax.Array,  # i32
         num_valid_tokens: jax.Array,  # i32
         kernel_batch_size: int,
+        swa_cache: jax.Array | None = None,
     ):
         batch_size = kernel_batch_size
         end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
@@ -763,25 +961,77 @@ def sparse_ragged_paged_attention(
             pltpu.SemaphoreType.DMA((7, 2)),
         ]
 
+        seq_bounds = [start_seq_idx, end_seq_idx, num_valid_tokens]
+        operands = (
+            attention_sinks,
+            q,
+            cache_kv_nope,
+            cache_kv_rope,
+            swa_accumution,
+            swa_l,
+            swa_m,
+        )
+        out_shape = jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
+        kernel_fn = _attention_kernel
+        swa_kwargs = {}
+        swa_prefetches = ()
+        if swa_cache is not None:
+            seq_bounds.append(swa_decode.num_decode_tokens)
+            swa_prefetches = (swa_decode.kv_lens, swa_decode.page_indices)
+            operands += (swa_decode.new_kv, swa_cache)
+            in_specs += [pl.BlockSpec(memory_space=pltpu.HBM)] * 2
+            out_specs = [out_specs, pl.BlockSpec(memory_space=pltpu.HBM)]
+            out_shape = [
+                out_shape,
+                jax.ShapeDtypeStruct(swa_cache.shape, swa_cache.dtype),
+            ]
+            slots = swa_decode.new_kv.shape[1]
+            lkv_dim = swa_decode.new_kv.shape[2]
+            scratch_shapes += [
+                pltpu.VMEM(
+                    (
+                        2,
+                        batch_size,
+                        swa_num_kv_pages_per_block * swa_logical_page_size,
+                        slots,
+                        lkv_dim,
+                    ),
+                    jnp.uint8,
+                ),
+                pltpu.SemaphoreType.DMA((2, batch_size)),
+            ]
+            kernel_fn = _attention_swa_decode_kernel
+            swa_kwargs = dict(
+                swa_sliding_window=swa_sliding_window,
+                swa_logical_page_size=swa_logical_page_size,
+                swa_bkv_p=swa_num_kv_pages_per_block,
+            )
+
         scalar_prefetches = (
             kv_lens,
-            jnp.array([start_seq_idx, end_seq_idx, num_valid_tokens], jnp.int32),
+            jnp.array(seq_bounds, jnp.int32),
             # (bi_sem_idx, bo_sem_idx)
             jnp.zeros((2,), jnp.int32),
             # seq_idx_start of the in-flight bo DMA per bo sem; -1 = none.
             jnp.full((2,), -1, jnp.int32),
+            *swa_prefetches,
         )
+        input_output_aliases = {len(scalar_prefetches) + 1: 0}  # q with output
+        if swa_cache is not None:
+            input_output_aliases[len(scalar_prefetches) + len(operands) - 1] = 1
 
         gathered_topk = cache_kv_nope.shape[1]
         scope_name = (
             f"SparseMLA-p_{gathered_topk}-bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
+            f"{'-swa_d' if swa_cache is not None else ''}"
         )
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(
-                    _attention_kernel,
+                    kernel_fn,
                     sm_scale=sm_scale,
                     batch_size=batch_size,
+                    **swa_kwargs,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
@@ -795,23 +1045,12 @@ def sparse_ragged_paged_attention(
                     vmem_limit_bytes=vmem_limit_bytes,
                     disable_bounds_checks=True,
                 ),
-                out_shape=jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                input_output_aliases={
-                    5: 0,  # Alias output activation with q
-                },
+                out_shape=out_shape,
+                input_output_aliases=input_output_aliases,
                 name=scope_name,
             )
         )
-        return kernel(
-            *scalar_prefetches,
-            attention_sinks,
-            q,
-            cache_kv_nope,
-            cache_kv_rope,
-            swa_accumution,
-            swa_l,
-            swa_m,
-        )
+        return kernel(*scalar_prefetches, *operands)
 
     tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
     seq_ids_segment = jnp.repeat(
@@ -847,6 +1086,7 @@ def sparse_ragged_paged_attention(
     assert page_ids.shape == (q.shape[0], topk)
     gather_indices = (page_ids * page_size + token_offset).reshape(-1)
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
+    swa_cache = None if swa_decode is None else swa_decode.cache_kv
 
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
@@ -908,7 +1148,13 @@ def sparse_ragged_paged_attention(
             end_seq_idx=batch_end,
             num_valid_tokens=cu_q_lens[distribution[2]],
             kernel_batch_size=kernel_batch_size,
+            swa_cache=swa_cache,
         )
-    return prepare_outputs(
+        if swa_cache is not None:
+            q, swa_cache = q
+    out = prepare_outputs(
         q, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
+    if swa_decode is not None:
+        return out, swa_cache
+    return out
