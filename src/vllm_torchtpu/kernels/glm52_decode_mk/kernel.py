@@ -91,6 +91,7 @@ FAULTS = (
         "f_a2a_early",  # L4 C2: an A2A chunk is sent one request before its rows are emitted
         "f_qag_pair_drop",  # stage-B L2-Q: qag="pair" forwards one same-parity block too few
         "f_leaf_shift",
+        "f_lv_short",  # LV: AR#1 moves one row block too few (the last live block's rows lose the peers' partials)
     )
 )  # L3: the expert-operand leaf / index is one MoE layer off -> RED
 # WHITEBOARD.v1's F-ALIAS-EARLY is not built (needs a hook between a
@@ -182,6 +183,11 @@ class Tiles:
     esingle: bool = False  # L3-s: ONE issue site per MoE layer (bundles): the expert loop runs from step -1,
     # whose iteration primes the ring through the same refill site and then runs the
     # shared expert; uses the L3-b refill rule with k = ebatch (k = 1 included)
+    # LV (stageB/dcp8-design §3.4; stageB/lv-probe): live-row collectives. The residual all-reduces move only
+    # ceil(T / rb) * rb rows (rb = TMAX // 4), the "pair" q all-gather ceil-to-{4, 8k} rows, and the L4 A2A only the
+    # ceil(T / 4) live 4-row chunks (padded chunks are no longer sent at layer end). Exact: every row of every
+    # collective is independent, and rows >= T are masked before every consumer. Default off = the 03dbe3617 program.
+    lv: bool = False
 
 
 def bf(x):
@@ -487,6 +493,16 @@ def build(
             TMAX,
         )
     OWX = OH if LSE_TILE else OW  # A2A payload row (u32 lanes)
+    LV = bool(tiles.lv) and cfg.R > 1 and "coll" not in skip
+    if LV:
+        assert LSE_TILE and RW == 4, ("LV rides on L4 C3: lse tile + 4-row A2A chunks", tiles.a2a_lse, RW)
+        assert tiles.qag == "pair", ("LV trims the 'pair' q all-gather only", tiles.qag)
+        assert not tiles.l2replay and not tiles.record and tiles.replay == "" and not tiles.shadow_a2a, (
+            "LV: no timing-only record / replay / shadow arms"
+        )
+        assert tiles.fault != "f_ar_earlyread", "LV's all-reduce has no early-read fault variant"
+    AR_RB = TMAX // 4  # LV all-reduce row granularity (4 options per bucket)
+    Q_OPTS = (4,) + tuple(range(8, TMAX + 1, 8))  # LV q AG row counts (u32 DMA rows: < 8 or a multiple of 8)
     assert tiles.replay in ("", "a2a", "ar"), tiles.replay
     n_r = {"": 0, "a2a": 1, "ar": 2}[tiles.replay]
     NQB = HR * DQ
@@ -831,6 +847,10 @@ def build(
 
         me = scal[2]
         T = scal[0]
+        if LV:  # rank-uniform (T is replicated metadata), so every byte-counting wait stays balanced
+            nlb_ar = (T + (AR_RB - 1)) // AR_RB
+            nq_lv = jnp.where(T <= 4, 4, (T + 7) // 8 * 8)
+            nch_lv = (T + (RW - 1)) // RW
         T_eff = (T - 1) if fault == "dropped_tail_row" else T
         row_m = lax.broadcasted_iota(I32, (M, 1), 0)
         rvalid = jnp.where(
@@ -929,7 +949,21 @@ def build(
                 return scr["rbuf"][...]
             buf = scr["arbuf"]
             buf[...] = jnp.where(row_m < T_eff, bf(partial_f32), 0.0).astype(BF16)
-            if "coll" not in skip:
+            if "coll" not in skip and LV:
+                with sc(f"X_ar{which}"):
+                    CO.all_reduce_lv(
+                        R,
+                        me,
+                        buf,
+                        M,
+                        H,
+                        ar_set(which),
+                        nlb_ar - (1 if (fault == "f_lv_short" and which == 1) else 0),
+                        AR_RB,
+                        drop_last=drop_last,
+                        mids=mids,
+                    )
+            elif "coll" not in skip:
                 with sc(f"X_ar{which}"):
                     if mids:
                         CO.all_reduce(
@@ -1002,14 +1036,29 @@ def build(
                     device_id_type=CO.MESH,
                 ).start()
 
-            rc(scr["qsend"], scr["qall"].at[me], scr["q_send"], scr["q_recv"], sib)
-            for p_ in peers:
-                rc(scr["qsend"], scr["qall"].at[me], scr["q_send2"], scr["q_recv2"], p_)
+            def qs(n):  # LV: the first n rows of the block (n None: the whole [TMAX, QH] block)
+                return scr["qsend"] if n is None else scr["qsend"].at[pl.ds(0, n)]
 
-            def desc(ss, rs):
+            def qa(i, n):
+                return scr["qall"].at[i] if n is None else scr["qall"].at[i, pl.ds(0, n)]
+
+            def lvs(fn):
+                if LV:
+                    CO.row_switch(nq_lv, Q_OPTS, fn)
+                else:
+                    fn(None)
+
+            def start(n):
+                rc(qs(n), qa(me, n), scr["q_send"], scr["q_recv"], sib)
+                for p_ in peers:
+                    rc(qs(n), qa(me, n), scr["q_send2"], scr["q_recv2"], p_)
+
+            lvs(start)
+
+            def desc(ss, rs, n):
                 return pltpu.make_async_remote_copy(
-                    src_ref=scr["qsend"],
-                    dst_ref=scr["qall"].at[0],
+                    src_ref=qs(n),
+                    dst_ref=qa(0, n),
                     send_sem=ss,
                     recv_sem=rs,
                     device_id=(me,),
@@ -1018,8 +1067,8 @@ def build(
 
             nf = len(peers) - (1 if fault == "f_qag_pair_drop" else 0)
 
-            def forward():
-                d2 = desc(scr["q_send2"], scr["q_recv2"])
+            def forward_n(n):
+                d2 = desc(scr["q_send2"], scr["q_recv2"], n)
                 with sc("X_qpar"):
                     for _ in peers:
                         d2.wait_recv()
@@ -1029,18 +1078,19 @@ def build(
                     ):  # FAULT: one forward omitted (sibling waits one less)
                         continue
                     rc(
-                        scr["qall"].at[p_],
-                        scr["qall"].at[p_],
+                        qa(p_, n),
+                        qa(p_, n),
                         scr["q_send"],
                         scr["q_recv"],
                         sib,
                     )
 
-            def finish():
-                d2 = desc(scr["q_send2"], scr["q_recv2"])
-                if not tiles.qmid:
-                    forward()
-                d1 = desc(scr["q_send"], scr["q_recv"])
+            def forward():
+                lvs(forward_n)
+
+            def finish_n(n):
+                d2 = desc(scr["q_send2"], scr["q_recv2"], n)
+                d1 = desc(scr["q_send"], scr["q_recv"], n)
                 with sc("X_qsib"):
                     for _ in range(1 + nf):
                         d1.wait_recv()
@@ -1048,6 +1098,11 @@ def build(
                     d1.wait_send()
                 for _ in peers:
                     d2.wait_send()
+
+            def finish():
+                if not tiles.qmid:
+                    forward()
+                lvs(finish_n)
 
             if tiles.qmid:
                 finish.mid = forward  # called by the DSA pre-issue loop (exactly once)
@@ -1667,7 +1722,11 @@ def build(
                                     NCH
                                 ):  # the chunks not started inside the attention loop
 
-                                    @pl.when(scr["a2a_n"][0] <= c_)
+                                    tail = scr["a2a_n"][0] <= c_
+                                    if LV:  # padded chunks (no live row) are not sent
+                                        tail = jnp.logical_and(tail, c_ < nch_lv)
+
+                                    @pl.when(tail)
                                     def _(c_=c_):
                                         a2a_chunk(c_)
                             else:
@@ -1697,7 +1756,7 @@ def build(
                                     (
                                         scr["osend"].at[0, pl.ds(0, rw_)],
                                         scr["orecv"].at[0, pl.ds(0, rw_)],
-                                        NCH,
+                                        nch_lv if LV else NCH,
                                     ),
                                     (
                                         scr["lsend"].at[pl.ds(0, HPAD)],
