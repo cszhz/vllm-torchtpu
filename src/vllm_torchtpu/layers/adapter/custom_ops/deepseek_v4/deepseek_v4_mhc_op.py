@@ -91,6 +91,32 @@ def _mhc_pre_jax(
     )
 
 
+def _mhc_pre_single_stream_jax(
+    x: jax.Array,
+    fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pre`` of hc_mult copies of one stream, reading the stream once."""
+    return pre_kernel.mhc_pre_single_stream(
+        x,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+
+
 def _mhc_post_jax(
     x: jax.Array,
     residual: jax.Array,
@@ -185,6 +211,17 @@ def _fake_mhc_pre(residual, fn, hc_scale, hc_base, *args, **kwargs):
     return _fake_pre_outputs(residual)
 
 
+def _as_streams(x: torch.Tensor, fn: torch.Tensor) -> torch.Tensor:
+    """A (..., hc_mult, hidden) stand-in for a single (..., hidden) stream."""
+    hc_mult = fn.shape[-1] // x.shape[-1]
+    return x.unsqueeze(-2).expand(*x.shape[:-1], hc_mult, x.shape[-1])
+
+
+def _fake_mhc_pre_single_stream(x, fn, hc_scale, hc_base, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return _fake_pre_outputs(_as_streams(x, fn))
+
+
 def _fake_mhc_post(x, residual, post_layer_mix, comb_res_mix, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty_like(residual)
@@ -203,6 +240,8 @@ def _fake_mhc_fused_post_pre(
     x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, *args, **kwargs
 ):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
+    if residual.dim() == x.dim():
+        residual = _as_streams(residual, fn)
     return (torch.empty_like(residual), *_fake_pre_outputs(residual))
 
 
@@ -237,6 +276,41 @@ def _mhc_pre_op(
             ),
         )
         op.register_fake(_fake_mhc_pre)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
+def _mhc_pre_single_stream_op(
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+):
+    op_name = "pallas::deepseek_v4_mhc_pre_single_stream_v1" + _gate_suffix(
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    )
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(
+                _mhc_pre_single_stream_jax,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_repeat=sinkhorn_repeat,
+            ),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(),  # fn
+                P(),  # hc_scale
+                P(),  # hc_base
+            ),
+        )
+        op.register_fake(_fake_mhc_pre_single_stream)
         _mhc_op_cache[op_name] = op
     return op
 
@@ -302,9 +376,17 @@ def _mhc_fused_post_pre_op(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    *,
+    single_stream_residual: bool = False,
 ):
-    op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v1" + _gate_suffix(
+    variant = "_res1" if single_stream_residual else ""
+    op_name = f"pallas::deepseek_v4_mhc_fused_post_pre{variant}_v1" + _gate_suffix(
         rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    )
+    residual_spec = (
+        P(ATTN_DATA_AXIS, None)
+        if single_stream_residual
+        else P(ATTN_DATA_AXIS, None, None)
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
@@ -321,7 +403,7 @@ def _mhc_fused_post_pre_op(
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None),  # x
-                P(ATTN_DATA_AXIS, None, None),  # residual
+                residual_spec,  # residual
                 P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
                 P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
                 P(),  # fn
@@ -350,11 +432,16 @@ class MHCOps(NamedTuple):
     ``fused(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base)``
         residual_cur -- the ``post`` output -- then ``pre``'s three outputs
         computed from it.
+    ``pre_single_stream(x, fn, hc_scale, hc_base)`` / ``fused_from_single_stream``
+        ``pre`` / ``fused`` for a residual whose hc_mult streams are copies
+        of one (..., hidden_size) stream, which is passed instead.
     """
 
     pre: Any
     fused: Any
     post: Any
+    pre_single_stream: Any
+    fused_from_single_stream: Any
 
 
 def get_mhc_ops(
@@ -380,4 +467,15 @@ def get_mhc_ops(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         ),
         post=get_mhc_post_op(),
+        pre_single_stream=_mhc_pre_single_stream_op(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        ),
+        fused_from_single_stream=_mhc_fused_post_pre_op(
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            single_stream_residual=True,
+        ),
     )

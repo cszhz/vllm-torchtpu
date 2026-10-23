@@ -70,9 +70,16 @@ def _mixes_collapse_kernel(
     which need no Sinkhorn and are per-token, so they are computable
     entirely in-block. The Sinkhorn/post/comb gates stay in
     XLA on the raw ``mixes`` output.
+
+    A (tb, hidden_size) block is one stream standing for all hc_mult
+    identical ones (the embedding before any post); it is repeated in VMEM
+    so the GEMM and the sums see exactly the values the repeated HBM
+    copy would have held.
     """
     m, h = hc_mult, hidden_size
     x = x_ref[...]
+    if x.shape[1] == h:
+        x = jnp.concatenate([x] * m, axis=1)
     acc = _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref)
     mixes_ref[...] = acc
     xf = x.astype(jnp.float32)
@@ -179,17 +186,20 @@ def mhc_pre_mixes_collapse(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Mixes + in-block collapse: the full memory-bound half of ``mhc_pre``.
 
+    ``x2d`` is (T, hc_mult * hidden_size), or (T, hidden_size) when all
+    hc_mult streams are the same single stream.
+
     Returns (mixes (T, hc_mult3) f32 — raw, unscaled, for the XLA gates;
     sqrsum (T, 1) f32; layer_input2d (T, hidden_size) bf16).
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
     assert fn.dtype == jnp.float32, fn.dtype
-    num_tokens, hc_hidden = x2d.shape
-    hc_mult3 = fn.shape[0]
-    assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, x2d.shape)
+    hc_mult3, hc_hidden = fn.shape
     # hc_mult3 = hc_mult * (hc_mult + 2) -> unique positive hc_mult.
     hc_mult = next(m for m in range(1, 64) if m * (m + 2) == hc_mult3)
     hidden_size = hc_hidden // hc_mult
+    num_tokens, x_width = x2d.shape
+    assert x_width in (hc_hidden, hidden_size), (fn.shape, x2d.shape)
 
     fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
@@ -231,7 +241,7 @@ def mhc_pre_mixes_collapse(
         ),
         grid=(padded_tokens // tb,),
         in_specs=[
-            pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
+            pl.BlockSpec((tb, x_width), lambda i: (i, 0)),
             resident,
             resident,
             resident,
@@ -312,6 +322,62 @@ def mhc_pre(
         sinkhorn_repeat,
     )
 
+    return (
+        post_mix.reshape(*outer_shape, hc_mult, 1),
+        comb_mix.reshape(*outer_shape, hc_mult, hc_mult),
+        layer2d.reshape(*outer_shape, hidden_size),
+    )
+
+
+def mhc_pre_single_stream(
+    x: jax.Array,
+    fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    *,
+    token_block_size: int = 64,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``mhc_pre`` of hc_mult identical streams, given the one stream.
+
+    x: (..., hidden_size) bf16 -- what ``mhc_pre`` would see repeated
+    hc_mult times on the stream axis. Same outputs, bit for bit, without
+    the repeated copy in HBM.
+    """
+    assert x.dtype == jnp.bfloat16
+    assert fn.dtype == jnp.float32
+
+    outer_shape = x.shape[:-1]
+    hidden_size = x.shape[-1]
+    hc_mult = fn.shape[1] // hidden_size
+    mixes, sqrsum, layer2d = mhc_pre_mixes_collapse(
+        x.reshape(-1, hidden_size),
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        token_block_size=token_block_size,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    _, post_mix, comb_mix = utils.mhc_pre_gates(
+        mixes,
+        sqrsum,
+        hc_mult,
+        hidden_size,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
     return (
         post_mix.reshape(*outer_shape, hc_mult, 1),
         comb_mix.reshape(*outer_shape, hc_mult, hc_mult),

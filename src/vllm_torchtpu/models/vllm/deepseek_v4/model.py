@@ -182,7 +182,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         still owes. The chain is opened by the layer-0 attention pre, which
         has no preceding post, and closed by the caller.
         """
-        if residual is None:
+        if residual is None and x.dim() == 2:
+            # Chain start on the embedding: its hc_mult streams are copies
+            # of x, so the pre (and the seam below) read x once.
+            residual = x
+            post_mix, res_mix, x = self.mhc_ops.pre_single_stream(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
+        elif residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
             x, post_mix, res_mix = self.hc_pre(
@@ -202,7 +209,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self.attn_norm(x)
         x = self.attn(positions, x)
 
-        residual, post_mix, res_mix, x = self.mhc_ops.fused(
+        fused = (
+            self.mhc_ops.fused_from_single_stream
+            if residual.dim() == x.dim()
+            else self.mhc_ops.fused
+        )
+        residual, post_mix, res_mix, x = fused(
             x,
             residual,
             post_mix,
@@ -443,7 +455,8 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            # Left as the one stream the hc_mult streams start as copies of;
+            # the first layer reads it as such (DeepseekV4DecoderLayer).
         else:
             assert intermediate_tensors is not None
             hidden_states = typing.cast(
