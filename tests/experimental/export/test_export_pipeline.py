@@ -483,7 +483,9 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
 
     with open(os.path.join(out_dir, "serving_checkpoint", "weight.json")) as f:
         wjson = json.load(f)
-    assert wjson["mesh"] == {"mesh_shape": [1, 1], "axis_names": ["dp", "tp"]}
+    assert "mesh" not in wjson
+    assert meta["mlir_shapes"] == "shard_local"
+    assert meta["mesh"] == {"mesh_shape": [1, 1], "axis_names": ["data", "model"]}
     assert wjson["lm_head.weight"]["sources"][0]["path"] == "model.safetensors"
     assert wjson["hf_checkpoint_path"] == os.path.abspath(hf_dir)
 
@@ -755,56 +757,246 @@ def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> N
             resolve("org/missing")
 
 
-def test_weight_json_declares_constants_and_full_source_shapes(tmp_path: Path) -> None:
-    hf_dir = tmp_path / "hf"
+def _tp2_model(hf_dir: Path, constant_values: Mapping[str, list[Any]]) -> Any:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny",
+        vocab_size=64,
+        hf_checkpoint_dir=str(hf_dir),
+        num_partitions=2,
+    )
+    return SimpleNamespace(
+        export_config=cfg,
+        model=None,
+        constant_axis_values=lambda name: constant_values[name],
+    )
+
+
+def _write_safetensors_header(hf_dir: Path, shapes: Mapping[str, list[int]]) -> None:
     hf_dir.mkdir()
     header = {
-        "model.embed_tokens.weight": {
-            "dtype": "BF16",
-            "shape": [64, 8],
-            "data_offsets": [0, 1024],
-        }
+        name: {"dtype": "BF16", "shape": shape, "data_offsets": [0, 0]}
+        for name, shape in shapes.items()
     }
     hb = json.dumps(header).encode("utf-8")
     with open(hf_dir / "model.safetensors", "wb") as f:
         f.write(struct.pack("<Q", len(hb)))
         f.write(hb)
-    cfg = api.TextOnlyLLMExportConfig(
-        model_name="tiny", vocab_size=64, hf_checkpoint_dir=str(hf_dir)
-    )
+
+
+def test_weight_json_declares_global_shapes_and_inline_constants(
+    tmp_path: Path,
+) -> None:
+    hf_dir = tmp_path / "hf"
+    _write_safetensors_header(hf_dir, {"model.embed_tokens.weight": [64, 8]})
+    values = {
+        "model.embed_tokens.org_vocab_start_index": [0, 32],
+        "model.embed_tokens.added_vocab_start_index": [64, 64],
+    }
+    model = _tp2_model(hf_dir, values)
     # Rank-local shapes of a tensor-parallel size 2 export.
     params = {
         "model.embed_tokens.weight": api.ShapeDtypeStruct(
             (32, 8), "bf16", sharding=["tp", None]
         ),
         "model.embed_tokens.org_vocab_start_index": api.ShapeDtypeStruct((), "i64"),
+        "model.embed_tokens.added_vocab_start_index": api.ShapeDtypeStruct((), "i64"),
     }
-    model = SimpleNamespace(
-        export_config=cfg,
-        model=None,
-        constant_axis_values=lambda name: [0, 32],
+    constants = frozenset(values)
+    layouts = exporter._tensor_layouts(
+        model, params, constants, exporter._axis_sizes(model.export_config)
     )
     out_dir = tmp_path / "artifact"
     exporter._emit_declarative_weight_json(
         model,
         params,
-        {"model.embed_tokens.weight": 6, "model.embed_tokens.org_vocab_start_index": 7},
+        layouts,
+        {n: 6 + i for i, n in enumerate(params)},
         str(out_dir),
-        1,
-        2,
-        constants=frozenset({"model.embed_tokens.org_vocab_start_index"}),
+        constants=constants,
     )
 
     wjson = json.loads((out_dir / "serving_checkpoint" / "weight.json").read_text())
-    embed = wjson["model.embed_tokens.weight"]
-    assert embed["shape"] == [32, 8]
-    assert embed["sources"][0]["source_shape"] == [64, 8]
+    assert "mesh" not in wjson
+    # The checkpoint tensor is the whole global array, so one source suffices.
+    assert wjson["model.embed_tokens.weight"] == {
+        "index": 6,
+        "shape": [64, 8],
+        "dtype": "bf16",
+        "sharding": ["model", None],
+        "sources": [
+            {
+                "path": "model.safetensors",
+                "source_tensor": "model.embed_tokens.weight",
+                "source_shape": [64, 8],
+            }
+        ],
+    }
+    # A per-device value is a sharded global array; each device holds `[1]`.
     assert wjson["model.embed_tokens.org_vocab_start_index"] == {
         "index": 7,
-        "shape": [],
-        "dtype": "int64",
-        "axis_values": {"axis": "tp", "values": [0, 32]},
+        "shape": [2],
+        "dtype": "i64",
+        "sharding": ["model"],
+        "value": [0, 32],
     }
+    assert layouts["model.embed_tokens.org_vocab_start_index"].lowered_shape == (1,)
+    assert layouts["model.embed_tokens.org_vocab_start_index"].reshape == ()
+    # A value shared by every device stays a replicated scalar.
+    assert wjson["model.embed_tokens.added_vocab_start_index"] == {
+        "index": 8,
+        "shape": [],
+        "dtype": "i64",
+        "sharding": [],
+        "value": 64,
+    }
+
+
+def _qkv_sources(q: int, kv: int, in_dim: int) -> list[dict[str, Any]]:
+    """Rank-local fused QKV sources, as `build_generic_weight_sources` emits."""
+    sources, start = [], 0
+    for proj, length, full in (("q", q, 2 * q), ("k", kv, 1024), ("v", kv, 1024)):
+        sources.append(
+            {
+                "path": "model.safetensors",
+                "source_tensor": f"model.layers.0.self_attn.{proj}_proj.weight",
+                "source_shape": [full, in_dim],
+                "transpose": [1, 0],
+                "dst_slices": [{"dim": 1, "start": start, "length": length}],
+            }
+        )
+        start += length
+    return sources
+
+
+def test_global_sources_concatenate_fused_qkv_shards() -> None:
+    # Qwen3-0.6B at tensor parallel size 2 (the RFC 0001 weight.json example).
+    layout = exporter._TensorLayout(
+        shape=[1024, 4096], sharding=[None, "model"], lowered_shape=(1024, 2048)
+    )
+    sources = exporter._global_sources(
+        "model.layers.0.self_attn.qkv_proj.weight",
+        _qkv_sources(1024, 512, 1024),
+        [1024, 2048],
+        layout,
+        {"data": 1, "model": 2},
+    )
+    got = [
+        (
+            s["source_tensor"].split(".")[-2],
+            s["src_slices"][0]["start"],
+            s["dst_slices"][0]["start"],
+        )
+        for s in sources
+    ]
+    assert got == [
+        ("q_proj", 0, 0),
+        ("k_proj", 0, 1024),
+        ("v_proj", 0, 1536),
+        ("q_proj", 1024, 2048),
+        ("k_proj", 512, 3072),
+        ("v_proj", 512, 3584),
+    ]
+    assert all(s["src_slices"][0]["dim"] == 0 for s in sources)
+    assert all(s["dst_slices"][0]["dim"] == 1 for s in sources)
+
+
+def test_global_sources_repeat_kv_heads_shared_by_several_ranks() -> None:
+    # 2 KV heads of 256 rows over 4 ranks: ranks 0-1 hold head 0, ranks 2-3 head 1.
+    kv_sources = [
+        {
+            "path": "model.safetensors",
+            "source_tensor": "model.layers.0.self_attn.k_proj.weight",
+            "source_shape": [512, 64],
+            "transpose": [1, 0],
+            "dst_slices": [{"dim": 1, "start": 0, "length": 256}],
+        }
+    ]
+    layout = exporter._TensorLayout(
+        shape=[64, 1024], sharding=[None, "model"], lowered_shape=(64, 256)
+    )
+    sources = exporter._global_sources(
+        "k", kv_sources, [64, 256], layout, {"data": 1, "model": 4}
+    )
+    assert [s["src_slices"][0]["start"] for s in sources] == [0, 0, 256, 256]
+    assert [s["dst_slices"][0]["start"] for s in sources] == [0, 256, 512, 768]
+
+
+def test_global_sources_reject_a_source_that_does_not_split_evenly() -> None:
+    layout = exporter._TensorLayout(
+        shape=[64, 96], sharding=[None, "model"], lowered_shape=(64, 32)
+    )
+    src = {
+        "path": "model.safetensors",
+        "source_tensor": "w",
+        "source_shape": [100, 64],
+        "transpose": [1, 0],
+        "dst_slices": [{"dim": 1, "start": 0, "length": 32}],
+    }
+    with pytest.raises(ValueError, match="does not split into 3 shards"):
+        exporter._global_sources("w", [src], [64, 32], layout, {"model": 3})
+
+
+def test_set_aliasing_outputs_pairs_each_donor_with_its_result() -> None:
+    mlir = (
+        "module {\n"
+        "  func.func public @main(%arg0: tensor<4xi32>, "
+        "%arg1: tensor<2x4xbf16> {jax.buffer_donor = true}, "
+        "%arg2: tensor<2x4xbf16> {jax.buffer_donor = true}) -> "
+        "(tensor<2x4xbf16>, tensor<2x4xbf16>, tensor<4xbf16>) {\n"
+        "  }\n}\n"
+    )
+    out = tpu_lowering.set_aliasing_outputs(mlir, {1: 0, 2: 1})
+    assert "jax.buffer_donor" not in out
+    assert "%arg1: tensor<2x4xbf16> {tf.aliasing_output = 0 : i32}" in out
+    assert "%arg2: tensor<2x4xbf16> {tf.aliasing_output = 1 : i32}" in out
+    with pytest.raises(ValueError, match="no aliased result"):
+        tpu_lowering.set_aliasing_outputs(mlir, {1: 0})
+
+
+def test_validator_rejects_a_donor_without_aliasing_output(tmp_path: Path) -> None:
+    mlir = (
+        "module {\n"
+        "  func.func public @main(%arg0: tensor<2xbf16> {jax.buffer_donor = true}) "
+        "-> tensor<2xbf16> {\n"
+        "    return %arg0 : tensor<2xbf16>\n"
+        "  }\n}\n"
+    )
+    (tmp_path / "abstract_params.mlir").write_text(mlir)
+    entry = {
+        "arg_index": 0,
+        "index": 0,
+        "name": "w",
+        "shape": [2],
+        "dtype": "bf16",
+        "sharding": [None],
+        "argument_type": "weight",
+        "buffer_donor": True,
+    }
+    meta = {
+        "format_version": 2,
+        "mlir_shapes": "shard_local",
+        "mesh": {"mesh_shape": [1, 1], "axis_names": ["data", "model"]},
+        "functions": {
+            "abstract_params": {
+                "default": {
+                    "file_path": "abstract_params.mlir",
+                    "inputs": [entry],
+                    "outputs": [dict(entry, buffer_donor=False)],
+                }
+            }
+        },
+    }
+    (tmp_path / "metadata.json").write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="has no tf.aliasing_output"):
+        validator.validate_exported_model_dir(str(tmp_path))
+    (tmp_path / "abstract_params.mlir").write_text(
+        mlir.replace("jax.buffer_donor = true", "tf.aliasing_output = 0 : i32")
+    )
+    validator.validate_exported_model_dir(str(tmp_path))
+    meta["functions"]["abstract_params"]["default"]["inputs"][0]["dtype"] = "bfloat16"
+    (tmp_path / "metadata.json").write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="not a StableHLO element type"):
+        validator.validate_exported_model_dir(str(tmp_path))
 
 
 @pytest.mark.usefixtures("single_rank_tp_group")
