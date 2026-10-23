@@ -342,15 +342,30 @@ def build_decode_plan(
         inputs.append(scale_bits_g.astype(i32).reshape(ep, t_local))
     vmem = pltpu.MemorySpace.VMEM
     n_in, n_out = len(inputs), len(out_shape)
+    scale_index = 6 if quantized else None
     if interpret:
-        out_space, body = vmem, kernel
+        out_spaces, body, scratch_shapes = [vmem] * n_out, kernel, []
+        final_shape = out_shape
     else:
-        # The plan is computed into VMEM scratch and DMA'd to HBM outputs by
-        # the kernel itself, all copies in flight at once. Left as VMEM
+        # The plan is computed into VMEM scratch and DMA'd by the kernel itself
+        # to outputs declared in HBM, every copy in flight at once. As VMEM
         # outputs, XLA placed them in VMEM and then copied each one to HBM for
         # the fused EP kernel, serially, ~0.59 us apiece (8 per decode layer
-        # at TP8 T16, j-6cb83e31).
-        out_space = pltpu.MemorySpace.HBM
+        # at TP8 T16, j-6cb83e31). The scale slab lands directly in the
+        # kernel's [rows, 128] layout, one row DMA per lane block, rather than
+        # as a [1, rows * 128] row XLA relayouts (0.59 us).
+        hbm = pltpu.MemorySpace.HBM
+        final_shape = [
+            hbm(
+                (scale_rows, HIDDEN_LANE_BLOCK) if i == scale_index else o.shape,
+                o.dtype,
+            )
+            for i, o in enumerate(out_shape)
+        ]
+        out_spaces = [hbm] * n_out
+        scratch_shapes = [pltpu.VMEM(o.shape, o.dtype) for o in out_shape] + [
+            pltpu.SemaphoreType.DMA
+        ]
 
         def body(me_ref, *refs):
             ins = refs[:n_in]
@@ -358,10 +373,19 @@ def build_decode_plan(
             scratch = refs[n_in + n_out : n_in + 2 * n_out]
             sem = refs[n_in + 2 * n_out]
             kernel(me_ref, *ins, *scratch)
-            copies = [
-                pltpu.make_async_copy(src, dst, sem)
-                for src, dst in zip(scratch, outs_hbm)
-            ]
+            copies = []
+            for i, (src, dst) in enumerate(zip(scratch, outs_hbm)):
+                if i == scale_index:
+                    for r in range(scale_rows):
+                        copies.append(
+                            pltpu.make_async_copy(
+                                src.at[:, pl.ds(r * HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK)],
+                                dst.at[pl.ds(r, 1), :],
+                                sem,
+                            )
+                        )
+                else:
+                    copies.append(pltpu.make_async_copy(src, dst, sem))
             for c in copies:
                 c.start()
             for c in copies:
@@ -373,15 +397,10 @@ def build_decode_plan(
             num_scalar_prefetch=1,
             grid=(),
             in_specs=[pl.BlockSpec(memory_space=vmem) for _ in inputs],
-            out_specs=[pl.BlockSpec(memory_space=out_space) for _ in out_shape],
-            scratch_shapes=(
-                []
-                if interpret
-                else [pltpu.VMEM(o.shape, o.dtype) for o in out_shape]
-                + [pltpu.SemaphoreType.DMA]
-            ),
+            out_specs=[pl.BlockSpec(memory_space=m) for m in out_spaces],
+            scratch_shapes=scratch_shapes,
         ),
-        out_shape=out_shape,
+        out_shape=final_shape,
         interpret=interpret,
         name="fused_ep_moe_v2_decode_plan",
     )(rank.reshape(1).astype(i32), *inputs)
