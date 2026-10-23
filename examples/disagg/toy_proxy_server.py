@@ -325,6 +325,226 @@ class _PrefixAffinityRouter:
             }
 
 
+class _DPRankRouter:
+    """Prefix-affinity DP-rank routing inside data-parallel decode hosts.
+
+    Opt-in with PROXY_DECODE_ROUTING=dp_affinity; any other value leaves this
+    class unused and the proxy on its old behaviour.
+
+    A DP>1 decode host (e.g. DP4xTP2) runs one vLLM engine per DP rank behind
+    one API server. vLLM's internal balancer picks the rank by request count
+    and knows nothing about prefixes, so a conversation's next turn lands on
+    the rank that holds its previous turn's KV only 1 time in DP size, and the
+    prefill re-sends KV the decode already holds. This router pins each decode
+    request to a (host, rank) slot with vLLM's ``X-data-parallel-rank`` header:
+
+    * Preferred slot: the slot that last served the longest known prefix of the
+      prompt (cumulative blake2b digests over fixed-size prompt byte chunks, as
+      _PrefixAffinityRouter), if at least ``min_frac`` of the chunks match.
+    * Host: the preferred slot's host while that host's unfinished requests are
+      at most ``host_slack`` above the host mean; otherwise the host with the
+      fewest unfinished requests. Chosen before the prefill hop (the decode
+      admission budget is per host).
+    * Rank, chosen at the decode send with the real prompt length: the
+      preferred rank while its unfinished prompt tokens are at most
+      ``(1 + kv_slack_frac)`` x the host's per-rank mean and its unfinished
+      request count at most ``count_slack`` above the per-rank mean. Otherwise
+      the rank with the fewest unfinished prompt tokens among the ranks within
+      ``fallback_count_slack`` of the fewest unfinished requests.
+
+    The guard exists because the DP ranks step in lockstep: the rank holding
+    the most resident KV sets every step's attention time, so a pure-affinity
+    policy that piles long contexts onto one rank costs TPOT (DP-balance
+    analysis, reports/dp_balance.md). "Unfinished" counts a request from its
+    decode send (rank) or host choice (host) until its stream ends.
+    """
+
+    def __init__(
+        self,
+        n_hosts: int,
+        ranks: int,
+        chunk: int = 4096,
+        min_frac: float = 0.5,
+        kv_slack_frac: float = 0.10,
+        count_slack: float = 1.0,
+        fallback_count_slack: int = 1,
+        host_slack: int = 8,
+        max_owners: int = 2_000_000,
+    ) -> None:
+        if n_hosts < 1 or ranks < 1:
+            raise ValueError(f"n_hosts and ranks must be >= 1, got {n_hosts}, {ranks}")
+        self.n_hosts = n_hosts
+        self.ranks = ranks
+        self.chunk = max(64, int(chunk))
+        self.min_frac = float(min_frac)
+        self.kv_slack_frac = max(0.0, float(kv_slack_frac))
+        self.count_slack = max(0.0, float(count_slack))
+        self.fallback_count_slack = max(0, int(fallback_count_slack))
+        self.host_slack = max(0, int(host_slack))
+        self.max_owners = max(1, int(max_owners))
+        self._lock = threading.Lock()
+        # digest -> (host, rank) of the slot that last served that prefix
+        self.owners: OrderedDict[bytes, tuple[int, int]] = OrderedDict()
+        self.host_unfinished = [0] * n_hosts
+        self.count = [[0] * ranks for _ in range(n_hosts)]
+        self.tokens = [[0.0] * ranks for _ in range(n_hosts)]
+        # req_id -> (host, rank or None, tokens)
+        self._reqs: dict[str, tuple[int, int | None, float]] = {}
+        self.routed = 0
+        self.sticky = 0
+        self.guard_kv = 0
+        self.guard_count = 0
+        self.other_host = 0
+        self.cold = 0
+
+    def hashes(self, text: str) -> list[bytes]:
+        raw = text.encode("utf-8", errors="ignore")
+        out: list[bytes] = []
+        h = hashlib.blake2b(digest_size=8)
+        for i in range(0, len(raw) - self.chunk + 1, self.chunk):
+            h.update(raw[i : i + self.chunk])
+            out.append(h.digest())
+        return out
+
+    def _owner(self, hs: list[bytes]) -> tuple[int, int] | None:
+        for i in range(len(hs) - 1, -1, -1):
+            slot = self.owners.get(hs[i])
+            if slot is not None:
+                if (i + 1) >= len(hs) * self.min_frac:
+                    return slot
+                return None
+        return None
+
+    def choose_host(self, hs: list[bytes], req_id: str) -> int:
+        """Picks the decode host before the prefill hop and counts the request there."""
+        with self._lock:
+            owner = self._owner(hs)
+            mean = sum(self.host_unfinished) / self.n_hosts
+            if owner is not None and self.host_unfinished[owner[0]] <= mean + self.host_slack:
+                host = owner[0]
+            else:
+                host = min(range(self.n_hosts), key=lambda h: (self.host_unfinished[h], h))
+            self.host_unfinished[host] += 1
+            self._reqs[req_id] = (host, None, 0.0)
+            return host
+
+    def choose_rank(
+        self, host: int, hs: list[bytes], prompt_tokens: int, req_id: str
+    ) -> tuple[int, str]:
+        """Picks the DP rank on ``host`` at the decode send. Returns (rank, reason)."""
+        with self._lock:
+            prev = self._reqs.get(req_id)
+            if prev is not None and prev[1] is not None:
+                raise ValueError(f"choose_rank called twice for {req_id}")
+            owner = self._owner(hs)
+            cnt, tok = self.count[host], self.tokens[host]
+            reason = "cold"
+            rank: int | None = None
+            if owner is not None and owner[0] != host:
+                reason = "other_host"
+            elif owner is not None:
+                r = owner[1]
+                mean_tok = sum(tok) / self.ranks
+                mean_cnt = sum(cnt) / self.ranks
+                if tok[r] > (1.0 + self.kv_slack_frac) * mean_tok + 1.0:
+                    reason = "guard_kv"
+                elif cnt[r] > mean_cnt + self.count_slack:
+                    reason = "guard_count"
+                else:
+                    rank, reason = r, "sticky"
+            if rank is None:
+                lo = min(cnt)
+                rank = min(
+                    (r for r in range(self.ranks) if cnt[r] <= lo + self.fallback_count_slack),
+                    key=lambda r: (tok[r], cnt[r], r),
+                )
+            ntok = float(max(0, int(prompt_tokens)))
+            cnt[rank] += 1
+            tok[rank] += ntok
+            if prev is None:
+                # choose_host was not called (single-host use): count the host here.
+                self.host_unfinished[host] += 1
+            self._reqs[req_id] = (host, rank, ntok)
+            for d in hs:
+                self.owners[d] = (host, rank)
+                self.owners.move_to_end(d)
+            while len(self.owners) > self.max_owners:
+                self.owners.popitem(last=False)
+            self.routed += 1
+            if reason == "sticky":
+                self.sticky += 1
+            elif reason == "guard_kv":
+                self.guard_kv += 1
+            elif reason == "guard_count":
+                self.guard_count += 1
+            elif reason == "other_host":
+                self.other_host += 1
+            else:
+                self.cold += 1
+            return rank, reason
+
+    def done(self, req_id: str) -> None:
+        with self._lock:
+            ent = self._reqs.pop(req_id, None)
+            if ent is None:
+                return
+            host, rank, ntok = ent
+            self.host_unfinished[host] = max(0, self.host_unfinished[host] - 1)
+            if rank is not None:
+                self.count[host][rank] = max(0, self.count[host][rank] - 1)
+                self.tokens[host][rank] = max(0.0, self.tokens[host][rank] - ntok)
+
+    def describe(self) -> str:
+        return (
+            f"dp_affinity ranks={self.ranks} hosts={self.n_hosts} chunk={self.chunk} "
+            f"min_frac={self.min_frac} kv_slack_frac={self.kv_slack_frac} "
+            f"count_slack={self.count_slack} fallback_count_slack={self.fallback_count_slack} "
+            f"host_slack={self.host_slack} max_owners={self.max_owners}"
+        )
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "routed": self.routed,
+                "sticky": self.sticky,
+                "guard_kv": self.guard_kv,
+                "guard_count": self.guard_count,
+                "other_host": self.other_host,
+                "cold": self.cold,
+                "host_unfinished": list(self.host_unfinished),
+                "count": [list(c) for c in self.count],
+                "tokens": [[int(t) for t in ts] for ts in self.tokens],
+                "owners": len(self.owners),
+            }
+
+
+def _make_dp_router(n_hosts: int) -> "_DPRankRouter | None":
+    """The DP-rank router when PROXY_DECODE_ROUTING=dp_affinity, else None."""
+    mode = os.getenv("PROXY_DECODE_ROUTING", "round_robin").strip().lower()
+    if mode != "dp_affinity":
+        return None
+    return _DPRankRouter(
+        n_hosts=n_hosts,
+        ranks=_env_int("PROXY_DP_RANKS", 4),
+        chunk=_env_int("PROXY_DP_PREFIX_CHUNK", 4096),
+        min_frac=_env_float("PROXY_DP_MIN_FRAC", 0.5),
+        kv_slack_frac=_env_float("PROXY_DP_KV_SLACK_FRAC", 0.10),
+        count_slack=_env_float("PROXY_DP_COUNT_SLACK", 1.0),
+        fallback_count_slack=_env_int("PROXY_DP_FALLBACK_COUNT_SLACK", 1),
+        host_slack=_env_int("PROXY_DP_HOST_SLACK", 8),
+        max_owners=_env_int("PROXY_DP_MAX_OWNERS", 2_000_000),
+    )
+
+
+def _decode_headers_with_rank(forwarded: dict, rank: int | None) -> dict:
+    """Headers for the decode hop only: the client's own X-data-parallel-rank
+    wins; otherwise the router's rank, if any. The prefill hop never gets a
+    router rank (the prefill leg is not data parallel)."""
+    if rank is None or "X-data-parallel-rank" in forwarded:
+        return forwarded
+    return {**forwarded, "X-data-parallel-rank": str(rank)}
+
+
 class _AdmissionBudget:
     """Bounds the requests one backend leg holds, by count and by tokens.
 
@@ -743,6 +963,12 @@ async def lifespan(app: FastAPI):
         )
     else:
         app.state.decode_router = None
+    # PROXY_DECODE_ROUTING=dp_affinity: pin each decode request to a DP rank of
+    # its decode host (X-data-parallel-rank), prefix-affine with a KV-aware load
+    # guard; it also replaces the host round robin (host affinity with a slack).
+    app.state.dp_router = _make_dp_router(len(app.state.decode_clients))
+    if app.state.dp_router is not None:
+        print(f"Decode DP-rank routing: {app.state.dp_router.describe()}", flush=True)
     # Admission per decode leg, so the contexts a decode leg holds (running
     # plus arriving KV) stay within its KV cache; above the cap, requests wait
     # here holding no KV anywhere. Without it a burst fills the decode KV,
@@ -1065,11 +1291,17 @@ async def _handle_completions(api: str, request: Request):
         if router is not None or decode_router is not None:
             hasher = router if router is not None else decode_router
             hs = hasher.hashes(hasher.extract_text(req_data))
+        dp_router: _DPRankRouter | None = getattr(request.app.state, "dp_router", None)
+        dp_hs: list[bytes] = []
+        if dp_router is not None:
+            dp_hs = dp_router.hashes(_PrefixAffinityRouter.extract_text(req_data))
         # The decode leg is chosen before the prefill hop so that the
         # admission slot is taken while the request holds no KV. A
         # conversation keeps its decode leg, so a later turn hits that leg's
         # own prefix cache and pulls only the new tokens' KV from the prefill.
-        if decode_router is not None:
+        if dp_router is not None:
+            decode_idx = dp_router.choose_host(dp_hs, request_id)
+        elif decode_router is not None:
             decode_idx, _ = decode_router.route(hs)
         else:
             decode_idx = next(request.app.state.decode_iterator)
@@ -1102,6 +1334,8 @@ async def _handle_completions(api: str, request: Request):
                 await decode_budget.release(decode_tokens)
             if decode_router is not None:
                 decode_router.done(decode_idx, was_running=decode_running)
+            if dp_router is not None:
+                dp_router.done(request_id)
 
         async def release_pending(reason: str) -> None:
             nonlocal pending_released
@@ -1245,6 +1479,23 @@ async def _handle_completions(api: str, request: Request):
                     if decode_router is not None:
                         decode_router.start_running(decode_idx)
                         decode_running = True
+                    decode_forwarded = forwarded
+                    if dp_router is not None and "X-data-parallel-rank" not in forwarded:
+                        dp_rank, dp_reason = dp_router.choose_rank(
+                            decode_idx,
+                            dp_hs,
+                            prompt_tokens if prompt_tokens is not None else prompt_est,
+                            request_id,
+                        )
+                        decode_forwarded = _decode_headers_with_rank(forwarded, dp_rank)
+                        print(
+                            f"PERF PROXY dp_route req_id={request_id} "
+                            f"decode_id={decode_idx} rank={dp_rank} reason={dp_reason} "
+                            f"tokens={prompt_tokens if prompt_tokens is not None else prompt_est}",
+                            flush=True,
+                        )
+                        if dp_router.routed % 256 == 0:
+                            print(f"PERF PROXY dp_router | {dp_router.stats()}", flush=True)
                     t_decode_send = time.time()
                     t_decode_send_perf = time.perf_counter()
                     print(
@@ -1254,7 +1505,7 @@ async def _handle_completions(api: str, request: Request):
                     )
                     first = True
                     async for chunk in stream_from_decode(
-                        decode_client_info, api, req_data, request_id, forwarded
+                        decode_client_info, api, req_data, request_id, decode_forwarded
                     ):
                         if first:
                             t_first = time.time()
@@ -1345,6 +1596,9 @@ async def healthcheck():
     )
     if decode_router is not None:
         res["decode_router"] = decode_router.stats()
+    dp_router = getattr(app.state, "dp_router", None)
+    if dp_router is not None:
+        res["dp_router"] = dp_router.stats()
     budgets = getattr(app.state, "decode_budgets", None)
     if budgets:
         res["decode_admission"] = [b.stats() for b in budgets]
