@@ -50,6 +50,12 @@ HCA_KV_PAGES_PER_BLOCK = (128, 64, 64)
 # overflows VMEM at 128 heads and 1024 tokens.
 HCA_FUSED_MAX_KV_TOKENS = 128
 
+logger.info(
+    "DeepSeek-V4 attention: HCA pass fused into the SWA kernels for kv blocks "
+    "of up to %d tokens",
+    HCA_FUSED_MAX_KV_TOKENS,
+)
+
 
 def _run_swa(
     q: jax.Array,
