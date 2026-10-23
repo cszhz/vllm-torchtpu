@@ -519,7 +519,7 @@ def _union_sc_kernel(
                     @plsc.parallel_loop(0, K, step=L)
                     def _(k):
                         c = rowb[slot, pl.ds(r * K + k, L)]
-                        v = c >= 0
+                        v = (c >= 0) & (c < S)
                         plsc.addupdate_scatter(cnt, (jnp.where(v, c, 0),), ones, mask=v)
 
                 rows_pass(q0, qn, count_row)
@@ -615,7 +615,7 @@ def _union_sc_kernel(
                         @plsc.parallel_loop(0, K, step=L)
                         def _(k):
                             c = rowb[slot, pl.ds(r * K + k, L)]
-                            v = c >= 0
+                            v = (c >= 0) & (c < S)
                             rk = plsc.load_gather(cnt, [jnp.where(v, c, 0)], mask=v)
                             rk = jnp.where(v, rk, 0)
                             word = jnp.bitwise_or(
@@ -762,7 +762,10 @@ def prepare(
     seq_ids = jnp.arange(nseq, dtype=jnp.int32)
     qlen = cu_q_lens[1:] - cu_q_lens[:-1]
     live = seq_ids < distribution[2]
-    ud_ok = (qlen >= min_q_len) & (kv_lens <= s_cap) & (kv_lens > 0)
+    # rc7's indexer can select a token's own still-open compressed block, i.e.
+    # index == kv_lens (= seq_len // ratio): the selectable range is kv + 1.
+    sel_len = kv_lens + 1
+    ud_ok = (qlen >= min_q_len) & (sel_len <= s_cap) & (kv_lens > 0)
     split_seq = jnp.max(jnp.where(live & ~ud_ok, seq_ids + 1, 0)).astype(jnp.int32)
     routed = live & (seq_ids >= split_seq)
     nblk = jnp.where(routed, (qlen + bq - 1) // bq, 0)
@@ -775,7 +778,7 @@ def prepare(
     q0 = cu_q_lens[seq_b] + j * bq
     qn = jnp.where(b < total_blocks, jnp.clip(cu_q_lens[seq_b + 1] - q0, 0, bq), 0)
     q0 = jnp.where(qn > 0, q0, 0)
-    s_b = jnp.where(qn > 0, kv_lens[seq_b], 0)
+    s_b = jnp.where(qn > 0, sel_len[seq_b], 0)
     meta_rows = jnp.stack([q0, qn, seq_b, s_b], axis=1)
     kw = dict(max_num_seqs=nseq, s_cap=s_cap, u_cap=u_cap, page_size=page_size)
     # Union sizes first (a cheap pass); the full plan only for a step that

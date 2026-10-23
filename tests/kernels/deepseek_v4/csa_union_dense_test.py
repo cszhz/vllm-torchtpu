@@ -36,9 +36,11 @@ def _case(rng, seqs, heads, correlated):
     cu = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
     n = int(cu[-1])
     T = 1 << max(9, (n - 1).bit_length())
-    kv_lens = np.array([(c + q) // 4 + 1 for q, c in seqs], np.int32)
+    # Served kv_len = seq_len // 4; rc7's indexer also selects a token's own
+    # still-open block, index == kv_len (the regression behind the E2E halt).
+    kv_lens = np.array([(c + q) // 4 for q, c in seqs], np.int32)
     max_seqs = max(4, len(seqs))
-    pps = int(-(-kv_lens.max() // PAGE_SIZE))
+    pps = int(-(-(kv_lens.max() + 1) // PAGE_SIZE))
     total_pages = max_seqs * pps + 5
     pages = rng.permutation(total_pages)[: max_seqs * pps].astype(np.int32)
     topk = np.full((T, TOPK), -1, np.int32)
@@ -46,7 +48,7 @@ def _case(rng, seqs, heads, correlated):
     for (q, c), kv in zip(seqs, kv_lens):
         prev = None
         for t in range(q):
-            vis = int(min(kv, (c + t) // 4 + 1))
+            vis = int(min(kv + 1, (c + t) // 4 + 1))
             if vis <= TOPK:
                 sel = np.arange(vis)
             elif correlated and prev is not None and prev.max() < vis:
@@ -99,6 +101,7 @@ def _union(c, bq):
         ([(3, 2000), (5, 9000), (300, 6000)], 16, 64),  # short chunk, small context
         ([(7, 30000), (7, 9000), (498, 31000)], 32, 32),  # TP4 shape
         ([(130, 0)], 16, 64),  # everything visible, -1 padded rows
+        ([(2048, 22528)], 16, 64),  # kv_len 6144 (multiple of 16), own block picked
     ],
 )
 def test_union_matches_sparse(seqs, heads, bq):
@@ -128,7 +131,8 @@ def test_plan_matches_numpy(bq):
     )  # fmt: skip
     meta = ref["meta"]
     nb = ref["num_blocks"]
-    rows = np.stack([meta[0], meta[1], meta[5], c["kv_np"][meta[5]] * (meta[1] > 0)], 1)
+    sel_len = c["kv_np"] + 1  # the open block is selectable (see _case)
+    rows = np.stack([meta[0], meta[1], meta[5], sel_len[meta[5]] * (meta[1] > 0)], 1)
     idx, mask, usize = csa_union_dense.build_union_plan(
         c["topk"], c["pages"], jnp.asarray(rows.astype(np.int32)),
         max_num_seqs=4, s_cap=49152, u_cap=u_cap, page_size=PAGE_SIZE,
