@@ -1289,10 +1289,9 @@ def mla_ragged_paged_attention(
             swa_m,
         )
 
-    def run_case(**kwargs):
+    def run_case(q, **kwargs):
         """Runs one case, which writes its rows over `q` in place."""
-        nonlocal q
-        q = run_mla_kernel(
+        return run_mla_kernel(
             q,
             cache_kv,
             kv_lens,
@@ -1317,7 +1316,8 @@ def mla_ragged_paged_attention(
     else:
         batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
         # Batched decode
-        run_case(
+        q = run_case(
+            q,
             num_kv_pages_per_block=num_kv_pages_per_blocks[0],
             num_queries_per_block=num_queries_per_blocks[0],
             start_seq_idx=jnp.array(0),
@@ -1328,7 +1328,8 @@ def mla_ragged_paged_attention(
         )
 
         # Decode-only
-        run_case(
+        q = run_case(
+            q,
             num_kv_pages_per_block=num_kv_pages_per_blocks[0],
             num_queries_per_block=num_queries_per_blocks[0],
             start_seq_idx=batch_distribution,
@@ -1338,28 +1339,37 @@ def mla_ragged_paged_attention(
             case=MlaCase.DECODE,
         )
 
-    if chunk_prefill_size is not None:
-        # Handle prefill where the query length is fixed per sequence.
-        run_case(
-            num_kv_pages_per_block=num_kv_pages_per_blocks[1],
-            num_queries_per_block=num_queries_per_blocks[1],
-            start_seq_idx=distribution[0],
-            end_seq_idx=distribution[1],
-            static_q_len=chunk_prefill_size,
+    def run_non_decode(q):
+        if chunk_prefill_size is not None:
+            # Handle prefill where the query length is fixed per sequence.
+            q = run_case(
+                q,
+                num_kv_pages_per_block=num_kv_pages_per_blocks[1],
+                num_queries_per_block=num_queries_per_blocks[1],
+                start_seq_idx=distribution[0],
+                end_seq_idx=distribution[1],
+                static_q_len=chunk_prefill_size,
+                batch_size=1,
+                case=MlaCase.PREFILL,
+            )
+
+        # Handle mixed case where the query length per sequence is variable.
+        return run_case(
+            q,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+            num_queries_per_block=num_queries_per_blocks[2],
+            start_seq_idx=distribution[1],
+            end_seq_idx=distribution[2],
+            static_q_len=None,
             batch_size=1,
-            case=MlaCase.PREFILL,
+            case=MlaCase.MIXED,
         )
 
-    # Handle mixed case where the query length per sequence is variable.
-    run_case(
-        num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-        num_queries_per_block=num_queries_per_blocks[2],
-        start_seq_idx=distribution[1],
-        end_seq_idx=distribution[2],
-        static_q_len=None,
-        batch_size=1,
-        case=MlaCase.MIXED,
-    )
+    if decode_in_swa_kernel:
+        # Skip the prefill and mixed launches in decode-only steps.
+        q = lax.cond(distribution[2] > distribution[0], run_non_decode, lambda q: q, q)
+    else:
+        q = run_non_decode(q)
     output = prepare_outputs(
         q, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
