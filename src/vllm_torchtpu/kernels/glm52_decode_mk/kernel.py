@@ -91,7 +91,7 @@ FAULTS = (
         "f_a2a_early",  # L4 C2: an A2A chunk is sent one request before its rows are emitted
         "f_qag_pair_drop",  # stage-B L2-Q: qag="pair" forwards one same-parity block too few
         "f_leaf_shift",
-        "f_lv_short",  # LV: AR#1 moves one row block too few (the last live block's rows lose the peers' partials)
+        "f_lv_short",  # LV: AR#1 moves one 4-row block too few (that block's rows lose the peers' partials)
     )
 )  # L3: the expert-operand leaf / index is one MoE layer off -> RED
 # WHITEBOARD.v1's F-ALIAS-EARLY is not built (needs a hook between a
@@ -972,9 +972,9 @@ def build(
             buf[...] = jnp.where(row_m < T_eff, bf(partial_f32), 0.0).astype(BF16)
             if "coll" not in skip and LV_A and LV:
                 with sc(f"X_ar{which}"):
-                    short = (
-                        (fault == "f_lv_short" and which == 1)
-                    )  # FAULT: AR#1 moves the last 4-row block of the live rows too few
+                    # FAULT f_lv_short: AR#1 moves one 4-row block too few (n - 4 rows; when that is not a compiled
+                    # option -- n = 4, or the bucket floor -- no option fires and AR#1 moves nothing, rank-uniformly)
+                    short = fault == "f_lv_short" and which == 1
                     CO.all_reduce_lv(
                         R,
                         me,
@@ -982,7 +982,7 @@ def build(
                         M,
                         H,
                         ar_set(which),
-                        jnp.where(n_ar > 4, n_ar - 4, n_ar) if short else n_ar,
+                        n_ar - 4 if short else n_ar,
                         AR_OPTS,
                         drop_last=drop_last,
                         mids=mids,
