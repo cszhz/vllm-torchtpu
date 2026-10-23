@@ -33,7 +33,9 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-MAX_M = 32
+MAX_M = 128
+# Rows above this use the *_LARGE_M tables (decode with several requests x 7 tokens).
+SMALL_M = 32
 LANE = 128
 FP8_SUBLANE_TILE = 32  # rows per fp8 (32, 128) HBM tile
 
@@ -44,17 +46,45 @@ Config = tuple[str, int, int, int]  # (split, tile, nbuf, ndma)
 # left to XLA's memory-space assignment; `TUNED_HBM`: constrained to HBM (`hbm_pin`).
 TUNED: dict[tuple[int, int], Config] = {
     (7168, 2048): ("k", 1792, 4, 1),  # attn.fused_wqa_wkv
-    (1536, 8192): ("k", 256, 2, 1),  # attn.wq_b
-    (2048, 7168): ("k", 512, 2, 1),  # attn.wo_b
-    (7168, 768): ("k", 3584, 2, 1),  # shared_experts.gate_up_proj
+    (1536, 8192): ("k", 256, 2, 1),  # attn.wq_b, attn.indexer.wq_b (TP8)
+    (2048, 7168): ("k", 512, 2, 1),  # attn.wo_b (TP8)
+    (7168, 768): ("k", 3584, 2, 1),  # shared_experts.gate_up_proj (TP8)
+    # TP4 (c16) per-rank shapes: not tuned unpinned; same as TUNED_HBM.
+    (1536, 16384): ("k", 128, 8, 4),  # attn.wq_b (TP4)
+    (4096, 7168): ("k", 128, 8, 1),  # attn.wo_b (TP4)
+    (7168, 1536): ("k", 512, 8, 4),  # shared_experts.gate_up_proj (TP4)
 }
+# HBM-pinned: fastest config per shape on tpu7x, one core, chain of 8 distinct
+# weights, M = 8/16 (fp8-linears close-gaps sweep, j-325ac3c7). Within ~1% of each
+# other across the top configs; all stream at the same rate.
 TUNED_HBM: dict[tuple[int, int], Config] = {
-    (7168, 2048): ("k", 512, 8, 4),
-    (1536, 8192): ("k", 128, 6, 4),
-    (2048, 7168): ("k", 128, 8, 1),
-    (7168, 768): ("k", 1792, 4, 1),
+    (7168, 2048): ("k", 512, 6, 1),
+    (1536, 8192): ("k", 128, 6, 2),
+    (2048, 7168): ("k", 256, 4, 2),
+    (7168, 768): ("k", 1024, 6, 1),
+    (1536, 16384): ("k", 128, 8, 4),
+    (4096, 7168): ("k", 128, 8, 1),
+    (7168, 1536): ("k", 512, 8, 4),
 }
-assert TUNED.keys() == TUNED_HBM.keys()
+# HBM-pinned, 32 < M <= 128 (sweep j-b29381de / j-af7fb5fa, M = 64 / 128). At these
+# rows the per-tile dot is no longer free and the n-split wins on some shapes.
+TUNED_HBM_LARGE_M: dict[tuple[int, int], Config] = {
+    (7168, 2048): ("k", 512, 6, 2),
+    (1536, 8192): ("n", 1024, 6, 1),
+    (2048, 7168): ("n", 1024, 6, 2),
+    (7168, 768): ("k", 1792, 4, 2),
+    (1536, 16384): ("n", 1024, 4, 2),
+    (4096, 7168): ("n", 512, 4, 1),
+    (7168, 1536): ("k", 512, 8, 2),
+}
+assert TUNED.keys() == TUNED_HBM.keys() == TUNED_HBM_LARGE_M.keys()
+
+
+def pick_config(m: int, k: int, n: int, hbm_pin: bool) -> Config:
+    if m > SMALL_M:
+        # Only measured HBM-pinned; the unpinned path uses the same tiling.
+        return TUNED_HBM_LARGE_M[(k, n)]
+    return (TUNED_HBM if hbm_pin else TUNED)[(k, n)]
 
 
 def supports(m: int, w_q: jax.Array, w_s: jax.Array) -> bool:
@@ -234,7 +264,7 @@ def fp8_skinny_matmul(
     m, k = x.shape
     n = w_q.shape[1]
     if config is None:
-        config = (TUNED_HBM if hbm_pin else TUNED)[(k, n)]
+        config = pick_config(m, k, n, hbm_pin)
     split, t, nbuf, ndma = config
     call = _build(m, k, n, w_q.dtype, x.dtype, split, t, nbuf, ndma)
     w_s2 = w_s.reshape(1, n).astype(jnp.float32)

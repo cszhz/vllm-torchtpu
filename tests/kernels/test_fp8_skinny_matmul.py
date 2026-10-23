@@ -70,7 +70,7 @@ def _run(x, wq, ws, **kw):
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("k,n", SHAPES)
 @pytest.mark.parametrize("hbm_pin", [False, True])
-@pytest.mark.parametrize("m,real", [(8, 7), (16, 14), (32, 32)])
+@pytest.mark.parametrize("m,real", [(8, 7), (16, 14), (32, 32), (64, 56), (128, 112)])
 def test_matches_f64_of_quantized_operands(k, n, hbm_pin, m, real):
     x = _x(m, k, real)
     wq, ws = _w(k, n)
