@@ -344,6 +344,15 @@ AGQ_MIN_EP = 16
 # trip is latency-bound. Larger buckets keep the program they had.
 SMALL_BATCH_LOCAL_TOKENS = 16
 
+# Where the two Pallas collectives beat XLA's, in local tokens. Measured on
+# DeepSeek-V4-Pro's EP16 shape (2x2x2 tpu7x, fp4, TP8 and TP4 token groups,
+# us per layer vs XLA, two jobs each, j-ed3611e0 / j-0c19cf21):
+#   pallas_restore  t_local 1/2/4: -3.3/-3.8/-1.8..-0  8: +1.6..+3.5  16: +5.0
+#   oneshot_gather  t_local 1: +7.8  2: -4.3  4: -1.3/-1.6  8: +1.9  16: +15.4
+# Outside these ranges the XLA collective is kept.
+PALLAS_RESTORE_MAX_LOCAL_TOKENS = 4
+ONESHOT_GATHER_LOCAL_TOKENS = (2, 4)
+
 # Per-config cache of the shard_map'd MoE callable; a fresh shard_map
 # body would re-trace the whole kernel for every hidden layer.
 _LAYER_SM_CACHE = {}
@@ -664,10 +673,20 @@ def fused_ep_moe_v2(
     )
     onehot_scatter = bool(onehot_scatter) and small_batch
     decode_combine = bool(decode_combine) and small_batch
-    pallas_restore = bool(pallas_restore) and small_batch
+    pallas_restore = (
+        bool(pallas_restore)
+        and small_batch
+        and t_local <= PALLAS_RESTORE_MAX_LOCAL_TOKENS
+    )
     fused_select = bool(fused_select) and small_batch
     lane_quant = bool(lane_quant) and small_batch and form.quantized_activations
-    oneshot_gather = bool(oneshot_gather) and merge_exchange
+    oneshot_gather = (
+        bool(oneshot_gather)
+        and merge_exchange
+        and ONESHOT_GATHER_LOCAL_TOKENS[0]
+        <= t_local
+        <= ONESHOT_GATHER_LOCAL_TOKENS[1]
+    )
     pallas_plan = (
         bool(pallas_plan)
         and small_batch
