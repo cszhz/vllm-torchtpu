@@ -201,6 +201,7 @@ def _build_op(
     shared_in_op=False,
     shared_out_scale=1.0,
     shared_rs_min_rows=0,
+    shared_small_ar_max_rows=0,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -238,6 +239,7 @@ def _build_op(
         shared_in_op,
         shared_out_scale,
         shared_rs_min_rows,
+        shared_small_ar_max_rows,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -266,6 +268,7 @@ def _build_op(
             shared_in_op=True,
             shared_out_scale=shared_out_scale,
             shared_rs_min_rows=shared_rs_min_rows,
+            shared_small_ar_max_rows=shared_small_ar_max_rows,
         )
         if shared_in_op
         else {}
@@ -1098,6 +1101,11 @@ def prebuild_fused_moe_ep(
         shared_in_op=shared_in_op,
         shared_out_scale=shared_out_scale,
         shared_rs_min_rows=envs.MOE_FUSED_EP_SHARED_RS_MIN_ROWS,
+        # Below the reduce-scatter threshold the in-op shared all-reduce takes
+        # the small all-reduce kernel where the runner's would have.
+        shared_small_ar_max_rows=(
+            _small_ar_max_rows() if shared_in_op and envs.TPU_SMALL_ALL_REDUCE else 0
+        ),
     )
     if shared_in_op:
         object.__setattr__(layer, SHARED_IN_OP_ATTR, True)
@@ -1218,6 +1226,12 @@ def fused_moe_ep_unsupported_reason(
     ):
         return "expert biases are not wired through the fused EP op"
     return _unsupported_routing_reason(layer, supplies_hash_ids=supplies_hash_ids)
+
+
+def _small_ar_max_rows() -> int:
+    from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+    return small_all_reduce_op.max_rows()
 
 
 def _routing_config(layer) -> tuple[str, bool, float]:

@@ -69,6 +69,12 @@ from vllm_torchtpu.kernels.fused_moe.v2.router_ops import (
     pallas_select,
     pallas_select_routed,
 )
+from vllm_torchtpu.kernels.experimental.small_collectives.all_reduce import (
+    small_all_reduce,
+)
+from vllm_torchtpu.kernels.experimental.small_collectives.all_reduce import (
+    supports as small_all_reduce_supports,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
     TokenReplicaLayout,
     replica_wire_rows,
@@ -405,6 +411,7 @@ def fused_ep_moe_v2(
     shared_in_op=False,
     shared_out_scale=1.0,
     shared_rs_min_rows=0,
+    shared_small_ar_max_rows=0,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -1092,9 +1099,9 @@ def fused_ep_moe_v2(
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         if shared_l is None:
             return token_layout.restore(combined, ax)
-        return _add_shared(combined, shared_l)
+        return _add_shared(combined, shared_l, me)
 
-    def _add_shared(combined, shared_l, restore=None):
+    def _add_shared(combined, shared_l, me, restore=None):
         """shared (reduced over the replica group) + scale * routed, restored.
 
         restore: the replica restore to apply (default token_layout.restore);
@@ -1123,7 +1130,22 @@ def fused_ep_moe_v2(
             )
             return restore(shared_own + combined)
         full = restore(combined)
-        if width > 1:
+        if width > 1 and token_layout.input_rows <= shared_small_ar_max_rows and (
+            small_all_reduce_supports(token_layout.input_rows, hidden, width)
+        ):
+            # TPU_SMALL_ALL_REDUCE's Pallas two-shot kernel over this core's
+            # replica group (position and peers as data), as the runner's own
+            # shared all-reduce would take at decode buckets.
+            by_rank = [None] * ep
+            for g in token_layout.groups:
+                for d in g:
+                    by_rank[d] = g
+            peers = jnp.asarray(by_rank, jnp.int32)[me]
+            pos = jnp.asarray(token_layout.slots, jnp.int32)[me].reshape(1)
+            shared_l = small_all_reduce(
+                shared_l, num_cores=width, axis=ax, rank=pos, peers=peers
+            )
+        elif width > 1:
             shared_l = lax.psum(shared_l, ax, axis_index_groups=groups)
         return shared_l + full
 
@@ -1555,6 +1577,7 @@ def fused_ep_moe_v2(
             return _add_shared(
                 combined,
                 order_after_l,
+                me,
                 lambda rows: token_layout.restore(
                     rows, ax, me=me if pallas_restore else None
                 ),
@@ -1707,6 +1730,7 @@ def fused_ep_moe_v2(
         bool(shared_in_op),
         float(shared_out_scale),
         int(shared_rs_min_rows),
+        int(shared_small_ar_max_rows),
     )
     body, out_specs = {
         "fused": (decode_fn if decode_glue else local_fn, P(ax)),

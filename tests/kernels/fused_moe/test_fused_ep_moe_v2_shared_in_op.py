@@ -33,7 +33,7 @@ from vllm_torchtpu.kernels.fused_moe.v2 import AXIS, WeightFormat, fused_ep_moe_
 
 pytestmark = pytest.mark.multichip
 
-HIDDEN = 512
+HIDDEN = 1024  # a multiple of 8 cores x 128 lanes, so the small all-reduce kernel applies
 _TP8 = ((0, 1, 4, 5, 6, 7, 2, 3),)
 _TP4_PERMUTED = ((7, 1, 4, 2), (6, 0, 5, 3))
 
@@ -172,6 +172,23 @@ def test_single_host_shared_in_op(mesh, groups, rows, scale):
     for g in groups:
         for m in g[1:]:
             np.testing.assert_array_equal(got_rs[m], got_rs[g[0]])
+
+    # Small all-reduce kernel path (TPU_SMALL_ALL_REDUCE at decode buckets):
+    # f32 sum in group order, rounded once -- tolerance, identical per group.
+    got_sar = _by_rank(
+        _layer(mesh, rank, inputs, groups, shared, shared_in_op=True,
+               shared_out_scale=scale, shared_rs_min_rows=rows + 1,
+               shared_small_ar_max_rows=rows),
+        rows,
+    )
+    for r in want:
+        norm = max(np.linalg.norm(exact[r]), 1e-20)
+        err_sar = float(np.linalg.norm(got_sar[r] - exact[r]) / norm)
+        err_ar = float(np.linalg.norm(want[r] - exact[r]) / norm)
+        assert err_sar < max(2.5 * err_ar, 2.0**-9), (r, err_sar, err_ar)
+    for g in groups:
+        for m in g[1:]:
+            np.testing.assert_array_equal(got_sar[m], got_sar[g[0]])
 
     # Fault injection: dropping the shared term must be caught by the oracle.
     assert any(
