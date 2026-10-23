@@ -71,6 +71,31 @@ def topk_rows_ref_impl(topk, page_indices, cu_q_lens, page_size, total_pages):
     return (page_ids * page_size + offsets).reshape(-1), seq_ids
 
 
+def assert_valid_prefix_equal(ref, out, topk):
+    """`csa_gather_topk` outputs agree on every token's first `kv_len`
+    entries, `kv_len` being its count of entries other than -1; the kernel
+    may leave the rest unwritten."""
+    num_tokens, top_k = topk.shape
+    kv_lens = np.asarray((topk != -1).sum(axis=1))[:, None]
+    entry = np.arange(top_k)[None, :]
+    nope_valid = (entry < kv_lens).reshape(-1)
+    np.testing.assert_array_equal(
+        np.asarray(ref[0])[nope_valid], np.asarray(out[0])[nope_valid]
+    )
+    # int32 rope row j of a token holds entries 2j (low bf16) and 2j + 1
+    # (high bf16) in lanes 0:64, and the same entries + top_k // 2 in 64:128.
+    shape = (num_tokens, top_k // 4, 2, 64)
+    j = np.arange(top_k // 4)[None, :, None, None]
+    half = np.arange(2)[None, None, :, None]
+    first = half * (top_k // 2) + 2 * j
+    kv = kv_lens[:, :, None, None]
+    for shift, e in ((0, first), (16, first + 1)):
+        valid = np.broadcast_to(e < kv, shape)
+        ref_bits = (np.asarray(ref[1]).view(np.uint32).reshape(shape) >> shift) & 0xFFFF
+        out_bits = (np.asarray(out[1]).view(np.uint32).reshape(shape) >> shift) & 0xFFFF
+        np.testing.assert_array_equal(ref_bits[valid], out_bits[valid])
+
+
 def _random_words(key, shape):
     bits = jax.random.bits(key, shape, dtype=jnp.uint32)
     return lax.bitcast_convert_type(bits, jnp.int32)
@@ -184,11 +209,10 @@ class GatherTest(parameterized.TestCase):
                 top_k=top_k,
                 pages_per_seq=pages_per_seq,
             )
-            nope_ref, rope_ref = gather_ref_impl(
+            ref = gather_ref_impl(
                 nope_cache, rope_cache, rows[start * top_k : (start + n) * top_k], top_k
             )
-            np.testing.assert_array_equal(nope_ref, nope_sc)
-            np.testing.assert_array_equal(rope_ref, rope_sc)
+            assert_valid_prefix_equal(ref, (nope_sc, rope_sc), topk[start : start + n])
 
 
 if __name__ == "__main__":

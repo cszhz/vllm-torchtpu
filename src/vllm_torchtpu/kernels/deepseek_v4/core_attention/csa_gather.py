@@ -97,6 +97,30 @@ def _lookup_rows(
         idx_ref[pl.ds(k, num_lanes)] = jnp.where(x == -1, pad_row, row)
 
 
+def _valid_steps(topk_ref, *, top_k, num_lanes, step_entries):
+    """Gather steps of `step_entries` covering the token's first `kv_len`
+    top-k entries, `kv_len` being its count of entries other than -1: the
+    attention kernel's `kv_lens`, which masks every row past it with a select.
+    """
+
+    @plsc.parallel_loop(
+        0,
+        top_k // num_lanes,
+        unroll=LOOKUP_UNROLL,
+        carry=jnp.zeros((num_lanes,), jnp.int32),
+    )
+    def counts(v, acc):
+        k = v * num_lanes
+        segment_words = csa_cache_layout.ROW_WORDS
+        x = topk_ref[0, k // segment_words, 0, pl.ds(k % segment_words, num_lanes)]
+        return acc + (x != -1).astype(jnp.int32)
+
+    # Lane by lane: the cross-lane scan a `jnp.sum` lowers to does not pass
+    # the kernel's layout passes.
+    kv_len = sum(counts[i] for i in range(num_lanes))
+    return pl.cdiv(kv_len, step_entries)
+
+
 def _topk_row_spec(lookup, top_k, num_cores, core_index):
     """Block `b` of subcore `core_index`: its token's top-k row, as
     `top_k // 128` segments of 128 entries. A subcore past the chunk's end
@@ -252,7 +276,7 @@ def main_kernel(
 
             if lookup is not None and num_steps > LOOKUP_STEPS_AHEAD:
 
-                @pl.when(r + LOOKUP_STEPS_AHEAD < num_steps)
+                @pl.when(r + LOOKUP_STEPS_AHEAD < gather_steps)
                 def _():
                     lookup_step_rows(r + LOOKUP_STEPS_AHEAD, 1)
 
@@ -304,8 +328,14 @@ def main_kernel(
         )
         core_start_idx = out_row_base * row_subchunk_size
         run = core_start_idx < valid_indices
+        gather_steps = num_steps
         if lookup is not None:
             run &= b * num_cores + core_index < lookup.num_tokens
+            # The rows past the token's last step are left unwritten.
+            gather_steps = _valid_steps(
+                in_ref, top_k=top_k, num_lanes=num_simd_lanes, step_entries=step_entries
+            )
+            run &= gather_steps > 0
 
         @pl.when(run)
         def _run_gather():
@@ -313,7 +343,7 @@ def main_kernel(
                 lookup_step_rows(0, min(LOOKUP_STEPS_AHEAD, num_steps))
             pltpu.emit_pipeline(
                 _body,
-                grid=(num_steps,),
+                grid=(gather_steps,),
                 in_specs=nope_in_specs + rope_in_specs,
                 out_specs=(rope_out_spec,),
             )(
@@ -447,6 +477,8 @@ def csa_gather_topk(
 
     Returns:
       `csa_gather`'s outputs for the chunk's `num_tokens * top_k` entries.
+      Only a token's first `kv_len` entries are defined, `kv_len` being its
+      count of entries other than -1 (see `_valid_steps`).
     """
     num_all_tokens = topk_indices.shape[0]
     assert topk_indices.shape[1] == top_k and topk_indices.dtype == jnp.int32
