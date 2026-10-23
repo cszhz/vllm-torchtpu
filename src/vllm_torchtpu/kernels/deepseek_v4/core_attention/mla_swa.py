@@ -160,6 +160,10 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     q_compute_block_size: int | None,
     bkv_p,
     bq_sz,
+    # With `hca`, fold each sequence's HCA kv (one block of `hca_bkv_p` pages)
+    # into every bq block's SWA state and write the normalized output; no l/m.
+    hca: "HcaDecodeRefs | None" = None,
+    hca_bkv_p: int = 0,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert sliding_window > 0
@@ -201,6 +205,23 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     q_end = cu_q_lens_ref[seq_idx + 1]
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
+
+    if hca is not None:
+        assert unnormalized_output
+        hca_total_pages, hca_slots_per_page, *hca_slot_shape = hca.cache_hbm_ref.shape
+        assert tuple(hca_slot_shape) == (kv_packing, lkv_dim)
+        hca_page_size = hca_slots_per_page // slots_per_token
+        hca_bkv_sz = hca_bkv_p * hca_page_size
+        hca_pages_per_seq = hca.page_indices_ref.shape[0] // max_num_seqs
+        assert hca_pages_per_seq <= hca_bkv_p, "HCA kv must fit one block"
+        hca_kv_len_cap = hca_pages_per_seq * hca_page_size
+        reshaped_hca_cache_hbm_ref = hca.cache_hbm_ref.reshape(
+            hca_total_pages * hca_page_size,
+            slots_per_token * kv_packing,
+            lkv_dim,
+        )
+        # One grid step per sequence; sequence i's HCA kv sits in slot i % 2.
+        hca_slot = pl.program_id(0) % 2
 
     def flash_attention(
         q,  # [bq_sz * num_q_heads, head_dim]
@@ -578,8 +599,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         bo_ids_ref[bo_sem_idx] = seq_idx
         bo_ids_ref[bo_sem_idx + 2] = bo_idx
         _send_bo(seq_idx, bo_idx, bo_sem_idx)
-        _send_l(seq_idx, bo_idx, bo_sem_idx)
-        _send_m(seq_idx, bo_idx, bo_sem_idx)
+        if hca is None:
+            _send_l(seq_idx, bo_idx, bo_sem_idx)
+            _send_m(seq_idx, bo_idx, bo_sem_idx)
 
     def wait_send_bo(bo_sem_idx):
         old_seq_idx = bo_ids_ref[bo_sem_idx]
@@ -588,8 +610,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         @pl.when(jnp.logical_and(old_seq_idx >= 0, old_seq_idx <= seq_idx))
         def _():
             _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
-            _send_l(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
-            _send_m(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
+            if hca is None:
+                _send_l(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
+                _send_m(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
 
     def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, vmem_start):
         bkv_update_ids_ref[bkv_sem_idx] = seq_idx
@@ -622,6 +645,69 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         # reconstruction is a plain bitcast + reshape.
         bkv = pltpu.bitcast(bkv_u8, jnp.bfloat16).reshape(bkv_sz, head_dim)
         return bkv
+
+    def _fetch_hca_bkv(seq_idx, slot, *, wait=False):
+        kv_len = hca.kv_lens_ref[seq_idx]
+        sem = hca.sems.at[slot]
+        bkv_ref = hca.bkv_x2_vmem.at[slot]
+        if wait:
+            # One wait for all page copies: the semaphore counts bytes.
+            sz = jnp.clip(kv_len, 0, hca_kv_len_cap)
+            _async_copy(bkv_ref.at[pl.ds(0, sz)], bkv_ref.at[pl.ds(0, sz)], sem, True)
+            return
+        for i in range(hca_pages_per_seq):
+            sz = jnp.clip(kv_len - i * hca_page_size, 0, hca_page_size)
+            page_idx = hca.page_indices_ref[seq_idx * hca_pages_per_seq + i]
+            _async_copy(
+                reshaped_hca_cache_hbm_ref.at[pl.ds(page_idx * hca_page_size, sz)],
+                bkv_ref.at[pl.ds(i * hca_page_size, sz)],
+                sem,
+                False,
+            )
+
+    def fold_hca(bq_idx, bq_sem_idx, acc):
+        """One flash-attention step over the HCA block from the SWA state,
+        then the sinks; the same ops as `mla._mla_ragged_paged_attention_kernel`
+        runs on the state this kernel would hand it through HBM."""
+        num_tokens = hca.kv_lens_to_attend_ref.shape[0]
+        tokens_attend = jnp.stack(
+            [
+                hca.kv_lens_to_attend_ref[
+                    jnp.minimum(q_start + bq_idx * bq_sz + i, num_tokens - 1)
+                ]
+                for i in range(bq_sz)
+            ]
+        )
+        kv_lens_to_attend = jnp.broadcast_to(
+            tokens_attend[:, None, None], (bq_sz, num_q_heads, hca_bkv_sz)
+        ).reshape(1, bq_sz * num_q_heads, hca_bkv_sz)
+        kv = pltpu.bitcast(hca.bkv_x2_vmem[hca_slot], jnp.bfloat16).reshape(
+            1, hca_bkv_sz, head_dim
+        )
+        q = load_bq(bq_sem_idx)[None]
+
+        # The HBM handoff stores the SWA accumulator in q_dtype.
+        acc = acc.astype(q_dtype).astype(jnp.float32)[None]
+        m_prev = m_ref[...][None]
+        l_prev = l_ref[...][None]
+
+        s = jnp.einsum("bnd,bmd->bnm", q, kv, preferred_element_type=jnp.float32)
+        s *= sm_scale
+        k_span = lax.broadcasted_iota(jnp.int32, s.shape, 2)
+        s = jnp.where(kv_lens_to_attend <= k_span, jnp.finfo(s.dtype).min, s)
+        m_curr = jnp.maximum(m_prev, jnp.max(s, axis=2))
+        p = jnp.exp(s - m_curr[:, :, None])
+        pv = jnp.einsum("bnm,bmd->bnd", p, kv, preferred_element_type=jnp.float32)
+        exp_m_diff = jnp.exp(m_prev - m_curr)
+        l_curr = exp_m_diff * l_prev + jnp.sum(p, axis=2)
+        acc = exp_m_diff[:, :, None] * acc + pv
+
+        attention_sinks = jnp.concat([attention_sinks_ref[...] for _ in range(bq_sz)])
+        exp_attention_sinks = jnp.exp(attention_sinks[None, :] - m_curr)
+        l_sum = (l_curr + exp_attention_sinks)[:, :, None]
+        if q_dtype == jnp.float32:
+            return lax.div(acc, l_sum)
+        return (acc * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
 
     def process():
         if static_q_len is None:
@@ -768,7 +854,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             # Load acc and calculate final output.
             acc = acc_ref[...]
 
-            if unnormalized_output:
+            if hca is not None:
+                out = fold_hca(bq_idx, bq_sem_idx, acc)
+            elif unnormalized_output:
                 out = acc.astype(q_dtype)
             else:
                 attention_sinks = jnp.concat(
@@ -789,7 +877,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
 
             # Store output from acc to bo.
             bo_x2_ref.at[bo_sem_idx][...] = out.reshape(bq_sz, num_q_heads, head_dim)
-            if num_q_heads % 128 == 0:
+            if hca is not None:
+                pass  # The output is final; there is no l/m to hand on.
+            elif num_q_heads % 128 == 0:
                 bl_x2_ref.at[bo_sem_idx][...] = l_ref[...].reshape(bq_sz, num_q_heads)
                 bm_x2_ref.at[bo_sem_idx][...] = m_ref[...].reshape(bq_sz, num_q_heads)
             else:
@@ -819,6 +909,19 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         # bq_idx=0, relative bkv_idx=0 (page-aligned base via _start_offset).
         start_fetch_bkv(start_seq_idx, 0, 0, _start_offset(start_seq_idx, 0))
         bkv_x2_ref[1] = bkv_zeros
+
+        if hca is not None:
+            # Masked HCA slots are multiplied by p == 0; stale VMEM may be NaN.
+            hca.bkv_x2_vmem[...] = jnp.zeros(hca.bkv_x2_vmem.shape, jnp.uint8)
+            _fetch_hca_bkv(start_seq_idx, 0)
+
+    if hca is not None:
+
+        @pl.when(seq_idx + 1 < end_seq_idx)
+        def prefetch_next_hca_bkv():
+            _fetch_hca_bkv(seq_idx + 1, 1 - hca_slot)
+
+        _fetch_hca_bkv(seq_idx, hca_slot, wait=True)
 
     process()
 
@@ -911,8 +1014,8 @@ def get_physical_layout(
 
 
 class HcaDecodeInputs(NamedTuple):
-    """The HCA pass `run_mla_batched_decode_kernel` fuses, as
-    `mla.mla_ragged_paged_attention` would run it on the decode sequences."""
+    """The HCA pass the SWA kernels fuse, as `mla.mla_ragged_paged_attention`
+    would run it on the same sequences."""
 
     # [total_num_pages, page_size * slots_per_token, kv_packing, lkv_dim] uint8
     cache_kv: jax.Array
@@ -924,16 +1027,70 @@ class HcaDecodeInputs(NamedTuple):
 
 
 class HcaDecodeRefs(NamedTuple):
-    """The HCA compressed-KV block the batched decode kernel folds in."""
+    """The HCA compressed-KV block the SWA kernels fold in."""
 
     kv_lens_ref: Any  # [max_num_seqs]
     kv_lens_to_attend_ref: Any  # [max_num_tokens]
     page_indices_ref: Any  # [max_num_seqs * pages_per_seq]
     # [total_num_pages, page_size * slots_per_token, kv_packing, lkv_dim] uint8
     cache_hbm_ref: Any
-    # [2, seq_batch_sz, bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8
+    # [2, (seq_batch_sz,) bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8;
+    # the batched decode kernel holds one block per sequence of its batch.
     bkv_x2_vmem: Any
-    sems: Any  # [2, seq_batch_sz]
+    sems: Any  # [2, (seq_batch_sz,)]
+
+
+def _mla_sliding_window_hca_kernel(
+    kv_lens_ref,
+    page_indices_ref,
+    cu_q_lens_ref,
+    start_end_seq_idx_ref,
+    sem_ids_ref,
+    bo_ids_ref,
+    bkv_update_ids_ref,
+    hca_kv_lens_ref,
+    hca_kv_lens_to_attend_ref,
+    hca_page_indices_ref,
+    attention_sinks_ref,
+    q_hbm_ref,
+    new_kv_hbm_ref,
+    cache_kv_hbm_ref,
+    in_l_hbm_ref,
+    in_m_hbm_ref,
+    hca_cache_hbm_ref,
+    *outputs_and_scratch,
+    **kwargs,
+):
+    """`_mla_sliding_window_ragged_paged_attention_kernel` with the HCA
+    operands of `HcaDecodeRefs`. q is aliased with the output: each bq block's
+    q rows are fetched before its output rows are written over them."""
+    *refs, hca_bkv_x2_vmem, hca_sems = outputs_and_scratch
+    _mla_sliding_window_ragged_paged_attention_kernel(
+        kv_lens_ref,
+        page_indices_ref,
+        cu_q_lens_ref,
+        start_end_seq_idx_ref,
+        sem_ids_ref,
+        bo_ids_ref,
+        bkv_update_ids_ref,
+        attention_sinks_ref,
+        q_hbm_ref,
+        new_kv_hbm_ref,
+        cache_kv_hbm_ref,
+        None,  # in_output: q is the aliased buffer.
+        in_l_hbm_ref,
+        in_m_hbm_ref,
+        *refs,
+        hca=HcaDecodeRefs(
+            hca_kv_lens_ref,
+            hca_kv_lens_to_attend_ref,
+            hca_page_indices_ref,
+            hca_cache_hbm_ref,
+            hca_bkv_x2_vmem,
+            hca_sems,
+        ),
+        **kwargs,
+    )
 
 
 def _mla_batched_decode_hca_kernel(
@@ -1827,7 +1984,9 @@ def mla_sliding_window_ragged_paged_attention(
         cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
         start_seq_idx: jax.Array,  # i32
         end_seq_idx: jax.Array,  # i32
-        in_output: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
+        # [max_num_tokens, actual_num_q_heads, head_dim]; None with `hca`,
+        # which writes the output over q.
+        in_output: jax.Array | None,
         in_l: jax.Array,  # [max_num_tokens, num_l_heads]
         in_m: jax.Array,  # [max_num_tokens, num_l_heads]
         attention_sinks: jax.Array,  # float32[num_q_heads]
@@ -1836,7 +1995,9 @@ def mla_sliding_window_ragged_paged_attention(
         num_kv_pages_per_block: int,
         num_queries_per_block: int,
         case: MlaCase = MlaCase.MIXED,
+        hca: HcaDecodeInputs | None = None,
     ):
+        assert (in_output is None) == (hca is not None)
         bkv_p = num_kv_pages_per_block
         if static_q_len is not None:
             bq_sz = min(num_queries_per_block, static_q_len)
@@ -1845,15 +2006,13 @@ def mla_sliding_window_ragged_paged_attention(
         bkv_sz = bkv_p * logical_page_size
         grid = (end_seq_idx - start_seq_idx,)
 
-        in_specs = [
-            pl.BlockSpec(memory_space=pltpu.VMEM),  # attention_sinks
-            pl.BlockSpec(memory_space=pltpu.HBM),  # q
-            pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv
-            pl.BlockSpec(memory_space=pltpu.HBM),  # in_output
-            pl.BlockSpec(memory_space=pltpu.HBM),  # in_l
-            pl.BlockSpec(memory_space=pltpu.HBM),  # in_m
-        ]
+        operands = (attention_sinks, q, new_kv, cache_kv)
+        if in_output is not None:
+            operands += (in_output,)
+        operands += (in_l, in_m)
+        # attention_sinks in VMEM, the rest in HBM.
+        in_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)]
+        in_specs += [pl.BlockSpec(memory_space=pltpu.HBM) for _ in operands[1:]]
 
         out_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # o
@@ -1924,10 +2083,40 @@ def mla_sliding_window_ragged_paged_attention(
             f"SWA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}"
             f"{'-ncb' if non_causal_block else ''}"
         )
+        kernel_fn = _mla_sliding_window_ragged_paged_attention_kernel
+        hca_kwargs = {}
+        hca_operands = ()
+        if hca is not None:
+            scalar_prefetches += (hca.kv_lens, hca.kv_lens_to_attend, hca.page_indices)
+            hca_page_size = hca.cache_kv.shape[1] // slots_per_token
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # hca cache_kv
+            hca_operands = (hca.cache_kv,)
+            scratch_shapes += [
+                pltpu.VMEM(
+                    (
+                        2,
+                        hca.num_kv_pages_per_block * hca_page_size,
+                        slots_per_token * kv_packing,
+                        lkv_dim,
+                    ),
+                    jnp.uint8,
+                ),
+                pltpu.SemaphoreType.DMA((2,)),
+            ]
+            kernel_fn = _mla_sliding_window_hca_kernel
+            hca_kwargs = {"hca_bkv_p": hca.num_kv_pages_per_block}
+            scope_name += f"-hca_bkvp_{hca.num_kv_pages_per_block}"
+        base = len(scalar_prefetches)
+        input_output_aliases = {
+            base + (1 if in_output is None else 4): 0,  # q or in_output with out
+            base + 3: 1,  # Alias cache_kv with updated_cache_kv
+            base + len(operands) - 2: 2,  # Alias in_l with out_l
+            base + len(operands) - 1: 3,  # Alias in_m with out_m
+        }
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(
-                    _mla_sliding_window_ragged_paged_attention_kernel,
+                    kernel_fn,
                     sm_scale=sm_scale,
                     sliding_window=sliding_window,
                     static_q_len=static_q_len,
@@ -1937,6 +2126,7 @@ def mla_sliding_window_ragged_paged_attention(
                     unnormalized_output=unnormalized_output,
                     non_causal_block=non_causal_block,
                     q_compute_block_size=q_compute_block_size,
+                    **hca_kwargs,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
@@ -1960,25 +2150,11 @@ def mla_sliding_window_ragged_paged_attention(
                         shape=(q.shape[0], num_l_heads), dtype=jnp.float32
                     ),
                 ],
-                input_output_aliases={
-                    11: 0,  # Alias output activation with in_output
-                    10: 1,  # Aliasing cache_kv with updated_cache_kv
-                    12: 2,  # Alias l with in_l
-                    13: 3,  # Alias m with in_m
-                },
+                input_output_aliases=input_output_aliases,
                 name=scope_name,
             )
         )
-        return kernel(
-            *scalar_prefetches,
-            attention_sinks,
-            q,
-            new_kv,
-            cache_kv,
-            in_output,
-            in_l,
-            in_m,
-        )
+        return kernel(*scalar_prefetches, *operands, *hca_operands)
 
     num_l_heads = align_to(num_q_heads, 128)
     l = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
