@@ -3805,6 +3805,14 @@ class TPUModelRunner(GPUModelRunner):
         ):
             assert self._remote_dspark_transport is not None
             remote_feedback = self._remote_dspark_transport.recv_feedback()
+            if self._profiler_rank == 0:
+                logger.info(
+                    "Remote DSpark producer applying feedback: valid_tokens=%s",
+                    [
+                        int((tokens >= 0).sum().item())
+                        for tokens in remote_feedback["next_tokens_per_chunk"]
+                    ],
+                )
             expected_req_ids = list(
                 self.input_batch.req_ids[: self.input_batch.num_reqs]
             )

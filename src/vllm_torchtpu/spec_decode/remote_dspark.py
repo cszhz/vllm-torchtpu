@@ -144,6 +144,13 @@ class RemoteDSparkTransport:
     def send_proposal(self, request_ids: list[str], token_ids: list[list[int]]) -> None:
         if self.role != "producer":
             raise RemoteDraftProtocolError("only the producer sends proposals")
+        if self.rank == 0:
+            logger.info(
+                "Remote DSpark proposal send: round=%d requests=%d lengths=%s",
+                self._round_id,
+                len(request_ids),
+                [len(tokens) for tokens in token_ids],
+            )
         self._send(
             {
                 "kind": "proposal",
@@ -170,6 +177,12 @@ class RemoteDSparkTransport:
         try:
             while True:
                 message = self._recv_round("proposal")
+                if self.rank == 0:
+                    logger.info(
+                        "Remote DSpark proposal receive: round=%d requests=%d",
+                        self._round_id,
+                        len(message["request_ids"]),
+                    )
                 self._proposal_queue.put((message["request_ids"], message["token_ids"]))
         except BaseException as exc:
             self._proposal_queue.put(exc)
@@ -177,6 +190,12 @@ class RemoteDSparkTransport:
     def send_feedback(self, payload: dict[str, Any]) -> None:
         if self.role != "consumer":
             raise RemoteDraftProtocolError("only the consumer sends feedback")
+        if self.rank == 0:
+            logger.info(
+                "Remote DSpark feedback send: round=%d requests=%d",
+                self._round_id,
+                len(payload.get("request_ids", ())),
+            )
         self._send({"kind": "feedback", "round_id": self._round_id, **payload})
         self._round_id += 1
 
@@ -184,6 +203,12 @@ class RemoteDSparkTransport:
         if self.role != "producer":
             raise RemoteDraftProtocolError("only the producer receives feedback")
         message = self._recv_round("feedback")
+        if self.rank == 0:
+            logger.info(
+                "Remote DSpark feedback receive: round=%d requests=%d",
+                self._round_id,
+                len(message.get("request_ids", ())),
+            )
         self._round_id += 1
         return message
 
