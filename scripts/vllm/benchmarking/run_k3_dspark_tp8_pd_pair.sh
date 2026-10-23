@@ -58,7 +58,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-RESULTS_DIR_OVERRIDE="$server_out" \
+RESULTS_DIR="$server_out" \
 CAPTURE_PROFILE=1 \
 K3_DSPARK_PD_ROLE="$role" \
   bash scripts/vllm/benchmarking/run_benchmarks.sh \
