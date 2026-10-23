@@ -1008,7 +1008,24 @@ def local_slab_rows(routing, me, *, shard_stride):
     )
 
 
-def shard_token_gather(routing, me, *, shard_stride, rows=None):
+def slab_scatter_add(length, rows, values, *, one_hot=False):
+    """``zeros(length).at[rows].add(values, mode="drop")`` for i32 values.
+
+    ``one_hot`` spells it as a compare-select-sum on the TensorCore. XLA
+    offloads the scatter to the SparseCore, which at a few hundred routed
+    pairs costs more in the TensorCore's wait than the whole one-hot pass;
+    integer addition is exact in any order, so both spellings agree bit for
+    bit, and a row outside [0, length) matches no column and is dropped.
+    """
+    if not one_hot:
+        return jnp.zeros((length,), values.dtype).at[rows].add(values, mode="drop")
+    hit = rows[:, None] == jnp.arange(length, dtype=rows.dtype)[None, :]
+    return jnp.sum(jnp.where(hit, values[:, None], 0), axis=0, dtype=values.dtype)
+
+
+def shard_token_gather(
+    routing, me, *, shard_stride, rows=None, source_rows=None, one_hot=False
+):
     """The token number each of shard `me`'s slab rows computes, [stride].
 
     `rows` is the destination slab row of each routed pair, which is derived
@@ -1030,23 +1047,27 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
     before any of this; the clip is written so that it would hold on its own.
     """
     T, K = routing.pair_grid
+    t_local, row_stride = (T, T) if source_rows is None else source_rows
     # The token number of each routed pair is a counted repeat, not a
     # division: pair i belongs to token i // K, which is the token index
     # broadcast K times. K is the selection width and need not be a power
     # of two, so this is the spelling that removes the division rather
     # than the one that shifts it.
-    token_of_pair = jnp.broadcast_to(
-        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)
-    ).reshape(-1)
+    token_row = jnp.arange(T, dtype=jnp.int32)
+    if source_rows is not None:
+        # The gathered activations hold `row_stride` rows per source shard,
+        # of which the first `t_local` are its tokens.
+        token_row = token_row // t_local * row_stride + token_row % t_local
+    token_of_pair = jnp.broadcast_to(token_row[:, None], (T, K)).reshape(-1)
     row = (
         local_slab_rows(routing, me, shard_stride=shard_stride)
         if rows is None
         else rows
     )
-    gather_lo, gather_hi = gather_clamp_bounds(T)
-    scattered = (
-        jnp.zeros((shard_stride,), jnp.int32).at[row].add(token_of_pair, mode="drop")
+    gather_lo, gather_hi = gather_clamp_bounds(
+        (T - 1) // t_local * row_stride + (T - 1) % t_local + 1
     )
+    scattered = slab_scatter_add(shard_stride, row, token_of_pair, one_hot=one_hot)
     return jnp.clip(scattered, jnp.int32(gather_lo), jnp.int32(gather_hi))
 
 

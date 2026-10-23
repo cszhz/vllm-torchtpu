@@ -48,6 +48,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     shard_push_tables_in_rows,
     shard_token_gather,
     shard_transport_tables_in_blocks,
+    slab_scatter_add,
     token_gather_window_rows,
     weight_form,
     weight_format_of_dtype,
@@ -58,7 +59,15 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     combine_step_tokens,
     rowquant_fp8,
 )
-from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
+from vllm_torchtpu.kernels.fused_moe.v2.plan_kernel import (
+    build_decode_combine,
+    build_decode_plan,
+    decode_plan_supported,
+)
+from vllm_torchtpu.kernels.fused_moe.v2.router_ops import (
+    pallas_select,
+    pallas_select_routed,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
     TokenReplicaLayout,
     replica_wire_rows,
@@ -96,7 +105,7 @@ def _row_routes(scores, gate_l):
 
 
 def _combine_arrivals(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype, decode=False
 ):
     """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden].
 
@@ -118,11 +127,19 @@ def _combine_arrivals(
     Both paths fold the arrival row's scale and the router weight into one
     coefficient over K * t_local values, so each of the K * t_local * hidden
     elements is multiplied once rather than twice.
+
+    `decode` takes plan_kernel.build_decode_combine instead, which DMAs the
+    few rows a decode bucket combines rather than gathering them on the
+    SparseCore.
     """
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
     hidden = lane_blocks * lanes
+    if decode:
+        return build_decode_combine(
+            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+        ).reshape(t_local, hidden)
     # A gather clamps an out-of-range index to the last one; a DMA does not,
     # and a sublane index clamped on its own would pair the last sublane with
     # the wrong lane. Neither position is ever negative.
@@ -209,6 +226,56 @@ def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total):
     return pairs, scale_bits, counts
 
 
+# The meta words cross the e4m3 collective a nibble per byte, each byte
+# 0x10 | nibble: a normal, finite e4m3 value, so no float data path -- NaN
+# canonicalization or subnormal flushing -- can change it, and the meta rows
+# are sliced out of the gathered rows as floats without a copy of the buffer.
+_META_NIBBLES = 8
+_META_BYTE_BASE = 0x10
+
+
+def _gather_rows_with_meta(rows, meta, ax):
+    """All-gather e4m3 token rows [t, lane blocks, 128] and an i32 vector.
+
+    The vector rides as trailing rows, so one collective carries both.
+    Returns the gathered rows -- each source's `t + meta rows` rows in turn,
+    its tokens first -- and the gathered vectors [ep, len(meta)].
+    """
+    if rows.dtype != jnp.float8_e4m3fn:
+        raise ValueError(f"the vector rides e4m3 rows; got {rows.dtype}")
+    t, lane_blocks, lanes = rows.shape
+    row_bytes = lane_blocks * lanes
+    nbytes = meta.size * _META_NIBBLES
+    meta_rows = -(-nbytes // row_bytes)
+    words = lax.bitcast_convert_type(meta, jnp.uint32)
+    shifts = 4 * jnp.arange(_META_NIBBLES, dtype=jnp.uint32)
+    nibbles = (words[:, None] >> shifts[None, :]) & jnp.uint32(15)
+    meta_bytes = (nibbles | jnp.uint32(_META_BYTE_BASE)).astype(jnp.uint8).reshape(-1)
+    meta_bytes = jnp.pad(
+        meta_bytes, (0, meta_rows * row_bytes - nbytes), constant_values=_META_BYTE_BASE
+    ).reshape(meta_rows, lane_blocks, lanes)
+    payload = jnp.concatenate(
+        [rows, lax.bitcast_convert_type(meta_bytes, rows.dtype)], axis=0
+    )
+    gathered = lax.all_gather(payload, ax, axis=0, tiled=True)
+    ep = gathered.shape[0] // (t + meta_rows)
+    if meta_rows == 1:
+        meta_g = lax.slice(
+            gathered,
+            (t, 0, 0),
+            (gathered.shape[0], -(-nbytes // lanes), lanes),
+            (t + 1, 1, 1),
+        )
+    else:
+        meta_g = lax.slice_in_dim(
+            gathered.reshape(ep, t + meta_rows, row_bytes), t, t + meta_rows, axis=1
+        )
+    meta_g = lax.bitcast_convert_type(meta_g, jnp.uint8).reshape(ep, -1)[:, :nbytes]
+    nibbles_g = meta_g.reshape(ep, meta.size, _META_NIBBLES).astype(jnp.uint32) & 15
+    words_g = jnp.sum(nibbles_g << shifts[None, None, :], axis=-1, dtype=jnp.uint32)
+    return gathered, lax.bitcast_convert_type(words_g, jnp.int32)
+
+
 def _to_slots(topk_idx, expert_slot, row_base):
     """Selected global ids [rows, K] -> slots under an [experts, R] table.
 
@@ -264,6 +331,12 @@ AGQ_MIN_LOCAL_TOKENS = 1024
 # 358.0 / 358.1 -> 348.0 / 348.1 -> 342.2 us at t_local 128 / 64 / 32 / 16.
 AGQ_MIN_EP = 16
 
+# Local tokens at or below which the decode-glue switches (merge_exchange,
+# onehot_scatter, pallas_plan, decode_combine, pallas_restore, fused_select)
+# take effect: decode buckets, where every collective and SparseCore round
+# trip is latency-bound. Larger buckets keep the program they had.
+SMALL_BATCH_LOCAL_TOKENS = 16
+
 # Per-config cache of the shard_map'd MoE callable; a fresh shard_map
 # body would re-trace the whole kernel for every hidden layer.
 _LAYER_SM_CACHE = {}
@@ -303,6 +376,12 @@ def fused_ep_moe_v2(
     expert_slot=None,
     order_after=None,
     scales_expert_second_minor=False,
+    merge_exchange=False,
+    onehot_scatter=False,
+    pallas_plan=False,
+    decode_combine=False,
+    pallas_restore=False,
+    fused_select=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -397,6 +476,19 @@ def fused_ep_moe_v2(
     the kernel does not start until it exists. It changes no value. A caller
     passes a result it wants computed while the token all-gather is in flight
     rather than after the kernel. Fused stage only.
+
+    merge_exchange sends the routing exchange as extra rows of the activation
+    all-gather, so a decode step pays one collective rather than two; the
+    per-expert counts are then histogrammed from the gathered selections.
+    onehot_scatter builds the two slab tables on the TensorCore rather than
+    by SparseCore scatter. pallas_plan builds the whole sharded routing plan
+    in one Pallas call (plan_kernel.build_decode_plan) where that kernel
+    covers the shape. decode_combine sums the arrivals in one Mosaic call
+    (plan_kernel.build_decode_combine). pallas_restore gathers the token
+    replicas' rows back with the small Pallas all-gather. fused_select folds
+    the score bias and the row-finiteness test into the top-k selector. All
+    apply only to the fused stage at or below SMALL_BATCH_LOCAL_TOKENS local
+    tokens and change no value.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -548,6 +640,38 @@ def fused_ep_moe_v2(
     has_order_after = order_after is not None
     if has_order_after and stage != "fused":
         raise ValueError('order_after is only taken by stage == "fused"')
+    small_batch = t_local <= SMALL_BATCH_LOCAL_TOKENS and stage == "fused"
+    # e4m3 rows only; see _gather_rows_with_meta.
+    merge_exchange = (
+        bool(merge_exchange)
+        and small_batch
+        and sharded_plan
+        and jnp.dtype(form.wire_dtype) == jnp.float8_e4m3fn
+    )
+    onehot_scatter = bool(onehot_scatter) and small_batch
+    decode_combine = bool(decode_combine) and small_batch
+    pallas_restore = bool(pallas_restore) and small_batch
+    fused_select = bool(fused_select) and small_batch
+    pallas_plan = (
+        bool(pallas_plan)
+        and small_batch
+        and sharded_plan
+        and decode_plan_supported(
+            e_total=e_total,
+            ep=ep,
+            t_local=t_local,
+            topk=topk,
+            shard_stride=ragged_stride,
+        )
+    )
+    decode_glue = (
+        merge_exchange
+        or onehot_scatter
+        or pallas_plan
+        or decode_combine
+        or pallas_restore
+        or fused_select
+    )
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -923,6 +1047,374 @@ def fused_ep_moe_v2(
             x_l.dtype,
         )
 
+    def decode_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
+        """stage="fused" at decode buckets with any decode-glue switch on.
+
+        The same layer as local_fn: route, dispatch, kernel, combine, with the
+        routing exchange optionally carried in the activation all-gather and
+        the plan, slab tables and combine optionally built by Pallas calls.
+        """
+        (
+            w1s_l,
+            w2s_l,
+            gate_l,
+            hash_l,
+            score_bias_l,
+            expert_slot_l,
+            order_after_l,
+            bias_it,
+        ) = unpack_operands(scales_gating_biases)
+        # One replica each: the selector emits slots directly.
+        select_labels = (
+            expert_slot_l[:, 0]
+            if expert_slot_l is not None and not replicated
+            else None
+        )
+        me = rank_l[0, 0]
+        gate_l, hash_l, q_rows, row_scale_l = quantize_local(
+            x_l, rank_l, gate_l, hash_l
+        )
+        if not merge_exchange:
+            q_g = lax.all_gather(q_rows, ax, axis=0, tiled=True)
+            if order_after_l is not None:
+                q_g, _ = lax.optimization_barrier((q_g, order_after_l))
+
+        scores = _apply_scoring_fn(gate_l, scoring_fn)
+        select_rows = MAX_ROUTING_BLOCK
+        while t_local % select_rows:
+            select_rows //= 2
+        if hash_l is not None:
+            # The selection was made by the caller's table, so the selector
+            # does not run at all; the weights are still the scores at the
+            # selected ids, which is the only thing the selector would have
+            # contributed here.
+            topk_idx = hash_l.astype(jnp.int32)
+            topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
+            if expert_slot_l is not None:
+                topk_idx = _to_slots(topk_idx, expert_slot_l, me * t_local)
+        elif fused_select:
+            topk_weights, topk_idx, fused_routes = pallas_select_routed(
+                scores,
+                gate_l,
+                topk=topk,
+                block_rows=select_rows,
+                score_bias=score_bias_l,
+                labels=select_labels,
+            )
+        elif score_bias_l is None:
+            topk_weights, topk_idx = pallas_select(
+                scores, topk=topk, block_rows=select_rows, labels=select_labels
+            )
+        else:
+            # Selection is based on (scores + score_bias_l); the weights come
+            # from the scores.
+            topk_weights, topk_idx = pallas_select(
+                scores + score_bias_l.astype(jnp.float32)[None, :],
+                topk=topk,
+                block_rows=select_rows,
+                weight_scores=scores,
+                labels=select_labels,
+            )
+        if replicated and hash_l is None:
+            topk_idx = _to_slots(topk_idx, expert_slot_l, me * t_local)
+        topk_idx = _relabel_expert_ids_to_mesh_order(
+            topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
+        )
+        # A row of scores carrying no real value routes nowhere. It was
+        # dropped by arithmetic accident: the selector gives every slot of
+        # such a row a large negative sentinel, and the renormalization below
+        # divided by their sum, which OVERFLOWED float32 to -inf and so
+        # returned exactly zero. That outcome is a property of the
+        # accumulation dtype and the association order, not of the design --
+        # a wider accumulator, a reassociating compiler pass, or a different
+        # renormalization would silently turn such a row from dropped into
+        # routed at full weight to expert zero. Mask it explicitly instead.
+        # gate_l is checked too: under sigmoid/sqrtsoftplus a -inf logit scores
+        # a finite 0, so replica padding would otherwise pass the score check.
+        row_routes = (
+            fused_routes
+            if fused_select and hash_l is None
+            else _row_routes(scores, gate_l)
+        )
+        if renormalize:
+            denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
+            topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
+        topk_weights = jnp.where(row_routes, topk_weights, 0.0)
+        topk_idx = jnp.where(row_routes, topk_idx, jnp.int32(e_total))
+        # A count of the masked rows would be the other half of this: an
+        # incident today is degraded output against a completely clean log.
+        # It is not added here because the only in-trace channel for it,
+        # jax.debug.print, makes the program refuse to lower for TPU from a
+        # host, which is how this repository verifies that a change served
+        # the same program. A counter belongs in a metrics channel outside
+        # the trace.
+        # One all-gather carries the indices, the row scales where the rows
+        # were quantized, and the per-expert pair counts the routing plan
+        # would otherwise exchange in a collective of its own.
+        local_blocks = topk_idx.astype(jnp.int32).reshape(
+            t_local * topk // block, block
+        )
+        block_hist = pair_block_hist(local_blocks, e_total)
+        scale_bits_l = (
+            None
+            if row_scale_l is None
+            else (
+                lax.bitcast_convert_type(
+                    row_scale_l[:, 0].astype(jnp.float32), jnp.int32
+                )
+            )
+        )
+        source_rows = None
+        if merge_exchange:
+            meta = local_blocks.reshape(-1)
+            if scale_bits_l is not None:
+                meta = jnp.concatenate([meta, scale_bits_l])
+            # The quantize must stay a fusion of its own, as it is when its
+            # rows feed the collective directly: fused into the packing, the
+            # bf16 multiply may be widened and the fp8 rounding moves.
+            q_rows = lax.optimization_barrier(q_rows)
+            q_g, meta_g = _gather_rows_with_meta(q_rows, meta, ax)
+            if order_after_l is not None:
+                q_g, _ = lax.optimization_barrier((q_g, order_after_l))
+            source_rows = (t_local, q_g.shape[0] // ep)
+            pairs_g = meta_g[:, : t_local * topk]
+            scale_bits_g = (
+                None
+                if scale_bits_l is None
+                else meta_g[:, t_local * topk :].reshape(-1)
+            )
+            # One source's pairs are one block of the histogram.
+            rows_by_dest = pair_block_hist(pairs_g, e_total)
+        else:
+            layout = _exchange_layout(
+                t_local, topk, e_total, form.quantized_activations
+            )
+            exchange = lax.all_gather(
+                _pack_routing_exchange(
+                    local_blocks.reshape(-1),
+                    scale_bits_l,
+                    block_hist.sum(axis=0),
+                    layout,
+                ),
+                ax,
+                axis=0,
+                tiled=True,
+            ).reshape(ep, layout[-1])
+            pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
+                exchange, layout, t_local, topk, e_total
+            )
+
+        def xla_plan(q_g):
+            """The routing plan in XLA ops; every shape and bucket."""
+            gathered = GatheredPairs(
+                expert_blocks=pairs_g.reshape(T * topk // block, block),
+                local_blocks=local_blocks,
+                block_hist=block_hist,
+                rows_by_dest=rows_by_dest,
+                n_tokens=T,
+                topk=topk,
+            )
+
+            plan_kw = dict(
+                e_total=e_total,
+                ep=ep,
+                t_local=t_local,
+                block=block,
+                tile_m=capacity,
+                shard_stride=ragged_stride,
+            )
+            if sharded_plan:
+                routing = build_routing_tables_sharded(
+                    None, me, gathered=gathered, **plan_kw
+                )
+            else:
+                routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
+            block_tables = shard_transport_tables_in_blocks(
+                routing, me, e_total=e_total, ep=ep
+            )
+            row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
+            # Both slab tables scatter onto this shard's own slab. The rows of
+            # the other shards are dropped where they are computed rather than
+            # built into a replicated slab and sliced away afterwards.
+            slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
+            # The two slab scatters and the activation all-gather are offloaded to
+            # the SAME SparseCore. Ordering the scatters behind the collective
+            # enqueues it 129 us earlier and costs them the cover they had; that
+            # trade measures +2.80% at 2048 local tokens and negative at every
+            # smaller shape, so it is taken only where the routing plan in front
+            # of the collective is longer than the scatters behind it, or where
+            # the mesh is wide enough that the collective is. Same bits either
+            # way; only the queue moves.
+            if t_local >= AGQ_MIN_LOCAL_TOKENS or ep >= AGQ_MIN_EP:
+                slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
+            token_gather = shard_token_gather(
+                routing,
+                me,
+                shard_stride=ragged_stride,
+                rows=slab_row,
+                source_rows=source_rows,
+                one_hot=onehot_scatter,
+            )
+            # The kernel DMA-aligns each logical expert window down by as much as
+            # 127 int32 rows and always copies a full fixed window. Pad after the
+            # scatter (rather than enlarging its destination) so the off-shard
+            # sentinel remains out of range and cannot write a live padding row.
+            token_gather = jnp.pad(
+                token_gather, (0, token_gather_window_rows(capacity))
+            )
+            # The activation row scale, scattered onto the slab row each routed
+            # pair computes on. It exists only where the rows were quantized.
+            #
+            # The slab is built flat and handed over in the dense lane-block
+            # view, which is the same bytes in the same order and so costs
+            # nothing. A column would cost a copy of the whole slab: [rows, 1]
+            # is padded out to a full lane block on the way to the kernel, and
+            # that copy is the largest single piece of glue above a thousand
+            # rows. The kernel rebuilds the column a tile at a time instead.
+            #
+            # The scatter runs the length of the view rather than of the slab.
+            # Those extra elements are past the slab's last row, so a pair the
+            # rebase sent past the end lands on one of them instead of being
+            # dropped; nothing reads them, and the slab's own rows are the same
+            # either way.
+            if form.quantized_activations:
+                scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
+                scale_rows = act_scale_slab_rows(ragged_stride)
+                scale_slab = lax.bitcast_convert_type(
+                    slab_scatter_add(
+                        scale_rows * HIDDEN_LANE_BLOCK,
+                        slab_row,
+                        scale_bits,
+                        one_hot=onehot_scatter,
+                    ),
+                    jnp.float32,
+                ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+            else:
+                scale_slab = None
+            expert_rows, slab_base = shard_expert_slabs(
+                routing, me, e_total=e_total, ep=ep
+            )
+            # The empty experts drop out of the visit list, so an empty
+            # expert's weight slab never streams. How MANY are visited is a
+            # row of the count table rather than its own reduction, so this
+            # builder's second value is not read; it leaves the program with
+            # the rest of the dead code, and its own test still sees it.
+            visit, _ = expert_visit_list(expert_rows, g_local)
+            # One pass builds every count the kernel needs, still spread over
+            # the expert-parallel axis; the kernel's scalar core closes them.
+            counts = shard_count_vector(
+                routing, expert_rows, me, e_total=e_total, ep=ep
+            )
+
+            # The destination's own table: one arrival row per selection slot.
+            pos = (
+                cast(ShardRoutingTables, routing).pos
+                if sharded_plan
+                else lax.dynamic_slice(
+                    cast(RoutingTables, routing).arrival_row, (me * t_local, 0), (t_local, topk)
+                )
+            )
+            mirror_pos = (
+                cast(ShardRoutingTables, routing).mirror_pos
+                if sharded_plan
+                else lax.dynamic_slice(
+                    cast(RoutingTables, routing).mirror_row, (me * t_local, 0), (t_local, topk)
+                )
+            )
+            return (
+                q_g,
+                (*block_tables[:3], block_tables[5], row_tables[0]),
+                token_gather,
+                scale_slab,
+                expert_rows,
+                slab_base,
+                visit,
+                counts,
+                pos,
+                mirror_pos,
+            )
+
+        if pallas_plan:
+            plan = build_decode_plan(
+                pairs_g,
+                scale_bits_g,
+                me,
+                e_total=e_total,
+                ep=ep,
+                t_local=t_local,
+                topk=topk,
+                block=block,
+                tile_m=capacity,
+                shard_stride=ragged_stride,
+                row_stride=None if source_rows is None else source_rows[1],
+            )
+            kernel_tables = (*plan.block_tables, plan.true_rows)
+            token_gather, scale_slab = plan.token_gather, plan.scale_slab
+            expert_rows, slab_base = plan.expert_rows, plan.slab_base
+            visit, counts = plan.visit, plan.counts
+            pos, mirror_pos = plan.pos, plan.mirror_pos
+        else:
+            (
+                q_g,
+                kernel_tables,
+                token_gather,
+                scale_slab,
+                expert_rows,
+                slab_base,
+                visit,
+                counts,
+                pos,
+                mirror_pos,
+            ) = xla_plan(q_g)
+        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
+        # The bias tables are per expert and per output channel on every
+        # weight format, so they take one layout: [G, N].
+        w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
+        w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
+
+        # The kernel takes four of the seven transport tables and one of the
+        # three push tables. The two totals are rows of `counts`, and three
+        # more are the same array as one already here -- push_src is the
+        # commit offset, push_len is the commit length, and the receive row
+        # offset is the push destination in rows -- so each goes over once and
+        # the kernel derives the rest. Every table shipped is another blocking
+        # HBM->SMEM DMA at the head of the kernel, and the prefetch also has to
+        # fit in 1 MB of SMEM.
+        arrivals, arrival_scales = kfn(
+            kernel_tables,
+            token_gather,
+            expert_rows,
+            slab_base,
+            q_g,
+            scale_slab,
+            w1_l,
+            w2_l,
+            w1s_l,
+            w2s_l,
+            w1b_k,
+            w2b_k,
+            recv_rows=recv_rows,
+            visit=visit,
+            counts=counts,
+            rank=rank_l,
+        )
+
+        combined = _combine_arrivals(
+            arrivals,
+            arrival_scales,
+            pos,
+            mirror_pos,
+            topk_weights,
+            x_l.dtype,
+            decode=decode_combine,
+        )
+        # A row that routed nowhere read arrival rows nobody wrote; its weight is
+        # zero, but zero times an unwritten NaN is not.
+        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        return token_layout.restore(combined, ax, me=me if pallas_restore else None)
+
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """stage="route": the wire rows, router weights and payload."""
         del w1_l, w2_l
@@ -1057,9 +1549,15 @@ def fused_ep_moe_v2(
         stage,
         gather_positions,
         bool(scales_expert_second_minor),
+        merge_exchange,
+        onehot_scatter,
+        pallas_plan,
+        decode_combine,
+        pallas_restore,
+        fused_select,
     )
     body, out_specs = {
-        "fused": (local_fn, P(ax)),
+        "fused": (decode_fn if decode_glue else local_fn, P(ax)),
         "route": (route_fn, (P(ax),) * 3),
         "compute": (compute_fn, P(ax)),
     }[stage]
