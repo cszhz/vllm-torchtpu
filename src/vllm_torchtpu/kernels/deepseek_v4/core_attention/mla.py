@@ -40,6 +40,16 @@ def align_to(x, a):
     return cdiv(x, a) * a
 
 
+def clamp_kv_pages_per_block(
+    num_kv_pages_per_block, num_page_indices, max_num_seqs, page_size
+):
+    """A kv block never needs more pages than a sequence's page table holds."""
+    max_bkv_p = align_to(
+        num_page_indices // max_num_seqs, cdiv(KV_BLOCK_ALIGN, page_size)
+    )
+    return min(num_kv_pages_per_block, max_bkv_p)
+
+
 def get_dtype_bitwidth(dtype):
     return jax.dtypes.itemsize_bits(dtype)
 
@@ -949,6 +959,7 @@ def prepare_outputs(
         "num_queries_per_block",
         "vmem_limit_bytes",
         "decode_batch_size",
+        "decode_in_swa_kernel",
     ),
 )
 def mla_ragged_paged_attention(
@@ -973,6 +984,9 @@ def mla_ragged_paged_attention(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_batch_size: int = 8,
+    # The SWA kernel already wrote the final output of the decode sequences
+    # into `swa_accumution`; run only prefill and mixed, writing in place there.
+    decode_in_swa_kernel: bool = False,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -997,6 +1011,9 @@ def mla_ragged_paged_attention(
         mixed) cases.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
       decode_batch_size: number of decode sequences to be batched in one block.
+      decode_in_swa_kernel: decode sequences were finished by the SWA kernel
+        (`mla_sliding_window_ragged_paged_attention` with `hca_decode`); skip
+        them and return `swa_accumution` updated in place.
 
     Returns:
       The output of attention.
@@ -1037,11 +1054,10 @@ def mla_ragged_paged_attention(
     max_num_seqs = cu_q_lens.shape[0] - 1
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
-    # A kv block never needs more pages than a sequence's page table holds.
-    max_bkv_p = align_to(
-        num_page_indices // max_num_seqs, cdiv(KV_BLOCK_ALIGN, page_size)
-    )
-    num_kv_pages_per_blocks = [min(p, max_bkv_p) for p in num_kv_pages_per_blocks]
+    num_kv_pages_per_blocks = [
+        clamp_kv_pages_per_block(p, num_page_indices, max_num_seqs, page_size)
+        for p in num_kv_pages_per_blocks
+    ]
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
@@ -1179,9 +1195,8 @@ def mla_ragged_paged_attention(
                     disable_bounds_checks=True,
                 ),
                 out_shape=jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                input_output_aliases={
-                    8: 0,  # Alias output activation with q
-                },
+                # Inputs: 7 scalar prefetches, sinks, q (8), cache_kv, swa (10).
+                input_output_aliases={10 if decode_in_swa_kernel else 8: 0},
                 name=scope_name,
             )
         )
@@ -1273,16 +1288,11 @@ def mla_ragged_paged_attention(
             swa_m,
         )
 
-    decode_bkv_p = num_kv_pages_per_blocks[0]
-    if num_page_indices // max_num_seqs <= decode_bkv_p:
-        # Every decode sequence fits one kv block: one kernel takes them all.
-        q = run_single_block_decode_kernel(
-            q, jnp.array(0), distribution[0], decode_bkv_p
-        )
-    else:
-        batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
-        # Batched decode
-        q = run_mla_kernel(
+    def run_case(**kwargs):
+        """Runs one case, which writes its rows in place into the aliased
+        buffer: `swa_accumution` when `decode_in_swa_kernel`, else `q`."""
+        nonlocal q, swa_accumution
+        out = run_mla_kernel(
             q,
             cache_kv,
             kv_lens,
@@ -1293,6 +1303,25 @@ def mla_ragged_paged_attention(
             swa_accumution,
             swa_l,
             swa_m,
+            **kwargs,
+        )
+        if decode_in_swa_kernel:
+            swa_accumution = out
+        else:
+            q = out
+
+    decode_bkv_p = num_kv_pages_per_blocks[0]
+    if decode_in_swa_kernel:
+        pass  # The SWA kernel already wrote the decode rows' final output.
+    elif num_page_indices // max_num_seqs <= decode_bkv_p:
+        # Every decode sequence fits one kv block: one kernel takes them all.
+        q = run_single_block_decode_kernel(
+            q, jnp.array(0), distribution[0], decode_bkv_p
+        )
+    else:
+        batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
+        # Batched decode
+        run_case(
             num_kv_pages_per_block=num_kv_pages_per_blocks[0],
             num_queries_per_block=num_queries_per_blocks[0],
             start_seq_idx=jnp.array(0),
@@ -1303,17 +1332,7 @@ def mla_ragged_paged_attention(
         )
 
         # Decode-only
-        q = run_mla_kernel(
-            q,
-            cache_kv,
-            kv_lens,
-            kv_lens_to_attend,
-            page_indices,
-            cu_q_lens,
-            attention_sinks,
-            swa_accumution,
-            swa_l,
-            swa_m,
+        run_case(
             num_kv_pages_per_block=num_kv_pages_per_blocks[0],
             num_queries_per_block=num_queries_per_blocks[0],
             start_seq_idx=batch_distribution,
@@ -1325,17 +1344,7 @@ def mla_ragged_paged_attention(
 
     if chunk_prefill_size is not None:
         # Handle prefill where the query length is fixed per sequence.
-        q = run_mla_kernel(
-            q,
-            cache_kv,
-            kv_lens,
-            kv_lens_to_attend,
-            page_indices,
-            cu_q_lens,
-            attention_sinks,
-            swa_accumution,
-            swa_l,
-            swa_m,
+        run_case(
             num_kv_pages_per_block=num_kv_pages_per_blocks[1],
             num_queries_per_block=num_queries_per_blocks[1],
             start_seq_idx=distribution[0],
@@ -1346,17 +1355,7 @@ def mla_ragged_paged_attention(
         )
 
     # Handle mixed case where the query length per sequence is variable.
-    q = run_mla_kernel(
-        q,
-        cache_kv,
-        kv_lens,
-        kv_lens_to_attend,
-        page_indices,
-        cu_q_lens,
-        attention_sinks,
-        swa_accumution,
-        swa_l,
-        swa_m,
+    run_case(
         num_kv_pages_per_block=num_kv_pages_per_blocks[2],
         num_queries_per_block=num_queries_per_blocks[2],
         start_seq_idx=distribution[1],
@@ -1366,7 +1365,9 @@ def mla_ragged_paged_attention(
         case=MlaCase.MIXED,
     )
     output = prepare_outputs(
-        q, actual_num_q_heads, actual_head_dim
+        swa_accumution if decode_in_swa_kernel else q,
+        actual_num_q_heads,
+        actual_head_dim,
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
 
     return output
