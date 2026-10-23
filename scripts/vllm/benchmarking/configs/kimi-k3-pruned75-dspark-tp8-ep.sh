@@ -50,6 +50,10 @@ ATTENTION_BACKEND="CUSTOM"
 # Target verify reaches 8 requests x (K + 1) rows. Draft-specific padding
 # buckets are added by DFlashProposer; the list here covers target decode and
 # the exact prefill chunk used by this profile.
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --block-size 256 --compilation-config {\"compile_sizes\":[1,8,16,32,64,1024]} --speculative-config {\"method\":\"dspark\",\"model\":\"Inferact/Kimi-K3-DSpark\",\"num_speculative_tokens\":7}"
+_loader_args=""
+if [ -n "$MODEL_URI" ]; then
+    _loader_args='--model-loader-extra-config {"memory_limit":17179869184}'
+fi
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} ${_loader_args} --block-size 256 --compilation-config {\"compile_sizes\":[1,8,16,32,64,1024]} --speculative-config {\"method\":\"dspark\",\"model\":\"Inferact/Kimi-K3-DSpark\",\"num_speculative_tokens\":7}"
 
 EVAL_TOLERANCE="0.025"
