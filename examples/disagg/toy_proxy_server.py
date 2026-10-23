@@ -15,6 +15,7 @@
 import argparse
 import asyncio
 import codecs
+import hashlib
 import itertools
 import json
 import logging
@@ -382,6 +383,48 @@ def _completion_text(body: bytes, streamed: bool) -> str:
             choice.get("text", choice.get("delta", {}).get("content", "")) or ""
         )
     return "".join(parts)
+
+
+def _record_remote_draft_verification(
+    request_id: str,
+    *,
+    shadow_text: str | None = None,
+    decode_text: str | None = None,
+    error: Exception | None = None,
+) -> None:
+    path = os.getenv("VLLM_TPU_REMOTE_DSPARK_VERIFICATION_PATH")
+    if error is not None:
+        record = {
+            "request_id": request_id,
+            "status": "error",
+            "error": repr(error),
+        }
+    else:
+        assert shadow_text is not None
+        assert decode_text is not None
+        record = {
+            "request_id": request_id,
+            "status": "match" if shadow_text == decode_text else "mismatch",
+            "shadow_length": len(shadow_text),
+            "decode_length": len(decode_text),
+            "shadow_sha256": hashlib.sha256(shadow_text.encode()).hexdigest(),
+            "decode_sha256": hashlib.sha256(decode_text.encode()).hexdigest(),
+        }
+        if shadow_text != decode_text:
+            record["shadow_preview"] = repr(shadow_text[:512])
+            record["decode_preview"] = repr(decode_text[:512])
+
+    message = f"REMOTE_DSPARK_VERIFY {json.dumps(record, sort_keys=True)}"
+    print(message, flush=True)
+    logger.info(message)
+    if path is None:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as output:
+            json.dump(record, output, sort_keys=True)
+            output.write("\n")
+    except OSError:
+        logger.exception("Failed to write remote DSpark verification to %s", path)
 
 
 @asynccontextmanager
@@ -806,16 +849,24 @@ async def _handle_completions(api: str, request: Request):
                 release_decode()
                 try:
                     if shadow_task is not None:
-                        shadow_response = await shadow_task
-                        shadow_response.raise_for_status()
-                        shadow_text = _completion_text(shadow_response.content, False)
-                        decode_text = _completion_text(
-                            b"".join(decode_chunks), bool(req_data.get("stream"))
-                        )
-                        if shadow_text != decode_text:
-                            raise RuntimeError(
-                                "remote DSpark shadow/decode output mismatch for "
-                                f"request {request_id}"
+                        try:
+                            shadow_response = await shadow_task
+                            shadow_response.raise_for_status()
+                            shadow_text = _completion_text(
+                                shadow_response.content, False
+                            )
+                            decode_text = _completion_text(
+                                b"".join(decode_chunks), bool(req_data.get("stream"))
+                            )
+                            _record_remote_draft_verification(
+                                request_id,
+                                shadow_text=shadow_text,
+                                decode_text=decode_text,
+                            )
+                        except Exception as error:
+                            _record_remote_draft_verification(
+                                request_id,
+                                error=error,
                             )
                 finally:
                     if remote_draft_bypass:

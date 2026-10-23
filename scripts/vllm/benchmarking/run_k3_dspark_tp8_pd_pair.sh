@@ -143,6 +143,8 @@ if [[ "$role" == decode ]]; then
     done
 else
     decode_ip="$(read_nonempty_file "$coord/decode.ip")"
+    verification_path="$out/remote-dspark-verification.jsonl"
+    rm -f "$verification_path"
     concurrency="${K3_DSPARK_PD_CONCURRENCY:-8}"
     num_prompts="${K3_DSPARK_PD_NUM_PROMPTS:-8}"
     warmup_prompts="${K3_DSPARK_PD_WARMUP_PROMPTS:-$num_prompts}"
@@ -155,6 +157,7 @@ else
     VLLM_TPU_REMOTE_DSPARK_SHADOW="$remote_dspark" \
       VLLM_TPU_REMOTE_DSPARK_BATCH_SIZE="$remote_batch_size" \
       VLLM_TPU_REMOTE_DSPARK_BYPASS_REQUESTS="$remote_bypass_requests" \
+      VLLM_TPU_REMOTE_DSPARK_VERIFICATION_PATH="$verification_path" \
       python3 examples/disagg/toy_proxy_server.py \
         --host 0.0.0.0 --port 8050 \
         --prefiller-hosts 127.0.0.1 --prefiller-ports 8000 \
@@ -235,6 +238,24 @@ if completed != expected:
         f"benchmark completed {completed!r} requests; expected {expected}"
     )
 PY
+    if ((remote_dspark)); then
+        expected_verifications=$((warmup_prompts + num_prompts))
+        python3 - "$verification_path" "$expected_verifications" <<'PY'
+import json
+import sys
+
+path, expected = sys.argv[1], int(sys.argv[2])
+with open(path) as verification_file:
+    records = [json.loads(line) for line in verification_file if line.strip()]
+if len(records) != expected:
+    raise RuntimeError(
+        f"remote DSpark recorded {len(records)} verifications; expected {expected}"
+    )
+failures = [record for record in records if record.get("status") != "match"]
+if failures:
+    raise RuntimeError(f"remote DSpark output verification failed: {failures}")
+PY
+    fi
     if [[ "$capture_profile" == 1 ]]; then
         curl -fsS -X POST http://127.0.0.1:8000/stop_profile >/dev/null
         curl -fsS -X POST "http://$decode_ip:8000/stop_profile" >/dev/null

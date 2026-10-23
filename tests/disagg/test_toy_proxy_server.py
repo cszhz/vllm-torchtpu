@@ -39,6 +39,8 @@ _replace_prompt_with_rendered_token_ids = (
     _toy_proxy_server._replace_prompt_with_rendered_token_ids
 )
 _RemoteDraftAdmissionBarrier = _toy_proxy_server._RemoteDraftAdmissionBarrier
+_completion_text = _toy_proxy_server._completion_text
+_record_remote_draft_verification = _toy_proxy_server._record_remote_draft_verification
 
 
 def test_remote_draft_admission_barrier_releases_complete_waves() -> None:
@@ -108,6 +110,34 @@ def test_ascii_safe_stream_encoder_leaves_ascii_unchanged() -> None:
 
     assert encoder.encode(message) == message
     assert encoder.encode(final=True) == b""
+
+
+def test_completion_text_matches_streamed_and_unstreamed_responses() -> None:
+    unstreamed = json.dumps({"choices": [{"text": "hello world"}]}).encode()
+    streamed = (
+        b'data: {"choices": [{"text": "hello "}]}\n\n'
+        b'data: {"choices": [{"text": "world"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    assert _completion_text(unstreamed, streamed=False) == "hello world"
+    assert _completion_text(streamed, streamed=True) == "hello world"
+
+
+def test_remote_draft_verification_records_mismatch(tmp_path, monkeypatch) -> None:
+    output = tmp_path / "verification.jsonl"
+    monkeypatch.setenv("VLLM_TPU_REMOTE_DSPARK_VERIFICATION_PATH", str(output))
+
+    _record_remote_draft_verification(
+        "request-1", shadow_text="shadow", decode_text="decode"
+    )
+
+    record = json.loads(output.read_text())
+    assert record["request_id"] == "request-1"
+    assert record["status"] == "mismatch"
+    assert record["shadow_length"] == 6
+    assert record["decode_length"] == 6
+    assert record["shadow_sha256"] != record["decode_sha256"]
 
 
 def test_replace_prompt_with_rendered_token_ids_single_prompt() -> None:
