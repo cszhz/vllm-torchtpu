@@ -207,9 +207,13 @@ def _row_scale(amax):
     return scale, sinv, usable
 
 
-def rowquant_fp8(x):
-    """Per-row dynamic fp8 quant, reducing and applying in bf16."""
-    amax = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
+def rowquant_fp8(x, axes=-1):
+    """Per-row dynamic fp8 quant, reducing and applying in bf16.
+
+    `axes` are the axes one row spans (the last, unless the row is laid out
+    over several).
+    """
+    amax = jnp.max(jnp.abs(x), axis=axes, keepdims=True)
     scale, sinv, usable = _row_scale(amax)
     return _quant_apply(x, sinv.astype(x.dtype), usable), scale
 

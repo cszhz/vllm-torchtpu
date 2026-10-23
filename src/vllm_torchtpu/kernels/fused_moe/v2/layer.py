@@ -382,6 +382,7 @@ def fused_ep_moe_v2(
     decode_combine=False,
     pallas_restore=False,
     fused_select=False,
+    lane_quant=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -486,7 +487,9 @@ def fused_ep_moe_v2(
     covers the shape. decode_combine sums the arrivals in one Mosaic call
     (plan_kernel.build_decode_combine). pallas_restore gathers the token
     replicas' rows back with the small Pallas all-gather. fused_select folds
-    the score bias and the row-finiteness test into the top-k selector. All
+    the score bias and the row-finiteness test into the top-k selector.
+    lane_quant quantizes the rows straight into the wire's [rows, lane blocks,
+    128] view (hwanginho f687714b0), so the reshape is not a relayout copy. All
     apply only to the fused stage at or below SMALL_BATCH_LOCAL_TOKENS local
     tokens and change no value.
     """
@@ -652,6 +655,7 @@ def fused_ep_moe_v2(
     decode_combine = bool(decode_combine) and small_batch
     pallas_restore = bool(pallas_restore) and small_batch
     fused_select = bool(fused_select) and small_batch
+    lane_quant = bool(lane_quant) and small_batch and form.quantized_activations
     pallas_plan = (
         bool(pallas_plan)
         and small_batch
@@ -671,6 +675,7 @@ def fused_ep_moe_v2(
         or decode_combine
         or pallas_restore
         or fused_select
+        or lane_quant
     )
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
@@ -739,7 +744,18 @@ def fused_ep_moe_v2(
             # Keep this boundary only for quantized replicated inputs.
             x_l = lax.optimization_barrier(x_l)
         rows_bf16 = x_l.astype(jnp.bfloat16)
-        if form.quantized_activations:
+        if lane_quant:
+            # Quantized straight into the wire's [rows, lane blocks, 128]
+            # view: quantizing [rows, hidden] and reshaping costs a relayout
+            # copy of the fp8 rows. Same values (a row max and elementwise).
+            q_l, row_scale_l = rowquant_fp8(
+                rows_bf16.reshape(
+                    t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK
+                ),
+                axes=(-2, -1),
+            )
+            row_scale_l = row_scale_l.reshape(t_local, 1)
+        elif form.quantized_activations:
             q_l, row_scale_l = rowquant_fp8(rows_bf16)
         else:
             # The rows go on the wire as they arrived. There is no scale to
@@ -1555,6 +1571,7 @@ def fused_ep_moe_v2(
         decode_combine,
         pallas_restore,
         fused_select,
+        lane_quant,
     )
     body, out_specs = {
         "fused": (decode_fn if decode_glue else local_fn, P(ax)),
