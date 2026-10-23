@@ -5191,6 +5191,11 @@ class TPUModelRunner(GPUModelRunner):
         return async_output
 
     def load_model(self) -> None:
+        from vllm_torchtpu.models.vllm import scan_layers
+
+        if scan_layers.enabled():
+            # Before the model is built: the compile wrapper binds `forward` at init.
+            scan_layers.install()
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
@@ -5220,6 +5225,8 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        if scan_layers.enabled():
+            scan_layers.prepare(self.model)
         if self.is_pooling_model:
             self._resolve_static_pooler()
         if self.parallel_config.pipeline_parallel_size > 1:

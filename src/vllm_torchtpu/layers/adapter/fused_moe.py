@@ -18,6 +18,7 @@ import functools
 from collections.abc import Callable
 from typing import Any
 
+import jax
 import torch
 from torch_tpu._internal import pallas
 
@@ -157,6 +158,7 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
+    layered: bool = False,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -182,6 +184,29 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
     )
+    if layered:
+        # Layer-stacked expert weights plus a trailing layer-index operand.
+        base_fn = wrapped_fn
+
+        def wrapped_fn(
+            hidden_states: jax.Array,
+            w1: jax.Array,
+            w2: jax.Array,
+            w1_scale: jax.Array | None,
+            w2_scale: jax.Array | None,
+            w1_bias: jax.Array | None,
+            w2_bias: jax.Array | None,
+            topk_weights: jax.Array,
+            topk_ids: jax.Array,
+            experts_start: jax.Array | None,
+            layer_index: jax.Array,
+        ) -> jax.Array:
+            return base_fn(
+                hidden_states, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias,
+                topk_weights, topk_ids, experts_start, layer_index=layer_index,
+            )
+    else:
+        wrapped_fn = functools.partial(wrapped_fn, layer_index=None)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
@@ -192,7 +217,7 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens, layered)
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -204,10 +229,11 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    layered: bool = False,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens, layered)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -217,6 +243,7 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        layered=layered,
     )
 
 
@@ -253,8 +280,13 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    layer_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
+
+    With ``layer_index`` set, the expert weights/scales/biases carry a leading
+    layer dimension (a scanned decoder's stacks) and the kernel reads that
+    layer in place instead of taking a materialized per-layer slice.
 
     ``experts_start`` is the first global expert id owned by this shard under
     linear EP placement (or ``None`` for non-EP) -- see
@@ -273,6 +305,7 @@ def fused_moe_gmm(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        layered=layer_index is not None,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
@@ -290,4 +323,5 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+        *(() if layer_index is None else (layer_index,)),
     )

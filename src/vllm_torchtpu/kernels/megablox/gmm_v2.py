@@ -819,6 +819,24 @@ def zero_out_end(
     ).wait()
 
 
+def _kernel_main_layered(
+    lhs_group_sizes_ref: jax.Array,
+    group_offset_ref: jax.Array,
+    layer_base_ref: jax.Array,  # int32[1]: layer * size_group
+    lhs_ref: jax.Array,
+    rhs_ref: WeightsRef,  # [num_layers * size_group, ...]
+    *args,
+    cfgs: GmmConfigs,
+):
+    """kernel_main over one layer of a layer-stacked rhs, sliced in place."""
+    base = layer_base_ref[0]
+    size_group = cfgs.dims.size_group
+    rhs_ref = jax.tree.map(lambda r: r.at[pl.ds(base, size_group)], rhs_ref)
+    return kernel_main(
+        lhs_group_sizes_ref, group_offset_ref, lhs_ref, rhs_ref, *args, cfgs=cfgs
+    )
+
+
 def kernel_main(
     # Scalar prefetch
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
@@ -1284,6 +1302,7 @@ def gmm_v2(
     rhs_scale: jax.Array | None = None,  # [size_group, num_blocks, 1, out_size]
     rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
     group_offset: jax.Array | None = None,  # int32[1]
+    rhs_layer: jax.Array | None = None,  # int32 scalar or [1]
     *,
     tile_info: TileSizes | TileFn = calculate_tiling,
     vmem_limit_bytes: int | None = None,
@@ -1309,6 +1328,11 @@ def gmm_v2(
         rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
         rhs_bias: The rhs bias of shape [size_group, 1, out_size].
         group_offset: Optional. The group offset of shape [1,].
+        rhs_layer: Optional layer index. When set, `rhs` (and `rhs_scale` /
+            `rhs_bias`) carry a leading layer dimension, [num_layers,
+            size_group, ...], and the kernel reads layer `rhs_layer` in place
+            through a ref slice. Lets a scanned decoder pass its stacked expert
+            weights without materializing the per-layer slice.
         tile_info: The tile sizes or tile function to use.
         vmem_limit_bytes: Optional vmem limit in bytes.
         precision: Unused. Exists for compatibility reasons.
@@ -1344,11 +1368,28 @@ def gmm_v2(
     if vmem_limit_bytes is None:
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
+    layer_base = None
+    cfg_rhs, cfg_rhs_scale, cfg_rhs_bias = rhs, rhs_scale, rhs_bias
+    if rhs_layer is not None:
+        num_layers, size_group = rhs.shape[:2]
+
+        def _flatten(x):
+            return None if x is None else x.reshape(num_layers * size_group, *x.shape[2:])
+
+        rhs, rhs_scale, rhs_bias = _flatten(rhs), _flatten(rhs_scale), _flatten(rhs_bias)
+        # Shape/dtype stand-ins for one layer (static slices, never read).
+        cfg_rhs = rhs[:size_group]
+        cfg_rhs_scale = None if rhs_scale is None else rhs_scale[:size_group]
+        cfg_rhs_bias = None if rhs_bias is None else rhs_bias[:size_group]
+        layer_base = (
+            jnp.asarray(rhs_layer, jnp.int32).reshape((1,)) * jnp.int32(size_group)
+        )
+
     cfgs = make_gmm_configs(
         lhs,
-        rhs,
-        rhs_scale,
-        rhs_bias,
+        cfg_rhs,
+        cfg_rhs_scale,
+        cfg_rhs_bias,
         group_sizes,
         group_offset,
         tile_info=tile_info,
@@ -1417,11 +1458,18 @@ def gmm_v2(
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
+    if layer_base is None:
+        kernel = functools.partial(kernel_main, cfgs=cfgs)
+        scalar_args = (group_sizes, group_offset)
+    else:
+        kernel = functools.partial(_kernel_main_layered, cfgs=cfgs)
+        scalar_args = (group_sizes, group_offset, layer_base)
+
     return pl.pallas_call(
-        functools.partial(kernel_main, cfgs=cfgs),
+        kernel,
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=len(scalar_args),
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),
                 WeightsRef(
@@ -1440,4 +1488,4 @@ def gmm_v2(
         name=get_scope_name(cfgs),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]
+    )(*scalar_args, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]

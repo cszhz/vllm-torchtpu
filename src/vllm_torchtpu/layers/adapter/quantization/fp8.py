@@ -1116,6 +1116,30 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
         )
+        scan_layer_index = getattr(layer, "_tpu_scan_layer_index", None)
+        if scan_layer_index is not None:
+            # Scanned decoder: the expert weights are the layer stacks
+            # [L, E, ...] and the GMM reads layer `scan_layer_index` in place.
+            topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+                topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                    topk_ids, topk_weights, is_local_tensor=False
+                )
+            return fused_moe_gmm(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                w1_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                w1_bias=getattr(layer, "w13_bias", None),
+                w2_bias=getattr(layer, "w2_bias", None),
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                experts_start=layer._experts_start,
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                layer_index=scan_layer_index,
+            )
         # The fused EP kernel takes this rank's own tokens and returns this
         # rank's own tokens: it routes, exchanges, computes and combines inside
         # one program. Keyed on the same predicate `supports_internal_mk` uses,

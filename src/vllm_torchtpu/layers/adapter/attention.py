@@ -1300,6 +1300,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             kv_cache_bundle.copy_(new_bundle)
             return output
 
+        # Functional variant (returns the updated bundle) for scanned layers.
+        rpa_kernel_bundled_impl.functional_op = rpa_kernel_op
         self._bundled_kernel_registry[registry_key] = rpa_kernel_bundled_impl
         return rpa_kernel_bundled_impl
 
@@ -1639,6 +1641,65 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if output is not None:
             output.copy_(outputs)
         return outputs
+
+
+def _forward_bundled_functional(
+    self,
+    layer: AttentionLayer,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache_bundle: torch.Tensor,
+    layer_idx: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bundled RPA attention that returns `(output, new_bundle)` without mutation.
+
+    Used by `scan_layers`, where the bundle is a scan carry and `layer_idx` a
+    scanned scalar, so the layer body stays functional.
+    """
+    q_len = query.shape[0]
+    query = query.reshape(q_len, self.num_heads, self.head_size)
+    key = key.reshape(q_len, self.num_kv_heads, self.head_size)
+    value = value.reshape(q_len, self.num_kv_heads, self.head_size)
+    if self._pool_is_seq_along_lane:
+        pool_head_dim = kv_cache_bundle.shape[-3] * kv_cache_bundle.shape[-2]
+    else:
+        pool_head_dim = kv_cache_bundle.shape[-1]
+    if pool_head_dim > self.head_size:
+        pad_size = pool_head_dim - self.head_size
+        query = torch.nn.functional.pad(query, (0, pad_size))
+        key = torch.nn.functional.pad(key, (0, pad_size))
+        value = torch.nn.functional.pad(value, (0, pad_size))
+    if self.kv_cache_quantized_dtype:
+        key, quantized_value = quantize_kv(
+            self.kv_cache_quantized_dtype,
+            key,
+            value,
+            layer._k_scale_float,
+            layer._v_scale_float,
+        )
+        assert quantized_value is not None
+        value = quantized_value
+    assert self.rpa_kernel_bundled is not None
+    new_bundle, outputs = self.rpa_kernel_bundled.functional_op(
+        kv_cache_bundle,
+        layer_idx,
+        query,
+        key,
+        value,
+        attn_metadata.seq_lens,
+        attn_metadata.block_tables,
+        attn_metadata.query_start_loc,
+        attn_metadata.request_distribution,
+        self.sinks,
+    )
+    if outputs.shape[-1] > self.head_size:
+        outputs = outputs[..., : self.head_size]
+    return outputs, new_bundle
+
+
+PallasAttentionBackendImpl.forward_bundled_functional = _forward_bundled_functional
 
 
 class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):

@@ -195,6 +195,7 @@ def gmm_wrapper(
     fuse_act=None,
     preferred_element_type=None,
     rhs_quant_dtype=None,
+    rhs_layer=None,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -215,6 +216,7 @@ def gmm_wrapper(
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
         rhs_quant_dtype=rhs_quant_dtype,
+        rhs_layer=rhs_layer,
     )
 
 
@@ -429,6 +431,7 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    rhs_layer: jax.Array | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -448,9 +451,11 @@ def moe_gmm(
         zero_initialize=False,
         fuse_act=activation,
         rhs_quant_dtype=rhs_quant_dtype,
+        rhs_layer=rhs_layer,
     )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+    w2_k = w2.shape[-2]
+    gmm1_res = gmm1_res[:, : w2_k * packing_factor]
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
@@ -465,6 +470,7 @@ def moe_gmm(
         zero_initialize=False,
         preferred_element_type=x.dtype,
         rhs_quant_dtype=rhs_quant_dtype,
+        rhs_layer=rhs_layer,
     )
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
@@ -607,8 +613,12 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    layer_index: jax.Array | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
+
+    With ``layer_index`` set, the expert weights (and scales/biases) carry a
+    leading layer dimension and the GMMs read that layer in place.
 
     For linear EP placement, ``experts_start`` is the first global expert id
     owned by this shard, passed as a 0-d int32 array (real traced data, not a
@@ -630,17 +640,19 @@ def fused_moe_func(
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
     # expected by gmm_v2.
-    if w1_scale is not None and w1_scale.ndim == 3:
-        w1_scale = jnp.expand_dims(w1_scale, 2)
-    if w2_scale is not None and w2_scale.ndim == 3:
-        w2_scale = jnp.expand_dims(w2_scale, 2)
+    lead = 0 if layer_index is None else 1
+    if w1_scale is not None and w1_scale.ndim == 3 + lead:
+        w1_scale = jnp.expand_dims(w1_scale, 2 + lead)
+    if w2_scale is not None and w2_scale.ndim == 3 + lead:
+        w2_scale = jnp.expand_dims(w2_scale, 2 + lead)
 
     num_tokens, hidden_size = hidden_states.shape
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
     # regime from the block size: block-16 -> W4A16, block >= MXU -> W4A8.
-    _, padded_hidden_size, _ = w1.shape
+    padded_hidden_size, _ = w1.shape[-2:]
+    num_local_experts = w1.shape[lead]
     packing_factor = get_packing_factor(w1.dtype, rhs_quant_dtype)
     padded_hidden_size *= packing_factor
 
@@ -662,13 +674,13 @@ def fused_moe_func(
 
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
+        valid = (local_ids >= 0) & (local_ids < num_local_experts)
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
-    if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
+    if layer_index is None and 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
         hidden_states,
         w1,
         w2,
@@ -696,7 +708,7 @@ def fused_moe_func(
         hidden_states,
         topk_ids,
         topk_weights,
-        local_num_experts=w1.shape[0],
+        local_num_experts=num_local_experts,
         topk=topk,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
@@ -724,5 +736,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        rhs_layer=layer_index,
     )
     return x[:num_tokens, :hidden_size]
