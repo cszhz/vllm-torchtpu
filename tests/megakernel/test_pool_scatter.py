@@ -464,7 +464,7 @@ def test_scatter_input_validation_and_pos_debug_check():
         )
 
     # 4. ckpt_indices with K < T is rejected
-    with pytest.raises(ValueError, match="ckpt_indices last dim K=1 must be >= T"):
+    with pytest.raises(ValueError, match="ckpt_indices last dim K=1 must be >= 2"):
         pool.scatter_pool_states(
             lay, ex, raw_r0, pos, pt, knew, vnew, conv, rec, ckpt[..., :1]
         )

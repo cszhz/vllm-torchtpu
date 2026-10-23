@@ -116,8 +116,7 @@ def check_ckpt_bounds(
             )
         if ckpt_indices.shape[-1] < min_k:
             raise ValueError(
-                f"ckpt_indices last dim K={ckpt_indices.shape[-1]} "
-                f"must be >= T ({min_k})"
+                f"ckpt_indices last dim K={ckpt_indices.shape[-1]} must be >= {min_k}"
             )
         if read_offsets is not None and read_offsets.shape not in (
             (ns,),
