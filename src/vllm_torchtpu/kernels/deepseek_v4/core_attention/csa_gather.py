@@ -29,6 +29,12 @@ from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 # so their gathers do not all hit one row.
 PAD_PAGE_PRIME = 104729
 PAD_OFFSET_PRIME = 15485863
+# The inner pipeline issues step `r + 1`'s gathers before running step `r`,
+# so step `r` looks up the rows of step `r + 2`, under its own DMAs; only the
+# first two steps' lookups run ahead of the gather.
+LOOKUP_STEPS_AHEAD = 2
+# 16-entry vectors per software-pipelined iteration of the lookup loop.
+LOOKUP_UNROLL = 8
 # Words of a vector subcore's VMEM `csa_gather_topk` may spend on its copies
 # of the page table and the token -> sequence map.
 LOOKUP_VMEM_WORDS = 64 * 1024
@@ -48,36 +54,47 @@ class TopkLookup:
 
 
 def _lookup_rows(
-    topk_ref, idx_ref, seq_ref, table_ref, *, token, lookup, top_k, num_lanes
+    topk_ref,
+    idx_ref,
+    seq_ref,
+    table_ref,
+    *,
+    token,
+    lookup,
+    top_k,
+    num_lanes,
+    first=0,
+    count=None,
 ):
-    """Writes the cache rows of `token`'s top-k entries to `idx_ref`.
+    """Writes the cache rows of `token`'s top-k entries `[first, first +
+    count)` (default: all) to `idx_ref`.
 
     Entry `x` >= 0 is a compressed token of the token's sequence `s` and
     reads row `page_table[s, x // page_size] * page_size + x % page_size`. A
     -1 entry reads a row spread by its flat index `token * top_k + k`. Both
     are the exact int32 expressions the TensorCore used to evaluate.
     """
+    count = top_k if count is None else count
     page_shift = lookup.page_size.bit_length() - 1
     seq = plsc.load_gather(seq_ref, [jnp.full((num_lanes,), token, jnp.int32)])
     base = jnp.clip(seq, 0, lookup.num_seqs - 1) * lookup.pages_per_seq
     lane = lax.broadcasted_iota(jnp.int32, (num_lanes,), 0)
+    segment_words = csa_cache_layout.ROW_WORDS
 
-    def segment(j):
-        for u in range(csa_cache_layout.ROW_WORDS // num_lanes):
-            k = j * csa_cache_layout.ROW_WORDS + u * num_lanes
-            x = topk_ref[0, j, 0, pl.ds(u * num_lanes, num_lanes)]
-            page = jnp.clip(
-                lax.shift_right_arithmetic(x, page_shift), 0, lookup.pages_per_seq - 1
-            )
-            phys = plsc.load_gather(table_ref, [base + page])
-            row = phys * lookup.page_size + (x & (lookup.page_size - 1))
-            flat = token * top_k + k + lane
-            pad_page = (flat * PAD_PAGE_PRIME) % lookup.total_pages
-            pad_offset = (flat * PAD_OFFSET_PRIME) & (lookup.page_size - 1)
-            pad_row = pad_page * lookup.page_size + pad_offset
-            idx_ref[pl.ds(k, num_lanes)] = jnp.where(x == -1, pad_row, row)
-
-    plsc.parallel_loop(0, top_k // csa_cache_layout.ROW_WORDS)(segment)
+    @plsc.parallel_loop(0, count // num_lanes, unroll=LOOKUP_UNROLL)
+    def _(v):
+        k = first + v * num_lanes
+        x = topk_ref[0, k // segment_words, 0, pl.ds(k % segment_words, num_lanes)]
+        page = jnp.clip(
+            lax.shift_right_arithmetic(x, page_shift), 0, lookup.pages_per_seq - 1
+        )
+        phys = plsc.load_gather(table_ref, [base + page])
+        row = phys * lookup.page_size + (x & (lookup.page_size - 1))
+        flat = token * top_k + k + lane
+        pad_page = (flat * PAD_PAGE_PRIME) % lookup.total_pages
+        pad_offset = (flat * PAD_OFFSET_PRIME) & (lookup.page_size - 1)
+        pad_row = pad_page * lookup.page_size + pad_offset
+        idx_ref[pl.ds(k, num_lanes)] = jnp.where(x == -1, pad_row, row)
 
 
 def _topk_row_spec(lookup, top_k, num_cores, core_index):
@@ -191,6 +208,23 @@ def main_kernel(
 
         # int32 rows produced per stream in the rope output (2 tokens per row).
         rope_rows_per_stream = row_subchunk_size // 2
+        num_steps = num_row_subchunks // num_streams
+        step_entries = num_streams * row_subchunk_size
+
+        def lookup_step_rows(step, steps):
+            """Rows of the entries inner steps `[step, step + steps)` gather."""
+            _lookup_rows(
+                in_ref,
+                idx_vmem_ref,
+                seq_vmem_ref,
+                table_vmem_ref,
+                token=lookup.token_start + b * num_cores + core_index,
+                lookup=lookup,
+                top_k=top_k,
+                num_lanes=num_simd_lanes,
+                first=step * step_entries,
+                count=steps * step_entries,
+            )
 
         def _body(*refs):
             r = pl.program_id(0)
@@ -215,6 +249,12 @@ def main_kernel(
                 )
                 copy.start()
                 nope_copies.append(copy)
+
+            if lookup is not None and num_steps > LOOKUP_STEPS_AHEAD:
+
+                @pl.when(r + LOOKUP_STEPS_AHEAD < num_steps)
+                def _():
+                    lookup_step_rows(r + LOOKUP_STEPS_AHEAD, 1)
 
             for s in range(num_streams):
                 process_rope(
@@ -270,19 +310,10 @@ def main_kernel(
         @pl.when(run)
         def _run_gather():
             if lookup is not None:
-                _lookup_rows(
-                    in_ref,
-                    idx_vmem_ref,
-                    seq_vmem_ref,
-                    table_vmem_ref,
-                    token=lookup.token_start + b * num_cores + core_index,
-                    lookup=lookup,
-                    top_k=top_k,
-                    num_lanes=num_simd_lanes,
-                )
+                lookup_step_rows(0, min(LOOKUP_STEPS_AHEAD, num_steps))
             pltpu.emit_pipeline(
                 _body,
-                grid=(num_row_subchunks // num_streams,),
+                grid=(num_steps,),
                 in_specs=nope_in_specs + rope_in_specs,
                 out_specs=(rope_out_spec,),
             )(
