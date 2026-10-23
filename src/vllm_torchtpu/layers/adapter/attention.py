@@ -1507,6 +1507,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pool_head_dim = self.head_size
         elif self._pool_is_seq_along_lane:
             pool_head_dim = kv_cache.shape[-3] * kv_cache.shape[-2]
+        elif self.head_size == 64 and tuple(kv_cache.shape[-4:]) == tuple(
+            PallasAttentionBackend.get_kv_cache_shape(
+                1, kv_cache.shape[-4], self.num_kv_heads, 64, kv_cache.dtype
+            )[1:]
+        ):
+            # The head_dim==64 page packs K and V along its last axis, so that
+            # axis is twice the head width. Padding to it would route the
+            # query to the head_dim!=64 kernel, which reads another layout.
+            pool_head_dim = self.head_size
         else:
             pool_head_dim = kv_cache.shape[-1]
         if pool_head_dim > self.head_size:
