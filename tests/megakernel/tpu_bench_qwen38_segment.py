@@ -173,18 +173,22 @@ def run_bucket(
     # Device clock: n chained calls inside one jit; the residual is the loop
     # carry, so XLA cannot hoist the kernel out of the loop.
     def dev_chain(n: int):
-        def body(_, h):
-            return step(pos, h, w_mk, states, attn)[1][RESIDUAL_OUT]
+        # Weights, states and inputs are arguments, not closure constants
+        # (closing over them embeds GBs of constants in the program).
+        def run(h, p, w, st, a):
+            return jax.lax.fori_loop(
+                0, n, lambda _, x: step(p, x, w, st, a)[1][RESIDUAL_OUT], h
+            )
 
-        return jax.jit(lambda h: jax.lax.fori_loop(0, n, body, h))
+        return jax.jit(run)
 
     dev_fns = {n: dev_chain(n) for n in chains}
     for f in dev_fns.values():
-        f(hid).block_until_ready()
+        f(hid, pos, w_mk, states, attn).block_until_ready()
 
     def dev_time(n: int) -> float:
         t = time.perf_counter()
-        dev_fns[n](hid).block_until_ready()
+        dev_fns[n](hid, pos, w_mk, states, attn).block_until_ready()
         return time.perf_counter() - t
 
     dbest = {n: min(dev_time(n) for _ in range(5)) for n in chains}
