@@ -56,6 +56,8 @@ HCA_FUSED_Q_COMPUTE_BLOCK_SIZE = 16
 # Queries per block of the HCA-fused SWA mixed kernel. Each 32 of them attend
 # over the window a 32-query block would read (`num_queries_per_view`).
 HCA_FUSED_QUERIES_PER_BLOCK = 128
+# The same for the SWA-only mixed kernels of CSA and SWA layers.
+SWA_FOLDED_QUERIES_PER_BLOCK = 128
 
 logger.info(
     "DeepSeek-V4 attention: HCA pass fused into the SWA kernels for kv blocks "
@@ -82,7 +84,9 @@ def _run_swa(
     verify_q_len: int | None = None,
     lane_padded_lm: bool = False,
     q_compute_block_size: int = 4,
-    num_queries_per_block: tuple[int, int, int] = SWA_QUERIES_PER_BLOCK,
+    num_queries_per_block: tuple[int, int, int] = SWA_QUERIES_PER_BLOCK[:2]
+    + (SWA_FOLDED_QUERIES_PER_BLOCK,),
+    num_queries_per_view: int = SWA_QUERIES_PER_BLOCK[2],
     **hca,
 ) -> tuple[jax.Array, ...]:
     """Sliding-window pass: updates the SWA cache and returns its partials.
@@ -116,6 +120,7 @@ def _run_swa(
         num_kv_pages_per_block=SWA_KV_PAGES_PER_BLOCK,
         num_queries_per_block=num_queries_per_block,
         q_compute_block_size=q_compute_block_size,
+        num_queries_per_view=num_queries_per_view,
         unnormalized_output=not swa_only,
         non_causal_block=non_causal_block,
         chunk_prefill_size=verify_q_len,
@@ -238,7 +243,6 @@ def _attention_hca(
                 q_compute_block_size=HCA_FUSED_Q_COMPUTE_BLOCK_SIZE,
                 num_queries_per_block=SWA_QUERIES_PER_BLOCK[:2]
                 + (HCA_FUSED_QUERIES_PER_BLOCK,),
-                num_queries_per_view=SWA_QUERIES_PER_BLOCK[2],
             )
             if hca
             else {}
