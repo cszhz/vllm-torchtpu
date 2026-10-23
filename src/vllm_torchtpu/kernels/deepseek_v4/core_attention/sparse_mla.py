@@ -764,8 +764,8 @@ def prepare_q_inputs(
 
 def prepare_swa_inputs(
     swa_accumution: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
-    swa_l: jax.Array,  # [max_num_tokens, num_q_heads]
-    swa_m: jax.Array,  # [max_num_tokens, num_q_heads]
+    swa_l: jax.Array,  # [max_num_tokens, num_q_heads or num_l_heads]
+    swa_m: jax.Array,  # [max_num_tokens, num_q_heads or num_l_heads]
 ):
     _, actual_num_q_heads, actual_head_dim = swa_accumution.shape
     swa_packing = get_dtype_packing(swa_accumution.dtype)
@@ -781,11 +781,13 @@ def prepare_swa_inputs(
         constant_values=0,
     )
     num_l_heads = align_to(num_q_heads, 128)
+    # l/m may already come at the kernel's 128 lanes (`lane_padded_lm`); the
+    # kernel reads only the first num_q_heads of them.
     swa_l = jnp.pad(
         swa_l,
         (
             (0, 0),
-            (0, num_l_heads - actual_num_q_heads),
+            (0, num_l_heads - swa_l.shape[1]),
         ),
         constant_values=0,
     )
@@ -793,7 +795,7 @@ def prepare_swa_inputs(
         swa_m,
         (
             (0, 0),
-            (0, num_l_heads - actual_num_q_heads),
+            (0, num_l_heads - swa_m.shape[1]),
         ),
         constant_values=0,
     )
