@@ -61,6 +61,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
 )
 from vllm_torchtpu.kernels.fused_moe.v2.plan_kernel import (
     build_decode_combine,
+    build_decode_combine_restore,
     build_decode_plan,
     decode_plan_supported,
 )
@@ -400,6 +401,7 @@ def fused_ep_moe_v2(
     fused_select=False,
     lane_quant=False,
     oneshot_gather=False,
+    combine_restore=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -509,7 +511,10 @@ def fused_ep_moe_v2(
     128] view (hwanginho f687714b0), so the reshape is not a relayout copy.
     oneshot_gather (needs merge_exchange) moves the merged payload with the
     one-shot Pallas all-gather (small_collectives.oneshot_gather) instead of
-    XLA's all-gather. All
+    XLA's all-gather. combine_restore (needs decode_combine and
+    pallas_restore in effect) runs the combine and the TP restore as one
+    Pallas call that pushes each member's summed rows straight into every
+    member's output. All
     apply only to the fused stage at or below SMALL_BATCH_LOCAL_TOKENS local
     tokens and change no value.
     """
@@ -698,6 +703,12 @@ def fused_ep_moe_v2(
             topk=topk,
             shard_stride=ragged_stride,
         )
+    )
+    combine_restore = (
+        bool(combine_restore)
+        and decode_combine
+        and pallas_restore
+        and len(token_layout.groups[0]) > 1
     )
     decode_glue = (
         merge_exchange
@@ -1458,6 +1469,22 @@ def fused_ep_moe_v2(
             rank=rank_l,
         )
 
+        if combine_restore:
+            g_rank, g_peers = token_layout.group_operands(me)
+            restored = build_decode_combine_restore(
+                arrivals,
+                arrival_scales,
+                pos,
+                mirror_pos,
+                topk_weights,
+                row_routes,
+                x_l.dtype,
+                num_cores=len(token_layout.groups[0]),
+                axis=ax,
+                rank=g_rank,
+                peers=g_peers,
+            )
+            return restored.reshape(-1, hidden)[: token_layout.input_rows]
         combined = _combine_arrivals(
             arrivals,
             arrival_scales,
@@ -1614,6 +1641,7 @@ def fused_ep_moe_v2(
         fused_select,
         lane_quant,
         oneshot_gather,
+        combine_restore,
     )
     body, out_specs = {
         "fused": (decode_fn if decode_glue else local_fn, P(ax)),

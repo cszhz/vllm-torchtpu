@@ -356,6 +356,9 @@ _DECODE_GLUE = {
     "select": dict(fused_select=True),
     "lane": dict(lane_quant=True),
     "merged_oneshot": dict(merge_exchange=True, oneshot_gather=True),
+    "combine_restore": dict(
+        decode_combine=True, pallas_restore=True, combine_restore=True
+    ),
     "all": dict(
         merge_exchange=True,
         onehot_scatter=True,
@@ -365,6 +368,7 @@ _DECODE_GLUE = {
         fused_select=True,
         lane_quant=True,
         oneshot_gather=True,
+        combine_restore=True,
     ),
 }
 

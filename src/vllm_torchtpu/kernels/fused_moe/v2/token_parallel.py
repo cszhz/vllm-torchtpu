@@ -105,6 +105,19 @@ class TokenReplicaLayout:
             rows, slot * self.local_rows, self.local_rows, axis=0
         )
 
+    def group_operands(self, me: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """(this core's position in its group [1], the group's mesh indices
+        [n]) for core ``me`` (its mesh index, as data)."""
+        group_of = [0] * len(self.slots)
+        for g, group in enumerate(self.groups):
+            for rank in group:
+                group_of[rank] = g
+        peers = jnp.asarray(self.groups, jnp.int32)[
+            jnp.asarray(group_of, jnp.int32)[me]
+        ]
+        rank = jnp.asarray(self.slots, jnp.int32)[me].reshape(1)
+        return rank, peers
+
     def restore(
         self, rows: jax.Array, axis: str, *, me: jax.Array | None = None
     ) -> jax.Array:

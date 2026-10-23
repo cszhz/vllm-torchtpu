@@ -192,6 +192,7 @@ def _build_op(
     fused_select=False,
     lane_quant=False,
     oneshot_gather=False,
+    combine_restore=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -225,6 +226,7 @@ def _build_op(
         fused_select,
         lane_quant,
         oneshot_gather,
+        combine_restore,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -246,6 +248,7 @@ def _build_op(
         fused_select=fused_select,
         lane_quant=lane_quant,
         oneshot_gather=oneshot_gather,
+        combine_restore=combine_restore,
     )
 
     # Any: the layer, route or compute result depending on bias_kw's stage;
@@ -1061,13 +1064,14 @@ def prebuild_fused_moe_ep(
         fused_select=envs.MOE_FUSED_EP_V2_FUSED_SELECT,
         lane_quant=envs.MOE_FUSED_EP_V2_LANE_QUANT,
         oneshot_gather=envs.MOE_FUSED_EP_V2_ONESHOT_GATHER,
+        combine_restore=envs.MOE_FUSED_EP_V2_COMBINE_RESTORE,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
         "token_replica_groups=%s decode_glue(merged=%s onehot=%s plan=%s "
-        "combine=%s restore=%s select=%s lane_quant=%s oneshot=%s)",
+        "combine=%s restore=%s select=%s lane_quant=%s oneshot=%s combine_restore=%s)",
         hidden,
         inter,
         local_experts,
@@ -1092,6 +1096,7 @@ def prebuild_fused_moe_ep(
         envs.MOE_FUSED_EP_V2_FUSED_SELECT,
         envs.MOE_FUSED_EP_V2_LANE_QUANT,
         envs.MOE_FUSED_EP_V2_ONESHOT_GATHER,
+        envs.MOE_FUSED_EP_V2_COMBINE_RESTORE,
     )
     # Chunked collection stops applying the moment this arms: the fused call
     # returns before `apply_monolithic` reaches the chunked path, and the

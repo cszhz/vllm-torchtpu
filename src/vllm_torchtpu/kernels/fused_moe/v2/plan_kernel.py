@@ -525,3 +525,178 @@ def build_decode_combine(arrivals, arrival_scales, pos, mirror_pos, weights, out
         pltpu.with_memory_space_constraint(arrivals, hbm),
         pltpu.with_memory_space_constraint(arrival_scales, hbm),
     )
+
+
+# Barrier semaphore group of the fused combine + restore: the fused EP MoE
+# kernel uses 0, the small all-reduce 5, the small all-gather 6 and the
+# one-shot gather 7.
+COMBINE_RESTORE_COLLECTIVE_ID = 8
+
+
+def _combine_restore_kernel(
+    rank_ref,
+    peers_ref,
+    tables_hbm,
+    arr_hbm,
+    scale_hbm,
+    out_hbm,
+    tables_sm,
+    rows_vm,
+    scales_vm,
+    sums_vm,
+    sems,
+    *,
+    t_local,
+    topk,
+    tile_m,
+    out_dtype,
+    n_cores,
+    axis,
+):
+    from vllm_torchtpu.kernels.experimental.small_collectives.common import (
+        MESH,
+        Group,
+        wait_bytes_of,
+    )
+
+    n = t_local * topk
+    me = rank_ref[0]
+    group = Group(n_cores, axis, True, peers_ref)
+    # Split barrier: signal every member now, wait only before the pushes,
+    # so its round trip hides under the row fetches and the sum.
+    barrier = pltpu.get_barrier_semaphore()
+    for j in range(n_cores):
+        pl.semaphore_signal(
+            barrier, 1, device_id=group.device_id(j), device_id_type=MESH
+        )
+    fetch = pltpu.make_async_copy(tables_hbm, tables_sm, sems.at[2])
+    fetch.start()
+    fetch.wait()
+    recv_rows = arr_hbm.shape[0]
+    mirror_elems = scale_hbm.shape[0] * tile_m
+    shift = pow2_shift(tile_m, "tile_m")
+    mirror = [jnp.minimum(tables_sm[n + p], mirror_elems - 1) for p in range(n)]
+    copies = []
+    for p in range(n):
+        row = jnp.minimum(tables_sm[p], recv_rows - 1)
+        sub = jnp.right_shift(mirror[p], shift)
+        copies.append(pltpu.make_async_copy(arr_hbm.at[row], rows_vm.at[p], sems.at[0]))
+        copies.append(
+            pltpu.make_async_copy(
+                scale_hbm.at[pl.ds(sub, 1)], scales_vm.at[p], sems.at[1]
+            )
+        )
+    for c in copies:
+        c.start()
+    for c in copies:
+        c.wait()
+    lane = _iota((1, tile_m), 1)
+    for t in range(t_local):
+        acc = None
+        for k in range(topk):
+            p = t * topk + k
+            row_scale = jnp.sum(
+                jnp.where(lane == (mirror[p] & (tile_m - 1)), scales_vm[p], 0.0),
+                axis=1,
+                keepdims=True,
+            )
+            weight = lax.bitcast_convert_type(tables_sm[2 * n + p], jnp.float32)
+            term = rows_vm[p].astype(jnp.float32) * (row_scale * weight)
+            acc = term if acc is None else acc + term
+        # A row that routed nowhere read arrival rows nobody wrote: zero it,
+        # as the layer's jnp.where(row_routes, combined, 0) does.
+        routes = tables_sm[3 * n + t] != 0
+        sums_vm[t] = jnp.where(routes, acc.astype(out_dtype), jnp.zeros_like(acc, out_dtype))
+    pl.semaphore_wait(barrier, n_cores)
+    dst = out_hbm.at[pl.ds(me * t_local, t_local)]
+    for j in range(n_cores):
+
+        @pl.when(jnp.int32(j) != me)
+        def _(j=j):
+            pltpu.make_async_remote_copy(
+                src_ref=sums_vm,
+                dst_ref=dst,
+                send_sem=sems.at[3],
+                recv_sem=sems.at[4],
+                device_id=group.device_id(j),
+                device_id_type=MESH,
+            ).start()
+
+    local = pltpu.make_async_copy(sums_vm, dst, sems.at[0])
+    local.start()
+    wait_bytes_of(out_hbm.at[pl.ds(0, (n_cores - 1) * t_local)], sems.at[4])
+    wait_bytes_of(out_hbm.at[pl.ds(0, (n_cores - 1) * t_local)], sems.at[3])
+    local.wait()
+
+
+def build_decode_combine_restore(
+    arrivals,
+    arrival_scales,
+    pos,
+    mirror_pos,
+    weights,
+    row_routes,
+    out_dtype,
+    *,
+    num_cores,
+    axis,
+    rank,
+    peers,
+):
+    """build_decode_combine followed by the TP-group restore, as one call.
+
+    Each member sums its own t_local rows exactly as build_decode_combine
+    does (zeroing rows that route nowhere), then pushes them straight from
+    VMEM into its slot of every group member's output. Returns [num_cores *
+    t_local, lane blocks, 128] in group order on every member -- the bytes
+    small_all_gather would have produced from the combine's output, without
+    the second kernel, its VMEM staging or the HBM round trip between them.
+    rank (int32 [1]) is this core's position in its group, peers (int32
+    [num_cores]) each member's mesh index, both as data.
+    """
+    t_local, topk = pos.shape
+    _, lane_blocks, lanes = arrivals.shape
+    tile_m = arrival_scales.shape[1]
+    n = t_local * topk
+    hbm = pltpu.MemorySpace.HBM
+    tables = jnp.concatenate(
+        [
+            pos.astype(jnp.int32).reshape(n),
+            mirror_pos.astype(jnp.int32).reshape(n),
+            lax.bitcast_convert_type(weights.astype(jnp.float32), jnp.int32).reshape(n),
+            row_routes.astype(jnp.int32).reshape(t_local),
+        ]
+    )
+    kernel = functools.partial(
+        _combine_restore_kernel,
+        t_local=t_local,
+        topk=topk,
+        tile_m=tile_m,
+        out_dtype=out_dtype,
+        n_cores=num_cores,
+        axis=axis,
+    )
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    return pl.pallas_call(
+        kernel,
+        in_specs=[smem, smem] + [pl.BlockSpec(memory_space=hbm)] * 3,
+        out_specs=pl.BlockSpec(memory_space=hbm),
+        scratch_shapes=(
+            pltpu.SMEM((3 * n + t_local,), jnp.int32),
+            pltpu.VMEM((n, lane_blocks, lanes), arrivals.dtype),
+            pltpu.VMEM((n, 1, tile_m), jnp.float32),
+            pltpu.VMEM((t_local, lane_blocks, lanes), out_dtype),
+            pltpu.SemaphoreType.DMA((5,)),
+        ),
+        out_shape=hbm((num_cores * t_local, lane_blocks, lanes), out_dtype),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=COMBINE_RESTORE_COLLECTIVE_ID
+        ),
+        name=f"fused_ep_moe_v2_decode_combine_restore_n{num_cores}",
+    )(
+        rank.reshape(1).astype(jnp.int32),
+        peers.reshape(-1).astype(jnp.int32),
+        tables,
+        pltpu.with_memory_space_constraint(arrivals, hbm),
+        pltpu.with_memory_space_constraint(arrival_scales, hbm),
+    )
