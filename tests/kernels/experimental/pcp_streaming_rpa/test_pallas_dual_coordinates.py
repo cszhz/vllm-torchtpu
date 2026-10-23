@@ -196,6 +196,7 @@ def _run_real_pallas(
             page_size=kv_cache_local.shape[1],
             pcp_size=PCP_SIZE,
             interleave_size=INTERLEAVE_SIZE,
+            vpage_group_size=kernel.PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
             pcp_axis_name=AXIS,
         )
         return pallas_attention(
@@ -203,12 +204,12 @@ def _run_real_pallas(
             current_kv_local,
             kv_cache_local,
             kv_lens_local,
-            page_indices_local,
             cu_q_lens_local,
             distribution_local,
             local_stage_plan.segment_descriptors,
             local_stage_plan.num_segments,
             stage_plan=local_stage_plan,
+            vpage_group_size=kernel.PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
             pcp_size=PCP_SIZE,
             interleave_size=INTERLEAVE_SIZE,
             q_block_size=Q_BLOCK_SIZE,

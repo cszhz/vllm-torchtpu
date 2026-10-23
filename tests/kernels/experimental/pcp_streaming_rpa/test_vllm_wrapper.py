@@ -2,6 +2,15 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import inspect
 from types import SimpleNamespace
@@ -799,3 +808,57 @@ def test_reshape_packed_kv_cache_for_attention_rejects_ambiguous_layout():
 
     with pytest.raises(ValueError, match="packing does not match"):
         pcp_wrapper._reshape_packed_kv_cache_for_attention(kv_cache)
+
+
+@pytest.mark.parametrize(
+    ("q_per_kv", "expected_stacked"),
+    [(2, 2), (6, 2), (8, 8), (16, 16)],
+)
+def test_metadata_entry_caps_stacked_q_heads_at_q_per_kv(
+    monkeypatch, q_per_kv, expected_stacked
+):
+    captured = {"num_stacked_q_heads": 0}
+
+    def fake_attend(
+        _kv_cache_local, q_scaled_hm, _stage_plan, *, splash_cfg, **_kwargs
+    ):
+        captured["num_stacked_q_heads"] = splash_cfg.num_stacked_q_heads
+        return jnp.zeros_like(q_scaled_hm, dtype=jnp.float32)
+
+    monkeypatch.setattr(
+        pcp_kernel,
+        "_route_current_kv_to_captured_kv",
+        lambda kv_in, *_args, **_kwargs: kv_in,
+    )
+    monkeypatch.setattr(
+        pcp_kernel,
+        "write_captured_kv_to_local_cache",
+        lambda cache, *_args, **_kwargs: cache,
+    )
+    monkeypatch.setattr(pcp_kernel, "_attend_over_vpage_groups", fake_attend)
+
+    q_local = jnp.zeros((128, 2, q_per_kv, 128), dtype=jnp.bfloat16)
+    current_kv_local = jnp.zeros((128, 2, 2, 128), dtype=jnp.bfloat16)
+    kv_cache_local = jnp.zeros((4, 128, 2, 2, 128), dtype=jnp.bfloat16)
+    stage_plan = SimpleNamespace(
+        needs_reroute=jnp.asarray(False),
+        q_seg_ids=jnp.zeros((128,), dtype=jnp.int32),
+    )
+
+    pcp_kernel.pcp_streaming_attention_page_groups_packed_local_from_metadata(
+        q_local,
+        current_kv_local,
+        kv_cache_local,
+        jnp.asarray([128], dtype=jnp.int32),
+        jnp.asarray([0, 128], dtype=jnp.int32),
+        jnp.asarray([0, 0, 1], dtype=jnp.int32),
+        jnp.zeros((3, 8), dtype=jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+        stage_plan=stage_plan,
+        vpage_group_size=128,
+        pcp_size=8,
+        interleave_size=128,
+    )
+
+    assert captured["num_stacked_q_heads"] == expected_stacked
+    assert q_per_kv % captured["num_stacked_q_heads"] == 0

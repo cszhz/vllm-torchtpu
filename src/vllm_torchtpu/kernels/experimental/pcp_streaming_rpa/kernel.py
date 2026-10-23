@@ -3111,7 +3111,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         block_q=min(128, local_tokens),
         block_kv=512,
         block_kv_compute=256,
-        num_stacked_q_heads=min(16, q_heads),
+        num_stacked_q_heads=math.gcd(16, q_per_kv),
         use_base2_exp=True,
         q_prescaled_log2e=True,
     )
