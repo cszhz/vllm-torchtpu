@@ -22,6 +22,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
@@ -169,7 +170,9 @@ def _fp8_linear_pallas(
     """Decode rows with a measured (K, N) tiling go to the weight-streaming
     `fp8_skinny` kernel; every other call is `xla_quantized_matmul` unchanged."""
     if fp8_skinny.supports(x.shape[0], w_q, w_s):
-        return fp8_skinny.fp8_skinny_matmul(x, w_q, w_s, hbm_pin=hbm_pin)
+        return fp8_skinny.fp8_skinny_matmul(
+            x, w_q, w_s, hbm_pin=hbm_pin, scale_dma=envs.TPU_FP8_SKINNY_SCALE_DMA
+        )
     return xla_quantized_matmul(x, w_q, w_s)
 
 

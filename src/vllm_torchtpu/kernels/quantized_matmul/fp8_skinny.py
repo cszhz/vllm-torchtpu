@@ -117,8 +117,19 @@ def _kernel(
     nbuf,
     ndma,
     q_dtype,
+    scale_dma=False,
 ):
     rows = wbuf.shape[1] // ndma  # each tile moves as `ndma` row-band DMAs
+    ws_copy = None
+    if scale_dma:
+        # The per-channel scale arrives as an HBM ref: copy it here, issued ahead of
+        # the weight ring, so its latency hides under the first tiles' instead of
+        # sitting in an XLA copy right before the call.
+        ws_vmem, ws_sem = acc[-2], acc[-1]
+        acc = acc[:-2]
+        ws_copy = pltpu.make_async_copy(ws_ref, ws_vmem, ws_sem)
+        ws_copy.start()
+        ws_ref = ws_vmem
 
     def copies(j):
         slot = j % nbuf
@@ -158,6 +169,8 @@ def _kernel(
             y = jax.lax.dot_general(
                 xq_ref[...], w, dn, preferred_element_type=jnp.float32
             )
+            if ws_copy is not None and j == 0:
+                ws_copy.wait()
             o_ref[:, cols] = (y * xs_ref[...] * ws_ref[:, cols]).astype(o_ref.dtype)
         else:
             y = jax.lax.dot_general(
@@ -174,6 +187,8 @@ def _kernel(
             for c in copies(j + nbuf):
                 c.start()
     if split == "k":
+        if ws_copy is not None:
+            ws_copy.wait()
         o_ref[...] = (acc[0][...] * xs_ref[...] * ws_ref[...]).astype(o_ref.dtype)
 
 
@@ -187,7 +202,7 @@ def _vmem_limit(m, k, n, tile, nbuf, split):
 
 
 @functools.cache
-def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma):
+def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma, scale_dma=False):
     full = k if split == "k" else n
     if full % t or t % LANE:
         raise ValueError(
@@ -207,6 +222,8 @@ def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma):
     ]
     if split == "k":
         scratch.append(pltpu.VMEM((m, n), jnp.float32))
+    if scale_dma:
+        scratch += [pltpu.VMEM((1, n), jnp.float32), pltpu.SemaphoreType.DMA(())]
     kern = functools.partial(
         _kernel,
         split=split,
@@ -215,6 +232,7 @@ def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma):
         nbuf=nbuf,
         ndma=ndma,
         q_dtype=w_dtype,
+        scale_dma=scale_dma,
     )
     return pl.pallas_call(
         kern,
@@ -222,7 +240,9 @@ def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma):
         grid=(1,),
         in_specs=[
             pl.BlockSpec((m, k), lambda g: (0, 0)),
-            pl.BlockSpec((1, n), lambda g: (0, 0)),
+            pl.BlockSpec(memory_space=pltpu.HBM)
+            if scale_dma
+            else pl.BlockSpec((1, n), lambda g: (0, 0)),
             # The weight is an HBM ref inside the kernel. This alone does not stop
             # XLA staging the operand in VMEM first; see `hbm_pin`.
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -233,15 +253,17 @@ def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma):
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=_vmem_limit(m, k, n, tile, nbuf, split),
         ),
-        name=f"fp8_skinny_{split}{t}_b{nbuf}_d{ndma}_m{m}_k{k}_n{n}",
+        name=f"fp8_skinny_{split}{t}_b{nbuf}_d{ndma}{'_sd' if scale_dma else ''}_m{m}_k{k}_n{n}",
     )
 
 
-@functools.partial(jax.jit, static_argnums=(0,))
-def _call_hbm_pinned(call, x, w_s, w_q):
+@functools.partial(jax.jit, static_argnums=(0, 4))
+def _call_hbm_pinned(call, x, w_s, w_q, scale_in_hbm=False):
     # The constraint sets the operand aval's memory space, which pallas_call lowers
     # to the custom call's input memory space. It only binds a pallas_call input
     # and cannot run eagerly, hence the jit around both.
+    if scale_in_hbm:
+        w_s = pltpu.with_memory_space_constraint(w_s, pltpu.HBM)
     return call(x, w_s, pltpu.with_memory_space_constraint(w_q, pltpu.HBM))
 
 
@@ -252,6 +274,7 @@ def fp8_skinny_matmul(
     *,
     config: Config | None = None,
     hbm_pin: bool = False,
+    scale_dma: bool = False,
 ) -> jax.Array:
     """x [m, k] bf16, w_q fp8 [k, n] with n % 128 == 0, w_s f32 [n] -> [m, n] in
     x.dtype. `config` defaults to the measured table for (k, n).
@@ -260,14 +283,20 @@ def fp8_skinny_matmul(
     types the ref inside the kernel; XLA's memory-space assignment reads the
     operand's aval, so without the constraint it may stage the weight into VMEM
     with a copy before the call. Same kernel, same arithmetic: bit-identical.
+
+    `scale_dma` (with `hbm_pin`, N % 1024 == 0 so the [1, N] view of the 1-D scale
+    is a bitcast): the scale is an HBM operand copied in-kernel with the weight
+    ring, instead of a VMEM operand XLA stages with a copy just before the call
+    (~0.7 us exposed per call in the DSv4 decode twin). Bit-identical.
     """
     m, k = x.shape
     n = w_q.shape[1]
     if config is None:
         config = pick_config(m, k, n, hbm_pin)
     split, t, nbuf, ndma = config
-    call = _build(m, k, n, w_q.dtype, x.dtype, split, t, nbuf, ndma)
+    scale_dma = bool(scale_dma and hbm_pin and n % 1024 == 0)
+    call = _build(m, k, n, w_q.dtype, x.dtype, split, t, nbuf, ndma, scale_dma)
     w_s2 = w_s.reshape(1, n).astype(jnp.float32)
     if hbm_pin:
-        return _call_hbm_pinned(call, x, w_s2, w_q)
+        return _call_hbm_pinned(call, x, w_s2, w_q, scale_dma)
     return call(x, w_s2, w_q)

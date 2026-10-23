@@ -95,6 +95,7 @@ def test_placement_and_dma_split_are_bit_identical(k, n):
     for kw in (
         dict(config=(split, t, 3, 4)),
         dict(config=(split, t, 2, 1), hbm_pin=True),
+        dict(config=(split, t, 2, 1), hbm_pin=True, scale_dma=True),
     ):
         np.testing.assert_array_equal(
             np.asarray(_run(x, wq, ws, **kw), np.float32), ref

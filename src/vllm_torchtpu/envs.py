@@ -134,6 +134,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_PALLAS: bool = False
     TPU_FP8_LINEAR_PALLAS_SITES: str = ""
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
+    TPU_FP8_SKINNY_SCALE_DMA: bool = False
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -1001,6 +1002,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # constrained to HBM, so XLA cannot stage it into VMEM ahead of the call.
     # Same arithmetic, bit-identical outputs; placement only.
     "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str("TPU_FP8_SKINNY_HBM_PIN_SITES", ""),
+    # HBM-pinned fp8_skinny sites with N % 1024 == 0: the per-channel weight scale
+    # is an HBM operand DMA'd in-kernel with the weight ring, instead of a VMEM
+    # operand XLA stages with an exposed copy just before the call. Bit-identical.
+    "TPU_FP8_SKINNY_SCALE_DMA": env_bool("TPU_FP8_SKINNY_SCALE_DMA"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
