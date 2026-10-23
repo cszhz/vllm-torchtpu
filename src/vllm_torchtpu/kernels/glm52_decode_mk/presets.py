@@ -13,6 +13,8 @@ to stage A (A0 TPU oracle per lane, and in the compose correctness jobs).
        abb6053ac); gearly / qmid differ per bucket
   L3   served operand form: one lax.cond per level of the expert-operand cascade (srv_a, 2f65c7fe7); no effect on
        the stacked form (stack_e=True has no cascade)
+  LV   live-row collectives (stageB/lv-probe): ARs / pair q AG / A2A move only the live rows. Not in ORDER ("B");
+       name it explicitly ("B,LV" or "L4,L1,L2,L3,L1e,LV"); needs L4 and L2
 """
 
 ORDER = (
@@ -37,6 +39,8 @@ def lever(name, T):
         )
     if name == "L3":
         return dict(ecas="cond")
+    if name == "LV":
+        return dict(lv=True)
     raise ValueError(f"unknown lever {name!r}")
 
 
@@ -47,6 +51,8 @@ def parse(spec):
         return ()
     if spec in ("B", "all"):
         return ORDER
+    if spec in ("B,LV", "all,LV"):
+        return ORDER + ("LV",)
     names = tuple(x.strip() for x in spec.split(",") if x.strip())
     for n in names:
         lever(n, 16)

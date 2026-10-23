@@ -108,6 +108,81 @@ def all_reduce(R, me, buf, rows, cols, s, drop_last=False, early_read=False, mid
         c.wait_send()
 
 
+def row_switch(n_dyn, options, fn):
+    """LV (live-row collectives): run fn(n) for the one static row count n in `options` equal to the runtime n_dyn
+    (DMA shapes are static, so every option is its own issue site; exactly one fires, rank-uniformly)."""
+    for n in options:
+
+        @pl.when(n_dyn == n)
+        def _(n=n):
+            fn(n)
+
+
+def all_reduce_lv(R, me, buf, rows, cols, s, nlb, rb, drop_last=False, mids=()):
+    """LV form of `all_reduce`: the same protocol (reduce-scatter of R column chunks, f32 rank-order sum, all-gather;
+    the same semaphores and peer order), moving only the first nlb * rb rows (nlb dynamic in 1..rows // rb, the same on
+    every rank). Rows >= nlb * rb of buf are neither sent nor overwritten (the caller zeroes rows >= T, so buf ends
+    bit-identical to `all_reduce`'s result); slot rows past them hold stale bytes and are masked out of `red`."""
+    if R == 1:
+        if drop_last:
+            buf[...] = jnp.zeros(buf.shape, buf.dtype)
+        return
+    cw = cols // R
+    opts = tuple(k * rb for k in range(1, rows // rb + 1))
+    n_dyn = nlb * rb
+
+    def slot(q, n):
+        return s["recv"].at[q, pl.ds(0, n), pl.ds(0, cw)]
+
+    def chunk(t, n):
+        return buf.at[pl.ds(0, n), pl.ds(pl.multiple_of(t * cw, cw), cw)]
+
+    def red(n):
+        return s["red"].at[pl.ds(0, n), pl.ds(0, cw)]
+
+    def rs_start(n):
+        pltpu.make_async_copy(chunk(me, n), slot(me, n), s["loc"].at[0]).start()
+        _send_all(R, me, lambda t: chunk(t, n), lambda q: slot(q, n), s["rs_send"], s["rs_recv"])
+
+    def rs_wait(n):
+        pltpu.make_async_copy(chunk(me, n), slot(me, n), s["loc"].at[0]).wait()
+        _recv_all(R, me, lambda q: slot(q, n), s["rs_recv"])
+
+    def ag_start(n):
+        pltpu.make_async_copy(red(n), chunk(me, n), s["loc"].at[1]).start()
+        _send_all(R, me, lambda t: red(n), lambda q: chunk(q, n), s["ag_send"], s["ag_recv"])
+
+    def ag_wait(n):
+        pltpu.make_async_copy(red(n), chunk(me, n), s["loc"].at[1]).wait()
+        _recv_all(R, me, lambda q: chunk(q, n), s["ag_recv"])
+        for step in range(1, R):
+            t = lax.rem(me + step, R)
+            for src, dst, ss, rs_ in (
+                (chunk(t, n), slot(me, n), s["rs_send"], s["rs_recv"]),
+                (red(n), chunk(me, n), s["ag_send"], s["ag_recv"]),
+            ):
+                pltpu.make_async_remote_copy(
+                    src, dst, ss.at[step], rs_.at[me], device_id=(t,), device_id_type=MESH
+                ).wait_send()
+
+    row_switch(nlb, tuple(range(1, len(opts) + 1)), lambda k: rs_start(k * rb))
+    if len(mids) > 0 and mids[0] is not None:
+        mids[0]()
+    row_switch(nlb, tuple(range(1, len(opts) + 1)), lambda k: rs_wait(k * rb))
+    acc = s["recv"][0, pl.ds(0, rows), pl.ds(0, cw)].astype(F32)
+    for q in range(1, R):
+        v = s["recv"][q, pl.ds(0, rows), pl.ds(0, cw)].astype(F32)
+        if drop_last and q == R - 1:
+            v = jnp.zeros_like(v)
+        acc = acc + v
+    live = lax.broadcasted_iota(jnp.int32, (rows, cw), 0) < n_dyn
+    s["red"][pl.ds(0, rows), pl.ds(0, cw)] = jnp.where(live, acc, 0.0).astype(BF16)
+    row_switch(nlb, tuple(range(1, len(opts) + 1)), lambda k: ag_start(k * rb))
+    if len(mids) > 1 and mids[1] is not None:
+        mids[1]()
+    row_switch(nlb, tuple(range(1, len(opts) + 1)), lambda k: ag_wait(k * rb))
+
+
 def entry_barrier(R):
     """The one barrier of the call: every rank signals every rank, then waits for R signals."""
     if R == 1:
@@ -208,7 +283,7 @@ def wait_pieces(R, me, pieces, send_sem, recv_sem, scope=None):
             for desc, n in descs:
                 tot = n * (R - 1)
                 fn = desc.wait_recv if kind == "recv" else desc.wait_send
-                if tot <= 16:
+                if isinstance(tot, int) and tot <= 16:
                     for _ in range(tot):
                         fn()
                 else:
