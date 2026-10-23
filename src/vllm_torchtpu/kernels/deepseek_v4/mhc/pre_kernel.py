@@ -303,6 +303,7 @@ def mhc_pre(
     token_block_size: int = 64,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     gates_in_kernel: bool = False,
+    gates_max_tokens: int | None = None,
     norm_weight: jax.Array | None = None,
     norm_eps: float | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -329,6 +330,7 @@ def mhc_pre(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        gates_max_tokens,
     )
     gate_a, gate_b, layer2d = mhc_pre_mixes_collapse(
         x2d,

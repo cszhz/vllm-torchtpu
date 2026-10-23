@@ -231,9 +231,16 @@ def gate_consts(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    max_tokens: int | None = None,
 ) -> "GateConsts | None":
-    """The in-kernel gate constants, or None for the XLA gates epilogue."""
-    if not gates_in_kernel or num_tokens > GATES_IN_KERNEL_MAX_TOKENS:
+    """The in-kernel gate constants, or None for the XLA gates epilogue.
+
+    ``max_tokens``: in-kernel only up to this many tokens (None: the module
+    default; 0: no cap -- worth it once the token block fills the 128 lanes
+    the token-major Sinkhorn runs on).
+    """
+    max_tokens = GATES_IN_KERNEL_MAX_TOKENS if max_tokens is None else max_tokens
+    if not gates_in_kernel or (max_tokens > 0 and num_tokens > max_tokens):
         return None
     return GateConsts(hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
 

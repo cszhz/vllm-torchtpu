@@ -38,6 +38,9 @@ def _fused_kernel(
     hc_pre_eps,
     gates,
     norm_eps,
+    fn_prefetch=False,
+    per_stream_dot=False,
+    ablate=(),
 ):
     """One token block: recombine, store once, 3-pass GEMM, collapse.
 
@@ -46,6 +49,28 @@ def _fused_kernel(
     in-block (post_mix, comb_mix).
     """
     fn_refs, (sc_ref, hb_ref), refs = refs[:n_fn], refs[n_fn : n_fn + 2], refs[n_fn + 2 :]
+    if fn_prefetch:
+        # fn stays in HBM; step 0 streams it into a persistent VMEM copy,
+        # one chunk per residual stream, under the recombine's VPU work.
+        *refs, fn_vmem, fn_sem = refs
+        fn_hbm = fn_refs[0]
+        h_ = hidden_size
+        copies = [
+            pltpu.make_async_copy(
+                fn_hbm.at[:, pl.ds(j * h_, h_)],
+                fn_vmem.at[:, pl.ds(j * h_, h_)],
+                fn_sem.at[j],
+            )
+            for j in range(hc_mult)
+        ]
+        first = pl.program_id(0) == 0
+
+        @pl.when(first)
+        def _start():
+            for c in copies:
+                c.start()
+
+        fn_refs = (fn_vmem,)
     *norm_w, newres_ref, gate_a_ref, gate_b_ref, layer_ref = refs
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
@@ -62,24 +87,74 @@ def _fused_kernel(
     streams_bf = []
     for j in range(hc_mult):
         acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
-        for i in range(hc_mult):
+        for i in range(hc_mult if "recombine" not in ablate else 0):
             k = i * hc_mult + j
             acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
         # Round to bf16 BEFORE the GEMM: the unfused path's pre reads the
         # bf16 residual that post stored, and parity requires matching it.
         new_bf = acc.astype(jnp.bfloat16)
+        if "recombine" in ablate:  # timing probe only: wrong results
+            new_bf = old_bf[j]
         newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = new_bf
         streams_bf.append(new_bf)
 
-    g_bf = jnp.concatenate(streams_bf, axis=1)  # (tb, hc_mult * hidden_size)
-    acc = utils.mix_gemm(
-        g_bf, fn_refs, hc_mult * (hc_mult + 2), gemm_precision
-    )
-    gf = g_bf.astype(jnp.float32)  # f32 for the squared sum + collapse
-    sqr = jnp.sum(gf * gf, axis=-1, keepdims=True)
+    m3 = hc_mult * (hc_mult + 2)
+    if fn_prefetch and not per_stream_dot:
+
+        @pl.when(first)
+        def _wait():
+            for c in copies:
+                c.wait()
+
+    if per_stream_dot:
+        # One dot per stream against its K-slice of the stacked chunks: no
+        # (tb, M*H) concatenation. Changes the K accumulation order.
+        assert len(fn_refs) == 1
+        dn = (((1,), (1,)), ((), ()))
+        out = None
+        for j in range(hc_mult):
+            if fn_prefetch:
+                # Wait only for this stream's K-chunk: the dot on chunk j
+                # runs while chunk j + 1 is still in flight.
+                @pl.when(first)
+                def _wait_j(j=j):
+                    copies[j].wait()
+
+            d = jax.lax.dot_general(
+                streams_bf[j],
+                fn_refs[0][:, j * hidden_size : (j + 1) * hidden_size],
+                dn,
+                preferred_element_type=jnp.float32,
+            )
+            out = d if out is None else out + d
+        acc = out[:, :m3]
+        if gemm_precision == "highest":
+            acc = acc + out[:, m3 : 2 * m3]
+            acc = acc + out[:, 2 * m3 :]
+        gf_streams = [sb.astype(jnp.float32) for sb in streams_bf]
+        sqr = None
+        for g in gf_streams:
+            p = jnp.sum(g * g, axis=-1, keepdims=True)
+            sqr = p if sqr is None else sqr + p
+        gf = None
+    else:
+        g_bf = jnp.concatenate(streams_bf, axis=1)  # (tb, hc_mult * hidden_size)
+        if "gemm" in ablate or "fn" in ablate:  # timing probe only
+            acc = jnp.zeros((g_bf.shape[0], m3), jnp.float32) + g_bf[:, :m3].astype(
+                jnp.float32
+            )
+        else:
+            acc = utils.mix_gemm(g_bf, fn_refs, m3, gemm_precision)
+        gf = g_bf.astype(jnp.float32)  # f32 for the squared sum + collapse
+        sqr = jnp.sum(gf * gf, axis=-1, keepdims=True)
+        gf_streams = [gf[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)]
 
     m, h = hc_mult, hidden_size
-    if gates is None:
+    if "gates" in ablate:  # timing probe only
+        gate_a_ref[...] = acc[:, :m]
+        gate_b_ref[...] = acc[:, m : m + m * m]
+        pre_mix = acc[:, :m]
+    elif gates is None:
         gate_a_ref[...] = acc
         gate_b_ref[...] = sqr
         scaled = acc[:, :m] * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
@@ -96,9 +171,9 @@ def _fused_kernel(
             hc_pre_eps=hc_pre_eps,
             gates=gates,
         )
-    lay = pre_mix[:, 0:1] * gf[:, :h]
+    lay = pre_mix[:, 0:1] * gf_streams[0]
     for i in range(1, m):
-        lay = lay + pre_mix[:, i : i + 1] * gf[:, i * h : (i + 1) * h]
+        lay = lay + pre_mix[:, i : i + 1] * gf_streams[i]
     layer_ref[...] = utils.finish_layer_input(lay, *norm_w or [None], norm_eps)
 
 
@@ -112,6 +187,9 @@ def _fused_kernel(
         "vmem_limit_bytes",
         "gates",
         "norm_eps",
+        "fn_prefetch",
+        "per_stream_dot",
+        "ablate",
     ),
 )
 def fused_post_pre_mixes(
@@ -131,6 +209,9 @@ def fused_post_pre_mixes(
     gates: utils.GateConsts | None = None,
     norm_weight: jax.Array | None = None,
     norm_eps: float | None = None,
+    fn_prefetch: bool = False,
+    per_stream_dot: bool = False,
+    ablate: tuple[str, ...] = (),
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """The Pallas seam kernel: post recombine fused with pre's mix GEMM
     and in-block collapse.
@@ -192,11 +273,27 @@ def fused_post_pre_mixes(
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
+    if fn_prefetch or per_stream_dot:
+        assert len(fn_ops) == 1, "fn_prefetch / per_stream_dot need a CatFn"
+    if pl.cdiv(padded_tokens, tb) > 1:
+        # Multi-block grids keep the pipelined resident fn: the in-kernel
+        # stream pays off only when one block has nothing else to overlap.
+        fn_prefetch = per_stream_dot = False
     compiler_params = pltpu.CompilerParams(
-        dimension_semantics=("parallel",),
+        # A prefetched fn is filled at step 0, so steps must run in order.
+        dimension_semantics=("arbitrary",) if fn_prefetch else ("parallel",),
         vmem_limit_bytes=vmem_limit_bytes,
         disable_bounds_checks=True,
     )
+    if fn_prefetch or "fn" in ablate:
+        fn_specs = [pl.BlockSpec(memory_space=pltpu.HBM) for _ in fn_ops]
+        scratch = [
+            pltpu.VMEM(fn_ops[0].shape, jnp.bfloat16),
+            pltpu.SemaphoreType.DMA((hc_mult,)),
+        ] if fn_prefetch else []
+    else:
+        fn_specs = [pl.BlockSpec(f.shape, lambda i: (0, 0)) for f in fn_ops]
+        scratch = []
 
     assert (norm_weight is None) == (norm_eps is None)
     norm_args = [] if norm_weight is None else [norm_weight.reshape(1, hidden_size)]
@@ -214,6 +311,9 @@ def fused_post_pre_mixes(
             hc_pre_eps=hc_pre_eps,
             gates=gates,
             norm_eps=norm_eps,
+            fn_prefetch=fn_prefetch,
+            per_stream_dot=per_stream_dot,
+            ablate=ablate,
         ),
         grid=(pl.cdiv(padded_tokens, tb),),
         in_specs=[
@@ -221,7 +321,7 @@ def fused_post_pre_mixes(
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
-            *(pl.BlockSpec(f.shape, lambda i: (0, 0)) for f in fn_ops),
+            *fn_specs,
             pl.BlockSpec((1, 3), lambda i: (0, 0)),
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
             *norm_specs,
@@ -239,6 +339,7 @@ def fused_post_pre_mixes(
             ),
             jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
         ],
+        scratch_shapes=scratch,
         compiler_params=compiler_params,
     )(x2d, res2d, post2d, comb2d, *fn_ops, sc2d, hb2d, *norm_args)
 
@@ -266,8 +367,12 @@ def mhc_fused_post_pre(
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     gates_in_kernel: bool = False,
+    gates_max_tokens: int | None = None,
     norm_weight: jax.Array | None = None,
     norm_eps: float | None = None,
+    fn_prefetch: bool = False,
+    per_stream_dot: bool = False,
+    ablate: tuple[str, ...] = (),
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Fused seam op: Pallas post+GEMM+collapse kernel, gates in an XLA
     epilogue or (``gates_in_kernel``, up to
@@ -291,6 +396,7 @@ def mhc_fused_post_pre(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        gates_max_tokens,
     )
     new_res2d, gate_a, gate_b, layer_input_cur = fused_post_pre_mixes(
         x2d,
@@ -308,6 +414,9 @@ def mhc_fused_post_pre(
         gates=gates,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        fn_prefetch=fn_prefetch,
+        per_stream_dot=per_stream_dot,
+        ablate=ablate,
     )
     if gates is not None:
         post_mix_cur, comb_mix_cur = gate_a, gate_b
