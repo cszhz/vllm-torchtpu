@@ -637,7 +637,8 @@ def _export_text_only_llm_functions(
                     name="logits",
                     shape=logits_shape,
                     dtype=logits_dtype_str,
-                    argument_type="user_io",
+                    # Stays on device: the samplers take it as an intermediate input.
+                    argument_type="intermediate",
                     is_input=False,
                 )
             ],
