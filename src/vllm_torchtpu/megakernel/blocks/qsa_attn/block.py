@@ -94,36 +94,42 @@ def attend_row(
     ntiles = (length + TILE - 1) // TILE
     nh, dim = q.shape
 
-    def copies(t: Any, s: Any) -> list[Any]:
+    ncols = pages.shape[1]
+
+    def copies(t: Any, s: Any) -> list[tuple[Any, Any]]:
+        """`(live, copy)` per micro-page of tile `t`; micro-pages at or past the
+        row's length are not fetched (their column may be past `budget + 1`)."""
         out = []
         for j in range(TILE // MICRO):
-            v = pages[r, t * (TILE // MICRO) + j]
-            out.append(
-                pltpu.make_async_copy(
-                    pool.at[v // per_page, pl.ds((v % per_page) * MICRO, MICRO)],
-                    ring.at[s, pl.ds(j * MICRO, MICRO)],
-                    sems.at[s],
-                )
+            col = t * (TILE // MICRO) + j
+            v = pages[r, jnp.minimum(col, ncols - 1)]
+            cp = pltpu.make_async_copy(
+                pool.at[v // per_page, pl.ds((v % per_page) * MICRO, MICRO)],
+                ring.at[s, pl.ds(j * MICRO, MICRO)],
+                sems.at[s],
             )
+            out.append((col * MICRO < length, cp))
         return out
+
+    def start(t: Any, s: Any) -> None:
+        for live, cp in copies(t, s):
+            pl.when(live)(cp.start)
 
     @pl.when(ntiles > 0)
     def _():
-        for c in copies(0, 0):
-            c.start()
+        start(0, 0)
 
     qf = q.astype(F32)
 
     def tile(t: Any, carry: Any) -> Any:
         m, l, acc = carry
         s = lax_rem(t, 2)
-        for c in copies(t, s):
-            c.wait()
+        for live, cp in copies(t, s):
+            pl.when(live)(cp.wait)
 
         @pl.when(t + 1 < ntiles)
         def _():
-            for c in copies(t + 1, 1 - s):
-                c.start()
+            start(t + 1, 1 - s)
 
         k8, v8 = _unpack_kv(ring.at[s], off, interpret)
         tok = t * TILE + jax.lax.broadcasted_iota(I32, (1, TILE), 1)
@@ -159,9 +165,11 @@ def lax_rem(a: Any, b: int) -> Any:
 
 
 class QSASparseAttnBlock(QSAOutBlock):
-    """In-kernel QSA sparse attention + gate for the verify rows, then `o_proj`."""
+    """In-kernel QSA sparse attention + gate for the verify rows, then `o_proj`.
 
-    name = "qsa_attn"
+    Keeps `QSAOutBlock`'s name: it owns the same weights (`o_proj` and the
+    wrapping hyper-connection's `qsa_out_*`), so packers need no change.
+    """
 
     def __init__(
         self,
