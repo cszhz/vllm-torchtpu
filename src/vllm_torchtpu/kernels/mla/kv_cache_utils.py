@@ -137,8 +137,11 @@ def merge_kv_stack(cache: jax.Array, kv_stack: tuple[int, int]) -> jax.Array:
     is `(this layer's row, num_blocks)`. Returns `[n_layers * num_blocks,
     *page]`: merging two untiled leading dims is a bitcast, so no per-layer
     slice (which torch_tpu would materialize as a copy) is ever taken. Undo
-    with `split_kv_stack`; address this layer's pages with
-    `stack_page_table_dcp`.
+    with `split_kv_stack`. Layer `row` owns pages `[row * num_blocks, (row +
+    1) * num_blocks)`: the DCP sparse-MLA op keeps its page math per layer and
+    adds that offset where it addresses the pool
+    (`attention_interface.sparse_mla_attention_dcp(kv_stack=)`); the indexer
+    ops rewrite their page table with `stack_page_table_dcp`.
     """
     row, num_blocks = kv_stack
     if cache.ndim < 3 or cache.shape[1] != num_blocks or not 0 <= row < cache.shape[0]:
@@ -799,7 +802,5 @@ def _get_dcp_page_and_slot(
     if kv_stack is not None:
         row, num_blocks = kv_stack
         if row:
-            page = jnp.where(
-                page < OOB_PAGE, page + jnp.int32(row * num_blocks), page
-            )
+            page = jnp.where(page < OOB_PAGE, page + jnp.int32(row * num_blocks), page)
     return page, slot

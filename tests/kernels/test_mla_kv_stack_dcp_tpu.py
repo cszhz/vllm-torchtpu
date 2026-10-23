@@ -22,7 +22,21 @@ real DCP indexer step (`streamidx_topk_dcp_step`: SAL Pallas append +
 per-layer caches and once on [n_layers, num_blocks, ...] stacks shared by every
 layer (`kv_stack=(row, num_blocks)`). Every output and every cache must match
 bit for bit.
+
+Two knob sets: the code defaults (the capped plain-window prep at DCP 8), and
+the best served config's sparse-MLA knobs (`BEST_ENV`, j-e0ae7f9f): the
+live-group mixed prep with the mixed fused prep (TPU_DCP_MLA_MIXED_LIVE /
+_MIXED_FUSED_PREP), the fused decode prep (TPU_DCP_MLA_FUSED_PREP) with the
+KV write in the gather (TPU_MLA_KV_WRITE_IN_GATHER), merge pieces, the rank
+operand. Under the stack every one of those preps runs on the per-layer
+geometry and the SparseCore gather adds the layer's row offset in-kernel (to
+its gathered rows and its write rows); the test asserts those paths ran.
+Positive controls: every stacked layer on row 0, and a wrong in-gather row
+offset (the gather's `row_offset` shifted one layer) -- both must be caught.
 """
+
+import os
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -58,6 +72,53 @@ STEPS = (
     ([3000, 700, 300, 0], [3000, 700, 300, 0], [0, 0, 3], 4096),  # prefill
     ([4, 64, 4, 0], [3004, 764, 304, 0], [0, 0, 3], 128),  # mixed / verify
     ([1, 1, 1, 0], [3005, 765, 305, 0], [3, 3, 3], 16),  # decode
+)
+
+
+# The best config's (j-e0ae7f9f) knobs read by the DCP sparse-MLA op and its
+# kernel (`scratch/cmp_best/recipe_best.yaml`); TPU_DCP_MERGE_CHUNKED* size the
+# merge pieces. Adapter-level knobs (prologue, send layout, small a2a) need
+# operands this op-level test does not build.
+BEST_ENV = {
+    "TPU_DCP_MLA_FUSED_PREP": "1",
+    "TPU_DCP_MLA_MASK_IN_KERNEL": "1",
+    "TPU_DCP_MLA_MERGE_PIECES": "2",
+    "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": "2048",
+    "TPU_DCP_MLA_MIXED_BODY": "1",
+    "TPU_DCP_MLA_MIXED_FUSED_PREP": "1",
+    "TPU_DCP_MLA_MIXED_KERNEL_V2": "1",
+    "TPU_DCP_MLA_MIXED_LIVE": "1",
+    "TPU_DCP_MLA_MIXED_LIVE_WIDTHS": "256,384",
+    "TPU_DCP_MLA_MIXED_MASK_IN_KERNEL": "1",
+    "TPU_DCP_MLA_SMALL_CHUNK_BATCH": "4",
+    "TPU_DCP_MLA_SMALL_CHUNK_TOKENS": "32",
+    "TPU_DCP_MLA_TOPK_CAP": "512",
+    "TPU_DCP_MLA_TOPK_CAP_CHUNK": "512",
+    "TPU_DCP_RANK_OPERAND": "1",
+    "TPU_MLA_DECODE_BODY_LEVERS": "1",
+    "TPU_MLA_DECODE_ROW_WIDTHS": "128,256,384",
+    "TPU_MLA_KV_WRITE_IN_GATHER": "1",
+    "TPU_MLA_SPARSE_SPLIT_Q": "1",
+    "TPU_MLA_TC_KV_WRITER": "1",
+    "TPU_SPARSE_MLA_CHUNK_TOKENS": "256",
+    "TPU_SPARSE_MLA_LIVE_GATHER": "0",
+    "TPU_SPARSE_MLA_PACKED_ROPE": "0",
+    "TPU_DCP_MERGE_CHUNKED": "8",
+    "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": "1024",
+    "TPU_DCP_MERGE_CHUNKED_SMALL": "2",
+    "TPU_DCP_MERGE_CHUNKED_LSE_AG": "1",
+    "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": "2048",
+}
+
+# Best-config steps: a 4096 prefill, a served-shaped 4096 mixed step (three
+# MTP-3 verify windows + a fresh 2000-token chunk), a 16-row verify step
+# (4 x 4) and a decode step -- the last two take the fused decode prep with the
+# KV write in the gather.
+STEPS_BEST = (
+    ([3000, 700, 300, 0], [3000, 700, 300, 0], [0, 0, 3], 4096),  # prefill
+    ([4, 4, 4, 2000], [3004, 704, 304, 2000], [0, 0, 4], 4096),  # mixed
+    ([4, 4, 4, 4], [3008, 708, 308, 2004], [0, 0, 4], 16),  # verify
+    ([1, 1, 1, 1], [3009, 709, 309, 2005], [4, 4, 4], 16),  # decode
 )
 
 
@@ -110,10 +171,114 @@ def test_wrong_stack_row_is_caught():
     assert any(b.startswith("cache ") for b in bad), bad
 
 
-def _run_stacked_vs_per_layer(fault=None):
+def test_best_env_stacked_caches_match_per_layer_bitwise():
+    """The best config's knobs: live-group + mixed fused prep, fused decode
+    prep, KV write in the gather -- every one on the per-layer geometry with
+    the row offset in the SparseCore gather -- stacked == per-layer, bitwise.
+    The run asserts those paths fired (`_check_best_paths`)."""
+    with mock.patch.dict(os.environ, BEST_ENV):
+        assert _run_stacked_vs_per_layer(fault=None, steps=STEPS_BEST) == []
+
+
+def test_best_env_wrong_stack_row_is_caught():
+    with mock.patch.dict(os.environ, BEST_ENV):
+        bad = _run_stacked_vs_per_layer(fault="row0", steps=STEPS_BEST)
+    assert any(b.startswith("out ") for b in bad), bad
+    assert any(b.startswith("cache ") for b in bad), bad
+
+
+def test_best_env_wrong_gather_offset_is_caught():
+    """Positive control for the in-kernel offset: the stacked arm's SparseCore
+    gather gets the NEXT layer's row offset (row 0 too). The gathered rows and
+    the in-gather KV writes then address another layer, so outputs (and the
+    caches the gather writes on the verify / decode steps) must differ -- a
+    gather ignoring `row_offset` would leave this undetected."""
+    with mock.patch.dict(os.environ, BEST_ENV):
+        bad = _run_stacked_vs_per_layer(fault="wrong_offset", steps=STEPS_BEST)
+    assert any(b.startswith("out ") for b in bad), bad
+    assert any(b.startswith("cache ") for b in bad), bad
+
+
+def _spied(fault):
+    """Spies on the window preps and the SparseCore gather (calls are traces);
+    fault="wrong_offset" shifts every stacked-cache gather's row offset by one
+    layer."""
+    from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla
+    from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
+
+    real_gather = native_sc_gather.dsa_gather_native_sc
+    layer_rows = NUM_BLOCKS * PAGE
+    gathers = []
+
+    def gather(nope, rope, indices, **kw):
+        stacked = nope.shape[0] == N_LAYERS * NUM_BLOCKS
+        if fault == "wrong_offset" and stacked:
+            row = (kw.get("row_offset") or 0) // layer_rows
+            kw["row_offset"] = ((row + 1) % N_LAYERS) * layer_rows or None
+        gathers.append(
+            dict(
+                stacked=stacked,
+                row_offset=kw.get("row_offset"),
+                kv_write=kw.get("kv_write") is not None,
+            )
+        )
+        return real_gather(nope, rope, indices, **kw)
+
+    preps = {}
+    patches = [mock.patch.object(native_sc_gather, "dsa_gather_native_sc", gather)]
+    for name in (
+        "prepare_capped_window_indices",
+        "prepare_capped_window_live",
+        "prepare_capped_window_live_fused",
+        "prepare_capped_window_fused",
+    ):
+        real = getattr(sparse_mla, name)
+
+        def spy(*a, _real=real, _name=name, **kw):
+            preps.setdefault(_name, []).append(kw.get("total_num_pages"))
+            return _real(*a, **kw)
+
+        patches.append(mock.patch.object(sparse_mla, name, spy))
+    return patches, preps, gathers
+
+
+def _check_best_paths(preps, gathers):
+    """The best-env run took the live-group fused prep (4096 buckets) and the
+    fused decode prep (16-row buckets), every prep on the per-layer geometry;
+    the gather wrote KV and carried the stack row offsets (rows 1 and 2)."""
+    assert preps.get("prepare_capped_window_live_fused"), preps.keys()
+    assert preps.get("prepare_capped_window_fused"), preps.keys()
+    assert not preps.get("prepare_capped_window_live"), preps.keys()
+    assert all(n == NUM_BLOCKS for v in preps.values() for n in v), preps
+    assert any(g["kv_write"] for g in gathers)
+    layer_rows = NUM_BLOCKS * PAGE
+    offs = {g["row_offset"] for g in gathers if g["stacked"]}
+    assert offs == {None, layer_rows, 2 * layer_rows}, offs
+    assert all(g["row_offset"] is None for g in gathers if not g["stacked"])
+    assert any(g["kv_write"] and g["row_offset"] for g in gathers)
+
+
+def _run_stacked_vs_per_layer(fault=None, steps=STEPS):
     """Runs the steps on per-layer and stacked caches. fault=None: asserts every
     output and cache bitwise equal (returns []). fault="row0": the stacked arm's
-    kv_stack is (0, NUM_BLOCKS) for every layer; returns the mismatches."""
+    kv_stack is (0, NUM_BLOCKS) for every layer; fault="wrong_offset": the
+    stacked arm's gathers get the next layer's row offset. Returns the
+    mismatches."""
+    patches, preps, gathers = _spied(fault)
+    jax.clear_caches()  # the spies count traces
+    for p in patches:
+        p.start()
+    try:
+        bad = _run(fault, steps)
+    finally:
+        for p in patches:
+            p.stop()
+    if fault is None and steps is STEPS_BEST:
+        _check_best_paths(preps, gathers)
+    return bad
+
+
+def _run(fault, steps):
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
         streamidx_topk_dcp_step,
     )
@@ -158,8 +323,14 @@ def _run_stacked_vs_per_layer(fault=None):
                 for _ in range(N_LAYERS)
             ]
 
+    # TPU_DCP_RANK_OPERAND: the shard's rank as data (as the adapter passes it).
+    rank_kw = {}
+    if os.environ.get("TPU_DCP_RANK_OPERAND") == "1":
+        rank_kw["dcp_rank_ids"] = jax.device_put(
+            jnp.arange(dcp, dtype=jnp.int32), sharded
+        )
     nontrivial_topk = False
-    for step, (q_lens, seq_lens, rd, num_tokens) in enumerate(STEPS):
+    for step, (q_lens, seq_lens, rd, num_tokens) in enumerate(steps):
         qsl = jnp.asarray(np.concatenate([[0], np.cumsum(q_lens)]), jnp.int32)
         seq_lens_a = jnp.asarray(seq_lens, jnp.int32)
         dist_attn = jnp.asarray(rd, jnp.int32)
@@ -211,6 +382,7 @@ def _run_stacked_vs_per_layer(fault=None):
                     dcp_size=dcp,
                     interleave_size=INTERLEAVE,
                     kv_stack=kv_stack,
+                    **rank_kw,
                 )
                 if stacked:
                     caches[True] = [nope, rope, idx]

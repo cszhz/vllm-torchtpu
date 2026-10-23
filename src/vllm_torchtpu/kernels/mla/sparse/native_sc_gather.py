@@ -118,6 +118,7 @@ def _kernel(
     sem_ref: Any,
     live_vmem_ref: Any = None,
     live_sem_ref: Any = None,
+    rowoff_vmem_ref: Any = None,
     *,
     core_axis_name: str,
     subcore_axis_name: str,
@@ -139,8 +140,46 @@ def _kernel(
     write_fault: str | None = None,
     rope_words: int = ROPE_WORDS,
     row_offset_lanes: bool = False,
+    rowoff_hbm_ref: Any = None,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
+
+    def load_live():
+        # The live logical-batch count arrives as a broadcast i32[NUM_LANES]
+        # vector. On SparseCore a scalar load is legal only from SMEM and SMEM
+        # only at rank 0 (jax/_src/pallas/mosaic/sc_lowering.py), so the count is
+        # DMA'd into a VMEM vector and lane 0 extracted -- the same shape as the
+        # in-repo dsa_gather.py:90 (`valid_ref[pl.ds(0, 16)][0]`).
+        cp = pltpu.make_async_copy(live_hbm_ref, live_vmem_ref, live_sem_ref.at[0])
+        cp.start()
+        cp.wait()
+
+    # GLM5_MKD_STACK_C (`dsa_gather_native_sc`'s `row_offset`): the layer's
+    # stack row offset, broadcast over one 16-lane vector -- lanes [32, 48) of
+    # the live vector (`num_live_indices` form) or its own operand (the
+    # `live_vec` / `live_vec_offset` forms, whose live vector is not built
+    # here). Loaded before the write phase, which offsets its rows too.
+    row_offset_vec = None
+    live_loaded = False
+    if row_offset_lanes:
+        if rowoff_hbm_ref is not None:
+            cp = pltpu.make_async_copy(
+                rowoff_hbm_ref, rowoff_vmem_ref, live_sem_ref.at[0]
+            )
+            cp.start()
+            cp.wait()
+
+            def row_offset_vec():
+                return rowoff_vmem_ref[pl.ds(0, NUM_LANES)]
+
+        else:
+            if write_refs is not None:
+                load_live()
+                live_loaded = True
+
+            def row_offset_vec():
+                return live_vmem_ref[pl.ds(2 * NUM_LANES, NUM_LANES)]
+
     late_drain = None
     if write_refs is not None and write_fault != "late_write":
         assert write_scratch is not None
@@ -152,17 +191,12 @@ def _kernel(
             subcore=lax.axis_index(subcore_axis_name),
             num_tokens=write_tokens,
             fault=write_fault,
+            row_offset=None if row_offset_vec is None else row_offset_vec()[0],
         )
     live_batches = None
     if live_hbm_ref is not None:
-        # The live logical-batch count arrives as a broadcast i32[NUM_LANES]
-        # vector. On SparseCore a scalar load is legal only from SMEM and SMEM
-        # only at rank 0 (jax/_src/pallas/mosaic/sc_lowering.py), so the count is
-        # DMA'd into a VMEM vector and lane 0 extracted -- the same shape as the
-        # in-repo dsa_gather.py:90 (`valid_ref[pl.ds(0, 16)][0]`).
-        cp = pltpu.make_async_copy(live_hbm_ref, live_vmem_ref, live_sem_ref.at[0])
-        cp.start()
-        cp.wait()
+        if not live_loaded:
+            load_live()
         # Lanes [0,16) broadcast the live logical-batch count, lanes [16,32)
         # the per-owner trip count; only lane 0 of a vector is ever extracted.
         live_batches = live_vmem_ref[pl.ds(0, NUM_LANES)][0]
@@ -195,14 +229,12 @@ def _kernel(
             return indices_ref[0, atom, stream, :]
 
         def values(atom, stream):
-            if row_offset_lanes:
-                # GLM5_MKD_STACK_C: lanes [32, 48) of the live vector broadcast
-                # this layer's row offset into the merged stack; the indices
-                # are the per-layer rows, shared by every layer that shares a
-                # top-k (dsa_gather_native_sc's `row_offset`).
-                return raw_values(atom, stream) + live_vmem_ref[
-                    pl.ds(2 * NUM_LANES, NUM_LANES)
-                ]
+            if row_offset_vec is not None:
+                # GLM5_MKD_STACK_C: this layer's row offset into the merged
+                # stack; the indices are the per-layer rows, shared by every
+                # layer that shares a top-k (dsa_gather_native_sc's
+                # `row_offset`).
+                return raw_values(atom, stream) + row_offset_vec()
             return raw_values(atom, stream)
 
         def destinations(atom, stream):
@@ -367,6 +399,7 @@ def _kernel(
             subcore=lax.axis_index(subcore_axis_name),
             num_tokens=write_tokens,
             fault=None,
+            row_offset=None if row_offset_vec is None else row_offset_vec()[0],
         )
 
 
@@ -398,6 +431,7 @@ def _write_phase(
     subcore: jax.Array,
     num_tokens: int,
     fault: str | None,
+    row_offset: Any = None,
 ) -> Any:
     """Write this step's packed tokens into both caches, then fence.
 
@@ -426,6 +460,10 @@ def _write_phase(
     already the SparseCore's linear layout (a [T, 384] operand cost a 0.6 us
     relayout, j-241c6f15). A SparseCore scalar comes from lane 0 of a VMEM
     vector.
+
+    `row_offset` (GLM5_MKD_STACK_C, a traced i32 scalar): the `dst` rows are
+    this layer's per-layer rows and the caches its merged stack; every row
+    written (`dst >= 0`) is offset by it into the layer's part of the stack.
     """
     (rows_src,) = write_refs
     dst_vmem, dst_sem, write_sem = write_scratch
@@ -450,6 +488,8 @@ def _write_phase(
         cp.start()
         cp.wait()
         dst = dst_vmem[k, :][0] - 1  # stored as dst + 1 (< 2**31), 0 = skip
+        if row_offset is not None:
+            dst = jnp.where(dst >= 0, dst + row_offset, dst)
         if fault == "wrong_row":
             dst = dst + 1
         write = jnp.logical_and(dst >= 0, dst < num_rows)
@@ -654,14 +694,17 @@ def dsa_gather_native_sc(
       serve_pipelined: whether to pipeline the gather serving loop.
       is_dcp_mode: whether to enable DCP mode (skips gather for padding atoms).
 
-    ``row_offset`` (traced i32 scalar, optional; GLM5_MKD_STACK_C; with
-    ``num_live_indices`` only) is added to every gathered index inside the
-    kernel: the caches are a merged ``[n_layers * num_blocks, ...]`` stack and
-    ``indices`` are this layer's per-layer rows, so the index array (and its
-    slicing / relayout) stays the same computation in every layer that shares a
-    top-k -- XLA CSEs it -- and only this scalar differs per layer. It rides in
-    lanes ``[32, 48)`` of the live vector; same rows as gathering
-    ``indices + row_offset``.
+    ``row_offset`` (traced i32 scalar, optional; GLM5_MKD_STACK_C; with one of
+    the live forms) is added to every gathered index inside the kernel: the
+    caches are a merged ``[n_layers * num_blocks, ...]`` stack and ``indices``
+    are this layer's per-layer rows, so the index array (and its slicing /
+    relayout, or the fused preps that produce it) stays the same computation
+    in every layer that shares a top-k -- XLA CSEs it -- and only this scalar
+    differs per layer. With ``num_live_indices`` it rides in lanes ``[32, 48)``
+    of the live vector; with ``live_vec`` / ``live_vec_offset`` (whose live
+    vector the caller built) in a 16-lane operand of its own. Same rows as
+    gathering ``indices + row_offset``. Under ``kv_write`` the write rows are
+    per-layer rows too, offset the same way.
 
     ``packed_rope`` reads (and ``kv_write`` writes) a ROPE cache whose tokens
     own 16-word eighths of a row (`SparseMLAKVCacheSpec.packed_rope`) instead
@@ -690,8 +733,10 @@ def dsa_gather_native_sc(
 
     if sum(x is not None for x in (num_live_indices, live_vec, live_vec_offset)) > 1:
         raise ValueError("pass one of num_live_indices, live_vec, live_vec_offset")
-    if row_offset is not None and num_live_indices is None:
-        raise ValueError("row_offset rides in the num_live_indices live vector")
+    if row_offset is not None and (
+        num_live_indices is None and live_vec is None and live_vec_offset is None
+    ):
+        raise ValueError("row_offset needs a live form (it rides in the live vector)")
     num_cores, num_subcores, atoms_per_batch, occurrences_per_batch, num_batches = (
         live_vec_geometry(out_size, atoms_per_batch)
     )
@@ -762,7 +807,9 @@ def dsa_gather_native_sc(
             lanes.append(jnp.full((NUM_LANES,), row_offset, jnp.int32))
         live_vec = jnp.concatenate(lanes)
         operands.append(live_vec)
-        scratch_types["live_vmem_ref"] = pltpu.VMEM((len(lanes) * NUM_LANES,), jnp.int32)
+        scratch_types["live_vmem_ref"] = pltpu.VMEM(
+            (len(lanes) * NUM_LANES,), jnp.int32
+        )
         scratch_types["live_sem_ref"] = pltpu.SemaphoreType.DMA((1,))
         # Per-owner guard is needed only if a live count can leave a ragged
         # last round, i.e. unless the caller promises num_live_indices is a
@@ -790,13 +837,20 @@ def dsa_gather_native_sc(
             ).reshape(-1)
         )
         row_kwargs = dict(row_atoms=row_atoms, rows_per_batch=rows_per_batch)
+    rowoff_operand = row_offset is not None and num_live_indices is None
+    if rowoff_operand:
+        # The live_vec / live_vec_offset forms: the row offset in an operand of
+        # its own, broadcast over 16 lanes (a constant when the offset is).
+        operands.append(jnp.full((NUM_LANES,), row_offset, jnp.int32))
+        scratch_types["rowoff_vmem_ref"] = pltpu.VMEM((NUM_LANES,), jnp.int32)
     mesh = plsc.VectorSubcoreMesh(
         num_cores=num_cores,
         num_subcores=num_subcores,
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    num_base = len(operands)  # nope, rope, indices[, live_vec][, row atoms]
+    # nope, rope, indices[, live_vec][, row atoms][, row offset]
+    num_base = len(operands)
     if kv_write is not None:
         if not isinstance(kv_write, jax.Array) and kv_write[2].shape[-1] not in (
             rope_words,
@@ -859,7 +913,7 @@ def dsa_gather_native_sc(
     def body(*refs, write_dst_vmem=None, write_dst_sem=None, write_sem=None, **scr):
         ins, (nope_o, rope_o) = refs[:-2], refs[-2:]
         nope, rope, idx = ins[:3]
-        extras = list(ins[3:num_base])  # [live_vec][, row atoms]
+        extras = list(ins[3:num_base])  # [live_vec][, row atoms][, row offset]
         kw = {}
         if live_vec_offset is not None:
             # The fused prep's live vector rides in the indices operand itself.
@@ -868,6 +922,8 @@ def dsa_gather_native_sc(
             kw["live_hbm_ref"] = extras.pop(0)
         if row_kwargs:
             kw["row_atoms_hbm_ref"] = extras.pop(0)
+        if rowoff_operand:
+            kw["rowoff_hbm_ref"] = extras.pop(0)
         if kv_write is not None:
             kw["write_refs"] = tuple(ins[num_base:])
             kw["write_scratch"] = (write_dst_vmem, write_dst_sem, write_sem)
