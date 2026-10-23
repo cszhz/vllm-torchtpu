@@ -171,6 +171,10 @@ class ServingConfigs:
     attention_scope: AttentionScope = AttentionScope.FULL
     return_lse: bool = False
     skip_kv_update: bool = False
+    # HEAD_ALONG_SUBLANE cache fetch with one SMEM load per page instead of
+    # three: a tile's pages are consecutive page-table entries landing at
+    # i * page_size, so only the first index and each size are read.
+    lean_kv_fetch: bool = False
 
     @property
     def max_decode_bkv_p_new(self) -> int:

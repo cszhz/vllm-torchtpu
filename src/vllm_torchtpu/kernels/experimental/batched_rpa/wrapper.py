@@ -509,6 +509,7 @@ def calculate_block_sizes(
         "attention_scope",
         "return_lse",
         "decode_only",
+        "lean_kv_fetch",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -552,6 +553,7 @@ def ragged_paged_attention(
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
     decode_only: bool = False,
+    lean_kv_fetch: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -612,6 +614,9 @@ def ragged_paged_attention(
         decode_only: The caller guarantees every sequence is a decode
             (distribution[0] == distribution[2]); skip the mixed kernel and its
             schedule, which would have no work. Defaults to False.
+        lean_kv_fetch: Fetch HEAD_ALONG_SUBLANE cache pages with one scalar
+            load per page (the decode KV fetch is scalar-issue bound). Same
+            DMAs and results. Defaults to False.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -697,7 +702,10 @@ def ragged_paged_attention(
         attention_scope=attention_scope,
         return_lse=return_lse,
         skip_kv_update=skip_kv_update,
+        lean_kv_fetch=lean_kv_fetch,
     )
+    if lean_kv_fetch and kv_layout != configs.KVLayout.HEAD_ALONG_SUBLANE:
+        raise ValueError("lean_kv_fetch needs HEAD_ALONG_SUBLANE")
 
     q_hbm, new_kv_hbm = prepare_inputs(
         queries,

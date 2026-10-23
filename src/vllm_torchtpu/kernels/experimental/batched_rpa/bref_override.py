@@ -340,16 +340,34 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         #     packing, page_size)
         kv_cache_hbm_flat = kv_cache_hbm.reshape(-1, *kv_cache_hbm.shape[2:])
 
+        page_size = self.cfgs.serve.page_size
+        last_index = self.cfgs.serve.num_page_indices - 1
         for b in range(self.cfgs.batch_size):
-            for i in range(self.cfgs.bkv_p_cache):
-                p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
-                sz = jnp.where(is_no_op, 0, sz)
-                src_off = page_indices_ref[p_idx] * self.cfgs.serve.page_size
-                pltpu.make_async_copy(
-                    kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
-                    vmem_dst.at[b, pl.ds(dst_off, sz)],
-                    sem,
-                ).start()
+            if not self.cfgs.serve.lean_kv_fetch:
+                for i in range(self.cfgs.bkv_p_cache):
+                    p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
+                    sz = jnp.where(is_no_op, 0, sz)
+                    src_off = page_indices_ref[p_idx] * page_size
+                    pltpu.make_async_copy(
+                        kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
+                        vmem_dst.at[b, pl.ds(dst_off, sz)],
+                        sem,
+                    ).start()
+            else:
+                # Lean per-page fetch: a tile's cache pages are consecutive
+                # page-table entries landing at i * page_size, so only the
+                # first entry's index and each page's size are loaded.
+                p0 = schedule_ref.dma_kv_cache[block_idx, b, 0, 0]
+                for i in range(self.cfgs.bkv_p_cache):
+                    sz = schedule_ref.dma_kv_cache[block_idx, b, i, 2]
+                    sz = jnp.where(is_no_op, 0, sz)
+                    p_idx = jnp.minimum(p0 + i, last_index) if i else p0
+                    src_off = page_indices_ref[p_idx] * page_size
+                    pltpu.make_async_copy(
+                        kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
+                        vmem_dst.at[b, pl.ds(i * page_size, sz)],
+                        sem,
+                    ).start()
 
             # Contiguous fetch for new KV
             dma_entry_0 = schedule_ref.dma_kv_new[block_idx, b, 0]
