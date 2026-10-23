@@ -44,7 +44,11 @@ def prepare_ckpt(
     conv_in: Any = None
     conv_buf_shape: Any = None
     if has_gdn:
-        assert conv is not None and rec is not None and ckpt_indices is not None
+        if conv is None or rec is None or ckpt_indices is None:
+            raise ValueError(
+                "scatter_pool_states requires conv, rec, and ckpt_indices when "
+                f"layout.slots_per_pool ({layout.slots_per_pool}) > 0"
+            )
         vh, KD, VD = layout.vh_per_rank(ex.R), layout.KD, layout.VD
         QKV = layout.qkv_per_rank(ex.R)
         taps = layout.conv_taps

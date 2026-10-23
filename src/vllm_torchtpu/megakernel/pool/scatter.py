@@ -23,6 +23,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
 from ..ops import BF16, FP8, I32
 from .backend import check_ckpt_bounds, resolve_active_seqs
@@ -87,7 +88,11 @@ def scatter_pool_states(
     conv_page = layout.conv_page
     conv_page_rows = layout.conv_page_rows
     page_rows = layout.page_rows
-    assert page_size >= MR, f"MR={MR} exceeds page_size={page_size}"
+    if page_size < MR:
+        raise MegakernelConfigError(
+            f"scatter_pool_states requires CacheExec.page_size ({page_size}) >= "
+            f"ex.MR ({MR}); increase page_size or reduce B * T"
+        )
     if page_table.ndim != 2 or page_table.shape[0] != NS or page_table.shape[1] < 1:
         raise ValueError(
             f"page_table has shape {page_table.shape}, expected ({NS}, >=1)"

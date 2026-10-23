@@ -24,6 +24,7 @@ import pytest
 from jax.experimental import pallas as pl
 
 from vllm_torchtpu.megakernel import pool
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.pool import (
     CacheExec,
@@ -468,6 +469,18 @@ def test_scatter_input_validation_and_pos_debug_check():
         pool.scatter_pool_states(
             lay, ex, raw_r0, pos, pt, knew, vnew, conv, rec, ckpt[..., :1]
         )
+
+    # 4b. Missing conv/rec/ckpt_indices with slots_per_pool > 0 raises ValueError,
+    # and page_size < MR raises MegakernelConfigError.
+    with pytest.raises(ValueError, match="requires conv, rec, and ckpt_indices"):
+        pool.scatter_pool_states(lay, ex, raw_r0, pos, pt, knew, vnew, None, rec, ckpt)
+    ex_big_mr = replace(ex)
+    object.__setattr__(ex_big_mr, "B", 256)
+    with pytest.raises(
+        MegakernelConfigError,
+        match=r"scatter_pool_states requires CacheExec\.page_size",
+    ):
+        pool.scatter_pool_states(kv_only, ex_big_mr, raw_r0, pos, pt, knew, vnew)
 
     # 5. pos beyond page_table capacity triggers kernel_debug_check
     pos_bad = jnp.asarray([261, 262, 20, 21], dtype=jnp.int32)
