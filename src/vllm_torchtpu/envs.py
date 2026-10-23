@@ -147,6 +147,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     TPU_DSV4_CSA_GATHER_NO_PAD: bool = False
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = False
+    TPU_DSPARK_SHARDED_CONTEXT_KV: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = True
     VLLM_TPU_DSV4_MHC_FUSE_NORM: bool = True
@@ -1041,6 +1042,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # exchange per-rank (max, argmax) pairs instead of reading the replicated
     # full-vocabulary weight at every draft position.
     "TPU_DSPARK_VOCAB_PARALLEL_MARKOV": env_bool("TPU_DSPARK_VOCAB_PARALLEL_MARKOV"),
+    # DSpark context-KV step: each tensor-parallel rank computes its 1/tp of
+    # the replicated main_proj columns and all-gathers them, and one matmul
+    # computes only the KV columns of every draft layer's fused_wqa_wkv.
+    "TPU_DSPARK_SHARDED_CONTEXT_KV": env_bool("TPU_DSPARK_SHARDED_CONTEXT_KV"),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission

@@ -139,6 +139,17 @@ class DSparkProposer(DFlashProposer):
                     "Markov head."
                 )
             self.draft_model.prepare_vocab_parallel_markov()
+        if envs.TPU_DSPARK_SHARDED_CONTEXT_KV:
+            prepare = getattr(
+                self.draft_model.model, "prepare_sharded_context_kv", None
+            )
+            if prepare is None:
+                raise RuntimeError(
+                    "TPU_DSPARK_SHARDED_CONTEXT_KV: "
+                    f"{type(self.draft_model).__name__} has no sharded context-KV "
+                    "projection."
+                )
+            prepare()
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
