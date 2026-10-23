@@ -25,6 +25,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import (
     mla_ragged_paged_attention,
 )
@@ -78,7 +79,7 @@ def _run_swa(
             jnp.zeros((q.shape[0], q.shape[1]), dtype=jnp.float32),
             jnp.full((q.shape[0], q.shape[1]), -1e9, dtype=jnp.float32),
         )
-    kv_pages_per_block = max(1, _SWA_KV_BLOCK_TOKENS // logical_page_size)
+    kv_pages_per_block = max(1, envs.TPU_DSV4_SWA_KV_BLOCK_TOKENS // logical_page_size)
     return mla_sliding_window_ragged_paged_attention(
         q=q,
         new_kv=new_kv,
@@ -93,8 +94,8 @@ def _run_swa(
         logical_page_size=logical_page_size,
         # The following parameters are tuned based on microbenchmark results.
         num_kv_pages_per_block=(kv_pages_per_block,) * 3,
-        num_queries_per_block=(1, 32, 32),
-        q_compute_block_size=4,
+        num_queries_per_block=envs.TPU_DSV4_SWA_NUM_QUERIES_PER_BLOCK,
+        q_compute_block_size=envs.TPU_DSV4_SWA_Q_COMPUTE_BLOCK_SIZE,
         unnormalized_output=not swa_only,
         non_causal_block=non_causal_block,
         chunk_prefill_size=verify_q_len,

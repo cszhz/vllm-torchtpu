@@ -148,6 +148,9 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DSV4_SC_TOPK_FLAT_SCORES: bool = True
     TPU_DSV4_SC_TOPK_COOP_MAX_ROWS: int = 16
+    TPU_DSV4_SWA_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
+    TPU_DSV4_SWA_Q_COMPUTE_BLOCK_SIZE: int = 16
+    TPU_DSV4_SWA_KV_BLOCK_TOKENS: int = 256
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -1039,6 +1042,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
     # Unset means unchunked: one single pass, no pipelining.
+    # DSv4 sliding-window attention kernel blocks (decode, prefill, mixed)
+    # query tokens per block, q rows per compute block, KV tokens per block.
+    "TPU_DSV4_SWA_NUM_QUERIES_PER_BLOCK": env_positive_int_triple(
+        "TPU_DSV4_SWA_NUM_QUERIES_PER_BLOCK", (1, 32, 32)
+    ),
+    # 16 (was a hardcoded 4): bit-exact, mixed T2048 SWA pass 0.497 -> 0.359 ms
+    # per layer on one core; decode unchanged.
+    "TPU_DSV4_SWA_Q_COMPUTE_BLOCK_SIZE": env_positive_int(
+        "TPU_DSV4_SWA_Q_COMPUTE_BLOCK_SIZE", 16
+    ),
+    "TPU_DSV4_SWA_KV_BLOCK_TOKENS": env_positive_int(
+        "TPU_DSV4_SWA_KV_BLOCK_TOKENS", 256
+    ),
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
