@@ -33,7 +33,7 @@ from vllm_torchtpu.kernels.fused_moe.v2 import AXIS, WeightFormat, fused_ep_moe_
 
 pytestmark = pytest.mark.multichip
 
-HIDDEN = 1024  # a multiple of 8 cores x 128 lanes, so the small all-reduce kernel applies
+HIDDEN = 512  # TP4 groups: 4 cores x 128 lanes divide it, so the small all-reduce kernel applies there
 _TP8 = ((0, 1, 4, 5, 6, 7, 2, 3),)
 _TP4_PERMUTED = ((7, 1, 4, 2), (6, 0, 5, 3))
 
