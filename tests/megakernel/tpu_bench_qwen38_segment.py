@@ -164,6 +164,28 @@ def run_bucket(
         "moved_std": float(np.std(ref - np.asarray(inp.x, np.float32))),
     }
     parity["ok"] = parity["mean_rel"] < 1e-2 and parity["rows_over_10pct"] <= max(1, B // 32)
+    # Where an outlier row deviates: per residual stream, and the last MoE
+    # layer's routed experts (with owner ranks) for that row.
+    h = g.H
+    diag = []
+    r_last = inp.w_l["router"][-1] if inp.w_l["router"].ndim == 3 else inp.w_l["router"]
+    lg = jnp.dot(moe_in[-1].astype(jnp.bfloat16), r_last.astype(jnp.bfloat16),
+                 preferred_element_type=jnp.float32)
+    top = np.asarray(jax.lax.top_k(lg, g.TOPK)[1])
+    for i in np.nonzero(row_max > 0.1)[0][:6]:
+        per_stream = [round(float(d[i, b * h : (b + 1) * h].max() / scale), 3) for b in range(g.NHC)]
+        diag.append({
+            "row": int(i),
+            "streams": per_stream,
+            "experts": [int(e) for e in top[i]],
+            "ranks": sorted({int(e) // (g.E // R) for e in top[i]}),
+            "ranks_peak": int(np.bincount(top[i] // (g.E // R), minlength=R).max()),
+        })
+    good = [i for i in range(B) if row_max[i] <= 0.1]
+    parity["outlier_diag"] = diag
+    parity["good_rows_ranks_peak"] = [
+        int(np.bincount(top[i] // (g.E // R), minlength=R).max()) for i in good[:16]
+    ]
 
     def chain(n: int) -> float:
         h = hid
