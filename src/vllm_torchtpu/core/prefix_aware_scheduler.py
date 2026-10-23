@@ -767,7 +767,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         return 32
 
     def _inflight_prefill_reserved_blocks(self) -> int:
-        reserved = super()._inflight_prefill_reserved_blocks()
+        reserved = self._decode_inflight_reserved_blocks()
         if (
             getattr(self, "_kv_prefetch_in_waiting", False)
             and self._kv_prefetch_at_cap()
@@ -779,6 +779,48 @@ class PrefixAwareScheduler(AsyncScheduler):
                 return 1 << 30
             return reserved + self._kv_prefetch_reserve
         return reserved
+
+    def _decode_inflight_reserved_blocks(self) -> int:
+        """The stock async-load reservation, or, under
+        TPU_SCHED_DECODE_INFLIGHT_THROTTLE=1 (ix-unified-port, default off), the
+        final-lineage decode admission throttle (fp2q-r5 0447ff58b, from ae5e50b95):
+        on a KV consumer, refuse a new remote load while TPU_SCHED_DECODE_MAX_STAGE3_INFLIGHT
+        loads are in flight or running + in flight reaches max_running +
+        TPU_SCHED_DECODE_STAGE3_OVERPROVISION, else reserve
+        max(TPU_SCHED_DECODE_RESERVED_BLOCKS, _PER_SEQ x (running + in flight)) blocks.
+        Defaults 16 / 32 / 128 / 8 at DCP > 1 and 6 / 4 / 512 / 16 otherwise, as in that tree."""
+        base = int(super()._inflight_prefill_reserved_blocks() or 0)
+        on = getattr(self, "_decode_throttle_switch", None)
+        if on is None:
+            on = os.environ.get("TPU_SCHED_DECODE_INFLIGHT_THROTTLE", "0").strip() == "1"
+            self._decode_throttle_switch = on
+        if not on or not getattr(self, "_is_kv_consumer", False):
+            return base
+        num_inflight = len(getattr(self, "_inflight_prefills", ()))
+        num_running = len(getattr(self, "running", ()))
+        max_running = int(getattr(self, "max_num_running_reqs", 32) or 32)
+        dcp_w = int(getattr(self, "dcp_world_size", 1) or 1)
+        max_stage3_inflight = int(
+            os.environ.get("TPU_SCHED_DECODE_MAX_STAGE3_INFLIGHT", "16" if dcp_w > 1 else "6")
+            or 0
+        )
+        stage3_overprovision = int(
+            os.environ.get("TPU_SCHED_DECODE_STAGE3_OVERPROVISION", "32" if dcp_w > 1 else "4")
+        )
+        if (max_stage3_inflight > 0 and num_inflight >= max_stage3_inflight) or (
+            stage3_overprovision >= 0
+            and (num_running + num_inflight) >= (max_running + stage3_overprovision)
+        ):
+            return 1 << 30
+        min_reserved = int(
+            os.environ.get("TPU_SCHED_DECODE_RESERVED_BLOCKS", "128" if dcp_w > 1 else "512")
+            or 0
+        )
+        per_seq_reserved = int(
+            os.environ.get("TPU_SCHED_DECODE_RESERVED_BLOCKS_PER_SEQ", "8" if dcp_w > 1 else "16")
+            or 0
+        )
+        return max(base, max(min_reserved, per_seq_reserved * (num_running + num_inflight)))
 
     def _get_sched_knobs(self) -> tuple[bool, int, int, int]:
         srpf = getattr(self, "_srpf_running", None)
