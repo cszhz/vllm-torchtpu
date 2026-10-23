@@ -2488,21 +2488,16 @@ def mla_sliding_window_ragged_paged_attention(
         )
         return output, updated_kv, out_l, out_m
 
-    if hca_decode is not None:
-        # Skip the prefill and mixed launches in decode-only steps.
-        output, updated_kv, out_l, out_m = lax.cond(
-            distribution[2] > distribution[0],
-            run_non_decode,
-            lambda *state: state,
-            output,
-            updated_kv,
-            out_l,
-            out_m,
-        )
-    else:
-        output, updated_kv, out_l, out_m = run_non_decode(
-            output, updated_kv, out_l, out_m
-        )
+    # Skip the prefill and mixed launches in decode-only steps.
+    output, updated_kv, out_l, out_m = lax.cond(
+        distribution[2] > distribution[0],
+        run_non_decode,
+        lambda *state: state,
+        output,
+        updated_kv,
+        out_l,
+        out_m,
+    )
     output = prepare_outputs(
         output, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
