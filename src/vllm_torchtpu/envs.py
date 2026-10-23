@@ -131,12 +131,12 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
-    VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = False
-    VLLM_TPU_DSV4_MHC_FUSE_NORM: bool = False
-    VLLM_TPU_DSV4_MHC_STACKED_FN: bool = False
-    VLLM_TPU_DSV4_MHC_TOKEN_BLOCK: int = 0
-    VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS: int = -1
-    VLLM_TPU_DSV4_MHC_POST_HEAD: bool = False
+    VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = True
+    VLLM_TPU_DSV4_MHC_FUSE_NORM: bool = True
+    VLLM_TPU_DSV4_MHC_STACKED_FN: bool = True
+    VLLM_TPU_DSV4_MHC_TOKEN_BLOCK: int = 128
+    VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS: int = 0
+    VLLM_TPU_DSV4_MHC_POST_HEAD: bool = True
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -981,29 +981,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sinkhorn) inside the Pallas pre / fused seam kernels instead of as an
     # XLA epilogue of ~130 tiny ops per seam.
     "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL": env_bool(
-        "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL"
+        "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL", True
     ),
     # DeepSeek-V4 mHC: the pre / fused seam kernels also apply the
     # sublayer's attn_norm / ffn_norm RMSNorm to the layer input they emit.
-    "VLLM_TPU_DSV4_MHC_FUSE_NORM": env_bool("VLLM_TPU_DSV4_MHC_FUSE_NORM"),
+    "VLLM_TPU_DSV4_MHC_FUSE_NORM": env_bool("VLLM_TPU_DSV4_MHC_FUSE_NORM", True),
     # DeepSeek-V4 mHC: keep fn as its three bf16 chunks stacked (3 * 24, K)
     # and run the mix GEMM as one MXU pass (the MXU pads the 24-wide output
     # anyway). Not bit-identical to the three-pass path: the partial sums
     # round differently (measured closer to an f64 reference).
-    "VLLM_TPU_DSV4_MHC_STACKED_FN": env_bool("VLLM_TPU_DSV4_MHC_STACKED_FN"),
+    "VLLM_TPU_DSV4_MHC_STACKED_FN": env_bool("VLLM_TPU_DSV4_MHC_STACKED_FN", True),
     # DeepSeek-V4 mHC: fused seam token block (0 = kernel default 32). 128
     # amortizes the per-grid-step cost at prefill sizes.
-    "VLLM_TPU_DSV4_MHC_TOKEN_BLOCK": env_int("VLLM_TPU_DSV4_MHC_TOKEN_BLOCK", 0),
+    "VLLM_TPU_DSV4_MHC_TOKEN_BLOCK": env_int("VLLM_TPU_DSV4_MHC_TOKEN_BLOCK", 128),
     # DeepSeek-V4 mHC: in-kernel gates only up to this many tokens
     # (-1 = kernel default 512, 0 = no cap; with a 128-token block the
     # token-major Sinkhorn fills every lane, so no cap is needed).
     "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS": env_int(
-        "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS", -1
+        "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS", 0
     ),
     # DeepSeek-V4 mHC: fuse the posts that only feed the hc head collapse or
     # DSpark's aux stream mean into one kernel each, so the (T, 4, H) streams
     # are never written (one to three posts per forward).
-    "VLLM_TPU_DSV4_MHC_POST_HEAD": env_bool("VLLM_TPU_DSV4_MHC_POST_HEAD"),
+    "VLLM_TPU_DSV4_MHC_POST_HEAD": env_bool("VLLM_TPU_DSV4_MHC_POST_HEAD", True),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),
