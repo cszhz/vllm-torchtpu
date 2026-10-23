@@ -29,12 +29,8 @@ def _fused_kernel(
     res_ref,
     post_ref,
     comb_ref,
-    fn_hi_ref,
-    fn_mid_ref,
-    fn_lo_ref,
-    sc_ref,
-    hb_ref,
     *refs,
+    n_fn,
     hc_mult,
     hidden_size,
     gemm_precision,
@@ -49,6 +45,7 @@ def _fused_kernel(
     gate_a/gate_b are (mixes, sqrsum) when ``gates`` is None, else the
     in-block (post_mix, comb_mix).
     """
+    fn_refs, (sc_ref, hb_ref), refs = refs[:n_fn], refs[n_fn : n_fn + 2], refs[n_fn + 2 :]
     *norm_w, newres_ref, gate_a_ref, gate_b_ref, layer_ref = refs
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
@@ -75,17 +72,9 @@ def _fused_kernel(
         streams_bf.append(new_bf)
 
     g_bf = jnp.concatenate(streams_bf, axis=1)  # (tb, hc_mult * hidden_size)
-    dn = (((1,), (1,)), ((), ()))
-    acc = jax.lax.dot_general(
-        g_bf, fn_hi_ref[...], dn, preferred_element_type=jnp.float32
+    acc = utils.mix_gemm(
+        g_bf, fn_refs, hc_mult * (hc_mult + 2), gemm_precision
     )
-    if gemm_precision == "highest":
-        acc = acc + jax.lax.dot_general(
-            g_bf, fn_mid_ref[...], dn, preferred_element_type=jnp.float32
-        )
-        acc = acc + jax.lax.dot_general(
-            g_bf, fn_lo_ref[...], dn, preferred_element_type=jnp.float32
-        )
     gf = g_bf.astype(jnp.float32)  # f32 for the squared sum + collapse
     sqr = jnp.sum(gf * gf, axis=-1, keepdims=True)
 
@@ -130,7 +119,7 @@ def fused_post_pre_mixes(
     res2d: jax.Array,
     post2d: jax.Array,
     comb2d: jax.Array,
-    fn: jax.Array | utils.SplitFn,
+    fn: jax.Array | utils.SplitFn | utils.CatFn,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     rms_eps: float,
@@ -199,7 +188,7 @@ def fused_post_pre_mixes(
     )
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
 
-    fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
+    fn_ops = utils.fn_operands(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
@@ -213,11 +202,11 @@ def fused_post_pre_mixes(
     norm_args = [] if norm_weight is None else [norm_weight.reshape(1, hidden_size)]
     norm_specs = [pl.BlockSpec((1, hidden_size), lambda i: (0, 0)) for _ in norm_args]
 
-    resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     gate_widths = (hc_mult3, 1) if gates is None else (hc_mult, hc_mult * hc_mult)
     new_res, gate_a, gate_b, layer2d = pl.pallas_call(
         functools.partial(
             _fused_kernel,
+            n_fn=len(fn_ops),
             hc_mult=hc_mult,
             hidden_size=hidden_size,
             gemm_precision=gemm_precision,
@@ -232,9 +221,7 @@ def fused_post_pre_mixes(
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
-            resident,
-            resident,
-            resident,
+            *(pl.BlockSpec(f.shape, lambda i: (0, 0)) for f in fn_ops),
             pl.BlockSpec((1, 3), lambda i: (0, 0)),
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
             *norm_specs,
@@ -253,7 +240,7 @@ def fused_post_pre_mixes(
             jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
         ],
         compiler_params=compiler_params,
-    )(x2d, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d, *norm_args)
+    )(x2d, res2d, post2d, comb2d, *fn_ops, sc2d, hb2d, *norm_args)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],
@@ -266,7 +253,7 @@ def mhc_fused_post_pre(
     residual: jax.Array,
     post_layer_mix: jax.Array,
     comb_res_mix: jax.Array,
-    fn: jax.Array | utils.SplitFn,
+    fn: jax.Array | utils.SplitFn | utils.CatFn,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     rms_eps: float,

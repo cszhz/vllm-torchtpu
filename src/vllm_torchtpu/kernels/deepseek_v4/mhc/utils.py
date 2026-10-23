@@ -113,6 +113,67 @@ def split_fn3(fn: jax.Array | SplitFn) -> SplitFn:
     return SplitFn(*(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo)))
 
 
+class CatFn(NamedTuple):
+    """fn's three bf16 chunks stacked along the output axis: (3 * M3, K).
+
+    One MXU pass against the stacked chunks yields the three partial
+    products side by side; the MXU pads the 24-wide output to its full
+    width anyway, so this costs one pass instead of three. The partials are
+    then summed (hi + mid) + lo, the order of the three-pass path.
+    """
+
+    cat: jax.Array
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return (self.cat.shape[0] // 3, self.cat.shape[1])
+
+
+def cat_fn3(fn: "jax.Array | SplitFn | CatFn") -> CatFn:
+    """``split_fn3`` chunks stacked as one (3 * M3, K) bf16 array."""
+    if isinstance(fn, CatFn):
+        assert fn.cat.dtype == jnp.bfloat16, fn.cat.dtype
+        return fn
+    return CatFn(jnp.concatenate(tuple(split_fn3(fn)), axis=0))
+
+
+def fn_operands(fn: "jax.Array | SplitFn | CatFn") -> tuple[jax.Array, ...]:
+    """The kernel's fn operands: one stacked array (CatFn) or three chunks."""
+    if isinstance(fn, CatFn):
+        return (cat_fn3(fn).cat,)
+    return tuple(split_fn3(fn))
+
+
+def mix_gemm(x_bf: jax.Array, fn_refs, hc_mult3: int, gemm_precision: str):
+    """x (tb, K) bf16 @ fn.T -> (tb, M3) f32, exact for bf16 x.
+
+    ``fn_refs``: three chunk refs (three MXU passes), or one stacked ref
+    (one pass, then the partials are summed in the three-pass order).
+    """
+    dn = (((1,), (1,)), ((), ()))
+    if len(fn_refs) == 1:
+        out = jax.lax.dot_general(
+            x_bf, fn_refs[0][...], dn, preferred_element_type=jnp.float32
+        )
+        acc = out[:, :hc_mult3]
+        if gemm_precision == "highest":
+            acc = acc + out[:, hc_mult3 : 2 * hc_mult3]
+            acc = acc + out[:, 2 * hc_mult3 :]
+        return acc
+    fn_hi_ref, fn_mid_ref, fn_lo_ref = fn_refs
+    acc = jax.lax.dot_general(
+        x_bf, fn_hi_ref[...], dn, preferred_element_type=jnp.float32
+    )
+    if gemm_precision == "highest":
+        acc = acc + jax.lax.dot_general(
+            x_bf, fn_mid_ref[...], dn, preferred_element_type=jnp.float32
+        )
+        acc = acc + jax.lax.dot_general(
+            x_bf, fn_lo_ref[...], dn, preferred_element_type=jnp.float32
+        )
+    return acc
+
+
 def mhc_pre_gates(
     mixes: jax.Array,
     sqrsum: jax.Array,
