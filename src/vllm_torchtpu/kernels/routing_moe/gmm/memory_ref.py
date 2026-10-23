@@ -683,7 +683,8 @@ class PipelineBlockSpecs:
 
   def get_scale_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the quantization scale tensor."""
-    block_shape = (None, 1, 1, self.cfg.plan.tile_n)
+    num_blocks = self.cfg.plan.tile_k // self.cfg.w.quant.block_size
+    block_shape = (None, num_blocks, 1, self.cfg.plan.tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=self.index_map_provider.scale_index,

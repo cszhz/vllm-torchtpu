@@ -407,9 +407,20 @@ class MoEKernelTest(parameterized.TestCase):
       w_dtype=[jnp.int8, jnp.float8_e5m2, jnp.float4_e2m1fn],
   )
   def test_sub_channel_quantization(self, w_dtype):
-    self.skipTest(
-        "TODO: Support sub-channel quantization in routing_moe."
-    )
+    if w_dtype == jnp.float4_e2m1fn:
+      self.skipTest("TODO: Support fp4 weights in routing_moe.")
+    if w_dtype == jnp.float8_e5m2:
+      # Root cause: routing_moe quantizes x to the weight dtype (e5m2, 2
+      # mantissa bits), while the reference (tokamax gmm_v2) quantizes x to
+      # e4m3 for any floating-point weights, so the outputs differ beyond
+      # tolerance. Not a scale bug: it fails the same way with per-channel
+      # scales, and passes when the reference also quantizes x to e5m2.
+      # Fix: default routing_moe's x quant dtype to e4m3 for floating-point
+      # weights (gmm/plan.py), as gmm_v2 does, then remove this skip.
+      self.skipTest(
+          "TODO: routing_moe quantizes x to e5m2 for e5m2 weights, but the"
+          " reference (tokamax gmm_v2) uses e4m3."
+      )
     if (
         w_dtype in (jnp.float8_e5m2, jnp.float4_e2m1fn)
         and test_utils.get_tpu_version() < 7

@@ -106,6 +106,15 @@ def matmul(
       dtype_max = float(jnp.iinfo(x_q_dtype).max)
       preferred_element_type = jnp.int32
 
+    # Weight quantization block along K, with one weight scale per block.
+    # Weights without scales are treated as a single block.
+    w_q_block_size = tile_k if w_scale is None else cfg.w.quant.block_size
+    if w_scale is not None:
+      block_sizes = (q_block_size, w_q_block_size)
+      assert max(block_sizes) % min(block_sizes) == 0, (
+          f"{q_block_size=} and {w_q_block_size=} must divide one another."
+      )
+
     # Without n outer loop, result of quantized matmul becomes available only
     # at the last iteration of the loop. This means [tile_m, tile_n] value
     # needs to be stored until the last iteration. By adding n outer loop,
@@ -142,17 +151,25 @@ def matmul(
         if not tpu_info.is_matmul_supported(x_q_dtype, block_w.dtype):
           block_w = block_w.astype(x_q_dtype)
 
-        block_acc = jnp.matmul(
-            block_x_q,
-            block_w,
-            preferred_element_type=preferred_element_type,
-        ).astype(cfg.plan.acc_dtype)
-
-        if w_scale is not None:
-          # TODO: Support subchannel quantization.
-          block_acc *= w_scale[0, :, start_n:end_n].astype(
-              cfg.plan.acc_dtype
-          )
+        # If w_q_block_size <
+        # q_block_size, this loops q_block_size // w_q_block_size times.
+        # Otherwise it runs once over the whole x block (end_w is clipped to
+        # end_k - start_k), and consecutive x blocks share one weight scale.
+        block_acc = jnp.zeros((tile_m, col_size), dtype=cfg.plan.acc_dtype)
+        for start_w in range(0, end_k - start_k, w_q_block_size):
+          end_w = min(end_k - start_k, start_w + w_q_block_size)
+          sub_acc = jnp.matmul(
+              block_x_q[:, start_w:end_w],  # block_x_q: [tile_m, end_k - start_k]
+              block_w[start_w:end_w],  # block_w: [end_k - start_k, col_size]
+              preferred_element_type=preferred_element_type,
+          ).astype(cfg.plan.acc_dtype)
+          if w_scale is not None:
+            # w_scale: [tile_k // w_q_block_size, 1, tile_n]
+            scale_idx = (start_k + start_w) // w_q_block_size
+            sub_acc *= w_scale[scale_idx, :, start_n:end_n].astype(
+                cfg.plan.acc_dtype
+            )
+          block_acc += sub_acc
 
         block_acc *= block_scale.astype(cfg.plan.acc_dtype)
 

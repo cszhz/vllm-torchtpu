@@ -308,6 +308,83 @@ class RoutingGmmTest(parameterized.TestCase):
         atol=1e-2,
     )
 
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="w_lt_x",
+          size_k=4096,
+          size_n=2048,
+          w_q_block_size=256,
+          x_q_block_size=512,
+      ),
+      dict(
+          testcase_name="w_eq_x",
+          size_k=4096,
+          size_n=2048,
+          w_q_block_size=512,
+          x_q_block_size=512,
+      ),
+      dict(
+          testcase_name="w_gt_x",
+          size_k=4096,
+          size_n=2048,
+          w_q_block_size=1024,
+          x_q_block_size=512,
+      ),
+      # DeepSeek-V4 gate/up and down weights: hidden=7168, intermediate=2048.
+      dict(
+          testcase_name="dsv4_w1",
+          size_k=7168,
+          size_n=2 * 2048,
+          w_q_block_size=512,
+          x_q_block_size=512,
+      ),
+      dict(
+          testcase_name="dsv4_w2",
+          size_k=2048,
+          size_n=7168,
+          w_q_block_size=512,
+          x_q_block_size=512,
+      ),
+  )
+  def test_sub_channel_numerics(
+      self, size_k, size_n, w_q_block_size, x_q_block_size
+  ):
+    self._setup_inputs(
+        num_tokens=256,
+        size_k=size_k,
+        size_n=size_n,
+        num_experts=8,
+        ep_size=1,
+        topk=2,
+    )
+    rhs_q, rhs_scale = gmm_util.quantize_tensor(
+        self.rhs, jnp.float8_e4m3fn, axis=1, block_size=w_q_block_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    expected = gmm_v2.gmm_v2(
+        self.lhs_gathered,
+        rhs_q,
+        self.group_sizes,
+        rhs_scale=rhs_scale,
+        zero_initialize=False,
+        fuse_act="silu",
+    )
+    actual = gmm.routing_gmm(
+        self.lhs_compact,
+        arg.make_weight_wrapper(rhs_q, rhs_scale, fused_gate_up=True),
+        self.group_sizes,
+        gather=self.gather,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(x_quant_block_size=x_q_block_size),
+    )
+    actual = actual.data.reshape(actual.spec.large_shape)
+    np.testing.assert_allclose(
+        actual[: self.num_valid_rows],
+        expected[: self.num_valid_rows],
+        rtol=5e-2,
+        atol=5e-2,
+    )
+
   @parameterized.named_parameters(*SHAPES)
   def test_permute_gmm_benchmark(self, **shape):
     self._setup_inputs(**shape)
