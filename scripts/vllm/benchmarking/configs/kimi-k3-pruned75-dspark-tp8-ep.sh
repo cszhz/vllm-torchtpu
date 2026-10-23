@@ -19,10 +19,10 @@
 # records draft_context_update, draft_generate, and main_forward separately so
 # dspark_pd_cost_model.py can estimate a two-engine pipeline before allocating
 # a second slice.
-MODEL="${MODEL:-mgoin/Kimi-K3-pruned75}"
+MODEL="${MODEL_OVERRIDE:-mgoin/Kimi-K3-pruned75}"
 # `${VAR-default}` intentionally preserves an explicit empty value. Falcon
-# mounts the same GCS prefix locally and sets MODEL to that path, while CI uses
-# this URI with the RunAI streamer.
+# mounts the same GCS prefix locally and sets MODEL_OVERRIDE to that path,
+# while CI uses this URI with the RunAI streamer.
 MODEL_URI="${MODEL_URI-gs://tpu-commons-ci/moonshootai/kimi/k3-pruned75}"
 TENSOR_PARALLELISM=8
 DATA_PARALLELISM=1
