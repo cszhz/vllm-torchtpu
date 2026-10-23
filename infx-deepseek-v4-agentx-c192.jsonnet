@@ -334,6 +334,9 @@ local stepTimingLogSteps = cdk.var('TPU_STEP_TIMING_LOG_STEPS', '2000');
 // each EP16 rank holds a load-balanced set of experts instead of a contiguous block. Bitexact. Removing it
 // cost -4.6% total tok/s at c160 (n=3). Empty = contiguous blocks.
 local expertPlacement = cdk.var('TPU_EXPERT_PLACEMENT', 'dsv4_pro_agentx_ep16');
+// Intra-chip attention: wo_a fetches the peer core's rows by remote DMA inside the kernel instead of an
+// all-gather before it. Bitexact; +2.9% total tok/s at c160 (n=3). Empty = off.
+local pairSwap = cdk.var('TPU_DSV4_PAIR_SWAP', '1');
 // SrptPrefillScheduler caps each step's attention work (sum over scheduled tokens of their context) by
 // clipping prefill chunks while some DP rank decodes, so one rank's chunk deep in a long prompt stops
 // setting every rank's step. Empty = off.
@@ -780,6 +783,7 @@ local serverJob = cdk.job(
           'TPU_STEP_TIMING_LOG_STEPS',
           'TPU_KV_DROP_HCA_STATE_CHECKPOINT',
           'TPU_EXPERT_PLACEMENT',
+          'TPU_DSV4_PAIR_SWAP',
           'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK',
           'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK',
           'TPU_DSV4_ATTN_INTRA_CHIP_TP',
@@ -814,6 +818,7 @@ local serverJob = cdk.job(
         TPU_STEP_TIMING_LOG_STEPS: stepTimingLogSteps,
         [if prefixRoutingNewSessionAffinity != '' then 'PREFIX_ROUTING_NEW_SESSION_AFFINITY']: prefixRoutingNewSessionAffinity,
         [if expertPlacement != '' then 'TPU_EXPERT_PLACEMENT']: expertPlacement,
+        [if pairSwap != '' then 'TPU_DSV4_PAIR_SWAP']: pairSwap,
         [if srptAttnWorkCap != '' then 'VLLM_TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
         [if hcaKvPagesPerBlock != '' then 'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK']: hcaKvPagesPerBlock,
         [if indexerKvPagesPerBlock != '' then 'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK']: indexerKvPagesPerBlock,
