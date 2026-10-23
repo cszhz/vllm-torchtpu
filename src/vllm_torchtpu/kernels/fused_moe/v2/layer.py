@@ -234,12 +234,16 @@ _META_NIBBLES = 8
 _META_BYTE_BASE = 0x10
 
 
-def _gather_rows_with_meta(rows, meta, ax):
+def _gather_rows_with_meta(rows, meta, ax, gather=None):
     """All-gather e4m3 token rows [t, lane blocks, 128] and an i32 vector.
 
     The vector rides as trailing rows, so one collective carries both.
     Returns the gathered rows -- each source's `t + meta rows` rows in turn,
     its tokens first -- and the gathered vectors [ep, len(meta)].
+
+    ``gather`` replaces ``lax.all_gather(payload, ax, axis=0, tiled=True)``
+    with a callable of the payload that returns the same array (the one-shot
+    Pallas all-gather).
     """
     if rows.dtype != jnp.float8_e4m3fn:
         raise ValueError(f"the vector rides e4m3 rows; got {rows.dtype}")
@@ -257,7 +261,10 @@ def _gather_rows_with_meta(rows, meta, ax):
     payload = jnp.concatenate(
         [rows, lax.bitcast_convert_type(meta_bytes, rows.dtype)], axis=0
     )
-    gathered = lax.all_gather(payload, ax, axis=0, tiled=True)
+    if gather is None:
+        gathered = lax.all_gather(payload, ax, axis=0, tiled=True)
+    else:
+        gathered = gather(payload)
     ep = gathered.shape[0] // (t + meta_rows)
     if meta_rows == 1:
         meta_g = lax.slice(
@@ -383,6 +390,7 @@ def fused_ep_moe_v2(
     pallas_restore=False,
     fused_select=False,
     lane_quant=False,
+    oneshot_gather=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -489,7 +497,10 @@ def fused_ep_moe_v2(
     replicas' rows back with the small Pallas all-gather. fused_select folds
     the score bias and the row-finiteness test into the top-k selector.
     lane_quant quantizes the rows straight into the wire's [rows, lane blocks,
-    128] view (hwanginho f687714b0), so the reshape is not a relayout copy. All
+    128] view (hwanginho f687714b0), so the reshape is not a relayout copy.
+    oneshot_gather (needs merge_exchange) moves the merged payload with the
+    one-shot Pallas all-gather (small_collectives.oneshot_gather) instead of
+    XLA's all-gather. All
     apply only to the fused stage at or below SMALL_BATCH_LOCAL_TOKENS local
     tokens and change no value.
     """
@@ -656,6 +667,7 @@ def fused_ep_moe_v2(
     pallas_restore = bool(pallas_restore) and small_batch
     fused_select = bool(fused_select) and small_batch
     lane_quant = bool(lane_quant) and small_batch and form.quantized_activations
+    oneshot_gather = bool(oneshot_gather) and merge_exchange
     pallas_plan = (
         bool(pallas_plan)
         and small_batch
@@ -1191,7 +1203,17 @@ def fused_ep_moe_v2(
             # rows feed the collective directly: fused into the packing, the
             # bf16 multiply may be widened and the fp8 rounding moves.
             q_rows = lax.optimization_barrier(q_rows)
-            q_g, meta_g = _gather_rows_with_meta(q_rows, meta, ax)
+            if oneshot_gather:
+                from vllm_torchtpu.kernels.experimental.small_collectives.oneshot_gather import (  # noqa: E501
+                    oneshot_all_gather,
+                )
+
+                def gather(payload):
+                    return oneshot_all_gather(payload, num_cores=ep, axis=ax, rank=me)
+
+            else:
+                gather = None
+            q_g, meta_g = _gather_rows_with_meta(q_rows, meta, ax, gather)
             if order_after_l is not None:
                 q_g, _ = lax.optimization_barrier((q_g, order_after_l))
             source_rows = (t_local, q_g.shape[0] // ep)
@@ -1572,6 +1594,7 @@ def fused_ep_moe_v2(
         pallas_restore,
         fused_select,
         lane_quant,
+        oneshot_gather,
     )
     body, out_specs = {
         "fused": (decode_fn if decode_glue else local_fn, P(ax)),

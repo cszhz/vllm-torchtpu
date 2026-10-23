@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_PALLAS_RESTORE: bool = False
     MOE_FUSED_EP_V2_FUSED_SELECT: bool = False
     MOE_FUSED_EP_V2_LANE_QUANT: bool = False
+    MOE_FUSED_EP_V2_ONESHOT_GATHER: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     MOE_EXPERT_COUNT_TAP_DIR: str = ""
     MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
@@ -853,6 +854,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_FUSED_SELECT": env_bool("MOE_FUSED_EP_V2_FUSED_SELECT"),
     # Decode buckets: quantize the wire rows straight into lane blocks.
     "MOE_FUSED_EP_V2_LANE_QUANT": env_bool("MOE_FUSED_EP_V2_LANE_QUANT"),
+    # Decode buckets with MERGED_EXCHANGE: move the merged payload with the
+    # one-shot Pallas all-gather (barrier + direct remote DMAs).
+    "MOE_FUSED_EP_V2_ONESHOT_GATHER": env_bool("MOE_FUSED_EP_V2_ONESHOT_GATHER"),
     # A JSON file naming, per MoE layer, which global experts each EP rank
     # holds and in what slot order (expert_placement.py), or the name of one
     # shipped in vllm_torchtpu/expert_placements/. Empty: the checkpoint's
