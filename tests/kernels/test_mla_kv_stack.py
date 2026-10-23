@@ -439,3 +439,236 @@ class StackedGatherIndicesTest(parameterized.TestCase):
             got = np.asarray(base) + off
             np.testing.assert_array_equal(got[~pad], np.asarray(want)[~pad])
             self.assertTrue(((got >= off) & (got < off + num_blocks * page_size)).all())
+
+
+def _jaxpr_cone_hashes(closed_jaxpr, eqns):
+    """A structural hash of each eqn's whole input cone (primitive, params and
+    inputs, recursively; jaxpr inputs by position, constants by value). Two
+    eqns hash equal iff they compute the same thing from the same inputs --
+    what XLA's CSE merges."""
+    import hashlib
+
+    jaxpr = closed_jaxpr.jaxpr
+    producer = {}
+    for e in jaxpr.eqns:
+        for k, o in enumerate(e.outvars):
+            producer[o] = (e, k)
+    names = {v: f"in{i}" for i, v in enumerate(jaxpr.invars)}
+    for v, c in zip(jaxpr.constvars, closed_jaxpr.consts):
+        c = np.asarray(c)
+        names[v] = "c" + hashlib.md5(c.tobytes() + str(c.shape).encode()).hexdigest()
+    memo = {}
+
+    def canon(v):
+        if hasattr(v, "val"):  # Literal
+            return f"lit({v.val!r})"
+        if v in names:
+            return names[v]
+        if v not in memo:
+            e, k = producer[v]
+            params = sorted((a, str(b)) for a, b in e.params.items())
+            ins = ",".join(canon(i) for i in e.invars)
+            memo[v] = hashlib.md5(
+                f"{e.primitive.name}{params}({ins})#{k}".encode()
+            ).hexdigest()
+        return memo[v]
+
+    return [canon(e.outvars[0]) for e in eqns]
+
+
+class StackedWindowPrepCSETest(parameterized.TestCase):
+    """Every capped top-k -> row prep of `sparse_ragged_paged_attention` under
+    `kv_stack` -- plain window, live-group (TPU_DCP_MLA_MIXED_LIVE), mixed fused
+    (TPU_DCP_MLA_MIXED_FUSED_PREP), fused decode (TPU_DCP_MLA_FUSED_PREP, with
+    TPU_MLA_KV_WRITE_IN_GATHER's kv_write) -- is the SAME computation as on a
+    per-layer cache, for every stack row: one structural hash over per-layer,
+    row 0, row 1 and row 2 sharing a top-k and a page table (so XLA CSEs an
+    IndexShare layer's prep with its indexer layer's). The row offset reaches
+    the SparseCore gather instead (`row_offset` = row * num_blocks * page
+    size, none on row 0 or per-layer caches), and kv_write is handed over
+    unchanged (per-layer rows; the gather offsets them). Traced only (the
+    gather is stubbed: SparseCore needs a TPU). Positive control: a stack-wide
+    page table (the pre-fix form) makes the preps distinct."""
+
+    NB, L, PS, TOPK, CAP = 12, 3, 256, 2048, 512
+
+    def _trace(self, num_tokens, cfg, kv_write, rewrite_table=False):
+        from unittest import mock
+
+        import jax
+        from jax.experimental.pallas import tpu as pltpu
+
+        from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla
+        from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
+
+        calls = []
+
+        def stub(nope, rope, indices, *, out_size, kv_write=None, row_offset=None, **_):
+            calls.append((row_offset, kv_write))
+            outs = (
+                jnp.zeros((out_size, 128), jnp.uint32),
+                jnp.zeros((out_size // native_sc_gather.ROPE_PACKING, 128), jnp.uint32),
+            )
+            return outs + ((nope, rope) if kv_write is not None else ())
+
+        nb, ps = self.NB, self.PS
+        rows = (None, 0, 1, 2)
+        attn = sparse_mla.sparse_ragged_paged_attention
+        attn = getattr(attn, "__wrapped__", attn)
+
+        def fn(q, q_pe, n1, r1, n_l, r_l, topk, table, cu, dist, write):
+            outs = []
+            for row in rows:
+                stack = None if row is None else (row, nb)
+                pages = table
+                if rewrite_table and stack is not None:
+                    pages = stack_page_table_dcp(table, stack)
+                outs.append(
+                    attn(
+                        q,
+                        n1 if stack is None else n_l,
+                        r1 if stack is None else r_l,
+                        topk,
+                        pages,
+                        cu,
+                        dist,
+                        q_pe=q_pe,
+                        return_lse=True,
+                        cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                        is_dcp_mode=True,
+                        topk_cap=self.CAP,
+                        small_chunk_batch_size=4,
+                        small_chunk_tokens=32,
+                        lse_mask_empty=True,
+                        lse_lane_dense=True,
+                        gather_and_attention_chunk_size=512 if num_tokens > 32 else 256,
+                        kv_write=write if kv_write else None,
+                        kv_stack=stack,
+                        **cfg,
+                    )
+                )
+            return outs
+
+        s = jax.ShapeDtypeStruct
+        args = (
+            s((num_tokens, 64, 512), jnp.bfloat16),
+            s((num_tokens, 64, 64), jnp.bfloat16),
+            s((nb, ps, 128), jnp.uint32),
+            s((nb, ps // 4, 128), jnp.uint32),
+            s((self.L * nb, ps, 128), jnp.uint32),
+            s((self.L * nb, ps // 4, 128), jnp.uint32),
+            s((num_tokens, self.TOPK), jnp.int32),
+            s((8 * 4,), jnp.int32),
+            s((9,), jnp.int32),
+            s((3,), jnp.int32),
+            s((3 * 16, 128), jnp.uint32),
+        )
+        with (
+            mock.patch.object(native_sc_gather, "dsa_gather_native_sc", stub),
+            mock.patch.object(pltpu, "get_tpu_info", lambda: None),
+        ):
+            closed = jax.make_jaxpr(fn)(*args)
+        preps = [
+            e
+            for e in closed.jaxpr.eqns
+            if e.primitive.name == "pallas_call"
+            and str(e.params.get("name", "")).startswith("capped_window")
+        ]
+        return closed, preps, calls
+
+    @parameterized.named_parameters(
+        ("plain_window", 1024, {}, False, "capped_window_indices"),
+        (
+            "live_group",
+            1024,
+            {"mixed_live_gather": True, "mixed_live_widths": (256, 384)},
+            False,
+            "capped_window_indices_live",
+        ),
+        (
+            "mixed_fused_prep",
+            1024,
+            {
+                "mixed_live_gather": True,
+                "mixed_fused_prep": True,
+                "mixed_live_widths": (256, 384),
+            },
+            False,
+            "capped_window_indices_live_fused",
+        ),
+        (
+            "fused_decode_kv_write",
+            16,
+            {"fused_window_prep": True},
+            True,
+            "capped_window_indices_fused",
+        ),
+    )
+    def test_prep_is_per_layer_and_offset_rides_the_gather(
+        self, num_tokens, cfg, kv_write, prep_name
+    ):
+        closed, preps, calls = self._trace(num_tokens, cfg, kv_write)
+        self.assertLen(preps, 4)  # one prep per call: the path under test ran
+        self.assertEqual([e.params["name"] for e in preps], [prep_name] * 4)
+        self.assertLen(set(_jaxpr_cone_hashes(closed, preps)), 1)
+        per_call = len(calls) // 4
+        layer_rows = self.NB * self.PS
+        want = (
+            [None] * 2 * per_call
+            + [layer_rows] * per_call
+            + [2 * layer_rows] * per_call
+        )
+        self.assertEqual([c[0] for c in calls], want)
+        self.assertTrue(all((c[1] is not None) == kv_write for c in calls))
+
+        # Positive control: the stack-wide page table makes every row's prep
+        # its own computation (what kept XLA from CSE-ing them).
+        closed, preps, _ = self._trace(num_tokens, cfg, kv_write, rewrite_table=True)
+        self.assertLen(set(_jaxpr_cone_hashes(closed, preps)), 4)
+
+
+class StackedWindowRowsTest(parameterized.TestCase):
+    """`_window_physical_rows` (the translation every live / fused window prep
+    runs) on the per-layer table and geometry, plus the stack row offset, is
+    the row the stack-wide table translates to on the merged pool for every
+    valid slot; padding slots stay inside this layer's row of the stack (the
+    per-layer padding rows shifted). A wrong row offset (positive control)
+    misses."""
+
+    def test_offset_rows(self):
+        from vllm_torchtpu.kernels.mla.sparse.kernel import _window_physical_rows
+
+        n_layers, num_blocks, page_size, pps, chunk = 5, 12, 32, 128, 128
+        rng = np.random.default_rng(11)
+        table = rng.integers(0, num_blocks, (40, pps)).astype(np.int32)
+        idx = rng.integers(0, pps * page_size, (40, 256)).astype(np.int32)
+        idx[rng.random(idx.shape) < 0.3] = -1
+        flat = np.arange(idx.size, dtype=np.int32).reshape(idx.shape)
+        assert pps % chunk == 0
+        kw = dict(page_size=page_size, pages_per_seq=pps)
+        base = np.asarray(
+            _window_physical_rows(
+                jnp.asarray(idx),
+                jnp.asarray(table),
+                jnp.asarray(flat),
+                total_num_pages=num_blocks,
+                **kw,
+            )
+        )
+        pad = idx == -1
+        for row in range(n_layers):
+            off = row * num_blocks * page_size
+            want = np.asarray(
+                _window_physical_rows(
+                    jnp.asarray(idx),
+                    stack_page_table_dcp(jnp.asarray(table), (row, num_blocks)),
+                    jnp.asarray(flat),
+                    total_num_pages=n_layers * num_blocks,
+                    **kw,
+                )
+            )
+            got = base + off
+            np.testing.assert_array_equal(got[~pad], want[~pad])
+            self.assertTrue(((got >= off) & (got < off + num_blocks * page_size)).all())
+            wrong = base + ((row + 1) % n_layers) * num_blocks * page_size
+            self.assertFalse(np.array_equal(wrong[~pad], want[~pad]))
