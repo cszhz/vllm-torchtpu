@@ -112,12 +112,17 @@ def build(
     skip = ex.skip
     assert set(skip) <= set(ABLATIONS), skip
     tiles = ex.resolve_tiles(g)
-    scopes = ex.scopes
+    scopes_lvl = int(ex.scopes)
+
+    def mod_sc(mod: Any, phase: str):
+        return (
+            jax.named_scope(f"{mod.name}/{phase}")
+            if scopes_lvl >= 1
+            else contextlib.nullcontext()
+        )
 
     def sc(name: str, level: int = 1):
-        return (
-            jax.named_scope(name) if int(scopes) >= level else contextlib.nullcontext()
-        )
+        return jax.named_scope(name) if scopes_lvl > level else contextlib.nullcontext()
 
     core_plan, scratch = build_scratch(model_spec, ex)
     p = core_plan.plan
@@ -177,6 +182,12 @@ def build(
             raw_refs=raw_refs,
         )
 
+        def _emit_mod(mod: Any, lyr: Any, slot: Any) -> Any:
+            with mod_sc(mod, "emit"):
+                if scopes_lvl >= 1 and not ex.interpret:
+                    pltpu.trace_value("layer", lyr)
+                return mod.emit(ctx, lyr, slot)
+
         # ------------------------------ layer loop ------------------------------
         def layer(l, carry):  # noqa: E741
             slot = l % 2
@@ -194,7 +205,8 @@ def build(
                         scr["sm_sem"].at[1 - slot],
                     ).start()
 
-                for m in modules:
+            for m in modules:
+                with mod_sc(m, "on_layer_start"):
                     m.on_layer_start(ctx, l, slot)
 
             stream.begin_layer(l)
@@ -208,7 +220,7 @@ def build(
                     assert len(norm_names) == 1, norm_names
                     ctx.apply_input_norm(active[0].input_norm, slot)
                     if len(active) == 1:
-                        part = active[0].emit(ctx, l, slot)
+                        part = _emit_mod(active[0], l, slot)
                         if ar_slot is not None:
                             comm.add_residual(comm.allreduce(ar_slot, part, first))
                     elif len(active) == 2:
@@ -221,7 +233,7 @@ def build(
                         # a `vector<MBxHxf32>` tensor across the branch boundary
                         # (which would keep 64 VRegs live across `scf.if`).
                         def _emit_branch(mod, ar_slot=ar_slot):
-                            part = mod.emit(ctx, l, slot)
+                            part = _emit_mod(mod, l, slot)
                             if ar_slot is not None:
                                 comm.add_residual(comm.allreduce(ar_slot, part, first))
 
@@ -239,7 +251,7 @@ def build(
                         )
                 else:
                     ctx.apply_input_norm(slot_entry.input_norm, slot)
-                    part = slot_entry.emit(ctx, l, slot)
+                    part = _emit_mod(slot_entry, l, slot)
                     if ar_slot is not None:
                         comm.add_residual(comm.allreduce(ar_slot, part, first))
 
@@ -253,7 +265,8 @@ def build(
         ).start()
 
         for m in modules:
-            m.prologue(ctx)
+            with mod_sc(m, "prologue"):
+                m.prologue(ctx)
 
         if ex.R > 1:
             barrier = pltpu.get_barrier_semaphore()
@@ -269,14 +282,16 @@ def build(
         scr["res"][...] = jnp.where(live, hid_ref[: ex.MB].astype(F32), 0.0)
         scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
         for m in modules:
-            m.init_buffers(ctx)
+            with mod_sc(m, "init_buffers"):
+                m.init_buffers(ctx)
 
         lax.fori_loop(0, g.L, layer, 0)
 
         # ------------------------------ step epilogue ------------------------------
         comm.drain_sends()
         for m in modules:
-            m.epilogue(ctx)
+            with mod_sc(m, "epilogue"):
+                m.epilogue(ctx)
 
         fn_cp = pltpu.make_async_copy(W["final_norm"], scr["fn"], scr["fn_sem"])
         fn_cp.start()

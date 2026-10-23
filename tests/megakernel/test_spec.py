@@ -211,3 +211,108 @@ def test_switch_slot_and_model_spec_all_modules():
         SwitchSlot("bad", branches=(a, b), branch_counts=(1,))
     with pytest.raises(AssertionError):
         SwitchSlot("bad_zero", branches=(a, b), branch_counts=(0, 0))
+
+
+def test_kernel_per_module_profiling_scopes(monkeypatch):
+    """`kernel.build` wraps module hooks in `<module>/<phase>` at `scopes >= 1`
+    and keeps finer `ctx.sc` scopes at `scopes >= 2` / `>= 3`."""
+    import contextlib
+
+    import jax
+    import jax.numpy as jnp
+    from conftest import TINY_TILES, FakeGeometry
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh
+
+    from vllm_torchtpu.megakernel import kernel, planner
+
+    class _ScopedModule(Module):
+        name = "scoped_mod"
+        reduction = "allreduce"
+        input_norm = "in_norm"
+
+        def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
+            return [WeightDecl("w", K=g.H, N=g.H, dtype=BF16, stream_ring="static")]
+
+        def smalls(self, g: FakeGeometry, ex: ExecSpec) -> list[SmallField]:
+            return [SmallField("in_norm", g.H)]
+
+        def shared_widths(self, g: FakeGeometry, ex: ExecSpec) -> dict[str, int]:
+            return {"acc": g.H}
+
+        def emit(self, ctx, lyr, slot):
+            del lyr, slot
+            with (
+                ctx.sc("inner_l1"),
+                ctx.sc("inner_l2", 2),
+                ctx.stream.segment(lazy=False),
+            ):
+                return ctx.stream.dmatmul("w", ctx.scr["xb"], ctx.g.H)
+
+    g = FakeGeometry(L=2, H=256)
+    ms = ModelSpec(
+        "scoped_test", config=g, layer_type=LayerType("lt", (_ScopedModule(),))
+    )
+    tiles = dataclasses.replace(TINY_TILES, bank=64 << 10, nbd=2)
+    devs = jax.devices("cpu")[:1]
+    mesh = Mesh(devs, ("tp",))
+
+    def _trace_scopes(scopes_val: int | bool, *, interpret: bool = True):
+        seen: list[str] = []
+        traced_vals: list[tuple[str, object]] = []
+        orig_ns = jax.named_scope
+
+        @contextlib.contextmanager
+        def _spy_ns(name: str):
+            seen.append(name)
+            with orig_ns(name):
+                yield
+
+        monkeypatch.setattr(jax, "named_scope", _spy_ns)
+        monkeypatch.setattr(
+            pltpu,
+            "trace_value",
+            lambda label, val: traced_vals.append((label, val)),
+        )
+        ex = ExecSpec(
+            R=1,
+            B=4,
+            T=1,
+            ctx=128,
+            tiles=tiles,
+            interpret=interpret,
+            debug=exec_spec.DebugOptions(scopes=scopes_val),
+        )
+        p = planner.plan(ms, ex)
+        wsh = planner.weight_shapes(ms, ex, p)
+        pos = jnp.zeros((ex.B,), dtype=jnp.int32)
+        hid = jnp.zeros((ex.R * ex.M, g.H), dtype=BF16)
+        weights = {k: jnp.zeros((ex.R, *sh), dtype=dt) for k, (sh, dt) in wsh.items()}
+        step, _ = kernel.make_step(mesh, ms, ex)
+        if interpret:
+            step.lower(pos, hid, weights, {})
+        else:
+            with pytest.raises(ValueError, match="Only interpret mode"):
+                step.lower(pos, hid, weights, {})
+        return seen, traced_vals
+
+    s_off, tv_off = _trace_scopes(False, interpret=False)
+    assert s_off == [] and tv_off == []
+
+    for s_val in (1, True):
+        s_l1, tv_l1 = _trace_scopes(s_val, interpret=False)
+        assert set(s_l1) == {
+            "scoped_mod/prologue",
+            "scoped_mod/init_buffers",
+            "scoped_mod/on_layer_start",
+            "scoped_mod/emit",
+            "scoped_mod/epilogue",
+        }
+        assert [lbl for lbl, _ in tv_l1] == ["layer"]
+
+    s_l2, _ = _trace_scopes(2)
+    assert {"scoped_mod/emit", "inner_l1", "norm_in", "smalls_sync"} <= set(s_l2)
+    assert "inner_l2" not in set(s_l2)
+
+    s_l3, _ = _trace_scopes(3)
+    assert {"scoped_mod/emit", "inner_l1", "inner_l2", "dwait"} <= set(s_l3)

@@ -168,7 +168,7 @@ class DebugOptions:
     """Debug and ablation flags kept separate from model geometry and execution."""
 
     skip: frozenset[str] = frozenset()  # Named execution phases to skip during ablation
-    scopes: int | bool = False  # Emit per-phase jax.named_scope annotations
+    scopes: int | bool = False  # 1/True: <module>/<phase>; 2+: finer internal scopes
     # Per-module debug flags (registered `Debug` dataclasses keyed by module name).
     # Kept out of `Tiles`, so setting them leaves `ExecSpec.tiles=None` (and its
     # build-time VMEM refinement) intact.
