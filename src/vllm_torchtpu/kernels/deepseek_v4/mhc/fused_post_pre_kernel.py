@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -39,7 +40,6 @@ def _fused_kernel(
     mixes_ref,
     sqrsum_ref,
     layer_ref,
-    ss_ref,
     *,
     hc_mult,
     hidden_size,
@@ -59,8 +59,6 @@ def _fused_kernel(
     With ``nw_ref`` (an RMSNorm weight), the layer input is stored already
     normalized, as the sublayer's RMSNorm would compute it from the stored
     bf16 value (``utils.xla_row_sum`` keeps its sum in XLA's order).
-    With ``ss_ref``, the stored layer input's squared row sum is stored too,
-    the reduce the next sublayer's RMSNorm would otherwise run in XLA.
     """
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
@@ -119,9 +117,6 @@ def _fused_kernel(
     for i in range(1, m):
         lay = lay + pre_mix[:, i : i + 1] * gf[:, i * h : (i + 1) * h]
     lay_bf = lay.astype(jnp.bfloat16)
-    if ss_ref is not None:
-        lf = lay_bf.astype(jnp.float32)
-        ss_ref[...] = utils.xla_row_sum(lf * lf)
     if nw_ref is not None:
         lf = lay_bf.astype(jnp.float32)
         inv_rms = jax.lax.rsqrt(utils.xla_row_sum(lf * lf) * (1.0 / h) + norm_eps)
@@ -136,7 +131,6 @@ def _fused_kernel(
         "hc_pre_eps",
         "routed_scale",
         "norm_eps",
-        "emit_sumsq",
         "token_block_size",
         "gemm_precision",
         "vmem_limit_bytes",
@@ -157,11 +151,10 @@ def fused_post_pre_mixes(
     routed_scale: float = 1.0,
     norm_weight: jax.Array | None = None,
     norm_eps: float | None = None,
-    emit_sumsq: bool = False,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
-) -> tuple[jax.Array, ...]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """The Pallas seam kernel: post recombine fused with pre's mix GEMM
     and in-block collapse.
 
@@ -186,7 +179,6 @@ def fused_post_pre_mixes(
         routed_scale: static; the MoE's routed scaling factor.
         norm_weight: optional (hidden_size,) bfloat16 RMSNorm weight; layer2d
             is then RMSNorm(layer input) with it and static ``norm_eps``.
-        emit_sumsq: static; also return the layer input's squared row sum.
         token_block_size: tokens per grid step. Default 32 keeps the
             worst-case VMEM footprint (f32 old streams + bf16 blocks +
             the three resident bf16 fn chunks) near 12 MB at DeepSeek-V4
@@ -202,8 +194,6 @@ def fused_post_pre_mixes(
         sqrsum: (num_tokens, 1), float32.
         layer2d: (num_tokens, hidden_size), bfloat16, normalized when
             ``norm_weight`` is given.
-        layer_sumsq: with ``emit_sumsq``, (num_tokens, 1) float32, summed in
-            XLA TPU's reduce order.
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
     assert res2d.dtype == jnp.bfloat16, res2d.dtype
@@ -261,9 +251,8 @@ def fused_post_pre_mixes(
         norm_eps=norm_eps,
     )
     passed = [True, shared2d is not None] + [True] * 8 + [norm_weight is not None]
-    passed += [True] * 4 + [emit_sumsq]
-    outs = pl.pallas_call(
-        utils.with_absent_refs(kernel, passed),
+    new_res, mixes, sqrsum, layer2d = pl.pallas_call(
+        utils.with_absent_refs(kernel, passed + [True] * 4),
         grid=(padded_tokens // tb,),
         in_specs=[
             *x_specs,
@@ -282,23 +271,20 @@ def fused_post_pre_mixes(
             pl.BlockSpec((tb, hc_mult3), lambda i: (i, 0)),
             pl.BlockSpec((tb, 1), lambda i: (i, 0)),
             pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
-            *([pl.BlockSpec((tb, 1), lambda i: (i, 0))] if emit_sumsq else []),
         ],
         out_shape=[
             jax.ShapeDtypeStruct((padded_tokens, hc_hidden), jnp.bfloat16),
             jax.ShapeDtypeStruct((padded_tokens, hc_mult3), jnp.float32),
             jax.ShapeDtypeStruct((padded_tokens, 1), jnp.float32),
             jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
-            *(
-                [jax.ShapeDtypeStruct((padded_tokens, 1), jnp.float32)]
-                if emit_sumsq
-                else []
-            ),
         ],
         compiler_params=compiler_params,
     )(*x_inputs, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d, *norm_inputs)
 
-    return utils.trim_to(num_tokens, *outs)
+    return cast(
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        utils.trim_to(num_tokens, new_res, mixes, sqrsum, layer2d),
+    )
 
 
 def mhc_fused_post_pre(
@@ -319,11 +305,10 @@ def mhc_fused_post_pre(
     routed_scale: float = 1.0,
     norm_weight: jax.Array | None = None,
     norm_eps: float | None = None,
-    emit_sumsq: bool = False,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
-) -> tuple[jax.Array, ...]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Fused seam op: Pallas post+GEMM+collapse kernel, XLA gates epilogue.
 
     ``residual`` is (..., hc_mult, hidden_size), or (..., hidden_size) when
@@ -332,8 +317,6 @@ def mhc_fused_post_pre(
     and the MoE output bf16(shared + x * routed_scale) is formed in-kernel.
     With ``norm_weight``, layer_input_cur comes back through the next
     sublayer's RMSNorm (weight ``norm_weight``, epsilon ``norm_eps``).
-    With ``emit_sumsq``, layer_input_cur's squared row sum (..., 1) f32
-    follows, for an RMSNorm the caller applies.
     Returns (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur).
     """
     assert residual.dtype == jnp.bfloat16
@@ -347,7 +330,7 @@ def mhc_fused_post_pre(
     post2d = post_layer_mix.reshape(-1, hc_mult)
     comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
 
-    new_res2d, mixes, sqrsum, layer_input_cur, *layer_sumsq = fused_post_pre_mixes(
+    new_res2d, mixes, sqrsum, layer_input_cur = fused_post_pre_mixes(
         x2d,
         res2d,
         post2d,
@@ -361,7 +344,6 @@ def mhc_fused_post_pre(
         routed_scale=routed_scale,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
-        emit_sumsq=emit_sumsq,
         token_block_size=token_block_size,
         gemm_precision=gemm_precision,
         vmem_limit_bytes=vmem_limit_bytes,
@@ -385,5 +367,4 @@ def mhc_fused_post_pre(
         post_mix_cur.reshape(*outer_shape, hc_mult, 1),
         comb_mix_cur.reshape(*outer_shape, hc_mult, hc_mult),
         layer_input_cur.reshape(*outer_shape, hidden_size),
-        *(s.reshape(*outer_shape, 1) for s in layer_sumsq),
     )
