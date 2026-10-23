@@ -244,6 +244,11 @@ class Config:
         tables inside the dense-slots program itself, under its first weight
         refills, on the shard's unpadded rows (padding and valid-row masks in
         the program); supersedes dense_slots_pallas_tables.
+      gdn_decode_tile_size: not a fused-EP setting: the GDN decode kernel's
+        tile size (kernels/gdn/v3/wrapper.py reads it from this JSON when
+        TPU_GDN_DECODE_TILE_SIZE is unset; 0 leaves the kernel's choice). It
+        rides here because the serving recipe passes this JSON to the decode
+        server alone and drops unknown env names.
     """
     result_slots: int = RESULT_SLOTS_DEFAULT
     row_fetch_ahead: int = ROW_FETCH_AHEAD_DEFAULT
@@ -281,6 +286,7 @@ class Config:
     dense_slots_fused: bool = False
     dense_slots_pallas_tables: bool = False
     dense_slots_merged: bool = False
+    gdn_decode_tile_size: int = 0
 
     @property
     def token_dtype(self):
@@ -410,6 +416,9 @@ class Config:
         if self.dense_slots_max_tokens <= 0 or self.dense_slots_max_tokens % 8:
             raise ValueError(f"dense_slots_max_tokens {self.dense_slots_max_tokens}: a "
                              "positive multiple of 8")
+        if self.gdn_decode_tile_size < 0:
+            raise ValueError(f"gdn_decode_tile_size {self.gdn_decode_tile_size}: 0 (the "
+                             "kernel's choice) or a positive tile size")
         if self.weight_dma_priority not in WEIGHT_DMA_PRIORITIES:
             raise ValueError(f"weight_dma_priority {self.weight_dma_priority} "
                              f"is not one of {WEIGHT_DMA_PRIORITIES}")
