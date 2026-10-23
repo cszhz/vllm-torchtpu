@@ -56,8 +56,10 @@ def tile_profile(name: str, B: int = 8) -> Any:
 
     if name == "default":
         return None
-    if name == "pipe_ep":  # e13 T=2, e2 T=1: the software-pipelined EP expert path
-        return Tiles(ebank=2 << 20, nbe=12 if B <= 16 else 6, nbd=10, vmem_mib=62).with_blocks(
+    if name in ("pipe_ep", "pipe_ep_h1"):  # e13 T=2, e2 T=1: software-pipelined EP experts
+        hier = 1 if (name == "pipe_ep_h1" or B > 32) else 0
+        nbe, nbd = (12, 10) if B <= 16 else ((6, 10) if B <= 32 else (3, 6))
+        return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=hier).with_blocks(
             {"moe": {"pipe_ep": True, "moe_unroll": True}}
         )
     if name == "pipe":  # single-tile experts
@@ -93,15 +95,23 @@ def run_bucket(
     interpret: bool = False,
     profile: str = "default",
     ref_precision: str = "highest",
+    same_experts: bool = False,
 ) -> dict:
     R = mesh.size
     ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=interpret, tiles=tiles)
     spec = qwen38.segment_spec(g, R, L=L)
 
     def gen(key):
-        return random_segment_inputs(
+        inp = random_segment_inputs(
             key, g, ex, L, gain=gain, zero=zero, router_gain=router_gain
         )
+        if same_experts:
+            # All routed experts identical: parity no longer depends on top-k picks.
+            w = dict(inp.w_l)
+            for k in ("e13", "e2", "e13_s", "e2_s"):
+                w[k] = jnp.broadcast_to(w[k][:1, :, :1], w[k].shape)
+            inp.w_l = w
+        return inp
 
     shapes = jax.eval_shape(gen, jax.random.PRNGKey(0))
     inp = jax.jit(gen, out_shardings=_shardings(shapes, R, mesh))(jax.random.PRNGKey(B))
@@ -238,6 +248,7 @@ def run_bucket(
         "zero": list(zero),
         "profile": profile,
         "ref_precision": ref_precision,
+        "same_experts": same_experts,
         "H": g.H,
         "I": g.I,
         "moe_path": moe_path,
@@ -268,6 +279,7 @@ def main() -> None:
     ap.add_argument("--geom", nargs="+", default=["2560:640"], help="H:I geometry overrides")
     ap.add_argument("--profile", nargs="+", default=["default"], help="default | pipe_ep | pipe")
     ap.add_argument("--ref-precision", nargs="+", default=["highest"], help="highest | default")
+    ap.add_argument("--same-experts", nargs="+", type=int, default=[0], help="0 | 1")
     args = ap.parse_args()
     g, tiny_tiles = qwen38.FULL, None
     devs = jax.devices()
@@ -287,14 +299,18 @@ def main() -> None:
     for g in geoms:
       for L in args.layers:
         for B in args.rows:
-          for (gn, z, rg), prof, rp in [
-              (a, pr, rp) for a in arms for pr in args.profile for rp in args.ref_precision
+          for (gn, z, rg), prof, rp, se in [
+              (a, pr, rp, se)
+              for a in arms
+              for pr in args.profile
+              for rp in args.ref_precision
+              for se in args.same_experts
           ]:
             tiles = tiny_tiles if args.tiny else tile_profile(prof, B)
             try:
                 r = run_bucket(
                     g, B, args.T, L, mesh, args.chains, tiles, gn,
-                    () if z == "none" else (z,), rg, args.tiny, prof, rp,
+                    () if z == "none" else (z,), rg, args.tiny, prof, rp, bool(se),
                 )
             except Exception as e:  # noqa: BLE001 — report and continue to the next bucket
                 r = {"rows": B, "L": L, "error": f"{type(e).__name__}: {e}"[:2000]}
