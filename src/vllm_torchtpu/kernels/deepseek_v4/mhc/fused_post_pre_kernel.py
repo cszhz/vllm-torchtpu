@@ -26,6 +26,7 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
 def _fused_kernel(
     x_ref,
+    shared_ref,
     res_ref,
     post_ref,
     comb_ref,
@@ -44,8 +45,15 @@ def _fused_kernel(
     gemm_precision,
     rms_eps,
     hc_pre_eps,
+    routed_scale,
 ):
-    """One token block: recombine, store once, 3-pass GEMM, collapse."""
+    """One token block: recombine, store once, 3-pass GEMM, collapse.
+
+    With ``shared_ref`` (the shared expert's f32 output), ``x_ref`` is the
+    routed experts' unscaled sum and the MoE output is formed here, in f32
+    with one rounding, as XLA forms it when the add fuses into the shared
+    expert's matmul epilogue.
+    """
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
 
@@ -53,7 +61,12 @@ def _fused_kernel(
     # values instead of 4 held f32 copies halves the resident working set,
     # leaving VMEM headroom for the pipeline to prefetch the next block.
     # bf16 -> f32 casts are exact, so results are unchanged.
-    x_bf = x_ref[...]  # (tb, hidden) bf16
+    if shared_ref is None:
+        x_bf = x_ref[...]  # (tb, hidden) bf16
+    else:
+        x_bf = (shared_ref[...] + x_ref[...].astype(jnp.float32) * routed_scale).astype(
+            jnp.bfloat16
+        )
     if res_ref.shape[1] == hidden_size:
         # One stream standing for hc_mult identical ones (the chain's start).
         old_bf = [res_ref[...]] * hc_mult
@@ -105,6 +118,7 @@ def _fused_kernel(
     static_argnames=(
         "rms_eps",
         "hc_pre_eps",
+        "routed_scale",
         "token_block_size",
         "gemm_precision",
         "vmem_limit_bytes",
@@ -121,6 +135,8 @@ def fused_post_pre_mixes(
     rms_eps: float,
     hc_pre_eps: float,
     *,
+    shared2d: jax.Array | None = None,
+    routed_scale: float = 1.0,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
@@ -129,7 +145,8 @@ def fused_post_pre_mixes(
     and in-block collapse.
 
     Args:
-        x2d: (num_tokens, hidden_size), bfloat16 — sublayer output.
+        x2d: (num_tokens, hidden_size), bfloat16 — sublayer output; with
+            ``shared2d``, the routed experts' sum before ``routed_scale``.
         res2d: (num_tokens, hc_mult * hidden_size), bfloat16 — old streams;
             or (num_tokens, hidden_size) when they are hc_mult copies of
             one stream.
@@ -142,6 +159,10 @@ def fused_post_pre_mixes(
         hc_base: (hc_mult3,), float32 — logit biases, pre entries first.
         rms_eps: static; RMS-norm epsilon for the in-block pre gates.
         hc_pre_eps: static; additive floor on the sigmoid pre gates.
+        shared2d: optional (num_tokens, hidden_size) float32 shared-expert
+            output; the sublayer output is then
+            bf16(shared2d + x2d * routed_scale).
+        routed_scale: static; the MoE's routed scaling factor.
         token_block_size: tokens per grid step. Default 32 keeps the
             worst-case VMEM footprint (f32 old streams + bf16 blocks +
             the three resident bf16 fn chunks) near 12 MB at DeepSeek-V4
@@ -176,6 +197,14 @@ def fused_post_pre_mixes(
     # budget at DeepSeek-V4 shapes, so there is no vmem_need to shrink by.
     tb, padded_tokens = utils.select_token_block(num_tokens, token_block_size)
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
+    x_inputs = [x2d]
+    x_specs = [pl.BlockSpec((tb, hidden_size), lambda i: (i, 0))]
+    if shared2d is not None:
+        assert shared2d.dtype == jnp.float32, shared2d.dtype
+        assert shared2d.shape == (num_tokens, hidden_size), shared2d.shape
+        (shared2d,) = utils.pad_to(padded_tokens, shared2d)
+        x_inputs.append(shared2d)
+        x_specs.append(pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)))
 
     fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
@@ -188,18 +217,20 @@ def fused_post_pre_mixes(
     )
 
     resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
+    kernel = functools.partial(
+        _fused_kernel,
+        hc_mult=hc_mult,
+        hidden_size=hidden_size,
+        gemm_precision=gemm_precision,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        routed_scale=routed_scale,
+    )
     new_res, mixes, sqrsum, layer2d = pl.pallas_call(
-        functools.partial(
-            _fused_kernel,
-            hc_mult=hc_mult,
-            hidden_size=hidden_size,
-            gemm_precision=gemm_precision,
-            rms_eps=rms_eps,
-            hc_pre_eps=hc_pre_eps,
-        ),
+        kernel if shared2d is not None else utils.without_shared(kernel),
         grid=(padded_tokens // tb,),
         in_specs=[
-            pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
+            *x_specs,
             pl.BlockSpec((tb, res_width), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
@@ -222,7 +253,7 @@ def fused_post_pre_mixes(
             jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
         ],
         compiler_params=compiler_params,
-    )(x2d, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
+    )(*x_inputs, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],
@@ -244,6 +275,8 @@ def mhc_fused_post_pre(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     *,
+    shared: jax.Array | None = None,
+    routed_scale: float = 1.0,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
@@ -252,6 +285,8 @@ def mhc_fused_post_pre(
 
     ``residual`` is (..., hc_mult, hidden_size), or (..., hidden_size) when
     its hc_mult streams are copies of one stream (the chain's first seam).
+    With ``shared`` (f32, x's shape), x is the routed experts' unscaled sum
+    and the MoE output bf16(shared + x * routed_scale) is formed in-kernel.
     Returns (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur).
     """
     assert residual.dtype == jnp.bfloat16
@@ -275,6 +310,8 @@ def mhc_fused_post_pre(
         hc_base,
         rms_eps,
         hc_pre_eps,
+        shared2d=None if shared is None else shared.reshape(-1, hidden_size),
+        routed_scale=routed_scale,
         token_block_size=token_block_size,
         gemm_precision=gemm_precision,
         vmem_limit_bytes=vmem_limit_bytes,

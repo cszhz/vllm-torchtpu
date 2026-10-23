@@ -57,6 +57,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op impo
     MHCOps,
     get_mhc_ops,
     get_mhc_post_head_op,
+    get_mhc_post_head_shared_op,
     get_mhc_post_op,
 )
 from vllm_torchtpu.logger import init_logger
@@ -147,6 +148,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
+                self.ffn.routed_scaling_factor,
             )
             object.__setattr__(self, "_mhc_ops_instance", ops)
         return ops
@@ -168,19 +170,29 @@ class DeepseekV4DecoderLayer(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         positions: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        defer_moe_combine: bool = False,
+    ) -> tuple[
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Defer each post into the next pre so the pair is one kernel.
 
         `x` arrives as the previous sublayer's raw output and the caller
         carries `(residual, post_mix, res_mix)` -- the recombine that output
         still owes. The chain is opened by the layer-0 attention pre, which
         has no preceding post, and closed by the caller.
+
+        With `defer_moe_combine`, a MoE output with a shared expert is
+        returned as `(routed, shared)` (see `DeepseekV4MoE.forward_parts`)
+        and the next seam adds the two; `x` may then arrive that way too.
         """
         if residual is None and x.dim() == 2:
             # Chain start on the embedding: its hc_mult streams are copies
@@ -196,8 +208,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
             )
         else:
-            residual, post_mix, res_mix, x = self.mhc_ops.fused(
-                x,
+            seam_args = (
                 residual,
                 post_mix,
                 res_mix,
@@ -205,6 +216,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_scale,
                 self.hc_attn_base,
             )
+            if isinstance(x, tuple):
+                residual, post_mix, res_mix, x = self.mhc_ops.fused_with_shared(
+                    *x, *seam_args
+                )
+            else:
+                residual, post_mix, res_mix, x = self.mhc_ops.fused(x, *seam_args)
 
         x = self.attn_norm(x)
         x = self.attn(positions, x)
@@ -224,8 +241,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_base,
         )
         x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        return x, residual, post_mix, res_mix
+        routed, shared = self.ffn.forward_parts(x, input_ids)
+        if shared is None:
+            return routed, residual, post_mix, res_mix
+        if defer_moe_combine:
+            return (routed, shared), residual, post_mix, res_mix
+        return self.ffn.combine(routed, shared), residual, post_mix, res_mix
+
+
+def _combined(
+    ffn: DeepseekV4MoE, x: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+) -> torch.Tensor:
+    """A layer output as one tensor, from a deferred (routed, shared) pair."""
+    return ffn.combine(*x) if isinstance(x, tuple) else x
 
 
 class _HostStagedParams:
@@ -383,13 +411,20 @@ class DeepseekV4Model(nn.Module):
         return op
 
     @property
-    def mhc_post_head_op(self):
-        """The deferred post fused with the hc head collapse, built once."""
-        op = self.__dict__.get("_mhc_post_head_op_instance")
-        if op is None:
-            op = get_mhc_post_head_op(self.rms_norm_eps, self.hc_eps)
-            object.__setattr__(self, "_mhc_post_head_op_instance", op)
-        return op
+    def mhc_post_head_op(self) -> tuple:
+        """The deferred post fused with the hc head collapse, built once:
+        (op on a combined MoE output, op on (routed, shared))."""
+        ops = self.__dict__.get("_mhc_post_head_op_instance")
+        if ops is None:
+            routed_scale = getattr(self.config, "routed_scaling_factor", 1.0)
+            ops = (
+                get_mhc_post_head_op(self.rms_norm_eps, self.hc_eps),
+                get_mhc_post_head_shared_op(
+                    self.rms_norm_eps, self.hc_eps, routed_scale
+                ),
+            )
+            object.__setattr__(self, "_mhc_post_head_op_instance", ops)
+        return ops
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -483,12 +518,16 @@ class DeepseekV4Model(nn.Module):
                 post_mix,
                 res_mix,
                 residual,
+                defer_moe_combine=True,
             )
+            last_ffn = layer.ffn
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the full hc-stream state and collapse it the
                 # way the drafts were trained on: settle the deferred post,
                 # then mean over the hc streams (upstream numerics).
-                aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
+                aux_recon = self.mhc_post_op(
+                    _combined(last_ffn, hidden_states), residual, post_mix, res_mix
+                )
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
 
@@ -503,8 +542,8 @@ class DeepseekV4Model(nn.Module):
             elif is_last_rank:
                 # Settle the deferred post and collapse the hc streams in one
                 # kernel; the [T, hc_mult, hidden] state never reaches HBM.
-                hidden_states = self.mhc_post_head_op(
-                    hidden_states,
+                post_head, post_head_shared = self.mhc_post_head_op
+                head_args = (
                     residual,
                     post_mix,
                     res_mix,
@@ -512,11 +551,15 @@ class DeepseekV4Model(nn.Module):
                     self.hc_head_scale,
                     self.hc_head_base,
                 )
+                if isinstance(hidden_states, tuple):
+                    hidden_states = post_head_shared(*hidden_states, *head_args)
+                else:
+                    hidden_states = post_head(hidden_states, *head_args)
                 collapsed = True
             else:
                 # Fused path: settle the post the last layer deferred.
                 hidden_states = self.mhc_post_op(
-                    hidden_states, residual, post_mix, res_mix
+                    _combined(last_ffn, hidden_states), residual, post_mix, res_mix
                 )
 
         if not is_last_rank:

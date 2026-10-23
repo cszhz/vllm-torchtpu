@@ -82,6 +82,7 @@ def xla_quantized_matmul(
     w_q: jax.Array,
     w_scale: jax.Array,
     quantize_activation=True,
+    out_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """
     Reference (pure JAX) implementation of the quantized matmul kernel.
@@ -96,6 +97,7 @@ def xla_quantized_matmul(
         x: Activation. [num_tokens, n_input_features]
         w_q: Weight quantized array. [n_input_features, n_output_features]
         w_scale: Weight quantization scale. [n_output_features]
+        out_dtype: Output dtype; defaults to ``x.dtype``.
 
     Returns:
         Output of the quantized matmul.
@@ -121,7 +123,7 @@ def xla_quantized_matmul(
             preferred_element_type=jnp.float32,
         )
     out *= jnp.expand_dims(w_scale, 0)
-    return out.astype(x.dtype)
+    return out.astype(out_dtype or x.dtype)
 
 
 def xla_quantized_batched_matmul(

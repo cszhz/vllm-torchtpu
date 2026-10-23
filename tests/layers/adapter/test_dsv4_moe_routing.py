@@ -221,6 +221,7 @@ def test_dsv4_forward_lets_vllm_runner_apply_gate_once():
 
     model = DeepseekV4MoE.__new__(DeepseekV4MoE)
     torch.nn.Module.__init__(model)
+    model.shared_experts = None
     model.gate = Gate(2, 2, bias=False)
     model.gate.weight.data.copy_(torch.tensor([[2.0, 0.0], [0.0, 3.0]]))
     config = VllmConfig(device_config=DeviceConfig(device="cpu"))

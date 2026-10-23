@@ -35,6 +35,7 @@ LANE_CHUNK = 256
 
 def _post_head_kernel(
     x_ref,
+    shared_ref,
     res_ref,
     post_ref,
     comb_ref,
@@ -48,11 +49,14 @@ def _post_head_kernel(
     lane_chunk,
     rms_eps,
     hc_eps,
+    routed_scale,
 ):
     """One token block: post recombine, then the head collapse in VMEM.
 
     Walks the hidden axis in lane chunks so each chunk's f32 values die
     before the next; only the bf16 streams stay resident between passes.
+    With ``shared_ref``, the MoE output is formed first, as the seam kernel
+    forms it (``fused_post_pre_kernel``).
     """
     m, h = hc_mult, hidden_size
     post = post_ref[...]  # (tb, m) f32
@@ -65,6 +69,9 @@ def _post_head_kernel(
     sq = None
     for cols in chunks:
         x = x_ref[:, cols].astype(jnp.float32)
+        if shared_ref is not None:
+            x = (shared_ref[:, cols] + x * routed_scale).astype(jnp.bfloat16)
+            x = x.astype(jnp.float32)
         streams = [
             res_ref[:, i * h + cols.start : i * h + cols.stop].astype(jnp.float32)
             for i in range(m)
@@ -106,6 +113,7 @@ def _post_head_kernel(
     static_argnames=(
         "rms_eps",
         "hc_eps",
+        "routed_scale",
         "token_block_size",
         "lane_chunk",
         "vmem_limit_bytes",
@@ -122,6 +130,8 @@ def mhc_post_head_2d(
     *,
     rms_eps: float,
     hc_eps: float,
+    shared: jax.Array | None = None,
+    routed_scale: float = 1.0,
     token_block_size: int = TOKEN_BLOCK,
     lane_chunk: int = LANE_CHUNK,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
@@ -135,6 +145,8 @@ def mhc_post_head_2d(
         comb_res_mix: (num_tokens, hc_mult, hc_mult) float32.
         hc_fn: (hc_mult, hc_mult * hidden_size) float32 head projection.
         hc_scale: (1,) float32. hc_base: (hc_mult,) float32.
+        shared: optional (num_tokens, hidden_size) float32 shared-expert
+            output; x is then the routed sum before ``routed_scale``.
 
     Returns:
         (num_tokens, hidden_size) in ``res2d.dtype``.
@@ -156,24 +168,32 @@ def mhc_post_head_2d(
 
     tb, padded_tokens = utils.select_token_block(num_tokens, token_block_size)
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
+    x_inputs = [x2d]
+    if shared is not None:
+        assert shared.dtype == jnp.float32, shared.dtype
+        x_inputs += utils.pad_to(padded_tokens, shared.reshape(-1, hidden_size))
 
     # Rounded as XLA rounds an f32 operand for a default-precision dot.
     fn_bf = hc_fn.astype(jnp.bfloat16)
     sc2d = hc_scale.reshape(1, 1).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult).astype(jnp.float32)
 
+    kernel = functools.partial(
+        _post_head_kernel,
+        hc_mult=hc_mult,
+        hidden_size=hidden_size,
+        lane_chunk=lane_chunk,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        routed_scale=routed_scale,
+    )
+    if shared is None:
+        kernel = utils.without_shared(kernel)
     out = pl.pallas_call(
-        functools.partial(
-            _post_head_kernel,
-            hc_mult=hc_mult,
-            hidden_size=hidden_size,
-            lane_chunk=lane_chunk,
-            rms_eps=rms_eps,
-            hc_eps=hc_eps,
-        ),
+        kernel,
         grid=(padded_tokens // tb,),
         in_specs=[
-            pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
+            *[pl.BlockSpec((tb, hidden_size), lambda i: (i, 0))] * len(x_inputs),
             pl.BlockSpec((tb, hc_mult * hidden_size), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
@@ -188,7 +208,7 @@ def mhc_post_head_2d(
             vmem_limit_bytes=vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
-    )(x2d, res2d, post2d, comb2d, fn_bf, sc2d, hb2d)
+    )(*x_inputs, res2d, post2d, comb2d, fn_bf, sc2d, hb2d)
 
     (out,) = utils.trim_to(num_tokens, out)
     return out
@@ -204,6 +224,9 @@ def mhc_post_head(
     hc_base: jax.Array,
     rms_eps: float,
     hc_eps: float,
+    *,
+    shared: jax.Array | None = None,
+    routed_scale: float = 1.0,
 ) -> jax.Array:
     """``mhc_post`` followed by ``mhc_collapse_head``, as one kernel.
 
@@ -211,6 +234,7 @@ def mhc_post_head(
         x: (..., hidden_size) bfloat16. residual: (..., hc_mult,
             hidden_size) bfloat16. post_layer_mix: (..., hc_mult, 1) and
             comb_res_mix: (..., hc_mult, hc_mult), float32.
+        shared, routed_scale: as in ``mhc_post_head_2d``.
 
     Returns:
         (..., hidden_size) in ``residual.dtype``.
@@ -227,5 +251,7 @@ def mhc_post_head(
         hc_base,
         rms_eps=rms_eps,
         hc_eps=hc_eps,
+        shared=None if shared is None else shared.reshape(-1, hidden_size),
+        routed_scale=routed_scale,
     )
     return out2d.reshape(*outer_shape, hidden_size)

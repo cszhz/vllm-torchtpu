@@ -116,9 +116,16 @@ class _StubDecoderLayer(nn.Module):
         self.outputs: list[tuple[torch.Tensor, ...]] = []
 
     def forward(
-        self, x, positions, input_ids=None, post_mix=None, res_mix=None, residual=None
+        self,
+        x,
+        positions,
+        input_ids=None,
+        post_mix=None,
+        res_mix=None,
+        residual=None,
+        defer_moe_combine=False,
     ):
-        del positions, input_ids, post_mix, res_mix
+        del positions, input_ids, post_mix, res_mix, defer_moe_combine
         if residual is None and x.dim() == 2:
             # The chain starts on the one embedding stream (see the real layer).
             x = x.unsqueeze(-2).expand(x.shape[0], HC, x.shape[-1])
@@ -143,10 +150,17 @@ class _FakePostOp:
 
 class _FakePostHeadOp:
     """Stand-in for the fused post + hc head op: the fake post, then the
-    fake collapse. Counts its calls."""
+    fake collapse. Counts its calls.
+
+    Unpacks as the model's (op, op-on-(routed, shared)) pair; the stub
+    layers never return a (routed, shared) pair, so both are this op.
+    """
 
     def __init__(self):
         self.calls = 0
+
+    def __iter__(self):
+        return iter((self, self))
 
     def __call__(self, x, residual, post_mix, res_mix, hc_fn, hc_scale, hc_base):
         self.calls += 1

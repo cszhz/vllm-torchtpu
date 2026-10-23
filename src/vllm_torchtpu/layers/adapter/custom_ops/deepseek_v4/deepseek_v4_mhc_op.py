@@ -153,6 +153,72 @@ def _mhc_post_head_jax(
     )
 
 
+def _mhc_post_head_shared_jax(
+    x: jax.Array,
+    shared: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    hc_fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    routed_scale: float,
+) -> jax.Array:
+    """``_mhc_post_head_jax`` on an MoE output given as (routed, shared)."""
+    return post_head_kernel.mhc_post_head(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+        shared=shared,
+        routed_scale=routed_scale,
+    )
+
+
+def _mhc_fused_post_pre_shared_jax(
+    x: jax.Array,
+    shared: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    routed_scale: float,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """The seam op on an MoE output given as (routed, shared)."""
+    return fused_post_pre_kernel.mhc_fused_post_pre(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        shared=shared,
+        routed_scale=routed_scale,
+    )
+
+
 def _mhc_fused_post_pre_jax(
     x: jax.Array,
     residual: jax.Array,
@@ -243,6 +309,16 @@ def _fake_mhc_fused_post_pre(
     if residual.dim() == x.dim():
         residual = _as_streams(residual, fn)
     return (torch.empty_like(residual), *_fake_pre_outputs(residual))
+
+
+def _fake_mhc_fused_post_pre_shared(x, shared, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return _fake_mhc_fused_post_pre(x, *args, **kwargs)
+
+
+def _fake_mhc_post_head_shared(x, shared, residual, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return _fake_mhc_post_head(x, residual)
 
 
 def _mhc_pre_op(
@@ -370,6 +446,88 @@ def get_mhc_post_head_op(rms_eps: float, hc_eps: float):
     return op
 
 
+def get_mhc_post_head_shared_op(rms_eps: float, hc_eps: float, routed_scale: float):
+    """``get_mhc_post_head_op`` taking the MoE output as (routed, shared).
+
+    Same outside-the-trace requirement as ``get_mhc_ops``.
+    """
+    op_name = (
+        "pallas::deepseek_v4_mhc_post_head_shared_v1"
+        f"_r{_name_float(rms_eps)}_e{_name_float(hc_eps)}"
+        f"_rs{_name_float(routed_scale)}"
+    )
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(
+                _mhc_post_head_shared_jax,
+                rms_eps=rms_eps,
+                hc_eps=hc_eps,
+                routed_scale=routed_scale,
+            ),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(ATTN_DATA_AXIS, None),  # shared
+                P(ATTN_DATA_AXIS, None, None),  # residual
+                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+                P(),  # hc_fn
+                P(),  # hc_scale
+                P(),  # hc_base
+            ),
+        )
+        op.register_fake(_fake_mhc_post_head_shared)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
+def _mhc_fused_post_pre_shared_op(
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    routed_scale: float,
+):
+    op_name = (
+        "pallas::deepseek_v4_mhc_fused_post_pre_shared_v1"
+        + _gate_suffix(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        )
+        + f"_rs{_name_float(routed_scale)}"
+    )
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(
+                _mhc_fused_post_pre_shared_jax,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_repeat=sinkhorn_repeat,
+                routed_scale=routed_scale,
+            ),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(ATTN_DATA_AXIS, None),  # shared
+                P(ATTN_DATA_AXIS, None, None),  # residual
+                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+                P(),  # fn
+                P(),  # hc_scale
+                P(),  # hc_base
+            ),
+        )
+        op.register_fake(_fake_mhc_fused_post_pre_shared)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
 def _mhc_fused_post_pre_op(
     rms_eps: float,
     hc_pre_eps: float,
@@ -435,6 +593,9 @@ class MHCOps(NamedTuple):
     ``pre_single_stream(x, fn, hc_scale, hc_base)`` / ``fused_from_single_stream``
         ``pre`` / ``fused`` for a residual whose hc_mult streams are copies
         of one (..., hidden_size) stream, which is passed instead.
+    ``fused_with_shared(routed, shared, residual, ...)``
+        ``fused`` on an MoE output given as its routed sum (before the
+        routed scale) and its f32 shared-expert output.
     """
 
     pre: Any
@@ -442,6 +603,7 @@ class MHCOps(NamedTuple):
     post: Any
     pre_single_stream: Any
     fused_from_single_stream: Any
+    fused_with_shared: Any
 
 
 def get_mhc_ops(
@@ -450,6 +612,7 @@ def get_mhc_ops(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    routed_scale: float = 1.0,
 ) -> MHCOps:
     """Build (or fetch) every mHC op for these gate constants.
 
@@ -477,5 +640,13 @@ def get_mhc_ops(
             hc_post_mult_value,
             sinkhorn_repeat,
             single_stream_residual=True,
+        ),
+        fused_with_shared=_mhc_fused_post_pre_shared_op(
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            routed_scale,
         ),
     )

@@ -95,8 +95,14 @@ class DeepseekV4MoE(nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
         assert config.n_routed_experts % self.tp_size == 0
 
+        # The shared expert runs outside the runner and the routed scale is
+        # left to the caller, which adds the two in f32 and rounds once --
+        # where a seam kernel does it, the shared matmul is free to run while
+        # the routed combine is still in flight. The router and the routed
+        # experts see 1.0 either way (apply_routed_scale_to_output).
+        defer_combine = self.shared_experts is not None
         self.experts = FusedMoEFactory(
-            shared_experts=self.shared_experts,
+            shared_experts=None if defer_combine else self.shared_experts,
             gate=self.gate,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -106,7 +112,7 @@ class DeepseekV4MoE(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             scoring_func=self.scoring_func,
-            routed_scaling_factor=self.routed_scaling_factor,
+            routed_scaling_factor=1.0 if defer_combine else self.routed_scaling_factor,
             e_score_correction_bias=cast(
                 torch.Tensor | None, self.gate.e_score_correction_bias
             ),
@@ -141,19 +147,39 @@ class DeepseekV4MoE(nn.Module):
         """
         return self.experts.do_naive_dispatch_combine
 
-    def forward(
+    def forward_parts(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """Forward pass executing router gate and fused expert computation."""
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """(routed, shared): the routed experts' sum before the routed scale,
+        and the shared expert's unrounded f32 output (None without one).
+
+        The layer output is ``combine(routed, shared)``.
+        """
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
         org_shape = hidden_states.shape
         # FusedMoEFactory gives the runner our gate, so it computes the logits.
-        final_hidden_states = self.experts(
+        routed = self.experts(
             hidden_states=hidden_states,
             router_logits=hidden_states,
             input_ids=input_ids,
-        )
+        ).view(org_shape)
+        if self.shared_experts is None:
+            return routed, None
+        return routed, self.shared_experts.forward_unrounded(hidden_states)
 
-        return final_hidden_states.view(org_shape)
+    def combine(
+        self, routed: torch.Tensor, shared: torch.Tensor | None
+    ) -> torch.Tensor:
+        """The layer output from ``forward_parts``: shared + routed * scale,
+        in f32 and rounded once (the runner already scaled a lone routed)."""
+        if shared is None:
+            return routed
+        return (shared + routed.float() * self.routed_scaling_factor).to(routed.dtype)
+
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Forward pass executing router gate and fused expert computation."""
+        return self.combine(*self.forward_parts(hidden_states, input_ids))

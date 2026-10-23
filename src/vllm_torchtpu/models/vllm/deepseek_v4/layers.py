@@ -24,6 +24,11 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    quantized_matmul_f32,
+)
+
 
 # Pure PyTorch head projection for MHC manifold collapse;
 # upstream vLLM only provides Triton/TileLang GPU kernels for hc_head.
@@ -103,3 +108,18 @@ class DeepseekV4MLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+    def forward_unrounded(self, x: torch.Tensor) -> torch.Tensor:
+        """``forward`` with the down projection's f32 product left unrounded.
+
+        For a caller that adds it to another output and rounds the sum once.
+        The down projection must be the per-channel FP8 linear (single TP
+        rank), whose ``apply`` is ``quantized_matmul`` on these tensors.
+        """
+        down = self.down_proj
+        assert down.tp_size == 1 and down.bias is None
+        weight = down.weight
+        if getattr(down, KEEP_VLLM_LAYOUT_ATTR, False):
+            weight = weight.transpose(0, 1)
+        gate_up, _ = self.gate_up_proj(x)
+        return quantized_matmul_f32(self.act_fn(gate_up), weight, down.weight_scale)

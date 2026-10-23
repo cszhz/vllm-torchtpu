@@ -54,6 +54,16 @@ def select_token_block(
     return tb, round_up(num_tokens, tb)
 
 
+def without_shared(kernel: Callable) -> Callable:
+    """A kernel body taking ``(x_ref, shared_ref, ...)``, for a call that
+    passes no shared-expert block: ``shared_ref`` is None."""
+
+    def body(x_ref, *refs):
+        return kernel(x_ref, None, *refs)
+
+    return body
+
+
 def pad_to(padded_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
     """Zero-pad the leading (token) axis of each array to ``padded_tokens``."""
     pad = padded_tokens - arrays[0].shape[0]

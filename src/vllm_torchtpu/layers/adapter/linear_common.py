@@ -107,8 +107,18 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
     return xla_quantized_matmul(x, w_q, w_s)
 
 
+def _quantized_matmul_f32_jax(
+    x: jax.Array, w_q: jax.Array, w_s: jax.Array
+) -> jax.Array:
+    """The per-channel FP8 matmul with its f32 product left unrounded."""
+    if w_s.ndim != 1:
+        raise ValueError(f"needs a per-channel weight scale, got {w_s.shape=}")
+    return xla_quantized_matmul(x, w_q, w_s, out_dtype=jnp.float32)
+
+
 _quantized_matmul_kernel_op: Callable | None = None
 _quantized_matmul_kernel_op_lock = Lock()
+_quantized_matmul_f32_op: Callable | None = None
 
 
 def _get_quantized_matmul_op() -> Callable:
@@ -133,6 +143,39 @@ def _get_quantized_matmul_op() -> Callable:
         op.register_fake(_fake_quantized_matmul)
         _quantized_matmul_kernel_op = op
         return op
+
+
+def _get_quantized_matmul_f32_op() -> Callable:
+    global _quantized_matmul_f32_op
+    with _quantized_matmul_kernel_op_lock:
+        if _quantized_matmul_f32_op is None:
+            op = pallas.jax_op(
+                "pallas::quantized_matmul_f32_kernel", _quantized_matmul_f32_jax
+            )
+
+            def _fake(x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor):
+                del w_s
+                return torch.empty(
+                    x.shape[0], w_q.shape[-1], dtype=torch.float32, device=x.device
+                )
+
+            op.register_fake(_fake)
+            _quantized_matmul_f32_op = op
+        return _quantized_matmul_f32_op
+
+
+def quantized_matmul_f32(
+    x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor:
+    """``quantized_matmul`` (per-channel scale only) returning the f32 product.
+
+    For a consumer that adds the product to something before rounding, so
+    the sum is rounded once, as XLA rounds it when the add fuses into the
+    matmul's epilogue.
+    """
+    orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
+    out_2d = _get_quantized_matmul_f32_op()(x.reshape(-1, x.shape[-1]), w_q, w_s)
+    return out_2d.reshape(orig_out_shape)
 
 
 def quantized_matmul(
