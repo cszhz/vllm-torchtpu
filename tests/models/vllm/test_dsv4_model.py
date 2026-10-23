@@ -138,6 +138,19 @@ class _FakePostOp:
         return x + residual * post_mix - res_mix
 
 
+class _FakePostHeadOp:
+    """Stand-in for the fused post + hc head op: the fake post, then the
+    fake collapse. Counts its calls."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, x, residual, post_mix, res_mix, hc_fn, hc_scale, hc_base):
+        self.calls += 1
+        settled = _FakePostOp()(x, residual, post_mix, res_mix)
+        return _fake_collapse_head(settled, hc_fn, hc_scale, hc_base, 0.0, 0.0)
+
+
 class _TorchRMSNorm(nn.Module):
     def __init__(self, eps: float):
         super().__init__()
@@ -268,6 +281,7 @@ def tiny_fc(dist_ctx, monkeypatch):
     # The post op is fetched lazily through ``mhc_post_op``; pre-seed the
     # instance slot it reads so no Pallas op is ever built.
     object.__setattr__(fc.model, "_mhc_post_op_instance", _FakePostOp())
+    object.__setattr__(fc.model, "_mhc_post_head_op_instance", _FakePostHeadOp())
     fc.model.norm = _TorchRMSNorm(fc.model.rms_norm_eps)
     return fc
 
@@ -277,6 +291,7 @@ def _forward(fc, tags):
     for layer in fc.model.layers:
         layer.outputs.clear()
     fc.model.mhc_post_op.calls = 0
+    fc.model.mhc_post_head_op.calls = 0
     torch.manual_seed(1)
     ids = torch.arange(TOKENS)
     embeds = torch.randn(TOKENS, HIDDEN)
@@ -295,8 +310,10 @@ def test_untagged_forward_is_bare_tensor_and_unchanged(tiny_fc):
     out = _forward(tiny_fc, ())
     assert isinstance(out, torch.Tensor)
     assert out.shape == (TOKENS, HIDDEN)
-    # Exactly one post-op call: the fused settle of the last layer's post.
-    assert tiny_fc.model.mhc_post_op.calls == 1
+    # Exactly one call, to the op that settles the last layer's post and
+    # collapses the streams together.
+    assert tiny_fc.model.mhc_post_head_op.calls == 1
+    assert tiny_fc.model.mhc_post_op.calls == 0
     x, residual, post_mix, res_mix = tiny_fc.model.layers[-1].outputs[0]
     settled = _FakePostOp()(x, residual, post_mix, res_mix)
     expected = tiny_fc.model.norm(settled.mean(dim=1))
@@ -320,3 +337,4 @@ def test_tagged_forward_captures_and_keeps_main_output(tiny_fc):
     # reuses its reconstruction: one post-op call per tag, none extra.
     torch.testing.assert_close(hidden, baseline)
     assert tiny_fc.model.mhc_post_op.calls == len(tags)
+    assert tiny_fc.model.mhc_post_head_op.calls == 0

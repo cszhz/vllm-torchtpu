@@ -28,6 +28,7 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     fused_post_pre_kernel,
+    post_head_kernel,
     post_kernel,
     pre_kernel,
 )
@@ -100,6 +101,32 @@ def _mhc_post_jax(
     return post_kernel.mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
 
+def _mhc_post_head_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    hc_fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+) -> jax.Array:
+    """The last layer's post and the hc head collapse as one kernel."""
+    return post_head_kernel.mhc_post_head(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+    )
+
+
 def _mhc_fused_post_pre_jax(
     x: jax.Array,
     residual: jax.Array,
@@ -161,6 +188,15 @@ def _fake_mhc_pre(residual, fn, hc_scale, hc_base, *args, **kwargs):
 def _fake_mhc_post(x, residual, post_layer_mix, comb_res_mix, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty_like(residual)
+
+
+def _fake_mhc_post_head(x, residual, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return torch.empty(
+        (*residual.shape[:-2], residual.shape[-1]),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
 
 
 def _fake_mhc_fused_post_pre(
@@ -226,6 +262,36 @@ def get_mhc_post_op():
             ),
         )
         op.register_fake(_fake_mhc_post)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
+def get_mhc_post_head_op(rms_eps: float, hc_eps: float):
+    """``post`` fused with the model's hc head collapse.
+
+    Same outside-the-trace requirement as ``get_mhc_ops``.
+    """
+    op_name = (
+        "pallas::deepseek_v4_mhc_post_head_v1"
+        f"_r{_name_float(rms_eps)}_e{_name_float(hc_eps)}"
+    )
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(_mhc_post_head_jax, rms_eps=rms_eps, hc_eps=hc_eps),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(ATTN_DATA_AXIS, None, None),  # residual
+                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+                P(),  # hc_fn
+                P(),  # hc_scale
+                P(),  # hc_base
+            ),
+        )
+        op.register_fake(_fake_mhc_post_head)
         _mhc_op_cache[op_name] = op
     return op
 

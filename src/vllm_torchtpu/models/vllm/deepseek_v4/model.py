@@ -56,6 +56,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
     MHCOps,
     get_mhc_ops,
+    get_mhc_post_head_op,
     get_mhc_post_op,
 )
 from vllm_torchtpu.logger import init_logger
@@ -369,6 +370,15 @@ class DeepseekV4Model(nn.Module):
             object.__setattr__(self, "_mhc_post_op_instance", op)
         return op
 
+    @property
+    def mhc_post_head_op(self):
+        """The deferred post fused with the hc head collapse, built once."""
+        op = self.__dict__.get("_mhc_post_head_op_instance")
+        if op is None:
+            op = get_mhc_post_head_op(self.rms_norm_eps, self.hc_eps)
+            object.__setattr__(self, "_mhc_post_head_op_instance", op)
+        return op
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -469,29 +479,45 @@ class DeepseekV4Model(nn.Module):
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
 
+        is_last_rank = get_pp_group().is_last_rank
+        collapsed = False
         if post_mix is not None:
             if (
                 final_aux_recon is not None
                 and self.end_layer in self.aux_hidden_state_layers
             ):
                 hidden_states = final_aux_recon
+            elif is_last_rank:
+                # Settle the deferred post and collapse the hc streams in one
+                # kernel; the [T, hc_mult, hidden] state never reaches HBM.
+                hidden_states = self.mhc_post_head_op(
+                    hidden_states,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self.hc_head_fn,
+                    self.hc_head_scale,
+                    self.hc_head_base,
+                )
+                collapsed = True
             else:
                 # Fused path: settle the post the last layer deferred.
                 hidden_states = self.mhc_post_op(
                     hidden_states, residual, post_mix, res_mix
                 )
 
-        if not get_pp_group().is_last_rank:
+        if not is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        hidden_states = mhc_collapse_head(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-        )
+        if not collapsed:
+            hidden_states = mhc_collapse_head(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
         hidden_states = self.norm(hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
