@@ -15,6 +15,7 @@
 
 import functools
 from enum import Enum
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -880,6 +881,13 @@ def prepare_outputs(
     return out[:, :actual_num_q_heads, :actual_head_dim]
 
 
+def uses_batched_decode(
+    sliding_window: int, logical_page_size: int, decode_kv_pages_per_block: int
+) -> bool:
+    """Whether decode runs `run_mla_batched_decode_kernel` (one kv block)."""
+    return sliding_window <= decode_kv_pages_per_block * logical_page_size
+
+
 def get_physical_layout(
     cache_kv_shape, q_dtype, head_dim, max_num_seqs, num_page_indices
 ):
@@ -899,6 +907,78 @@ def get_physical_layout(
         slots_per_token,
         phys_tokens_per_page,
         pages_per_seq,
+    )
+
+
+class HcaDecodeInputs(NamedTuple):
+    """The HCA pass `run_mla_batched_decode_kernel` fuses, as
+    `mla.mla_ragged_paged_attention` would run it on the decode sequences."""
+
+    # [total_num_pages, page_size * slots_per_token, kv_packing, lkv_dim] uint8
+    cache_kv: jax.Array
+    kv_lens: jax.Array  # i32[max_num_seqs]
+    kv_lens_to_attend: jax.Array  # i32[max_num_tokens]
+    page_indices: jax.Array  # i32[max_num_seqs * pages_per_seq]
+    # Pages per kv block; every sequence's page table must fit in one.
+    num_kv_pages_per_block: int
+
+
+class HcaDecodeRefs(NamedTuple):
+    """The HCA compressed-KV block the batched decode kernel folds in."""
+
+    kv_lens_ref: Any  # [max_num_seqs]
+    kv_lens_to_attend_ref: Any  # [max_num_tokens]
+    page_indices_ref: Any  # [max_num_seqs * pages_per_seq]
+    # [total_num_pages, page_size * slots_per_token, kv_packing, lkv_dim] uint8
+    cache_hbm_ref: Any
+    # [2, seq_batch_sz, bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8
+    bkv_x2_vmem: Any
+    sems: Any  # [2, seq_batch_sz]
+
+
+def _mla_batched_decode_hca_kernel(
+    kv_lens_ref,
+    page_indices_ref,
+    cu_q_lens_ref,
+    start_end_seq_idx_ref,
+    hca_kv_lens_ref,
+    hca_kv_lens_to_attend_ref,
+    hca_page_indices_ref,
+    attention_sinks_ref,
+    q_hbm_ref,
+    new_kv_hbm_ref,
+    cache_kv_hbm_ref,
+    in_output_hbm_ref,
+    in_l_hbm_ref,
+    in_m_hbm_ref,
+    hca_cache_hbm_ref,
+    *outputs_and_scratch,
+    **kwargs,
+):
+    """`_mla_batched_decode_kernel` with the HCA operands of `HcaDecodeRefs`."""
+    *refs, hca_bkv_x2_vmem, hca_sems = outputs_and_scratch
+    _mla_batched_decode_kernel(
+        kv_lens_ref,
+        page_indices_ref,
+        cu_q_lens_ref,
+        start_end_seq_idx_ref,
+        attention_sinks_ref,
+        q_hbm_ref,
+        new_kv_hbm_ref,
+        cache_kv_hbm_ref,
+        in_output_hbm_ref,
+        in_l_hbm_ref,
+        in_m_hbm_ref,
+        *refs,
+        hca=HcaDecodeRefs(
+            hca_kv_lens_ref,
+            hca_kv_lens_to_attend_ref,
+            hca_page_indices_ref,
+            hca_cache_hbm_ref,
+            hca_bkv_x2_vmem,
+            hca_sems,
+        ),
+        **kwargs,
     )
 
 
@@ -938,6 +1018,10 @@ def _mla_batched_decode_kernel(
     unnormalized_output: bool,
     bkv_p: int,
     seq_batch_sz: int,
+    # With `hca`, fold each sequence's HCA kv (one block of `hca_bkv_p` pages)
+    # into the SWA softmax state and write the normalized output; no l/m.
+    hca: HcaDecodeRefs | None = None,
+    hca_bkv_p: int = 0,
 ):
     del in_output_hbm_ref, in_l_hbm_ref, in_m_hbm_ref  # Aliased with out, l, m.
 
@@ -983,6 +1067,20 @@ def _mla_batched_decode_kernel(
 
     num_decode_seqs = end_seq_idx - start_seq_idx
     num_batches = cdiv(num_decode_seqs, seq_batch_sz)
+
+    if hca is not None:
+        hca_total_pages, hca_slots_per_page, *hca_slot_shape = hca.cache_hbm_ref.shape
+        assert tuple(hca_slot_shape) == (kv_packing, lkv_dim)
+        hca_page_size = hca_slots_per_page // slots_per_token
+        hca_bkv_sz = hca_bkv_p * hca_page_size
+        hca_pages_per_seq = hca.page_indices_ref.shape[0] // max_num_seqs
+        assert hca_pages_per_seq <= hca_bkv_p, "HCA kv must fit one block"
+        hca_kv_len_cap = hca_pages_per_seq * hca_page_size
+        reshaped_hca_cache_hbm_ref = hca.cache_hbm_ref.reshape(
+            hca_total_pages * hca_page_size,
+            slots_per_token * kv_packing,
+            lkv_dim,
+        )
 
     def get_bkv_sz_frm_cache(kv_len):
         start_offset = jnp.maximum(kv_len - sliding_window, jnp.int32(0))
@@ -1073,6 +1171,79 @@ def _mla_batched_decode_kernel(
                 wait=wait,
             )
 
+    def _fetch_hca_bkv(batch_idx, sem_idx, wait=False):
+        s_start = start_seq_idx + batch_idx * seq_batch_sz
+        for s in range(seq_batch_sz):
+            seq_idx = s_start + s
+            seq_idx_clamped = jnp.minimum(seq_idx, max_num_seqs - 1)
+            kv_len = jnp.where(
+                seq_idx < end_seq_idx, hca.kv_lens_ref[seq_idx_clamped], 0
+            )
+            sem = hca.sems.at[sem_idx, s]
+            bkv_s_ref = hca.bkv_x2_vmem.at[sem_idx, s]
+            if wait:
+                # One wait for all page copies: the semaphore counts bytes.
+                sz = jnp.clip(kv_len, 0, hca_kv_len_cap)
+                async_copy(
+                    bkv_s_ref.at[pl.ds(0, sz)], bkv_s_ref.at[pl.ds(0, sz)], sem, True
+                )
+                continue
+            for i in range(hca_pages_per_seq):
+                sz = jnp.clip(kv_len - i * hca_page_size, 0, hca_page_size)
+                page_idx = hca.page_indices_ref[seq_idx_clamped * hca_pages_per_seq + i]
+                async_copy(
+                    reshaped_hca_cache_hbm_ref.at[pl.ds(page_idx * hca_page_size, sz)],
+                    bkv_s_ref.at[pl.ds(i * hca_page_size, sz)],
+                    sem,
+                )
+
+    def fold_hca(s_start, sem_idx, q_batch, pv_batch, l_val, m_val):
+        """One flash-attention step over the HCA block from the SWA state,
+        then the sinks; the same ops as `mla._mla_ragged_paged_attention_kernel`
+        runs on the state the SWA kernel hands it through HBM."""
+        num_tokens = hca.kv_lens_to_attend_ref.shape[0]
+        kv_lens_to_attend = jnp.stack(
+            [
+                jnp.where(
+                    (s_start + s) < end_seq_idx,
+                    hca.kv_lens_to_attend_ref[
+                        jnp.minimum(
+                            cu_q_lens_ref[jnp.minimum(s_start + s, max_num_seqs - 1)],
+                            num_tokens - 1,
+                        )
+                    ],
+                    0,
+                )
+                for s in range(seq_batch_sz)
+            ]
+        )
+        kv = pltpu.bitcast(
+            hca.bkv_x2_vmem[sem_idx][:, :hca_bkv_sz, ...], jnp.bfloat16
+        ).reshape(seq_batch_sz, hca_bkv_sz, head_dim)
+        k_span = lax.broadcasted_iota(jnp.int32, (1, 1, hca_bkv_sz), 2)
+        mask = kv_lens_to_attend[:, None, None] <= k_span
+
+        # The HBM handoff stores the SWA accumulator in q_dtype.
+        acc = pv_batch.astype(q_dtype).astype(jnp.float32)
+
+        s_mat = jnp.einsum(
+            "snd,smd->snm", q_batch, kv, preferred_element_type=jnp.float32
+        )
+        s_mat *= sm_scale
+        s_mat = jnp.where(mask, jnp.finfo(s_mat.dtype).min, s_mat)
+        m_curr = jnp.maximum(m_val, jnp.max(s_mat, axis=2))
+        p_mat = jnp.exp(s_mat - m_curr[:, :, None])
+        pv = jnp.einsum("snm,smd->snd", p_mat, kv, preferred_element_type=jnp.float32)
+        exp_m_diff = jnp.exp(m_val - m_curr)
+        l_curr = exp_m_diff * l_val + jnp.sum(p_mat, axis=2)
+        acc = exp_m_diff[:, :, None] * acc + pv
+
+        exp_attention_sinks = jnp.exp(attention_sinks_ref[...][None, :] - m_curr)
+        l_sum = (l_curr + exp_attention_sinks)[:, :, None]
+        if q_dtype == jnp.float32:
+            return lax.div(acc, l_sum)
+        return (acc * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
+
     def compute_batch(batch_idx, sem_idx):
         s_start = start_seq_idx + batch_idx * seq_batch_sz
 
@@ -1126,6 +1297,11 @@ def _mla_batched_decode_kernel(
         m_val = s_max[:, :, 0]
         l_val = jnp.sum(p_mat, axis=2)
 
+        if hca is not None:
+            o_batch_x2_vmem[sem_idx, ...] = fold_hca(
+                s_start, sem_idx, q_batch, pv_batch, l_val, m_val
+            )
+            return
         if unnormalized_output:
             out = pv_batch.astype(q_dtype)
         else:
@@ -1167,6 +1343,8 @@ def _mla_batched_decode_kernel(
             sems.at[sem_idx, 1],
             wait=wait,
         )
+        if hca is not None:
+            return
         async_copy(
             l_batch_x2_vmem.at[sem_idx, pl.ds(0, batch_sz)],
             l_hbm_ref.at[pl.ds(q_token_idx, batch_sz)],
@@ -1224,10 +1402,14 @@ def _mla_batched_decode_kernel(
     def fetch_batch(batch_idx, sem_idx):
         _fetch_bq(batch_idx, sem_idx, wait=False)
         _fetch_bkv(batch_idx, sem_idx, wait=False)
+        if hca is not None:
+            _fetch_hca_bkv(batch_idx, sem_idx, wait=False)
 
     def wait_fetch(batch_idx, sem_idx):
         _fetch_bq(batch_idx, sem_idx, wait=True)
         _fetch_bkv(batch_idx, sem_idx, wait=True)
+        if hca is not None:
+            _fetch_hca_bkv(batch_idx, sem_idx, wait=True)
 
     def wait_update_kv_cache(batch_idx, sem_idx):
         @pl.when(batch_idx >= 0)
@@ -1240,6 +1422,10 @@ def _mla_batched_decode_kernel(
             _send_bo(batch_idx, sem_idx, wait=True)
 
     start_batch_idx = 0
+
+    if hca is not None:
+        # Masked HCA slots are multiplied by p == 0; stale VMEM may be NaN.
+        hca.bkv_x2_vmem[...] = jnp.zeros(hca.bkv_x2_vmem.shape, jnp.uint8)
 
     @pl.when(start_batch_idx < num_batches)
     def _():
@@ -1307,6 +1493,7 @@ def run_mla_batched_decode_kernel(
     vmem_limit_bytes: int,
     unnormalized_output: bool,
     seq_batch_sz: int = 32,
+    hca_decode: HcaDecodeInputs | None = None,
 ):
     num_decode_seqs = end_seq_idx - start_seq_idx
     bkv_p = num_kv_pages_per_block
@@ -1339,6 +1526,12 @@ def run_mla_batched_decode_kernel(
         cu_q_lens,
         jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
     )
+    if hca_decode is not None:
+        scalar_prefetches += (
+            hca_decode.kv_lens,
+            hca_decode.kv_lens_to_attend,
+            hca_decode.page_indices,
+        )
 
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.VMEM),  # attention_sinks
@@ -1402,17 +1595,44 @@ def run_mla_batched_decode_kernel(
         sems,
     ]
 
+    kernel_fn = _mla_batched_decode_kernel
+    hca_kwargs = {}
+    hca_operands = ()
     scope_name = f"SWA-d-bq_1-bkvp_{bkv_p}"
+    if hca_decode is not None:
+        hca_cache = hca_decode.cache_kv
+        assert hca_cache.dtype == jnp.uint8
+        hca_page_size = hca_cache.shape[1] // slots_per_token
+        in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # hca cache_kv
+        hca_operands = (hca_cache,)
+        scratch_shapes += [
+            pltpu.VMEM(
+                (
+                    2,
+                    seq_batch_sz,
+                    hca_decode.num_kv_pages_per_block * hca_page_size,
+                    slots_per_token * kv_packing,
+                    lkv_dim,
+                ),
+                jnp.uint8,
+            ),
+            pltpu.SemaphoreType.DMA((2, seq_batch_sz)),
+        ]
+        kernel_fn = _mla_batched_decode_hca_kernel
+        hca_kwargs = {"hca_bkv_p": hca_decode.num_kv_pages_per_block}
+        scope_name += f"-hca_bkvp_{hca_decode.num_kv_pages_per_block}"
+
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
             functools.partial(
-                _mla_batched_decode_kernel,
+                kernel_fn,
                 sm_scale=sm_scale,
                 sliding_window=sliding_window,
                 logical_page_size=logical_page_size,
                 unnormalized_output=unnormalized_output,
                 bkv_p=bkv_p,
                 seq_batch_sz=seq_batch_sz,
+                **hca_kwargs,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
@@ -1440,6 +1660,7 @@ def run_mla_batched_decode_kernel(
         in_output,
         in_l,
         in_m,
+        *hca_operands,
     )
 
 
@@ -1457,6 +1678,7 @@ def run_mla_batched_decode_kernel(
         "non_causal_block",
         "q_compute_block_size",
         "lane_padded_lm",
+        "hca_num_kv_pages_per_block",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -1490,6 +1712,13 @@ def mla_sliding_window_ragged_paged_attention(
     decode_seq_batch_size: int = 32,
     # Return l/m at the kernel's 128-lane width instead of slicing to the heads.
     lane_padded_lm: bool = False,
+    # Fuse the HCA pass into the batched decode kernel (see `HcaDecodeInputs`):
+    # decode rows of the output are then final, other rows stay unnormalized.
+    hca_cache_kv: jax.Array | None = None,
+    hca_kv_lens: jax.Array | None = None,
+    hca_kv_lens_to_attend: jax.Array | None = None,
+    hca_page_indices: jax.Array | None = None,
+    hca_num_kv_pages_per_block: int | None = None,
 ) -> tuple[
     jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     jax.Array,  # [total_num_pages, physical_page_size_per_kv_packing, 4, 128] uint8
@@ -1764,8 +1993,30 @@ def mla_sliding_window_ragged_paged_attention(
     # data won't be used downstream at all, so un-initialized buffer is fine.
     in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
 
-    bkv_sz = num_kv_pages_per_blocks[0] * logical_page_size
-    if sliding_window <= bkv_sz:
+    hca_decode = None
+    if hca_num_kv_pages_per_block is not None:
+        if not uses_batched_decode(
+            sliding_window, logical_page_size, num_kv_pages_per_blocks[0]
+        ):
+            raise ValueError("HCA fusion needs the batched decode kernel.")
+        if not unnormalized_output:
+            raise ValueError("HCA fusion leaves non-decode rows unnormalized.")
+        assert hca_kv_lens.shape == (max_num_seqs,)
+        assert hca_page_indices.shape[0] % max_num_seqs == 0
+        hca_decode = HcaDecodeInputs(
+            hca_cache_kv,
+            hca_kv_lens,
+            hca_kv_lens_to_attend,
+            hca_page_indices,
+            hca_num_kv_pages_per_block,
+        )
+        # The HCA kernel this replaces wrote its output over q; rows no kernel
+        # writes (padding tokens) keep q's values.
+        in_output = q
+
+    if uses_batched_decode(
+        sliding_window, logical_page_size, num_kv_pages_per_blocks[0]
+    ):
         output, updated_kv, out_l, out_m = run_mla_batched_decode_kernel(
             q,
             new_kv,
@@ -1787,6 +2038,7 @@ def mla_sliding_window_ragged_paged_attention(
             vmem_limit_bytes=vmem_limit_bytes,
             unnormalized_output=unnormalized_output,
             seq_batch_sz=decode_seq_batch_size,
+            hca_decode=hca_decode,
         )
     else:
         output, updated_kv, out_l, out_m = run_mla_kernel(
