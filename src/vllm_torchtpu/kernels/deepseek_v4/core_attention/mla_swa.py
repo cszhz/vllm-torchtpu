@@ -2057,8 +2057,30 @@ def mla_sliding_window_ragged_paged_attention(
         # hold q: the other cases read q there and write their own buffer.
         q, output = output, in_output
 
-    if chunk_prefill_size is not None:
-        # Handle prefill where the query length is fixed per sequence.
+    def run_non_decode(output, updated_kv, out_l, out_m):
+        if chunk_prefill_size is not None:
+            # Handle prefill where the query length is fixed per sequence.
+            output, updated_kv, out_l, out_m = run_mla_kernel(
+                q,
+                new_kv,
+                updated_kv,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                num_kv_pages_per_block=num_kv_pages_per_blocks[1],
+                num_queries_per_block=num_queries_per_blocks[1],
+                start_seq_idx=distribution[0],
+                end_seq_idx=distribution[1],
+                in_output=output,
+                in_l=out_l,
+                in_m=out_m,
+                attention_sinks=attention_sinks,
+                static_q_len=chunk_prefill_size,
+                unnormalized_output=unnormalized_output,
+                case=MlaCase.PREFILL,
+            )
+
+        # Handle mixed case where the query length per sequence is variable.
         output, updated_kv, out_l, out_m = run_mla_kernel(
             q,
             new_kv,
@@ -2066,39 +2088,35 @@ def mla_sliding_window_ragged_paged_attention(
             kv_lens,
             page_indices,
             cu_q_lens,
-            num_kv_pages_per_block=num_kv_pages_per_blocks[1],
-            num_queries_per_block=num_queries_per_blocks[1],
-            start_seq_idx=distribution[0],
-            end_seq_idx=distribution[1],
+            num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+            num_queries_per_block=num_queries_per_blocks[2],
+            start_seq_idx=distribution[1],
+            end_seq_idx=distribution[2],
             in_output=output,
             in_l=out_l,
             in_m=out_m,
             attention_sinks=attention_sinks,
-            static_q_len=chunk_prefill_size,
+            static_q_len=None,
             unnormalized_output=unnormalized_output,
-            case=MlaCase.PREFILL,
+            case=MlaCase.MIXED,
         )
+        return output, updated_kv, out_l, out_m
 
-    # Handle mixed case where the query length per sequence is variable.
-    output, updated_kv, out_l, out_m = run_mla_kernel(
-        q,
-        new_kv,
-        updated_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-        num_queries_per_block=num_queries_per_blocks[2],
-        start_seq_idx=distribution[1],
-        end_seq_idx=distribution[2],
-        in_output=output,
-        in_l=out_l,
-        in_m=out_m,
-        attention_sinks=attention_sinks,
-        static_q_len=None,
-        unnormalized_output=unnormalized_output,
-        case=MlaCase.MIXED,
-    )
+    if hca_decode is not None:
+        # Skip the prefill and mixed launches in decode-only steps.
+        output, updated_kv, out_l, out_m = lax.cond(
+            distribution[2] > distribution[0],
+            run_non_decode,
+            lambda *state: state,
+            output,
+            updated_kv,
+            out_l,
+            out_m,
+        )
+    else:
+        output, updated_kv, out_l, out_m = run_non_decode(
+            output, updated_kv, out_l, out_m
+        )
     output = prepare_outputs(
         output, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
