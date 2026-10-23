@@ -1355,9 +1355,10 @@ def _wait_rows(ref, sem, n):
     _dma(ref.at[pl.ds(0, n)], ref.at[pl.ds(0, n)], sem, wait=True)
 
 
-def _swa_window_kv(bkv_ref, keep_rows):
+def _swa_window_kv(bkv_ref, keep_rows, num_slots=None):
     """One decode token's window keys/values, bf16 [slots, head_dim], zero
-    where `keep_rows` is False.
+    where `keep_rows` [slots, lanes] is False (or the first `num_slots` rows
+    as they are when `keep_rows` is None).
 
     Built from the 32-bit words of its uint8 slab rows `bkv_ref`
     [>= slots, slots_per_token * kv_packing, lkv_dim]: word w of word row k
@@ -1365,13 +1366,16 @@ def _swa_window_kv(bkv_ref, keep_rows):
     values a uint8 -> bfloat16 bitcast of the rows reads, without its
     sublane relayout.
     """
-    num_slots, lanes = keep_rows.shape
-    _, rows, _ = bkv_ref.shape
+    _, rows, lanes = bkv_ref.shape
+    if keep_rows is not None:
+        num_slots = keep_rows.shape[0]
     word_rows = rows // 4
     words = bkv_ref.reshape(bkv_ref.shape[0] * rows, lanes).bitcast(jnp.int32)
     pieces = []
     for k in range(word_rows):
-        w = jnp.where(keep_rows, words[pl.ds(k, num_slots, stride=word_rows), :], 0)
+        w = words[pl.ds(k, num_slots, stride=word_rows), :]
+        if keep_rows is not None:
+            w = jnp.where(keep_rows, w, 0)
         for half in (w << 16, w & jnp.int32(-65536)):
             pieces.append(pltpu.bitcast(half, jnp.float32).astype(jnp.bfloat16))
     return jnp.concatenate(pieces, axis=1)
@@ -1619,9 +1623,12 @@ def _mla_batched_decode_kernel(
                 for s in range(seq_batch_sz)
             ]
         )
-        kv = pltpu.bitcast(
-            hca.bkv_x2_vmem[sem_idx][:, :hca_bkv_sz, ...], jnp.bfloat16
-        ).reshape(seq_batch_sz, hca_bkv_sz, head_dim)
+        kv = jnp.stack(
+            [
+                _swa_window_kv(hca.bkv_x2_vmem.at[sem_idx, s], None, hca_bkv_sz)
+                for s in range(seq_batch_sz)
+            ]
+        )
         k_span = lax.broadcasted_iota(jnp.int32, (1, 1, hca_bkv_sz), 2)
         mask = kv_lens_to_attend[:, None, None] <= k_span
 
