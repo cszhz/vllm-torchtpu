@@ -109,9 +109,15 @@ only_docs_changed() {
 INTEGRATION_SLUG="${VLLM_INTEGRATION_PIPELINE_SLUG:-vllm-torchtpu-integration}"
 pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
 has_perf_label=0
-if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
-    && grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}"; then
-  has_perf_label=1
+has_full_ci_label=0
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+  if grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}"; then
+    has_perf_label=1
+  fi
+  if grep -qx "run-full-ci" <<< "${pr_labels//,/$'\n'}"; then
+    has_full_ci_label=1
+    export NIGHTLY=1
+  fi
 fi
 
 FILES_CHANGED=""
@@ -203,9 +209,18 @@ fi
 # perf, which has scheduled builds of its own; nightly builds still run perf,
 # and so does the integration pipeline, whose LKG promotion waits on two perf
 # steps. A PR whose change needs perf/eval coverage asks for it with the
-# run-perf-eval label; adding the label to a ready PR starts a build.
+# run-perf-eval label, or the full nightly suite across every lane with
+# run-full-ci; adding either label to a ready PR starts a build.
 ALL_LANES="verify perf integration tests"
 default_lanes="${PR_SELECTED_LANES:-verify integration tests}"
+if [[ "${has_full_ci_label}" == "1" ]]; then
+  export NIGHTLY=1
+  PR_TEST_SELECTION_ANNOTATION=""
+  OMNI_IMAGE_SKIP=""
+  unset PR_SKIP_STEPS_JSON GENERAL_TEST_FILE_PATTERN GENERAL_TEST_PARALLELISM MULTICHIP_TEST_FILE_PATTERN
+  buildkite-agent annotate --style info --context full-ci \
+    "Runs the full (nightly) suite (\`run-full-ci\` label)."
+fi
 if [[ "${NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   default_lanes="${ALL_LANES}"
 elif [[ "${has_perf_label}" == "1" ]]; then

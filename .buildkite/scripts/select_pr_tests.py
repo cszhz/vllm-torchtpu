@@ -41,6 +41,7 @@ ALL_PR_TEST_STEPS: tuple[str, ...] = (
 
 ALL_PR_INTEGRATION_STEPS: tuple[str, ...] = (
     "integration_qwen35_pcp4_dp4_disagg_correctness",
+    "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
     "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
     "presubmit_disagg_single_host",
     "integration_qwen35_apc_correctness",
@@ -55,6 +56,7 @@ ALL_PR_INTEGRATION_STEPS: tuple[str, ...] = (
 DISAGG_KV_INTEGRATION_STEPS: frozenset[str] = frozenset(
     {
         "integration_qwen35_pcp4_dp4_disagg_correctness",
+        "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
         "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
         "presubmit_disagg_single_host",
         "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
@@ -74,6 +76,9 @@ INTEGRATION_FILE_TO_STEPS: dict[str, frozenset[str]] = {
     "examples/disagg/launch_qwen35_p4d2_v2_baseline.sh": frozenset(
         {"integration_qwen35_pcp4_dp4_disagg_correctness"}
     ),
+    "scripts/vllm/integration/run_qwen35_pcp4_2tp2dp_disagg_correctness.sh": (
+        frozenset({"integration_qwen35_pcp4_2tp2dp_disagg_correctness"})
+    ),
     "scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh": (
         frozenset({"integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness"})
     ),
@@ -84,6 +89,7 @@ INTEGRATION_FILE_TO_STEPS: dict[str, frozenset[str]] = {
         {
             "presubmit_disagg_single_host",
             "integration_qwen35_pcp4_dp4_disagg_correctness",
+            "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
             "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
             "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
         }
@@ -427,9 +433,18 @@ def _finalize_plan(
     if multichip_test_pattern != DEFAULT_TEST_PATTERN:
         summary_parts.append(f"multichip pattern: `{multichip_test_pattern}`")
 
-    annotation = (
-        f"Diff-aware PR test selection ({reason}): " + "; ".join(summary_parts) + "."
-    )
+    annotation = ""
+    if (
+        dropped_lanes
+        or set(skip_steps) - {"unit_tests_omni_pr"}
+        or general_test_pattern != DEFAULT_TEST_PATTERN
+        or multichip_test_pattern != DEFAULT_TEST_PATTERN
+    ):
+        annotation = (
+            f"Diff-aware PR test selection ({reason}): "
+            + "; ".join(summary_parts)
+            + "."
+        )
     return SelectionPlan(
         skip_all_ci=False,
         lanes=tuple(lanes),
