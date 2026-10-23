@@ -18,6 +18,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -364,6 +365,71 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+
+    # --- Vocabulary-parallel greedy Markov chain ----------------------------
+    # Each rank scores only its lm_head vocabulary shard: base draft logits
+    # without the all-gather, Markov bias from its rows of `markov_w2`.
+
+    def prepare_vocab_parallel_markov(self) -> None:
+        """Slice this rank's `markov_w2` rows; call once the lm_head is shared."""
+        head = self.lm_head
+        assert head is not None
+        w2 = self.model.markov_head.markov_w2
+        if head.num_embeddings_padded != head.org_vocab_size or (
+            w2.org_vocab_size != head.org_vocab_size
+        ):
+            raise ValueError(
+                "TPU_DSPARK_VOCAB_PARALLEL_MARKOV needs a full-vocabulary draft "
+                "whose lm_head shards carry no padding or added tokens; got "
+                f"lm_head {head.org_vocab_size} (padded "
+                f"{head.num_embeddings_padded}), markov_w2 {w2.org_vocab_size}."
+            )
+        if self.logits_processor.soft_cap is not None:
+            raise ValueError("Vocabulary-parallel Markov drafting needs no soft cap.")
+        shard = head.shard_indices
+        self.register_buffer(
+            "markov_w2_local",
+            w2.weight[shard.org_vocab_start_index : shard.org_vocab_end_index]
+            .detach()
+            .clone(),
+            persistent=False,
+        )
+
+    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocabulary shard of `compute_draft_logits`."""
+        assert self.lm_head is not None
+        return self.logits_processor(
+            self.lm_head, self.model.norm(hidden_states), skip_gather=True
+        )
+
+    def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        """This rank's vocabulary shard of `markov_bias`."""
+        bias = torch.nn.functional.linear(markov_embed, self.markov_w2_local)
+        if self.logits_processor.scale != 1.0:
+            bias = bias * self.logits_processor.scale
+        return bias
+
+    def vocab_parallel_argmax(self, local_logits: torch.Tensor) -> torch.Tensor:
+        """`argmax` over the full vocabulary from per-rank shards ([P, V/tp]).
+
+        Ties resolve to the lowest token id as in a full-vocabulary argmax: the
+        local argmax keeps its shard's first index and the cross-rank argmax
+        the first rank, which owns the lower ids.
+        """
+        head = self.lm_head
+        assert head is not None
+        local_idx = local_logits.argmax(dim=-1, keepdim=True)
+        local_max = local_logits.gather(-1, local_idx)
+        # A buffer, not the int: rank-specific literals would give each rank
+        # its own compiled graph.
+        global_idx = local_idx + head.org_vocab_start_index
+        # f32 holds token ids below 2**24 exactly.
+        pair = torch.cat([local_max.float(), global_idx.float()], dim=-1)
+        gathered = tensor_model_parallel_all_gather(pair, dim=-1).view(
+            local_logits.shape[0], head.tp_size, 2
+        )
+        best_rank = gathered[..., 0].argmax(dim=-1, keepdim=True)
+        return gathered[..., 1].gather(-1, best_rank).squeeze(-1).to(torch.int64)
 
     # --- Weight loading -----------------------------------------------------
 
