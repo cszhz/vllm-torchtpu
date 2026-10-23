@@ -1574,21 +1574,25 @@ def _mla_batched_decode_kernel(
 
     def _fetch_hca_bkv(batch_idx, sem_idx, wait=False):
         s_start = start_seq_idx + batch_idx * seq_batch_sz
+        kv_lens = []
         for s in range(seq_batch_sz):
             seq_idx = s_start + s
             seq_idx_clamped = jnp.minimum(seq_idx, max_num_seqs - 1)
-            kv_len = jnp.where(
-                seq_idx < end_seq_idx, hca.kv_lens_ref[seq_idx_clamped], 0
+            kv_lens.append(
+                jnp.where(seq_idx < end_seq_idx, hca.kv_lens_ref[seq_idx_clamped], 0)
             )
+        if wait:
+            # One wait per sequence for all its page copies (the semaphore
+            # counts bytes), every wait sized before the first (see
+            # `SwaDecodeWindowRefs.wait_fetches`).
+            sizes = [jnp.clip(kv_len, 0, hca_kv_len_cap) for kv_len in kv_lens]
+            for s, sz in enumerate(sizes):
+                _wait_rows(hca.bkv_x2_vmem.at[sem_idx, s], hca.sems.at[sem_idx, s], sz)
+            return
+        for s, kv_len in enumerate(kv_lens):
+            seq_idx_clamped = jnp.minimum(s_start + s, max_num_seqs - 1)
             sem = hca.sems.at[sem_idx, s]
             bkv_s_ref = hca.bkv_x2_vmem.at[sem_idx, s]
-            if wait:
-                # One wait for all page copies: the semaphore counts bytes.
-                sz = jnp.clip(kv_len, 0, hca_kv_len_cap)
-                async_copy(
-                    bkv_s_ref.at[pl.ds(0, sz)], bkv_s_ref.at[pl.ds(0, sz)], sem, True
-                )
-                continue
             for i in range(hca_pages_per_seq):
                 sz = jnp.clip(kv_len - i * hca_page_size, 0, hca_page_size)
                 page_idx = hca.page_indices_ref[seq_idx_clamped * hca_pages_per_seq + i]
