@@ -1319,6 +1319,10 @@ def swa_decode_window_partials(
     """The unnormalized SWA softmax state of a batch of decode tokens over
     their single kv block: (pv [s, n, d], l [s, n], m [s, n]), all float32."""
     kv_lens_batch = jnp.stack(kv_lens)
+    # A decode token's window keys and the new token fill slots
+    # [0, min(kv_len, sliding_window)); later slots are always masked (p == 0,
+    # kv == 0), so leave them out of both matmuls.
+    num_slots = min(bkv_sz, align_to(sliding_window, 128))
 
     def keep_mask(kv_len, shape, axis):
         """Window slots a decode token attends to, along `axis`."""
@@ -1329,14 +1333,14 @@ def swa_decode_window_partials(
             m_vec == 0
         )
 
-    keep_batch = keep_mask(kv_lens_batch[:, None, None], (1, 1, bkv_sz), 2)
+    keep_batch = keep_mask(kv_lens_batch[:, None, None], (1, 1, num_slots), 2)
 
     # Slots past kv_left were not written this step and still hold whatever
     # the previous kernel left in VMEM. Masking their scores is not enough,
     # since 0 * NaN is NaN in the PV matmul, so zero the values too.
     bkv_batch = jnp.stack(
         [
-            _swa_window_kv(bkv_batch_ref.at[s], keep_mask(kv_len, (bkv_sz, 128), 0))
+            _swa_window_kv(bkv_batch_ref.at[s], keep_mask(kv_len, (num_slots, 128), 0))
             for s, kv_len in enumerate(kv_lens)
         ]
     )
