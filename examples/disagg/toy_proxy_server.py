@@ -128,6 +128,38 @@ class _DecodeRouter:
             )
 
 
+class _RemoteDraftAdmissionBarrier:
+    """Release matched remote-draft requests to D as one scheduler batch.
+
+    The prototype transport is deliberately synchronous: every P proposal
+    batch is followed by exactly one D feedback batch. Staggering requests can
+    otherwise create a mixed P batch that waits for feedback before publishing
+    the newly admitted requests' first proposals, while D waits for those
+    proposals. Grouping one benchmark concurrency wave avoids that cycle.
+    """
+
+    def __init__(self, parties: int):
+        if parties <= 0:
+            raise ValueError("remote draft barrier parties must be positive")
+        self.parties = parties
+        self._condition = asyncio.Condition()
+        self._generation = 0
+        self._waiting = 0
+
+    async def wait(self) -> None:
+        if self.parties == 1:
+            return
+        async with self._condition:
+            generation = self._generation
+            self._waiting += 1
+            if self._waiting == self.parties:
+                self._waiting = 0
+                self._generation += 1
+                self._condition.notify_all()
+                return
+            await self._condition.wait_for(lambda: self._generation != generation)
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -369,6 +401,9 @@ async def lifespan(app: FastAPI):
         len(app.state.decode_clients),
         global_args.decode_routing,
         _proxy_latency_interval(),
+    )
+    app.state.remote_draft_barrier = _RemoteDraftAdmissionBarrier(
+        _env_int("VLLM_TPU_REMOTE_DSPARK_BATCH_SIZE", 1)
     )
 
     print(
@@ -639,10 +674,14 @@ async def _handle_completions(api: str, request: Request):
             flush=True,
         )
         if remote_dspark:
+            await request.app.state.remote_draft_barrier.wait()
             shadow_task = asyncio.create_task(
                 send_shadow_request_to_prefill(
                     prefill_client_info, api, req_data, request_id, forwarded
                 )
+            )
+            await asyncio.sleep(
+                _env_float("VLLM_TPU_REMOTE_DSPARK_ADMISSION_DELAY_S", 0.05)
             )
             response_json = {}
         else:

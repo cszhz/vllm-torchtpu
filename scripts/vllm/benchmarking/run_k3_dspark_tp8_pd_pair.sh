@@ -130,6 +130,7 @@ if [[ "$role" == decode ]]; then
 else
     decode_ip="$(<"$coord/decode.ip")"
     VLLM_TPU_REMOTE_DSPARK_SHADOW="$remote_dspark" \
+      VLLM_TPU_REMOTE_DSPARK_BATCH_SIZE=8 \
       python3 examples/disagg/toy_proxy_server.py \
         --host 0.0.0.0 --port 8050 \
         --prefiller-hosts 127.0.0.1 --prefiller-ports 8000 \

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import importlib.util
 import json
 from pathlib import Path
@@ -37,6 +38,30 @@ _AsciiSafeStreamEncoder = _toy_proxy_server._AsciiSafeStreamEncoder
 _replace_prompt_with_rendered_token_ids = (
     _toy_proxy_server._replace_prompt_with_rendered_token_ids
 )
+_RemoteDraftAdmissionBarrier = _toy_proxy_server._RemoteDraftAdmissionBarrier
+
+
+def test_remote_draft_admission_barrier_releases_complete_waves() -> None:
+    async def run() -> None:
+        barrier = _RemoteDraftAdmissionBarrier(3)
+        released: list[int] = []
+
+        async def arrive(index: int) -> None:
+            await barrier.wait()
+            released.append(index)
+
+        first_wave = [asyncio.create_task(arrive(i)) for i in range(2)]
+        await asyncio.sleep(0)
+        assert released == []
+        first_wave.append(asyncio.create_task(arrive(2)))
+        await asyncio.gather(*first_wave)
+        assert sorted(released) == [0, 1, 2]
+
+        released.clear()
+        await asyncio.gather(*(arrive(i) for i in range(3, 6)))
+        assert sorted(released) == [3, 4, 5]
+
+    asyncio.run(run())
 
 
 def test_ascii_safe_stream_encoder_handles_split_utf8() -> None:
