@@ -5487,6 +5487,12 @@ class TPUModelRunner(GPUModelRunner):
                     ):
                         _ = module.indexer_op
                         initialized_count += 1
+                    if hasattr(type(module), "split_hc_fns"):
+                        # DeepSeek-V4 mHC: (re)derive the bf16 fn chunks from
+                        # the weights as they are now -- load_weights does it
+                        # too, but dummy / post-load-mutated weights skip it.
+                        module.split_hc_fns()
+                        initialized_count += 1
                     for op_name in (
                         "mhc_ops",
                         "mhc_post_op",
