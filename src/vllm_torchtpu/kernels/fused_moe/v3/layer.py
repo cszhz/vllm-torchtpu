@@ -25,6 +25,7 @@ row tables. The FFN kernel computes the expert outputs and pushes them
 to their destination shards, where a sparse-core gather and TensorCore
 weighted sum combine the arrivals.
 """
+import dataclasses
 import math
 import threading
 
@@ -39,7 +40,7 @@ from . import routing_tables as tables
 from . import routing_tables_kernel as tables_kernel
 from . import row_gather_kernel as gather
 from . import row_tables_kernel, transport, vmem
-from .config import (COMBINE_TOKENS_PER_TILE_DEFAULT,
+from .config import (COMBINE_TOKENS_PER_TILE_DEFAULT, COMPACT_MESSAGE_TOKENS,
                      GATHER_BLOCK_ROWS_DEFAULT, TABLES_BLOCKS_PER_STEP_MAX,
                      Config, sorted_rows_by_shape)
 from .ffn_kernel import ffn_kernel
@@ -302,13 +303,19 @@ def pallas_geometry(tokens_per_shard,
                     blocks_per_step,
                     *,
                     tokens_per_tile=COMBINE_TOKENS_PER_TILE_DEFAULT,
-                    gather_block_rows=GATHER_BLOCK_ROWS_DEFAULT):
+                    gather_block_rows=GATHER_BLOCK_ROWS_DEFAULT,
+                    compact=False):
     """(rows per shard, message tokens per shard, pair words per shard) the
     pallas mode's programs run at for a call: the rows padded to their
-    multiple, the message tokens to message_token_multiple, then the pairs
-    to theirs."""
+    multiple, the message tokens to message_token_multiple (with `compact`,
+    Config.compact_message, COMPACT_MESSAGE_TOKENS for a shard of at most
+    that many rows), then the pairs to theirs."""
     rows = align_up(tokens_per_shard, pallas_token_multiple(num_shards))
-    message_tokens = align_up(rows, message_token_multiple(tokens_per_tile))
+    if compact and rows <= COMPACT_MESSAGE_TOKENS:
+        message_tokens = COMPACT_MESSAGE_TOKENS
+    else:
+        message_tokens = align_up(rows,
+                                  message_token_multiple(tokens_per_tile))
     pairs = align_up(message_tokens * top_k,
                      pallas_pair_multiple(blocks_per_step, gather_block_rows))
     return rows, message_tokens, pairs
@@ -328,7 +335,8 @@ def tables_blocks_per_step_for(tokens_per_shard, top_k, num_shards, config):
                         num_shards,
                         c,
                         tokens_per_tile=config.combine_tokens_per_tile,
-                        gather_block_rows=config.gather_block_rows)[2]
+                        gather_block_rows=config.gather_block_rows,
+                        compact=config.compact_message)[2]
         for c in counts
     }
     least = min(padded.values())
@@ -385,7 +393,14 @@ def _pallas_step(x,
         num_shards,
         blocks_per_step,
         tokens_per_tile=config.combine_tokens_per_tile,
-        gather_block_rows=config.gather_block_rows)
+        gather_block_rows=config.gather_block_rows,
+        compact=config.compact_message)
+    # Config.compact_message: the select runs on the uncompacted block of
+    # tokens (whole lane rows per slot) and its index rows are cut to the
+    # message's tokens below.
+    select_tokens = align_up(message_tokens,
+                             message_token_multiple(
+                                 config.combine_tokens_per_tile))
     # The rows are padded to whole blocks with zero rows, the logits to the
     # message's token count with no finite logit: the select kernel routes
     # a padding token nowhere, its weight is zero, and the output rows past
@@ -403,6 +418,35 @@ def _pallas_step(x,
             message_tokens=message_tokens,
             message_rows=message_rows,
             pair_rows=pairs_per_shard // LANES)
+    elif select_tokens > message_tokens:
+        # Config.compact_message: the uncompacted select (its message is
+        # just the top_k index rows, select_tokens words each, rounded to a
+        # sublane tile), then each slot's first message_tokens words laid
+        # end to end, the pairs padded with the unrouted index to
+        # pairs_per_shard and the scale rows (zero) after them.
+        logits = jnp.pad(logits, ((0, select_tokens - real_tokens), (0, 0)),
+                         constant_values=jnp.nan)
+        index_rows = top_k * select_tokens // LANES
+        weights, select_message = _select(logits,
+                                          top_k=top_k,
+                                          tokens_per_shard=select_tokens,
+                                          renormalize=renormalize,
+                                          drop_nan_rows=drop_nan_rows,
+                                          message_rows=align_up(
+                                              index_rows, SUBLANES),
+                                          pair_rows=index_rows,
+                                          valid_tokens=valid_tokens)
+        pairs = select_message[:index_rows].reshape(
+            top_k, select_tokens)[:, :message_tokens].reshape(-1)
+        pairs = jnp.pad(pairs, (0, pairs_per_shard - pairs.shape[0]),
+                        constant_values=num_experts)
+        routing_message = jnp.concatenate([
+            pairs.reshape(pairs_per_shard // LANES, LANES),
+            jnp.zeros((message_rows - pairs_per_shard // LANES, LANES),
+                      jnp.int32)
+        ],
+                                          axis=0)
+        weights = weights[:message_tokens]
     else:
         if message_tokens > real_tokens:
             logits = jnp.pad(logits,
@@ -573,10 +617,11 @@ def _pallas_step(x,
     combine_tile = config.combine_tokens_per_tile
     if config.combine_real_tokens:
         combine_tokens = min(message_tokens, align_up(real_tokens, SUBLANES))
-        if combine_tokens % combine_tile:
-            combine_tile = max(t for t in range(SUBLANES, combine_tokens + 1,
-                                                SUBLANES)
-                               if combine_tokens % t == 0 and t <= combine_tile)
+    if combine_tokens % combine_tile:
+        # combine_real_tokens, or a compacted message (Config.compact_message)
+        combine_tile = max(t for t in range(SUBLANES, combine_tokens + 1,
+                                            SUBLANES)
+                           if combine_tokens % t == 0 and t <= combine_tile)
     n_pairs = top_k * combine_tokens
     n_gather = align_up(n_pairs,
                         gather.gather_rows_multiple(config.gather_block_rows))
@@ -812,6 +857,10 @@ def fused_ep_moe(x,
                                   inter=inter,
                                   experts_per_shard=experts_per_shard,
                                   top_k=top_k)
+    if routing is not None and config.compact_message:
+        # The caller's routing arrives as [tokens, top_k]; it is laid out
+        # as the uncompacted message (Config.compact_message).
+        config = dataclasses.replace(config, compact_message=False)
     partition = jax.sharding.PartitionSpec
     token_dtype = config.token_dtype
     bound = tables.routed_rows_bound(tokens, top_k, num_experts, tile_rows)
@@ -827,7 +876,8 @@ def fused_ep_moe(x,
             num_shards,
             blocks_per_step,
             tokens_per_tile=config.combine_tokens_per_tile,
-            gather_block_rows=config.gather_block_rows)
+            gather_block_rows=config.gather_block_rows,
+            compact=config.compact_message)
         routing_block = tables_kernel.shard_tables_block(
             pairs, blocks_per_step)
     if routed_rows_per_shard % tile_rows:
