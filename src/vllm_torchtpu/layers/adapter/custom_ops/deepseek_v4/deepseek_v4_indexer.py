@@ -31,7 +31,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config as compressor_config,
 )
-from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
+from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant_flat
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     KVLayout,
     get_kv_cache_shape,
@@ -108,6 +108,7 @@ def _indexer_jax(
     compression_ratio: int,
     softmax_scale: float,
     n_head: int,
+    head_dim: int,
     verify_q_len: int | None = None,
 ) -> jax.Array:
     if cache_kv.shape[0] == 0:
@@ -136,8 +137,13 @@ def _indexer_jax(
         # Note: vLLM's implementation rounds the scale factors up to the next
         # power of 2, but the plain `abs_max / dtype_max` the kernel returns is
         # sufficient here.
-        q_quant, q_scales = rope_quant(
-            q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
+        # ``q`` is the flat projection; the kernel returns [tokens, heads, dim].
+        q_quant, q_scales = rope_quant_flat(
+            q,
+            positions,
+            cos_sin_cache,
+            num_heads=q.shape[1] // head_dim,
+            quant_dtype=jnp.float8_e4m3fn,
         )
 
         # Fold the query quantization scales into the weights.
@@ -224,6 +230,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             compression_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
             n_head=self.n_head,
+            head_dim=self.head_dim,
             verify_q_len=verify_q_len,
         )
 
@@ -249,7 +256,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             wrapped_fn,
             mesh=mesh,
             input_partition_specs=(
-                P(attn_data_axis, attn_head_axis, None),  # q
+                P(attn_data_axis, attn_head_axis),  # q, flat: heads side by side
                 P(attn_data_axis),  # positions
                 P(),  # cos_sin_cache
                 P(attn_data_axis, attn_head_axis),  # indexer_weights
@@ -281,7 +288,6 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         slot_mapping: torch.Tensor | None = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(query)
-        q = q.view(-1, self.n_head, self.head_dim)
 
         self.compressor(hidden_states, positions, rotary_emb)
 

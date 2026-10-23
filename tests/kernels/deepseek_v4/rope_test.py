@@ -23,6 +23,7 @@ from vllm_torchtpu.kernels.deepseek_v4.rope import (
     qnorm_rope_flat,
     rope,
     rope_quant,
+    rope_quant_flat,
 )
 
 pytestmark = pytest.mark.tpu_test
@@ -201,6 +202,24 @@ class RopeQuantTest(parameterized.TestCase):
             np.asarray(scales), np.asarray(scales_expected), rtol=1e-6, atol=1e-6
         )
         assert_bits_equal(q, q_expected)
+
+    @parameterized.product(num_tokens=(8, 72, 1024))
+    def test_flat_input_is_bit_identical(self, num_tokens):
+        """Reading the projection's tiles gives the 3-D path's bits."""
+        num_heads, head_dim = 64, 128
+        rng = np.random.default_rng(2)
+        x = jnp.asarray(
+            rng.normal(size=(num_tokens, num_heads * head_dim)), jnp.bfloat16
+        )
+        positions = jnp.asarray(rng.integers(0, 4096, size=(num_tokens,)), jnp.int32)
+        cos_sin_cache = jnp.asarray(make_cos_sin_cache(4096, ROTARY_DIM, 2))
+
+        q_expected, scales_expected = rope_quant(
+            x.reshape(num_tokens, num_heads, head_dim), positions, cos_sin_cache
+        )
+        q, scales = rope_quant_flat(x, positions, cos_sin_cache, num_heads=num_heads)
+        assert_bits_equal(q, q_expected)
+        assert_bits_equal(scales, scales_expected)
 
 
 class QNormRopeTest(parameterized.TestCase):

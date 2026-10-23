@@ -360,6 +360,91 @@ def _untile_heads(words_ref: jax.Ref, out_ref: jax.Ref) -> None:
     jax.lax.fori_loop(0, num_groups, group, 0, unroll=True)
 
 
+def _rope_quant_tiles_kernel(
+    # scalar prefetch
+    positions_ref: jax.Ref,
+    # HBM inputs
+    x_hbm_ref: jax.Ref,  # `token_tiles` of [tokens, heads * LANE]
+    cos_sin_cache_hbm_ref: jax.Ref,
+    # HBM outputs
+    q_hbm_ref: jax.Ref,
+    scale_hbm_ref: jax.Ref,
+    *,
+    num_tiles: int,
+    tile_n: int,
+    num_heads: int,
+    rotary_dim: int,
+    inverse: bool,
+    in_dtype: jnp.dtype,
+    cos_sin_dtype: jnp.dtype,
+    quant_dtype: jnp.dtype,
+) -> None:
+    x_spec = pl.BlockSpec(
+        block_shape=(tile_n // TOKEN_TILE, num_heads, 1, TOKEN_TILE, LANE),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0, 0, 0, 0),
+    )
+    q_spec = pl.BlockSpec(
+        block_shape=(tile_n, num_heads, LANE),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0, 0),
+    )
+    scale_spec = pl.BlockSpec(
+        block_shape=(tile_n, num_heads),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0),
+    )
+    cos_sin_spec = pl.BlockSpec(
+        block_shape=(tile_n, rotary_dim),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0),
+    )
+    cos_sin_alloc = CosSinRef.create(
+        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
+    )
+    allocations = (
+        pltpu.BufferedRef.input(x_spec, in_dtype, buffer_count=2),
+        cos_sin_alloc,
+        pltpu.BufferedRef.output(q_spec, quant_dtype, buffer_count=2),
+        pltpu.BufferedRef.output(scale_spec, jnp.float32, buffer_count=2),
+    )
+
+    @pl.with_scoped(
+        allocations=(allocations, pltpu.VMEM((tile_n, num_heads, LANE), in_dtype))
+    )
+    def _run(allocations):
+        allocations, rows_ref = allocations
+
+        def body(x_ref, cos_sin_ref, q_ref, scale_ref):
+            _untile_heads(x_ref.bitcast(jnp.uint32), rows_ref)
+            _rope_body(
+                rows_ref,
+                cos_sin_ref,
+                q_ref,
+                scale_ref,
+                rotary_dim=rotary_dim,
+                inverse=inverse,
+                out_dtype=in_dtype,
+                quant_dtype=quant_dtype,
+            )
+
+        pipeline = pltpu.emit_pipeline(
+            body,
+            grid=(num_tiles,),
+            in_specs=[x_spec, cos_sin_spec],
+            out_specs=[q_spec, scale_spec],
+        )
+        pipeline(
+            x_hbm_ref,
+            (cos_sin_cache_hbm_ref, positions_ref),
+            q_hbm_ref,
+            scale_hbm_ref,
+            allocations=allocations,
+        )
+
+    _run()
+
+
 def _qnorm_rope_body(
     x_ref: jax.Ref,
     cos_sin_ref: jax.Ref,
@@ -759,3 +844,78 @@ def rope_quant(
             name=name,
         ),
     )
+
+
+@functools.partial(
+    jax.jit, static_argnames=("num_heads", "inverse", "quant_dtype", "name")
+)
+def rope_quant_flat(
+    x: jax.Array,  # [num_tokens, num_heads * LANE]
+    positions: jax.Array,  # [num_tokens] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    num_heads: int,
+    inverse: bool = False,
+    quant_dtype: jnp.dtype = jnp.float8_e4m3fn,
+    name: str = "rope_quant",
+) -> tuple[jax.Array, jax.Array]:
+    """`rope_quant` of a flat ``[tokens, heads * LANE]`` projection output.
+
+    Returns ``q`` as ``[tokens, heads, LANE]`` and the scales as ``[tokens,
+    heads]``, like `rope_quant` on the 3-D view, but reads the projection's
+    own tiles (see `qnorm_rope_flat`), so XLA does not relayout ``x`` first.
+    """
+    num_tokens, width = x.shape
+    if x.dtype != jnp.bfloat16 or not can_untile_heads(num_tokens, num_heads, LANE):
+        q = x.reshape(num_tokens, num_heads, width // num_heads)
+        return rope_quant(
+            q,
+            positions,
+            cos_sin_cache,
+            inverse=inverse,
+            quant_dtype=quant_dtype,
+            name=name,
+        )
+    assert width == num_heads * LANE, (x.shape, num_heads)
+    assert positions.ndim == 1 and positions.shape[0] == num_tokens
+    rotary_dim = cos_sin_cache.shape[1]
+    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
+
+    tile_n = TOKEN_TILE * largest_divisor(
+        num_tokens // TOKEN_TILE, cap=128 // TOKEN_TILE
+    )
+    kernel = functools.partial(
+        _rope_quant_tiles_kernel,
+        num_tiles=num_tokens // tile_n,
+        tile_n=tile_n,
+        num_heads=num_heads,
+        rotary_dim=rotary_dim,
+        inverse=inverse,
+        in_dtype=x.dtype,
+        cos_sin_dtype=cos_sin_cache.dtype,
+        quant_dtype=quant_dtype,
+    )
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=1,
+        in_specs=(
+            pl.BlockSpec(memory_space=pltpu.HBM),  # x tiles
+            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin_cache
+        ),
+        out_specs=(
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+        ),
+    )
+    return pl.pallas_call(
+        kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct((num_tokens, num_heads, LANE), quant_dtype),
+            jax.ShapeDtypeStruct((num_tokens, num_heads), jnp.float32),
+        ),
+        grid_spec=grid_spec,
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(positions, token_tiles(x, num_heads), cos_sin_cache)
