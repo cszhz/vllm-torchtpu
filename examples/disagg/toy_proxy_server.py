@@ -378,7 +378,10 @@ def _completion_text(body: bytes, streamed: bool) -> str:
     for line in body.splitlines():
         if not line.startswith(b"data: ") or line == b"data: [DONE]":
             continue
-        choice = json.loads(line[6:])["choices"][0]
+        choices = json.loads(line[6:]).get("choices", [])
+        if not choices:
+            continue
+        choice = choices[0]
         parts.append(
             choice.get("text", choice.get("delta", {}).get("content", "")) or ""
         )

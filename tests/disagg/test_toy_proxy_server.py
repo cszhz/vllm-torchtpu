@@ -117,6 +117,7 @@ def test_completion_text_matches_streamed_and_unstreamed_responses() -> None:
     streamed = (
         b'data: {"choices": [{"text": "hello "}]}\n\n'
         b'data: {"choices": [{"text": "world"}]}\n\n'
+        b'data: {"choices": [], "usage": {"completion_tokens": 2}}\n\n'
         b"data: [DONE]\n\n"
     )
 
