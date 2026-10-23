@@ -37,9 +37,9 @@ from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
         ("model.layers.3.attn.fused_wqa_wkv", True),
         ("model.layers.3.attn.wq_b", True),
         ("model.layers.3.attn.wo_b", True),
-        ("model.layers.0.ffn.shared_experts.gate_up_proj", True),
+        ("model.layers.0.ffn.shared_experts.gate_up_proj", False),
         ("model.layers.0.ffn.shared_experts.down_proj", False),
-        ("model.layers.3.attn.indexer.wq_b", False),
+        ("model.layers.3.attn.indexer.wq_b", True),
         ("model.layers.3.attn.wo_a", False),
         ("model.layers.3.xattn.wq_b", False),  # "."-bounded suffix
         ("", False),
@@ -51,8 +51,14 @@ def test_default_sites(monkeypatch, prefix, expected):
     assert fp8_mod.fp8_linear_pallas_selected(prefix) is expected
 
 
-def test_off_by_default(monkeypatch):
+def test_on_by_default(monkeypatch):
     monkeypatch.delenv("TPU_FP8_LINEAR_PALLAS", raising=False)
+    monkeypatch.delenv("TPU_FP8_LINEAR_PALLAS_SITES", raising=False)
+    assert fp8_mod.fp8_linear_pallas_selected("model.layers.3.attn.wo_b")
+
+
+def test_off_when_disabled(monkeypatch):
+    monkeypatch.setenv("TPU_FP8_LINEAR_PALLAS", "0")
     assert not fp8_mod.fp8_linear_pallas_selected("model.layers.3.attn.wo_b")
 
 
