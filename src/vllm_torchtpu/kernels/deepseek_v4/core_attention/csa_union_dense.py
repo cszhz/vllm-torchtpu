@@ -31,6 +31,7 @@ union ranks with KV block = `tile`: bit `b` of word `128 s + l` is rank
 """
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +54,8 @@ WORD_BITS = 32
 SUPER_BLOCK = WORD_BITS * LANES  # 4096 ranks per 128-word column
 TILE = 1024  # union rows per KV tile (== csa_gather top_k period)
 META = 6  # q_start, q_len, tile0, n_tiles, union_size, seq
+# Debug: TPU_DSV4_CSA_UNION_DENSE_CHECKS=1 compiles the kernels with bounds checks.
+_CHECKS = bool(int(os.environ.get("TPU_DSV4_CSA_UNION_DENSE_CHECKS", "0") or 0))
 
 
 def cdiv(a, b):
@@ -255,7 +258,11 @@ def _kernel(
         l_ref[...] = exp_m_diff * l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
         acc_ref[...] = lanes(exp_m_diff, head_dim) * acc_ref[...] + pv
 
-    @pl.when(jnp.logical_and(blk < nb, meta_ref[1, blk] > 0))
+    @pl.when(
+        jnp.logical_and(
+            blk < nb, jnp.logical_and(meta_ref[1, blk] > 0, meta_ref[3, blk] > 0)
+        )
+    )
     def _block():
         q0 = meta_ref[0, blk]
         qn = meta_ref[1, blk]
@@ -382,7 +389,7 @@ def union_dense_attention(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=vmem_limit_bytes,
-            disable_bounds_checks=True,
+            disable_bounds_checks=not _CHECKS,
         ),
         out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
         input_output_aliases={len(prefetch) + 1: 0},
@@ -716,7 +723,7 @@ def build_union_plan(
             pltpu.SemaphoreType.DMA((2,)),
         ),
         compiler_params=pltpu.CompilerParams(
-            disable_bounds_checks=True, needs_layout_passes=False
+            disable_bounds_checks=not _CHECKS, needs_layout_passes=False
         ),
         mesh=mesh,
         name="sc_csa_union_count" if count_only else "sc_csa_union_plan",
@@ -877,6 +884,8 @@ def attention(
     def all_sparse(q):
         return sparse_call(q, T, None)
 
+    total_rows = cache_kv_nope.shape[0] * cache_kv_nope.shape[1]
+
     def union_path(q):
         if T <= 64:
             q = sparse_call(q, T, n_sparse)
@@ -898,6 +907,8 @@ def attention(
             g_end = jnp.max(jnp.where(in_g, tile_end, 0))
             g_end = jnp.maximum(g_end, g_first)
             compact = compact_tiles(idx, tile_end, tile0, g_end, u_cap, grp_cap, g_first)
+            # Never hand the gather a row outside the cache (defensive).
+            compact = jnp.clip(compact, 0, total_rows - 1)
             nope_g, rope_g = csa_gather.csa_gather(
                 cache_kv_nope, cache_kv_rope, compact,
                 num_valid_indices=(g_end - g_first) * TILE, top_k=TILE,
