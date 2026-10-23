@@ -20,13 +20,26 @@ from . import (
     qwen35_pool,
     qwen35_profile,
     qwen35_weights,
+    qwen38,
+    qwen38_profile,
 )
+from .qwen35 import MKConfig, Qwen35, Qwen35Geometry, qwen35_spec
+from .qwen38 import Qwen38, Qwen38Geometry, qwen38_spec
 
 __all__ = [
+    "MKConfig",
+    "Qwen35",
+    "Qwen35Geometry",
+    "Qwen38",
+    "Qwen38Geometry",
     "qwen35",
     "qwen35_candidate30",
     "qwen35_pack",
     "qwen35_pool",
     "qwen35_profile",
     "qwen35_weights",
+    "qwen35_spec",
+    "qwen38",
+    "qwen38_profile",
+    "qwen38_spec",
 ]

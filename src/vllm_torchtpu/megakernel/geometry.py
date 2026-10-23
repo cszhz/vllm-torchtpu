@@ -21,11 +21,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .blocks.gdn import GDNBlock
-from .decls import (
-    REQUIRED,
-    FrozenDict,
-    _resolve_field_spec,
-)
+from .decls import REQUIRED, FrozenDict, _resolve_field_spec
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .pool.config import cache_exec, resolved_max_pages_per_seq
@@ -35,15 +31,7 @@ if TYPE_CHECKING:
     from .model_def import ModelDef
 
 _KNOWN_FROM_HF_KEYS = frozenset(
-    {
-        "hidden",
-        "layers",
-        "vocab",
-        "eps",
-        "gdn_l2_eps",
-        "rope_theta",
-        "rope_partial",
-    }
+    ["hidden", "layers", "vocab", "eps", "gdn_l2_eps", "rope_theta", "rope_partial"]
 )
 
 
@@ -140,28 +128,31 @@ class FromHF:
         )
 
 
-_GEOM_FIELD_NAMES = (
-    "L",
-    "att_every",
-    "H",
-    "NH",
-    "NKV",
-    "HD",
-    "ROT",
-    "KH",
-    "VH",
-    "KD",
-    "VD",
-    "E",
-    "TOPK",
-    "I",
-    "IS",
-    "moe_tp",
-    "e_slots",
-    "eps",
-    "gdn_l2_eps",
-    "theta",
-    "zero_centered_norm",
+_GEOM_FIELD_NAMES = tuple(
+    [
+        "L",
+        "att_every",
+        "H",
+        "NH",
+        "NKV",
+        "HD",
+        "ROT",
+        "KH",
+        "VH",
+        "KD",
+        "VD",
+        "E",
+        "TOPK",
+        "I",
+        "IS",
+        "moe_tp",
+        "e_slots",
+        "expert_quant",
+        "eps",
+        "gdn_l2_eps",
+        "theta",
+        "zero_centered_norm",
+    ]
 )
 
 
@@ -186,6 +177,7 @@ class ModelGeometry:
     IS: int
     moe_tp: bool = True
     e_slots: int = 0
+    expert_quant: str = "fp8"
     eps: float = 1e-6
     gdn_l2_eps: float = 1e-6
     theta: float = 10_000.0
@@ -207,6 +199,9 @@ class ModelGeometry:
 
     def G(self, R: int) -> int:
         return R // self.NKV
+
+    def kh_rep(self, R: int) -> int:
+        return max(1, R // self.KH) if self.KH > 0 else 1
 
     def kh(self, R: int) -> int:
         return GDNBlock.lin_in_layout(self, R).kh
@@ -232,18 +227,17 @@ class ModelGeometry:
     def ER(self, R: int) -> int:
         return self.E // R
 
+    def sh_rep(self, R: int) -> int:
+        return max(1, R // max(1, self.IS // 128))
+
     def ISR(self, R: int) -> int:
-        return self.IS // R
+        return self.IS // max(1, R // self.sh_rep(R))
 
     def IR(self, R: int) -> int:
         return self.I // R if self.moe_tp else self.I
 
     def EW(self, R: int) -> int:
-        return (
-            self.e_slots
-            if self.e_slots > 0
-            else (self.E if self.moe_tp else self.ER(R))
-        )
+        return self.e_slots or (self.E if self.moe_tp else self.ER(R))
 
     @property
     def NGDN(self) -> int:
@@ -257,6 +251,7 @@ class ModelGeometry:
         R, B, T, M = ex.R, ex.B, ex.T, ex.M
         pc = min(1024, self.H)
         min_slots = self.E if self.moe_tp else self.ER(R)
+        sh_r = max(1, R // self.sh_rep(R))
         for cond, msg in (
             (
                 self.L % self.att_every == 0,
@@ -278,6 +273,10 @@ class ModelGeometry:
                 f"Invalid E={self.E}, H={self.H}, nh={self.nh(R)}",
             ),
             (
+                R % self.sh_rep(R) == 0 and self.IS % sh_r == 0,
+                f"Invalid IS={self.IS}, R={R}, sh_rep={self.sh_rep(R)}",
+            ),
+            (
                 self.ROT % 2 == 0 and (R & (R - 1) == 0),
                 f"ROT={self.ROT} must be even and R={R} a power of 2",
             ),
@@ -290,11 +289,16 @@ class ModelGeometry:
             if not cond:
                 raise MegakernelConfigError(msg)
         cx = cache_exec(ex)
+        dcp_g = (
+            self.G(ex.R)
+            if (getattr(cx, "dcp_kv_sharded", False) and self.G(ex.R) > 1)
+            else 1
+        )
         if cx.paged_kv and not (
             cx.page_size == 128
             and ex.ctx % cx.page_size == 0
             and cx.num_pages >= 1
-            and resolved_max_pages_per_seq(ex) >= ex.ctx // cx.page_size
+            and resolved_max_pages_per_seq(ex) * dcp_g >= ex.ctx // cx.page_size
         ):
             raise MegakernelConfigError(
                 f"Invalid paged_kv config: page_size={cx.page_size}, ctx={ex.ctx}, "
@@ -304,7 +308,11 @@ class ModelGeometry:
             if n % 128 != 0:
                 raise MegakernelConfigError(f"Dimension {n} must be a multiple of 128")
         if self.NGDN > 0:
-            if not (self.KH % R == 0 and self.VH % R == 0 and self.VH % self.KH == 0):
+            if not (
+                (self.KH % R == 0 or (self.KH > 0 and R % self.KH == 0))
+                and self.VH % R == 0
+                and self.VH % self.KH == 0
+            ):
                 raise MegakernelConfigError(
                     f"Invalid GDN heads KH={self.KH}, VH={self.VH}, R={R}"
                 )
@@ -325,13 +333,7 @@ class ModelGeometry:
             R = ex.R
         if not isinstance(periods, int) or isinstance(periods, bool) or periods < 1:
             raise MegakernelConfigError(f"shrink periods must be >= 1, got {periods!r}")
-        if (
-            not isinstance(R, int)
-            or isinstance(R, bool)
-            or R < 1
-            or (R & (R - 1)) != 0
-            or R > 8
-        ):
+        if type(R) is not int or R < 1 or R > 8 or (R & (R - 1)) != 0:
             raise MegakernelConfigError(
                 f"shrink R must be a power of 2 in 1..8, got {R!r}"
             )
@@ -378,19 +380,14 @@ class ModelGeometry:
             object.__setattr__(shrunk, "_model_def", mdef)
         return shrunk
 
-    def to_model_spec(self) -> ModelSpec:
+    def to_model_spec(self, R: int = 8) -> ModelSpec:
         """Convert this geometry into its declarative `ModelSpec`."""
         mdef = getattr(self, "_model_def", None)
         if mdef is not None:
-            return mdef.to_model_spec(self)
+            return mdef.to_model_spec(self, R=R)
         raise MegakernelConfigError(
             "ModelGeometry is not bound to a ModelDef; call ModelDef.to_model_spec(g)"
         )
 
 
-__all__ = [
-    "FromHF",
-    "LMHead",
-    "ModelGeometry",
-    "_BoundFromHF",
-]
+__all__ = ["FromHF", "LMHead", "ModelGeometry", "_BoundFromHF"]

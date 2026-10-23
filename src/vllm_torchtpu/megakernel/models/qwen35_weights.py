@@ -63,10 +63,7 @@ def encode_eplb_ecopy(
     return jnp.asarray(rows, dtype=F32)
 
 
-def random_hf_weights(
-    key: jax.Array,
-    g: Any,
-) -> dict[str, jax.Array]:
+def random_hf_weights(key: jax.Array, g: Any) -> dict[str, jax.Array]:
     """Generate unsharded HuggingFace-style Qwen3.5 weights (`[L, ...]`, full `E`)."""
     L, H, E, inter_dim, IS = g.L, g.H, g.E, g.I, g.IS
     NH, NKV, HD = g.NH, g.NKV, g.HD
@@ -166,59 +163,32 @@ def split_hf_weights(
     *,
     e_cores: list[list[list[int]]] | None = None,
 ) -> dict[str, Any]:
-    """Shard unsharded HuggingFace-style Qwen3.5 weights across `R = ex.R` ranks.
-
-    Produces `logical_weights` ready for `pack_inputs(...)` and `reference_step(...)`,
-    including EPLB redundant expert replication (`ew > er`) and `ecopy` metadata.
-    """
+    """Shard unsharded HuggingFace-style Qwen3.5 weights across `R = ex.R` ranks."""
     g.check(ex)
     R = ex.R
     L, H, E, inter_dim, IS = g.L, g.H, g.E, g.I, g.IS
-    HD = g.HD
-    nh = g.nh(R)
+    HD, nh, nkv, G = g.HD, g.nh(R), g.NKV, g.G(R)
     isr, ir, er, ew = g.ISR(R), g.IR(R), g.ER(R), g.EW(R)
+    sh_rep = g.sh_rep(R)
+    sh_r = R // sh_rep
     natt, ngdn = g.NATT, g.NGDN
-    G = g.G(R)
-    nkv = g.NKV
     koff = nh * 2 * HD
 
     # 1. Attention projections: [q_proj (NH*2*HD) | k_proj (NKV,HD) | v_proj (NKV,HD)]
     q_p = jnp.transpose(hf["q_proj"].reshape(natt, H, R, koff), (2, 0, 1, 3))
     q_s = jnp.transpose(hf["q_proj_s"].reshape(natt, R, koff), (1, 0, 2))
-
-    k_in = (
-        hf["k_proj"].reshape(natt, nkv, H, HD)
-        if hf["k_proj"].ndim == 3
-        else hf["k_proj"]
-    )
-    v_in = (
-        hf["v_proj"].reshape(natt, nkv, H, HD)
-        if hf["v_proj"].ndim == 3
-        else hf["v_proj"]
-    )
-    ks_in = (
-        hf["k_proj_s"].reshape(natt, nkv, HD)
-        if hf["k_proj_s"].ndim == 2
-        else hf["k_proj_s"]
-    )
-    vs_in = (
-        hf["v_proj_s"].reshape(natt, nkv, HD)
-        if hf["v_proj_s"].ndim == 2
-        else hf["v_proj_s"]
-    )
+    k_in = hf["k_proj"].reshape(natt, nkv, H, HD)
+    v_in = hf["v_proj"].reshape(natt, nkv, H, HD)
+    ks_in = hf["k_proj_s"].reshape(natt, nkv, HD)
+    vs_in = hf["v_proj_s"].reshape(natt, nkv, HD)
     kv_p = jnp.repeat(
-        jnp.transpose(jnp.concatenate([k_in, v_in], axis=-1), (1, 0, 2, 3)),
-        G,
-        axis=0,
+        jnp.transpose(jnp.concatenate([k_in, v_in], axis=-1), (1, 0, 2, 3)), G, axis=0
     )
     kv_s = jnp.repeat(
-        jnp.transpose(jnp.concatenate([ks_in, vs_in], axis=-1), (1, 0, 2)),
-        G,
-        axis=0,
+        jnp.transpose(jnp.concatenate([ks_in, vs_in], axis=-1), (1, 0, 2)), G, axis=0
     )
     att_in = jnp.concatenate([q_p, kv_p], axis=-1)
     att_in_s = jnp.concatenate([q_s, kv_s], axis=-1)
-
     att_out = jnp.transpose(hf["att_out"].reshape(natt, R, nh * HD, H), (1, 0, 2, 3))
     att_out_s = jnp.broadcast_to(hf["att_out_s"][None, ...], (R, natt, H))
 
@@ -227,10 +197,11 @@ def split_hf_weights(
         qn = jnp.transpose(qn_in.reshape(natt, R, nh, HD), (1, 0, 2, 3)).mean(axis=2)
     else:
         qn = jnp.broadcast_to(qn_in[None, ...], (R, natt, HD))
-    kn_in = hf["kn"].reshape(natt, nkv, HD) if hf["kn"].ndim == 2 else hf["kn"]
-    kn = jnp.repeat(jnp.transpose(kn_in, (1, 0, 2)), G, axis=0)
+    kn = jnp.repeat(
+        jnp.transpose(hf["kn"].reshape(natt, nkv, HD), (1, 0, 2)), G, axis=0
+    )
 
-    # 2. Shared expert (always TP-sharded along IS across R)
+    # 2. Shared expert (sharded across sh_r = R // sh_rep groups, replicated sh_rep-way)
     sh_gate = jnp.broadcast_to(hf["sh_gate"][None, ...], (R, L, H))
     if "sh_gate_proj" in hf and "sh_up_proj" in hf:
         sh_g_in, sh_u_in = hf["sh_gate_proj"], hf["sh_up_proj"]
@@ -238,15 +209,23 @@ def split_hf_weights(
     else:
         sh_g_in, sh_u_in = hf["sh13"][:, :, :IS], hf["sh13"][:, :, IS:]
         sh_gs_in, sh_us_in = hf["sh13_s"][:, :IS], hf["sh13_s"][:, IS:]
-    sh_g = jnp.transpose(sh_g_in.reshape(L, H, R, isr), (2, 0, 1, 3))
-    sh_u = jnp.transpose(sh_u_in.reshape(L, H, R, isr), (2, 0, 1, 3))
+    sh_g = jnp.repeat(
+        jnp.transpose(sh_g_in.reshape(L, H, sh_r, isr), (2, 0, 1, 3)), sh_rep, axis=0
+    )
+    sh_u = jnp.repeat(
+        jnp.transpose(sh_u_in.reshape(L, H, sh_r, isr), (2, 0, 1, 3)), sh_rep, axis=0
+    )
     sh13 = jnp.concatenate([sh_g, sh_u], axis=-1)
-
-    sh_gs = jnp.transpose(sh_gs_in.reshape(L, R, isr), (1, 0, 2))
-    sh_us = jnp.transpose(sh_us_in.reshape(L, R, isr), (1, 0, 2))
+    sh_gs = jnp.repeat(
+        jnp.transpose(sh_gs_in.reshape(L, sh_r, isr), (1, 0, 2)), sh_rep, axis=0
+    )
+    sh_us = jnp.repeat(
+        jnp.transpose(sh_us_in.reshape(L, sh_r, isr), (1, 0, 2)), sh_rep, axis=0
+    )
     sh13_s = jnp.concatenate([sh_gs, sh_us], axis=-1)
-
-    sh2 = jnp.transpose(hf["sh2"].reshape(L, R, isr, H), (1, 0, 2, 3))
+    sh2 = jnp.repeat(
+        jnp.transpose(hf["sh2"].reshape(L, sh_r, isr, H), (1, 0, 2, 3)), sh_rep, axis=0
+    )
     sh2_s = jnp.broadcast_to(hf["sh2_s"][None, ...], (R, L, H))
 
     # 3. Routed experts: TP-sharded (g.moe_tp=True) or EP + EPLB (g.moe_tp=False)
@@ -256,23 +235,17 @@ def split_hf_weights(
         e13_full = jnp.concatenate([e_g_in, e_u_in], axis=-1)
         e13_s_full = jnp.concatenate([e_gs_in, e_us_in], axis=-1)
     else:
-        e13_full = hf["e13"]
-        e13_s_full = hf["e13_s"]
+        e13_full, e13_s_full = hf["e13"], hf["e13_s"]
         e_g_in, e_u_in = e13_full[:, :, :, :inter_dim], e13_full[:, :, :, inter_dim:]
-        e_gs_in, e_us_in = (
-            e13_s_full[:, :, :inter_dim],
-            e13_s_full[:, :, inter_dim:],
-        )
+        e_gs_in, e_us_in = e13_s_full[:, :, :inter_dim], e13_s_full[:, :, inter_dim:]
 
     if g.moe_tp:
         e13_g = jnp.transpose(e_g_in.reshape(L, E, H, R, ir), (3, 0, 1, 2, 4))
         e13_u = jnp.transpose(e_u_in.reshape(L, E, H, R, ir), (3, 0, 1, 2, 4))
         e13 = jnp.concatenate([e13_g, e13_u], axis=-1)
-
         e13_sg = jnp.transpose(e_gs_in.reshape(L, E, R, ir), (2, 0, 1, 3))
         e13_su = jnp.transpose(e_us_in.reshape(L, E, R, ir), (2, 0, 1, 3))
         e13_s = jnp.concatenate([e13_sg, e13_su], axis=-1)
-
         e2 = jnp.transpose(hf["e2"].reshape(L, E, R, ir, H), (2, 0, 1, 3, 4))
         e2_s = jnp.broadcast_to(hf["e2_s"][None, ...], (R, L, E, H))
     elif ew == er:
@@ -285,7 +258,7 @@ def split_hf_weights(
     else:
         if e_cores is None:
             e_cores = default_eplb_cores(g, R)
-        idx = jnp.maximum(jnp.asarray(e_cores, dtype=I32), 0)  # [L, R, EW]
+        idx = jnp.maximum(jnp.asarray(e_cores, dtype=I32), 0)
         l_idx = jnp.arange(L, dtype=I32)[:, None, None]
         e13 = jnp.transpose(e13_full[l_idx, idx], (1, 0, 2, 3, 4))
         e13_s = jnp.transpose(e13_s_full[l_idx, idx], (1, 0, 2, 3))
@@ -322,13 +295,21 @@ def split_hf_weights(
     if ngdn > 0:
         lay_gdn = GDNBlock.lin_in_layout(g, ex)
         kh, vh, KD, VD = lay_gdn.kh, lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
-        b_pad = lay_gdn.A_OFF - lay_gdn.BA
-        a_pad = lay_gdn.NLI - lay_gdn.A_OFF
-        kq_w = kh * KD
-        v_w = vh * VD
+        kh_rep = g.kh_rep(R)
+        kh_r = R // kh_rep
+        b_pad, a_pad = lay_gdn.A_OFF - lay_gdn.BA, lay_gdn.NLI - lay_gdn.A_OFF
+        kq_w, v_w = kh * KD, vh * VD
 
-        lin_q = jnp.transpose(hf["lin_q"].reshape(ngdn, H, R, kq_w), (2, 0, 1, 3))
-        lin_k = jnp.transpose(hf["lin_k"].reshape(ngdn, H, R, kq_w), (2, 0, 1, 3))
+        lin_q = jnp.repeat(
+            jnp.transpose(hf["lin_q"].reshape(ngdn, H, kh_r, kq_w), (2, 0, 1, 3)),
+            kh_rep,
+            axis=0,
+        )
+        lin_k = jnp.repeat(
+            jnp.transpose(hf["lin_k"].reshape(ngdn, H, kh_r, kq_w), (2, 0, 1, 3)),
+            kh_rep,
+            axis=0,
+        )
         lin_v = jnp.transpose(hf["lin_v"].reshape(ngdn, H, R, v_w), (2, 0, 1, 3))
         lin_z = jnp.transpose(hf["lin_z"].reshape(ngdn, H, R, v_w), (2, 0, 1, 3))
         lin_b = jnp.transpose(hf["lin_b"].reshape(ngdn, H, R, vh), (2, 0, 1, 3))
@@ -340,8 +321,16 @@ def split_hf_weights(
         lin_in = jnp.concatenate([lin_q, lin_k, lin_v, lin_z, lin_b, lin_a], axis=-1)
         assert lin_in.shape[-1] == lay_gdn.NLI, (lin_in.shape[-1], lay_gdn.NLI)
 
-        lin_q_s = jnp.transpose(hf["lin_q_s"].reshape(ngdn, R, kq_w), (1, 0, 2))
-        lin_k_s = jnp.transpose(hf["lin_k_s"].reshape(ngdn, R, kq_w), (1, 0, 2))
+        lin_q_s = jnp.repeat(
+            jnp.transpose(hf["lin_q_s"].reshape(ngdn, kh_r, kq_w), (1, 0, 2)),
+            kh_rep,
+            axis=0,
+        )
+        lin_k_s = jnp.repeat(
+            jnp.transpose(hf["lin_k_s"].reshape(ngdn, kh_r, kq_w), (1, 0, 2)),
+            kh_rep,
+            axis=0,
+        )
         lin_v_s = jnp.transpose(hf["lin_v_s"].reshape(ngdn, R, v_w), (1, 0, 2))
         lin_z_s = jnp.transpose(hf["lin_z_s"].reshape(ngdn, R, v_w), (1, 0, 2))
         lin_b_s = jnp.transpose(hf["lin_b_s"].reshape(ngdn, R, vh), (1, 0, 2))
@@ -358,13 +347,22 @@ def split_hf_weights(
         lin_out = jnp.transpose(hf["lin_out"].reshape(ngdn, R, v_w, H), (1, 0, 2, 3))
         lin_out_s = jnp.broadcast_to(hf["lin_out_s"][None, ...], (R, ngdn, H))
 
-        c_full = hf["conv"]  # [ngdn, 4, 2*KH*KD + VH*VD]
+        c_full = hf["conv"]
         KH_KD = g.KH * KD
-        c_q = jnp.transpose(
-            c_full[:, :, :KH_KD].reshape(ngdn, 4, R, kq_w), (2, 0, 1, 3)
+        c_q = jnp.repeat(
+            jnp.transpose(
+                c_full[:, :, :KH_KD].reshape(ngdn, 4, kh_r, kq_w), (2, 0, 1, 3)
+            ),
+            kh_rep,
+            axis=0,
         )
-        c_k = jnp.transpose(
-            c_full[:, :, KH_KD : 2 * KH_KD].reshape(ngdn, 4, R, kq_w), (2, 0, 1, 3)
+        c_k = jnp.repeat(
+            jnp.transpose(
+                c_full[:, :, KH_KD : 2 * KH_KD].reshape(ngdn, 4, kh_r, kq_w),
+                (2, 0, 1, 3),
+            ),
+            kh_rep,
+            axis=0,
         )
         c_v = jnp.transpose(
             c_full[:, :, 2 * KH_KD :].reshape(ngdn, 4, R, v_w), (2, 0, 1, 3)
@@ -376,18 +374,16 @@ def split_hf_weights(
         alog = jnp.transpose(hf["alog"].reshape(ngdn, R, vh), (1, 0, 2))
         dtb = jnp.transpose(hf["dtb"].reshape(ngdn, R, vh), (1, 0, 2))
         gnorm = jnp.broadcast_to(hf["gnorm"][None, ...], (R, ngdn, VD))
-
-        for k, v in (
-            ("lin_in", lin_in),
-            ("lin_in_s", lin_in_s),
-            ("lin_out", lin_out),
-            ("lin_out_s", lin_out_s),
-            ("conv", conv),
-            ("alog", alog),
-            ("dtb", dtb),
-            ("gnorm", gnorm),
-        ):
-            logical_weights[k] = v
+        logical_weights.update(
+            lin_in=lin_in,
+            lin_in_s=lin_in_s,
+            lin_out=lin_out,
+            lin_out_s=lin_out_s,
+            conv=conv,
+            alog=alog,
+            dtb=dtb,
+            gnorm=gnorm,
+        )
 
     return logical_weights
 

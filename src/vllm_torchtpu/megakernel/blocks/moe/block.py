@@ -52,6 +52,10 @@ from .reference import moe_reference
 from .routing import route
 
 
+def _isr(g: Any, R: int) -> int:
+    return int(g.ISR(R))
+
+
 class MoEBlock(Block):
     """Sparse + shared MoE block with dynamic `epool` streaming and `PIPE`."""
 
@@ -159,7 +163,7 @@ class MoEBlock(Block):
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         moe_tp, e_slots = self._check_option_consistency(g)
         er = g.E // ex.R
-        isr = g.IS // ex.R
+        isr = _isr(g, ex.R)
         ir = g.I // ex.R if moe_tp else g.I
         ew = e_slots if e_slots > 0 else (g.E if moe_tp else er)
         layout_e = "stacked" if ex.stack_e else "per_layer"
@@ -198,7 +202,7 @@ class MoEBlock(Block):
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
         moe_tp, e_slots = self._check_option_consistency(g)
         er = g.E // ex.R
-        isr = g.IS // ex.R
+        isr = _isr(g, ex.R)
         fields = [
             SmallField("post_norm", g.H),
             SmallField("sh13_s", 2 * isr),
@@ -211,7 +215,7 @@ class MoEBlock(Block):
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
         moe_tp, _ = self._check_option_consistency(g)
-        isr = g.IS // ex.R
+        isr = _isr(g, ex.R)
         ir = g.I // ex.R if moe_tp else g.I
         return {"acc": max(g.H, g.E, 2 * isr, 2 * ir), "xb2": max(isr, ir)}
 
@@ -338,7 +342,10 @@ class MoEBlock(Block):
                 mid = rnd(rnd(jax.nn.silu(rnd(g13[:, :ISR]))) * rnd(g13[:, ISR:]))
                 scr["xb2"][:, :ISR] = mid.astype(BF16)
                 ysh = stream.dmatmul("sh2", scr["xb2"], H)
-                scr["part"][...] = ysh * ctx.sm(slot, "sh2_s") * scr["sg"][:, 0:1]
+                sh2_s = ctx.sm(slot, "sh2_s")
+                if mp.sh_rep > 1:
+                    sh2_s = sh2_s * (1.0 / mp.sh_rep)
+                scr["part"][...] = ysh * sh2_s * scr["sg"][:, 0:1]
             with sc("moe_experts"):
                 if PIPE:
                     experts_piped(m, l, n_hit)

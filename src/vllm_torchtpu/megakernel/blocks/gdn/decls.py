@@ -81,6 +81,7 @@ GDN_FIELD_ALIASES: dict[str, str] = {
 }
 
 GDN_GEOMETRY_METHODS: dict[str, Any] = {
+    "kh_rep": lambda g, R: max(1, R // int(g.KH)) if int(g.KH) > 0 else 1,
     "kh": lambda g, R: gdn_lin_in_layout(g, R).kh,
     "vh": lambda g, R: gdn_lin_in_layout(g, R).vh,
     "QKV": lambda g, R: gdn_lin_in_layout(g, R).QKV,

@@ -283,6 +283,7 @@ def pack_router_and_shared_layer(
 ) -> dict[str, torch.Tensor]:
     """Extract router (`bf16`), shared expert `sh13`/`sh2` (`fp8`), and scales."""
     isr = g.ISR(ex.R)
+    sh_rank = tp_rank // g.sh_rep(ex.R)
     w_gu = getattr(mlp, "_fused_gate_gu_fp8_weight", None)
     if w_gu is not None:
         s_gu = mlp._fused_gate_gu_fp8_scale.data.float().reshape(-1)
@@ -316,8 +317,8 @@ def pack_router_and_shared_layer(
 
         n_cols = int(w_gu.shape[1])
         if n_cols == g.E + 2 * g.IS:
-            g0 = g.E + tp_rank * isr
-            u0 = g.E + g.IS + tp_rank * isr
+            g0 = g.E + sh_rank * isr
+            u0 = g.E + g.IS + sh_rank * isr
             w_sh13 = torch.cat(
                 [w_gu.data[:, g0 : g0 + isr], w_gu.data[:, u0 : u0 + isr]], dim=1
             ).contiguous()
@@ -333,7 +334,7 @@ def pack_router_and_shared_layer(
             )
 
         if int(w_down.shape[0]) == g.IS:
-            r0 = tp_rank * isr
+            r0 = sh_rank * isr
             w_sh2 = w_down[r0 : r0 + isr, :].contiguous()
         elif int(w_down.shape[0]) == isr:
             w_sh2 = w_down.contiguous()
@@ -361,8 +362,8 @@ def pack_router_and_shared_layer(
         )
         w_gu_only, s_gu_only = extract_kn_fp8_weight(gu_proj, g.H, gu_cols)
         if gu_cols == 2 * g.IS:
-            g0 = tp_rank * isr
-            u0 = g.IS + tp_rank * isr
+            g0 = sh_rank * isr
+            u0 = g.IS + sh_rank * isr
             w_sh13 = torch.cat(
                 [w_gu_only[:, g0 : g0 + isr], w_gu_only[:, u0 : u0 + isr]], dim=1
             ).contiguous()
@@ -383,7 +384,7 @@ def pack_router_and_shared_layer(
         )
         w_down_only, s_down = extract_kn_fp8_weight(down_proj, down_rows, g.H)
         if down_rows == g.IS:
-            r0 = tp_rank * isr
+            r0 = sh_rank * isr
             w_sh2 = w_down_only[r0 : r0 + isr, :].contiguous()
         elif down_rows == isr:
             w_sh2 = w_down_only.contiguous()

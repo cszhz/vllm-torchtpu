@@ -37,30 +37,24 @@ def accept_states(g: Any, ex: ExecSpec, st: dict[str, Any], acc: Any) -> dict[st
 
 
 def random_logical_inputs(
-    key: jax.Array,
-    g: Any,
-    ex: ExecSpec,
+    key: jax.Array, g: Any, ex: ExecSpec
 ) -> tuple[jax.Array, jax.Array, dict[str, Any], dict[str, Any]]:
     """Generate small random logical inputs for `reference_step` and `pack_inputs`."""
     g.check(ex)
     R, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
     L, H, E, HD = g.L, g.H, g.E, g.HD
-    nh = g.nh(R)
+    nh, isr, ir, er, ew = g.nh(R), g.ISR(R), g.IR(R), g.ER(R), g.EW(R)
     lay_gdn = GDNBlock.lin_in_layout(g, ex)
     vh, KD, VD = lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
     qkv, z, nli = lay_gdn.QKV, lay_gdn.Z, lay_gdn.NLI
-    isr, ir, er, ew = g.ISR(R), g.IR(R), g.ER(R), g.EW(R)
     natt, ngdn = g.NATT, g.NGDN
-
-    keys = jax.random.split(key, 36)
-    it = iter(keys)
-
+    it = iter(jax.random.split(key, 36))
     base_pos = jnp.arange(1, NS + 1, dtype=I32) * min(16, ctx // 4)
-    if T == 1:
-        pos = base_pos
-    else:
-        pos = (base_pos[:, None] + jnp.arange(T, dtype=I32)[None, :]).reshape(B)
-
+    pos = (
+        base_pos
+        if T == 1
+        else (base_pos[:, None] + jnp.arange(T, dtype=I32)[None, :]).reshape(B)
+    )
     hidden = jax.random.normal(next(it), (B, H), dtype=BF16) * 0.1
 
     def rfp8(shape):
@@ -70,19 +64,20 @@ def random_logical_inputs(
         return jnp.abs(jax.random.normal(next(it), shape, dtype=F32)) * 0.02 + 0.01
 
     G, nkv, koff = g.G(R), g.NKV, nh * 2 * HD
-    att_q = rfp8((R, natt, H, koff))
-    att_kv = jnp.repeat(rfp8((nkv, natt, H, 2 * HD)), G, axis=0)
-    att_in = jnp.concatenate([att_q, att_kv], axis=-1)
-    att_q_s = rscale((R, natt, koff))
-    att_kv_s = jnp.repeat(rscale((nkv, natt, 2 * HD)), G, axis=0)
-    att_in_s = jnp.concatenate([att_q_s, att_kv_s], axis=-1)
+    att_in = jnp.concatenate(
+        [rfp8((R, natt, H, koff)), jnp.repeat(rfp8((nkv, natt, H, 2 * HD)), G, axis=0)],
+        axis=-1,
+    )
+    att_in_s = jnp.concatenate(
+        [rscale((R, natt, koff)), jnp.repeat(rscale((nkv, natt, 2 * HD)), G, axis=0)],
+        axis=-1,
+    )
 
     kn = jnp.repeat(
         jax.random.normal(next(it), (nkv, natt, HD), dtype=F32) * 0.05, G, axis=0
     )
     sh_gate = jnp.broadcast_to(
-        (jax.random.normal(next(it), (L, H), dtype=F32) * 0.1)[None, :, :],
-        (R, L, H),
+        (jax.random.normal(next(it), (L, H), dtype=F32) * 0.1)[None, :, :], (R, L, H)
     )
 
     e13 = rfp8((R, L, ew, H, 2 * ir))
@@ -111,6 +106,11 @@ def random_logical_inputs(
         "e2": e2,
         "e2_s": e2_s,
     }
+    sh_rep = g.sh_rep(R)
+    if sh_rep > 1:
+        for k in ("sh13", "sh13_s", "sh2"):
+            w_k = logical_weights[k]
+            logical_weights[k] = jnp.repeat(w_k[::sh_rep], sh_rep, axis=0)
     if not g.moe_tp and ew > er and R > 1:
         e_cores = default_eplb_cores(g, R)
         for lyr in range(L):
@@ -122,28 +122,23 @@ def random_logical_inputs(
                     e13_s = e13_s.at[r1, lyr, slot].set(e13_s[r0, lyr, s0])
                     e2 = e2.at[r1, lyr, slot].set(e2[r0, lyr, s0])
                     e2_s = e2_s.at[r1, lyr, slot].set(e2_s[r0, lyr, s0])
-        logical_weights["e13"] = e13
-        logical_weights["e13_s"] = e13_s
-        logical_weights["e2"] = e2
-        logical_weights["e2_s"] = e2_s
-        logical_weights["e_cores"] = e_cores
-        logical_weights["ecopy"] = encode_eplb_ecopy(g, R, e_cores)
+        ecopy = encode_eplb_ecopy(g, R, e_cores)
+        logical_weights.update(
+            e13=e13, e13_s=e13_s, e2=e2, e2_s=e2_s, e_cores=e_cores, ecopy=ecopy
+        )
 
     if ngdn > 0:
+        r_vh = jax.random.normal(next(it), (R, ngdn, vh), dtype=F32) * 0.1
+        r_vd = jax.random.normal(next(it), (R, ngdn, VD), dtype=F32) * 0.05
         logical_weights.update(
-            {
-                "lin_in": rfp8((R, ngdn, H, nli)),
-                "lin_in_s": rscale((R, ngdn, nli)),
-                "lin_out": rfp8((R, ngdn, z, H)),
-                "lin_out_s": rscale((R, ngdn, H)),
-                "conv": jax.random.normal(next(it), (R, ngdn, 4 * qkv), dtype=F32)
-                * 0.05,
-                "alog": jax.random.normal(next(it), (R, ngdn, vh), dtype=F32) * 0.1
-                - 1.0,
-                "dtb": jax.random.normal(next(it), (R, ngdn, vh), dtype=F32) * 0.1,
-                "gnorm": jnp.ones((R, ngdn, VD), dtype=F32)
-                + jax.random.normal(next(it), (R, ngdn, VD), dtype=F32) * 0.05,
-            }
+            lin_in=rfp8((R, ngdn, H, nli)),
+            lin_in_s=rscale((R, ngdn, nli)),
+            lin_out=rfp8((R, ngdn, z, H)),
+            lin_out_s=rscale((R, ngdn, H)),
+            conv=jax.random.normal(next(it), (R, ngdn, 4 * qkv), dtype=F32) * 0.05,
+            alog=r_vh - 1.0,
+            dtb=jax.random.normal(next(it), (R, ngdn, vh), dtype=F32) * 0.1,
+            gnorm=jnp.ones((R, ngdn, VD), dtype=F32) + r_vd,
         )
 
     kc_nkv = jax.random.normal(next(it), (nkv, natt, NS, ctx, HD), dtype=BF16) * 0.1
@@ -159,6 +154,22 @@ def random_logical_inputs(
         logical_states["rec"] = (
             jax.random.normal(next(it), (R, ngdn, NS, vh, KD, VD), dtype=BF16) * 0.05
         )
+        kh_rep = g.kh_rep(R)
+        if kh_rep > 1:
+            qk_cols = 2 * lay_gdn.kh * KD
+            for k in ("lin_in", "lin_in_s"):
+                arr = logical_weights[k]
+                rep_qk = jnp.repeat(arr[::kh_rep, ..., :qk_cols], kh_rep, axis=0)
+                logical_weights[k] = arr.at[..., :qk_cols].set(rep_qk)
+            cw = logical_weights["conv"].reshape(R, ngdn, 4, qkv)
+            cw_qk = jnp.repeat(cw[::kh_rep, ..., :qk_cols], kh_rep, axis=0)
+            logical_weights["conv"] = (
+                cw.at[..., :qk_cols].set(cw_qk).reshape(R, ngdn, 4 * qkv)
+            )
+            cs = logical_states["conv"]
+            logical_states["conv"] = cs.at[..., :qk_cols].set(
+                jnp.repeat(cs[::kh_rep, ..., :qk_cols], kh_rep, axis=0)
+            )
     return pos, hidden, logical_weights, logical_states
 
 
@@ -190,7 +201,6 @@ def pack_inputs(
         assert n_in == exp_n, (kind, n_in, exp_n)
         return arr.reshape((*lead, nt_, tk_, n_in))
 
-    # Pack smalls [R, L, 1, S]
     lay = p.smalls_layout
     S = p.smalls_width
     sm = jnp.zeros((R, L, 1, S), dtype=F32)
@@ -220,36 +230,29 @@ def pack_inputs(
     def branch_slice(arr: jax.Array, lyr: int, ord_idx: int) -> jax.Array:
         return arr[:, lyr] if arr.shape[1] == L else arr[:, ord_idx]
 
+    lw = logical_weights
     for k in ("in_norm", "post_norm", "sh_gate", "sh13_s", "sh2_s"):
-        set_sm_all(k, logical_weights[k])
-    if "ecopy" in logical_weights:
-        set_sm_all("ecopy", logical_weights["ecopy"])
-    elif "e_cores" in logical_weights:
-        set_sm_all("ecopy", encode_eplb_ecopy(g, R, logical_weights["e_cores"]))
+        set_sm_all(k, lw[k])
+    if "ecopy" in lw:
+        set_sm_all("ecopy", lw["ecopy"])
+    elif "e_cores" in lw:
+        set_sm_all("ecopy", encode_eplb_ecopy(g, R, lw["e_cores"]))
 
     for lyr in range(L):
         if (lyr + 1) % g.att_every == 0:
             a = lyr // g.att_every
-            set_sm_layer(lyr, "in_s", branch_slice(logical_weights["att_in_s"], lyr, a))
-            set_sm_layer(
-                lyr, "out_s", branch_slice(logical_weights["att_out_s"], lyr, a)
-            )
-            set_sm_layer(lyr, "qn", branch_slice(logical_weights["qn"], lyr, a))
-            set_sm_layer(lyr, "kn", branch_slice(logical_weights["kn"], lyr, a))
+            set_sm_layer(lyr, "in_s", branch_slice(lw["att_in_s"], lyr, a))
+            set_sm_layer(lyr, "out_s", branch_slice(lw["att_out_s"], lyr, a))
+            for k in ("qn", "kn"):
+                set_sm_layer(lyr, k, branch_slice(lw[k], lyr, a))
         else:
-            o_gdn = lyr - (lyr + 1) // g.att_every
-            set_sm_layer(
-                lyr, "in_s", branch_slice(logical_weights["lin_in_s"], lyr, o_gdn)
-            )
-            set_sm_layer(
-                lyr, "out_s", branch_slice(logical_weights["lin_out_s"], lyr, o_gdn)
-            )
+            o = lyr - (lyr + 1) // g.att_every
+            set_sm_layer(lyr, "in_s", branch_slice(lw["lin_in_s"], lyr, o))
+            set_sm_layer(lyr, "out_s", branch_slice(lw["lin_out_s"], lyr, o))
             for k in ("conv", "alog", "dtb", "gnorm"):
-                set_sm_layer(lyr, k, branch_slice(logical_weights[k], lyr, o_gdn))
+                set_sm_layer(lyr, k, branch_slice(lw[k], lyr, o))
 
-    router_rep = jnp.broadcast_to(
-        logical_weights["router"][None, ...], (R, L, g.H, g.E)
-    )
+    router_rep = jnp.broadcast_to(lw["router"][None, ...], (R, L, g.H, g.E))
 
     def _pack_expert(raw_e: Any, kind: str) -> Any:
         if ex.stack_e:
@@ -270,29 +273,25 @@ def pack_inputs(
         logical_weights["final_norm"][None, None, :], (R, 1, g.H)
     ).astype(F32)
 
-    weights_mk: dict[str, Any] = {}
+    weights_mk: dict[str, Any] = {
+        "att_in": tile_w(logical_weights["att_in"], "att_in"),
+        "att_out": tile_w(logical_weights["att_out"], "att_out"),
+        "router": tile_w(router_rep, "router"),
+        "sh13": tile_w(logical_weights["sh13"], "sh13"),
+        "sh2": tile_w(logical_weights["sh2"], "sh2"),
+        "e13": e13_mk,
+        "e2": e2_mk,
+        "es": es_mk,
+        "smalls": sm,
+        "final_norm": fn_mk,
+    }
     if ngdn > 0:
         weights_mk["lin_in"] = tile_w(logical_weights["lin_in"], "lin_in")
         weights_mk["lin_out"] = tile_w(logical_weights["lin_out"], "lin_out")
-    weights_mk.update(
-        {
-            "att_in": tile_w(logical_weights["att_in"], "att_in"),
-            "att_out": tile_w(logical_weights["att_out"], "att_out"),
-            "router": tile_w(router_rep, "router"),
-            "sh13": tile_w(logical_weights["sh13"], "sh13"),
-            "sh2": tile_w(logical_weights["sh2"], "sh2"),
-            "e13": e13_mk,
-            "e2": e2_mk,
-            "es": es_mk,
-            "smalls": sm,
-            "final_norm": fn_mk,
-        }
-    )
 
     states_mk: dict[str, Any] = {}
     if ngdn > 0 and "conv" in logical_states and "rec" in logical_states:
-        conv_l = logical_states["conv"]
-        rec_l = logical_states["rec"]
+        conv_l, rec_l = logical_states["conv"], logical_states["rec"]
         qkv, vh = g.QKV(R), g.vh(R)
         if conv_l.ndim == 5 and conv_l.shape[3] == 3:
             if T == 1:
@@ -357,22 +356,17 @@ def pack_inputs(
         states_mk["vc"] = kernel.fold(logical_states["vc"])
 
     if mesh is not None:
-        rep = NamedSharding(mesh, P())
-        tp = NamedSharding(mesh, P("tp"))
+        rep, tp = NamedSharding(mesh, P()), NamedSharding(mesh, P("tp"))
         pos = jax.device_put(pos, rep)
         hid_mk = jax.device_put(hid_mk, tp)
-        weights_mk = {
-            k: tuple(jax.device_put(x, tp) for x in v)
-            if isinstance(v, tuple)
-            else jax.device_put(v, tp)
-            for k, v in weights_mk.items()
-        }
-        states_mk = {
-            k: tuple(jax.device_put(x, tp) for x in v)
-            if isinstance(v, tuple)
-            else jax.device_put(v, tp)
-            for k, v in states_mk.items()
-        }
+
+        def _put_tp(v: Any) -> Any:
+            if isinstance(v, tuple):
+                return tuple(jax.device_put(x, tp) for x in v)
+            return jax.device_put(v, tp)
+
+        weights_mk = {k: _put_tp(v) for k, v in weights_mk.items()}
+        states_mk = {k: _put_tp(v) for k, v in states_mk.items()}
 
     return pos, hid_mk, weights_mk, states_mk
 

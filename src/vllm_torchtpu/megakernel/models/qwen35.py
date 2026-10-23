@@ -65,9 +65,9 @@ class Qwen35Geometry(ModelGeometry):
         base = dataclasses.asdict(FULL) if "FULL" in globals() else {}
         super().__init__(**(base | overrides))
 
-    def to_model_spec(self) -> ModelSpec:
+    def to_model_spec(self, R: int = 8) -> ModelSpec:
         """Convert this geometry into its declarative `ModelSpec`."""
-        return qwen35_spec(self)
+        return qwen35_spec(self, R=R)
 
 
 @register_model(
@@ -144,14 +144,19 @@ TINY_EP = dataclasses.replace(TINY, moe_tp=False)
 reference_step = Qwen35.reference_step
 
 
-def qwen35_spec(g: Qwen35Geometry = FULL, gdn_block: Block | None = None) -> ModelSpec:
+def qwen35_spec(
+    g: Qwen35Geometry = FULL,
+    gdn_block: Block | None = None,
+    *,
+    R: int = 8,
+) -> ModelSpec:
     """Construct the declarative `ModelSpec` for Qwen3.5."""
-    return Qwen35.to_model_spec(g, gdn_block=gdn_block)
+    return Qwen35.to_model_spec(g, gdn_block=gdn_block, R=R)
 
 
 def build(g: Qwen35Geometry, ex: ExecSpec, *, gdn_block: Block | None = None):
     """Build Qwen3.5 megakernel `(call, info)` via the generic `kernel.build` engine."""
-    return kernel.build(qwen35_spec(g, gdn_block=gdn_block), ex)
+    return kernel.build(qwen35_spec(g, gdn_block=gdn_block, R=ex.R), ex)
 
 
 def make_step(
@@ -163,7 +168,7 @@ def make_step(
     donate_states: bool = False,
 ):
     """Build Qwen3.5 `jax.jit` + `shard_map` step `(step, info)`."""
-    spec = qwen35_spec(g, gdn_block=gdn_block)
+    spec = qwen35_spec(g, gdn_block=gdn_block, R=ex.R)
     return kernel.make_step(mesh, spec, ex, donate_states=donate_states)
 
 
@@ -179,7 +184,7 @@ def make_pooled_step(
     min_b_hi: int = 56,
 ):
     """Build Qwen3.5 paged-pool `shard_map` step (`PallasWriter`)."""
-    spec = qwen35_spec(g, gdn_block=gdn_block)
+    spec = qwen35_spec(g, gdn_block=gdn_block, R=ex.R)
     return cache.make_pooled_step(
         mesh,
         spec,
