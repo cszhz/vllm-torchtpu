@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -187,6 +188,24 @@ def _pack_routing_exchange(pairs, scale_bits, counts, layout):
         ]
     parts.append(counts)
     return jnp.concatenate([p for p in parts if p.size])
+
+
+def _exchange_routing(packed, ax, ep, width):
+    """Every shard's routing payload on every shard, as ``[ep, width]``.
+
+    The payload is a few KB per shard, so the exchange is latency-bound, not
+    bandwidth-bound. ``MOE_ROUTING_EXCHANGE=all_gather`` (default) is the tiled
+    all-gather, which XLA runs as a ring: ep - 1 dependent hops.
+    ``all_to_all`` sends each shard's payload straight to every shard in one
+    exchange instead: each shard puts one copy per destination on the wire,
+    which is ep x a few KB. The chunks are equal, so unlike a ragged
+    all-to-all there are no sizes or offsets to exchange first. Same result.
+    """
+    flat = packed.reshape(-1)
+    if envs.MOE_ROUTING_EXCHANGE == "all_to_all":
+        operand = jnp.broadcast_to(flat.reshape(1, width), (ep, width))
+        return lax.all_to_all(operand, ax, split_axis=0, concat_axis=0, tiled=True)
+    return lax.all_gather(flat, ax, axis=0, tiled=True).reshape(ep, width)
 
 
 def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total):
@@ -803,9 +822,7 @@ def fused_ep_moe_v2(
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l
         )
-        exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
-            ep, layout[-1]
-        )
+        exchange = _exchange_routing(packed, ax, ep, layout[-1])
         return compute_local(
             q_g,
             exchange,
@@ -847,9 +864,7 @@ def fused_ep_moe_v2(
         )
         topk_weights = topk_weights[:t_local]
         packed = packed[:, : layout[-1]]
-        exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
-            ep, layout[-1]
-        )
+        exchange = _exchange_routing(packed, ax, ep, layout[-1])
         local_blocks = packed[0, : t_local * topk].reshape(
             t_local * topk // block, block
         )
@@ -946,6 +961,7 @@ def fused_ep_moe_v2(
         float(routed_scaling_factor),
         stage,
         gather_positions,
+        envs.MOE_ROUTING_EXCHANGE,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),

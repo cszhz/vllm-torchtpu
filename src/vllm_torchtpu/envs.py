@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
+    MOE_ROUTING_EXCHANGE: str = "all_gather"
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -753,6 +754,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # Collective that exchanges the fused EP MoE's per-layer routing payload
+    # (kernels/fused_moe/v2/layer.py:_exchange_routing): "all_gather" (a ring)
+    # or "all_to_all" (one direct exchange; same result).
+    "MOE_ROUTING_EXCHANGE": env_with_choices(
+        "MOE_ROUTING_EXCHANGE", "all_gather", ["all_gather", "all_to_all"]
+    ),
     # Keep the fused EP MoE mesh in EP-rank order and do the activation
     # all-gather outside the kernel's program, over a process group in
     # ascending device-id order, so the SparseCore gather gets its
