@@ -35,6 +35,7 @@ def _fused_kernel(
     fn_lo_ref,
     sc_ref,
     hb_ref,
+    nw_ref,
     newres_ref,
     mixes_ref,
     sqrsum_ref,
@@ -46,6 +47,7 @@ def _fused_kernel(
     rms_eps,
     hc_pre_eps,
     routed_scale,
+    norm_eps,
 ):
     """One token block: recombine, store once, 3-pass GEMM, collapse.
 
@@ -53,6 +55,10 @@ def _fused_kernel(
     routed experts' unscaled sum and the MoE output is formed here, in f32
     with one rounding, as XLA forms it when the add fuses into the shared
     expert's matmul epilogue.
+
+    With ``nw_ref`` (an RMSNorm weight), the layer input is stored already
+    normalized, as the sublayer's RMSNorm would compute it from the stored
+    bf16 value (``utils.xla_row_sum`` keeps its sum in XLA's order).
     """
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
@@ -110,7 +116,12 @@ def _fused_kernel(
     lay = pre_mix[:, 0:1] * gf[:, :h]
     for i in range(1, m):
         lay = lay + pre_mix[:, i : i + 1] * gf[:, i * h : (i + 1) * h]
-    layer_ref[...] = lay.astype(jnp.bfloat16)
+    lay_bf = lay.astype(jnp.bfloat16)
+    if nw_ref is not None:
+        lf = lay_bf.astype(jnp.float32)
+        inv_rms = jax.lax.rsqrt(utils.xla_row_sum(lf * lf) * (1.0 / h) + norm_eps)
+        lay_bf = ((lf * inv_rms) * nw_ref[...].astype(jnp.float32)).astype(jnp.bfloat16)
+    layer_ref[...] = lay_bf
 
 
 @functools.partial(
@@ -119,6 +130,7 @@ def _fused_kernel(
         "rms_eps",
         "hc_pre_eps",
         "routed_scale",
+        "norm_eps",
         "token_block_size",
         "gemm_precision",
         "vmem_limit_bytes",
@@ -137,6 +149,8 @@ def fused_post_pre_mixes(
     *,
     shared2d: jax.Array | None = None,
     routed_scale: float = 1.0,
+    norm_weight: jax.Array | None = None,
+    norm_eps: float | None = None,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
@@ -163,6 +177,8 @@ def fused_post_pre_mixes(
             output; the sublayer output is then
             bf16(shared2d + x2d * routed_scale).
         routed_scale: static; the MoE's routed scaling factor.
+        norm_weight: optional (hidden_size,) bfloat16 RMSNorm weight; layer2d
+            is then RMSNorm(layer input) with it and static ``norm_eps``.
         token_block_size: tokens per grid step. Default 32 keeps the
             worst-case VMEM footprint (f32 old streams + bf16 blocks +
             the three resident bf16 fn chunks) near 12 MB at DeepSeek-V4
@@ -176,7 +192,8 @@ def fused_post_pre_mixes(
         mixes: (num_tokens, hc_mult3), float32 — raw, unscaled, for the
             XLA gates.
         sqrsum: (num_tokens, 1), float32.
-        layer2d: (num_tokens, hidden_size), bfloat16.
+        layer2d: (num_tokens, hidden_size), bfloat16, normalized when
+            ``norm_weight`` is given.
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
     assert res2d.dtype == jnp.bfloat16, res2d.dtype
@@ -209,6 +226,12 @@ def fused_post_pre_mixes(
     fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
+    norm_inputs, norm_specs = [], []
+    if norm_weight is not None:
+        assert norm_weight.shape == (hidden_size,), norm_weight.shape
+        assert norm_eps is not None
+        norm_inputs.append(norm_weight.reshape(1, hidden_size))
+        norm_specs.append(pl.BlockSpec((1, hidden_size), lambda i: (0, 0)))
 
     compiler_params = pltpu.CompilerParams(
         dimension_semantics=("parallel",),
@@ -225,9 +248,11 @@ def fused_post_pre_mixes(
         rms_eps=rms_eps,
         hc_pre_eps=hc_pre_eps,
         routed_scale=routed_scale,
+        norm_eps=norm_eps,
     )
+    passed = [True, shared2d is not None] + [True] * 8 + [norm_weight is not None]
     new_res, mixes, sqrsum, layer2d = pl.pallas_call(
-        kernel if shared2d is not None else utils.without_shared(kernel),
+        utils.with_absent_refs(kernel, passed + [True] * 4),
         grid=(padded_tokens // tb,),
         in_specs=[
             *x_specs,
@@ -239,6 +264,7 @@ def fused_post_pre_mixes(
             resident,
             pl.BlockSpec((1, 3), lambda i: (0, 0)),
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
+            *norm_specs,
         ],
         out_specs=[
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
@@ -253,7 +279,7 @@ def fused_post_pre_mixes(
             jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
         ],
         compiler_params=compiler_params,
-    )(*x_inputs, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
+    )(*x_inputs, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d, *norm_inputs)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],
@@ -277,6 +303,8 @@ def mhc_fused_post_pre(
     *,
     shared: jax.Array | None = None,
     routed_scale: float = 1.0,
+    norm_weight: jax.Array | None = None,
+    norm_eps: float | None = None,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
@@ -287,6 +315,8 @@ def mhc_fused_post_pre(
     its hc_mult streams are copies of one stream (the chain's first seam).
     With ``shared`` (f32, x's shape), x is the routed experts' unscaled sum
     and the MoE output bf16(shared + x * routed_scale) is formed in-kernel.
+    With ``norm_weight``, layer_input_cur comes back through the next
+    sublayer's RMSNorm (weight ``norm_weight``, epsilon ``norm_eps``).
     Returns (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur).
     """
     assert residual.dtype == jnp.bfloat16
@@ -312,6 +342,8 @@ def mhc_fused_post_pre(
         hc_pre_eps,
         shared2d=None if shared is None else shared.reshape(-1, hidden_size),
         routed_scale=routed_scale,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
         token_block_size=token_block_size,
         gemm_precision=gemm_precision,
         vmem_limit_bytes=vmem_limit_bytes,

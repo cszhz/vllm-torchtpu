@@ -101,6 +101,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+        # Applied inside the attention->MoE seam kernel, with the same eps.
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
@@ -226,10 +227,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self.attn_norm(x)
         x = self.attn(positions, x)
 
+        # The seam hands the MoE its input through ffn_norm already.
         fused = (
-            self.mhc_ops.fused_from_single_stream
+            self.mhc_ops.fused_normed_from_single_stream
             if residual.dim() == x.dim()
-            else self.mhc_ops.fused
+            else self.mhc_ops.fused_normed
         )
         residual, post_mix, res_mix, x = fused(
             x,
@@ -239,8 +241,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
+            self.ffn_norm.weight,
         )
-        x = self.ffn_norm(x)
         routed, shared = self.ffn.forward_parts(x, input_ids)
         if shared is None:
             return routed, residual, post_mix, res_mix

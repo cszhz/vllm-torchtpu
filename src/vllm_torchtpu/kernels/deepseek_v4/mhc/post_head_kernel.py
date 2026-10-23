@@ -188,7 +188,7 @@ def mhc_post_head_2d(
         routed_scale=routed_scale,
     )
     if shared is None:
-        kernel = utils.without_shared(kernel)
+        kernel = utils.with_absent_refs(kernel, [True, False] + [True] * 7)
     out = pl.pallas_call(
         kernel,
         grid=(padded_tokens // tb,),
