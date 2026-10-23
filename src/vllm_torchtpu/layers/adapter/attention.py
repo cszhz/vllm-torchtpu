@@ -3086,7 +3086,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         chunked_oproj = (
                             envs.TPU_DCP_MERGE_CHUNKED_OPROJ_AR
                             and getattr(layer, "oproj_per_chunk", False)
-                            and rows_ >= envs.TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MIN_TOKENS
+                            # `T > edge`, never `T >= min` (envs.bucket_gate_edge):
+                            # with MIN = MAX both would hold at one bucket only
+                            # and pin the traced token count to it.
+                            and rows_
+                            > envs.bucket_gate_edge(
+                                envs.TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MIN_TOKENS
+                            )
                             and (
                                 envs.TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MAX_TOKENS <= 0
                                 or rows_
