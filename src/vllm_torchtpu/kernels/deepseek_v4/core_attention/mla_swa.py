@@ -1186,6 +1186,13 @@ class SwaDecodeWindowRefs(NamedTuple):
     def bkv_sz(self) -> int:
         return self.bkv_p * self.logical_page_size
 
+    @property
+    def num_chunks(self) -> int:
+        """Pages a decode token's window keys can span."""
+        lps = self.logical_page_size
+        max_keys = min(self.sliding_window - 1, self.bkv_sz)
+        return min(self.bkv_p + 1, cdiv(lps - 1 + max_keys, lps))
+
     def _seq_geometry(self, seq_idx, valid):
         max_num_seqs = self.kv_lens_ref.shape[0]
         seq_idx_clamped = jnp.minimum(seq_idx, max_num_seqs - 1)
@@ -1218,7 +1225,7 @@ class SwaDecodeWindowRefs(NamedTuple):
         )
 
         vmem_off = 0
-        for i in range(self.bkv_p + 1):
+        for i in range(self.num_chunks):
             avail = lps - page_off
             chunk_sz = jnp.where(
                 valid,
