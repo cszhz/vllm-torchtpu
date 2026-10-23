@@ -118,6 +118,8 @@ if TYPE_CHECKING:
     MOE_EXPERT_COUNT_TAP_DIR: str = ""
     MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
     MOE_FUSED_EP_SHARED_BEFORE_KERNEL: bool = False
+    MOE_FUSED_EP_SHARED_IN_OP: bool = False
+    MOE_FUSED_EP_SHARED_RS_MIN_ROWS: int = 1024
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_DSV4_PAIR_SWAP: bool = False
@@ -895,6 +897,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Finish the shared expert before the fused EP kernel starts, so it runs
     # while the kernel's token all-gather is in flight instead of after the
     # kernel; see VllmMoERunner._apply_quant_method.
+    # With MOE_FUSED_EP_SHARED_BEFORE_KERNEL: the fused EP op takes the shared
+    # expert's TP-partial output and returns shared + routed, reduced. From
+    # MOE_FUSED_EP_SHARED_RS_MIN_ROWS rows per TP replica up, the shared partial
+    # is reduce-scattered onto each core's own rows before the routed rows'
+    # replica all-gather (one reduce-scatter instead of an all-reduce); below,
+    # it is all-reduced in the op (the runner's own arithmetic).
+    "MOE_FUSED_EP_SHARED_IN_OP": env_bool("MOE_FUSED_EP_SHARED_IN_OP"),
+    "MOE_FUSED_EP_SHARED_RS_MIN_ROWS": env_nonnegative_int(
+        "MOE_FUSED_EP_SHARED_RS_MIN_ROWS", 1024
+    ),
     "MOE_FUSED_EP_SHARED_BEFORE_KERNEL": env_bool("MOE_FUSED_EP_SHARED_BEFORE_KERNEL"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its

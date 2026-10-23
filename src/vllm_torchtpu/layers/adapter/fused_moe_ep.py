@@ -119,6 +119,10 @@ _RANK_BUFFER: Any = None
 # (`Fp8Config.get_quant_method`), so this is per-layer state without a registry
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
+# Set on a layer whose op returns shared + routed (MOE_FUSED_EP_SHARED_IN_OP).
+SHARED_IN_OP_ATTR = "_tpu_fused_ep_shared_in_op"
+# The runner's routed_scaling_factor, stashed on the routed-experts layer.
+RUNNER_ROUTED_SCALE_ATTR = "_tpu_runner_routed_scale"
 
 
 def _squeeze_channel_scale(
@@ -184,7 +188,8 @@ def _build_op(
     sorted_gather=None,
     has_expert_slot=False,
     has_order_after=False,
-    scales_expert_second_minor=False,    merge_exchange=False,
+    scales_expert_second_minor=False,
+    merge_exchange=False,
     onehot_scatter=False,
     pallas_plan=False,
     decode_combine=False,
@@ -193,6 +198,9 @@ def _build_op(
     lane_quant=False,
     oneshot_gather=False,
     combine_restore=False,
+    shared_in_op=False,
+    shared_out_scale=1.0,
+    shared_rs_min_rows=0,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -227,6 +235,9 @@ def _build_op(
         lane_quant,
         oneshot_gather,
         combine_restore,
+        shared_in_op,
+        shared_out_scale,
+        shared_rs_min_rows,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -249,6 +260,15 @@ def _build_op(
         lane_quant=lane_quant,
         oneshot_gather=oneshot_gather,
         combine_restore=combine_restore,
+    )
+    shared_kw = (
+        dict(
+            shared_in_op=True,
+            shared_out_scale=shared_out_scale,
+            shared_rs_min_rows=shared_rs_min_rows,
+        )
+        if shared_in_op
+        else {}
     )
 
     # Any: the layer, route or compute result depending on bias_kw's stage;
@@ -279,6 +299,7 @@ def _build_op(
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
             scales_expert_second_minor=scales_expert_second_minor,
+            **shared_kw,
             **bias_kw,
             **routing_kw,
         )
@@ -1032,6 +1053,15 @@ def prebuild_fused_moe_ep(
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
     has_expert_slot = placed is not None
     has_order_after = envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL
+    # The shared expert's partial rides the ordering operand into the op, which
+    # returns shared + routed reduced; the runner's routed scale moves in with
+    # it (VllmMoERunner stashes it on the layer and skips its own scaling).
+    shared_in_op = (
+        has_order_after
+        and envs.MOE_FUSED_EP_SHARED_IN_OP
+        and hasattr(layer, RUNNER_ROUTED_SCALE_ATTR)  # the runner has a shared expert
+    )
+    shared_out_scale = float(getattr(layer, RUNNER_ROUTED_SCALE_ATTR, 1.0))
     if (has_expert_slot or has_order_after) and sorted_gather is not None:
         raise ValueError(
             f"{layer.layer_name}: TPU_EXPERT_PLACEMENT and "
@@ -1065,7 +1095,18 @@ def prebuild_fused_moe_ep(
         lane_quant=envs.MOE_FUSED_EP_V2_LANE_QUANT,
         oneshot_gather=envs.MOE_FUSED_EP_V2_ONESHOT_GATHER,
         combine_restore=envs.MOE_FUSED_EP_V2_COMBINE_RESTORE,
+        shared_in_op=shared_in_op,
+        shared_out_scale=shared_out_scale,
+        shared_rs_min_rows=envs.MOE_FUSED_EP_SHARED_RS_MIN_ROWS,
     )
+    if shared_in_op:
+        object.__setattr__(layer, SHARED_IN_OP_ATTR, True)
+        logger.info_once(
+            "Fused EP MoE reduces the shared expert in its op | out_scale=%s "
+            "rs_min_rows=%d",
+            shared_out_scale,
+            envs.MOE_FUSED_EP_SHARED_RS_MIN_ROWS,
+        )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "

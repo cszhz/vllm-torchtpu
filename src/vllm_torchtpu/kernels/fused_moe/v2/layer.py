@@ -402,6 +402,9 @@ def fused_ep_moe_v2(
     lane_quant=False,
     oneshot_gather=False,
     combine_restore=False,
+    shared_in_op=False,
+    shared_out_scale=1.0,
+    shared_rs_min_rows=0,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -709,6 +712,9 @@ def fused_ep_moe_v2(
         and decode_combine
         and pallas_restore
         and len(token_layout.groups[0]) > 1
+        # The fused combine + restore returns restored rows only; the in-op
+        # shared reduction needs the combined rows first.
+        and not shared_in_op
     )
     decode_glue = (
         merge_exchange
@@ -719,6 +725,17 @@ def fused_ep_moe_v2(
         or fused_select
         or lane_quant
     )
+    # shared_in_op: order_after is the shared expert's TP-partial output
+    # [tokens, hidden] (a row-parallel down projection that was not reduced),
+    # and the op returns shared + shared_out_scale * routed, fully reduced over
+    # each token replica group (the TP group). From shared_rs_min_rows rows per
+    # replica up, the shared partial is reduce-scattered onto the rows this
+    # shard owns and added before the replica all-gather that restores the
+    # routed rows, so one reduce-scatter replaces the shared all-reduce; below,
+    # it is all-reduced and added after the restore, which is what the runner
+    # computes with this off.
+    if shared_in_op and not has_order_after:
+        raise ValueError("shared_in_op needs the shared partial as order_after")
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -912,6 +929,7 @@ def fused_ep_moe_v2(
         w2s_l,
         bias_it,
         out_dtype,
+        shared_l=None,
     ):
         """Plan, kernel and combine over the gathered rows and payload."""
         me = rank_l[0, 0]
@@ -1072,7 +1090,42 @@ def fused_ep_moe_v2(
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
-        return token_layout.restore(combined, ax)
+        if shared_l is None:
+            return token_layout.restore(combined, ax)
+        return _add_shared(combined, shared_l)
+
+    def _add_shared(combined, shared_l, restore=None):
+        """shared (reduced over the replica group) + scale * routed, restored.
+
+        restore: the replica restore to apply (default token_layout.restore);
+        decode_fn passes its Pallas restore when that is in effect.
+        """
+        if restore is None:
+            def restore(rows):
+                return token_layout.restore(rows, ax)
+        width = len(token_layout.groups[0])
+        groups = [list(g) for g in token_layout.groups]
+        scale = jnp.asarray(shared_out_scale, combined.dtype)
+        if shared_out_scale != 1.0:
+            combined = combined * scale
+        shared_l = shared_l.astype(combined.dtype)
+        if width > 1 and token_layout.input_rows >= max(shared_rs_min_rows, 1) and (
+            shared_rs_min_rows > 0
+        ):
+            pad = token_layout.local_rows * width - token_layout.input_rows
+            shared_p = jnp.pad(shared_l, ((0, pad), (0, 0)))
+            shared_own = lax.psum_scatter(
+                shared_p,
+                ax,
+                scatter_dimension=0,
+                axis_index_groups=groups,
+                tiled=True,
+            )
+            return restore(shared_own + combined)
+        full = restore(combined)
+        if width > 1:
+            shared_l = lax.psum(shared_l, ax, axis_index_groups=groups)
+        return shared_l + full
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
@@ -1082,7 +1135,7 @@ def fused_ep_moe_v2(
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
         q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
         if order_after_l is not None:
-            q_g, _ = lax.optimization_barrier((q_g, order_after_l))
+            q_g, order_after_l = lax.optimization_barrier((q_g, order_after_l))
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, slot_l, row_scale_l, rank_l[0, 0]
         )
@@ -1103,6 +1156,7 @@ def fused_ep_moe_v2(
             w2s_l,
             bias_it,
             x_l.dtype,
+            shared_l=order_after_l if shared_in_op else None,
         )
 
     def decode_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -1135,7 +1189,7 @@ def fused_ep_moe_v2(
         if not merge_exchange:
             q_g = lax.all_gather(q_rows, ax, axis=0, tiled=True)
             if order_after_l is not None:
-                q_g, _ = lax.optimization_barrier((q_g, order_after_l))
+                q_g, order_after_l = lax.optimization_barrier((q_g, order_after_l))
 
         scores = _apply_scoring_fn(gate_l, scoring_fn)
         select_rows = MAX_ROUTING_BLOCK
@@ -1245,7 +1299,7 @@ def fused_ep_moe_v2(
                 gather = None
             q_g, meta_g = _gather_rows_with_meta(q_rows, meta, ax, gather)
             if order_after_l is not None:
-                q_g, _ = lax.optimization_barrier((q_g, order_after_l))
+                q_g, order_after_l = lax.optimization_barrier((q_g, order_after_l))
             source_rows = (t_local, q_g.shape[0] // ep)
             pairs_g = meta_g[:, : t_local * topk]
             scale_bits_g = (
@@ -1497,6 +1551,14 @@ def fused_ep_moe_v2(
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        if shared_in_op:
+            return _add_shared(
+                combined,
+                order_after_l,
+                lambda rows: token_layout.restore(
+                    rows, ax, me=me if pallas_restore else None
+                ),
+            )
         return token_layout.restore(combined, ax, me=me if pallas_restore else None)
 
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -1642,6 +1704,9 @@ def fused_ep_moe_v2(
         lane_quant,
         oneshot_gather,
         combine_restore,
+        bool(shared_in_op),
+        float(shared_out_scale),
+        int(shared_rs_min_rows),
     )
     body, out_specs = {
         "fused": (decode_fn if decode_glue else local_fn, P(ax)),
