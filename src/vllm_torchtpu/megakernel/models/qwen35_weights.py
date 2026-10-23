@@ -24,6 +24,7 @@ from .. import planner
 from ..exec_spec import ExecSpec
 from ..modules.gdn import GDNModule
 from ..ops import BF16, F32, FP8, I32
+from .replication import shard_gdn_weights, shard_shared_expert_weights
 
 
 def default_eplb_cores(g: Any, R: int) -> list[list[list[int]]]:
@@ -173,10 +174,10 @@ def split_hf_weights(
     """
     g.check(ex)
     R = ex.R
-    L, H, E, inter_dim, IS = g.L, g.H, g.E, g.I, g.IS
+    L, H, E, inter_dim = g.L, g.H, g.E, g.I
     HD = g.HD
     nh = g.nh(R)
-    isr, ir, er, ew = g.ISR(R), g.IR(R), g.ER(R), g.EW(R)
+    ir, er, ew = g.IR(R), g.ER(R), g.EW(R)
     natt, ngdn = g.NATT, g.NGDN
     G = g.G(R)
     nkv = g.NKV
@@ -230,24 +231,8 @@ def split_hf_weights(
     kn_in = hf["kn"].reshape(natt, nkv, HD) if hf["kn"].ndim == 2 else hf["kn"]
     kn = jnp.repeat(jnp.transpose(kn_in, (1, 0, 2)), G, axis=0)
 
-    # 2. Shared expert (always TP-sharded along IS across R)
-    sh_gate = jnp.broadcast_to(hf["sh_gate"][None, ...], (R, L, H))
-    if "sh_gate_proj" in hf and "sh_up_proj" in hf:
-        sh_g_in, sh_u_in = hf["sh_gate_proj"], hf["sh_up_proj"]
-        sh_gs_in, sh_us_in = hf["sh_gate_proj_s"], hf["sh_up_proj_s"]
-    else:
-        sh_g_in, sh_u_in = hf["sh13"][:, :, :IS], hf["sh13"][:, :, IS:]
-        sh_gs_in, sh_us_in = hf["sh13_s"][:, :IS], hf["sh13_s"][:, IS:]
-    sh_g = jnp.transpose(sh_g_in.reshape(L, H, R, isr), (2, 0, 1, 3))
-    sh_u = jnp.transpose(sh_u_in.reshape(L, H, R, isr), (2, 0, 1, 3))
-    sh13 = jnp.concatenate([sh_g, sh_u], axis=-1)
-
-    sh_gs = jnp.transpose(sh_gs_in.reshape(L, R, isr), (1, 0, 2))
-    sh_us = jnp.transpose(sh_us_in.reshape(L, R, isr), (1, 0, 2))
-    sh13_s = jnp.concatenate([sh_gs, sh_us], axis=-1)
-
-    sh2 = jnp.transpose(hf["sh2"].reshape(L, R, isr, H), (1, 0, 2, 3))
-    sh2_s = jnp.broadcast_to(hf["sh2_s"][None, ...], (R, L, H))
+    # 2. Shared expert (sharded across sh_r = R // sh_rep groups, replicated sh_rep-way)
+    sh_gate, sh13, sh13_s, sh2, sh2_s = shard_shared_expert_weights(hf, g, R)
 
     # 3. Routed experts: TP-sharded (g.moe_tp=True) or EP + EPLB (g.moe_tp=False)
     if "e_gate_proj" in hf and "e_up_proj" in hf:
@@ -320,74 +305,11 @@ def split_hf_weights(
 
     # 4. GDN linear attention: [qkv | z | b(64) | a(64)] (NLI=BA+128, A_OFF=BA+64)
     if ngdn > 0:
+        w_gdn = shard_gdn_weights(hf, g, ex)
         lay_gdn = GDNModule.lin_in_layout(g, ex)
-        kh, vh, KD, VD = lay_gdn.kh, lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
-        b_pad = lay_gdn.A_OFF - lay_gdn.BA
-        a_pad = lay_gdn.NLI - lay_gdn.A_OFF
-        kq_w = kh * KD
-        v_w = vh * VD
-
-        lin_q = jnp.transpose(hf["lin_q"].reshape(ngdn, H, R, kq_w), (2, 0, 1, 3))
-        lin_k = jnp.transpose(hf["lin_k"].reshape(ngdn, H, R, kq_w), (2, 0, 1, 3))
-        lin_v = jnp.transpose(hf["lin_v"].reshape(ngdn, H, R, v_w), (2, 0, 1, 3))
-        lin_z = jnp.transpose(hf["lin_z"].reshape(ngdn, H, R, v_w), (2, 0, 1, 3))
-        lin_b = jnp.transpose(hf["lin_b"].reshape(ngdn, H, R, vh), (2, 0, 1, 3))
-        lin_a = jnp.transpose(hf["lin_a"].reshape(ngdn, H, R, vh), (2, 0, 1, 3))
-        if b_pad > vh:
-            lin_b = jnp.pad(lin_b, ((0, 0), (0, 0), (0, 0), (0, b_pad - vh)))
-        if a_pad > vh:
-            lin_a = jnp.pad(lin_a, ((0, 0), (0, 0), (0, 0), (0, a_pad - vh)))
-        lin_in = jnp.concatenate([lin_q, lin_k, lin_v, lin_z, lin_b, lin_a], axis=-1)
-        assert lin_in.shape[-1] == lay_gdn.NLI, (lin_in.shape[-1], lay_gdn.NLI)
-
-        lin_q_s = jnp.transpose(hf["lin_q_s"].reshape(ngdn, R, kq_w), (1, 0, 2))
-        lin_k_s = jnp.transpose(hf["lin_k_s"].reshape(ngdn, R, kq_w), (1, 0, 2))
-        lin_v_s = jnp.transpose(hf["lin_v_s"].reshape(ngdn, R, v_w), (1, 0, 2))
-        lin_z_s = jnp.transpose(hf["lin_z_s"].reshape(ngdn, R, v_w), (1, 0, 2))
-        lin_b_s = jnp.transpose(hf["lin_b_s"].reshape(ngdn, R, vh), (1, 0, 2))
-        lin_a_s = jnp.transpose(hf["lin_a_s"].reshape(ngdn, R, vh), (1, 0, 2))
-        if b_pad > vh:
-            lin_b_s = jnp.pad(lin_b_s, ((0, 0), (0, 0), (0, b_pad - vh)))
-        if a_pad > vh:
-            lin_a_s = jnp.pad(lin_a_s, ((0, 0), (0, 0), (0, a_pad - vh)))
-        lin_in_s = jnp.concatenate(
-            [lin_q_s, lin_k_s, lin_v_s, lin_z_s, lin_b_s, lin_a_s], axis=-1
-        )
-        assert lin_in_s.shape[-1] == lay_gdn.NLI, (lin_in_s.shape[-1], lay_gdn.NLI)
-
-        lin_out = jnp.transpose(hf["lin_out"].reshape(ngdn, R, v_w, H), (1, 0, 2, 3))
-        lin_out_s = jnp.broadcast_to(hf["lin_out_s"][None, ...], (R, ngdn, H))
-
-        c_full = hf["conv"]  # [ngdn, 4, 2*KH*KD + VH*VD]
-        KH_KD = g.KH * KD
-        c_q = jnp.transpose(
-            c_full[:, :, :KH_KD].reshape(ngdn, 4, R, kq_w), (2, 0, 1, 3)
-        )
-        c_k = jnp.transpose(
-            c_full[:, :, KH_KD : 2 * KH_KD].reshape(ngdn, 4, R, kq_w), (2, 0, 1, 3)
-        )
-        c_v = jnp.transpose(
-            c_full[:, :, 2 * KH_KD :].reshape(ngdn, 4, R, v_w), (2, 0, 1, 3)
-        )
-        conv = jnp.concatenate([c_q, c_k, c_v], axis=-1).reshape(
-            R, ngdn, 4 * lay_gdn.QKV
-        )
-
-        alog = jnp.transpose(hf["alog"].reshape(ngdn, R, vh), (1, 0, 2))
-        dtb = jnp.transpose(hf["dtb"].reshape(ngdn, R, vh), (1, 0, 2))
-        gnorm = jnp.broadcast_to(hf["gnorm"][None, ...], (R, ngdn, VD))
-
-        for k, v in (
-            ("lin_in", lin_in),
-            ("lin_in_s", lin_in_s),
-            ("lin_out", lin_out),
-            ("lin_out_s", lin_out_s),
-            ("conv", conv),
-            ("alog", alog),
-            ("dtb", dtb),
-            ("gnorm", gnorm),
-        ):
-            logical_weights[k] = v
+        assert w_gdn["lin_in"].shape[-1] == lay_gdn.NLI
+        assert w_gdn["lin_in_s"].shape[-1] == lay_gdn.NLI
+        logical_weights.update(w_gdn)
 
     return logical_weights
 

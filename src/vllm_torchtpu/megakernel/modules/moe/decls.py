@@ -83,9 +83,14 @@ def _moe_ew(g: Any, R: int) -> int:
     return int(g.E) if moe_tp else int(g.E) // R
 
 
+def _moe_sh_rep(g: Any, R: int) -> int:
+    return max(1, R // max(1, int(g.IS) // 128))
+
+
 MOE_GEOMETRY_METHODS: dict[str, Any] = {
     "ER": lambda g, R: int(g.E) // R,
-    "ISR": lambda g, R: int(g.IS) // R,
+    "sh_rep": _moe_sh_rep,
+    "ISR": lambda g, R: int(g.IS) // max(1, R // _moe_sh_rep(g, R)),
     "IR": lambda g, R: (
         int(g.I) // R
         if bool(g.options.get("moe_tp", g.values.get("moe_tp", True)))
