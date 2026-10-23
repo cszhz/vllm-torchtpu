@@ -111,6 +111,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_ONESHOT_GATHER: bool = True
     MOE_FUSED_EP_V2_COMBINE_RESTORE: bool = False
     MOE_FUSED_EP_V2_TAIL_BARRIER: bool = False
+    MOE_FUSED_EP_V2_FILL_SCHEDULE: bool = True
     TPU_EXPERT_PLACEMENT: str = ""
     MOE_EXPERT_COUNT_TAP_DIR: str = ""
     MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
@@ -888,6 +889,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The kernel's double head barrier is sufficient on its own; the trailing
     # one only waits for the slowest core (~4.7 us a call at EP16).
     "MOE_FUSED_EP_V2_TAIL_BARRIER": env_bool("MOE_FUSED_EP_V2_TAIL_BARRIER"),
+    # Fused EP MoE v2's decode fill schedule: on chunk-streamed builds with at
+    # most kernel.FILL_MAX_ROWS_PER_EXPERT routed rows per expert, stream each
+    # weight slab in two chunks and wait the gate/up slab chunk by chunk, so
+    # the first visit computes before its whole slab lands. 0 turns it off.
+    "MOE_FUSED_EP_V2_FILL_SCHEDULE": env_bool("MOE_FUSED_EP_V2_FILL_SCHEDULE", True),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device

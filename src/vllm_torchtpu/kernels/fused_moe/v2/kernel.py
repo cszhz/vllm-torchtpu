@@ -62,6 +62,12 @@ FP4_OUTPUT_CHUNK = 256
 # the single-slot fp4 path; each a whole number of FP4_OUTPUT_CHUNK.
 W1_STREAM_CHUNK = 2048
 W2_STREAM_CHUNK = 1792
+# The decode fill schedule (see `fill_stream` in the builder): each slab
+# streams in this many column chunks and the gate/up slab is waited chunk by
+# chunk, where a build expects at most FILL_MAX_ROWS_PER_EXPERT routed rows
+# per expert.
+FILL_SLAB_CHUNKS = 2
+FILL_MAX_ROWS_PER_EXPERT = 8
 # How many tile heights the FFN body is emitted at, where it is emitted at
 # more than one. A tile runs the smallest rung that covers its live rows, so
 # an expert's short tail tile stops computing a full tile_m of rows nothing
@@ -559,6 +565,7 @@ def _build_fused_ep_moe_kernel(
     has_w2_bias=False,
     scales_block_major=False,
     tail_barrier=False,
+    fill_schedule=True,
 ):
     """Build the pallas_call and the function that invokes it.
 
@@ -569,6 +576,9 @@ def _build_fused_ep_moe_kernel(
     `tail_barrier` puts a second all-pairs barrier after the transport
     drain, which the kernel does not need (see the end of the body) and
     which costs ~4.7 us a call at EP16; it is kept as an escape hatch.
+
+    `fill_schedule` allows the decode fill schedule on the chunk-streamed
+    path (see `fill_stream` below).
     """
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
@@ -722,15 +732,45 @@ def _build_fused_ep_moe_kernel(
     # Only where an expert is expected to fit one tile (the bound the height
     # rungs use): a multi-tile visit re-reads the slab every tile, and the
     # per-chunk predicates then cost more than the refill overlap buys.
-    chunk_of = {1: W1_STREAM_CHUNK, 2: W2_STREAM_CHUNK}
+    #
+    # The decode fill schedule. The kernel costs a fixed part plus one weight
+    # stream per expert on the busiest shard, and per expert the DMA (one
+    # core's ring rate) and the matmul (the MXU's weight-push rate) take
+    # about the same time, so the matmul trails the stream by however far it
+    # started behind: one whole gate/up slab, because the first visit's first
+    # block waits for all of it. Waiting the gate/up slab chunk by chunk lets
+    # the first visit start computing after one chunk, and the lag it saves
+    # carries to the end of the call. Each extra wait is a fence in the
+    # unrolled matmul chain that costs ~0.16 us a visit, which is free while
+    # a visit's matmul has slack under its DMA -- few routed rows per expert,
+    # the low rung -- and a loss where the tiles are tall and the matmul
+    # binds (prefill buckets). Two chunks per slab (the down slab in two as
+    # well, so its refill starts sooner) measured best of the 2/3/4-chunk
+    # splits; the down slab keeps one wait, since waiting it per chunk cost
+    # more than it saved.
+    est_rows = ragged_rows_alloc - (host.ROWBLK - 1) * ep * g_local - capacity
+    w1_fill_chunk = 2 * inter // FILL_SLAB_CHUNKS
+    w2_fill_chunk = hidden // FILL_SLAB_CHUNKS
+    fill_stream = (
+        fill_schedule
+        and est_rows <= FILL_MAX_ROWS_PER_EXPERT * ep * g_local
+        and (2 * inter) % FILL_SLAB_CHUNKS == 0
+        and hidden % FILL_SLAB_CHUNKS == 0
+        and w1_fill_chunk % FP4_OUTPUT_CHUNK == 0
+        and w2_fill_chunk % FP4_OUTPUT_CHUNK == 0
+    )
+    w1_stream_chunk = w1_fill_chunk if fill_stream else W1_STREAM_CHUNK
+    w2_stream_chunk = w2_fill_chunk if fill_stream else W2_STREAM_CHUNK
+    chunk_of = {1: w1_stream_chunk, 2: w2_stream_chunk}
     chunked_stream = (
         starts_next_weights
         and ragged_rows_alloc <= ep * g_local * capacity
-        and (2 * inter) % W1_STREAM_CHUNK == 0
-        and hidden % W2_STREAM_CHUNK == 0
+        and (2 * inter) % w1_stream_chunk == 0
+        and hidden % w2_stream_chunk == 0
     )
-    n_w1_chunks = 2 * inter // W1_STREAM_CHUNK
-    n_w2_chunks = hidden // W2_STREAM_CHUNK
+    fill_stream = fill_stream and chunked_stream
+    n_w1_chunks = 2 * inter // w1_stream_chunk
+    n_w2_chunks = hidden // w2_stream_chunk
     # A chunk-streamed visit's head waits only for its scale tables, which
     # otherwise start after the previous visit's tile loop, behind that
     # visit's down-slab chunks. A second scale slot lets them go out at the
@@ -989,14 +1029,14 @@ def _build_fused_ep_moe_kernel(
 
         def w1_chunk_copy(expert, slot, c):
             """Gate/up column chunk `c` of `expert`, into weight slot `slot`."""
-            cols = pl.ds(c * W1_STREAM_CHUNK, W1_STREAM_CHUNK)
+            cols = pl.ds(c * w1_stream_chunk, w1_stream_chunk)
             return pltpu.make_async_copy(
                 w1_hbm.at[expert, :, cols], w1_vm.at[slot, :, cols], w1c_sems.at[c]
             )
 
         def w2_chunk_copy(expert, slot, c):
             """Down column chunk `c` of `expert`, into weight slot `slot`."""
-            cols = pl.ds(c * W2_STREAM_CHUNK, W2_STREAM_CHUNK)
+            cols = pl.ds(c * w2_stream_chunk, w2_stream_chunk)
             return pltpu.make_async_copy(
                 w2_hbm.at[expert, :, cols], w2_vm.at[slot, :, cols], w2c_sems.at[c]
             )
@@ -1106,7 +1146,21 @@ def _build_fused_ep_moe_kernel(
                 # wait is a scheduling fence in the unrolled matmul chain, and
                 # the refills (started a whole matmul earlier) have landed by
                 # then, so one fence per slab is cheaper than one per chunk.
-                if block or n_start:
+                # The fill schedule's gate/up slab is the exception: there
+                # chunk c is waited at its own first read.
+                if block:
+                    return
+                if fill_stream and which == 1:
+                    if n_start % chunk_of[which]:
+                        return
+                    c = n_start // chunk_of[which]
+
+                    @pl.when(first_tile)
+                    def _():
+                        copies[which](expert, slot, c).wait()
+
+                    return
+                if n_start:
                     return
 
                 @pl.when(first_tile)
@@ -2369,6 +2423,7 @@ def build_fused_ep_moe_kernel(**kwargs):
     programs says so, rather than being read off host memory afterwards.
     """
     kwargs.setdefault("tail_barrier", envs.MOE_FUSED_EP_V2_TAIL_BARRIER)
+    kwargs.setdefault("fill_schedule", envs.MOE_FUSED_EP_V2_FILL_SCHEDULE)
     key = tuple(sorted(kwargs.items()))
     fn = _BUILD_CACHE.get(key)
     if fn is None:
