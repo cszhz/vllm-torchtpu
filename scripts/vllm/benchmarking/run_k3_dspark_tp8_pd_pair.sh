@@ -50,6 +50,11 @@ proxy_pid=""
 cleanup() {
     status=$?
     trap - EXIT
+    if [[ "$status" -ne 0 ]]; then
+        echo "========== Last 200 lines of $role server.log ==========" >&2
+        tail -200 "$server_out/server.log" >&2 || true
+        echo "========================================================" >&2
+    fi
     [[ -z "$proxy_pid" ]] || kill "$proxy_pid" 2>/dev/null || true
     [[ -z "$server_pid" ]] || kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
@@ -96,6 +101,10 @@ done
 if [[ "$role" == decode ]]; then
     until [[ -f "$coord/benchmark.done" ]]; do
         [[ ! -f "$coord/prefill.exit" ]] || exit 1
+        kill -0 "$server_pid" 2>/dev/null || {
+            echo "decode server exited while the benchmark was running" >&2
+            exit 1
+        }
         sleep 5
     done
 else
@@ -127,9 +136,11 @@ else
     "${bench[@]}" --num-prompts 8 \
         --save-result --result-filename "$out/warmup.json"
 
+    curl -fsS --max-time 3 http://127.0.0.1:8000/health >/dev/null
+    curl -fsS --max-time 3 "http://$decode_ip:8000/health" >/dev/null
     curl -fsS -X POST http://127.0.0.1:8000/start_profile >/dev/null
     curl -fsS -X POST "http://$decode_ip:8000/start_profile" >/dev/null
-    "${bench[@]}" --num-prompts 16 \
+    "${bench[@]}" --num-prompts 8 \
         --save-result --result-filename "$out/measurement.json"
     curl -fsS -X POST http://127.0.0.1:8000/stop_profile >/dev/null
     curl -fsS -X POST "http://$decode_ip:8000/stop_profile" >/dev/null
