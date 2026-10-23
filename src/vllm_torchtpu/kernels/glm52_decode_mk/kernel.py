@@ -191,8 +191,8 @@ class Tiles:
     lv: bool = False
     lv_eight: str = "split"  # an all-reduce of 8 (mod 16) rows: "split" = two 4-row pieces | "round" = 12 rows
     lv_floor: int = 0  # rows below which nothing is trimmed (the next-smaller row bucket: T <= floor never runs here)
-    lv_loop: int = 0  # LV all-reduce per-peer issue / wait sites: 0 unrolled | 1 fori_loops (bundles) | 2 fori_loops
-    # except the all-rows transfer (unrolled, as stage B issues it)
+    lv_loop: int = 0  # LV all-reduce issue sites (collectives.all_reduce_lv): 0 = per row count, peers unrolled |
+    # 1 = per row count, peer fori_loops (bundles) | 2 = 1 except the all-rows transfer (unrolled)
     lv_sites: str = "aqx"  # which collectives LV trims: a = all-reduces, q = q all-gather, x = A2A (arms)
     lv_dead: bool = False  # TIMING-ONLY control: the LV all-reduce / q AG code is compiled under a never-true
     # predicate and the stage-B code runs (prices code size / branch structure with no row saved)
