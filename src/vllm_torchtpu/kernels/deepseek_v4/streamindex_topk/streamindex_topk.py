@@ -1216,6 +1216,7 @@ def _effective_row_lengths(
         "return_scores",
         "uniform_q_len",
         "sc_flat_scores",
+        "sc_topk_coop_max_rows",
     ),
 )
 def streamindex_topk(
@@ -1246,6 +1247,7 @@ def streamindex_topk(
     return_scores: bool = False,
     uniform_q_len: int | None = None,
     sc_flat_scores: bool = False,
+    sc_topk_coop_max_rows: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1314,6 +1316,7 @@ def streamindex_topk(
         the top-k's wave size, which XLA lowers as a relayout, a pad and a
         SparseCore data-format conversion of the whole (padded) buffer. Same
         selection either way.
+      sc_topk_coop_max_rows: `sparsecore_topk`'s `coop_max_rows`.
       return_scores: also return the score of each selected position, which is
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
@@ -1762,7 +1765,7 @@ def streamindex_topk(
                 out_dtype,
                 tc_group,
             )
-            topk_kwargs = {}
+            topk_kwargs = dict(coop_max_rows=sc_topk_coop_max_rows)
             if sc_flat_scores and scores.shape[1] * 128 >= k:
                 topk_kwargs["pad_rows"] = False
             else:

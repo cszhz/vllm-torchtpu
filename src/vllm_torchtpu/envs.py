@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DSV4_SC_TOPK_FLAT_SCORES: bool = True
+    TPU_DSV4_SC_TOPK_COOP_MAX_ROWS: int = 16
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -942,6 +943,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_SC_TOPK_FLAT_SCORES": env_bool(
         "TPU_DSV4_SC_TOPK_FLAT_SCORES", default=True
     ),
+    # DSv4 indexer: token buckets up to which the SparseCore top-k splits every
+    # row over a group of subcores (the cooperative pass) instead of one
+    # subcore per row. A decode bucket holds a few long verify rows, which
+    # otherwise leave most of the 32 subcores idle. Same selection. 0 = off.
+    # (port of patemotter 591c2370b; 32-row buckets measured no better)
+    "TPU_DSV4_SC_TOPK_COOP_MAX_ROWS": env_int("TPU_DSV4_SC_TOPK_COOP_MAX_ROWS", 16),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),

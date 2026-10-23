@@ -125,6 +125,7 @@ def _indexer_jax(
             kv_layout=KVLayout.SEQ_ALONG_LANE,
             uniform_q_len=verify_q_len,
             sc_flat_scores=envs.TPU_DSV4_SC_TOPK_FLAT_SCORES,
+            sc_topk_coop_max_rows=envs.TPU_DSV4_SC_TOPK_COOP_MAX_ROWS,
         )
 
     return _indexer_local(
