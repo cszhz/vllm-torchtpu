@@ -12,7 +12,7 @@ Choose your preferred installation method below:
   <div class="cg-row">
     <div class="cg-label">1. Installation Method</div>
     <div class="cg-options">
-      <button type="button" class="cg-btn active" data-group="method" data-val="uv_pip" aria-pressed="true">uv sync (Recommended)</button>
+      <button type="button" class="cg-btn active" data-group="method" data-val="uv_pip" aria-pressed="true">PyPI Wheel (Recommended)</button>
       <button type="button" class="cg-btn" data-group="method" data-val="source" aria-pressed="false">Editable Source Install</button>
       <button type="button" class="cg-btn" data-group="method" data-val="docker" aria-pressed="false">Docker Container</button>
     </div>
@@ -20,8 +20,8 @@ Choose your preferred installation method below:
   <div class="cg-row" id="docker-image-group" style="display: none;">
     <div class="cg-label">2. Container Type</div>
     <div class="cg-options">
-      <button type="button" class="cg-btn active" data-group="docker_img" data-val="latest" aria-pressed="true">Base TPU Dev Image</button>
-      <button type="button" class="cg-btn" data-group="docker_img" data-val="nightly" aria-pressed="false">Build from Dockerfile</button>
+      <button type="button" class="cg-btn active" data-group="docker_img" data-val="latest" aria-pressed="true">Release Image (:latest)</button>
+      <button type="button" class="cg-btn" data-group="docker_img" data-val="nightly" aria-pressed="false">Nightly Image (:nightly)</button>
     </div>
   </div>
   <div class="cg-output-container">
@@ -71,9 +71,9 @@ Choose your preferred installation method below:
 
 ---
 
-## Option 1: Install from PyPI (`vllm-torchtpu`)
+## Option 1: Install from PyPI ([`vllm-torchtpu`](https://pypi.org/project/vllm-torchtpu/))
 
-For standard usage without modifying source code, install the pre-built `vllm-torchtpu` package directly from PyPI (this automatically installs both `vllm` and `vllm-torchtpu-core`):
+For standard usage without modifying source code, install the pre-built [`vllm-torchtpu`](https://pypi.org/project/vllm-torchtpu/) package directly from PyPI (this automatically installs both `vllm` and [`vllm-torchtpu-core`](https://pypi.org/project/vllm-torchtpu-core/)):
 
 ### Using `uv` (Recommended)
 
@@ -153,7 +153,7 @@ VLLM_TARGET_DEVICE=empty pip install -e . --group vllm \
 
 ## Option 3: Install `vllm` and `vllm-torchtpu-core` Separately (Cross-Repo Development)
 
-Follow these steps when developing or debugging both `vllm` and `vllm-torchtpu-core` in separate local checkouts (or installing `vllm-torchtpu-core` without `--group vllm`). Currently, `vllm==0.31.0` is supported.
+Follow these steps when developing or debugging both `vllm` and `vllm-torchtpu-core` in separate local checkouts (or installing `vllm-torchtpu-core` without `--group vllm`). Currently, `vllm==0.32.0` is supported.
 
 ### Using `uv` (Recommended)
 
@@ -163,7 +163,7 @@ source ~/uv_venv/bin/activate
 export UV_TORCH_BACKEND=cpu
 
 # 1. Clone and install vLLM in editable mode (with common dependencies)
-git clone --depth 1 --branch v0.31.0 https://github.com/vllm-project/vllm.git ~/vllm
+git clone --depth 1 --branch v0.32.0 https://github.com/vllm-project/vllm.git ~/vllm
 VLLM_TARGET_DEVICE="empty" uv pip install -e ~/vllm
 
 # 2. Clone and install vllm-torchtpu-core only (without --group vllm)
@@ -181,7 +181,7 @@ source ~/pip_venv/bin/activate
 pip install --upgrade pip
 
 # 1. Clone and install vLLM in editable mode (with common dependencies)
-git clone --depth 1 --branch v0.31.0 https://github.com/vllm-project/vllm.git ~/vllm
+git clone --depth 1 --branch v0.32.0 https://github.com/vllm-project/vllm.git ~/vllm
 VLLM_TARGET_DEVICE="empty" pip install \
   --extra-index-url https://download.pytorch.org/whl/cpu \
   -e ~/vllm
@@ -204,10 +204,11 @@ pip install \
 
 | Flag | Purpose |
 | :--- | :--- |
-| `--group vllm` | Installs pinned upstream `vllm` (`v0.31.0`) from source. |
+| `--group vllm` | Installs pinned upstream `vllm` (`v0.32.0`) from source. |
 | `--group test` | Installs `pytest`, `pytest-mock`, `pytest-cov`, `parameterized`, and `vllm_test_utils`. |
 | `--extra benchmarking` | Installs `lm-eval`, `evalscope`, `datasets`, and `runai-model-streamer[gcs]`. |
 | `--extra omni` | Installs `vllm-omni` for multimodal diffusion models (e.g., FLUX, Wan2.2). |
+| `--group omni-git` | Installs `vllm-omni` 0.32.0rc1 from its git tag for `--extra omni`, until that release is on PyPI. |
 
 ---
 
