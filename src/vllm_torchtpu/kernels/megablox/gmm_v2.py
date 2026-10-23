@@ -941,6 +941,10 @@ DECODE_OUT_IN_VMEM_UNFUSED = True
 #: Overrides DECODE_LHS_IN_HBM for unfused calls.
 DECODE_LHS_IN_VMEM_UNFUSED = True
 
+#: The same for a fused decode call, whose lhs is the routed rows an XLA op
+#: gathers just before it; that op can write them to VMEM directly.
+DECODE_LHS_IN_VMEM_FUSED = True
+
 #: Ablation switch of the decode path, False outside a diagnostic job. True
 #: starts and waits on no output DMA, so the output is wrong; it prices the
 #: writeback tail against the same tree in a scoring job.
@@ -956,7 +960,9 @@ def decode_out_in_vmem(cfgs: GmmConfigs) -> bool:
 
 def decode_lhs_in_vmem(cfgs: GmmConfigs) -> bool:
     """Whether the decode path at `cfgs` reads lhs from a VMEM operand."""
-    return cfgs.fuse_act is None and DECODE_LHS_IN_VMEM_UNFUSED
+    if cfgs.fuse_act is None:
+        return DECODE_LHS_IN_VMEM_UNFUSED
+    return DECODE_LHS_IN_VMEM_FUSED
 
 
 def decode_slots(cfgs: GmmConfigs) -> int:
