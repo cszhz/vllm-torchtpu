@@ -697,17 +697,13 @@ def _mla_single_block_decode_kernel(
             return
         for i in range(pages_per_seq):
             sz = jnp.clip(kv_len - i * page_size, 0, page_size)
-
-            # Pages past kv_len would be zero-sized copies; do not issue them.
-            @pl.when(sz > 0)
-            def _(i=i, sz=sz):
-                page_idx = page_indices_ref[seq_idx * pages_per_seq + i]
-                async_copy(
-                    reshaped_cache_hbm_ref.at[pl.ds(page_idx * page_size, sz)],
-                    bkv_vmem_ref.at[pl.ds(i * page_size, sz)],
-                    sem,
-                    wait=False,
-                )
+            page_idx = page_indices_ref[seq_idx * pages_per_seq + i]
+            async_copy(
+                reshaped_cache_hbm_ref.at[pl.ds(page_idx * page_size, sz)],
+                bkv_vmem_ref.at[pl.ds(i * page_size, sz)],
+                sem,
+                wait=False,
+            )
 
     def _copy_rows(q_start, q_sz, b, slot, wait):
         @pl.when(q_sz > 0)
