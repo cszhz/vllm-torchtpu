@@ -1052,6 +1052,7 @@ def prebuild_fused_moe_ep(
     token_replica_groups = ep_token_replica_groups(
         is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
     )
+    replica_width = _replica_width(token_replica_groups)
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
     has_expert_slot = placed is not None
@@ -1100,11 +1101,13 @@ def prebuild_fused_moe_ep(
         combine_restore=envs.MOE_FUSED_EP_V2_COMBINE_RESTORE,
         shared_in_op=shared_in_op,
         shared_out_scale=shared_out_scale,
-        shared_rs_min_rows=_shared_rs_min_rows(),
+        shared_rs_min_rows=_shared_rs_min_rows(replica_width),
         # Below the reduce-scatter threshold the in-op shared all-reduce takes
         # the small all-reduce kernel where the runner's would have.
         shared_small_ar_max_rows=(
-            _small_ar_max_rows() if shared_in_op and envs.TPU_SMALL_ALL_REDUCE else 0
+            _small_ar_max_rows(replica_width)
+            if shared_in_op and envs.TPU_SMALL_ALL_REDUCE
+            else 0
         ),
     )
     if shared_in_op:
@@ -1113,7 +1116,7 @@ def prebuild_fused_moe_ep(
             "Fused EP MoE reduces the shared expert in its op | out_scale=%s "
             "rs_min_rows=%d",
             shared_out_scale,
-            _shared_rs_min_rows(),
+            _shared_rs_min_rows(replica_width),
         )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
@@ -1228,21 +1231,24 @@ def fused_moe_ep_unsupported_reason(
     return _unsupported_routing_reason(layer, supplies_hash_ids=supplies_hash_ids)
 
 
-def _shared_rs_min_rows() -> int:
-    """MOE_FUSED_EP_SHARED_RS_MIN_ROWS, with -1 resolved by TP size: 1024 rows
-    at TP >= 8, 256 below (where the reduce-scatter measured faster than the
-    in-op all-reduce on the DSv4 twin)."""
+def _replica_width(groups) -> int:
+    """Cores per token replica group (the TP group), 1 without groups."""
+    return len(groups[0]) if groups else 1
+
+
+def _shared_rs_min_rows(width: int) -> int:
+    """MOE_FUSED_EP_SHARED_RS_MIN_ROWS, with -1 resolved by the token replica
+    (TP) group width: 1024 rows at 8 or more, 256 below (where the
+    reduce-scatter measured faster than the in-op all-reduce on the DSv4 twin)."""
     if envs.MOE_FUSED_EP_SHARED_RS_MIN_ROWS >= 0:
         return envs.MOE_FUSED_EP_SHARED_RS_MIN_ROWS
-    from vllm.distributed.parallel_state import get_tp_group
-
-    return 1024 if get_tp_group().world_size >= 8 else 256
+    return 1024 if width >= 8 else 256
 
 
-def _small_ar_max_rows() -> int:
+def _small_ar_max_rows(width: int) -> int:
     from vllm_torchtpu.layers.adapter import small_all_reduce_op
 
-    return small_all_reduce_op.max_rows()
+    return small_all_reduce_op.max_rows(width)
 
 
 def _routing_config(layer) -> tuple[str, bool, float]:

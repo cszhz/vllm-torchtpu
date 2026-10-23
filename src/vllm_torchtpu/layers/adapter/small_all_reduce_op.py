@@ -66,14 +66,18 @@ DEFAULT_MAX_ROWS = {8: 32}
 DEFAULT_MAX_ROWS_SMALL_TP = 16
 
 
-def max_rows() -> int:
-    """The kernel's row cap: TPU_SMALL_ALL_REDUCE_MAX_ROWS, else by TP size."""
+def max_rows(cores: int = 0) -> int:
+    """The kernel's row cap: TPU_SMALL_ALL_REDUCE_MAX_ROWS, else by the TP
+    group's core count (``cores``, or this core's group once prebuilt), else
+    MAX_ROWS."""
     if envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS:
         return envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS
-    from vllm.distributed.parallel_state import get_tp_group
-
-    tp = get_tp_group().world_size
-    return DEFAULT_MAX_ROWS.get(tp, MAX_ROWS if tp > 8 else DEFAULT_MAX_ROWS_SMALL_TP)
+    cores = cores or _CORES
+    if not cores:
+        return MAX_ROWS
+    return DEFAULT_MAX_ROWS.get(
+        cores, MAX_ROWS if cores > 8 else DEFAULT_MAX_ROWS_SMALL_TP
+    )
 
 
 def group_all_reduce(groups: tuple[tuple[int, ...], ...], cap: int, axis: str):
