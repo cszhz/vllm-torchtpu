@@ -147,6 +147,9 @@ def _get_quantized_matmul_op() -> Callable:
 
 def _get_quantized_matmul_f32_op() -> Callable:
     global _quantized_matmul_f32_op
+    if _quantized_matmul_f32_op is not None:
+        return _quantized_matmul_f32_op
+
     with _quantized_matmul_kernel_op_lock:
         if _quantized_matmul_f32_op is None:
             op = pallas.jax_op(
