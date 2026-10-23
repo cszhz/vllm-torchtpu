@@ -78,6 +78,8 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
+    TPU_SAMPLER_FUSED_CHAIN: bool = False
+    TPU_SAMPLER_GRAPH_RNG: bool = False
     DP_SCHED_ENABLED: bool = False
     TPU_STEP_TIMING_LOG_STEPS: int = 0
     TPU_KV_DROP_HCA_STATE_CHECKPOINT: bool = False
@@ -759,6 +761,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    # Non-greedy, grammar-free spec-verify steps run the logits gathers, bonus
+    # sampling, per-token parameter gathers and the rejection sampler as one
+    # compiled program instead of about ten. Same uniforms, same tokens.
+    "TPU_SAMPLER_FUSED_CHAIN": env_bool("TPU_SAMPLER_FUSED_CHAIN"),
+    # With TPU_SAMPLER_FUSED_CHAIN: draw the chain's uniforms inside that
+    # program instead of as eager programs before it. Dynamo cannot take a
+    # torch.Generator, so the sampling generator becomes the device's default
+    # generator, seeded once from model_config.seed like the dedicated one; a
+    # compiled torch.rand on it yields the eager draw's bits, so the stream is
+    # unchanged as long as nothing else draws from the default generator.
+    "TPU_SAMPLER_GRAPH_RNG": env_bool("TPU_SAMPLER_GRAPH_RNG"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Steps between per-rank "step timing" log lines: the step period grouped
