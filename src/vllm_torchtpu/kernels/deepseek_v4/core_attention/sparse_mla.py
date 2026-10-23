@@ -165,7 +165,8 @@ class SwaDecodeRefs(NamedTuple):
     window: mla_swa.SwaDecodeWindowRefs
     # [2, batch_size, bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8
     bkv_x2_vmem: Any
-    sems: Any  # DMA [2, batch_size]
+    sems: Any  # DMA [2, batch_size], the window fetches
+    store_sem: Any  # DMA, every new kv store
 
 
 def _attention_swa_decode_kernel(
@@ -229,7 +230,12 @@ def _attention_swa_decode_kernel(
         swa_m_hbm_ref,
         o_hbm_ref,
         *scratch,
-        swa=SwaDecodeRefs(window, swa_bkv_x2_vmem, swa_sems),
+        swa=SwaDecodeRefs(
+            window,
+            swa_bkv_x2_vmem,
+            swa_sems.at[:, : swa_bkv_x2_vmem.shape[1]],
+            swa_sems.at[0, swa_bkv_x2_vmem.shape[1]],
+        ),
         **kwargs,
     )
 
@@ -414,18 +420,18 @@ def _attention_kernel(
         else:
             _async_copy(src=vmem_ref, dst=vmem_ref, sem=sem, wait=True)
 
-    def _swa_window_batch(seq_idx_start, slot, *, store, wait):
-        """Fetch the decode tokens' window kv blocks, or store their new kv."""
+    def _swa_window_batch(seq_idx_start, slot, *, wait):
+        """Fetch the decode tokens' window kv blocks (and store their new kv
+        into the cache), or wait for the fetches."""
         for b in range(batch_size):
             token_idx = seq_idx_start + b
             args = (swa.bkv_x2_vmem.at[slot, b], swa.sems.at[slot, b])
 
             @pl.when(token_idx < num_decode_tokens)
             def _():
-                if store:
-                    swa.window.store_new_kv(token_idx, *args, wait=wait)
-                else:
-                    swa.window.fetch(token_idx, *args, wait=wait)
+                swa.window.fetch(token_idx, *args, wait=wait)
+                if not wait:
+                    swa.window.store_new_kv(token_idx, swa.store_sem)
 
     def _fetch_swa_batch(seq_idx_start, bq_sem_idx, *, wait=False):
         if swa is None:
@@ -436,17 +442,7 @@ def _attention_kernel(
         def _():
             _fetch_swa_state_batch(seq_idx_start, bq_sem_idx, wait=wait)
 
-        if wait:
-            _swa_window_batch(seq_idx_start, bq_sem_idx, store=False, wait=True)
-            return
-        # The slot's last batch stores its new kv from the window buffer.
-        prev_seq_idx_start = seq_idx_start - 2 * batch_size
-
-        @pl.when(prev_seq_idx_start >= start_seq_idx)
-        def _():
-            _swa_window_batch(prev_seq_idx_start, bq_sem_idx, store=True, wait=True)
-
-        _swa_window_batch(seq_idx_start, bq_sem_idx, store=False, wait=False)
+        _swa_window_batch(seq_idx_start, bq_sem_idx, wait=wait)
 
     def _fetch_swa_state_batch(seq_idx_start, bq_sem_idx, *, wait=False):
         sem_acc = sems.at[3, bq_sem_idx]
@@ -632,7 +628,6 @@ def _attention_kernel(
         wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
 
         if swa is not None:
-            _swa_window_batch(batch_start_seq_idx, bi_sem_idx, store=True, wait=False)
 
             @pl.when(batch_start_seq_idx < num_decode_tokens)
             def _():
@@ -712,19 +707,9 @@ def _attention_kernel(
             wait_send_bo_batch(1)
 
         if swa is not None:
-            # The last two batches' new kv stores; earlier ones were waited
-            # before their window slot was refilled.
-            last_slot = sem_ids_ref[0]
-            _swa_window_batch(batch_start_seq_idx, last_slot, store=True, wait=True)
-
-            @pl.when(pl.num_programs(0) >= 2)
-            def _():
-                _swa_window_batch(
-                    batch_start_seq_idx - batch_size,
-                    1 - last_slot,
-                    store=True,
-                    wait=True,
-                )
+            # Every new kv store of this call's decode tokens.
+            num_stores = jnp.minimum(end_seq_idx, num_decode_tokens) - start_seq_idx
+            swa.window.wait_stores(jnp.maximum(num_stores, 0), swa.store_sem)
 
     ### ------- Kernel end ------- ###
 
@@ -995,7 +980,8 @@ def sparse_ragged_paged_attention(
                     ),
                     jnp.uint8,
                 ),
-                pltpu.SemaphoreType.DMA((2, batch_size)),
+                # The window fetches, plus one for every new kv store.
+                pltpu.SemaphoreType.DMA((2, batch_size + 1)),
             ]
             kernel_fn = _attention_swa_decode_kernel
             swa_kwargs = dict(

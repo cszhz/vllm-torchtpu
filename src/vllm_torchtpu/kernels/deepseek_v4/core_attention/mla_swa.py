@@ -1295,12 +1295,9 @@ class SwaDecodeWindowRefs(NamedTuple):
         for n, ref, sem in zip(sizes, bkv_s_refs, sems, strict=True):
             _wait_rows(ref, sem, n)
 
-    def wait_stores(self, seq_idxs, bkv_s_refs, sems):
-        """`store_new_kv(..., wait=True)` for several sequences, every wait
-        sized before the first (see `wait_fetches`)."""
-        sizes = [self._tail(i, SwaCopyCols.NEW_ROWS) for i in seq_idxs]
-        for n, ref, sem in zip(sizes, bkv_s_refs, sems, strict=True):
-            _wait_rows(ref, sem, n)
+    def wait_stores(self, num_rows, sem):
+        """Wait for the `store_new_kv` copies of `num_rows` sequences."""
+        _wait_rows(self.updated_cache_hbm_ref, sem, num_rows)
 
     def fetch(self, seq_idx, bkv_s_ref, sem, *, wait=False):
         """Copy (or wait for) the window keys and the new token into
@@ -1330,14 +1327,14 @@ class SwaDecodeWindowRefs(NamedTuple):
             sem,
         )
 
-    def store_new_kv(self, seq_idx, bkv_s_ref, sem, *, wait=False):
-        """Copy (or wait for) the new token from `bkv_s_ref` into the cache."""
+    def store_new_kv(self, seq_idx, sem):
+        """Copy the new token from new_kv into the cache, HBM to HBM: no
+        window copy reads its row, so it needs no ordering against them."""
         new_rows = self._tail(seq_idx, SwaCopyCols.NEW_ROWS)
-        if wait:
-            _wait_rows(bkv_s_ref, sem, new_rows)
-            return
         _dma(
-            bkv_s_ref.at[pl.ds(self._tail(seq_idx, SwaCopyCols.SLOT), new_rows)],
+            self.new_kv_hbm_ref.at[
+                pl.ds(self._tail(seq_idx, SwaCopyCols.NEW_SRC), new_rows)
+            ],
             self.updated_cache_hbm_ref.at[
                 pl.ds(self._tail(seq_idx, SwaCopyCols.STORE_DST), new_rows)
             ],
@@ -1461,7 +1458,7 @@ def _mla_batched_decode_kernel(
     o_batch_x2_vmem,  # [2, seq_batch_sz, num_q_heads, head_dim]
     l_batch_x2_vmem,  # [2, seq_batch_sz, num_l_heads]
     m_batch_x2_vmem,  # [2, seq_batch_sz, num_l_heads]
-    sems,  # [2, seq_batch_sz + 4]
+    sems,  # [2, seq_batch_sz + 5]
     *,
     sm_scale: float,
     sliding_window: int,
@@ -1531,6 +1528,7 @@ def _mla_batched_decode_kernel(
             lkv_dim,
         )
 
+    store_sem = sems.at[0, seq_batch_sz + 4]
     window = SwaDecodeWindowRefs(
         kv_lens_ref,
         copy_table_ref,
@@ -1560,8 +1558,6 @@ def _mla_batched_decode_kernel(
         )
 
     def _fetch_bkv(batch_idx, sem_idx, wait=False):
-        if not wait:
-            wait_update_kv_cache(batch_idx - 2, sem_idx)
         s_start = start_seq_idx + batch_idx * seq_batch_sz
         seq_idxs = [s_start + s for s in range(seq_batch_sz)]
         bkv_refs = [bkv_batch_x2_vmem.at[sem_idx, s] for s in range(seq_batch_sz)]
@@ -1571,6 +1567,7 @@ def _mla_batched_decode_kernel(
             return
         for args in zip(seq_idxs, bkv_refs, bkv_sems):
             window.fetch(*args)
+            window.store_new_kv(args[0], store_sem)
 
     def _fetch_hca_bkv(batch_idx, sem_idx, wait=False):
         s_start = start_seq_idx + batch_idx * seq_batch_sz
@@ -1732,17 +1729,6 @@ def _mla_batched_decode_kernel(
             wait=wait,
         )
 
-    def _update_kv_cache(batch_idx, sem_idx, wait=False):
-        s_start = start_seq_idx + batch_idx * seq_batch_sz
-        seq_idxs = [s_start + s for s in range(seq_batch_sz)]
-        bkv_refs = [bkv_batch_x2_vmem.at[sem_idx, s] for s in range(seq_batch_sz)]
-        bkv_sems = [sems.at[sem_idx, 4 + s] for s in range(seq_batch_sz)]
-        if wait:
-            window.wait_stores(seq_idxs, bkv_refs, bkv_sems)
-            return
-        for args in zip(seq_idxs, bkv_refs, bkv_sems):
-            window.store_new_kv(*args)
-
     def fetch_batch(batch_idx, sem_idx):
         _fetch_bq(batch_idx, sem_idx, wait=False)
         _fetch_bkv(batch_idx, sem_idx, wait=False)
@@ -1754,11 +1740,6 @@ def _mla_batched_decode_kernel(
         _fetch_bkv(batch_idx, sem_idx, wait=True)
         if hca is not None:
             _fetch_hca_bkv(batch_idx, sem_idx, wait=True)
-
-    def wait_update_kv_cache(batch_idx, sem_idx):
-        @pl.when(batch_idx >= 0)
-        def _():
-            _update_kv_cache(batch_idx, sem_idx, wait=True)
 
     def wait_send_bo(batch_idx, sem_idx):
         @pl.when(batch_idx >= 0)
@@ -1794,7 +1775,6 @@ def _mla_batched_decode_kernel(
         compute_batch(batch_idx, sem_idx)
 
         _send_bo(batch_idx, sem_idx, wait=False)
-        _update_kv_cache(batch_idx, sem_idx, wait=False)
 
         return ()
 
@@ -1805,13 +1785,12 @@ def _mla_batched_decode_kernel(
     def _():
         last_i = loop_cnt - 1
         last_batch_idx = last_i
-        wait_update_kv_cache(last_batch_idx, last_i % 2)
+        window.wait_stores(num_decode_seqs, store_sem)
         wait_send_bo(last_batch_idx, last_i % 2)
 
         @pl.when(loop_cnt > 1)
         def _():
             wait_send_bo(last_batch_idx - 1, (last_i - 1) % 2)
-            wait_update_kv_cache(last_batch_idx - 1, (last_i - 1) % 2)
 
 
 def run_mla_batched_decode_kernel(
@@ -1941,9 +1920,8 @@ def run_mla_batched_decode_kernel(
         (2, seq_batch_sz, num_l_heads),
         jnp.float32,
     )
-    sems = pltpu.SemaphoreType.DMA(
-        (2, seq_batch_sz + 4)
-    )  # 4 for q, o, l, m; seq_batch_sz for bkv
+    # 4 for q, o, l, m; seq_batch_sz for bkv; 1 for every new-kv store.
+    sems = pltpu.SemaphoreType.DMA((2, seq_batch_sz + 5))
 
     scratch_shapes = [
         bkv_batch_x2_vmem,
