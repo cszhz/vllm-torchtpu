@@ -6209,23 +6209,47 @@ class TPUModelRunner(GPUModelRunner):
             dtype=self._hidden_states_dtype,
         ).to(self.device)
 
+    def _logits_row_paddings(self, num_tokens: int) -> list[int]:
+        """Row counts `compute_selected_logits` sees at one token bucket:
+        the request buckets, and under speculative decoding every token
+        bucket up to the verify rows of a full batch (sum of 1 + drafts per
+        request, padded by `get_spec_decode_metadata` to a token bucket)."""
+        rows: list[int] = []
+        for num_reqs in self.num_reqs_paddings:
+            rows.append(num_reqs)
+            if num_reqs >= min(num_tokens, self.max_num_reqs):
+                break
+        if self.speculative_config is not None and not self._mtp_prefill_only:
+            k = self.speculative_config.num_speculative_tokens
+            max_rows = _get_padded_token_len(
+                self.num_tokens_paddings,
+                min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
+            )
+            rows += [
+                t
+                for t in self.num_tokens_paddings
+                if t <= min(num_tokens, max_rows) and t not in rows
+            ]
+        return rows
+
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
-        with self._precompile_timed("compute_selected_logits"):
+        # Serving calls it under execute_model's (and _dummy_run's) no_grad,
+        # and dynamo guards on grad mode: a grad-enabled precompile is never
+        # hit and every bucket compiles again while serving.
+        with self._precompile_timed("compute_selected_logits"), torch.no_grad():
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
                     dtype=self._hidden_states_dtype,
                 ).to(self.device)
-                for num_reqs in self.num_reqs_paddings:
-                    indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
+                for num_rows in self._logits_row_paddings(num_tokens):
+                    indices = torch.zeros(num_rows, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
                     logger.info(
-                        "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
+                        "  -- num_tokens: %d, logits rows: %d", num_tokens, num_rows
                     )
-                    if num_reqs >= min(num_tokens, self.max_num_reqs):
-                        break
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -6406,7 +6430,8 @@ class TPUModelRunner(GPUModelRunner):
             next_lens.append(
                 self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
             )
-        with self._precompile_timed("substitute_placeholder_token"):
+        # Called from execute_model under no_grad; dynamo guards on grad mode.
+        with self._precompile_timed("substitute_placeholder_token"), torch.no_grad():
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
                 cur_input_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
@@ -6845,6 +6870,15 @@ class TPUModelRunner(GPUModelRunner):
                 # request would otherwise compile new graphs. Warm those
                 # through the real two-phase spec-decode path.
                 self._warmup_spec_decode()
+                # The warmup drives a few (requests, prompt) shapes; the
+                # drafter's input builders compile per (target token bucket,
+                # draft bucket) and would otherwise compile while serving.
+                warm_builders = getattr(
+                    self._async_drafter, "warm_input_builders", None
+                )
+                if warm_builders is not None:
+                    with self._precompile_timed("drafter input builders"):
+                        warm_builders()
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
