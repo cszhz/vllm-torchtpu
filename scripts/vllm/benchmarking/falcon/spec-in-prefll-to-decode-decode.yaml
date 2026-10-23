@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: pd-spec-pipeline-decode-20261024-r14-baseline
+name: pd-spec-pipeline-decode-20261024-r15-baseline
 exp_type: BENCHMARK
 artifact_type: generic
 cluster_name: gke-tpu-train-us-central1-1-prod
@@ -66,7 +66,7 @@ role_to_task_spec:
       - name: coord
         type: gcs
         bucket: inference-model-storage-poc-tpu-hns
-        prefix: benchmarks/pd-spec-pipeline/20261024-r14-baseline
+        prefix: benchmarks/pd-spec-pipeline/20261024-r15-baseline
         mount_path: /coord
         mount_options: [implicit-dirs, metadata-cache:ttl-secs:0]
     sources:
@@ -74,5 +74,5 @@ role_to_task_spec:
         type: git
         repo: https://github.com/vllm-project/vllm-torchtpu.git
         ref: hafeng/spec_in_prefll_to_decode
-        commit: 3926552efb6b9d7871b6e5c94625a49a339837aa
+        commit: 56f465eba
         path: /workspace/vllm-torchtpu
