@@ -78,7 +78,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
-    TPU_SAMPLER_FUSED_CHAIN: bool = False
+    TPU_SAMPLER_FUSED_CHAIN: bool = True
     TPU_SAMPLER_GRAPH_RNG: bool = False
     DP_SCHED_ENABLED: bool = False
     TPU_KV_HOLD_REPLAY_CHECKPOINT: bool = False
@@ -121,8 +121,8 @@ if TYPE_CHECKING:
     MOE_EXPERT_COUNT_TAP_DIR: str = ""
     MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
     MOE_FUSED_EP_SHARED_BEFORE_KERNEL: bool = False
-    MOE_FUSED_EP_SHARED_IN_OP: bool = False
-    MOE_FUSED_EP_SHARED_RS_MIN_ROWS: int = 1024
+    MOE_FUSED_EP_SHARED_IN_OP: bool = True
+    MOE_FUSED_EP_SHARED_RS_MIN_ROWS: int = -1
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_DSV4_PAIR_SWAP: bool = False
@@ -132,12 +132,12 @@ if TYPE_CHECKING:
     TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
     TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE: int = 64
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
-    TPU_SMALL_ALL_REDUCE: bool = False
+    TPU_SMALL_ALL_REDUCE: bool = True
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
-    TPU_FP8_LINEAR_PALLAS: bool = False
+    TPU_FP8_LINEAR_PALLAS: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = ""
-    TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
-    TPU_FP8_SKINNY_SCALE_DMA: bool = False
+    TPU_FP8_SKINNY_HBM_PIN_SITES: str = FP8_LINEAR_PALLAS_DEFAULT_SITES
+    TPU_FP8_SKINNY_SCALE_DMA: bool = True
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -160,9 +160,9 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
-    TPU_DSV4_CSA_GATHER_NO_PAD: bool = False
-    TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = False
-    TPU_DSPARK_SHARDED_CONTEXT_KV: bool = False
+    TPU_DSV4_CSA_GATHER_NO_PAD: bool = True
+    TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = True
+    TPU_DSPARK_SHARDED_CONTEXT_KV: bool = True
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = True
     VLLM_TPU_DSV4_MHC_FUSE_NORM: bool = True
@@ -295,8 +295,10 @@ _TRUE_STRINGS = ("true", "1", "yes", "on")
 _FALSE_STRINGS = ("false", "0", "no", "off")
 DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
 # DeepSeek-V4 per-core decode linears at TP8 (attention TP, shared expert TP).
+# DSv4 decode linears measured faster on the kernel (close-gaps fp8-linears);
+# the shared expert is left out (no gain at c16, already prefetched at c4).
 FP8_LINEAR_PALLAS_DEFAULT_SITES = (
-    "attn.fused_wqa_wkv,attn.wq_b,attn.wo_b,shared_experts.gate_up_proj"
+    "attn.fused_wqa_wkv,attn.wq_b,attn.wo_b,indexer.wq_b"
 )
 
 
@@ -781,7 +783,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Non-greedy, grammar-free spec-verify steps run the logits gathers, bonus
     # sampling, per-token parameter gathers and the rejection sampler as one
     # compiled program instead of about ten. Same uniforms, same tokens.
-    "TPU_SAMPLER_FUSED_CHAIN": env_bool("TPU_SAMPLER_FUSED_CHAIN"),
+    "TPU_SAMPLER_FUSED_CHAIN": env_bool("TPU_SAMPLER_FUSED_CHAIN", True),
     # With TPU_SAMPLER_FUSED_CHAIN: draw the chain's uniforms inside that
     # program instead of as eager programs before it. Dynamo cannot take a
     # torch.Generator, so the sampling generator becomes the device's default
@@ -929,11 +931,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MOE_FUSED_EP_SHARED_RS_MIN_ROWS rows per TP replica up, the shared partial
     # is reduce-scattered onto each core's own rows before the routed rows'
     # replica all-gather (one reduce-scatter instead of an all-reduce); below,
-    # it is all-reduced in the op (the runner's own arithmetic).
-    "MOE_FUSED_EP_SHARED_IN_OP": env_bool("MOE_FUSED_EP_SHARED_IN_OP"),
-    "MOE_FUSED_EP_SHARED_RS_MIN_ROWS": env_nonnegative_int(
-        "MOE_FUSED_EP_SHARED_RS_MIN_ROWS", 1024
-    ),
+    # it is all-reduced in the op (the runner's own arithmetic). -1 (default)
+    # picks by TP size: 1024 rows at TP >= 8, 256 below (DSv4 twin: the
+    # reduce-scatter wins at T2048 TP8 and T512 TP4); 0 never reduce-scatters.
+    "MOE_FUSED_EP_SHARED_IN_OP": env_bool("MOE_FUSED_EP_SHARED_IN_OP", True),
+    "MOE_FUSED_EP_SHARED_RS_MIN_ROWS": env_int("MOE_FUSED_EP_SHARED_RS_MIN_ROWS", -1),
     "MOE_FUSED_EP_SHARED_BEFORE_KERNEL": env_bool("MOE_FUSED_EP_SHARED_BEFORE_KERNEL"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
@@ -1001,9 +1003,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sum small bf16 TP all-reduces with the Pallas two-shot kernel
     # (kernels/experimental/small_collectives) over the TP group's cores of the
     # expert-parallel mesh, instead of XLA's all-reduce. Needs an EP mesh.
-    "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE"),
+    "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE", True),
     # Largest block, in rows, the kernel takes; XLA sums larger ones inside the
-    # same op. 0 keeps small_all_reduce_op.MAX_ROWS.
+    # same op. 0 picks by TP group size (small_all_reduce_op.max_rows: 32 rows
+    # at 8 cores, 16 below, where the kernel measured faster than XLA under the
+    # DSv4 served LIBTPU flags).
     "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
         "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
     ),
@@ -1012,7 +1016,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fp8_skinny.py) instead of XLA's quantize + fp8 dot, on the layers named by
     # TPU_FP8_LINEAR_PALLAS_SITES whose (K, N) has a measured tiling. Outputs differ
     # from the XLA path (exact f32 accumulation): tolerance-tier numerics.
-    "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS"),
+    "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS", True),
     # Comma-separated layer-prefix suffixes, "."-bounded, e.g. "attn.wo_b".
     "TPU_FP8_LINEAR_PALLAS_SITES": env_str(
         "TPU_FP8_LINEAR_PALLAS_SITES", FP8_LINEAR_PALLAS_DEFAULT_SITES
@@ -1020,11 +1024,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Of the TPU_FP8_LINEAR_PALLAS sites, those whose kernel weight operand is
     # constrained to HBM, so XLA cannot stage it into VMEM ahead of the call.
     # Same arithmetic, bit-identical outputs; placement only.
-    "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str("TPU_FP8_SKINNY_HBM_PIN_SITES", ""),
+    "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str(
+        "TPU_FP8_SKINNY_HBM_PIN_SITES", FP8_LINEAR_PALLAS_DEFAULT_SITES
+    ),
     # HBM-pinned fp8_skinny sites with N % 1024 == 0: the per-channel weight scale
     # is an HBM operand DMA'd in-kernel with the weight ring, instead of a VMEM
     # operand XLA stages with an exposed copy just before the call. Bit-identical.
-    "TPU_FP8_SKINNY_SCALE_DMA": env_bool("TPU_FP8_SKINNY_SCALE_DMA"),
+    "TPU_FP8_SKINNY_SCALE_DMA": env_bool("TPU_FP8_SKINNY_SCALE_DMA", True),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
@@ -1128,15 +1134,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # DSv4 CSA: size the SparseCore KV gather's per-subcore chunk so its output
     # needs no padding rows, and hence no slice copy after it.
-    "TPU_DSV4_CSA_GATHER_NO_PAD": env_bool("TPU_DSV4_CSA_GATHER_NO_PAD"),
+    "TPU_DSV4_CSA_GATHER_NO_PAD": env_bool("TPU_DSV4_CSA_GATHER_NO_PAD", True),
     # DSpark greedy drafting: shard the Markov head over the vocabulary and
     # exchange per-rank (max, argmax) pairs instead of reading the replicated
     # full-vocabulary weight at every draft position.
-    "TPU_DSPARK_VOCAB_PARALLEL_MARKOV": env_bool("TPU_DSPARK_VOCAB_PARALLEL_MARKOV"),
+    "TPU_DSPARK_VOCAB_PARALLEL_MARKOV": env_bool("TPU_DSPARK_VOCAB_PARALLEL_MARKOV", True),
     # DSpark context-KV step: each tensor-parallel rank computes its 1/tp of
     # the replicated main_proj columns and all-gathers them, and one matmul
     # computes only the KV columns of every draft layer's fused_wqa_wkv.
-    "TPU_DSPARK_SHARDED_CONTEXT_KV": env_bool("TPU_DSPARK_SHARDED_CONTEXT_KV"),
+    "TPU_DSPARK_SHARDED_CONTEXT_KV": env_bool("TPU_DSPARK_SHARDED_CONTEXT_KV", True),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission

@@ -26,6 +26,7 @@ all-reduce over the same groups. No branch on the token count reaches the
 torch trace, so the backbone and the drafter take the same op.
 """
 
+import os
 import jax
 import torch
 from jax import lax
@@ -58,9 +59,21 @@ _CORES = 0
 _TP_RANKS: tuple[int, ...] = ()
 
 
+# Default row cap by TP group size, under the DSv4 served LIBTPU flags: the
+# kernel saves 4-5 us per call up to 32 rows at TP8 but is slower at 64; at TP4
+# it wins only up to 16 (close-gaps decode-step-glue / mixed-step-collectives).
+DEFAULT_MAX_ROWS = {8: 32}
+DEFAULT_MAX_ROWS_SMALL_TP = 16
+
+
 def max_rows() -> int:
-    """The kernel's row cap: TPU_SMALL_ALL_REDUCE_MAX_ROWS, else MAX_ROWS."""
-    return envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS or MAX_ROWS
+    """The kernel's row cap: TPU_SMALL_ALL_REDUCE_MAX_ROWS, else by TP size."""
+    if envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS:
+        return envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp = get_tp_group().world_size
+    return DEFAULT_MAX_ROWS.get(tp, MAX_ROWS if tp > 8 else DEFAULT_MAX_ROWS_SMALL_TP)
 
 
 def group_all_reduce(groups: tuple[tuple[int, ...], ...], cap: int, axis: str):
@@ -113,6 +126,8 @@ def prebuild() -> None:
     if not envs.TPU_SMALL_ALL_REDUCE or _OP is not None:
         return
     mesh = build_ep_mesh()
+    if mesh is None and "TPU_SMALL_ALL_REDUCE" not in os.environ:
+        return  # on by default; only an explicit request needs an EP mesh
     if mesh is None:
         raise NotImplementedError(
             "TPU_SMALL_ALL_REDUCE=1 runs its kernel over the expert-parallel "

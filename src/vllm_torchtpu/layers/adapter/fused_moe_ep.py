@@ -1100,7 +1100,7 @@ def prebuild_fused_moe_ep(
         combine_restore=envs.MOE_FUSED_EP_V2_COMBINE_RESTORE,
         shared_in_op=shared_in_op,
         shared_out_scale=shared_out_scale,
-        shared_rs_min_rows=envs.MOE_FUSED_EP_SHARED_RS_MIN_ROWS,
+        shared_rs_min_rows=_shared_rs_min_rows(),
         # Below the reduce-scatter threshold the in-op shared all-reduce takes
         # the small all-reduce kernel where the runner's would have.
         shared_small_ar_max_rows=(
@@ -1113,7 +1113,7 @@ def prebuild_fused_moe_ep(
             "Fused EP MoE reduces the shared expert in its op | out_scale=%s "
             "rs_min_rows=%d",
             shared_out_scale,
-            envs.MOE_FUSED_EP_SHARED_RS_MIN_ROWS,
+            _shared_rs_min_rows(),
         )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
@@ -1226,6 +1226,17 @@ def fused_moe_ep_unsupported_reason(
     ):
         return "expert biases are not wired through the fused EP op"
     return _unsupported_routing_reason(layer, supplies_hash_ids=supplies_hash_ids)
+
+
+def _shared_rs_min_rows() -> int:
+    """MOE_FUSED_EP_SHARED_RS_MIN_ROWS, with -1 resolved by TP size: 1024 rows
+    at TP >= 8, 256 below (where the reduce-scatter measured faster than the
+    in-op all-reduce on the DSv4 twin)."""
+    if envs.MOE_FUSED_EP_SHARED_RS_MIN_ROWS >= 0:
+        return envs.MOE_FUSED_EP_SHARED_RS_MIN_ROWS
+    from vllm.distributed.parallel_state import get_tp_group
+
+    return 1024 if get_tp_group().world_size >= 8 else 256
 
 
 def _small_ar_max_rows() -> int:
