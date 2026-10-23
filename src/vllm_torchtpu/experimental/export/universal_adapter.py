@@ -334,9 +334,18 @@ def init_export_distributed_environment(vllm_config: Any) -> None:
     )
 
 
-@trace("export.load_model")
 def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
     """Loads a vLLM model with `load_format='dummy'` on TPU (zero disk weight IO)."""
+    return load_vllm_model(vllm_config, load_format="dummy")
+
+
+@trace("export.load_model")
+def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
+    """Loads a vLLM model with `load_format`, running vLLM's weight processing.
+
+    The model is placed on TPU when one is available; on a host without one
+    (`PJRT_DEVICE=CPU`) it stays on CPU.
+    """
     import torch.distributed as dist
     from vllm.config import set_current_vllm_config
     from vllm.distributed import (
@@ -346,7 +355,7 @@ def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.model_executor.model_loader import get_model_loader
 
-    vllm_config.load_config.load_format = "dummy"
+    vllm_config.load_config.load_format = load_format
     if getattr(vllm_config, "device_config", None) is not None:
         with contextlib.suppress(Exception):
             vllm_config.device_config.device = torch.device("tpu")

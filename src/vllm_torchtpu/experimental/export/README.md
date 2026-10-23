@@ -85,3 +85,28 @@ TPU KV cache size: 1,128,064 tokens, ...
 To export the same KV capacity, pass `--block-size 128 --num-blocks 8813`
 (1,128,064 / 128) together with the same `--max-model-len`, `--max-num-seqs` and
 `--max-num-batched-tokens`.
+
+## Real weights: `python -m vllm_torchtpu.experimental.export.checkpoint`
+
+`weight.json` can only slice, transpose and concatenate checkpoint tensors, so it
+cannot express what vLLM does to some weights while loading them: FP8 checkpoints
+are dequantized and requantized to the runtime format, and checkpoint tensors are
+cast to the model dtype. For such models, write the weights vLLM actually serves
+with as an Orbax checkpoint:
+
+```bash
+python -m vllm_torchtpu.experimental.export.checkpoint \
+  --artifact-dir /tmp/exported \
+  --model Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
+  --tensor-parallel-size 8 --enable-expert-parallel --quantization fp8 \
+  --max-model-len 10240 --max-num-seqs 512 --max-num-batched-tokens 8192
+```
+
+Pass the model arguments of the export that produced `--artifact-dir`. The command
+runs on CPU without a TPU: it starts one process per tensor-parallel rank, loads
+that rank's weights through vLLM (so they go through the same processing as when
+serving), and saves `abstract_params` input `i` as array `array_{i}` of an Orbax
+checkpoint (Zarr v2, no OCDBT) in `serving_checkpoint/data/`, each rank writing
+its own shards. It then removes `serving_checkpoint/weight.json`. Each rank holds
+its shard of the processed weights in host memory, so the host needs roughly the
+model size in RAM.
