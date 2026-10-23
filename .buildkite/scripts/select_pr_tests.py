@@ -591,9 +591,7 @@ def select_for_files(
                     "unit_tests_multichip_pr",
                 }
             )
-            run_integration_steps.add(
-                "integration_k3_pruned75_apc_offload_correctness"
-            )
+            run_integration_steps.add("integration_k3_pruned75_apc_offload_correctness")
             full_general_tests = True
             full_multichip_tests = True
             reasons.append("Kimi-K3/MLA/offload module changes")
