@@ -1546,6 +1546,18 @@ class Glm52DecodeMK:
         return ""
 
     @torch.no_grad()
+    def _run(self, step, ids, pos, qsl, seq, bt) -> torch.Tensor:
+        """The one place a compiled step program is called, by serving (`__call__`)
+        and `warmup` alike, so both run it in the same global state. Dynamo guards
+        the torch.compile'd step on the grad mode (GLOBAL_STATE). Serving runs here
+        under no_grad; capture_model (which calls `warmup`) runs with grad enabled.
+        A warmup that called the programs directly compiled entries serving never
+        hit, and every program re-traced on its first served call
+        (stageB/best-ab-lv: 0.8-1.7 s decode stalls inside the measured window)."""
+        weights = self.dense + self.experts
+        return step(ids, pos, qsl, seq, bt, self.smalls, weights, self.caches)
+
+    @torch.no_grad()
     def __call__(
         self,
         runner,
@@ -1560,15 +1572,13 @@ class Glm52DecodeMK:
         md = md if md is not None else self._metadata()
         steps = self._steps_full if (getattr(bucket, "full", False) and t in self._steps_full) else self._steps
         t = int(t)
-        out = steps[t](
+        out = self._run(
+            steps[t],
             to_bucket_rows(input_ids, t),
             to_bucket_rows(positions, t),
             md.query_start_loc,
             md.seq_lens,
             md.block_tables,
-            self.smalls,
-            self.dense + self.experts,
-            self.caches,
         )
         self.calls += 1
         if n <= out.shape[0]:
@@ -1610,17 +1620,26 @@ class Glm52DecodeMK:
             "rank_layout": self.rank_layout,
             "call_shapes": {str(k): v for k, v in self.call_shapes.items()},
             "warm_shapes": {str(k): v for k, v in self.warm_shapes.items()},
+            "warm_replay_compiles": getattr(self, "warm_replay_compiles", None),
         }
 
     def warmup(self, runner) -> None:
-        """Compile and run each bucket once: one request of QMAX rows at positions 0..QMAX-1 on block 0 (the null
-        block; nothing is served from it before the first step), inside a forward context the step reads."""
+        """Compile and run every built step program once, through `_run` (serving's
+        call and grad mode): each bucket's program and, with lever LV, its
+        full-bucket no-LV program (`_steps_full`). Input: one request of QMAX rows at
+        positions 0..QMAX-1 on block 0 (the null block; nothing is served from it
+        before the first step). Then replay every program once more and count dynamo
+        compiles: a served-mode call after warmup must compile nothing (logged;
+        `status()['warm_replay_compiles']`)."""
+        from torch._dynamo.utils import counters
+
         from vllm_torchtpu.utils import synchronize_tensors
 
         cfg = self.cfg
         dev = self.smalls.device
         if self.unbound is not None:
             return
+        programs = []
         for t in self.rows:
             ids = torch.zeros(t, dtype=torch.int32, device=dev)
             pos = torch.arange(t, dtype=torch.int32, device=dev) % cfg.QMAX
@@ -1633,22 +1652,25 @@ class Glm52DecodeMK:
             for tag, steps in (("", self._steps), (" (full-bucket, no LV)", self._steps_full)):
                 if t not in steps:
                     continue
+                args = (steps[t], ids, pos, qsl, seq, bt)
                 t0 = time.monotonic()
-                out = steps[t](
-                    ids,
-                    pos,
-                    qsl,
-                    seq,
-                    bt,
-                    self.smalls,
-                    self.dense + self.experts,
-                    self.caches,
-                )
-                synchronize_tensors([out])
+                synchronize_tensors([self._run(*args)])
                 self.warm_shapes[t] = (tuple(qsl.shape), tuple(seq.shape), int(bt.numel()))
+                programs.append((t, tag, args))
                 logger.info(
                     "GLM-5.2 decode megakernel: b%d%s compiled and warmed in %.1f s",
                     t,
                     tag,
                     time.monotonic() - t0,
                 )
+        g0 = counters["stats"]["unique_graphs"]
+        for _, _, args in programs:
+            synchronize_tensors([self._run(*args)])
+        self.warm_replay_compiles = counters["stats"]["unique_graphs"] - g0
+        (logger.info if self.warm_replay_compiles == 0 else logger.warning)(
+            "GLM-5.2 decode megakernel: warmed %d step programs (%s); "
+            "served-mode replay compiled %d new graphs",
+            len(programs),
+            ", ".join(f"b{t}{'f' if tag else ''}" for t, tag, _ in programs),
+            self.warm_replay_compiles,
+        )
