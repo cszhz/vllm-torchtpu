@@ -36,15 +36,25 @@ def mhc_collapse_head(
     hc_eps: float,
 ) -> torch.Tensor:
     """Collapse multi-stream residual manifold into a single vector before LM head."""
-    residual_flat = hidden_states.flatten(-2).float()
+    hc_mult, hidden_size = hidden_states.shape[-2:]
+    assert hc_mult == 4, f"stream sum order is written for 4 hc streams, got {hc_mult}"
+    streams_flat = hidden_states.flatten(-2)
+    residual_flat = streams_flat.float()
     residual_norm = residual_flat * torch.rsqrt(
         residual_flat.square().mean(dim=-1, keepdim=True) + rms_norm_eps
     )
     pre_mix = torch.nn.functional.linear(residual_norm, hc_fn)
     pre_mix = torch.sigmoid(pre_mix * hc_scale + hc_base) + hc_eps
-    return torch.sum(pre_mix.unsqueeze(-1) * hidden_states.float(), dim=-2).to(
-        hidden_states.dtype
-    )
+    # Weigh lane-aligned slices of the flat bf16 rows: a sum over the stream
+    # axis makes XLA relayout an f32 [T, 4, H] copy first. (0+2)+(1+3) is the
+    # order XLA's sublane-tree reduce adds the 4 streams in, so the result is
+    # bit-identical to torch.sum(dim=-2).
+    terms = [
+        pre_mix[..., j : j + 1]
+        * streams_flat[..., j * hidden_size : (j + 1) * hidden_size].float()
+        for j in range(hc_mult)
+    ]
+    return ((terms[0] + terms[2]) + (terms[1] + terms[3])).to(hidden_states.dtype)
 
 
 class DeepseekV4MLP(nn.Module):
