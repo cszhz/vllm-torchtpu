@@ -117,6 +117,21 @@ def _reference(mesh, routed, shared, groups, scale):
     )(routed, shared)
 
 
+def _exact(mesh, routed, shared, groups, scale):
+    """f32 sum of the partials plus the scaled routed rows (rounded once at the
+    end only when compared)."""
+    index_groups = [list(g) for g in groups]
+
+    def body(r, s):
+        r32 = r.astype(jnp.float32) * jnp.float32(scale)
+        return lax.psum(s.astype(jnp.float32), AXIS, axis_index_groups=index_groups) + r32
+
+    return jax.jit(
+        jax.shard_map(body, mesh=mesh, in_specs=(P(AXIS), P(AXIS)), out_specs=P(AXIS),
+                      check_vma=False)
+    )(routed, shared)
+
+
 def _by_rank(arr, rows):
     return {s.index[0].start // rows: np.asarray(s.data).astype(np.float32)
             for s in arr.addressable_shards}
@@ -139,20 +154,21 @@ def test_single_host_shared_in_op(mesh, groups, rows, scale):
     for r in want:
         np.testing.assert_array_equal(got_ar[r], want[r], err_msg=f"rank {r}")
 
-    # Reduce-scatter path: tolerance, identical across each group.
+    # Reduce-scatter path: the summation order changes, so it is held to the
+    # all-reduce path's own error against an exact (f32) sum, not to its bits.
     got_rs = _by_rank(
         _layer(mesh, rank, inputs, groups, shared, shared_in_op=True,
                shared_out_scale=scale, shared_rs_min_rows=1),
         rows,
     )
+    exact = _by_rank(_exact(mesh, routed, shared, groups, scale), rows)
     for r in want:
         assert np.isfinite(got_rs[r]).all()
-        d = got_rs[r] - want[r]
-        rel = float(np.linalg.norm(d) / max(np.linalg.norm(want[r]), 1e-20))
-        assert rel < 4e-3, (r, rel)
-        # one bf16 ulp at the output's magnitude, at most
-        ulp = np.abs(want[r]) * 2.0**-7 + 1e-6
-        assert (np.abs(d) <= 2 * ulp + 1e-3).all(), (r, float(np.abs(d).max()))
+        norm = max(np.linalg.norm(exact[r]), 1e-20)
+        err_rs = float(np.linalg.norm(got_rs[r] - exact[r]) / norm)
+        err_ar = float(np.linalg.norm(want[r] - exact[r]) / norm)
+        print(f"rank {r}: rel-L2 vs exact  rs {err_rs:.2e}  ar {err_ar:.2e}")
+        assert err_rs < max(2.5 * err_ar, 2.0**-9), (r, err_rs, err_ar)
     for g in groups:
         for m in g[1:]:
             np.testing.assert_array_equal(got_rs[m], got_rs[g[0]])
