@@ -544,27 +544,6 @@ def select_for_files(
 
         if f.startswith(
             (
-                "src/vllm_torchtpu/models/vllm/deepseek_v4/",
-                "src/vllm_torchtpu/kernels/deepseek_v4/",
-                "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/",
-                "src/vllm_torchtpu/models/vllm/qwen4_exp/",
-            )
-        ):
-            run_test_steps.update(
-                {
-                    "typecheck_full",
-                    "unit_tests_cpu_pr",
-                    "unit_tests_general_pr",
-                    "unit_tests_multichip_pr",
-                }
-            )
-            full_general_tests = True
-            full_multichip_tests = True
-            reasons.append("isolated model module changes")
-            continue
-
-        if f.startswith(
-            (
                 "src/vllm_torchtpu/models/vllm/kimi_k3/",
                 "src/vllm_torchtpu/kernels/kimi_k3/",
             )
@@ -678,6 +657,7 @@ def filter_yaml_content(
     ):
         return yaml_text
 
+    step_start_re = re.compile(r"^[ \t]*-[ \t]+(?:label|group|wait|block):")
     key_re = re.compile(r'^(?P<indent>[ \t]*)key:[ \t]*"(?P<key>[^"]+)"[ \t]*$')
     parallelism_re = re.compile(r"^(?P<indent>[ \t]*)parallelism:[ \t]*\d+[ \t]*$")
     plugin_defaults_re = re.compile(
@@ -690,6 +670,9 @@ def filter_yaml_content(
     for line in yaml_text.splitlines(keepends=True):
         stripped = line.rstrip("\r\n")
         eol = line[len(stripped) :] or "\n"
+
+        if step_start_re.match(stripped):
+            current_key = None
 
         m_key = key_re.match(stripped)
         if m_key:

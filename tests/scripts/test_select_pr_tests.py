@@ -162,17 +162,20 @@ class SelectPrTestsTest(unittest.TestCase):
         self.assertNotIn("typecheck_full", plan.skip_steps)
         self.assertNotIn("unit_tests_cpu_pr", plan.skip_steps)
 
-    def test_dsv4_custom_ops_skips_integration_and_spec_decode(self) -> None:
+    def test_kv_transfer_and_offload_run_disagg_and_offload_steps(self) -> None:
         plan = select_pr_tests.select_for_files(
-            [
-                "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/"
-                "deepseek_v4_indexer.py"
-            ]
+            ["src/vllm_torchtpu/offload/raiden_connector.py"]
         )
         self.assertFalse(plan.skip_all_ci)
-        self.assertEqual(plan.lanes, ("verify", "tests"))
+        self.assertEqual(plan.lanes, ("verify", "integration", "tests"))
         self.assertNotIn("unit_tests_general_pr", plan.skip_steps)
         self.assertNotIn("unit_tests_multichip_pr", plan.skip_steps)
+        self.assertNotIn(
+            "integration_k3_pruned75_apc_offload_correctness",
+            plan.skip_steps,
+        )
+        self.assertNotIn("integration_qwen35_gpc_correctness", plan.skip_steps)
+        self.assertIn("integration_compilation_cache_e2e", plan.skip_steps)
         self.assertIn("unit_tests_spec_decode_pr", plan.skip_steps)
         self.assertIn("unit_tests_omni_pr", plan.skip_steps)
 
