@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import codecs
 import itertools
+import json
 import logging
 import os
 import threading
@@ -293,6 +294,23 @@ class _AsciiSafeStreamEncoder:
         return _json_escape_non_ascii(text)
 
 
+def _completion_text(body: bytes, streamed: bool) -> str:
+    if not streamed:
+        payload = json.loads(body)
+        choice = payload["choices"][0]
+        return choice.get("text", choice.get("message", {}).get("content", ""))
+
+    parts = []
+    for line in body.splitlines():
+        if not line.startswith(b"data: ") or line == b"data: [DONE]":
+            continue
+        choice = json.loads(line[6:])["choices"][0]
+        parts.append(
+            choice.get("text", choice.get("delta", {}).get("content", "")) or ""
+        )
+    return "".join(parts)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -472,6 +490,33 @@ async def send_request_to_prefill(
     )
 
 
+async def send_shadow_request_to_prefill(
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
+):
+    """Run the P-side remote-draft lifecycle without exposing its response."""
+    shadow_data = req_data.copy()
+    shadow_data["stream"] = False
+    shadow_data.pop("stream_options", None)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+        **(forwarded or {}),
+    }
+    return await _post_with_retries(
+        client_info,
+        endpoint,
+        shadow_data,
+        headers,
+        request_id,
+        phase="REMOTE_DRAFT",
+    )
+
+
 async def render_completion_prompt(
     client_info: dict,
     endpoint: str,
@@ -584,6 +629,8 @@ async def _handle_completions(api: str, request: Request):
                 req_data, render_response.json()
             )
 
+        remote_dspark = os.getenv("VLLM_TPU_REMOTE_DSPARK_SHADOW", "0") == "1"
+        shadow_task = None
         # Send request to prefill service
         t_prefill_send = time.time()
         t_prefill_send_perf = time.perf_counter()
@@ -591,9 +638,18 @@ async def _handle_completions(api: str, request: Request):
             f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
             flush=True,
         )
-        response = await send_request_to_prefill(
-            prefill_client_info, api, req_data, request_id, forwarded
-        )
+        if remote_dspark:
+            shadow_task = asyncio.create_task(
+                send_shadow_request_to_prefill(
+                    prefill_client_info, api, req_data, request_id, forwarded
+                )
+            )
+            response_json = {}
+        else:
+            response = await send_request_to_prefill(
+                prefill_client_info, api, req_data, request_id, forwarded
+            )
+            response_json = response.json()
         t_prefill_recv = time.time()
         t_prefill_recv_perf = time.perf_counter()
         prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
@@ -603,7 +659,6 @@ async def _handle_completions(api: str, request: Request):
         )
 
         # Extract the needed fields
-        response_json = response.json()
         kv_transfer_params = response_json.get("kv_transfer_params", {})
         kv_uuid = kv_transfer_params.get("uuid") if kv_transfer_params else None
         kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
@@ -634,6 +689,7 @@ async def _handle_completions(api: str, request: Request):
 
         # Stream response from decode service
         async def generate_stream():
+            decode_chunks = []
             try:
                 t_decode_send = time.time()
                 t_decode_send_perf = time.perf_counter()
@@ -661,9 +717,23 @@ async def _handle_completions(api: str, request: Request):
                             flush=True,
                         )
                         first = False
+                    if shadow_task is not None:
+                        decode_chunks.append(chunk)
                     yield chunk
             finally:
                 release_decode()
+                if shadow_task is not None:
+                    shadow_response = await shadow_task
+                    shadow_response.raise_for_status()
+                    shadow_text = _completion_text(shadow_response.content, False)
+                    decode_text = _completion_text(
+                        b"".join(decode_chunks), bool(req_data.get("stream"))
+                    )
+                    if shadow_text != decode_text:
+                        raise RuntimeError(
+                            "remote DSpark shadow/decode output mismatch for "
+                            f"request {request_id}"
+                        )
 
         # text/event-stream when the caller asked for a stream, which is what
         # the decode instance is actually sending back. Declared as

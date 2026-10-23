@@ -178,6 +178,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.spec_decode.remote_dspark import RemoteDSparkTransport
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,
@@ -220,6 +221,9 @@ class ExecuteModelState:
     # logits_list holds the greedy tokens ([rows, 1]), not logits
     # (TPU_GREEDY_TOP_TOKENS).
     top_tokens: bool = False
+    # P-side remote-draft steps reuse D's device rejection output rather than
+    # running the target model and sampler locally.
+    remote_next_tokens_per_chunk: list[torch.Tensor] = field(default_factory=list)
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -613,6 +617,8 @@ class TPUModelRunner(GPUModelRunner):
         draft; the other stages hand their hidden states on and never draft.
         """
         if not self.speculative_config or not self._pp_is_last:
+            return False
+        if getattr(self, "_remote_dspark_role", "") == "consumer":
             return False
         return (
             self.speculative_config.use_eagle()
@@ -1010,6 +1016,28 @@ class TPUModelRunner(GPUModelRunner):
 
         self.speculative_config = self.vllm_config.speculative_config
         speculative_config = self.speculative_config
+        self._remote_dspark_role = envs.VLLM_TPU_REMOTE_DSPARK_ROLE
+        if self._remote_dspark_role not in ("", "producer", "consumer"):
+            raise ValueError(
+                "VLLM_TPU_REMOTE_DSPARK_ROLE must be producer, consumer, or empty"
+            )
+        self._remote_dspark_transport: RemoteDSparkTransport | None = None
+        if self._remote_dspark_role:
+            if speculative_config is None or speculative_config.method != "dspark":
+                raise ValueError("remote DSpark requires speculative method dspark")
+            if self.scheduler_config.async_scheduling:
+                raise ValueError("remote DSpark currently requires sync scheduling")
+            if transfer_config is not None:
+                raise ValueError(
+                    "remote DSpark prototype does not combine with KV transfer"
+                )
+            self._remote_dspark_transport = RemoteDSparkTransport(
+                role=self._remote_dspark_role,
+                producer_host=envs.VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST,
+                port=envs.VLLM_TPU_REMOTE_DSPARK_PORT,
+                rank=self._profiler_rank,
+                timeout_s=envs.VLLM_TPU_REMOTE_DSPARK_TIMEOUT_S,
+            )
         # The producer populates draft context KV without generating proposals.
         self._is_dspark_pd_producer = bool(
             transfer_config is not None
@@ -3770,6 +3798,22 @@ class TPUModelRunner(GPUModelRunner):
         )
         self._dp_step_num_chunks = target_num_chunks
 
+        remote_feedback: dict[str, Any] | None = None
+        if (
+            self._remote_dspark_role == "producer"
+            and scheduler_output.scheduled_spec_decode_tokens
+        ):
+            assert self._remote_dspark_transport is not None
+            remote_feedback = self._remote_dspark_transport.recv_feedback()
+            expected_req_ids = list(
+                self.input_batch.req_ids[: self.input_batch.num_reqs]
+            )
+            if remote_feedback.get("request_ids") != expected_req_ids:
+                raise RuntimeError(
+                    "remote DSpark feedback request order mismatch: expected "
+                    f"{expected_req_ids}, got {remote_feedback.get('request_ids')}"
+                )
+
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
         # explicitly, otherwise the encoder never runs, image placeholder
@@ -3842,7 +3886,9 @@ class TPUModelRunner(GPUModelRunner):
         spec_decode_metadata_list = []
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
         draft_chunks: list[DraftChunkInputs] = []
-        is_draft_model = self._is_async_drafter
+        is_draft_model = self._is_async_drafter or (
+            self._remote_dspark_role == "consumer"
+        )
         top_tokens = self._greedy_top_tokens_this_step()
 
         # NOTE: setup current batch's metadata for kv connector.
@@ -4022,12 +4068,29 @@ class TPUModelRunner(GPUModelRunner):
                 ),
                 self._stage_timing.stage("main_forward"),
             ):
-                hidden_states, aux_hidden_states = self.forward_model(
-                    input_ids=input_ids,
-                    positions=self.position_ids,
-                    inputs_embeds=inputs_embeds,
-                    intermediate_tensors=intermediate_tensors,
-                )
+                if remote_feedback is None:
+                    hidden_states, aux_hidden_states = self.forward_model(
+                        input_ids=input_ids,
+                        positions=self.position_ids,
+                        inputs_embeds=inputs_embeds,
+                        intermediate_tensors=intermediate_tensors,
+                    )
+                else:
+                    feedback_chunks = remote_feedback["aux_hidden_states"]
+                    if chunk_index >= len(feedback_chunks):
+                        raise RuntimeError(
+                            "remote DSpark feedback has fewer chunks than the "
+                            "producer batch"
+                        )
+                    aux_hidden_states = [
+                        tensor.to(self.device, non_blocking=True)
+                        for tensor in feedback_chunks[chunk_index]
+                    ]
+                    hidden_states = torch.empty(
+                        (num_tokens_padded, 1),
+                        dtype=aux_hidden_states[0].dtype,
+                        device=self.device,
+                    )
 
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
@@ -4045,7 +4108,9 @@ class TPUModelRunner(GPUModelRunner):
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
             layout_plan = self._last_sequence_layout_plan
-            if self.is_pooling_model:
+            if remote_feedback is not None:
+                logits = torch.empty((0,), device=self.device)
+            elif self.is_pooling_model:
                 hidden_states = sequence_layout_planner.finalize_hidden_states(
                     hidden_states,
                     layout_plan,
@@ -4148,6 +4213,14 @@ class TPUModelRunner(GPUModelRunner):
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
             top_tokens=top_tokens,
+            remote_next_tokens_per_chunk=(
+                [
+                    tensor.to(self.device, non_blocking=True)
+                    for tensor in remote_feedback["next_tokens_per_chunk"]
+                ]
+                if remote_feedback is not None
+                else []
+            ),
         )
 
         if self.is_pooling_model:
@@ -4251,7 +4324,47 @@ class TPUModelRunner(GPUModelRunner):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self.spec_decode_manager is None:
             return None
-        return self.spec_decode_manager.take_draft_token_ids()
+        transport = self._remote_dspark_transport
+        if self._remote_dspark_role == "consumer":
+            assert transport is not None
+            request_ids, token_ids = transport.recv_proposal()
+            return DraftTokenIds(request_ids, token_ids)
+        drafts = self.spec_decode_manager.take_draft_token_ids()
+        if self._remote_dspark_role == "producer" and drafts is not None:
+            assert transport is not None
+            transport.send_proposal(drafts.req_ids, drafts.draft_token_ids)
+        return drafts
+
+    def _send_remote_dspark_feedback(
+        self,
+        request_ids: list[str],
+        next_tokens_per_chunk: list[torch.Tensor],
+        draft_chunks: list[DraftChunkInputs],
+    ) -> None:
+        transport = self._remote_dspark_transport
+        assert transport is not None
+        aux_hidden_states: list[list[torch.Tensor]] = []
+        for chunk in draft_chunks:
+            aux = chunk.aux_hidden_states
+            tensors = list(aux) if isinstance(aux, (list, tuple)) else [aux]
+            if not tensors or any(
+                not isinstance(tensor, torch.Tensor) for tensor in tensors
+            ):
+                raise RuntimeError(
+                    "remote DSpark consumer did not capture target aux hidden states"
+                )
+            aux_hidden_states.append(
+                [tensor.detach().cpu() for tensor in cast(list[torch.Tensor], tensors)]
+            )
+        transport.send_feedback(
+            {
+                "request_ids": request_ids,
+                "next_tokens_per_chunk": [
+                    tensor.detach().cpu() for tensor in next_tokens_per_chunk
+                ],
+                "aux_hidden_states": aux_hidden_states,
+            }
+        )
 
     def _get_sampling_generator(self) -> torch.Generator:
         """Return the dedicated non-greedy sampling generator, seeded once.
@@ -4645,6 +4758,24 @@ class TPUModelRunner(GPUModelRunner):
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
             self._update_num_xla_graphs("pooling_step")
+        elif state.remote_next_tokens_per_chunk:
+            if not is_spec_step or grammar_output is not None or needs_logprobs:
+                raise RuntimeError(
+                    "remote DSpark producer only supports greedy verify steps "
+                    "without grammar or logprobs"
+                )
+            if len(state.remote_next_tokens_per_chunk) != len(state.num_reqs_list):
+                raise RuntimeError(
+                    "remote DSpark feedback chunk count does not match the batch"
+                )
+            for next_tokens, num_reqs in zip(
+                state.remote_next_tokens_per_chunk,
+                state.num_reqs_list,
+                strict=True,
+            ):
+                combined_selected_tokens.append(next_tokens)
+                combined_selected_tokens_real_lens.append(num_reqs)
+                next_tokens_per_chunk.append(next_tokens)
         elif is_spec_step:
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
@@ -4863,6 +4994,11 @@ class TPUModelRunner(GPUModelRunner):
         discard_sampled_tokens_req_indices = []
         num_reqs = self.input_batch.num_reqs
         req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+
+        if self._remote_dspark_role == "consumer" and is_spec_step:
+            self._send_remote_dspark_feedback(
+                req_ids, next_tokens_per_chunk, state.draft_chunks
+            )
 
         request_seq_lens = []
         for i, req_id in enumerate(req_ids):
@@ -5256,6 +5392,13 @@ class TPUModelRunner(GPUModelRunner):
             # shared op rejects them with RuntimeProgramInputMismatch while
             # precompiling the draft buckets.
             self._relayout_tables(getattr(self.drafter, "draft_model", None))
+        elif self._remote_dspark_role == "consumer":
+            assert isinstance(self.drafter, DSparkProposer)
+            self.drafter.tag_target_aux_hidden_state_layers(self.model)
+            logger.info(
+                "Remote DSpark consumer registered target aux layers without "
+                "loading draft weights."
+            )
 
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:

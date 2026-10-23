@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import heapq
 import json
 from typing import Any
 
@@ -40,6 +41,114 @@ class Inputs:
     d2p_latency_us: float
     d2p_bandwidth_gbps: float
     mean_accepted_tokens: float
+
+
+@dataclasses.dataclass(frozen=True)
+class StageInterval:
+    stage: str
+    request_index: int
+    round_id: int
+    start_ms: float
+    end_ms: float
+
+
+def simulate_pipeline(
+    *,
+    p_stage_ms: float,
+    d_stage_ms: float,
+    num_requests: int,
+    rounds_per_request: int,
+) -> dict[str, Any]:
+    """Schedule dependent P/D rounds on two independent workers.
+
+    Requests are FIFO within each stage. A request's D round starts after its
+    P round; its next P round starts after that D feedback. Independent
+    requests may occupy the other stage during either wait.
+    """
+    positive = {
+        "p_stage_ms": p_stage_ms,
+        "d_stage_ms": d_stage_ms,
+        "num_requests": num_requests,
+        "rounds_per_request": rounds_per_request,
+    }
+    for name, value in positive.items():
+        if value <= 0:
+            raise ValueError(f"{name} must be positive, got {value}")
+
+    sequence = 0
+    ready: list[tuple[float, int, str, int, int]] = []
+    for request_index in range(num_requests):
+        heapq.heappush(ready, (0.0, sequence, "p", request_index, 0))
+        sequence += 1
+    available_at = {"p": 0.0, "d": 0.0}
+    intervals: list[StageInterval] = []
+
+    while ready:
+        dependency_ready, _, stage, request_index, round_id = heapq.heappop(ready)
+        start_ms = max(dependency_ready, available_at[stage])
+        duration_ms = p_stage_ms if stage == "p" else d_stage_ms
+        end_ms = start_ms + duration_ms
+        available_at[stage] = end_ms
+        intervals.append(
+            StageInterval(stage, request_index, round_id, start_ms, end_ms)
+        )
+        if stage == "p":
+            next_stage = "d"
+            next_round = round_id
+        elif round_id + 1 < rounds_per_request:
+            next_stage = "p"
+            next_round = round_id + 1
+        else:
+            continue
+        heapq.heappush(
+            ready,
+            (end_ms, sequence, next_stage, request_index, next_round),
+        )
+        sequence += 1
+
+    p_intervals = [interval for interval in intervals if interval.stage == "p"]
+    d_intervals = [interval for interval in intervals if interval.stage == "d"]
+    overlap_ms = _overlap_ms(p_intervals, d_intervals)
+    makespan_ms = max(interval.end_ms for interval in intervals)
+    colocated_ms = num_requests * rounds_per_request * (p_stage_ms + d_stage_ms)
+    return {
+        "makespan_ms": makespan_ms,
+        "colocated_ms": colocated_ms,
+        "overlap_ms": overlap_ms,
+        "speedup_vs_colocated": colocated_ms / makespan_ms,
+        "p_utilization": sum(
+            interval.end_ms - interval.start_ms for interval in p_intervals
+        )
+        / makespan_ms,
+        "d_utilization": sum(
+            interval.end_ms - interval.start_ms for interval in d_intervals
+        )
+        / makespan_ms,
+        "timeline": [dataclasses.asdict(interval) for interval in intervals],
+    }
+
+
+def _overlap_ms(
+    p_intervals: list[StageInterval], d_intervals: list[StageInterval]
+) -> float:
+    p_intervals.sort(key=lambda interval: interval.start_ms)
+    d_intervals.sort(key=lambda interval: interval.start_ms)
+    p_index = 0
+    d_index = 0
+    overlap = 0.0
+    while p_index < len(p_intervals) and d_index < len(d_intervals):
+        p_interval = p_intervals[p_index]
+        d_interval = d_intervals[d_index]
+        overlap += max(
+            0.0,
+            min(p_interval.end_ms, d_interval.end_ms)
+            - max(p_interval.start_ms, d_interval.start_ms),
+        )
+        if p_interval.end_ms <= d_interval.end_ms:
+            p_index += 1
+        else:
+            d_index += 1
+    return overlap
 
 
 def _transfer_ms(payload_bytes: int, latency_us: float, bandwidth_gbps: float) -> float:
@@ -184,6 +293,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--d2p-latency-us", type=float, required=True)
     parser.add_argument("--d2p-bandwidth-gbps", type=float, required=True)
     parser.add_argument("--mean-accepted-tokens", type=float, required=True)
+    parser.add_argument("--simulate-requests", type=int, default=0)
+    parser.add_argument("--simulate-rounds", type=int, default=1)
     return parser.parse_args()
 
 
@@ -195,7 +306,15 @@ def main() -> None:
             for field in dataclasses.fields(Inputs)
         }
     )
-    print(json.dumps(evaluate(inputs), indent=2, sort_keys=True))
+    result = evaluate(inputs)
+    if args.simulate_requests:
+        result["simulation"] = simulate_pipeline(
+            p_stage_ms=result["stage_ms"]["p"],
+            d_stage_ms=result["stage_ms"]["d"],
+            num_requests=args.simulate_requests,
+            rounds_per_request=args.simulate_rounds,
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

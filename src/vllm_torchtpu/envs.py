@@ -114,6 +114,10 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
+    VLLM_TPU_REMOTE_DSPARK_ROLE: str = ""
+    VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST: str = ""
+    VLLM_TPU_REMOTE_DSPARK_PORT: int = 29800
+    VLLM_TPU_REMOTE_DSPARK_TIMEOUT_S: float = 900.0
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -824,6 +828,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # effect for models whose ops implement that pass (DeepSeek-V4); 0 keeps
     # every verify window on the mixed pass.
     "TPU_SPEC_STATIC_VERIFY": env_bool("TPU_SPEC_STATIC_VERIFY", default=True),
+    # Experimental 1P1D DSpark split. One full-duplex stream connects matching
+    # TP ranks; producer owns draft state, consumer owns target verification.
+    "VLLM_TPU_REMOTE_DSPARK_ROLE": env_str("VLLM_TPU_REMOTE_DSPARK_ROLE", ""),
+    "VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST": env_str(
+        "VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST", ""
+    ),
+    "VLLM_TPU_REMOTE_DSPARK_PORT": env_int("VLLM_TPU_REMOTE_DSPARK_PORT", 29800),
+    "VLLM_TPU_REMOTE_DSPARK_TIMEOUT_S": env_float(
+        "VLLM_TPU_REMOTE_DSPARK_TIMEOUT_S", 900.0
+    ),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),

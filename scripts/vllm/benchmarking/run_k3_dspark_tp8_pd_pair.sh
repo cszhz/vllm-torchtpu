@@ -44,6 +44,21 @@ export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/tpu_logs/uv-cache}"
 mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR"
 ulimit -c 0
 
+config="${K3_DSPARK_PD_CONFIG:-kimi-k3-pruned75-dspark-tp8-ep-1p1d}"
+remote_dspark=0
+if [[ "$config" == kimi-k3-pruned75-dspark-tp8-ep-remote ]]; then
+    remote_dspark=1
+    peer=decode
+    [[ "$role" == prefill ]] || peer=prefill
+    until [[ -f "$coord/$peer.ip" ]]; do sleep 2; done
+    export VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST
+    if [[ "$role" == prefill ]]; then
+        VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST="$role_ip"
+    else
+        VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST="$(<"$coord/prefill.ip")"
+    fi
+fi
+
 server_pid=""
 proxy_pid=""
 # shellcheck disable=SC2317  # Invoked through the EXIT trap.
@@ -67,7 +82,7 @@ RESULTS_DIR="$server_out" \
 CAPTURE_PROFILE=1 \
 K3_DSPARK_PD_ROLE="$role" \
   bash scripts/vllm/benchmarking/run_benchmarks.sh \
-    --config kimi-k3-pruned75-dspark-tp8-ep-1p1d --serve-only &
+    --config "$config" --serve-only &
 server_pid=$!
 
 deadline=$((SECONDS + 14400))
@@ -109,7 +124,8 @@ if [[ "$role" == decode ]]; then
     done
 else
     decode_ip="$(<"$coord/decode.ip")"
-    python3 examples/disagg/toy_proxy_server.py \
+    VLLM_TPU_REMOTE_DSPARK_SHADOW="$remote_dspark" \
+      python3 examples/disagg/toy_proxy_server.py \
         --host 0.0.0.0 --port 8050 \
         --prefiller-hosts 127.0.0.1 --prefiller-ports 8000 \
         --decoder-hosts "$decode_ip" --decoder-ports 8000 \
@@ -136,15 +152,26 @@ else
     "${bench[@]}" --num-prompts 8 \
         --save-result --result-filename "$out/warmup.json"
 
-    curl -fsS --max-time 3 http://127.0.0.1:8000/health >/dev/null
-    curl -fsS --max-time 3 "http://$decode_ip:8000/health" >/dev/null
-    curl -fsS -X POST http://127.0.0.1:8000/start_profile >/dev/null
-    curl -fsS -X POST "http://$decode_ip:8000/start_profile" >/dev/null
+    capture_profile="${K3_DSPARK_PD_CAPTURE_PROFILE:-1}"
+    if [[ "$capture_profile" == 1 ]]; then
+        curl -fsS --max-time 3 http://127.0.0.1:8000/health >/dev/null
+        curl -fsS --max-time 3 "http://$decode_ip:8000/health" >/dev/null
+        curl -fsS -X POST http://127.0.0.1:8000/start_profile >/dev/null
+        curl -fsS -X POST "http://$decode_ip:8000/start_profile" >/dev/null
+    fi
     "${bench[@]}" --num-prompts 8 \
         --save-result --result-filename "$out/measurement.json"
-    curl -fsS -X POST http://127.0.0.1:8000/stop_profile >/dev/null
-    curl -fsS -X POST "http://$decode_ip:8000/stop_profile" >/dev/null
+    if [[ "$capture_profile" == 1 ]]; then
+        curl -fsS -X POST http://127.0.0.1:8000/stop_profile >/dev/null
+        curl -fsS -X POST "http://$decode_ip:8000/stop_profile" >/dev/null
+    fi
+    curl -fsS http://127.0.0.1:8000/metrics >"$out/prefill.metrics"
+    curl -fsS "http://$decode_ip:8000/metrics" >"$out/decode.metrics"
     touch "$coord/benchmark.done"
+fi
+
+if [[ "${K3_DSPARK_PD_CAPTURE_PROFILE:-1}" != 1 ]]; then
+    exit 0
 fi
 
 for _ in $(seq 1 120); do

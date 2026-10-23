@@ -82,6 +82,32 @@ def test_same_request_latency_is_not_reported_as_pipeline_latency():
     )
 
 
+def test_simulation_overlaps_independent_requests_across_stages():
+    result = dspark_pd_cost_model.simulate_pipeline(
+        p_stage_ms=2.0,
+        d_stage_ms=4.0,
+        num_requests=2,
+        rounds_per_request=2,
+    )
+
+    assert result["makespan_ms"] == pytest.approx(18.0)
+    assert result["colocated_ms"] == pytest.approx(24.0)
+    assert result["overlap_ms"] == pytest.approx(6.0)
+    assert result["speedup_vs_colocated"] == pytest.approx(4 / 3)
+
+
+def test_single_request_has_no_pipeline_speedup():
+    result = dspark_pd_cost_model.simulate_pipeline(
+        p_stage_ms=2.0,
+        d_stage_ms=4.0,
+        num_requests=1,
+        rounds_per_request=4,
+    )
+
+    assert result["overlap_ms"] == 0
+    assert result["speedup_vs_colocated"] == 1
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("batch_size", 0), ("d2p_bandwidth_gbps", 0.0), ("verify_ms", -0.1)],
