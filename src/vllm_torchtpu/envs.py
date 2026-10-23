@@ -125,6 +125,8 @@ if TYPE_CHECKING:
     TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
     TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE: int = 64
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_SMALL_ALL_REDUCE: bool = False
+    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -940,6 +942,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
+    ),
+    # Sum small bf16 TP all-reduces with the Pallas two-shot kernel
+    # (kernels/experimental/small_collectives) over the TP group's cores of the
+    # expert-parallel mesh, instead of XLA's all-reduce. Needs an EP mesh.
+    "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE"),
+    # Largest block, in rows, the kernel takes; XLA sums larger ones inside the
+    # same op. 0 keeps small_all_reduce_op.MAX_ROWS.
+    "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
     ),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [

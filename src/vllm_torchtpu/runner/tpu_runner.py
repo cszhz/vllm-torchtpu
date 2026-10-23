@@ -5375,6 +5375,9 @@ class TPUModelRunner(GPUModelRunner):
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
+        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+        small_all_reduce_op.prebuild()
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.adapter.linear_common import (
