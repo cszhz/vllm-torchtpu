@@ -111,6 +111,43 @@ def test_feedback_channel_does_not_require_a_rank_local_proposal():
         assert feedback["round_id"] == round_id
 
 
+def test_next_proposal_can_abandon_terminal_round_without_feedback():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    producer: list[RemoteDSparkTransport] = []
+
+    def accept_producer() -> None:
+        producer.append(
+            RemoteDSparkTransport(
+                role="producer",
+                producer_host="127.0.0.1",
+                port=port,
+                rank=0,
+                timeout_s=5,
+            )
+        )
+
+    accept_thread = threading.Thread(target=accept_producer)
+    accept_thread.start()
+    consumer = RemoteDSparkTransport(
+        role="consumer",
+        producer_host="127.0.0.1",
+        port=port,
+        rank=0,
+        timeout_s=5,
+    )
+    accept_thread.join(timeout=5)
+
+    producer[0].send_proposal(["finished"], [[11]])
+    assert consumer.recv_proposal() == (["finished"], [[11]])
+    producer[0].send_proposal(["next"], [[12]])
+    assert consumer.recv_proposal() == (["next"], [[12]])
+    consumer.send_feedback({"request_ids": ["next"]})
+    assert producer[0].recv_feedback()["round_id"] == 1
+
+
 def _proposal(request_id: str, round_id: int, kv_version: int) -> DraftProposal:
     return DraftProposal(request_id, round_id, kv_version, (11, 12, 13, 14, 15))
 

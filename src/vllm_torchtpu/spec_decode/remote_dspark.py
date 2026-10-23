@@ -82,6 +82,7 @@ class RemoteDSparkTransport:
         self.role = role
         self.rank = rank
         self._round_id = 0
+        self._proposal_outstanding = False
         address = (producer_host, port + rank)
         if role == "producer":
             stream = self._accept(address, timeout_s)
@@ -147,6 +148,13 @@ class RemoteDSparkTransport:
     def send_proposal(self, request_ids: list[str], token_ids: list[list[int]]) -> None:
         if self.role != "producer":
             raise RemoteDraftProtocolError("only the producer sends proposals")
+        if self._proposal_outstanding:
+            if self.rank == 0:
+                logger.info(
+                    "Remote DSpark abandoning terminal proposal: round=%d",
+                    self._round_id,
+                )
+            self._round_id += 1
         if self.rank == 0:
             logger.info(
                 "Remote DSpark proposal send: round=%d requests=%d lengths=%s",
@@ -162,11 +170,30 @@ class RemoteDSparkTransport:
                 "token_ids": token_ids,
             }
         )
+        self._proposal_outstanding = True
 
     def recv_proposal(self) -> tuple[list[str], list[list[int]]]:
         if self.role != "consumer":
             raise RemoteDraftProtocolError("only the consumer receives proposals")
-        message = self._recv_round("proposal")
+        message = self._recv()
+        round_id = message.get("round_id")
+        if (
+            message.get("kind") != "proposal"
+            or not isinstance(round_id, int)
+            or round_id not in (self._round_id, self._round_id + 1)
+        ):
+            raise RemoteDraftProtocolError(
+                f"remote DSpark rank {self.rank} expected proposal round "
+                f"{self._round_id} or {self._round_id + 1}, got "
+                f"{message.get('kind')} round {round_id}"
+            )
+        if round_id == self._round_id + 1:
+            if self.rank == 0:
+                logger.info(
+                    "Remote DSpark consumer skipped terminal feedback: round=%d",
+                    self._round_id,
+                )
+            self._round_id = round_id
         if self.rank == 0:
             logger.info(
                 "Remote DSpark proposal receive: round=%d requests=%d",
@@ -197,6 +224,7 @@ class RemoteDSparkTransport:
                 self._round_id,
                 len(message.get("request_ids", ())),
             )
+        self._proposal_outstanding = False
         self._round_id += 1
         return message
 

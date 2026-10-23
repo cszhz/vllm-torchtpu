@@ -143,9 +143,18 @@ if [[ "$role" == decode ]]; then
     done
 else
     decode_ip="$(read_nonempty_file "$coord/decode.ip")"
+    concurrency="${K3_DSPARK_PD_CONCURRENCY:-8}"
+    num_prompts="${K3_DSPARK_PD_NUM_PROMPTS:-8}"
+    warmup_prompts="${K3_DSPARK_PD_WARMUP_PROMPTS:-$num_prompts}"
+    remote_batch_size="$concurrency"
+    remote_bypass_requests=0
+    if ((remote_dspark && concurrency > 1)); then
+        remote_batch_size=$((concurrency - 1))
+        remote_bypass_requests=1
+    fi
     VLLM_TPU_REMOTE_DSPARK_SHADOW="$remote_dspark" \
-      VLLM_TPU_REMOTE_DSPARK_BATCH_SIZE=7 \
-      VLLM_TPU_REMOTE_DSPARK_BYPASS_REQUESTS=1 \
+      VLLM_TPU_REMOTE_DSPARK_BATCH_SIZE="$remote_batch_size" \
+      VLLM_TPU_REMOTE_DSPARK_BYPASS_REQUESTS="$remote_bypass_requests" \
       python3 examples/disagg/toy_proxy_server.py \
         --host 0.0.0.0 --port 8050 \
         --prefiller-hosts 127.0.0.1 --prefiller-ports 8000 \
@@ -195,12 +204,14 @@ PY
         --dataset-name random
         --random-input-len "${K3_DSPARK_PD_INPUT_LEN:-1024}"
         --random-output-len 256
-        --random-range-ratio 0 --max-concurrency 8 --request-rate inf
+        --random-range-ratio 0 --max-concurrency "$concurrency" --request-rate inf
         --percentile-metrics "ttft,tpot,itl,e2el" --ignore-eos --temperature 0
         --seed 42
     )
-    "${bench[@]}" --num-prompts 8 \
-        --save-result --result-filename "$out/warmup.json"
+    if ((warmup_prompts > 0)); then
+        "${bench[@]}" --num-prompts "$warmup_prompts" \
+            --save-result --result-filename "$out/warmup.json"
+    fi
 
     capture_profile="${K3_DSPARK_PD_CAPTURE_PROFILE:-1}"
     if [[ "$capture_profile" == 1 ]]; then
@@ -209,8 +220,21 @@ PY
         curl -fsS -X POST http://127.0.0.1:8000/start_profile >/dev/null
         curl -fsS -X POST "http://$decode_ip:8000/start_profile" >/dev/null
     fi
-    "${bench[@]}" --num-prompts 8 \
+    "${bench[@]}" --num-prompts "$num_prompts" \
         --save-result --result-filename "$out/measurement.json"
+    python3 - "$out/measurement.json" "$num_prompts" <<'PY'
+import json
+import sys
+
+path, expected = sys.argv[1], int(sys.argv[2])
+with open(path) as result_file:
+    result = json.load(result_file)
+completed = result.get("completed", result.get("successful_requests"))
+if completed != expected:
+    raise RuntimeError(
+        f"benchmark completed {completed!r} requests; expected {expected}"
+    )
+PY
     if [[ "$capture_profile" == 1 ]]; then
         curl -fsS -X POST http://127.0.0.1:8000/stop_profile >/dev/null
         curl -fsS -X POST "http://$decode_ip:8000/stop_profile" >/dev/null
