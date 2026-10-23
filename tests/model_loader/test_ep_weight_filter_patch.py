@@ -19,6 +19,9 @@ vLLM 0.27.0's ``should_skip_weight`` only matches names ending in
 widens the suffix allowlist. No TPU, no network.
 """
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from vllm_torchtpu import model_loader_patches
@@ -210,6 +213,27 @@ def test_lazy_iterator_filters_remote_packed_and_scale(tmp_path, monkeypatch):
 _E = "model.layers.0.mlp.experts"
 
 
+@pytest.mark.parametrize(
+    ("world_size", "local_world_size", "expected"),
+    [(8, 8, True), (16, 8, False)],
+)
+def test_single_host_parallel_world(
+    monkeypatch, world_size, local_world_size, expected
+):
+    import vllm.config
+
+    parallel_config = SimpleNamespace(
+        world_size=world_size, local_world_size=local_world_size
+    )
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(parallel_config=parallel_config),
+    )
+
+    assert model_loader_patches._is_single_host_parallel_world() is expected
+
+
 def _save_shard(tmp_path):
     from safetensors.torch import save_file
 
@@ -334,6 +358,9 @@ def test_prefetch_strategy_under_filter_switches_to_lazy(tmp_path, monkeypatch):
         "_start_ep_range_prefetch",
         lambda files, ids, threads, block: prefetches.append((files, ids)),
     )
+    monkeypatch.setattr(
+        model_loader_patches, "_is_single_host_parallel_world", lambda: False
+    )
     patch_default_loader_ep_weight_filter()
     iterator = weight_utils.safetensors_weights_iterator
 
@@ -349,3 +376,45 @@ def test_prefetch_strategy_under_filter_switches_to_lazy(tmp_path, monkeypatch):
     list(iterator([shard], False, "prefetch", local_expert_ids=None))
     assert strategies == ["lazy", "prefetch"]
     assert len(prefetches) == 1
+
+
+def test_single_host_prefetch_uses_upstream_whole_file_strategy(tmp_path, monkeypatch):
+    from vllm.model_executor.model_loader import ep_weight_filter, weight_utils
+
+    shard = _save_shard(tmp_path)
+    monkeypatch.setattr(
+        weight_utils, "should_skip_weight", weight_utils.should_skip_weight
+    )
+    monkeypatch.setattr(
+        ep_weight_filter, "should_skip_weight", ep_weight_filter.should_skip_weight
+    )
+    monkeypatch.setattr(weight_utils, "_tpu_ep_filter_patch", False, raising=False)
+    _restore_iterators(monkeypatch)
+
+    original = weight_utils.safetensors_weights_iterator
+    strategies = []
+
+    def recording_iterator(files, use_tqdm, strategy=None, local_ids=None, **kw):
+        strategies.append(strategy)
+        return original(files, use_tqdm, strategy, local_ids, **kw)
+
+    monkeypatch.setattr(
+        weight_utils, "safetensors_weights_iterator", recording_iterator
+    )
+    monkeypatch.setattr(
+        model_loader_patches,
+        "_start_ep_range_prefetch",
+        lambda *args: pytest.fail("single-host load must use upstream prefetch"),
+    )
+    monkeypatch.setattr(
+        model_loader_patches, "_is_single_host_parallel_world", lambda: True
+    )
+    patch_default_loader_ep_weight_filter()
+
+    list(
+        weight_utils.safetensors_weights_iterator(
+            [shard], False, "prefetch", local_expert_ids={0}
+        )
+    )
+
+    assert strategies == ["prefetch"]

@@ -513,7 +513,12 @@ def patch_default_loader_ep_weight_filter() -> None:
         local_expert_ids=None,
         **kwargs,
     ):
-        if safetensors_load_strategy == "prefetch" and local_expert_ids is not None:
+        use_ep_range_prefetch = (
+            safetensors_load_strategy == "prefetch"
+            and local_expert_ids is not None
+            and not _is_single_host_parallel_world()
+        )
+        if use_ep_range_prefetch:
             _start_ep_range_prefetch(
                 sorted(hf_weights_files, key=weight_utils._natural_sort_key),
                 local_expert_ids,
@@ -527,6 +532,11 @@ def patch_default_loader_ep_weight_filter() -> None:
                 ),
             )
             safetensors_load_strategy = "lazy"
+        elif safetensors_load_strategy == "prefetch" and local_expert_ids is not None:
+            logger.info_once(
+                "[ep-prefetch] single-host parallel world; using upstream "
+                "whole-file rank-sharded prefetch."
+            )
         return original_iterator(
             hf_weights_files,
             use_tqdm_on_load,
@@ -540,9 +550,16 @@ def patch_default_loader_ep_weight_filter() -> None:
     weight_utils._tpu_ep_filter_patch = True
     logger.info(
         "Applied TPU patch: EP weight filter covers "
-        ".weight_packed/.weight_scale/.scale, and prefetch reads only "
-        "local tensors (DefaultModelLoader)."
+        ".weight_packed/.weight_scale/.scale, and multi-host prefetch reads "
+        "only local tensors (DefaultModelLoader)."
     )
+
+
+def _is_single_host_parallel_world() -> bool:
+    from vllm.config import get_current_vllm_config
+
+    parallel_config = get_current_vllm_config().parallel_config
+    return parallel_config.world_size == parallel_config.local_world_size
 
 
 def _local_tensor_ranges(
