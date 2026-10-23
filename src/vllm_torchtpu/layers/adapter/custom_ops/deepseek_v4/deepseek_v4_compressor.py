@@ -99,6 +99,11 @@ def _run_compressor(
         rms_eps=rms_eps,
         quant_block=quant_block,
         seq_along_lane=seq_along_lane,
+        proj_runs_min_tokens=envs.TPU_DSV4_COMPRESSOR_PROJ_RUNS_MIN_TOKENS,
+        proj_runs_tile_n=envs.TPU_DSV4_COMPRESSOR_PROJ_RUNS_TILE_N,
+        proj_runs_indexer=envs.TPU_DSV4_COMPRESSOR_PROJ_RUNS_INDEXER,
+        prefill_block=envs.TPU_DSV4_COMPRESSOR_PREFILL_BLOCK,
+        prefill_block_min_tokens=envs.TPU_DSV4_COMPRESSOR_PREFILL_BLOCK_MIN_TOKENS,
     )
 
 

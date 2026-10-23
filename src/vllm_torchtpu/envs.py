@@ -131,6 +131,11 @@ if TYPE_CHECKING:
     TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK: tuple[int, int, int] = (64, 128, 64)
     TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
     TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE: int = 64
+    TPU_DSV4_COMPRESSOR_PROJ_RUNS_MIN_TOKENS: int = 128
+    TPU_DSV4_COMPRESSOR_PROJ_RUNS_TILE_N: int = 512
+    TPU_DSV4_COMPRESSOR_PROJ_RUNS_INDEXER: bool = False
+    TPU_DSV4_COMPRESSOR_PREFILL_BLOCK: int = 128
+    TPU_DSV4_COMPRESSOR_PREFILL_BLOCK_MIN_TOKENS: int = 128
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_SMALL_ALL_REDUCE: bool = True
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
@@ -985,6 +990,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK": env_positive_int_triple(
         "TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK", (1, 32, 32)
+    ),
+    # DSv4 compressor state projection (proj_and_save_state): calls of at least
+    # this many tokens write one DMA per page-contiguous run of token states
+    # instead of one per token and half-state (same bytes). 0 disables.
+    "TPU_DSV4_COMPRESSOR_PROJ_RUNS_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DSV4_COMPRESSOR_PROJ_RUNS_MIN_TOKENS", 128
+    ),
+    "TPU_DSV4_COMPRESSOR_PROJ_RUNS_TILE_N": env_positive_int(
+        "TPU_DSV4_COMPRESSOR_PROJ_RUNS_TILE_N", 512
+    ),
+    # Also the 128-dim indexer compressor (not bit-exact: last-bit differences
+    # in the score half of the state).
+    "TPU_DSV4_COMPRESSOR_PROJ_RUNS_INDEXER": env_bool(
+        "TPU_DSV4_COMPRESSOR_PROJ_RUNS_INDEXER"
+    ),
+    # DSv4 compress-norm-rope-store of a step's prefill boundaries in blocks of
+    # this many compressed tokens (prefill_block.py), CSA and the SAL indexer,
+    # for calls of at least ..._MIN_TOKENS tokens. 0 disables.
+    "TPU_DSV4_COMPRESSOR_PREFILL_BLOCK": env_nonnegative_int(
+        "TPU_DSV4_COMPRESSOR_PREFILL_BLOCK", 128
+    ),
+    "TPU_DSV4_COMPRESSOR_PREFILL_BLOCK_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DSV4_COMPRESSOR_PREFILL_BLOCK_MIN_TOKENS", 128
     ),
     # CSA: query tokens per gather + attention chunk of the sparse attention
     # (sparse_ragged_paged_attention). Steps of at most 128 tokens keep 32.

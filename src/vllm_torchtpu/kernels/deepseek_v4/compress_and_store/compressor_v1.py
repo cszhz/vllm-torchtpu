@@ -18,6 +18,7 @@ import jax.numpy as jnp
 
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.config as config
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.kernel as compress_kernel
+import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.prefill_block as prefill_block_kernel
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.proj_and_save_state as proj_kernel  # noqa: E501
 
 
@@ -248,6 +249,11 @@ def compressor_forward(
     quant_block: int,
     state_cache: jax.Array | None = None,  # [num_pages, state_page_size, 4, 128] uint8
     seq_along_lane: bool = False,  # indexer only: `cache` is SEQ_ALONG_LANE
+    proj_runs_min_tokens: int = 0,  # see `proj_and_save_state`
+    proj_runs_tile_n: int = 512,
+    proj_runs_indexer: bool = False,  # runs path for the 128-dim indexer too
+    prefill_block: int = 0,  # see `prefill_block`; 0 disables
+    prefill_block_min_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array | None, jax.Array]:
     """Projects, saves state, then compresses and stores the boundary records."""
     num_tokens = positions.shape[0]
@@ -281,6 +287,12 @@ def compressor_forward(
         slot_mapping=slot_mapping_slots,
         cache=cache if shares_buffer else state_cache,
         compress_ratio=compress_ratio,
+        # The indexer's runs bytes differ from `kernel`'s in the last bits of
+        # the score half (same f64 distance); opt in only.
+        runs_min_tokens=(
+            proj_runs_min_tokens if head_dim != 128 or proj_runs_indexer else 0
+        ),
+        runs_tile_n=proj_runs_tile_n,
     )
     if shares_buffer:
         cache = updated_state
@@ -289,6 +301,42 @@ def compressor_forward(
 
     is_decode_token = token_index < query_start_loc[distribution[0]]
     is_boundary = (kv_slot_mapping >= 0) & is_real_token
+
+    use_block = (
+        prefill_block > 0
+        and num_tokens >= max(prefill_block_min_tokens, 1)
+        and overlap
+        and compress_ratio == config.CSA_COMPRESS_RATIO
+        and (head_dim == 512 or seq_along_lane)
+        and cos_sin_cache is not None
+    )
+    plan = None
+    if use_block:
+        cfgs = config.Configs.make(
+            config.select_mode(head_dim, overlap),
+            size_n=num_tokens,
+            physical_page_size=cache.shape[1],
+            state_block_size=state_block_size,
+            head_dim=head_dim,
+            compress_ratio=compress_ratio,
+            seq_along_lane=seq_along_lane,
+            sal_page_size=cache.shape[-1] if seq_along_lane else None,
+        )
+        plan = prefill_block_kernel.plan_blocks(
+            positions,
+            query_start_loc,
+            distribution,
+            token_to_req_indices,
+            block_table,
+            kv_block_table,
+            cos_sin_cache,
+            block=prefill_block,
+            compress_ratio=compress_ratio,
+            state_block_size=state_block_size,
+            kv_block_size=cfgs.kv_block_size,
+            seq_along_lane=seq_along_lane,
+        )
+        is_boundary = is_boundary & ~plan.in_block
 
     boundary_positions, boundary_req, boundary_kv_slot = prepare_boundary_batch(
         positions=positions,
@@ -318,6 +366,20 @@ def compressor_forward(
         rms_eps=rms_eps,
         seq_along_lane=seq_along_lane,
     )
+
+    if plan is not None:
+        cache, rope_cache = prefill_block_kernel.prefill_block_compress(
+            cache,
+            rope_cache,
+            plan,
+            norm_weight,
+            state_block_size=state_block_size,
+            compress_ratio=compress_ratio,
+            quant_block=quant_block,
+            rms_eps=rms_eps,
+            seq_along_lane=seq_along_lane,
+            block=prefill_block,
+        )
 
     if shares_buffer:
         return cache, rope_cache, cache

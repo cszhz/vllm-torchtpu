@@ -323,6 +323,224 @@ def kernel(
             pl.semaphore_wait(sem_ref.at[b], count)
 
 
+def kernel_runs(
+    # scalar prefetch
+    slot_mapping,  # [num_tokens] state row of each token, -1 = no write
+    run_token,  # [num_tokens] first token of each write run (compacted)
+    run_len,  # [num_tokens] tokens in each write run (compacted)
+    tile_run_offset,  # [num_n + 1] first run of each token tile
+    # input
+    hidden_states,  # [num_tokens, hidden_size]
+    wkv_wgate,  # [hidden_size, 2 * state_width]
+    ape,  # [compress_ratio, state_width]
+    positions,  # [num_tokens]
+    cache,  # [num_pages, page_size, 4, lanes] uint8 or [..., lanes] int32 (aliased)
+    # output
+    _,  # unused output ref (aliased to cache)
+    # scratch_memory
+    acc_ref,  # (2, tile_n * rows_per_token, 1, lanes) f32, write staging
+    sem_ref,
+    write_counts_ref,  # [2]
+    dense_ref,  # (tile_n, tile_m) f32, running sum over k
+    *,
+    cfgs: Configs,
+):
+    """`kernel` with one write DMA per run of page-contiguous tokens.
+
+    A token tile's whole state (kv then score, `rows_per_token` rows) is staged
+    token-major before it is written, so consecutive tokens of one state page
+    are one contiguous HBM range: a prefill chunk writes one DMA per page
+    instead of one per token and m tile. The dots, the k accumulation order
+    and the APE add are `kernel`'s, so the stored bytes are identical.
+    """
+    tile_n = cfgs.tile_sizes.tile_n
+    lanes = acc_ref.shape[-1]
+    rows_per_token = cfgs.dims.size_m // lanes
+    state_width = cfgs.dims.size_m // 2
+    acc_ref_u8 = acc_ref.bitcast(jnp.uint8)
+    cache = csa_cache_layout.as_u8_slabs(cache)
+    page_rows = cfgs.token_page_size
+    write_counts_ref[0] = 0
+    write_counts_ref[1] = 0
+
+    def _run_copy(n_idx_val, buf_idx_val, r):
+        tok = run_token[r]
+        slot = slot_mapping[tok]
+        nrows = run_len[r] * rows_per_token
+        src_row = (tok - n_idx_val * tile_n) * rows_per_token
+        src = acc_ref_u8.at[buf_idx_val, pl.ds(src_row, nrows), :, :]
+        dest = cache.at[slot // page_rows, pl.ds(slot % page_rows, nrows), :, :]
+        return pltpu.make_async_copy(src, dest, sem_ref.at[buf_idx_val])
+
+    def _dma_copy_out(n_idx_val, buf_idx_val):
+        @pl.loop(tile_run_offset[n_idx_val], tile_run_offset[n_idx_val + 1])
+        def _(r):
+            _run_copy(n_idx_val, buf_idx_val, r).start()
+
+        # Remember which tile's runs this buffer is writing, for `_wait`.
+        write_counts_ref[buf_idx_val] = n_idx_val + 1
+
+    def _wait(buf_idx_val):
+        n_plus_1 = write_counts_ref[buf_idx_val]
+
+        @pl.when(n_plus_1 > 0)
+        def _():
+            n_idx_val = n_plus_1 - 1
+
+            @pl.loop(tile_run_offset[n_idx_val], tile_run_offset[n_idx_val + 1])
+            def _(r):
+                _run_copy(n_idx_val, buf_idx_val, r).wait()
+
+        write_counts_ref[buf_idx_val] = 0
+
+    def inner_kernel(
+        tiled_wgate_ref,  # (tile_k, state_width): this m tile's half
+        tiled_hidden_states_ref,  # (tile_n, tile_k)
+        tiled_positions_ref,  # (tile_n,)
+    ):
+        n_idx = pl.program_id(0)
+        m_idx = pl.program_id(1)
+        k_idx = pl.program_id(2)
+        buf_idx = n_idx % 2
+        is_last_k = k_idx == (cfgs.num_k - 1)
+
+        @pl.when((m_idx == 0) & (k_idx == 0))
+        def _start_tile():
+            # Free this buffer (its writes were started two tiles ago), then
+            # start the previous tile's writes so they overlap this tile's dots.
+            _wait(buf_idx)
+
+            @pl.when(n_idx > 0)
+            def _():
+                _dma_copy_out(n_idx - 1, 1 - buf_idx)
+
+        num_m = cfgs.num_m  # 1: both halves per step; 2: one half, as `kernel`
+        halves = 2 // num_m
+
+        def _stage(val, h):
+            # Token-major rows for the write DMA: token t's 128-lane chunk c of
+            # half h lands on row t * R + h * R / 2 + c.
+            ref_flat = acc_ref.at[buf_idx].reshape(-1, LANES)
+            num_chunks = cfgs.dims.size_m // LANES
+            half_chunks = state_width // LANES
+            for c in range(half_chunks):
+                ref_flat[pl.ds(h * half_chunks + c, tile_n, num_chunks)] = val[
+                    :, c * LANES : (c + 1) * LANES
+                ]
+
+        def _ape():
+            ape_rows = tiled_positions_ref[...] % cfgs.dims.compress_ratio
+            one_hot = (
+                ape_rows[:, None] == jnp.arange(cfgs.dims.compress_ratio)[None, :]
+            ).astype(jnp.float32)
+            return jnp.matmul(
+                one_hot, ape[...].astype(jnp.float32), precision=lax.Precision.HIGHEST
+            )
+
+        x = tiled_hidden_states_ref[...]
+        for hh in range(halves):
+            # Each half is `kernel`'s m-tile dot, summed the same way
+            # (0 + dot at k = 0) into a dense running sum.
+            cols = pl.ds(hh * state_width, state_width)
+            prod = lax.dot_general(
+                x,
+                tiled_wgate_ref[:, cols] if halves > 1 else tiled_wgate_ref[...],
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            old = lax.select(k_idx > 0, dense_ref[:, cols], jnp.zeros_like(prod))
+            new = old + prod
+
+            @pl.when(jnp.logical_not(is_last_k))
+            def _(new=new, cols=cols):
+                dense_ref[:, cols] = new
+
+            h = hh if halves > 1 else m_idx  # which half this dot produced
+
+            @pl.when(is_last_k & (h == 0))
+            def _(new=new):
+                _stage(new, 0)
+
+            @pl.when(is_last_k & (h == 1))
+            def _(new=new):
+                # `kernel` stores the sum, then adds APE to the score half.
+                _stage(new + _ape(), 1)
+
+    tile_m = cfgs.tile_sizes.tile_m
+    pipeline_fn = pltpu.emit_pipeline(
+        inner_kernel,
+        grid=(cfgs.num_n, cfgs.num_m, cfgs.num_k),
+        in_specs=(
+            pl.BlockSpec(
+                (cfgs.tile_sizes.tile_k, tile_m),
+                lambda n, m, k: (k, m),
+                memory_space=pltpu.VMEM,
+            ),
+            pl.BlockSpec(
+                (cfgs.tile_sizes.tile_n, cfgs.tile_sizes.tile_k),
+                lambda n, m, k: (n, k),
+                memory_space=pltpu.VMEM,
+            ),
+            pl.BlockSpec(
+                (cfgs.tile_sizes.tile_n,),
+                lambda n, m, k: (n,),
+                memory_space=pltpu.VMEM,
+            ),
+        ),
+    )
+    pipeline_fn(wkv_wgate, hidden_states, positions)
+
+    last_n = cfgs.num_n - 1
+    _dma_copy_out(last_n, last_n % 2)
+    _wait(0)
+    _wait(1)
+
+
+LANES = 128
+
+
+def _write_runs(slot_mapping, tile_n, rows_per_token, page_rows):
+    """Splits the tokens' state writes into page-contiguous runs.
+
+    A run is a maximal set of consecutive tokens of one token tile whose state
+    rows are consecutive in one page. Returns the compacted run starts and
+    lengths (padded with 0) and each tile's first run.
+    """
+    num_tokens = slot_mapping.shape[0]
+    idx = jnp.arange(num_tokens)
+    valid = slot_mapping >= 0
+    prev = jnp.roll(slot_mapping, 1)
+    prev_valid = jnp.roll(valid, 1)
+    same_page = (slot_mapping // page_rows) == (prev // page_rows)
+    continues = (
+        valid
+        & prev_valid
+        & (idx % tile_n != 0)
+        & (slot_mapping == prev + rows_per_token)
+        & same_page
+    )
+    starts = valid & ~continues
+    run_token = jnp.nonzero(starts, size=num_tokens, fill_value=0)[0].astype(jnp.int32)
+    num_runs = jnp.sum(starts.astype(jnp.int32))
+    # Each run ends where the next one starts, or at the end of its own valid
+    # stretch; count a run's tokens as its start's id over the stretch.
+    run_id = jnp.cumsum(starts.astype(jnp.int32)) - 1
+    run_len = (
+        jnp.zeros((num_tokens,), jnp.int32)
+        .at[jnp.where(valid, run_id, num_tokens)]
+        .add(1, mode="drop")
+    )
+    run_len = jnp.where(idx < num_runs, run_len, 0)
+    num_n = num_tokens // tile_n
+    tile_starts = jnp.arange(num_n + 1) * tile_n
+    # Runs never cross a tile, so a tile's runs are those starting inside it.
+    starts_before = jnp.concatenate(
+        [jnp.zeros((1,), jnp.int32), jnp.cumsum(starts.astype(jnp.int32))]
+    )
+    tile_run_offset = starts_before[tile_starts].astype(jnp.int32)
+    return run_token, run_len, tile_run_offset
+
+
 def _select_tile_k(size_k: int, cap: int = 3584, align: int = 128) -> int:
     """Largest 128-aligned k tile that *divides* ``size_k``."""
     cap = max(align, (min(cap, size_k) // align) * align)
@@ -337,6 +555,8 @@ def _select_tile_k(size_k: int, cap: int = 3584, align: int = 128) -> int:
     static_argnames=[
         "compress_ratio",
         "interpret",
+        "runs_min_tokens",
+        "runs_tile_n",
     ],
 )
 def proj_and_save_state(
@@ -348,8 +568,14 @@ def proj_and_save_state(
     cache: jax.Array,  # [num_pages, page_size, 4, 128] uint8 / [..., 128] int32
     compress_ratio: int,
     interpret: bool = False,
+    runs_min_tokens: int = 0,
+    runs_tile_n: int = 512,
 ) -> jax.Array:
     """Projects hidden states and saves them to the KV cache in HBM.
+
+    With ``runs_min_tokens > 0``, a call of at least that many tokens computes
+    each token's whole state in one grid step and writes page-contiguous runs
+    of tokens with one DMA each (`kernel_runs`); the stored bytes are the same.
 
     Args:
       hidden_states: Input hidden states.
@@ -367,6 +593,19 @@ def proj_and_save_state(
     _, state_dim = wkv_wgate.shape
 
     token_page_size = cache.shape[1]
+
+    if runs_min_tokens > 0 and num_tokens >= runs_min_tokens:
+        return _proj_and_save_state_runs(
+            hidden_states,
+            wkv_wgate,
+            ape,
+            positions,
+            slot_mapping,
+            cache,
+            compress_ratio=compress_ratio,
+            tile_n_cap=runs_tile_n,
+            interpret=interpret,
+        )
 
     state_width = state_dim // 2
     tile_m = state_width
@@ -432,3 +671,106 @@ def proj_and_save_state(
         interpret=interpret,
         name="proj_and_save_state",
     )(slot_mapping, positions, hidden_states, wkv_wgate, ape, cache)
+
+
+def _proj_and_save_state_runs(
+    hidden_states: jax.Array,
+    wkv_wgate: jax.Array,
+    ape: jax.Array,
+    positions: jax.Array,
+    slot_mapping: jax.Array,
+    cache: jax.Array,
+    *,
+    compress_ratio: int,
+    tile_n_cap: int,
+    interpret: bool,
+) -> jax.Array:
+    num_tokens, hidden_size = hidden_states.shape
+    _, state_dim = wkv_wgate.shape
+    token_page_size = cache.shape[1]
+    lanes = cache.shape[-1]
+    assert state_dim % lanes == 0 and lanes % LANES == 0, (state_dim, lanes)
+    rows_per_token = state_dim // lanes
+    # Same k tiling as `kernel`, so each dot accumulates in the same order.
+    tile_k = _select_tile_k(hidden_size)
+
+    sublane_tile = 8
+    tile_n = min(tile_n_cap, pl.cdiv(num_tokens, sublane_tile) * sublane_tile)
+    padded_num_tokens = pl.cdiv(num_tokens, tile_n) * tile_n
+    if padded_num_tokens != num_tokens:
+        pad = padded_num_tokens - num_tokens
+        hidden_states = jnp.pad(hidden_states, ((0, pad), (0, 0)))
+        positions = jnp.pad(positions, (0, pad))
+        slot_mapping = jnp.pad(slot_mapping, (0, pad), constant_values=-1)
+        num_tokens = padded_num_tokens
+
+    cfgs = Configs(
+        # Halves narrower than 512 lanes keep `kernel`'s one-half grid steps:
+        # one dot per step there is what reproduces its bytes (measured).
+        tile_sizes=TileSizes(
+            tile_m=state_dim if state_dim // 2 >= 512 else state_dim // 2,
+            tile_k=tile_k,
+            tile_n=tile_n,
+        ),
+        dims=Dimensions(
+            size_m=state_dim,
+            size_k=hidden_size,
+            size_n=num_tokens,
+            compress_ratio=compress_ratio,
+        ),
+        token_page_size=token_page_size,
+    )
+    run_token, run_len, tile_run_offset = _write_runs(
+        slot_mapping, tile_n, rows_per_token, token_page_size
+    )
+
+    w_bytes = jnp.dtype(wkv_wgate.dtype).itemsize
+    x_bytes = jnp.dtype(hidden_states.dtype).itemsize
+    vmem_need = (
+        2 * tile_k * cfgs.tile_sizes.tile_m * w_bytes  # weight tiles, double-buffered
+        + 2 * tile_n * tile_k * x_bytes  # hidden tiles, double-buffered
+        + 2 * tile_n * rows_per_token * lanes * 4  # write staging
+        + tile_n * cfgs.tile_sizes.tile_m * 4  # running sum
+        + tile_n * state_dim * 4  # dot / sum temporaries
+    )
+    vmem_limit = min(max(vmem_need + (8 << 20), 32 << 20), 60 << 20)
+
+    return pl.pallas_call(
+        functools.partial(kernel_runs, cfgs=cfgs),
+        out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            grid=(),
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states
+                pl.BlockSpec(memory_space=pltpu.HBM),  # wkv_wgate
+                pl.BlockSpec(memory_space=pltpu.VMEM),  # ape
+                pl.BlockSpec(memory_space=pltpu.HBM),  # positions
+                pl.BlockSpec(memory_space=pltpu.HBM),  # cache
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((2, tile_n * rows_per_token, 1, lanes), jnp.float32),
+                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SMEM((2,), jnp.int32),
+                pltpu.VMEM((tile_n, cfgs.tile_sizes.tile_m), jnp.float32),
+            ],
+        ),
+        input_output_aliases={8: 0},  # cache
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True,
+            vmem_limit_bytes=vmem_limit,
+        ),
+        interpret=interpret,
+        name="proj_and_save_state_runs",
+    )(
+        slot_mapping,
+        run_token,
+        run_len,
+        tile_run_offset,
+        hidden_states,
+        wkv_wgate,
+        ape,
+        positions,
+        cache,
+    )
