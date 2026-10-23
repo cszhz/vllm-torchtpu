@@ -50,6 +50,10 @@ Env:
 - GLM52_DECODE_MK_OFF=1        built and warmed, but `enabled` starts False (the harness turns it on per arm);
 - GLM52_DECODE_MK_LOG_EVERY=n  engagement log cadence (decisions; 0 = first-of-reason lines only);
 - GLM52_DECODE_MK_PERLAYER_MAX_L=10  the largest model served from per-layer caches (the 10-layer twin compiled);
+- GLM52_DECODE_MK_LV_FULL=1    with lever LV (GLM52_DECODE_MK_LEVERS=B,LV): also build each bucket's program WITHOUT
+                               LV and run it on steps whose live rows fill the bucket after LV's 4-row rounding
+                               (ceil(T / 4) * 4 == bucket: LV moves every row there, and its extra issue sites cost
+                               0.01-0.14 ms per step, stageB/lv-prod D1); "0" = the LV program on every step;
 - GLM5_MKD_STACK_C             unset: stacked caches when the megakernel is built; "0" keeps per-layer caches.
 """
 
@@ -433,6 +437,23 @@ def classify_step(
     return None, "over_bucket", f"{detail}; buckets {list(rows)}"
 
 
+class StepBucket(int):
+    """step_ok's decision: the row bucket (an int, which is all the runner passes along) plus `full` = the step's live
+    rows fill the bucket after LV's 4-row rounding (ceil(T / 4) * 4 == bucket), so the adapter runs the bucket's
+    no-LV program (GLM52_DECODE_MK_LV_FULL). A plain int decision (harness paths) runs the LV program."""
+
+    def __new__(cls, t: int, full: bool = False):
+        o = int.__new__(cls, t)
+        o.full = bool(full)
+        return o
+
+
+def fills_bucket(total_tokens: int, bucket: int) -> bool:
+    """LV moves ceil(T / 4) * 4 all-reduce rows (>= its floor), q-AG rows 4 / ceil(T / 8) * 8 and ceil(T / 4) A2A
+    chunks: every collective moves the whole bucket iff ceil(T / 4) * 4 == bucket."""
+    return -(-int(total_tokens) // 4) * 4 >= int(bucket)
+
+
 def sched_reqs(runner, scheduler_output) -> list:
     """classify_step's per-request view of a SchedulerOutput (+ the runner's prompt bookkeeping after _update_states)."""
     ns = scheduler_output.num_scheduled_tokens
@@ -738,6 +759,18 @@ class Glm52DecodeMK:
             t: dataclasses.replace(self.tiles, **PR.tiles_kwargs(t, self.levers, self.rows))
             for t in self.rows
         }
+        # LV full-bucket steps run the no-LV program (GLM52_DECODE_MK_LV_FULL, default on with lever LV)
+        self.lv_full = "LV" in self.levers and os.environ.get("GLM52_DECODE_MK_LV_FULL", "1") != "0"
+        self.tiles_full_by_rows = (
+            {
+                t: dataclasses.replace(
+                    self.tiles, **PR.tiles_kwargs(t, tuple(x for x in self.levers if x != "LV"), self.rows)
+                )
+                for t in self.rows
+            }
+            if self.lv_full
+            else {}
+        )
         self.pool_pages = check_pool(
             mml,
             {t: tl.pool for t, tl in self.tiles_by_rows.items()},
@@ -747,6 +780,7 @@ class Glm52DecodeMK:
         )
         self.caches = None
         self._steps = {}
+        self._steps_full = {}
         self.mla_layer_name = _attn_module(bb.layers[0].self_attn).layer_name
         logger.info(
             "GLM-5.2 decode megakernel: built for rows %s, L %d (fresh indexer layers %s, freq %d skip %d), "
@@ -1026,6 +1060,7 @@ class Glm52DecodeMK:
             self.unbound = str(e)
             self.caches = None
             self._steps = {}
+            self._steps_full = {}
             logger.warning(
                 "GLM-5.2 decode megakernel: NOT bound, every step will run stock ('unbound'): %s",
                 e,
@@ -1159,11 +1194,14 @@ class Glm52DecodeMK:
         )
         for t in self.rows:
             self._steps[t] = self._build_op(self.cfgs[t])
+            if self.lv_full:
+                self._steps_full[t] = self._build_op(self.cfgs[t], full=True)
 
-    def _build_op(self, cfg):
+    def _build_op(self, cfg, full=False):
         """The compiled per-step torch function for row bucket cfg.TMAX: embed (torch, vocab-parallel) -> one SPMD
         program shard_map(metadata + rope table (wrapper.py, the instruments-tested arithmetic) -> megakernel ->
-        writer) over the R-rank mesh -> caches copied back (donated, aliased in place)."""
+        writer) over the R-rank mesh -> caches copied back (donated, aliased in place). full: the bucket's no-LV
+        program (tiles_full_by_rows; GLM52_DECODE_MK_LV_FULL)."""
         import jax
 
         from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
@@ -1175,7 +1213,7 @@ class Glm52DecodeMK:
             max_pages=self.max_pages,
             nb=self.nb,
             nbi=self.nbi,
-            tiles=self.tiles_by_rows[cfg.TMAX],
+            tiles=(self.tiles_full_by_rows if full else self.tiles_by_rows)[cfg.TMAX],
             groups=self.groups,
             stacked=self.cache_form == "stacked",
         )
@@ -1194,14 +1232,14 @@ class Glm52DecodeMK:
         n_in = n_fix + n_d + n_e + n_c
         args = [f"x{i}" for i in range(n_in)]
         ret = "tuple[" + ", ".join(["jax.Array"] * len(out_specs)) + "]"
-        fname = f"glm52_decode_mk_b{TMAX}"
+        fname = f"glm52_decode_mk_b{TMAX}{'f' if full else ''}"
         src = (
             f"def {fname}({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"
             f"    return _smap({', '.join(args)})\n"
         )
         ns: dict[str, Any] = {"jax": jax, "_smap": smap}
         exec(compile(src, f"<{fname}>", "exec"), ns)  # noqa: S102 - arity is data
-        name = f"glm52_decode_mk::step_b{TMAX}"
+        name = f"glm52_decode_mk::step_b{TMAX}{'f' if full else ''}"
         # unregistered callable (sharded_jax_op register=False): the operand count exceeds a torch op schema's 64;
         # the op below takes the weights and caches as Tensor[] arguments (glm5_mk_dcp)
         flat = sharded_jax_op(
@@ -1288,7 +1326,10 @@ class Glm52DecodeMK:
             return outs[0][:TMAX]
 
         logger.info(
-            "GLM-5.2 decode megakernel: step b%d built (%d operands)", TMAX, n_in
+            "GLM-5.2 decode megakernel: step b%d%s built (%d operands)",
+            TMAX,
+            " (full-bucket, no LV)" if full else "",
+            n_in,
         )
         return torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
 
@@ -1308,19 +1349,34 @@ class Glm52DecodeMK:
         self._count(why, detail, bucket)
         return bucket
 
+    def decision(self, reqs, num_chunks: int = 1, has_encoder: bool = False):
+        """step_ok's decision from classify_step's per-request view [(scheduled tokens, drafts, in prompt)]: None or a
+        StepBucket (full = the step fills its bucket and the no-LV program is built). Not counted (step_ok counts);
+        public for harnesses that emulate step_ok."""
+        cfg = self.cfg
+        bucket, why, detail = classify_step(
+            reqs,
+            num_chunks=num_chunks,
+            has_encoder=has_encoder,
+            qmax=cfg.QMAX,
+            rows=[t for t in self.rows if t in self._steps],
+            bmax=cfg.BMAX,
+        )
+        if bucket is None:
+            return None, why, detail
+        total = sum(int(n) for n, _, _ in reqs)
+        full = self.lv_full and bucket in self._steps_full and fills_bucket(total, bucket)
+        return StepBucket(bucket, full), why, detail
+
     def _decide(self, runner, scheduler_output, num_chunks: int):
         if not self.enabled:
             return None, "off", ""
         if self.unbound is not None or not self._steps:
             return None, "unbound", str(self.unbound)
-        cfg = self.cfg
-        return classify_step(
+        return self.decision(
             sched_reqs(runner, scheduler_output),
             num_chunks=num_chunks,
             has_encoder=bool(scheduler_output.scheduled_encoder_inputs),
-            qmax=cfg.QMAX,
-            rows=[t for t in self.rows if t in self._steps],
-            bmax=cfg.BMAX,
         )
 
     def _count(self, why: str, detail: str = "", bucket: int | None = None) -> None:
@@ -1328,7 +1384,9 @@ class Glm52DecodeMK:
         first = c.get(why, 0) == 0
         c[why] = c.get(why, 0) + 1
         if bucket is not None:
-            c[f"mk_b{bucket}"] = c.get(f"mk_b{bucket}", 0) + 1
+            c[f"mk_b{int(bucket)}"] = c.get(f"mk_b{int(bucket)}", 0) + 1
+            if getattr(bucket, "full", False):
+                c[f"mk_b{int(bucket)}_full"] = c.get(f"mk_b{int(bucket)}_full", 0) + 1
         if why != "embeds" and why != "shape":
             self.decisions += 1
         if self.rank == 0 and first:
@@ -1475,7 +1533,9 @@ class Glm52DecodeMK:
         t = bucket if bucket is not None else self.bucket_for(n)
         assert t is not None, (n, self.rows)
         md = md if md is not None else self._metadata()
-        out = self._steps[t](
+        steps = self._steps_full if (getattr(bucket, "full", False) and t in self._steps_full) else self._steps
+        t = int(t)
+        out = steps[t](
             to_bucket_rows(input_ids, t),
             to_bucket_rows(positions, t),
             md.query_start_loc,
@@ -1496,6 +1556,8 @@ class Glm52DecodeMK:
             "enabled": self.enabled,
             "rows": self.rows,
             "built": sorted(self._steps),
+            "built_full": sorted(self._steps_full),
+            "lv_full": self.lv_full,
             "L": self.cfg.L,
             "fresh_layers": LY.layers_of(self.cfg, "iwq"),
             "idx_freq_skip": [self.cfg.idx_freq, self.cfg.idx_skip],
@@ -1541,21 +1603,25 @@ class Glm52DecodeMK:
                 [cfg.QMAX] + [0] * (S - 1), dtype=torch.int32, device=dev
             )
             bt = torch.zeros(S * self.max_pages, dtype=torch.int32, device=dev)
-            t0 = time.monotonic()
-            out = self._steps[t](
-                ids,
-                pos,
-                qsl,
-                seq,
-                bt,
-                self.smalls,
-                self.dense + self.experts,
-                self.caches,
-            )
-            synchronize_tensors([out])
-            self.warm_shapes[t] = (tuple(qsl.shape), tuple(seq.shape), int(bt.numel()))
-            logger.info(
-                "GLM-5.2 decode megakernel: b%d compiled and warmed in %.1f s",
-                t,
-                time.monotonic() - t0,
-            )
+            for tag, steps in (("", self._steps), (" (full-bucket, no LV)", self._steps_full)):
+                if t not in steps:
+                    continue
+                t0 = time.monotonic()
+                out = steps[t](
+                    ids,
+                    pos,
+                    qsl,
+                    seq,
+                    bt,
+                    self.smalls,
+                    self.dense + self.experts,
+                    self.caches,
+                )
+                synchronize_tensors([out])
+                self.warm_shapes[t] = (tuple(qsl.shape), tuple(seq.shape), int(bt.numel()))
+                logger.info(
+                    "GLM-5.2 decode megakernel: b%d%s compiled and warmed in %.1f s",
+                    t,
+                    tag,
+                    time.monotonic() - t0,
+                )

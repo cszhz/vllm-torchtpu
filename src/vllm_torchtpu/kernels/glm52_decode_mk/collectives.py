@@ -185,29 +185,21 @@ def _recv_all_loop(R, me, dst_of, recv_sem):
     lax.fori_loop(1, R, body, 0)
 
 
-def all_reduce_lv(R, me, buf, rows, cols, s, n_dyn, options, drop_last=False, mids=(), loop=False):
+def all_reduce_lv(R, me, buf, rows, cols, s, n_dyn, options, drop_last=False, mids=(), loop=0):
     """LV form of `all_reduce`: the same protocol (reduce-scatter of R column chunks, f32 rank-order sum, all-gather;
     the same semaphores and peer order), moving only the first n rows, n = n_dyn (traced, rank-uniform) in `options`
-    (lv_ar_options), each transfer issued as Mosaic-exact pieces (ar_pieces). Rows >= n of buf are neither sent nor
-    overwritten: the caller zeroes rows >= T, so buf ends bit-identical to `all_reduce`'s. Slot / red rows >= n hold
-    stale bytes and are never sent (no mask needed). n == rows is `all_reduce`'s transfer (one (0, rows) piece).
-    loop: 0 = per-peer issue / wait sites unrolled (R - 1 sites each); 1 = fori_loops over the peers (bundles);
-    2 = fori_loops for every n < rows, the n == rows transfer unrolled exactly as `all_reduce` issues it."""
+    (lv_ar_options), each transfer issued as Mosaic-exact pieces (ar_pieces). Rows >= n of buf are
+    neither sent nor overwritten: the caller zeroes rows >= T, so buf ends bit-identical to `all_reduce`'s. Slot / red
+    rows >= n hold stale bytes and are never sent (no mask needed). n == rows is `all_reduce`'s transfer.
+    loop: 0 = one issue site per (row count, piece), per-peer sites unrolled; 1 = the same with fori_loops over the
+    peers (bundles: stageB/lv-prod D1 measured a never-executed copy of the unrolled b32 LV code at ~0.1 ms/step);
+    2 = loops except the n == rows transfer (unrolled as `all_reduce` issues it)."""
     if R == 1:
         if drop_last:
             buf[...] = jnp.zeros(buf.shape, buf.dtype)
         return
     cw = cols // R
     assert loop in (0, 1, 2), loop
-
-    def lp(n):
-        return loop == 1 or (loop == 2 and n != rows)
-
-    def send_all(n, *a):
-        return (_send_all_loop if lp(n) else _send_all)(*a)
-
-    def recv_all(n, *a):
-        return (_recv_all_loop if lp(n) else _recv_all)(*a)
 
     def slot(q, o, m):
         return s["recv"].at[q, pl.ds(o, m), pl.ds(0, cw)]
@@ -218,49 +210,49 @@ def all_reduce_lv(R, me, buf, rows, cols, s, n_dyn, options, drop_last=False, mi
     def red(o, m):
         return s["red"].at[pl.ds(o, m), pl.ds(0, cw)]
 
-    def rs_start(n):
-        for o, m in ar_pieces(n):
+    def piece(kind, o, m, lp):
+        send_all = _send_all_loop if lp else _send_all
+        recv_all = _recv_all_loop if lp else _recv_all
+        if kind == "rs_start":
             pltpu.make_async_copy(chunk(me, o, m), slot(me, o, m), s["loc"].at[0]).start()
-            send_all(n, R, me, lambda t, o=o, m=m: chunk(t, o, m), lambda q, o=o, m=m: slot(q, o, m), s["rs_send"],
-                     s["rs_recv"])
-
-    def rs_wait(n):
-        for o, m in ar_pieces(n):
+            send_all(R, me, lambda t: chunk(t, o, m), lambda q: slot(q, o, m), s["rs_send"], s["rs_recv"])
+        elif kind == "rs_wait":
             pltpu.make_async_copy(chunk(me, o, m), slot(me, o, m), s["loc"].at[0]).wait()
-            recv_all(n, R, me, lambda q, o=o, m=m: slot(q, o, m), s["rs_recv"])
-
-    def ag_start(n):
-        for o, m in ar_pieces(n):
+            recv_all(R, me, lambda q: slot(q, o, m), s["rs_recv"])
+        elif kind == "ag_start":
             pltpu.make_async_copy(red(o, m), chunk(me, o, m), s["loc"].at[1]).start()
-            send_all(n, R, me, lambda t, o=o, m=m: red(o, m), lambda q, o=o, m=m: chunk(q, o, m), s["ag_send"],
-                     s["ag_recv"])
-
-    def ag_wait(n):
-        for o, m in ar_pieces(n):
+            send_all(R, me, lambda t: red(o, m), lambda q: chunk(q, o, m), s["ag_send"], s["ag_recv"])
+        else:  # ag_wait: the all-gather receives, then every send of this piece (reduce-scatter and all-gather)
             pltpu.make_async_copy(red(o, m), chunk(me, o, m), s["loc"].at[1]).wait()
-            recv_all(n, R, me, lambda q, o=o, m=m: chunk(q, o, m), s["ag_recv"])
+            recv_all(R, me, lambda q: chunk(q, o, m), s["ag_recv"])
 
-        def wsend(step, o, m):
-            t = lax.rem(me + step, R)
-            for src, dst, ss, rs_ in (
-                (chunk(t, o, m), slot(me, o, m), s["rs_send"], s["rs_recv"]),
-                (red(o, m), chunk(me, o, m), s["ag_send"], s["ag_recv"]),
-            ):
-                pltpu.make_async_remote_copy(
-                    src, dst, ss.at[step], rs_.at[me], device_id=(t,), device_id_type=MESH
-                ).wait_send()
+            def wsend(step):
+                t = lax.rem(me + step, R)
+                for src, dst, ss, rs_ in (
+                    (chunk(t, o, m), slot(me, o, m), s["rs_send"], s["rs_recv"]),
+                    (red(o, m), chunk(me, o, m), s["ag_send"], s["ag_recv"]),
+                ):
+                    pltpu.make_async_remote_copy(
+                        src, dst, ss.at[step], rs_.at[me], device_id=(t,), device_id_type=MESH
+                    ).wait_send()
 
-        for o, m in ar_pieces(n):
-            if lp(n):
-                lax.fori_loop(1, R, lambda step, c, o=o, m=m: (wsend(step, o, m), c)[1], 0)
+            if lp:
+                lax.fori_loop(1, R, lambda step, c: (wsend(step), c)[1], 0)
             else:
                 for step in range(1, R):
-                    wsend(step, o, m)
+                    wsend(step)
 
-    row_switch(n_dyn, options, rs_start)
+    def phase(kind):
+        def one(n):
+            for o, m in ar_pieces(n):
+                piece(kind, o, m, loop == 1 or (loop == 2 and n != rows))
+
+        row_switch(n_dyn, options, one)
+
+    phase("rs_start")
     if len(mids) > 0 and mids[0] is not None:
         mids[0]()
-    row_switch(n_dyn, options, rs_wait)
+    phase("rs_wait")
     acc = s["recv"][0, pl.ds(0, rows), pl.ds(0, cw)].astype(F32)
     for q in range(1, R):
         v = s["recv"][q, pl.ds(0, rows), pl.ds(0, cw)].astype(F32)
@@ -268,10 +260,10 @@ def all_reduce_lv(R, me, buf, rows, cols, s, n_dyn, options, drop_last=False, mi
             v = jnp.zeros_like(v)
         acc = acc + v
     s["red"][pl.ds(0, rows), pl.ds(0, cw)] = acc.astype(BF16)
-    row_switch(n_dyn, options, ag_start)
+    phase("ag_start")
     if len(mids) > 1 and mids[1] is not None:
         mids[1]()
-    row_switch(n_dyn, options, ag_wait)
+    phase("ag_wait")
 
 
 def entry_barrier(R):
