@@ -255,7 +255,7 @@ def _kernel(
         l_ref[...] = exp_m_diff * l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
         acc_ref[...] = lanes(exp_m_diff, head_dim) * acc_ref[...] + pv
 
-    @pl.when(blk < nb)
+    @pl.when(jnp.logical_and(blk < nb, meta_ref[1, blk] > 0))
     def _block():
         q0 = meta_ref[0, blk]
         qn = meta_ref[1, blk]
@@ -724,12 +724,14 @@ def build_union_plan(
     return idx, mask.reshape(T, W), usize.reshape(nb_cap, L)[:, 0]
 
 
-def compact_tiles(idx, tile_end, tile0, total_tiles, u_cap, rows_cap):
+def compact_tiles(idx, tile_end, tile0, total_tiles, u_cap, rows_cap, first_tile=0):
     """Block-region union rows -> one tile-contiguous list (a row gather of
-    whole 1024-row tiles). Tiles past `total_tiles` repeat earlier tiles."""
+    whole 1024-row tiles) of tiles [first_tile, total_tiles). Positions past
+    the range repeat earlier tiles."""
     n_tiles = rows_cap // TILE
     g = jnp.arange(n_tiles, dtype=jnp.int32)
-    g = jnp.where(g < total_tiles, g, g % jnp.maximum(total_tiles, 1))
+    span = jnp.maximum(total_tiles - first_tile, 1)
+    g = first_tile + jnp.where(g < span, g, g % span)
     blk = jnp.sum(tile_end[None, :] <= g[:, None], axis=1).astype(jnp.int32)
     blk = jnp.minimum(blk, tile_end.shape[0] - 1)
     src_tile = blk * (u_cap // TILE) + g - tile0[blk]
@@ -808,6 +810,7 @@ def attention(
     sparse_batch: int = 16,
     gather_no_pad: bool | None = None,
     plan: dict | None = None,
+    groups: int = 4,
 ) -> jax.Array:
     """CSA attention: union-dense for the planned blocks (`prepare`; built
     here when `plan` is None), the per-token sparse gather for the leading
@@ -863,15 +866,29 @@ def attention(
                 lambda q: sparse_call(q, T, n_sparse),
                 q,
             )
-        compact = compact_tiles(idx, tile_end, tile0, total_tiles, u_cap, rows_cap)
-        nope_g, rope_g = csa_gather.csa_gather(
-            cache_kv_nope, cache_kv_rope, compact,
-            num_valid_indices=total_tiles * TILE, top_k=TILE,
-        )  # fmt: skip
-        meta = jnp.stack([q0, qn, tile0, ntiles, usize, seq_b]).astype(jnp.int32)
-        return union_dense_attention(
-            q, nope_g, rope_g, mask, meta, plan["total_blocks"], attention_sinks,
-            swa_accumution, swa_l, swa_m, sm_scale=sm_scale, bq=bq,
-        )  # fmt: skip
+        # Blocks split into `groups` runs of about equal tiles: the gather of
+        # run g + 1 (SparseCore) overlaps the attention of run g.
+        blk_ids = jnp.arange(usize.shape[0], dtype=jnp.int32)
+        grp = jnp.where(qn > 0, (tile0 * groups) // jnp.maximum(total_tiles, 1), groups)
+        grp_cap = cdiv(rows_cap // groups + u_cap, 32768) * 32768
+        for gi in range(groups):
+            in_g = grp == gi
+            g_first = jnp.min(jnp.where(in_g, tile0, total_tiles))
+            g_end = jnp.max(jnp.where(in_g, tile_end, 0))
+            g_end = jnp.maximum(g_end, g_first)
+            compact = compact_tiles(idx, tile_end, tile0, g_end, u_cap, grp_cap, g_first)
+            nope_g, rope_g = csa_gather.csa_gather(
+                cache_kv_nope, cache_kv_rope, compact,
+                num_valid_indices=(g_end - g_first) * TILE, top_k=TILE,
+            )  # fmt: skip
+            meta = jnp.stack(
+                [q0, jnp.where(in_g, qn, 0), tile0 - g_first, ntiles, usize, seq_b]
+            ).astype(jnp.int32)
+            q = union_dense_attention(
+                q, nope_g, rope_g, mask, meta, plan["total_blocks"], attention_sinks,
+                swa_accumution, swa_l, swa_m, sm_scale=sm_scale, bq=bq,
+            )  # fmt: skip
+        del blk_ids
+        return q
 
     return lax.cond(use_union, union_path, all_sparse, q)
