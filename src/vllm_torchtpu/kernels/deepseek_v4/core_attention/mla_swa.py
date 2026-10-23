@@ -1208,6 +1208,29 @@ class SwaDecodeWindowRefs(NamedTuple):
         kv_len = jnp.where(valid, self.kv_lens_ref[seq_idx_clamped], 0)
         return seq_idx_clamped, kv_len
 
+    def num_tokens(self, seq_idx, valid):
+        """Rows `fetch` copies: the window's cache keys and the new token."""
+        _, kv_len = self._seq_geometry(seq_idx, valid)
+        _, bkv_sz_frm_cache = _swa_decode_window_span(
+            kv_len, sliding_window=self.sliding_window, bkv_sz=self.bkv_sz
+        )
+        return bkv_sz_frm_cache + jnp.where(valid, 1, 0)
+
+    def wait_fetches(self, seq_idxs, valids, bkv_s_refs, sems):
+        """`fetch(..., wait=True)` for several sequences. A DMA wait orders
+        the scalar work around it, so every wait is sized before the first."""
+        sizes = [self.num_tokens(i, v) for i, v in zip(seq_idxs, valids)]
+        for n, ref, sem in zip(sizes, bkv_s_refs, sems, strict=True):
+            _wait_rows(ref, sem, n)
+
+    @staticmethod
+    def wait_stores(valids, bkv_s_refs, sems):
+        """`store_new_kv(..., wait=True)` for several sequences, every wait
+        sized before the first (see `wait_fetches`)."""
+        sizes = [jnp.where(v, 1, 0) for v in valids]
+        for n, ref, sem in zip(sizes, bkv_s_refs, sems, strict=True):
+            _wait_rows(ref, sem, n)
+
     def fetch(self, seq_idx, valid, q_token_idx, bkv_s_ref, sem, *, wait=False):
         """Copy (or wait for) the window keys and the new token into
         `bkv_s_ref`, [bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8."""
@@ -1217,14 +1240,13 @@ class SwaDecodeWindowRefs(NamedTuple):
         seq_idx_clamped, kv_len = self._seq_geometry(seq_idx, valid)
         sz = jnp.where(valid, 1, 0)
 
+        if wait:
+            # One wait for all the copies below: the semaphore counts bytes.
+            _wait_rows(bkv_s_ref, sem, self.num_tokens(seq_idx, valid))
+            return
         start_offset, bkv_sz_frm_cache = _swa_decode_window_span(
             kv_len, sliding_window=self.sliding_window, bkv_sz=self.bkv_sz
         )
-        if wait:
-            # One wait for all the copies below: the semaphore counts bytes.
-            n = bkv_sz_frm_cache + sz
-            _dma(bkv_s_ref.at[pl.ds(0, n)], bkv_s_ref.at[pl.ds(0, n)], sem, wait=True)
-            return
 
         kv_p_start, page_off = _divmod_nonneg(start_offset, lps)
         page_indices_offset = seq_idx_clamped * pages_per_seq + kv_p_start
@@ -1259,7 +1281,7 @@ class SwaDecodeWindowRefs(NamedTuple):
         """Copy (or wait for) the new token from `bkv_s_ref` into the cache."""
         sz = jnp.where(valid, 1, 0)
         if wait:
-            _dma(bkv_s_ref.at[pl.ds(0, sz)], bkv_s_ref.at[pl.ds(0, sz)], sem, wait=True)
+            _wait_rows(bkv_s_ref, sem, sz)
             return
         lps = self.logical_page_size
         num_page_indices = self.page_indices_ref.shape[0]
@@ -1295,6 +1317,11 @@ def _dma(src, dst, sem, *, wait=False):
         cp.wait()
     else:
         cp.start()
+
+
+def _wait_rows(ref, sem, n):
+    """Wait for copies of `n` leading rows' worth of `ref` on `sem`."""
+    _dma(ref.at[pl.ds(0, n)], ref.at[pl.ds(0, n)], sem, wait=True)
 
 
 def _swa_window_kv(bkv_ref, keep_rows):
@@ -1503,6 +1530,15 @@ def _mla_batched_decode_kernel(
         if not wait:
             wait_update_kv_cache(batch_idx - 2, sem_idx)
         s_start = start_seq_idx + batch_idx * seq_batch_sz
+        if wait:
+            seq_idxs = [s_start + s for s in range(seq_batch_sz)]
+            window.wait_fetches(
+                seq_idxs,
+                [i < end_seq_idx for i in seq_idxs],
+                [bkv_batch_x2_vmem.at[sem_idx, s] for s in range(seq_batch_sz)],
+                [sems.at[sem_idx, 4 + s] for s in range(seq_batch_sz)],
+            )
+            return
 
         for s in range(seq_batch_sz):
             seq_idx = s_start + s
@@ -1679,6 +1715,13 @@ def _mla_batched_decode_kernel(
 
     def _update_kv_cache(batch_idx, sem_idx, wait=False):
         s_start = start_seq_idx + batch_idx * seq_batch_sz
+        if wait:
+            window.wait_stores(
+                [s_start + s < end_seq_idx for s in range(seq_batch_sz)],
+                [bkv_batch_x2_vmem.at[sem_idx, s] for s in range(seq_batch_sz)],
+                [sems.at[sem_idx, 4 + s] for s in range(seq_batch_sz)],
+            )
+            return
 
         for s in range(seq_batch_sz):
             seq_idx = s_start + s
