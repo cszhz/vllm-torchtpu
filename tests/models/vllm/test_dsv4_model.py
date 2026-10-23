@@ -149,8 +149,8 @@ class _FakePostOp:
 
 
 class _FakePostHeadOp:
-    """Stand-in for the fused post + hc head op: the fake post, then the
-    fake collapse. Counts its calls.
+    """Stand-in for the fused post + hc head + final norm op: the fake post,
+    the fake collapse, then the norm. Counts its calls.
 
     Unpacks as the model's (op, op-on-(routed, shared)) pair; the stub
     layers never return a (routed, shared) pair, so both are this op.
@@ -162,19 +162,27 @@ class _FakePostHeadOp:
     def __iter__(self):
         return iter((self, self))
 
-    def __call__(self, x, residual, post_mix, res_mix, hc_fn, hc_scale, hc_base):
+    def __call__(
+        self, x, residual, post_mix, res_mix, hc_fn, hc_scale, hc_base, norm_weight
+    ):
         self.calls += 1
         settled = _FakePostOp()(x, residual, post_mix, res_mix)
-        return _fake_collapse_head(settled, hc_fn, hc_scale, hc_base, 0.0, 0.0)
+        collapsed = _fake_collapse_head(settled, hc_fn, hc_scale, hc_base, 0.0, 0.0)
+        return _rms_norm(collapsed, norm_weight, _tiny_hf_config().rms_norm_eps)
+
+
+def _rms_norm(x, weight, eps):
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
 
 
 class _TorchRMSNorm(nn.Module):
     def __init__(self, eps: float):
         super().__init__()
         self.eps = eps
+        self.weight = nn.Parameter(torch.ones(HIDDEN), requires_grad=False)
 
     def forward(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return _rms_norm(x, self.weight, self.eps)
 
 
 def _fake_collapse_head(hidden_states, hc_fn, hc_scale, hc_base, rms_norm_eps, hc_eps):
