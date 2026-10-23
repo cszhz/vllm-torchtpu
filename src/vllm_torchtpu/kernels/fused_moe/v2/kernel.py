@@ -558,12 +558,17 @@ def _build_fused_ep_moe_kernel(
     has_w1_bias=False,
     has_w2_bias=False,
     scales_block_major=False,
+    tail_barrier=False,
 ):
     """Build the pallas_call and the function that invokes it.
 
     `scales_block_major` takes the per-contraction-block scale tables as
     [blocks, G, N] rather than [G, blocks, N]; an expert's table is then a
     strided slice, which the DMA reads as cheaply.
+
+    `tail_barrier` puts a second all-pairs barrier after the transport
+    drain, which the kernel does not need (see the end of the body) and
+    which costs ~4.7 us a call at EP16; it is kept as an escape hatch.
     """
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
@@ -2085,7 +2090,20 @@ def _build_fused_ep_moe_kernel(
             _rows_wait(mehop_scl_sem, rscl_hbm, count(host.COUNT_SELF_MIRROR))
 
         drain_transport()
-        _all_pairs_barrier(ep)
+        # No barrier on the way out. The head barrier is the two-round
+        # (double) barrier, which is reusable across calls by itself: a peer
+        # can only enter call k + 1 and signal the barrier semaphore after it
+        # passed call k's second round, i.e. after every core finished call
+        # k's first-round wait, so no early signal is ever consumed by the
+        # wrong round, and nothing can push into this core's call-k + 1
+        # buffers before this core entered call k + 1. Everything peers
+        # write into THIS call -- arrival rows and mirror sublanes -- has
+        # been counted by the receive drains above, and every send has been
+        # drained, so no DMA is in flight when the kernel returns. A trailing
+        # all-pairs barrier only made every core wait for the slowest one:
+        # ~4.7 us a call at EP16 across two hosts, measured.
+        if tail_barrier:
+            _all_pairs_barrier(ep)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     # The VMEM buffers come from the same list the VMEM accounting sums, in
@@ -2350,6 +2368,7 @@ def build_fused_ep_moe_kernel(**kwargs):
     the size is logged on every insert so a boot that is accumulating
     programs says so, rather than being read off host memory afterwards.
     """
+    kwargs.setdefault("tail_barrier", envs.MOE_FUSED_EP_V2_TAIL_BARRIER)
     key = tuple(sorted(kwargs.items()))
     fn = _BUILD_CACHE.get(key)
     if fn is None:

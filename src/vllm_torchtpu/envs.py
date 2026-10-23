@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_LANE_QUANT: bool = True
     MOE_FUSED_EP_V2_ONESHOT_GATHER: bool = True
     MOE_FUSED_EP_V2_COMBINE_RESTORE: bool = False
+    MOE_FUSED_EP_V2_TAIL_BARRIER: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     MOE_EXPERT_COUNT_TAP_DIR: str = ""
     MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
@@ -883,6 +884,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
     ),
+    # Restore fused EP MoE v2's all-pairs barrier after the transport drain.
+    # The kernel's double head barrier is sufficient on its own; the trailing
+    # one only waits for the slowest core (~4.7 us a call at EP16).
+    "MOE_FUSED_EP_V2_TAIL_BARRIER": env_bool("MOE_FUSED_EP_V2_TAIL_BARRIER"),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
