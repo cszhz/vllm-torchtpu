@@ -181,11 +181,14 @@ def _patch_vllm_mtp_prefill_cache_groups() -> None:
             num_external_computed_tokens,
         )
         if envs.TPU_MTP_PREFILL_ONLY and self.cache_config.enable_prefix_caching:
-            # Fine-grained MTP hits drop one hash unit. Preserve the target's
-            # Mamba checkpoint at that same earlier boundary, not only at the
-            # last prompt hash boundary selected by upstream.
+            # Lookup always leaves one token for logits. Back off another
+            # hash unit only while EAGLE block drop is enabled; otherwise
+            # preserve just the last boundary the lookup can actually hit.
             unit = self.hash_block_size
-            boundary = max(0, ((request.num_prompt_tokens - 1) // unit - 1) * unit)
+            drop_units = int(not envs.VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP)
+            boundary = max(
+                0, ((request.num_prompt_tokens - 1) // unit - drop_units) * unit
+            )
             start = (
                 request.num_computed_tokens
                 + num_new_local_computed_tokens
@@ -210,8 +213,13 @@ def _patch_vllm_mtp_prefill_cache_groups() -> None:
             extra = None
             if envs.TPU_MTP_PREFILL_ONLY:
                 unit = self.block_pool.hash_block_size
-                boundary = max(0, ((request.num_prompt_tokens - 1) // unit - 1) * unit)
-                if boundary > 0:
+                drop_units = int(not envs.VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP)
+                boundary = max(
+                    0, ((request.num_prompt_tokens - 1) // unit - drop_units) * unit
+                )
+                if boundary > 0 and (
+                    drop_units or request.num_prompt_tokens % unit == 0
+                ):
                     # Reuse upstream registration and Mamba CoW. The view only
                     # changes which boundary is retained; token hashes, request
                     # identity and block ownership remain those of the request.
@@ -667,6 +675,9 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
 
     patch_executor_for_pp_wave(kwargs.get("vllm_config"))
     patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
+    from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
+
+    patch_engine_core_for_lazy_push(kwargs.get("vllm_config"))
 
     from vllm.v1.engine.core import EngineCoreProc
 

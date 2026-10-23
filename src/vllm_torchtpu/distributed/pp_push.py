@@ -68,6 +68,7 @@ class _WaveState:
         self.open = False
         self.pushes = 0
         self.settles = 0
+        self.lazy = False
 
     def dispatched(self) -> int:
         """Records a scheduler step and returns its number."""
@@ -76,6 +77,34 @@ class _WaveState:
         self.real_steps += 1
         self.open = True
         return self.steps
+
+    def push(self, executor: Any) -> tuple[int, Future]:
+        """Sends one ``pp_push`` and returns its step number and the last
+        stage's reply."""
+        self.steps += 1
+        self.open = True
+        self.pushes += 1
+        if self.pushes <= 5 or self.pushes % 100 == 0:
+            logger.debug("PP wave push %d as step %d", self.pushes, self.steps)
+        return self.steps, executor.collective_rpc(
+            "pp_push", non_block=True, unique_reply_rank=executor.output_rank
+        )
+
+    def settle(self, executor: Any) -> Future | None:
+        """Sends the ``pp_settle`` that closes the burst and returns the last
+        stage's reply; None when no step was dispatched since the last
+        settle."""
+        if not self.open:
+            return None
+        self.open = False
+        self.settles += 1
+        if self.settles <= 5 or self.settles % 100 == 0:
+            logger.debug(
+                "PP wave settle %d after step %d", self.settles, self.last_step
+            )
+        return executor.collective_rpc(
+            "pp_settle", non_block=True, unique_reply_rank=executor.output_rank
+        )
 
     def before_waiting(self, executor: Any, step: int, real_step: int) -> None:
         """Send what carries ``step`` to the last stage before the engine
@@ -88,16 +117,8 @@ class _WaveState:
         # launch before forward m is stage 0's launch after it.
         if not self.open or (self.stages <= 2 and not envs.TPU_PP_ASYNC_HANDOFF):
             return
-        if real_step == self.real_steps:
-            self.open = False
-            self.settles += 1
-            if self.settles <= 5 or self.settles % 100 == 0:
-                logger.debug(
-                    "PP wave settle %d before waiting on step %d", self.settles, step
-                )
-            executor.collective_rpc(
-                "pp_settle", non_block=True, unique_reply_rank=executor.output_rank
-            )
+        if self.lazy or real_step == self.real_steps:
+            self.settle(executor)
             return
         need = self.stages - 2 - (self.steps - step)
         if need <= 0:
@@ -143,6 +164,8 @@ class _PushFuture(Future):
         self._real_step = real_step
 
     def _before_waiting(self) -> None:
+        if self._wave.lazy and self._inner.done():
+            return
         if self._step is None:
             # An empty RPC can wait on earlier push replies in the executor's
             # FIFO. Drain everything already dispatched, including forwards
@@ -179,6 +202,17 @@ class _PushFuture(Future):
 
     def add_done_callback(self, fn):
         self._inner.add_done_callback(lambda _: fn(self))
+
+
+def wave_state(executor: Any) -> _WaveState:
+    """The executor's step count, created on first use."""
+    state = getattr(executor, "_tpu_wave_state", None)
+    if state is None:
+        state = _WaveState(
+            int(executor.vllm_config.parallel_config.pipeline_parallel_size)
+        )
+        executor._tpu_wave_state = state
+    return state
 
 
 def rpc_ring_chunks(stages: int) -> int:
@@ -255,17 +289,8 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
     orig_execute = MultiprocExecutor.execute_model
     orig_sample = MultiprocExecutor.sample_tokens
 
-    def _state(executor) -> _WaveState:
-        state = getattr(executor, "_tpu_wave_state", None)
-        if state is None:
-            state = _WaveState(
-                int(executor.vllm_config.parallel_config.pipeline_parallel_size)
-            )
-            executor._tpu_wave_state = state
-        return state
-
     def execute_model(self, scheduler_output, non_block=False):
-        state = _state(self)
+        state = wave_state(self)
         step = (
             state.dispatched()
             if scheduler_output.total_num_scheduled_tokens > 0
@@ -278,7 +303,7 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         return future if non_block else future.result()
 
     def sample_tokens(self, grammar_output, non_block=False):
-        state = _state(self)
+        state = wave_state(self)
         inner = cast(Future, orig_sample(self, grammar_output, non_block=True))
         # Sampling belongs to the last dispatched step, whatever pushes
         # went out since.

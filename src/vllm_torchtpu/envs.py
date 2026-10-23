@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_MTP_PREFILL_ONLY: bool = False
+    TPU_PP_LAZY_PUSH: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_ASYNC_HANDOFF: bool = False
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -700,6 +701,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental forward-only validation; never enables speculative decode.
     "TPU_MTP_PREFILL_ONLY": env_bool("TPU_MTP_PREFILL_ONLY"),
     "TPU_PP_ASYNC_HANDOFF": env_bool("TPU_PP_ASYNC_HANDOFF", default=False),
+    "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
     "TPU_PP_DYNAMIC_CHUNKS": env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),
     # Fraction above the time of a full prefix-free step that a step may
     # take before its chunks are shortened.
