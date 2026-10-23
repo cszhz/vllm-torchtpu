@@ -178,7 +178,10 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
-from vllm_torchtpu.spec_decode.remote_dspark import RemoteDSparkTransport
+from vllm_torchtpu.spec_decode.remote_dspark import (
+    RemoteDSparkTransport,
+    is_remote_draft_proposal_rank,
+)
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,
@@ -1022,6 +1025,7 @@ class TPUModelRunner(GPUModelRunner):
                 "VLLM_TPU_REMOTE_DSPARK_ROLE must be producer, consumer, or empty"
             )
         self._remote_dspark_transport: RemoteDSparkTransport | None = None
+        self._remote_dspark_proposal_rank = False
         if self._remote_dspark_role:
             if speculative_config is None or speculative_config.method != "dspark":
                 raise ValueError("remote DSpark requires speculative method dspark")
@@ -1031,12 +1035,21 @@ class TPUModelRunner(GPUModelRunner):
                 raise ValueError(
                     "remote DSpark prototype does not combine with KV transfer"
                 )
+            self._remote_dspark_proposal_rank = is_remote_draft_proposal_rank(
+                self._profiler_rank,
+                self.parallel_config.pipeline_parallel_size,
+            )
             self._remote_dspark_transport = RemoteDSparkTransport(
                 role=self._remote_dspark_role,
                 producer_host=envs.VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST,
                 port=envs.VLLM_TPU_REMOTE_DSPARK_PORT,
                 rank=self._profiler_rank,
                 timeout_s=envs.VLLM_TPU_REMOTE_DSPARK_TIMEOUT_S,
+            )
+            logger.info(
+                "Remote DSpark worker channels: rank=%d proposal=%s feedback=true",
+                self._profiler_rank,
+                self._remote_dspark_proposal_rank,
             )
         # The producer populates draft context KV without generating proposals.
         self._is_dspark_pd_producer = bool(
@@ -3800,6 +3813,19 @@ class TPUModelRunner(GPUModelRunner):
 
         remote_feedback: dict[str, Any] | None = None
         if (
+            self._remote_dspark_role == "consumer"
+            and scheduler_output.scheduled_spec_decode_tokens
+            and self._remote_dspark_proposal_rank
+        ):
+            logger.info(
+                "Remote DSpark target verify start: requests=%d lengths=%s",
+                len(scheduler_output.scheduled_spec_decode_tokens),
+                [
+                    len(tokens)
+                    for tokens in scheduler_output.scheduled_spec_decode_tokens.values()
+                ],
+            )
+        if (
             self._remote_dspark_role == "producer"
             and scheduler_output.scheduled_spec_decode_tokens
         ):
@@ -4334,11 +4360,17 @@ class TPUModelRunner(GPUModelRunner):
             return None
         transport = self._remote_dspark_transport
         if self._remote_dspark_role == "consumer":
+            if not self._remote_dspark_proposal_rank:
+                return None
             assert transport is not None
             request_ids, token_ids = transport.recv_proposal()
             return DraftTokenIds(request_ids, token_ids)
         drafts = self.spec_decode_manager.take_draft_token_ids()
-        if self._remote_dspark_role == "producer" and drafts is not None:
+        if (
+            self._remote_dspark_role == "producer"
+            and self._remote_dspark_proposal_rank
+            and drafts is not None
+        ):
             assert transport is not None
             transport.send_proposal(drafts.req_ids, drafts.draft_token_ids)
         return drafts

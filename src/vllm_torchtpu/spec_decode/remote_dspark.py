@@ -32,6 +32,21 @@ _FRAME_HEADER = struct.Struct("!Q")
 _MAX_FRAME_BYTES = 1 << 30
 
 
+def is_remote_draft_proposal_rank(rank: int, pipeline_parallel_size: int) -> bool:
+    """Return whether this worker owns the engine-level proposal channel.
+
+    vLLM invokes ``take_draft_token_ids`` on every model worker, but consumes
+    only the output worker's reply. Remote proposals therefore belong to that
+    one worker; blocking every TP rank on a proposal can prevent the remaining
+    ranks from entering the next target-model collective.
+    """
+    if pipeline_parallel_size != 1:
+        raise ValueError("remote DSpark proposal routing currently requires PP=1")
+    if rank < 0:
+        raise ValueError("remote DSpark rank must be nonnegative")
+    return rank == 0
+
+
 class RemoteDraftProtocolError(RuntimeError):
     """A remote draft message violates request ordering or KV ownership."""
 

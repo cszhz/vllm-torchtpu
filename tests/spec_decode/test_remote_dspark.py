@@ -24,6 +24,7 @@ from vllm_torchtpu.spec_decode.remote_dspark import (
     RemoteDSparkTransport,
     RequestPhase,
     VerifyFeedback,
+    is_remote_draft_proposal_rank,
 )
 
 
@@ -61,6 +62,53 @@ def test_transport_proposal_feedback_round_trip():
 
     consumer.send_feedback({"request_ids": ["req-a"]})
     assert producer[0].recv_feedback()["request_ids"] == ["req-a"]
+
+
+def test_only_output_rank_owns_remote_proposals():
+    assert is_remote_draft_proposal_rank(0, 1)
+    assert not is_remote_draft_proposal_rank(1, 1)
+    assert not is_remote_draft_proposal_rank(7, 1)
+
+    with pytest.raises(ValueError, match="requires PP=1"):
+        is_remote_draft_proposal_rank(0, 2)
+    with pytest.raises(ValueError, match="nonnegative"):
+        is_remote_draft_proposal_rank(-1, 1)
+
+
+def test_feedback_channel_does_not_require_a_rank_local_proposal():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1] - 1
+
+    producer: list[RemoteDSparkTransport] = []
+
+    def accept_producer() -> None:
+        producer.append(
+            RemoteDSparkTransport(
+                role="producer",
+                producer_host="127.0.0.1",
+                port=port,
+                rank=1,
+                timeout_s=5,
+            )
+        )
+
+    accept_thread = threading.Thread(target=accept_producer)
+    accept_thread.start()
+    consumer = RemoteDSparkTransport(
+        role="consumer",
+        producer_host="127.0.0.1",
+        port=port,
+        rank=1,
+        timeout_s=5,
+    )
+    accept_thread.join(timeout=5)
+    assert not accept_thread.is_alive()
+
+    for round_id in range(2):
+        consumer.send_feedback({"request_ids": ["req-a"]})
+        feedback = producer[0].recv_feedback()
+        assert feedback["round_id"] == round_id
 
 
 def _proposal(request_id: str, round_id: int, kv_version: int) -> DraftProposal:
