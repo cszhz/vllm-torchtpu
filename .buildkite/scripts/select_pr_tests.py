@@ -329,20 +329,9 @@ def _classify_unit_test_file(
         content = full_path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return (True, True)
-    has_multichip = bool(re.search(r"\bmultichip\b", content))
     has_tpu = bool(re.search(r"\btpu_test\b", content))
-    return (has_tpu or not has_multichip, has_multichip)
-
-
-def _is_cpu_only_unit_test(rel_path: str, repo_root: Path = REPO_ROOT) -> bool:
-    full_path = repo_root / rel_path
-    if not full_path.is_file():
-        return False
-    try:
-        content = full_path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return False
-    return not bool(re.search(r"\b(tpu_test|multichip)\b", content))
+    has_multichip = bool(re.search(r"\bmultichip\b", content))
+    return (has_tpu, has_multichip)
 
 
 def _format_brace_pattern(files: list[str]) -> str:
@@ -507,7 +496,7 @@ def select_for_files(
                     }
                 )
                 reasons.append("spec-decode unit test changes")
-            elif f == "tests/conftest.py" or not (
+            elif not (
                 Path(f).name.startswith("test_") or Path(f).name.endswith("_test.py")
             ):
                 run_test_steps.update(
@@ -523,17 +512,18 @@ def select_for_files(
                 reasons.append("shared test fixture changes")
             elif not (repo_root / f).is_file():
                 reasons.append("deleted unit test file")
-            elif _is_cpu_only_unit_test(f, repo_root):
-                reasons.append("CPU unit test changes")
             else:
                 has_gen, has_multi = _classify_unit_test_file(f, repo_root)
-                if has_gen:
-                    run_test_steps.add("unit_tests_general_pr")
-                    general_test_files.append(f)
-                if has_multi:
-                    run_test_steps.add("unit_tests_multichip_pr")
-                    multichip_test_files.append(f)
-                reasons.append("TPU unit test changes")
+                if not has_gen and not has_multi:
+                    reasons.append("CPU unit test changes")
+                else:
+                    if has_gen:
+                        run_test_steps.add("unit_tests_general_pr")
+                        general_test_files.append(f)
+                    if has_multi:
+                        run_test_steps.add("unit_tests_multichip_pr")
+                        multichip_test_files.append(f)
+                    reasons.append("TPU unit test changes")
             continue
 
         if f.startswith("src/vllm_torchtpu/spec_decode/"):
@@ -554,12 +544,9 @@ def select_for_files(
 
         if f.startswith(
             (
-                "src/vllm_torchtpu/tracing/",
-                "src/vllm_torchtpu/structured_decoding/",
                 "src/vllm_torchtpu/models/vllm/deepseek_v4/",
                 "src/vllm_torchtpu/kernels/deepseek_v4/",
                 "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/",
-                "src/vllm_torchtpu/kernels/experimental/",
                 "src/vllm_torchtpu/models/vllm/qwen4_exp/",
             )
         ):
@@ -573,14 +560,13 @@ def select_for_files(
             )
             full_general_tests = True
             full_multichip_tests = True
-            reasons.append("isolated model/feature module changes")
+            reasons.append("isolated model module changes")
             continue
 
         if f.startswith(
             (
                 "src/vllm_torchtpu/models/vllm/kimi_k3/",
-                "src/vllm_torchtpu/kernels/mla/",
-                "src/vllm_torchtpu/offload/",
+                "src/vllm_torchtpu/kernels/kimi_k3/",
             )
         ):
             run_test_steps.update(
@@ -594,10 +580,15 @@ def select_for_files(
             run_integration_steps.add("integration_k3_pruned75_apc_offload_correctness")
             full_general_tests = True
             full_multichip_tests = True
-            reasons.append("Kimi-K3/MLA/offload module changes")
+            reasons.append("Kimi-K3 module changes")
             continue
 
-        if f.startswith("src/vllm_torchtpu/distributed/kv_transfer/"):
+        if f.startswith(
+            (
+                "src/vllm_torchtpu/distributed/kv_transfer/",
+                "src/vllm_torchtpu/offload/",
+            )
+        ):
             run_test_steps.update(
                 {
                     "typecheck_full",
@@ -615,11 +606,12 @@ def select_for_files(
                     "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
                     "integration_qwen35_gpc_correctness",
                     "integration_qwen35_gpc_global_dram_pool",
+                    "integration_k3_pruned75_apc_offload_correctness",
                 }
             )
             full_general_tests = True
             full_multichip_tests = True
-            reasons.append("KV-transfer module changes")
+            reasons.append("KV-transfer/offload module changes")
             continue
 
         run_test_steps.update(
