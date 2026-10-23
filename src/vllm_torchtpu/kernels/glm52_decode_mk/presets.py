@@ -13,9 +13,13 @@ to stage A (A0 TPU oracle per lane, and in the compose correctness jobs).
        abb6053ac); gearly / qmid differ per bucket
   L3   served operand form: one lax.cond per level of the expert-operand cascade (srv_a, 2f65c7fe7); no effect on
        the stacked form (stack_e=True has no cascade)
-  LV   live-row collectives (stageB/lv-probe): ARs / pair q AG / A2A move only the live rows. Not in ORDER ("B");
-       name it explicitly ("B,LV" or "L4,L1,L2,L3,L1e,LV"); needs L4 and L2
+  LV   live-row collectives (stageB/lv-probe, lv-prod): ARs / pair q AG / A2A move only the live rows. Not in ORDER
+       ("B"); name it explicitly ("B,LV" or "L4,L1,L2,L3,L1e,LV"); needs L4 and L2. Its floor is the next-smaller
+       row bucket (`rows`: the adapter's GLM52_DECODE_MK_ROWS; default 16, 32)
 """
+
+LV_EIGHT = "split"  # placeholder until lv-prod measures split vs round
+LV_LOOP = 0
 
 ORDER = (
     "L4",
@@ -26,7 +30,7 @@ ORDER = (
 )  # forward-ladder order, ranked by measured lane gain (compose README)
 
 
-def lever(name, T):
+def lever(name, T, rows=None):
     if name == "L4":
         return dict(a2a_lse="tile", a2a_rw=4)
     if name == "L1":
@@ -40,7 +44,8 @@ def lever(name, T):
     if name == "L3":
         return dict(ecas="cond")
     if name == "LV":
-        return dict(lv=True)
+        below = [r for r in (rows if rows else (16, 32)) if r < T]
+        return dict(lv=True, lv_floor=max(below) if below else 0, lv_eight=LV_EIGHT, lv_loop=LV_LOOP)
     raise ValueError(f"unknown lever {name!r}")
 
 
@@ -59,10 +64,10 @@ def parse(spec):
     return names
 
 
-def tiles_kwargs(T, levers):
+def tiles_kwargs(T, levers, rows=None):
     out = {}
     for n in levers:
-        kw = lever(n, T)
+        kw = lever(n, T, rows)
         clash = set(kw) & set(out)
         assert not clash, ("two levers set the same Tiles field", n, clash)
         out.update(kw)
