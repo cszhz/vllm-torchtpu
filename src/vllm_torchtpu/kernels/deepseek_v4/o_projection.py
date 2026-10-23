@@ -359,8 +359,11 @@ def wo_a_projection(
     if groups_per_step is None:
         # Two groups per grid step halve the steps (and their fixed cost) at
         # decode-sized token tiles; a larger tile's doubled blocks overrun VMEM.
-        # tpu7x, T=16/64/128: 28.6/32.0/37.2 -> 23.6/26.9/31.5 us.
-        groups_per_step = 2 if tile_t <= 512 and num_r_tiles == 1 else 1
+        # rc7 tpu7x one core, quantized activations (j-1e69970b), per call:
+        # 4 groups (TP4) T=16/128/256: 14.7/19.5/25.6 -> 13.4/18.0/24.9 us;
+        # 2 groups (TP8) within 0.2 us; T=512 is slower (24.8 -> 26.0 us at
+        # TP8, 38.7 -> 39.9 at TP4), so the cap is 256.
+        groups_per_step = 2 if tile_t <= 256 and num_r_tiles == 1 else 1
     gps = groups_per_step if num_groups % groups_per_step == 0 else 1
     assert gps == 1 or num_r_tiles == 1
 
