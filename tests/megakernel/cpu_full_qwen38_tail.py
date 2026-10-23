@@ -9,7 +9,8 @@ from vllm_torchtpu.megakernel.models.qwen38_inputs import pack_segment, random_s
 from vllm_torchtpu.megakernel.models.qwen38_pack import shard_step_inputs
 from vllm_torchtpu.megakernel.models.qwen38_reference import segment_reference
 g = qwen38.FULL; R, L, T, B = 8, 1, 4, 8
-tiles = Tiles(ebank=2 << 20, nbe=12, nbd=10, vmem_mib=8192)  # interpret: one typed ring per kind.with_blocks({"moe": {"pipe_ep": True, "moe_unroll": True}})
+# Interpret mode allocates one typed ring per weight kind, hence the budget.
+tiles = Tiles(ebank=2 << 20, nbe=12, nbd=10, vmem_mib=8192).with_blocks({"moe": {"pipe_ep": True, "moe_unroll": True}})
 ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=True, tiles=tiles)
 spec = qwen38.segment_spec(g, R, L=L)
 t0 = time.time()
