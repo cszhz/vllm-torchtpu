@@ -2358,9 +2358,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             # all-reduce is ordered after the one before, or XLA combines them
             # after the last o_proj. The same matmul and all-reduce as
             # `self.o_proj(x)` on each chunk's rows.
+            ys = [self.o_proj.quant_method.apply(self.o_proj, x, None) for x in attn_out]
+            groups = envs.TPU_DCP_MERGE_CHUNKED_OPROJ_AR_GROUPS
+            if 0 < groups < len(ys) and len(ys) % groups == 0:
+                # TPU_DCP_MERGE_CHUNKED_OPROJ_AR_GROUPS: one all-reduce per
+                # group of consecutive chunks.
+                n = len(ys) // groups
+                ys = [torch.cat(ys[g * n : (g + 1) * n]) for g in range(groups)]
             outs: list[torch.Tensor] = []
-            for x in attn_out:
-                y = self.o_proj.quant_method.apply(self.o_proj, x, None)
+            for y in ys:
                 if outs:
                     y = _after(y, outs[-1])
                 outs.append(tensor_model_parallel_all_reduce(y))

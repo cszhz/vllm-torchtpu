@@ -280,7 +280,12 @@ def _merge_chunks(num_tokens: int) -> int:
     ):
         return 1
     small = envs.TPU_DCP_MERGE_CHUNKED_SMALL
-    if small >= 2 and _lse_gathered_once(num_tokens):
+    small_cap = envs.TPU_DCP_MERGE_CHUNKED_SMALL_MAX_TOKENS
+    if (
+        small >= 2
+        and _lse_gathered_once(num_tokens)
+        and (small_cap <= 0 or num_tokens <= small_cap)
+    ):
         chunks = small
     if num_tokens % (8 * chunks):
         return 1

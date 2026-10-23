@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_CHUNKED_OPROJ_AR: bool = False
     TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MAX_TOKENS: int = 0
+    TPU_DCP_MERGE_CHUNKED_OPROJ_AR_GROUPS: int = 0
+    TPU_DCP_MERGE_CHUNKED_SMALL_MAX_TOKENS: int = 0
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
@@ -844,6 +846,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MAX_TOKENS": env_int(
         "TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MAX_TOKENS", 0
+    ),
+    # Its all-reduces per step: the chunks' o_proj outputs are joined into this
+    # many contiguous groups, one all-reduce each (0 = one per chunk). Fewer
+    # SparseCore all-reduces leave the SparseCore KV gather fewer to wait on.
+    "TPU_DCP_MERGE_CHUNKED_OPROJ_AR_GROUPS": env_int(
+        "TPU_DCP_MERGE_CHUNKED_OPROJ_AR_GROUPS", 0
+    ),
+    # TPU_DCP_MERGE_CHUNKED_SMALL applies only up to this bucket (0 = every
+    # bucket that gathers its lse once). Lets TPU_DCP_MERGE_CHUNKED_LSE_AG
+    # cover 4096 with one gather while 4096 keeps its TPU_DCP_MERGE_CHUNKED
+    # chunks.
+    "TPU_DCP_MERGE_CHUNKED_SMALL_MAX_TOKENS": env_int(
+        "TPU_DCP_MERGE_CHUNKED_SMALL_MAX_TOKENS", 0
     ),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
