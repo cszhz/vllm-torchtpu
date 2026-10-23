@@ -2493,8 +2493,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 fused_merge=fused_merge,
                 dcp_lane_ids=lane_ids,
                 # TPU_DCP_MLA_OPROJ_ALL_REDUCE reads the partial whole on every
-                # bucket the pieces would serve (and the drafter never chunks).
-                merge_pieces=getattr(layer, "W_O_dcp_qrep", None) is None,
+                # bucket the pieces would serve (and the drafter never chunks),
+                # up to its TPU_DCP_MLA_OPROJ_ALL_REDUCE_MAX_TOKENS: the larger
+                # buckets keep the merge and its pieces (static shape here).
+                merge_pieces=getattr(layer, "W_O_dcp_qrep", None) is None
+                or 0 < envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE_MAX_TOKENS < ql_nope.shape[0],
             )
 
         # The torch op schema is inferred from the signature: no varargs or
@@ -3079,8 +3082,16 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         # projection); same W_UV buffers as uv_first.
                         # TPU_DCP_MERGE_CHUNKED_OPROJ_AR: the chunks go to the
                         # wrapper unjoined, for o_proj + all-reduce per chunk.
-                        chunked_oproj = envs.TPU_DCP_MERGE_CHUNKED_OPROJ_AR and getattr(
-                            layer, "oproj_per_chunk", False
+                        rows_ = partial.shape[0]
+                        chunked_oproj = (
+                            envs.TPU_DCP_MERGE_CHUNKED_OPROJ_AR
+                            and getattr(layer, "oproj_per_chunk", False)
+                            and rows_ >= envs.TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MIN_TOKENS
+                            and (
+                                envs.TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MAX_TOKENS <= 0
+                                or rows_
+                                <= envs.TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MAX_TOKENS
+                            )
                         )
                         outputs = (
                             _cp_mla_attention.merge_lse_partials_scatter_heads_vspace(

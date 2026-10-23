@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_MAX_TOKENS: int = 0
     TPU_DCP_MERGE_CHUNKED_OPROJ_AR: bool = False
+    TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MIN_TOKENS: int = 0
+    TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MAX_TOKENS: int = 0
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
@@ -834,6 +836,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # attention layer at 4096 tokens on the AgentX c16 twin. Not with an
     # output gate (applied to the joined output).
     "TPU_DCP_MERGE_CHUNKED_OPROJ_AR": env_bool("TPU_DCP_MERGE_CHUNKED_OPROJ_AR"),
+    # Its bucket range (0 = unbounded). On the c16 twin it won at 2048 tokens
+    # (2 chunks) and lost at 1024 and at 4096, where 8 SparseCore all-reduces
+    # delayed the SparseCore KV gather feeding each attention chunk.
+    "TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MIN_TOKENS": env_int(
+        "TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MIN_TOKENS", 0
+    ),
+    "TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MAX_TOKENS": env_int(
+        "TPU_DCP_MERGE_CHUNKED_OPROJ_AR_MAX_TOKENS", 0
+    ),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
     # them in VMEM and its output aliases q_nope (512 wide), instead of the
