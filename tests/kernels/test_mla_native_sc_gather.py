@@ -120,6 +120,65 @@ class NativeScGatherTest(absltest.TestCase):
                     np.asarray(gathered_rope)[:groups], expected_rope[:groups]
                 )
 
+    def test_row_offset_gathers_the_offset_rows(self):
+        """``row_offset`` (GLM5_MKD_STACK_C): per-layer indices + an in-kernel
+        row offset gather exactly what ``indices + row_offset`` gathers from the
+        merged stack, for every live row; offset 0 equals no offset; a wrong
+        offset (positive control) gathers other rows."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("native-SC gather requires a TPU SparseCore")
+
+        n_layers, pages, page_size = 3, 32, 256
+        layer_tokens = pages * page_size
+        query_tokens, topk = 32, 2048
+        count = query_tokens * topk
+        rng = np.random.default_rng(20261023)
+        nope_u8 = rng.integers(0, 256, (n_layers * pages, page_size, 4, 128), np.uint8)
+        rope_u8 = rng.integers(0, 0x7E, (n_layers * pages, page_size // 4, 4, 128), np.uint8)
+        rope_u8[..., 64:] = 0
+        nope_i32 = jnp.asarray(native_sc_cache_layout.pack_nope(nope_u8))
+        rope_i32 = jnp.asarray(native_sc_cache_layout.pack_rope_banded(rope_u8))
+        indices = jnp.asarray(
+            rng.integers(0, layer_tokens, count, dtype=np.int32).reshape(query_tokens, topk)
+        )
+        num_live = 20 * topk + 3 * 64
+        groups = num_live // native_sc_gather.ROPE_PACKING
+
+        def gather(idx, **kw):
+            return jax.block_until_ready(
+                native_sc_gather.dsa_gather_native_sc(
+                    nope_i32,
+                    rope_i32,
+                    idx,
+                    out_size=count,
+                    atoms_per_batch=16,
+                    num_live_indices=jnp.int32(num_live),
+                    live_multiple=64,
+                    **kw,
+                )
+            )
+
+        for row in range(n_layers):
+            with self.subTest(row=row):
+                off = row * layer_tokens
+                want_nope, want_rope = gather(indices + off)
+                got_nope, got_rope = gather(indices, row_offset=off)
+                np.testing.assert_array_equal(
+                    np.asarray(got_nope)[:num_live], np.asarray(want_nope)[:num_live]
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(got_rope)[:groups], np.asarray(want_rope)[:groups]
+                )
+                wrong_nope, _ = gather(
+                    indices, row_offset=((row + 1) % n_layers) * layer_tokens
+                )
+                self.assertFalse(
+                    np.array_equal(
+                        np.asarray(wrong_nope)[:num_live], np.asarray(want_nope)[:num_live]
+                    ),
+                    "positive control: a wrong row offset must gather other rows",
+                )
+
     def test_live_bounded_gather_is_byte_exact_on_live_rows(self):
         """The decode bucket (16 tokens x topk 2048) with a traced live count.
 

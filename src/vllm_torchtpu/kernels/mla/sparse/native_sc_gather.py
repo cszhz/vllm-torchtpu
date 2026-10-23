@@ -138,6 +138,7 @@ def _kernel(
     write_tokens: int = 0,
     write_fault: str | None = None,
     rope_words: int = ROPE_WORDS,
+    row_offset_lanes: bool = False,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     late_drain = None
@@ -185,13 +186,24 @@ def _kernel(
         def atom_of(step):
             return live_atom_of(step, starts, row_atoms)
 
-        def values(atom, stream):
+        def raw_values(atom, stream):
             if linear_indices:
                 # 1-D operand, one logical batch per block (dsa_gather.py's form).
                 return indices_ref[
                     pl.ds(atom * OCCURRENCES_PER_ATOM + stream * NUM_LANES, NUM_LANES)
                 ]
             return indices_ref[0, atom, stream, :]
+
+        def values(atom, stream):
+            if row_offset_lanes:
+                # GLM5_MKD_STACK_C: lanes [32, 48) of the live vector broadcast
+                # this layer's row offset into the merged stack; the indices
+                # are the per-layer rows, shared by every layer that shares a
+                # top-k (dsa_gather_native_sc's `row_offset`).
+                return raw_values(atom, stream) + live_vmem_ref[
+                    pl.ds(2 * NUM_LANES, NUM_LANES)
+                ]
+            return raw_values(atom, stream)
 
         def destinations(atom, stream):
             return pl.ds(
@@ -284,7 +296,7 @@ def _kernel(
         pred = None
         if is_dcp_mode:
             # Skip a batch whose first index is the -1 pad.
-            pred = values(0, 0)[0] >= 0
+            pred = raw_values(0, 0)[0] >= 0
         if live_batches is not None and guard_tail:
             # Owners share a uniform traced grid of cdiv(live, num_owners);
             # the ragged last round is skipped per owner.
@@ -582,6 +594,7 @@ def dsa_gather_native_sc(
     kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     write_fault: str | None = None,
     packed_rope: bool = False,
+    row_offset: jax.Array | int | None = None,
 ) -> tuple[jax.Array, ...]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -641,6 +654,15 @@ def dsa_gather_native_sc(
       serve_pipelined: whether to pipeline the gather serving loop.
       is_dcp_mode: whether to enable DCP mode (skips gather for padding atoms).
 
+    ``row_offset`` (traced i32 scalar, optional; GLM5_MKD_STACK_C; with
+    ``num_live_indices`` only) is added to every gathered index inside the
+    kernel: the caches are a merged ``[n_layers * num_blocks, ...]`` stack and
+    ``indices`` are this layer's per-layer rows, so the index array (and its
+    slicing / relayout) stays the same computation in every layer that shares a
+    top-k -- XLA CSEs it -- and only this scalar differs per layer. It rides in
+    lanes ``[32, 48)`` of the live vector; same rows as gathering
+    ``indices + row_offset``.
+
     ``packed_rope`` reads (and ``kv_write`` writes) a ROPE cache whose tokens
     own 16-word eighths of a row (`SparseMLAKVCacheSpec.packed_rope`) instead
     of 32-word quarters. The gathered output is the same: the rope lanes past
@@ -668,6 +690,8 @@ def dsa_gather_native_sc(
 
     if sum(x is not None for x in (num_live_indices, live_vec, live_vec_offset)) > 1:
         raise ValueError("pass one of num_live_indices, live_vec, live_vec_offset")
+    if row_offset is not None and num_live_indices is None:
+        raise ValueError("row_offset rides in the num_live_indices live vector")
     num_cores, num_subcores, atoms_per_batch, occurrences_per_batch, num_batches = (
         live_vec_geometry(out_size, atoms_per_batch)
     )
@@ -729,14 +753,16 @@ def dsa_gather_native_sc(
         )
         owner_b = (live_b + num_owners - 1) // num_owners
         # Lanes [0,16) = live logical batches, [16,32) = per-owner grid length.
-        live_vec = jnp.concatenate(
-            [
-                jnp.full((NUM_LANES,), live_b, jnp.int32),
-                jnp.full((NUM_LANES,), owner_b, jnp.int32),
-            ]
-        )
+        lanes = [
+            jnp.full((NUM_LANES,), live_b, jnp.int32),
+            jnp.full((NUM_LANES,), owner_b, jnp.int32),
+        ]
+        if row_offset is not None:
+            # Lanes [32, 48) = the stack row offset (`row_offset`).
+            lanes.append(jnp.full((NUM_LANES,), row_offset, jnp.int32))
+        live_vec = jnp.concatenate(lanes)
         operands.append(live_vec)
-        scratch_types["live_vmem_ref"] = pltpu.VMEM((2 * NUM_LANES,), jnp.int32)
+        scratch_types["live_vmem_ref"] = pltpu.VMEM((len(lanes) * NUM_LANES,), jnp.int32)
         scratch_types["live_sem_ref"] = pltpu.SemaphoreType.DMA((1,))
         # Per-owner guard is needed only if a live count can leave a ragged
         # last round, i.e. unless the caller promises num_live_indices is a
@@ -827,6 +853,7 @@ def dsa_gather_native_sc(
         write_fault=write_fault,
         **row_kwargs,
         rope_words=rope_words,
+        row_offset_lanes=row_offset is not None,
     )
 
     def body(*refs, write_dst_vmem=None, write_dst_sem=None, write_sem=None, **scr):
@@ -865,6 +892,7 @@ def dsa_gather_native_sc(
             f"{'_rowlive' if row_kwargs else ''}"
             f"{'_kvw' if kv_write is not None else ''}"
             f"{'_packedrope' if packed_rope else ''}"
+            f"{'_rowoff' if row_offset is not None else ''}"
         ),
     )(*operands)
     if kv_write is None:

@@ -1367,6 +1367,7 @@ def sparse_mla_attention_dcp(
     def _local_layer(
         nope_spec,
         rope_spec,
+        stack,
         ql_nope,
         q_pe,
         kv_c_normed,
@@ -1381,7 +1382,13 @@ def sparse_mla_attention_dcp(
         *extra_,
     ):
         # `nope_spec` / `rope_spec` shadow the outer specs: `_local` passes
-        # them, with `num_pages` the merged pool under GLM5_MKD_STACK_C.
+        # them, with `num_pages` the merged pool under GLM5_MKD_STACK_C, and
+        # `stack` = `kv_stack` (None: per-layer caches). On a stack the block
+        # table stays this layer's per-layer table: every page computation
+        # below runs on the per-layer geometry (`stack[1]` pages), the same in
+        # every layer, so XLA CSEs it across layers exactly as on per-layer
+        # caches, and the stack row is added only where a cache is addressed
+        # (the writer's pages, the attention's gathered rows).
         # Trailing operands, in order: the q rope table (TPU_MLA_DECODE_PROLOGUE),
         # then this shard's DCP rank (TPU_DCP_RANK_OPERAND), then its lane
         # (TPU_MLA_FUSED_SMALL_A2A).
@@ -1434,6 +1441,7 @@ def sparse_mla_attention_dcp(
                 nope_spec=nope_spec,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
+                kv_stack=stack,
             )
             # One u32[3 * Tp, 128] operand: one TensorCore producer for the gather.
             kv_write = native_sc_gather.pack_write_rows(
@@ -1455,6 +1463,7 @@ def sparse_mla_attention_dcp(
                 rope_spec=rope_spec,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
+                kv_stack=stack,
             )
 
         # Decode buckets with TPU_DCP_MLA_MASK_IN_KERNEL: the kernel takes the
@@ -1531,7 +1540,10 @@ def sparse_mla_attention_dcp(
         )
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
-        local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
+        local_block_tables = jnp.mod(
+            block_tables_,
+            jnp.int32(nope_spec.num_pages if stack is None else stack[1]),
+        )
         # Decode-sized chunks: query tokens per attention grid step.
         small_chunk_batch = envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH
         if small_chunk_batch < 1:
@@ -1603,6 +1615,7 @@ def sparse_mla_attention_dcp(
             decode_body_levers=_decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS),
             out_pieces=merge_pieces,
             out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
+            kv_stack=stack,
             **chunk_kwargs,
             **split_kwargs,
             **packed_rope_kwargs,
@@ -1685,6 +1698,7 @@ def sparse_mla_attention_dcp(
             return _local_layer(
                 nope_spec,
                 rope_spec,
+                None,
                 ql_nope,
                 q_pe,
                 kv_c_normed,
@@ -1696,13 +1710,14 @@ def sparse_mla_attention_dcp(
                 block_tables_,
                 *rest_,
             )
-        # GLM5_MKD_STACK_C: this rank's stacks as one page pool (bitcasts), the
-        # block table rewritten into this layer's pages; every return path of
-        # `_local_layer` leads with the two caches, split back here.
+        # GLM5_MKD_STACK_C: this rank's stacks as one page pool (bitcasts); the
+        # block table is NOT rewritten (`_local_layer` adds this layer's row
+        # where it addresses a cache, after the per-layer page math, so that
+        # math stays common to every layer and XLA CSEs it); every return
+        # path of `_local_layer` leads with the two caches, split back here.
         stacked_shapes = (kv_cache_nope.shape, kv_cache_rope.shape)
         kv_cache_nope = kv_cache_utils.merge_kv_stack(kv_cache_nope, kv_stack)
         kv_cache_rope = kv_cache_utils.merge_kv_stack(kv_cache_rope, kv_stack)
-        block_tables_ = kv_cache_utils.stack_page_table_dcp(block_tables_, kv_stack)
         # Same per-page geometry, a pool of n_layers * num_blocks pages.
         local_nope_spec = dataclasses.replace(
             nope_spec, num_pages=kv_cache_nope.shape[0]
@@ -1713,6 +1728,7 @@ def sparse_mla_attention_dcp(
         outs = _local_layer(
             local_nope_spec,
             local_rope_spec,
+            kv_stack,
             ql_nope,
             q_pe,
             kv_c_normed,
