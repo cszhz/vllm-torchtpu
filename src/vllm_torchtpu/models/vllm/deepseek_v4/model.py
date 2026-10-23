@@ -54,10 +54,12 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
     VllmDeepseekCompressor,  # noqa: E501
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
+    KernelOpts,
     MHCOps,
     get_mhc_ops,
     get_mhc_post_op,
     get_mhc_split_fn_op,
+    get_mhc_stack_fn_op,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
@@ -104,6 +106,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         # The mHC kernels then emit attn_norm/ffn_norm-normalized inputs.
         self.fuse_norm = envs.VLLM_TPU_DSV4_MHC_FUSE_NORM
+        self.mhc_opts = KernelOpts(
+            gates_in_kernel=envs.VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL,
+            fuse_norm=self.fuse_norm,
+            stacked_fn=envs.VLLM_TPU_DSV4_MHC_STACKED_FN,
+            token_block=envs.VLLM_TPU_DSV4_MHC_TOKEN_BLOCK,
+            gates_max_tokens=envs.VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS,
+        )
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -150,8 +159,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
-                gates_in_kernel=envs.VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL,
-                fuse_norm=self.fuse_norm,
+                opts=self.mhc_opts,
             )
             object.__setattr__(self, "_mhc_ops_instance", ops)
         return ops
@@ -162,16 +170,40 @@ class DeepseekV4DecoderLayer(nn.Module):
         The split depends only on the weight; doing it here, once after the
         weights land, keeps it out of every forward.
         """
-        split = get_mhc_split_fn_op()
-        for name in ("hc_attn_fn", "hc_ffn_fn"):
-            for suffix, chunk in zip(("hi", "mid", "lo"), split(getattr(self, name))):
-                self.register_buffer(f"{name}_{suffix}", chunk, persistent=False)
+        if self.mhc_opts.stacked_fn:
+            stack = get_mhc_stack_fn_op()
+            for name in ("hc_attn_fn", "hc_ffn_fn"):
+                self.register_buffer(
+                    f"{name}_cat", stack(getattr(self, name)), persistent=False
+                )
+        else:
+            split = get_mhc_split_fn_op()
+            for name in ("hc_attn_fn", "hc_ffn_fn"):
+                for suffix, chunk in zip(
+                    ("hi", "mid", "lo"), split(getattr(self, name))
+                ):
+                    self.register_buffer(f"{name}_{suffix}", chunk, persistent=False)
+        if self.fuse_norm:
+            # The kernels read the norm weight as (1, H); reshaping (H,) in
+            # the forward is a relayout copy per seam (~1.4 us at decode).
+            for norm_name in ("attn_norm", "ffn_norm"):
+                w = getattr(self, norm_name).weight
+                self.register_buffer(
+                    f"{norm_name}_w2d",
+                    w.detach().reshape(1, -1).clone(),
+                    persistent=False,
+                )
 
-    def _fn3(self, name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _fn3(self, name: str) -> tuple[torch.Tensor, ...]:
+        if self.mhc_opts.stacked_fn:
+            return (getattr(self, f"{name}_cat"),)
         return tuple(getattr(self, f"{name}_{s}") for s in ("hi", "mid", "lo"))
 
     def _norm_arg(self, norm: RMSNorm) -> tuple[torch.Tensor, ...]:
-        return (norm.weight,) if self.fuse_norm else ()
+        if not self.fuse_norm:
+            return ()
+        name = "attn_norm" if norm is self.attn_norm else "ffn_norm"
+        return (getattr(self, f"{name}_w2d"),)
 
     def _norm(self, norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
         return x if self.fuse_norm else norm(x)

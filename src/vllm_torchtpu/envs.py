@@ -133,6 +133,9 @@ if TYPE_CHECKING:
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = False
     VLLM_TPU_DSV4_MHC_FUSE_NORM: bool = False
+    VLLM_TPU_DSV4_MHC_STACKED_FN: bool = False
+    VLLM_TPU_DSV4_MHC_TOKEN_BLOCK: int = 0
+    VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS: int = -1
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -982,6 +985,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DeepSeek-V4 mHC: the pre / fused seam kernels also apply the
     # sublayer's attn_norm / ffn_norm RMSNorm to the layer input they emit.
     "VLLM_TPU_DSV4_MHC_FUSE_NORM": env_bool("VLLM_TPU_DSV4_MHC_FUSE_NORM"),
+    # DeepSeek-V4 mHC: keep fn as its three bf16 chunks stacked (3 * 24, K)
+    # and run the mix GEMM as one MXU pass (the MXU pads the 24-wide output
+    # anyway). Not bit-identical to the three-pass path: the partial sums
+    # round differently (measured closer to an f64 reference).
+    "VLLM_TPU_DSV4_MHC_STACKED_FN": env_bool("VLLM_TPU_DSV4_MHC_STACKED_FN"),
+    # DeepSeek-V4 mHC: fused seam token block (0 = kernel default 32). 128
+    # amortizes the per-grid-step cost at prefill sizes.
+    "VLLM_TPU_DSV4_MHC_TOKEN_BLOCK": env_int("VLLM_TPU_DSV4_MHC_TOKEN_BLOCK", 0),
+    # DeepSeek-V4 mHC: in-kernel gates only up to this many tokens
+    # (-1 = kernel default 512, 0 = no cap; with a 128-token block the
+    # token-major Sinkhorn fills every lane, so no cap is needed).
+    "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS": env_int(
+        "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS", -1
+    ),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),

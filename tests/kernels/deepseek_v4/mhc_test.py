@@ -725,5 +725,70 @@ class MhcGatesInKernelTpuTest(parameterized.TestCase):
             self.assertTrue(bool(jnp.isfinite(out.astype(jnp.float32)).all()))
 
 
+@pytest.mark.tpu_test
+class MhcStackedFnTpuTest(parameterized.TestCase):
+    """Stacked-chunk single-pass GEMM (utils.CatFn), the 128-token block, the
+    uncapped in-kernel gates and the in-kernel stream of fn vs the default
+    three-chunk path. Streams are bit-identical (they never see fn); the
+    gates differ only by GEMM partial-sum rounding (tolerance tier)."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.product(
+        num_tokens=[8, 16, 17, 128, 600],
+        variant=["cat", "cat_tb128_gkall", "cat_stream"],
+    )
+    def test_fused(self, num_tokens, variant):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        args = list(_fused_args(np.random.default_rng(21), num_tokens, 7168))
+        fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
+        want = fused_fn(*args, gates_in_kernel=True, gates_max_tokens=0)
+        args[4] = utils.cat_fn3(args[4])
+        kw = dict(gates_in_kernel=True, gates_max_tokens=0)
+        if variant == "cat_tb128_gkall":
+            kw["token_block_size"] = 128
+        if variant == "cat_stream":
+            kw.update(token_block_size=128, fn_prefetch=True, per_stream_dot=True)
+        got = fused_fn(*args, **kw)
+        np.testing.assert_array_equal(_to_np(got[0]), _to_np(want[0]))
+        for g, w in zip(got[1:3], want[1:3]):
+            np.testing.assert_allclose(
+                _to_np(g), _to_np(w), rtol=GATES_RTOL * 10, atol=GATES_ATOL
+            )
+        # layer input: pre_mix moves by a few f32 ulp -> rare 1-ulp bf16 flips
+        np.testing.assert_allclose(
+            _to_np(got[3]), _to_np(want[3]), rtol=8e-3, atol=1e-6
+        )
+
+    def test_pre(self):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import pre_kernel
+
+        rng = np.random.default_rng(22)
+        residual, fn, hc_scale, hc_base = _make_pre_inputs(rng, 16, 7168)
+        args = [
+            jnp.asarray(residual).astype(jnp.bfloat16),
+            jnp.asarray(fn),
+            jnp.asarray(hc_scale),
+            jnp.asarray(hc_base),
+            RMS_EPS,
+            HC_PRE_EPS,
+            HC_SINKHORN_EPS,
+            HC_POST_MULT_VALUE,
+            20,
+        ]
+        want = pre_kernel.mhc_pre(*args, gates_in_kernel=True)
+        args[1] = utils.cat_fn3(args[1])
+        got = pre_kernel.mhc_pre(*args, gates_in_kernel=True)
+        for g, w in zip(got[:2], want[:2]):
+            np.testing.assert_allclose(
+                _to_np(g), _to_np(w), rtol=GATES_RTOL * 10, atol=GATES_ATOL
+            )
+        np.testing.assert_allclose(_to_np(got[2]), _to_np(want[2]), rtol=8e-3, atol=1e-6)
+
+
 if __name__ == "__main__":
     absltest.main()
