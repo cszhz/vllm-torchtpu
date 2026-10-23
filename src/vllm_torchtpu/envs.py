@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
     TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_VSPACE_FUSED: bool = False
-    TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = True
+    TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
@@ -801,11 +801,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # it (above TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS) skip the reduce-scatter: each
     # rank runs o_proj on its weighted partial of every group head, and
     # o_proj's all-reduce sums the ranks. Every other step keeps the merge and
-    # o_proj itself. On by default; a no-op without TPU_DCP_MLA_UV_BEFORE_MERGE,
+    # o_proj itself. Off by default: the replicated o_proj does not fit some
+    # served configs' HBM. A no-op without TPU_DCP_MLA_UV_BEFORE_MERGE,
     # unless o_proj is FP8 from an FP8 checkpoint (requantized to a float8),
     # and with an output gate. Costs one o_proj per layer of HBM.
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE": env_bool(
-        "TPU_DCP_MLA_OPROJ_ALL_REDUCE", default=True
+        "TPU_DCP_MLA_OPROJ_ALL_REDUCE", default=False
     ),
     # Its o_proj and all-reduce run in chunks of this many tokens (a multiple
     # of 128), pipelined: each chunk's all-reduce under the next chunk's
