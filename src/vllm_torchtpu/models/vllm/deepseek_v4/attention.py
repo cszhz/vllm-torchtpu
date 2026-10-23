@@ -82,9 +82,12 @@ def _qnorm_rope_jax(
     cos_sin_cache: jax.Array,
     *,
     eps: float,
+    head_dim: int,
 ) -> jax.Array:
-    """Per-head RMSNorm (no weight) fused with RoPE on the query heads."""
-    return rope_kernel.qnorm_rope(x, positions, cos_sin_cache, eps=eps)
+    """Per-head RMSNorm (no weight) fused with RoPE on the flat q projection."""
+    return rope_kernel.qnorm_rope_flat(
+        x, positions, cos_sin_cache, num_heads=x.shape[1] // head_dim, eps=eps
+    )
 
 
 def _rope_jax(
@@ -121,6 +124,15 @@ def _o_proj_jax(
 def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty_like(x)
+
+
+def _make_fake_qnorm_rope(head_dim: int):
+    """Abstract implementation: ``[tokens, heads * head_dim]`` -> 3-D."""
+
+    def _fake(x, positions, cos_sin_cache):
+        return x.new_empty((x.shape[0], x.shape[1] // head_dim, head_dim))
+
+    return _fake
 
 
 def _fake_o_proj(x, positions, cos_sin_cache, wo_a, wo_a_scale, *args, **kwargs):
@@ -512,20 +524,22 @@ class VllmDeepseekV4MLAAttention(
             return op
 
         eps = float(self.mla_attn.eps)
-        op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
+        head_dim = int(self.mla_attn.head_dim)
+        op_name = f"pallas::deepseek_v4_qnorm_rope_flat_e{_name_float(eps)}_d{head_dim}"
         op = _pallas_op_cache.get(op_name)
         if op is None:
             op = pallas.jax_op(
                 op_name,
-                functools.partial(_qnorm_rope_jax, eps=eps),
+                functools.partial(_qnorm_rope_jax, eps=eps, head_dim=head_dim),
                 mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
-                    P(None, "model", None),  # q
+                    P(None, "model"),  # q, flat: heads side by side
                     P(),  # positions
                     P(),  # cos_sin_cache
                 ),
+                output_partition_specs=(P(None, "model", None),),
             )
-            op.register_fake(_fake_rope)
+            op.register_fake(_make_fake_qnorm_rope(head_dim))
             _pallas_op_cache[op_name] = op
         object.__setattr__(self, "_qnorm_rope_op_instance", op)
         return op
@@ -560,7 +574,7 @@ class VllmDeepseekV4MLAAttention(
         q: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply RMSNorm and scaling RoPE to query head states."""
+        """RMSNorm + scaling RoPE on the flat q projection -> [tokens, heads, dim]."""
         return self.qnorm_rope_op(q, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
     def kv_rope(
@@ -572,10 +586,8 @@ class VllmDeepseekV4MLAAttention(
         return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
     def _project_q(self, qr: torch.Tensor) -> torch.Tensor:
-        """Project the q latent to query heads: [num_tokens, heads, head_dim]."""
-        return self.wq_b(qr).view(
-            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
-        )
+        """Project the q latent: [num_tokens, heads * head_dim], heads side by side."""
+        return self.wq_b(qr)
 
     def attention_impl(
         self,
