@@ -959,7 +959,6 @@ def prepare_outputs(
         "num_queries_per_block",
         "vmem_limit_bytes",
         "decode_batch_size",
-        "decode_in_swa_kernel",
     ),
 )
 def mla_ragged_paged_attention(
@@ -984,9 +983,6 @@ def mla_ragged_paged_attention(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_batch_size: int = 8,
-    # The SWA kernel already wrote the final output of the decode sequences
-    # over their rows of `q`; run only prefill and mixed.
-    decode_in_swa_kernel: bool = False,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1011,9 +1007,6 @@ def mla_ragged_paged_attention(
         mixed) cases.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
       decode_batch_size: number of decode sequences to be batched in one block.
-      decode_in_swa_kernel: decode sequences were finished by the SWA kernel
-        (`mla_sliding_window_ragged_paged_attention` with `hca_decode`), which
-        wrote their output over their rows of `q`; skip them.
 
     Returns:
       The output of attention.
@@ -1306,9 +1299,7 @@ def mla_ragged_paged_attention(
         )
 
     decode_bkv_p = num_kv_pages_per_blocks[0]
-    if decode_in_swa_kernel:
-        pass  # The SWA kernel already wrote the decode rows' final output.
-    elif num_page_indices // max_num_seqs <= decode_bkv_p:
+    if num_page_indices // max_num_seqs <= decode_bkv_p:
         # Every decode sequence fits one kv block: one kernel takes them all.
         q = run_single_block_decode_kernel(
             q, jnp.array(0), distribution[0], decode_bkv_p
@@ -1365,11 +1356,7 @@ def mla_ragged_paged_attention(
             case=MlaCase.MIXED,
         )
 
-    if decode_in_swa_kernel:
-        # Skip the prefill and mixed launches in decode-only steps.
-        q = lax.cond(distribution[2] > distribution[0], run_non_decode, lambda q: q, q)
-    else:
-        q = run_non_decode(q)
+    q = run_non_decode(q)
     output = prepare_outputs(
         q, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
