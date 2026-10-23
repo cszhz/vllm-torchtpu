@@ -218,6 +218,7 @@ def _attention_csa(
     union_dense: bool = False,
     union_dense_min_tokens: int = 512,
     union_dense_rows_per_token: int = 160,
+    union_dense_max_heads: int = 16,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -262,7 +263,11 @@ def _attention_csa(
     # it, instead of stalling the TensorCore before them.
     extra, swa_output = jax.lax.optimization_barrier((extra, swa_output))
 
-    if union_dense and q.shape[0] >= union_dense_min_tokens:
+    if (
+        union_dense
+        and q.shape[0] >= union_dense_min_tokens
+        and q.shape[1] <= union_dense_max_heads
+    ):
         output = csa_union_dense.attention(
             q,
             main_cache_kv,

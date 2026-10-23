@@ -436,6 +436,7 @@ def _union_sc_kernel(
     L: int,
     num_cores: int,
     num_subcores: int,
+    count_only: bool = False,
 ):
     W = u_cap // WORD_BITS
     R = ROWS_PER_DMA
@@ -510,10 +511,7 @@ def _union_sc_kernel(
                 )
                 n16 = (S + L - 1) // L
 
-                # A sequential loop: the counts below must see these zeros
-                # (a parallel_loop here left stale counts from an earlier use
-                # of the subcore's VMEM visible to the scan).
-                @pl.loop(0, n16)
+                @plsc.parallel_loop(0, n16)
                 def _(i):
                     cnt[pl.ds(i * L, L)] = zeros
 
@@ -537,9 +535,22 @@ def _union_sc_kernel(
                     )
                     return woff + plsc.all_reduce_population_count(sel)[0]
 
-                U = plsc.parallel_loop(0, n16, carry=jnp.int32(0))(emit)
+                if count_only:
+                    # Union size only: per-lane counts, no ordered compaction.
+                    def tally(i, acc):
+                        g = cnt[pl.ds(i * L, L)]
+                        sel = (g > 0) & (iota + i * L < S)
+                        return acc + jnp.where(sel, ones, zeros)
+
+                    acc = plsc.parallel_loop(0, n16, carry=zeros)(tally)
+                    U = plsc.cumsum(acc)[L - 1]
+                else:
+                    U = plsc.parallel_loop(0, n16, carry=jnp.int32(0))(emit)
                 ubuf[...] = jnp.full((L,), U, jnp.int32)
                 pltpu.sync_copy(ubuf, cnt_out.at[pl.ds(b * L, L)])
+
+                if count_only:
+                    return
 
                 @pl.when(jnp.logical_and(U > 0, U <= u_cap))
                 def _fits():
@@ -644,8 +655,9 @@ def build_union_plan(
     u_cap: int,
     page_size: int,
     tile: int = TILE,
+    count_only: bool = False,
 ):
-    """SparseCore union builder.
+    """SparseCore union builder (`count_only`: union sizes only).
 
     Returns idx i32[nb_cap * u_cap] (physical rows; block b's tile-padded union
     in [b * u_cap, b * u_cap + ceil(U_b / tile) * tile)), mask i32[T, u_cap // 32]
@@ -684,6 +696,7 @@ def build_union_plan(
             L=L,
             num_cores=sc.num_cores,
             num_subcores=sc.num_subcores,
+            count_only=count_only,
         ),
         out_type=(
             jax.ShapeDtypeStruct((nb_cap * u_cap,), jnp.int32),
@@ -706,7 +719,7 @@ def build_union_plan(
             disable_bounds_checks=True, needs_layout_passes=False
         ),
         mesh=mesh,
-        name="sc_csa_union_plan",
+        name="sc_csa_union_count" if count_only else "sc_csa_union_plan",
     )(meta, topk.reshape(-1), page_indices)
     return idx, mask.reshape(T, W), usize.reshape(nb_cap, L)[:, 0]
 
@@ -795,10 +808,12 @@ def attention(
         qn = jnp.where(b < total_blocks, jnp.clip(cu_q_lens[seq_b + 1] - q0, 0, bq), 0)
         q0 = jnp.where(qn > 0, q0, 0)
         s_b = jnp.where(qn > 0, kv_lens[seq_b], 0)
-        idx, mask, usize = build_union_plan(
-            topk_indices, page_indices, jnp.stack([q0, qn, seq_b, s_b], axis=1),
-            max_num_seqs=nseq, s_cap=s_cap, u_cap=u_cap, page_size=page_size,
-        )  # fmt: skip
+        meta_rows = jnp.stack([q0, qn, seq_b, s_b], axis=1)
+        plan_kw = dict(max_num_seqs=nseq, s_cap=s_cap, u_cap=u_cap, page_size=page_size)
+        # Union sizes first (a cheap SparseCore pass), so a step that would
+        # not pay falls back before the expensive plan is built.
+        _, _, usize = build_union_plan(topk_indices, page_indices, meta_rows,
+                                       count_only=True, **plan_kw)  # fmt: skip
         usize = jnp.where(qn > 0, usize, 0)
         ntiles = (usize + TILE - 1) // TILE
         tile_end = jnp.cumsum(ntiles)
@@ -807,6 +822,7 @@ def attention(
         fits = jnp.all(usize <= u_cap) & (total_tiles * TILE <= rows_cap)
 
         def union_path(q):
+            idx, mask, _ = build_union_plan(topk_indices, page_indices, meta_rows, **plan_kw)
             if T <= 64:
                 q = sparse_call(q, T, n_sparse)
             else:
