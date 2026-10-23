@@ -41,6 +41,8 @@ def _fused_kernel(
     fn_prefetch=False,
     per_stream_dot=False,
     ablate=(),
+    dense_group=0,
+    hoist_f32=False,
 ):
     """One token block: recombine, store once, 3-pass GEMM, collapse.
 
@@ -49,6 +51,8 @@ def _fused_kernel(
     in-block (post_mix, comb_mix).
     """
     fn_refs, (sc_ref, hb_ref), refs = refs[:n_fn], refs[n_fn : n_fn + 2], refs[n_fn + 2 :]
+    if dense_group > 1:
+        *refs, mt_ref = refs
     if fn_prefetch:
         # fn stays in HBM; step 0 streams it into a persistent VMEM copy,
         # one chunk per residual stream, under the recombine's VPU work.
@@ -84,12 +88,17 @@ def _fused_kernel(
         res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
     ]
 
+    if hoist_f32:
+        # One bf16 -> f32 unpack per input stream instead of one per use.
+        x_f = x_bf.astype(jnp.float32)
+        old_f = [o.astype(jnp.float32) for o in old_bf]
     streams_bf = []
     for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
+        acc = post[:, j : j + 1] * (x_f if hoist_f32 else x_bf.astype(jnp.float32))
         for i in range(hc_mult if "recombine" not in ablate else 0):
             k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
+            o = old_f[i] if hoist_f32 else old_bf[i].astype(jnp.float32)
+            acc = acc + comb[:, k : k + 1] * o
         # Round to bf16 BEFORE the GEMM: the unfused path's pre reads the
         # bf16 residual that post stored, and parity requires matching it.
         new_bf = acc.astype(jnp.bfloat16)
@@ -154,6 +163,24 @@ def _fused_kernel(
         gate_a_ref[...] = acc[:, :m]
         gate_b_ref[...] = acc[:, m : m + m * m]
         pre_mix = acc[:, :m]
+    elif gates is not None and dense_group > 1:
+        # Defer the post/comb gates: park this block's scaled mixes and run
+        # the Sinkhorn once per dense_group blocks on full (G, tb) slabs.
+        m3_ = m * (m + 2)
+        tb_ = acc.shape[0]
+        scaled = acc * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
+        pre_mix = jax.nn.sigmoid(scaled[:, :m] * sc_ref[0, 0] + hb_ref[:, :m]) + hc_pre_eps
+        step = pl.program_id(0) % dense_group
+        mt_ref[step] = scaled.T
+
+        @pl.when(step == dense_group - 1)
+        def _dense_gates():
+            mt = jnp.stack([mt_ref[:, k, :] for k in range(m3_)])
+            post_t, comb_t = utils.gates_dense(mt, sc_ref, hb_ref, hc_mult=m, gates=gates)
+            for g in range(dense_group):
+                gate_a_ref[g * tb_ : (g + 1) * tb_, :] = post_t[:, g, :].T
+                gate_b_ref[g * tb_ : (g + 1) * tb_, :] = comb_t[:, g, :].T
+
     elif gates is None:
         gate_a_ref[...] = acc
         gate_b_ref[...] = sqr
@@ -172,9 +199,12 @@ def _fused_kernel(
             gates=gates,
         )
     lay = pre_mix[:, 0:1] * gf_streams[0]
-    for i in range(1, m):
+    for i in range(1, m if "collapse" not in ablate else 1):
         lay = lay + pre_mix[:, i : i + 1] * gf_streams[i]
-    layer_ref[...] = utils.finish_layer_input(lay, *norm_w or [None], norm_eps)
+    if "norm" in ablate:  # timing probe only
+        layer_ref[...] = utils.finish_layer_input(lay, None, None)
+    else:
+        layer_ref[...] = utils.finish_layer_input(lay, *norm_w or [None], norm_eps)
 
 
 @functools.partial(
@@ -190,6 +220,8 @@ def _fused_kernel(
         "fn_prefetch",
         "per_stream_dot",
         "ablate",
+        "dense_group",
+        "hoist_f32",
     ),
 )
 def fused_post_pre_mixes(
@@ -212,6 +244,8 @@ def fused_post_pre_mixes(
     fn_prefetch: bool = False,
     per_stream_dot: bool = False,
     ablate: tuple[str, ...] = (),
+    dense_group: int = 0,
+    hoist_f32: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """The Pallas seam kernel: post recombine fused with pre's mix GEMM
     and in-block collapse.
@@ -275,13 +309,20 @@ def fused_post_pre_mixes(
 
     if fn_prefetch or per_stream_dot:
         assert len(fn_ops) == 1, "fn_prefetch / per_stream_dot need a CatFn"
-    if pl.cdiv(padded_tokens, tb) > 1:
+    n_blocks = pl.cdiv(padded_tokens, tb)
+    if n_blocks > 1:
         # Multi-block grids keep the pipelined resident fn: the in-kernel
         # stream pays off only when one block has nothing else to overlap.
         fn_prefetch = per_stream_dot = False
+    group = 1
+    if gates is not None and dense_group > 1 and "gates" not in ablate:
+        group = max(g for g in range(1, dense_group + 1) if n_blocks % g == 0)
     compiler_params = pltpu.CompilerParams(
-        # A prefetched fn is filled at step 0, so steps must run in order.
-        dimension_semantics=("arbitrary",) if fn_prefetch else ("parallel",),
+        # A prefetched fn is filled at step 0 and dense gates run every
+        # group-th step, so those steps must run in order.
+        dimension_semantics=(
+            ("arbitrary",) if fn_prefetch or group > 1 else ("parallel",)
+        ),
         vmem_limit_bytes=vmem_limit_bytes,
         disable_bounds_checks=True,
     )
@@ -294,6 +335,8 @@ def fused_post_pre_mixes(
     else:
         fn_specs = [pl.BlockSpec(f.shape, lambda i: (0, 0)) for f in fn_ops]
         scratch = []
+    if group > 1:
+        scratch.append(pltpu.VMEM((group, hc_mult3, tb), jnp.float32))
 
     assert (norm_weight is None) == (norm_eps is None)
     norm_args = [] if norm_weight is None else [norm_weight.reshape(1, hidden_size)]
@@ -314,6 +357,8 @@ def fused_post_pre_mixes(
             fn_prefetch=fn_prefetch,
             per_stream_dot=per_stream_dot,
             ablate=ablate,
+            dense_group=group,
+            hoist_f32=hoist_f32,
         ),
         grid=(pl.cdiv(padded_tokens, tb),),
         in_specs=[
@@ -328,7 +373,10 @@ def fused_post_pre_mixes(
         ],
         out_specs=[
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
-            *(pl.BlockSpec((tb, w), lambda i: (i, 0)) for w in gate_widths),
+            *(
+                pl.BlockSpec((group * tb, w), lambda i: (i // group, 0))
+                for w in gate_widths
+            ),
             pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
         ],
         out_shape=[
@@ -343,6 +391,186 @@ def fused_post_pre_mixes(
         compiler_params=compiler_params,
     )(x2d, res2d, post2d, comb2d, *fn_ops, sc2d, hb2d, *norm_args)
 
+    return cast(
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        utils.trim_to(num_tokens, new_res, gate_a, gate_b, layer2d),
+    )
+
+
+
+def _kstream_kernel(
+    x_ref,
+    res_ref,
+    post_ref,
+    comb_ref,
+    fn_ref,
+    sc_ref,
+    hb_ref,
+    *refs,
+    hc_mult,
+    hidden_size,
+    rms_eps,
+    hc_pre_eps,
+    gates,
+    norm_eps,
+):
+    """One grid step per residual stream j (= one K-chunk of the mix GEMM).
+
+    Step j recombines stream j, stores it, and multiplies it by fn's j-th
+    K-chunk while the pipeline fetches chunk j + 1 and writes stream j - 1
+    back; the last step finishes the gates and the collapse. For token
+    counts that fit one block, where the token-tiled kernel has nothing to
+    overlap fn's DMA with.
+    """
+    *norm_w, newres_ref, gate_a_ref, gate_b_ref, layer_ref, acc_ref, sqr_ref, g_ref = refs
+    m, h = hc_mult, hidden_size
+    m3 = m * (m + 2)
+    j = pl.program_id(0)
+    dn = (((1,), (1,)), ((), ()))
+
+    for jj in range(m):
+
+        @pl.when(j == jj)
+        def _step(jj=jj):
+            post = post_ref[...]
+            comb = comb_ref[...]
+            acc = post[:, jj : jj + 1] * x_ref[...].astype(jnp.float32)
+            for i in range(m):
+                k = i * m + jj
+                acc = acc + comb[:, k : k + 1] * res_ref[:, i * h : (i + 1) * h].astype(
+                    jnp.float32
+                )
+            new_bf = acc.astype(jnp.bfloat16)
+            newres_ref[...] = new_bf
+            g_ref[jj] = new_bf
+            d = jax.lax.dot_general(
+                new_bf, fn_ref[...], dn, preferred_element_type=jnp.float32
+            )
+            gf = new_bf.astype(jnp.float32)
+            sq = jnp.sum(gf * gf, axis=-1, keepdims=True)
+            if jj == 0:
+                acc_ref[...] = d
+                sqr_ref[...] = sq
+            else:
+                acc_ref[...] += d
+                sqr_ref[...] += sq
+
+            if jj == m - 1:
+                out = acc_ref[...]
+                mixes = (out[:, :m3] + out[:, m3 : 2 * m3]) + out[:, 2 * m3 :]
+                sqr = sqr_ref[...]
+                if gates is None:
+                    gate_a_ref[...] = mixes
+                    gate_b_ref[...] = sqr
+                    scaled = mixes[:, :m] * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
+                    pre_mix = (
+                        jax.nn.sigmoid(scaled * sc_ref[0, 0] + hb_ref[:, :m]) + hc_pre_eps
+                    )
+                else:
+                    pre_mix, gate_a_ref[...], gate_b_ref[...] = utils.gates_in_block(
+                        mixes,
+                        sqr,
+                        sc_ref,
+                        hb_ref,
+                        hc_mult=m,
+                        hidden_size=h,
+                        rms_eps=rms_eps,
+                        hc_pre_eps=hc_pre_eps,
+                        gates=gates,
+                    )
+                lay = pre_mix[:, 0:1] * g_ref[0].astype(jnp.float32)
+                for i in range(1, m):
+                    lay = lay + pre_mix[:, i : i + 1] * g_ref[i].astype(jnp.float32)
+                layer_ref[...] = utils.finish_layer_input(
+                    lay, *norm_w or [None], norm_eps
+                )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("rms_eps", "hc_pre_eps", "vmem_limit_bytes", "gates", "norm_eps"),
+)
+def fused_post_pre_kstream(
+    x2d: jax.Array,
+    res2d: jax.Array,
+    post2d: jax.Array,
+    comb2d: jax.Array,
+    fn: utils.CatFn,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    rms_eps: float,
+    hc_pre_eps: float,
+    *,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    gates: utils.GateConsts | None = None,
+    norm_weight: jax.Array | None = None,
+    norm_eps: float | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``fused_post_pre_mixes`` for a single token block, gridded over the
+    hc_mult residual streams instead of tokens (see ``_kstream_kernel``).
+    Same outputs; the mixes sum the per-stream partial products, so they
+    round differently from the one-GEMM kernel (tolerance tier)."""
+    assert isinstance(fn, utils.CatFn), "kstream needs the stacked fn"
+    num_tokens, hidden_size = x2d.shape
+    hc_hidden = res2d.shape[1]
+    hc_mult = hc_hidden // hidden_size
+    hc_mult3 = fn.shape[0]
+    tb, padded_tokens = utils.select_token_block(
+        num_tokens, 1 << 30, whole_small_batch=True
+    )
+    x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
+    sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
+    hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
+    assert (norm_weight is None) == (norm_eps is None)
+    norm_args = [] if norm_weight is None else [norm_weight.reshape(1, hidden_size)]
+    norm_specs = [pl.BlockSpec((1, hidden_size), lambda j: (0, 0)) for _ in norm_args]
+    gate_widths = (hc_mult3, 1) if gates is None else (hc_mult, hc_mult * hc_mult)
+    const = lambda j: (0, 0)  # noqa: E731
+    new_res, gate_a, gate_b, layer2d = pl.pallas_call(
+        functools.partial(
+            _kstream_kernel,
+            hc_mult=hc_mult,
+            hidden_size=hidden_size,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            gates=gates,
+            norm_eps=norm_eps,
+        ),
+        grid=(hc_mult,),
+        in_specs=[
+            pl.BlockSpec((tb, hidden_size), const),
+            pl.BlockSpec((tb, hc_hidden), const),
+            pl.BlockSpec((tb, hc_mult), const),
+            pl.BlockSpec((tb, hc_mult * hc_mult), const),
+            pl.BlockSpec((3 * hc_mult3, hidden_size), lambda j: (0, j)),
+            pl.BlockSpec((1, 3), const),
+            pl.BlockSpec((1, hc_mult3), const),
+            *norm_specs,
+        ],
+        out_specs=[
+            pl.BlockSpec((tb, hidden_size), lambda j: (0, j)),
+            *(pl.BlockSpec((tb, w), const) for w in gate_widths),
+            pl.BlockSpec((tb, hidden_size), const),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((padded_tokens, hc_hidden), jnp.bfloat16),
+            *(
+                jax.ShapeDtypeStruct((padded_tokens, w), jnp.float32)
+                for w in gate_widths
+            ),
+            jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
+        ],
+        scratch_shapes=[
+            pltpu.VMEM((tb, 3 * hc_mult3), jnp.float32),
+            pltpu.VMEM((tb, 1), jnp.float32),
+            pltpu.VMEM((hc_mult, tb, hidden_size), jnp.bfloat16),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+    )(x2d, res2d, post2d, comb2d, fn.cat, sc2d, hb2d, *norm_args)
     return cast(
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],
         utils.trim_to(num_tokens, new_res, gate_a, gate_b, layer2d),
@@ -373,6 +601,9 @@ def mhc_fused_post_pre(
     fn_prefetch: bool = False,
     per_stream_dot: bool = False,
     ablate: tuple[str, ...] = (),
+    kstream_max_tokens: int = 0,
+    dense_group: int = 0,
+    hoist_f32: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Fused seam op: Pallas post+GEMM+collapse kernel, gates in an XLA
     epilogue or (``gates_in_kernel``, up to
@@ -398,26 +629,49 @@ def mhc_fused_post_pre(
         sinkhorn_repeat,
         gates_max_tokens,
     )
-    new_res2d, gate_a, gate_b, layer_input_cur = fused_post_pre_mixes(
-        x2d,
-        res2d,
-        post2d,
-        comb2d,
-        fn,
-        hc_scale,
-        hc_base,
-        rms_eps,
-        hc_pre_eps,
-        token_block_size=token_block_size,
-        gemm_precision=gemm_precision,
-        vmem_limit_bytes=vmem_limit_bytes,
-        gates=gates,
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
-        fn_prefetch=fn_prefetch,
-        per_stream_dot=per_stream_dot,
-        ablate=ablate,
-    )
+    if (
+        kstream_max_tokens
+        and isinstance(fn, utils.CatFn)
+        and x2d.shape[0] <= kstream_max_tokens
+    ):
+        new_res2d, gate_a, gate_b, layer_input_cur = fused_post_pre_kstream(
+            x2d,
+            res2d,
+            post2d,
+            comb2d,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            vmem_limit_bytes=vmem_limit_bytes,
+            gates=gates,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+    else:
+        new_res2d, gate_a, gate_b, layer_input_cur = fused_post_pre_mixes(
+            x2d,
+            res2d,
+            post2d,
+            comb2d,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            token_block_size=token_block_size,
+            gemm_precision=gemm_precision,
+            vmem_limit_bytes=vmem_limit_bytes,
+            gates=gates,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            fn_prefetch=fn_prefetch,
+            per_stream_dot=per_stream_dot,
+            ablate=ablate,
+            dense_group=dense_group,
+            hoist_f32=hoist_f32,
+        )
     if gates is not None:
         post_mix_cur, comb_mix_cur = gate_a, gate_b
     else:
