@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: pd-spec-pipeline-prefill-20261023-r7
+name: pd-spec-pipeline-prefill-20261023-r8
 exp_type: PROFILING
 artifact_type: trace
 cluster_name: gke-tpu-train-us-central1-1-prod
@@ -64,7 +64,7 @@ role_to_task_spec:
       - name: coord
         type: gcs
         bucket: inference-model-storage-poc-tpu-hns
-        prefix: benchmarks/pd-spec-pipeline/20261023-r7
+        prefix: benchmarks/pd-spec-pipeline/20261023-r8
         mount_path: /coord
         mount_options: [implicit-dirs, metadata-cache:ttl-secs:0]
     sources:
@@ -72,5 +72,5 @@ role_to_task_spec:
         type: git
         repo: https://github.com/vllm-project/vllm-torchtpu.git
         ref: hafeng/spec_in_prefll_to_decode
-        commit: 7d221528a9cfd0b3986c596a822a6772bc4fced6
+        commit: dd3e76120ed102cb15cba1205030f86c0ccd1f95
         path: /workspace/vllm-torchtpu
