@@ -42,18 +42,29 @@ def resolve_active_seqs(
     active_seqs: jax.Array | str | None,
     *,
     default_mode: str = "from_ckpt",
+    ns: int | None = None,
+    has_recurrent: bool = True,
 ) -> tuple[str, jax.Array | None]:
     """Normalize `active_seqs` into `(act_mode, active_mask_array)`."""
     if active_seqs is None:
-        return default_mode, None
-    if isinstance(active_seqs, str):
-        if active_seqs in ("from_ckpt", "all"):
-            return active_seqs, None
+        act_mode, mask = default_mode, None
+    elif isinstance(active_seqs, str):
+        if active_seqs not in ("from_ckpt", "all"):
+            raise ValueError(
+                f"Unsupported active_seqs mode {active_seqs!r}; "
+                "expected 'from_ckpt', 'all', None, or an int32/bool mask array"
+            )
+        act_mode, mask = active_seqs, None
+    else:
+        act_mode, mask = "ref", jnp.asarray(active_seqs, dtype=I32)
+    if not has_recurrent and act_mode == "from_ckpt":
         raise ValueError(
-            f"Unsupported active_seqs mode {active_seqs!r}; "
-            "expected 'from_ckpt', 'all', None, or an int32/bool mask array"
+            "active_seqs='from_ckpt' requires a layout with recurrent state "
+            "(slots_per_pool > 0); use active_seqs='all' or a mask array"
         )
-    return "ref", jnp.asarray(active_seqs, dtype=I32)
+    if ns is not None and mask is not None and mask.shape != (ns,):
+        raise ValueError(f"active_seqs mask has shape {mask.shape}, expected ({ns},)")
+    return act_mode, mask
 
 
 def check_ckpt_bounds(
@@ -64,29 +75,65 @@ def check_ckpt_bounds(
     act_mode: str = "from_ckpt",
     active_mask: Any = None,
     read_offsets: Any = None,
+    raw_pools: Any = None,
+    ns: int | None = None,
+    min_k: int = 1,
 ) -> None:
-    """Validate concrete (eager) active checkpoint slots fit in `[0, num_pages)`.
+    """Validate pool/ckpt shapes and concrete active slot bounds in `[0, num_pages)`.
 
     Accepts 2D `[NS, K]`, 3D `[slots_per_pool, NS, K]` or rank-leading 4D
     `ckpt_indices` (see `PoolLayout.page_base`). 3D indices must use disjoint
-    slots across sub-layers of an active sequence. When `read_offsets` is
-    provided, also checks `read_offsets < K` for active sequences. Under
-    `jax.jit` (`Tracer` inputs), this eager host check is a no-op and bounds
-    are checked inside the Pallas kernels via `pl.debug_check` when Pallas
-    debug checks are enabled (`jax_pallas_enable_debug_checks=True`).
+    slots across sub-layers of an active sequence. When `raw_pools`, `ns`, or
+    `read_offsets` are provided, also checks per-rank pool shapes, `ckpt_indices`
+    / `read_offsets` shapes, and `read_offsets < K` for active sequences. Under
+    `jax.jit` (`Tracer` inputs), static shape checks still run while eager slot
+    value checks are skipped (enforced inside the Pallas kernels via
+    `pl.debug_check` when `jax_pallas_enable_debug_checks=True`).
     """
+    if raw_pools is not None:
+        if len(raw_pools) != layout.num_pools:
+            raise ValueError(
+                f"expected {layout.num_pools} raw_pools, got {len(raw_pools)}"
+            )
+        exp_pool_shape = (num_pages, *layout.kv_page_shape)
+        for p_idx, pool_arr in enumerate(raw_pools):
+            if pool_arr.shape != exp_pool_shape:
+                raise ValueError(
+                    f"raw_pools[{p_idx}] has shape {pool_arr.shape}, expected "
+                    f"per-rank shape {exp_pool_shape}"
+                )
     g_per_att = layout.slots_per_pool
-    if (
-        ckpt_indices is None
-        or g_per_att <= 0
-        or isinstance(ckpt_indices, jax.core.Tracer)
-    ):
+    if ckpt_indices is None or g_per_att <= 0:
+        return
+    if ns is not None:
+        if not (
+            (ckpt_indices.ndim == 2 and ckpt_indices.shape[0] == ns)
+            or (ckpt_indices.ndim == 3 and ckpt_indices.shape[:2] == (g_per_att, ns))
+        ):
+            raise ValueError(
+                f"ckpt_indices has shape {ckpt_indices.shape}, expected "
+                f"({g_per_att}, {ns}, K) or ({ns}, K)"
+            )
+        if ckpt_indices.shape[-1] < min_k:
+            raise ValueError(
+                f"ckpt_indices last dim K={ckpt_indices.shape[-1]} "
+                f"must be >= T ({min_k})"
+            )
+        if read_offsets is not None and read_offsets.shape not in (
+            (ns,),
+            (g_per_att, ns),
+        ):
+            raise ValueError(
+                f"read_offsets has shape {read_offsets.shape}, expected "
+                f"({g_per_att}, {ns}) or ({ns},)"
+            )
+    if isinstance(ckpt_indices, jax.core.Tracer):
         return
     ckpt_np = np.asarray(ckpt_indices)
     if ckpt_np.ndim == 4:
         ckpt_np = ckpt_np[0]
     is_3d = ckpt_np.ndim == 3
-    ns = ckpt_np.shape[1] if is_3d else ckpt_np.shape[0]
+    n_seqs = int(ckpt_np.shape[1] if is_3d else ckpt_np.shape[0])
     ckpt_k = ckpt_np.shape[-1]
     mask_np = (
         None
@@ -101,7 +148,7 @@ def check_ckpt_bounds(
     if roff_np is not None and roff_np.ndim == 3:
         roff_np = roff_np[0]
     pps = layout.pages_per_slot
-    for s in range(ns):
+    for s in range(n_seqs):
         if act_mode == "from_ckpt":
             active = int(ckpt_np[0, s, 0] if is_3d else ckpt_np[s, 0]) > 0
         elif act_mode == "ref" and mask_np is not None:

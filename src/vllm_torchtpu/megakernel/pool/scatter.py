@@ -75,23 +75,12 @@ def scatter_pool_states(
     layout.validate(ex)
     if interpret is None:
         interpret = ex.interpret
-    NATT = layout.num_pools
-    if len(raw_pools) != NATT:
-        raise ValueError(f"expected {NATT} raw_pools, got {len(raw_pools)}")
-
+    NATT, G_PER_ATT = layout.num_pools, layout.slots_per_pool
     NS, B, T, MR = ex.NS, ex.B, ex.T, ex.MR
-    G_PER_ATT = layout.slots_per_pool
     page_size = cache_exec(ex).page_size
     HD = layout.hd
     h4 = HD // 4
     page_shape = layout.kv_page_shape
-    exp_pool_shape = (cache_exec(ex).num_pages, *page_shape)
-    for p_idx, pool_arr in enumerate(raw_pools):
-        if pool_arr.shape != exp_pool_shape:
-            raise ValueError(
-                f"raw_pools[{p_idx}] has shape {pool_arr.shape}, expected "
-                f"per-rank shape {exp_pool_shape}"
-            )
     pps = layout.pages_per_slot
     rec_pages = layout.rec_pages_per_slot
     rec_u32_cap = layout.rec_u32_rows
@@ -110,25 +99,21 @@ def scatter_pool_states(
         and not bool(interpret)
     )
     act_mode, active_mask = resolve_active_seqs(
-        active_seqs, default_mode="from_ckpt" if has_gdn else "all"
+        active_seqs,
+        default_mode="from_ckpt" if has_gdn else "all",
+        ns=NS,
+        has_recurrent=has_gdn,
     )
-    if not has_gdn and act_mode == "from_ckpt":
-        raise ValueError(
-            "active_seqs='from_ckpt' requires a layout with recurrent state "
-            "(slots_per_pool > 0); use active_seqs='all' or a mask array"
-        )
-    if active_mask is not None and active_mask.shape != (NS,):
-        raise ValueError(
-            f"active_seqs mask has shape {active_mask.shape}, expected ({NS},)"
-        )
-    if has_gdn:
-        check_ckpt_bounds(
-            ckpt_indices,
-            cache_exec(ex).num_pages,
-            layout,
-            act_mode=act_mode,
-            active_mask=active_mask,
-        )
+    check_ckpt_bounds(
+        ckpt_indices if has_gdn else None,
+        cache_exec(ex).num_pages,
+        layout,
+        act_mode=act_mode,
+        active_mask=active_mask,
+        raw_pools=raw_pools,
+        ns=NS,
+        min_k=T,
+    )
 
     # Pre-gather and clamp only the (NS, T) active KV page indices for SMEM
     pt_cols = page_table.shape[1]

@@ -395,6 +395,35 @@ def test_scatter_cross_page_active_modes_k_plus_two_and_backend():
     for r_a, r_b in zip(out_pb, out_k4):
         np.testing.assert_array_equal(_bytes(r_a), _bytes(r_b))
 
+    ex_dec = _exec(R=1, B=2, T=1)
+    pos_dec = jnp.asarray([15, 25], dtype=jnp.int32)
+    conv_dec = _bf16_f32(k[2], (ngdn, 8, qkv))
+    rec_dec = rec[:, : 2 * vh]
+    out_pb_dec = pb.scatter_states(
+        ex_dec,
+        raw_pools,
+        pos_dec,
+        pt,
+        {"knew": knew, "vnew": vnew, "conv": conv_dec, "rec": rec_dec},
+        ckpt[..., :1],
+        "all",
+    )
+    out_direct_dec = pool.scatter_pool_states(
+        lay,
+        ex_dec,
+        raw_pools,
+        pos_dec,
+        pt,
+        knew,
+        vnew,
+        conv_dec,
+        rec_dec,
+        ckpt[..., :1],
+        "all",
+    )
+    for r_a, r_b in zip(out_pb_dec, out_direct_dec):
+        np.testing.assert_array_equal(_bytes(r_a), _bytes(r_b))
+
 
 def test_scatter_input_validation_and_pos_debug_check():
     lay = _layout(1, num_pools=2)

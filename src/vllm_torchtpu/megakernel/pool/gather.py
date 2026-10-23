@@ -78,39 +78,11 @@ def gather_gdn_states(
         )
     if interpret is None:
         interpret = ex.interpret
-    NATT = layout.num_pools
-    if len(raw_pools) != NATT:
-        raise ValueError(f"expected {NATT} raw_pools, got {len(raw_pools)}")
-    exp_pool_shape = (cache_exec(ex).num_pages, *layout.kv_page_shape)
-    for p_idx, pool_arr in enumerate(raw_pools):
-        if pool_arr.shape != exp_pool_shape:
-            raise ValueError(
-                f"raw_pools[{p_idx}] has shape {pool_arr.shape}, expected "
-                f"per-rank shape {exp_pool_shape}"
-            )
-    G_PER_ATT = layout.slots_per_pool
+    NATT, G_PER_ATT = layout.num_pools, layout.slots_per_pool
     NS, B, T = ex.NS, ex.B, ex.T
-    if (
-        not (
-            (ckpt_indices.ndim == 2 and ckpt_indices.shape[0] == NS)
-            or (ckpt_indices.ndim == 3 and ckpt_indices.shape[:2] == (G_PER_ATT, NS))
-        )
-        or ckpt_indices.shape[-1] < 1
-    ):
-        raise ValueError(
-            f"ckpt_indices has shape {ckpt_indices.shape}, expected "
-            f"({G_PER_ATT}, {NS}, >=1) or ({NS}, >=1)"
-        )
-    if read_offsets.shape not in ((NS,), (G_PER_ATT, NS)):
-        raise ValueError(
-            f"read_offsets has shape {read_offsets.shape}, expected "
-            f"({G_PER_ATT}, {NS}) or ({NS},)"
-        )
-    act_mode, active_mask = resolve_active_seqs(active_seqs, default_mode="from_ckpt")
-    if active_mask is not None and active_mask.shape != (NS,):
-        raise ValueError(
-            f"active_seqs mask has shape {active_mask.shape}, expected ({NS},)"
-        )
+    act_mode, active_mask = resolve_active_seqs(
+        active_seqs, default_mode="from_ckpt", ns=NS
+    )
     check_ckpt_bounds(
         ckpt_indices,
         cache_exec(ex).num_pages,
@@ -118,6 +90,8 @@ def gather_gdn_states(
         act_mode=act_mode,
         active_mask=active_mask,
         read_offsets=read_offsets,
+        raw_pools=raw_pools,
+        ns=NS,
     )
 
     vh, KD, VD = layout.vh_per_rank(ex.R), layout.KD, layout.VD
@@ -206,7 +180,7 @@ def gather_gdn_states(
                 "GDN gather read_offsets outside [0, K)",
                 interpret=bool(interpret),
             )
-            roff = jnp.clip(raw_roff, jnp.int32(0), jnp.int32(ckpt_k - 1))
+            roff = jnp.maximum(raw_roff, jnp.int32(0))
             slot = ckpt_ref[sub, s, roff] if ckpt_is_3d else ckpt_ref[s, roff]
             pb = layout.page_base(slot, sub, ckpt_indices.ndim)
             kernel_debug_check(
