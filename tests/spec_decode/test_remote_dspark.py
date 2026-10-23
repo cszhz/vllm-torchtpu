@@ -12,15 +12,63 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import socket
+import threading
+import time
+
 import pytest
 
 from vllm_torchtpu.spec_decode.remote_dspark import (
     DraftProposal,
     RemoteDraftPipeline,
     RemoteDraftProtocolError,
+    RemoteDSparkTransport,
     RequestPhase,
     VerifyFeedback,
 )
+
+
+def test_consumer_proposal_poll_is_nonblocking():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    producer: list[RemoteDSparkTransport] = []
+
+    def accept_producer() -> None:
+        producer.append(
+            RemoteDSparkTransport(
+                role="producer",
+                producer_host="127.0.0.1",
+                port=port,
+                rank=0,
+                timeout_s=5,
+            )
+        )
+
+    accept_thread = threading.Thread(target=accept_producer)
+    accept_thread.start()
+    consumer = RemoteDSparkTransport(
+        role="consumer",
+        producer_host="127.0.0.1",
+        port=port,
+        rank=0,
+        timeout_s=5,
+    )
+    accept_thread.join(timeout=5)
+    assert not accept_thread.is_alive()
+    assert consumer.recv_proposal() is None
+
+    producer[0].send_proposal(["req-a"], [[11, 12]])
+    deadline = time.monotonic() + 5
+    proposal = None
+    while proposal is None and time.monotonic() < deadline:
+        proposal = consumer.recv_proposal()
+        time.sleep(0.01)
+    assert proposal == (["req-a"], [[11, 12]])
+
+    consumer.send_feedback({"request_ids": ["req-a"]})
+    assert producer[0].recv_feedback()["request_ids"] == ["req-a"]
 
 
 def _proposal(request_id: str, round_id: int, kv_version: int) -> DraftProposal:

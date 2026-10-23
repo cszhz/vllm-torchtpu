@@ -18,8 +18,10 @@ from __future__ import annotations
 import collections
 import dataclasses
 import pickle
+import queue
 import socket
 import struct
+import threading
 import time
 from enum import StrEnum
 from typing import Any
@@ -76,6 +78,16 @@ class RemoteDSparkTransport:
         stream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._stream = stream
         self._exchange_handshake()
+        self._proposal_queue: (
+            queue.Queue[tuple[list[str], list[list[int]]] | BaseException] | None
+        ) = None
+        if role == "consumer":
+            self._proposal_queue = queue.Queue(maxsize=2)
+            threading.Thread(
+                target=self._receive_proposals,
+                name=f"remote-dspark-rank-{rank}",
+                daemon=True,
+            ).start()
         logger.info(
             "Remote DSpark transport connected: role=%s rank=%d peer=%s:%d",
             role,
@@ -141,11 +153,26 @@ class RemoteDSparkTransport:
             }
         )
 
-    def recv_proposal(self) -> tuple[list[str], list[list[int]]]:
+    def recv_proposal(self) -> tuple[list[str], list[list[int]]] | None:
         if self.role != "consumer":
             raise RemoteDraftProtocolError("only the consumer receives proposals")
-        message = self._recv_round("proposal")
-        return message["request_ids"], message["token_ids"]
+        assert self._proposal_queue is not None
+        try:
+            proposal = self._proposal_queue.get_nowait()
+        except queue.Empty:
+            return None
+        if isinstance(proposal, BaseException):
+            raise proposal
+        return proposal
+
+    def _receive_proposals(self) -> None:
+        assert self._proposal_queue is not None
+        try:
+            while True:
+                message = self._recv_round("proposal")
+                self._proposal_queue.put((message["request_ids"], message["token_ids"]))
+        except BaseException as exc:
+            self._proposal_queue.put(exc)
 
     def send_feedback(self, payload: dict[str, Any]) -> None:
         if self.role != "consumer":

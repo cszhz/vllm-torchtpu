@@ -4327,7 +4327,10 @@ class TPUModelRunner(GPUModelRunner):
         transport = self._remote_dspark_transport
         if self._remote_dspark_role == "consumer":
             assert transport is not None
-            request_ids, token_ids = transport.recv_proposal()
+            proposal = transport.recv_proposal()
+            if proposal is None:
+                return None
+            request_ids, token_ids = proposal
             return DraftTokenIds(request_ids, token_ids)
         drafts = self.spec_decode_manager.take_draft_token_ids()
         if self._remote_dspark_role == "producer" and drafts is not None:
