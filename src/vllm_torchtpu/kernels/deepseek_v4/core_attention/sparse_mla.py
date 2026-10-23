@@ -174,7 +174,7 @@ def _attention_swa_decode_kernel(
     sem_ids_ref,
     bo_ids_ref,
     swa_kv_lens_ref,  # [max_num_seqs]
-    swa_page_indices_ref,  # [max_num_seqs * pages_per_seq]
+    swa_copy_table_ref,  # `mla_swa.swa_decode_copy_table`
     attention_sinks_ref,
     q_hbm_ref,
     cache_kv_nope_hbm_ref,
@@ -206,14 +206,13 @@ def _attention_swa_decode_kernel(
     flat_shape = (total_num_pages * phys_tokens_per_page, slots, lkv_dim)
     window = mla_swa.SwaDecodeWindowRefs(
         swa_kv_lens_ref,
-        swa_page_indices_ref,
+        swa_copy_table_ref,
         cache.reshape(flat_shape),
         updated_cache.reshape(flat_shape),
         swa_new_kv_hbm_ref,
         swa_sliding_window,
         swa_logical_page_size,
         swa_bkv_p,
-        phys_tokens_per_page,
         token_bytes,
     )
     _attention_kernel(
@@ -424,9 +423,9 @@ def _attention_kernel(
             @pl.when(token_idx < num_decode_tokens)
             def _():
                 if store:
-                    swa.window.store_new_kv(token_idx, True, *args, wait=wait)
+                    swa.window.store_new_kv(token_idx, *args, wait=wait)
                 else:
-                    swa.window.fetch(token_idx, True, token_idx, *args, wait=wait)
+                    swa.window.fetch(token_idx, *args, wait=wait)
 
     def _fetch_swa_batch(seq_idx_start, bq_sem_idx, *, wait=False):
         if swa is None:
@@ -975,7 +974,7 @@ def sparse_ragged_paged_attention(
         swa_prefetches = ()
         if swa_cache is not None:
             seq_bounds.append(swa_decode.num_decode_tokens)
-            swa_prefetches = (swa_decode.kv_lens, swa_decode.page_indices)
+            swa_prefetches = (swa_decode.kv_lens, swa_decode.copy_table)
             operands += (swa_decode.new_kv, swa_cache)
             in_specs += [pl.BlockSpec(memory_space=pltpu.HBM)] * 2
             out_specs = [out_specs, pl.BlockSpec(memory_space=pltpu.HBM)]
