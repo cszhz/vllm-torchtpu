@@ -23,6 +23,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+# Tokens a clamped kv block is rounded up to (one lane width of scores).
+KV_BLOCK_ALIGN = 128
 
 
 def cdiv(a, b):
@@ -783,6 +785,11 @@ def mla_ragged_paged_attention(
     max_num_seqs = cu_q_lens.shape[0] - 1
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
+    # A kv block never needs more pages than a sequence's page table holds.
+    max_bkv_p = align_to(
+        num_page_indices // max_num_seqs, cdiv(KV_BLOCK_ALIGN, page_size)
+    )
+    num_kv_pages_per_blocks = [min(p, max_bkv_p) for p in num_kv_pages_per_blocks]
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
