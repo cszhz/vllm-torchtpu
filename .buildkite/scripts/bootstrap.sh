@@ -161,8 +161,7 @@ if [[ -n "${FILES_CHANGED}" ]]; then
     exit 0
   fi
 
-  if [[ "${DIFF_RESOLVED}" == "1" && -z "${CI_LANES:-}" && "${SKIP_PR_TEST_SELECTION:-0}" != "1" ]] \
-      && ! [[ "${BUILDKITE_MESSAGE:-}" =~ \[full[[:space:]]ci\] || "${BUILDKITE_MESSAGE:-}" =~ \[ci[[:space:]]full\] ]]; then
+  if [[ "${DIFF_RESOLVED}" == "1" && -z "${CI_LANES:-}" ]]; then
     eval "$(printf '%s\n' "${FILES_CHANGED}" | python3 "${SCRIPT_DIR}/select_pr_tests.py" --shell)"
     if [[ "${PR_SKIP_ALL_CI:-0}" == "1" ]]; then
       if [[ "${has_perf_label}" == "1" ]]; then
@@ -214,10 +213,6 @@ fi
 ALL_LANES="verify perf integration tests"
 default_lanes="${PR_SELECTED_LANES:-verify integration tests}"
 if [[ "${has_full_ci_label}" == "1" ]]; then
-  export NIGHTLY=1
-  PR_TEST_SELECTION_ANNOTATION=""
-  OMNI_IMAGE_SKIP=""
-  unset PR_SKIP_STEPS_JSON GENERAL_TEST_FILE_PATTERN GENERAL_TEST_PARALLELISM MULTICHIP_TEST_FILE_PATTERN
   buildkite-agent annotate --style info --context full-ci \
     "Runs the full (nightly) suite (\`run-full-ci\` label)."
 fi
