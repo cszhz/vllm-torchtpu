@@ -66,7 +66,7 @@ All five failures are pre-existing and fail identically on the base:
 - Engine token identity of 176/176 in `j-394f71be`.
 - The engine microbench `j-50ecf56a`.
 
-**Hardware: this tree has not run on TPU yet.** The planned gates are:
+**Hardware: this tree has not run on TPU yet. Status at push (2026-10-23): the two GSM8K gates below are pending; use the source branches for gated numbers until they pass.** The planned gates are:
 
 - GSM8K, TP8+DCP4 1P1D, against `j-e0de41ff` (97.57%).
 - GSM8K, DP4×TP2 candidate, against `j-489694e3` (97.80%).
@@ -129,6 +129,6 @@ Set `TREE` to a clone of this branch.
 ## Known limits
 
 - DP>1 with DCP>1 on a P/D KV consumer raises `NotImplementedError`. The Raiden Stage-3 admission names the layout `dp{N}tp{T}_decode`, with no DCP axis.
-- DP4×TP2 loses to TP8 below about 32 requests per decode host: +56% step time at 8, +27% at 16, −1.7% at 32, −10% at 64 and −13% at 112 (DP4TP2_README, microbench).
+- DP4×TP2 loses to TP8 as served (megakernel up to 28 per host, XLA from 32) below about 31 requests per decode host. Same-harness step times, DP4×TP2 vs TP8 as served (2026-10-23, real weights, ctx 98,560): +58.5% at 8, +26.8% at 16, +3.6% at 28, −1.0% at 32, −9.3% at 64, −13.8% at 112; the cross is where TP8 leaves the megakernel (128 rows > its 112-row limit).
 - Under DP4×TP2, each request's KV lands on 2 cores instead of 8. The median KV transfer is therefore 1.7–2.6× slower, and median TTFT is 0.1–0.3 s higher.
 - R4 (HR + hx collectives) and the MK 112-row buckets are on by default. They live inside the megakernel, which DP4×TP2 turns off.
