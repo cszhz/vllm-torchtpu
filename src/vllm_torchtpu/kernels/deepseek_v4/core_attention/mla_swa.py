@@ -1456,6 +1456,7 @@ def run_mla_batched_decode_kernel(
         "unnormalized_output",
         "non_causal_block",
         "q_compute_block_size",
+        "lane_padded_lm",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -1487,6 +1488,8 @@ def mla_sliding_window_ragged_paged_attention(
     # context keys). Requires q_len <= sliding_window.
     non_causal_block: bool = False,
     decode_seq_batch_size: int = 32,
+    # Return l/m at the kernel's 128-lane width instead of slicing to the heads.
+    lane_padded_lm: bool = False,
 ) -> tuple[
     jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     jax.Array,  # [total_num_pages, physical_page_size_per_kv_packing, 4, 128] uint8
@@ -1851,7 +1854,8 @@ def mla_sliding_window_ragged_paged_attention(
     output = prepare_outputs(
         output, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
-    out_l = out_l[:, :actual_num_q_heads]
-    out_m = out_m[:, :actual_num_q_heads]
+    if not lane_padded_lm:
+        out_l = out_l[:, :actual_num_q_heads]
+        out_m = out_m[:, :actual_num_q_heads]
 
     return output, updated_kv, out_l, out_m
