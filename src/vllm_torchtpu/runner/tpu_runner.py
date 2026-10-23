@@ -5100,7 +5100,24 @@ class TPUModelRunner(GPUModelRunner):
                     spec_logprobs=spec_logprobs_chunks,
                 )
 
-        if self.scheduler_config.async_scheduling:
+        # A device-fused drafter (DFlash/DSpark) reads only device tensors and
+        # the draft chunks captured in execute_model, never the host token
+        # state the previous result commits, so it can be dispatched before
+        # the host blocks on that result (gxd 1b74d815e). On the multi-host
+        # serving slice the previous step's sampled-token copy lands only when
+        # this step's forward completes, so the wait is device-long and every
+        # host millisecond after it is device idle; dispatching the drafter
+        # first takes its dispatch out of that window.
+        draft_first = envs.TPU_ASYNC_DRAFT_BEFORE_RESULT_WAIT and bool(
+            self.scheduler_config.async_scheduling
+        )
+        if draft_first and not (
+            self._is_async_drafter and isinstance(self._async_drafter, DFlashProposer)
+        ):
+            raise ValueError(
+                "TPU_ASYNC_DRAFT_BEFORE_RESULT_WAIT=1 needs a DFlash/DSpark drafter"
+            )
+        if self.scheduler_config.async_scheduling and not draft_first:
             self._modify_prev_results()
 
         # Unified eagle3 draft propose -- ONE call serving both sync and async
@@ -5192,6 +5209,8 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors([eagle3_drafts], wait=False)
             copy_state.fence_pending_device_work()
 
+        if draft_first:
+            self._modify_prev_results()
         # Save, poll and clear the KV connector only after the drafter. Its
         # forward above writes the draft layers' KV into the blocks the target
         # just filled; a save taken before it, or the save fence

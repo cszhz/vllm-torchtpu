@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     TPU_KV_HOLD_REPLAY_CHECKPOINT: bool = False
     TPU_FINE_PREFIX_HIT_TOKENS: int = 0
     TPU_STEP_TIMING_LOG_STEPS: int = 0
+    TPU_ASYNC_DRAFT_BEFORE_RESULT_WAIT: bool = False
     TPU_KV_DROP_HCA_STATE_CHECKPOINT: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -802,6 +803,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.
     "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),
+    # Async scheduling + DFlash/DSpark: dispatch the drafter before the host
+    # waits on the previous step's sampled-token copy (runner/tpu_runner.py).
+    "TPU_ASYNC_DRAFT_BEFORE_RESULT_WAIT": env_bool("TPU_ASYNC_DRAFT_BEFORE_RESULT_WAIT"),
     # Model workers: DeepSeek-V4's 128-ratio compressor state cache is declared
     # not prefix-cacheable (no checkpoint cached, held or host-offloaded); see
     # core/hca_state_checkpoint.py.
