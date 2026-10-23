@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "description": "Sixteen anonymized request shapes and relative engine arrival times from a dummy-load service trace. Token contents are not included. Cached lengths are fixed per request.",
+  "requests": [
+    {
+      "id": "r1",
+      "arrival_ms": 0.0,
+      "prompt_tokens": 49391,
+      "cached_tokens": 39936
+    },
+    {
+      "id": "r2",
+      "arrival_ms": 11.974464869126678,
+      "prompt_tokens": 49391,
+      "cached_tokens": 39936
+    },
+    {
+      "id": "r3",
+      "arrival_ms": 30.95666505396366,
+      "prompt_tokens": 93027,
+      "cached_tokens": 79872
+    },
+    {
+      "id": "r4",
+      "arrival_ms": 56.572808884084225,
+      "prompt_tokens": 93027,
+      "cached_tokens": 79872
+    },
+    {
+      "id": "r6",
+      "arrival_ms": 2861.317602917552,
+      "prompt_tokens": 49391,
+      "cached_tokens": 39936
+    },
+    {
+      "id": "r7",
+      "arrival_ms": 2894.055271986872,
+      "prompt_tokens": 93027,
+      "cached_tokens": 82944
+    },
+    {
+      "id": "r8",
+      "arrival_ms": 3615.227336063981,
+      "prompt_tokens": 93027,
+      "cached_tokens": 82944
+    },
+    {
+      "id": "r9",
+      "arrival_ms": 3659.6875209361315,
+      "prompt_tokens": 348891,
+      "cached_tokens": 307200
+    },
+    {
+      "id": "r10",
+      "arrival_ms": 4780.490570934489,
+      "prompt_tokens": 49391,
+      "cached_tokens": 43008
+    },
+    {
+      "id": "r11",
+      "arrival_ms": 5619.993604021147,
+      "prompt_tokens": 49391,
+      "cached_tokens": 43008
+    },
+    {
+      "id": "r12",
+      "arrival_ms": 8788.827982032672,
+      "prompt_tokens": 49391,
+      "cached_tokens": 43008
+    },
+    {
+      "id": "r13",
+      "arrival_ms": 12071.544688893482,
+      "prompt_tokens": 49391,
+      "cached_tokens": 43008
+    },
+    {
+      "id": "r14",
+      "arrival_ms": 12207.374542951584,
+      "prompt_tokens": 93027,
+      "cached_tokens": 82944
+    },
+    {
+      "id": "r15",
+      "arrival_ms": 12212.100951001048,
+      "prompt_tokens": 93027,
+      "cached_tokens": 82944
+    },
+    {
+      "id": "r16",
+      "arrival_ms": 12547.066853847355,
+      "prompt_tokens": 93027,
+      "cached_tokens": 82944
+    },
+    {
+      "id": "r17",
+      "arrival_ms": 14616.009034914896,
+      "prompt_tokens": 172036,
+      "cached_tokens": 153600
+    }
+  ]
+}

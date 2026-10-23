@@ -1,0 +1,7296 @@
+{
+  "provenance": {
+    "vllm_source_commit": "2ba984a5d06db414f3b2474fe9338faf6cd80a1c",
+    "vllm_source_path": "vllm/v1/core/sched/scheduler.py",
+    "plugin_base_commit": "194a765fb77ae162cde2289831477a7a9ee40f7e",
+    "fixture_notes": {
+      "vllm_scheduler.py.txt": "Byte-for-byte scheduler snapshot; stored as text to avoid reformatting upstream code.",
+      "workload.json": "Anonymous prompt/cache lengths and relative arrivals; no prompt text or tokens.",
+      "observed_batches.json": "Derived scheduler submit/result timestamps; result consumption is not device completion.",
+      "scheduler_config.json": "Only the scheduling-related subset of the 1K reference configuration."
+    },
+    "sha256": {
+      "observed_batches.json": "3fe399133eb6b053dc7e12068be8c09f9c5f02e3972dcb083d183b272b57e7f3",
+      "scheduler_config.json": "84cef9228cf4d3b45efda4d1e8098675c5fb19e5cc81f52fafb7a46ac2ac8800",
+      "vllm_scheduler.py.txt": "abca7134821e2fb5cc8572df5c4a0b570ecf702646254327bc786fc452074983",
+      "workload.json": "c4be2f2a6e3deaf52ba16587d8802004801681594a888b2ad7cd689f4388a710"
+    },
+    "plugin_sources": {
+      "__init__.py": "e3b8278b1401766b96c94343bcf29800ac38af7c6a853690db4553714d4703d6",
+      "core/eagle_block_drop.py": "cdde786361b1c0b2041cc4e73e5612ded896b2388b317f070f6e8d6c80850688"
+    }
+  },
+  "results": [
+    {
+      "mode": "closed_loop_c4",
+      "compile_sizes_per_pcp_rank": [
+        4096
+      ],
+      "global_token_budget": 32768,
+      "mtp_checkpoint": true,
+      "batch_count": 16,
+      "request_chunk_count": 33,
+      "computed_tokens": 190749,
+      "mean_tokens_per_batch": 11921.8125,
+      "budget_utilization": 0.36382484436035156,
+      "small_batches_le_1024": 4,
+      "per_request": {
+        "r1": [
+          9216,
+          239
+        ],
+        "r2": [
+          9216,
+          239
+        ],
+        "r3": [
+          12288,
+          867
+        ],
+        "r4": [
+          12288,
+          867
+        ],
+        "r6": [
+          9216,
+          239
+        ],
+        "r7": [
+          9216,
+          867
+        ],
+        "r8": [
+          9216,
+          867
+        ],
+        "r9": [
+          30720,
+          9216,
+          1755
+        ],
+        "r10": [
+          6144,
+          239
+        ],
+        "r11": [
+          6144,
+          239
+        ],
+        "r12": [
+          6144,
+          239
+        ],
+        "r13": [
+          6144,
+          239
+        ],
+        "r14": [
+          9216,
+          867
+        ],
+        "r15": [
+          9216,
+          867
+        ],
+        "r16": [
+          9216,
+          867
+        ],
+        "r17": [
+          18432,
+          4
+        ]
+      },
+      "batches": [
+        {
+          "batch": 1,
+          "synthetic_submit_ms": 0.0,
+          "assigned": {
+            "r1": 9216,
+            "r2": 9216,
+            "r3": 12288
+          },
+          "tokens": 30720,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [],
+            "waiting": [
+              "r1",
+              "r2",
+              "r3",
+              "r4"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 39936,
+              "offered": 9455,
+              "allocated": 9216
+            },
+            {
+              "request": "r2",
+              "start": 39936,
+              "offered": 9455,
+              "allocated": 9216
+            },
+            {
+              "request": "r3",
+              "start": 79872,
+              "offered": 13155,
+              "allocated": 12288
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 2,
+          "synthetic_submit_ms": 0.001,
+          "assigned": {
+            "r1": 239,
+            "r2": 239,
+            "r3": 867,
+            "r4": 12288
+          },
+          "tokens": 13633,
+          "unused_budget": 19135,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2",
+              "r3"
+            ],
+            "waiting": [
+              "r4"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r2",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r3",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 13155,
+              "allocated": 12288
+            }
+          ]
+        },
+        {
+          "batch": 3,
+          "synthetic_submit_ms": 0.002,
+          "assigned": {
+            "r4": 867
+          },
+          "tokens": 867,
+          "unused_budget": 31901,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2",
+              "r3",
+              "r4"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            }
+          ]
+        },
+        {
+          "batch": 4,
+          "synthetic_submit_ms": 2.0,
+          "assigned": {
+            "r6": 9216,
+            "r7": 9216,
+            "r8": 9216
+          },
+          "tokens": 27648,
+          "unused_budget": 5120,
+          "queues_before": {
+            "running": [
+              "r4"
+            ],
+            "waiting": [
+              "r6",
+              "r7",
+              "r8"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 39936,
+              "offered": 9455,
+              "allocated": 9216
+            },
+            {
+              "request": "r7",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            },
+            {
+              "request": "r8",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            }
+          ]
+        },
+        {
+          "batch": 5,
+          "synthetic_submit_ms": 2.001,
+          "assigned": {
+            "r6": 239,
+            "r7": 867,
+            "r8": 867
+          },
+          "tokens": 1973,
+          "unused_budget": 30795,
+          "queues_before": {
+            "running": [
+              "r4",
+              "r6",
+              "r7",
+              "r8"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r7",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r8",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            }
+          ]
+        },
+        {
+          "batch": 6,
+          "synthetic_submit_ms": 3.0,
+          "assigned": {
+            "r9": 30720
+          },
+          "tokens": 30720,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r6",
+              "r7",
+              "r8"
+            ],
+            "waiting": [
+              "r9"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 307200,
+              "offered": 32768,
+              "allocated": 30720
+            }
+          ]
+        },
+        {
+          "batch": 7,
+          "synthetic_submit_ms": 3.001,
+          "assigned": {
+            "r9": 9216
+          },
+          "tokens": 9216,
+          "unused_budget": 23552,
+          "queues_before": {
+            "running": [
+              "r6",
+              "r7",
+              "r8",
+              "r9"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 337920,
+              "offered": 10971,
+              "allocated": 9216
+            }
+          ]
+        },
+        {
+          "batch": 8,
+          "synthetic_submit_ms": 4.0,
+          "assigned": {
+            "r9": 1755
+          },
+          "tokens": 1755,
+          "unused_budget": 31013,
+          "queues_before": {
+            "running": [
+              "r6",
+              "r7",
+              "r8",
+              "r9"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 347136,
+              "offered": 1755,
+              "allocated": 1755
+            }
+          ]
+        },
+        {
+          "batch": 9,
+          "synthetic_submit_ms": 5.0,
+          "assigned": {
+            "r10": 6144,
+            "r11": 6144,
+            "r12": 6144
+          },
+          "tokens": 18432,
+          "unused_budget": 14336,
+          "queues_before": {
+            "running": [
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r11",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r12",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 10,
+          "synthetic_submit_ms": 6.0,
+          "assigned": {
+            "r10": 239,
+            "r11": 239,
+            "r12": 239
+          },
+          "tokens": 717,
+          "unused_budget": 32051,
+          "queues_before": {
+            "running": [
+              "r9",
+              "r10",
+              "r11",
+              "r12"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r11",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r12",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            }
+          ]
+        },
+        {
+          "batch": 11,
+          "synthetic_submit_ms": 8.0,
+          "assigned": {
+            "r13": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 26624,
+          "queues_before": {
+            "running": [
+              "r10",
+              "r11",
+              "r12"
+            ],
+            "waiting": [
+              "r13"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r13",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 12,
+          "synthetic_submit_ms": 8.001,
+          "assigned": {
+            "r13": 239
+          },
+          "tokens": 239,
+          "unused_budget": 32529,
+          "queues_before": {
+            "running": [
+              "r10",
+              "r11",
+              "r12",
+              "r13"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r13",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            }
+          ]
+        },
+        {
+          "batch": 13,
+          "synthetic_submit_ms": 10.0,
+          "assigned": {
+            "r14": 9216,
+            "r15": 9216,
+            "r16": 9216
+          },
+          "tokens": 27648,
+          "unused_budget": 5120,
+          "queues_before": {
+            "running": [
+              "r13"
+            ],
+            "waiting": [
+              "r14",
+              "r15",
+              "r16"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            },
+            {
+              "request": "r15",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            },
+            {
+              "request": "r16",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            }
+          ]
+        },
+        {
+          "batch": 14,
+          "synthetic_submit_ms": 10.001,
+          "assigned": {
+            "r14": 867,
+            "r15": 867,
+            "r16": 867
+          },
+          "tokens": 2601,
+          "unused_budget": 30167,
+          "queues_before": {
+            "running": [
+              "r13",
+              "r14",
+              "r15",
+              "r16"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r15",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r16",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            }
+          ]
+        },
+        {
+          "batch": 15,
+          "synthetic_submit_ms": 12.0,
+          "assigned": {
+            "r17": 18432
+          },
+          "tokens": 18432,
+          "unused_budget": 14336,
+          "queues_before": {
+            "running": [
+              "r14",
+              "r15",
+              "r16"
+            ],
+            "waiting": [
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 153600,
+              "offered": 18436,
+              "allocated": 18432
+            }
+          ]
+        },
+        {
+          "batch": 16,
+          "synthetic_submit_ms": 12.001,
+          "assigned": {
+            "r17": 4
+          },
+          "tokens": 4,
+          "unused_budget": 32764,
+          "queues_before": {
+            "running": [
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 172032,
+              "offered": 4,
+              "allocated": 4
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "closed_loop_c4",
+      "compile_sizes_per_pcp_rank": [
+        256,
+        512,
+        1024
+      ],
+      "global_token_budget": 8192,
+      "mtp_checkpoint": true,
+      "batch_count": 32,
+      "request_chunk_count": 51,
+      "computed_tokens": 190749,
+      "mean_tokens_per_batch": 5960.90625,
+      "budget_utilization": 0.7276496887207031,
+      "small_batches_le_1024": 2,
+      "per_request": {
+        "r1": [
+          6144,
+          3072,
+          239
+        ],
+        "r2": [
+          3072,
+          6144,
+          239
+        ],
+        "r3": [
+          6144,
+          6144,
+          867
+        ],
+        "r4": [
+          6144,
+          6144,
+          867
+        ],
+        "r6": [
+          6144,
+          3072,
+          239
+        ],
+        "r7": [
+          3072,
+          6144,
+          867
+        ],
+        "r8": [
+          6144,
+          3072,
+          867
+        ],
+        "r9": [
+          3072,
+          6144,
+          6144,
+          6144,
+          6144,
+          6144,
+          6144,
+          1755
+        ],
+        "r10": [
+          6144,
+          239
+        ],
+        "r11": [
+          6144,
+          239
+        ],
+        "r12": [
+          6144,
+          239
+        ],
+        "r13": [
+          6144,
+          239
+        ],
+        "r14": [
+          6144,
+          3072,
+          867
+        ],
+        "r15": [
+          3072,
+          6144,
+          867
+        ],
+        "r16": [
+          6144,
+          3072,
+          867
+        ],
+        "r17": [
+          3072,
+          6144,
+          6144,
+          3072,
+          4
+        ]
+      },
+      "batches": [
+        {
+          "batch": 1,
+          "synthetic_submit_ms": 0.0,
+          "assigned": {
+            "r1": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [],
+            "waiting": [
+              "r1",
+              "r2",
+              "r3",
+              "r4"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 39936,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r2",
+              "start": 39936,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 2,
+          "synthetic_submit_ms": 0.001,
+          "assigned": {
+            "r1": 3072,
+            "r2": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r1"
+            ],
+            "waiting": [
+              "r2",
+              "r3",
+              "r4"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 46080,
+              "offered": 3311,
+              "allocated": 3072
+            },
+            {
+              "request": "r2",
+              "start": 39936,
+              "offered": 5120,
+              "allocated": 3072
+            },
+            {
+              "request": "r3",
+              "start": 79872,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 3,
+          "synthetic_submit_ms": 0.002,
+          "assigned": {
+            "r1": 239,
+            "r2": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2"
+            ],
+            "waiting": [
+              "r3",
+              "r4"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r2",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r3",
+              "start": 79872,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 4,
+          "synthetic_submit_ms": 0.003,
+          "assigned": {
+            "r2": 239,
+            "r3": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2"
+            ],
+            "waiting": [
+              "r3",
+              "r4"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r3",
+              "start": 79872,
+              "offered": 7953,
+              "allocated": 6144
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 5,
+          "synthetic_submit_ms": 1.0,
+          "assigned": {
+            "r3": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2",
+              "r3"
+            ],
+            "waiting": [
+              "r4"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 86016,
+              "offered": 7011,
+              "allocated": 6144
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 6,
+          "synthetic_submit_ms": 2.0,
+          "assigned": {
+            "r3": 867,
+            "r4": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2",
+              "r3"
+            ],
+            "waiting": [
+              "r4"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 7325,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 7,
+          "synthetic_submit_ms": 3.0,
+          "assigned": {
+            "r4": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r2",
+              "r3",
+              "r4"
+            ],
+            "waiting": [
+              "r6"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 86016,
+              "offered": 7011,
+              "allocated": 6144
+            },
+            {
+              "request": "r6",
+              "start": 39936,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 8,
+          "synthetic_submit_ms": 4.0,
+          "assigned": {
+            "r4": 867,
+            "r6": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r3",
+              "r4"
+            ],
+            "waiting": [
+              "r6",
+              "r7"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r6",
+              "start": 39936,
+              "offered": 7325,
+              "allocated": 6144
+            },
+            {
+              "request": "r7",
+              "start": 82944,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 9,
+          "synthetic_submit_ms": 5.0,
+          "assigned": {
+            "r6": 3072,
+            "r7": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r3",
+              "r4",
+              "r6"
+            ],
+            "waiting": [
+              "r7"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 46080,
+              "offered": 3311,
+              "allocated": 3072
+            },
+            {
+              "request": "r7",
+              "start": 82944,
+              "offered": 5120,
+              "allocated": 3072
+            }
+          ]
+        },
+        {
+          "batch": 10,
+          "synthetic_submit_ms": 6.0,
+          "assigned": {
+            "r6": 239,
+            "r7": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r4",
+              "r6",
+              "r7"
+            ],
+            "waiting": [
+              "r8"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r7",
+              "start": 86016,
+              "offered": 7011,
+              "allocated": 6144
+            },
+            {
+              "request": "r8",
+              "start": 82944,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 11,
+          "synthetic_submit_ms": 7.0,
+          "assigned": {
+            "r7": 867,
+            "r8": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r4",
+              "r6",
+              "r7"
+            ],
+            "waiting": [
+              "r8"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r8",
+              "start": 82944,
+              "offered": 7325,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 12,
+          "synthetic_submit_ms": 8.0,
+          "assigned": {
+            "r8": 3072,
+            "r9": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r6",
+              "r7",
+              "r8"
+            ],
+            "waiting": [
+              "r9"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 89088,
+              "offered": 3939,
+              "allocated": 3072
+            },
+            {
+              "request": "r9",
+              "start": 307200,
+              "offered": 5120,
+              "allocated": 3072
+            }
+          ]
+        },
+        {
+          "batch": 13,
+          "synthetic_submit_ms": 9.0,
+          "assigned": {
+            "r8": 867,
+            "r9": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r6",
+              "r7",
+              "r8",
+              "r9"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r9",
+              "start": 310272,
+              "offered": 7325,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 14,
+          "synthetic_submit_ms": 10.0,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r7",
+              "r8",
+              "r9"
+            ],
+            "waiting": [
+              "r10"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 316416,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 15,
+          "synthetic_submit_ms": 11.0,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r8",
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 322560,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 16,
+          "synthetic_submit_ms": 12.0,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r8",
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 328704,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 17,
+          "synthetic_submit_ms": 13.0,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 334848,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 18,
+          "synthetic_submit_ms": 14.0,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 340992,
+              "offered": 7899,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 19,
+          "synthetic_submit_ms": 15.0,
+          "assigned": {
+            "r9": 1755,
+            "r10": 6144
+          },
+          "tokens": 7899,
+          "unused_budget": 293,
+          "queues_before": {
+            "running": [
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 347136,
+              "offered": 1755,
+              "allocated": 1755
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r11",
+              "start": 43008,
+              "offered": 293,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 20,
+          "synthetic_submit_ms": 16.0,
+          "assigned": {
+            "r10": 239,
+            "r11": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r9",
+              "r10"
+            ],
+            "waiting": [
+              "r11",
+              "r12"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r11",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r12",
+              "start": 43008,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 21,
+          "synthetic_submit_ms": 17.0,
+          "assigned": {
+            "r11": 239,
+            "r12": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r9",
+              "r10",
+              "r11"
+            ],
+            "waiting": [
+              "r12"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r12",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 22,
+          "synthetic_submit_ms": 18.0,
+          "assigned": {
+            "r12": 239
+          },
+          "tokens": 239,
+          "unused_budget": 7953,
+          "queues_before": {
+            "running": [
+              "r9",
+              "r10",
+              "r11",
+              "r12"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            }
+          ]
+        },
+        {
+          "batch": 23,
+          "synthetic_submit_ms": 19.0,
+          "assigned": {
+            "r13": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r10",
+              "r11",
+              "r12"
+            ],
+            "waiting": [
+              "r13"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r13",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 24,
+          "synthetic_submit_ms": 20.0,
+          "assigned": {
+            "r13": 239,
+            "r14": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r11",
+              "r12",
+              "r13"
+            ],
+            "waiting": [
+              "r14"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r13",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r14",
+              "start": 82944,
+              "offered": 7953,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 25,
+          "synthetic_submit_ms": 21.0,
+          "assigned": {
+            "r14": 3072,
+            "r15": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r12",
+              "r13",
+              "r14"
+            ],
+            "waiting": [
+              "r15"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r12",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 89088,
+              "offered": 3939,
+              "allocated": 3072
+            },
+            {
+              "request": "r15",
+              "start": 82944,
+              "offered": 5120,
+              "allocated": 3072
+            }
+          ]
+        },
+        {
+          "batch": 26,
+          "synthetic_submit_ms": 22.0,
+          "assigned": {
+            "r14": 867,
+            "r15": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r13",
+              "r14",
+              "r15"
+            ],
+            "waiting": [
+              "r16"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r15",
+              "start": 86016,
+              "offered": 7011,
+              "allocated": 6144
+            },
+            {
+              "request": "r16",
+              "start": 82944,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 27,
+          "synthetic_submit_ms": 23.0,
+          "assigned": {
+            "r15": 867,
+            "r16": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r13",
+              "r14",
+              "r15"
+            ],
+            "waiting": [
+              "r16"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r16",
+              "start": 82944,
+              "offered": 7325,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 28,
+          "synthetic_submit_ms": 24.0,
+          "assigned": {
+            "r16": 3072,
+            "r17": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r14",
+              "r15",
+              "r16"
+            ],
+            "waiting": [
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 89088,
+              "offered": 3939,
+              "allocated": 3072
+            },
+            {
+              "request": "r17",
+              "start": 153600,
+              "offered": 5120,
+              "allocated": 3072
+            }
+          ]
+        },
+        {
+          "batch": 29,
+          "synthetic_submit_ms": 25.0,
+          "assigned": {
+            "r16": 867,
+            "r17": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r17",
+              "start": 156672,
+              "offered": 7325,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 30,
+          "synthetic_submit_ms": 26.0,
+          "assigned": {
+            "r17": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r15",
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 162816,
+              "offered": 8192,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 31,
+          "synthetic_submit_ms": 27.0,
+          "assigned": {
+            "r17": 3072
+          },
+          "tokens": 3072,
+          "unused_budget": 5120,
+          "queues_before": {
+            "running": [
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 168960,
+              "offered": 3076,
+              "allocated": 3072
+            }
+          ]
+        },
+        {
+          "batch": 32,
+          "synthetic_submit_ms": 28.0,
+          "assigned": {
+            "r17": 4
+          },
+          "tokens": 4,
+          "unused_budget": 8188,
+          "queues_before": {
+            "running": [
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 172032,
+              "offered": 4,
+              "allocated": 4
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "historical_arrivals",
+      "compile_sizes_per_pcp_rank": [
+        4096
+      ],
+      "global_token_budget": 32768,
+      "mtp_checkpoint": true,
+      "batch_count": 28,
+      "request_chunk_count": 33,
+      "computed_tokens": 190749,
+      "mean_tokens_per_batch": 6812.464285714285,
+      "budget_utilization": 0.20789991106305802,
+      "small_batches_le_1024": 11,
+      "per_request": {
+        "r1": [
+          9216,
+          239
+        ],
+        "r2": [
+          9216,
+          239
+        ],
+        "r3": [
+          12288,
+          867
+        ],
+        "r4": [
+          12288,
+          867
+        ],
+        "r6": [
+          9216,
+          239
+        ],
+        "r7": [
+          9216,
+          867
+        ],
+        "r8": [
+          9216,
+          867
+        ],
+        "r9": [
+          21504,
+          18432,
+          1755
+        ],
+        "r10": [
+          6144,
+          239
+        ],
+        "r11": [
+          6144,
+          239
+        ],
+        "r12": [
+          6144,
+          239
+        ],
+        "r13": [
+          6144,
+          239
+        ],
+        "r14": [
+          9216,
+          867
+        ],
+        "r15": [
+          9216,
+          867
+        ],
+        "r16": [
+          9216,
+          867
+        ],
+        "r17": [
+          18432,
+          4
+        ]
+      },
+      "batches": [
+        {
+          "batch": 1,
+          "synthetic_submit_ms": 0.0,
+          "assigned": {
+            "r1": 9216
+          },
+          "tokens": 9216,
+          "unused_budget": 23552,
+          "queues_before": {
+            "running": [],
+            "waiting": [
+              "r1"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 39936,
+              "offered": 9455,
+              "allocated": 9216
+            }
+          ]
+        },
+        {
+          "batch": 2,
+          "synthetic_submit_ms": 1.0,
+          "assigned": {
+            "r1": 239
+          },
+          "tokens": 239,
+          "unused_budget": 32529,
+          "queues_before": {
+            "running": [
+              "r1"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            }
+          ]
+        },
+        {
+          "batch": 3,
+          "synthetic_submit_ms": 11.974464869126678,
+          "assigned": {
+            "r2": 9216
+          },
+          "tokens": 9216,
+          "unused_budget": 23552,
+          "queues_before": {
+            "running": [
+              "r1"
+            ],
+            "waiting": [
+              "r2"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 39936,
+              "offered": 9455,
+              "allocated": 9216
+            }
+          ]
+        },
+        {
+          "batch": 4,
+          "synthetic_submit_ms": 12.974464869126678,
+          "assigned": {
+            "r2": 239
+          },
+          "tokens": 239,
+          "unused_budget": 32529,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            }
+          ]
+        },
+        {
+          "batch": 5,
+          "synthetic_submit_ms": 1554.4470000000001,
+          "assigned": {
+            "r3": 12288,
+            "r4": 12288
+          },
+          "tokens": 24576,
+          "unused_budget": 8192,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2"
+            ],
+            "waiting": [
+              "r3",
+              "r4"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 79872,
+              "offered": 13155,
+              "allocated": 12288
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 13155,
+              "allocated": 12288
+            }
+          ]
+        },
+        {
+          "batch": 6,
+          "synthetic_submit_ms": 2242.425,
+          "assigned": {
+            "r3": 867,
+            "r4": 867
+          },
+          "tokens": 1734,
+          "unused_budget": 31034,
+          "queues_before": {
+            "running": [
+              "r2",
+              "r3",
+              "r4"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r4",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            }
+          ]
+        },
+        {
+          "batch": 7,
+          "synthetic_submit_ms": 2861.317602917552,
+          "assigned": {
+            "r6": 9216
+          },
+          "tokens": 9216,
+          "unused_budget": 23552,
+          "queues_before": {
+            "running": [
+              "r3",
+              "r4"
+            ],
+            "waiting": [
+              "r6"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 39936,
+              "offered": 9455,
+              "allocated": 9216
+            }
+          ]
+        },
+        {
+          "batch": 8,
+          "synthetic_submit_ms": 2862.317602917552,
+          "assigned": {
+            "r6": 239
+          },
+          "tokens": 239,
+          "unused_budget": 32529,
+          "queues_before": {
+            "running": [
+              "r3",
+              "r4",
+              "r6"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            }
+          ]
+        },
+        {
+          "batch": 9,
+          "synthetic_submit_ms": 3042.905,
+          "assigned": {
+            "r7": 9216
+          },
+          "tokens": 9216,
+          "unused_budget": 23552,
+          "queues_before": {
+            "running": [
+              "r3",
+              "r4",
+              "r6"
+            ],
+            "waiting": [
+              "r7"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            }
+          ]
+        },
+        {
+          "batch": 10,
+          "synthetic_submit_ms": 3211.386,
+          "assigned": {
+            "r7": 867
+          },
+          "tokens": 867,
+          "unused_budget": 31901,
+          "queues_before": {
+            "running": [
+              "r6",
+              "r7"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            }
+          ]
+        },
+        {
+          "batch": 11,
+          "synthetic_submit_ms": 4180.509,
+          "assigned": {
+            "r8": 9216,
+            "r9": 21504
+          },
+          "tokens": 30720,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r6",
+              "r7"
+            ],
+            "waiting": [
+              "r8",
+              "r9"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            },
+            {
+              "request": "r9",
+              "start": 307200,
+              "offered": 23552,
+              "allocated": 21504
+            }
+          ]
+        },
+        {
+          "batch": 12,
+          "synthetic_submit_ms": 4383.544,
+          "assigned": {
+            "r8": 867,
+            "r9": 18432
+          },
+          "tokens": 19299,
+          "unused_budget": 13469,
+          "queues_before": {
+            "running": [
+              "r7",
+              "r8",
+              "r9"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r9",
+              "start": 328704,
+              "offered": 20187,
+              "allocated": 18432
+            }
+          ]
+        },
+        {
+          "batch": 13,
+          "synthetic_submit_ms": 4593.543,
+          "assigned": {
+            "r9": 1755
+          },
+          "tokens": 1755,
+          "unused_budget": 31013,
+          "queues_before": {
+            "running": [
+              "r7",
+              "r8",
+              "r9"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 347136,
+              "offered": 1755,
+              "allocated": 1755
+            }
+          ]
+        },
+        {
+          "batch": 14,
+          "synthetic_submit_ms": 5447.774,
+          "assigned": {
+            "r10": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 26624,
+          "queues_before": {
+            "running": [
+              "r8",
+              "r9"
+            ],
+            "waiting": [
+              "r10"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 15,
+          "synthetic_submit_ms": 6312.6900000000005,
+          "assigned": {
+            "r10": 239,
+            "r11": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 26385,
+          "queues_before": {
+            "running": [
+              "r8",
+              "r9",
+              "r10"
+            ],
+            "waiting": [
+              "r11"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r11",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 16,
+          "synthetic_submit_ms": 7971.889999999999,
+          "assigned": {
+            "r11": 239
+          },
+          "tokens": 239,
+          "unused_budget": 32529,
+          "queues_before": {
+            "running": [
+              "r9",
+              "r10",
+              "r11"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            }
+          ]
+        },
+        {
+          "batch": 17,
+          "synthetic_submit_ms": 8788.827982032672,
+          "assigned": {
+            "r12": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 26624,
+          "queues_before": {
+            "running": [
+              "r10",
+              "r11"
+            ],
+            "waiting": [
+              "r12"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 18,
+          "synthetic_submit_ms": 10196.839999999998,
+          "assigned": {
+            "r12": 239
+          },
+          "tokens": 239,
+          "unused_budget": 32529,
+          "queues_before": {
+            "running": [
+              "r10",
+              "r11",
+              "r12"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            }
+          ]
+        },
+        {
+          "batch": 19,
+          "synthetic_submit_ms": 12071.544688893482,
+          "assigned": {
+            "r13": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 26624,
+          "queues_before": {
+            "running": [],
+            "waiting": [
+              "r13"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r13",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 20,
+          "synthetic_submit_ms": 12072.544688893482,
+          "assigned": {
+            "r13": 239
+          },
+          "tokens": 239,
+          "unused_budget": 32529,
+          "queues_before": {
+            "running": [
+              "r13"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r13",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            }
+          ]
+        },
+        {
+          "batch": 21,
+          "synthetic_submit_ms": 12207.374542951584,
+          "assigned": {
+            "r14": 9216
+          },
+          "tokens": 9216,
+          "unused_budget": 23552,
+          "queues_before": {
+            "running": [
+              "r13"
+            ],
+            "waiting": [
+              "r14"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            }
+          ]
+        },
+        {
+          "batch": 22,
+          "synthetic_submit_ms": 12208.374542951584,
+          "assigned": {
+            "r14": 867
+          },
+          "tokens": 867,
+          "unused_budget": 31901,
+          "queues_before": {
+            "running": [
+              "r13",
+              "r14"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            }
+          ]
+        },
+        {
+          "batch": 23,
+          "synthetic_submit_ms": 12253.044688893482,
+          "assigned": {
+            "r15": 9216
+          },
+          "tokens": 9216,
+          "unused_budget": 23552,
+          "queues_before": {
+            "running": [
+              "r13",
+              "r14"
+            ],
+            "waiting": [
+              "r15"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            }
+          ]
+        },
+        {
+          "batch": 24,
+          "synthetic_submit_ms": 12432.920688893482,
+          "assigned": {
+            "r15": 867
+          },
+          "tokens": 867,
+          "unused_budget": 31901,
+          "queues_before": {
+            "running": [
+              "r14",
+              "r15"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            }
+          ]
+        },
+        {
+          "batch": 25,
+          "synthetic_submit_ms": 12603.881688893483,
+          "assigned": {
+            "r16": 9216
+          },
+          "tokens": 9216,
+          "unused_budget": 23552,
+          "queues_before": {
+            "running": [
+              "r14",
+              "r15"
+            ],
+            "waiting": [
+              "r16"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            }
+          ]
+        },
+        {
+          "batch": 26,
+          "synthetic_submit_ms": 13506.211688893483,
+          "assigned": {
+            "r16": 867
+          },
+          "tokens": 867,
+          "unused_budget": 31901,
+          "queues_before": {
+            "running": [
+              "r15",
+              "r16"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            }
+          ]
+        },
+        {
+          "batch": 27,
+          "synthetic_submit_ms": 14616.009034914896,
+          "assigned": {
+            "r17": 18432
+          },
+          "tokens": 18432,
+          "unused_budget": 14336,
+          "queues_before": {
+            "running": [
+              "r16"
+            ],
+            "waiting": [
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 153600,
+              "offered": 18436,
+              "allocated": 18432
+            }
+          ]
+        },
+        {
+          "batch": 28,
+          "synthetic_submit_ms": 14617.009034914896,
+          "assigned": {
+            "r17": 4
+          },
+          "tokens": 4,
+          "unused_budget": 32764,
+          "queues_before": {
+            "running": [
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 172032,
+              "offered": 4,
+              "allocated": 4
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "historical_arrivals",
+      "compile_sizes_per_pcp_rank": [
+        256,
+        512,
+        1024
+      ],
+      "global_token_budget": 8192,
+      "mtp_checkpoint": true,
+      "batch_count": 33,
+      "request_chunk_count": 55,
+      "computed_tokens": 190749,
+      "mean_tokens_per_batch": 5780.272727272727,
+      "budget_utilization": 0.7055996981534091,
+      "small_batches_le_1024": 2,
+      "per_request": {
+        "r1": [
+          6144,
+          3072,
+          239
+        ],
+        "r2": [
+          6144,
+          3072,
+          239
+        ],
+        "r3": [
+          3072,
+          6144,
+          3072,
+          867
+        ],
+        "r4": [
+          3072,
+          6144,
+          3072,
+          867
+        ],
+        "r6": [
+          3072,
+          6144,
+          239
+        ],
+        "r7": [
+          6144,
+          3072,
+          867
+        ],
+        "r8": [
+          3072,
+          6144,
+          867
+        ],
+        "r9": [
+          6144,
+          6144,
+          6144,
+          6144,
+          6144,
+          6144,
+          3072,
+          1755
+        ],
+        "r10": [
+          3072,
+          3072,
+          239
+        ],
+        "r11": [
+          3072,
+          3072,
+          239
+        ],
+        "r12": [
+          3072,
+          3072,
+          239
+        ],
+        "r13": [
+          6144,
+          239
+        ],
+        "r14": [
+          6144,
+          3072,
+          867
+        ],
+        "r15": [
+          3072,
+          6144,
+          867
+        ],
+        "r16": [
+          6144,
+          3072,
+          867
+        ],
+        "r17": [
+          6144,
+          6144,
+          6144,
+          4
+        ]
+      },
+      "batches": [
+        {
+          "batch": 1,
+          "synthetic_submit_ms": 0.0,
+          "assigned": {
+            "r1": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [],
+            "waiting": [
+              "r1"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 39936,
+              "offered": 8192,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 2,
+          "synthetic_submit_ms": 1.0,
+          "assigned": {
+            "r1": 3072
+          },
+          "tokens": 3072,
+          "unused_budget": 5120,
+          "queues_before": {
+            "running": [
+              "r1"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 46080,
+              "offered": 3311,
+              "allocated": 3072
+            }
+          ]
+        },
+        {
+          "batch": 3,
+          "synthetic_submit_ms": 2.0,
+          "assigned": {
+            "r1": 239
+          },
+          "tokens": 239,
+          "unused_budget": 7953,
+          "queues_before": {
+            "running": [
+              "r1"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            }
+          ]
+        },
+        {
+          "batch": 4,
+          "synthetic_submit_ms": 11.974464869126678,
+          "assigned": {
+            "r2": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r1"
+            ],
+            "waiting": [
+              "r2"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 39936,
+              "offered": 8192,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 5,
+          "synthetic_submit_ms": 1554.4470000000001,
+          "assigned": {
+            "r2": 3072,
+            "r3": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2"
+            ],
+            "waiting": [
+              "r3",
+              "r4"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 46080,
+              "offered": 3311,
+              "allocated": 3072
+            },
+            {
+              "request": "r3",
+              "start": 79872,
+              "offered": 5120,
+              "allocated": 3072
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 6,
+          "synthetic_submit_ms": 2242.425,
+          "assigned": {
+            "r2": 239,
+            "r3": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2",
+              "r3"
+            ],
+            "waiting": [
+              "r4"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r3",
+              "start": 82944,
+              "offered": 7953,
+              "allocated": 6144
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 7,
+          "synthetic_submit_ms": 2587.465,
+          "assigned": {
+            "r3": 3072,
+            "r4": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r2",
+              "r3"
+            ],
+            "waiting": [
+              "r4"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 89088,
+              "offered": 3939,
+              "allocated": 3072
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 5120,
+              "allocated": 3072
+            }
+          ]
+        },
+        {
+          "batch": 8,
+          "synthetic_submit_ms": 2861.2900000000004,
+          "assigned": {
+            "r3": 867,
+            "r4": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r2",
+              "r3",
+              "r4"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r4",
+              "start": 82944,
+              "offered": 7325,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 9,
+          "synthetic_submit_ms": 3042.905,
+          "assigned": {
+            "r4": 3072,
+            "r6": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r2",
+              "r3",
+              "r4"
+            ],
+            "waiting": [
+              "r6",
+              "r7"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 89088,
+              "offered": 3939,
+              "allocated": 3072
+            },
+            {
+              "request": "r6",
+              "start": 39936,
+              "offered": 5120,
+              "allocated": 3072
+            },
+            {
+              "request": "r7",
+              "start": 82944,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 10,
+          "synthetic_submit_ms": 3211.386,
+          "assigned": {
+            "r4": 867,
+            "r6": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r3",
+              "r4",
+              "r6"
+            ],
+            "waiting": [
+              "r7"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r6",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r7",
+              "start": 82944,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 11,
+          "synthetic_submit_ms": 4180.509,
+          "assigned": {
+            "r6": 239,
+            "r7": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r3",
+              "r4",
+              "r6"
+            ],
+            "waiting": [
+              "r7",
+              "r8",
+              "r9"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r7",
+              "start": 82944,
+              "offered": 7953,
+              "allocated": 6144
+            },
+            {
+              "request": "r8",
+              "start": 82944,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 12,
+          "synthetic_submit_ms": 4383.544,
+          "assigned": {
+            "r7": 3072,
+            "r8": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r4",
+              "r6",
+              "r7"
+            ],
+            "waiting": [
+              "r8",
+              "r9"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 89088,
+              "offered": 3939,
+              "allocated": 3072
+            },
+            {
+              "request": "r8",
+              "start": 82944,
+              "offered": 5120,
+              "allocated": 3072
+            },
+            {
+              "request": "r9",
+              "start": 307200,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 13,
+          "synthetic_submit_ms": 4593.543,
+          "assigned": {
+            "r7": 867,
+            "r8": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r4",
+              "r6",
+              "r7",
+              "r8"
+            ],
+            "waiting": [
+              "r9"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r8",
+              "start": 86016,
+              "offered": 7011,
+              "allocated": 6144
+            },
+            {
+              "request": "r9",
+              "start": 307200,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 14,
+          "synthetic_submit_ms": 5447.774,
+          "assigned": {
+            "r8": 867,
+            "r9": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r6",
+              "r7",
+              "r8"
+            ],
+            "waiting": [
+              "r9",
+              "r10"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r9",
+              "start": 307200,
+              "offered": 7325,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 15,
+          "synthetic_submit_ms": 6312.6900000000005,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r7",
+              "r8",
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 313344,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 16,
+          "synthetic_submit_ms": 7971.889999999999,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r7",
+              "r8",
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 319488,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 17,
+          "synthetic_submit_ms": 8610.231,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r8",
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 325632,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 18,
+          "synthetic_submit_ms": 10196.839999999998,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 331776,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 19,
+          "synthetic_submit_ms": 10551.948,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 337920,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 20,
+          "synthetic_submit_ms": 11305.857,
+          "assigned": {
+            "r9": 3072,
+            "r10": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 344064,
+              "offered": 4827,
+              "allocated": 3072
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 5120,
+              "allocated": 3072
+            },
+            {
+              "request": "r11",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 21,
+          "synthetic_submit_ms": 11617.17,
+          "assigned": {
+            "r9": 1755,
+            "r10": 3072,
+            "r11": 3072
+          },
+          "tokens": 7899,
+          "unused_budget": 293,
+          "queues_before": {
+            "running": [
+              "r9",
+              "r10"
+            ],
+            "waiting": [
+              "r11",
+              "r12"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 347136,
+              "offered": 1755,
+              "allocated": 1755
+            },
+            {
+              "request": "r10",
+              "start": 46080,
+              "offered": 3311,
+              "allocated": 3072
+            },
+            {
+              "request": "r11",
+              "start": 43008,
+              "offered": 3365,
+              "allocated": 3072
+            },
+            {
+              "request": "r12",
+              "start": 43008,
+              "offered": 293,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 22,
+          "synthetic_submit_ms": 11778.094,
+          "assigned": {
+            "r10": 239,
+            "r11": 3072,
+            "r12": 3072
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r9",
+              "r10",
+              "r11"
+            ],
+            "waiting": [
+              "r12"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r11",
+              "start": 46080,
+              "offered": 3311,
+              "allocated": 3072
+            },
+            {
+              "request": "r12",
+              "start": 43008,
+              "offered": 4881,
+              "allocated": 3072
+            }
+          ]
+        },
+        {
+          "batch": 23,
+          "synthetic_submit_ms": 11959.594,
+          "assigned": {
+            "r11": 239,
+            "r12": 3072
+          },
+          "tokens": 3311,
+          "unused_budget": 4881,
+          "queues_before": {
+            "running": [
+              "r9",
+              "r10",
+              "r11",
+              "r12"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r12",
+              "start": 46080,
+              "offered": 3311,
+              "allocated": 3072
+            }
+          ]
+        },
+        {
+          "batch": 24,
+          "synthetic_submit_ms": 12139.47,
+          "assigned": {
+            "r12": 239,
+            "r13": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r9",
+              "r10",
+              "r11",
+              "r12"
+            ],
+            "waiting": [
+              "r13"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r13",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 25,
+          "synthetic_submit_ms": 12310.431,
+          "assigned": {
+            "r13": 239,
+            "r14": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r10",
+              "r11",
+              "r12",
+              "r13"
+            ],
+            "waiting": [
+              "r14",
+              "r15"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r13",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r14",
+              "start": 82944,
+              "offered": 7953,
+              "allocated": 6144
+            },
+            {
+              "request": "r15",
+              "start": 82944,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 26,
+          "synthetic_submit_ms": 13212.761,
+          "assigned": {
+            "r14": 3072,
+            "r15": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r11",
+              "r12",
+              "r13",
+              "r14"
+            ],
+            "waiting": [
+              "r15",
+              "r16"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 89088,
+              "offered": 3939,
+              "allocated": 3072
+            },
+            {
+              "request": "r15",
+              "start": 82944,
+              "offered": 5120,
+              "allocated": 3072
+            },
+            {
+              "request": "r16",
+              "start": 82944,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 27,
+          "synthetic_submit_ms": 13620.32,
+          "assigned": {
+            "r14": 867,
+            "r15": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r12",
+              "r13",
+              "r14",
+              "r15"
+            ],
+            "waiting": [
+              "r16"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r12",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r15",
+              "start": 86016,
+              "offered": 7011,
+              "allocated": 6144
+            },
+            {
+              "request": "r16",
+              "start": 82944,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 28,
+          "synthetic_submit_ms": 14236.931,
+          "assigned": {
+            "r15": 867,
+            "r16": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r13",
+              "r14",
+              "r15"
+            ],
+            "waiting": [
+              "r16"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r16",
+              "start": 82944,
+              "offered": 7325,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 29,
+          "synthetic_submit_ms": 14466.451,
+          "assigned": {
+            "r16": 3072
+          },
+          "tokens": 3072,
+          "unused_budget": 5120,
+          "queues_before": {
+            "running": [
+              "r14",
+              "r15",
+              "r16"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 89088,
+              "offered": 3939,
+              "allocated": 3072
+            }
+          ]
+        },
+        {
+          "batch": 30,
+          "synthetic_submit_ms": 14677.789,
+          "assigned": {
+            "r16": 867,
+            "r17": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r14",
+              "r15",
+              "r16"
+            ],
+            "waiting": [
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r17",
+              "start": 153600,
+              "offered": 7325,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 31,
+          "synthetic_submit_ms": 14877.463000000002,
+          "assigned": {
+            "r17": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r15",
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 159744,
+              "offered": 8192,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 32,
+          "synthetic_submit_ms": 15059.457,
+          "assigned": {
+            "r17": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 165888,
+              "offered": 6148,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 33,
+          "synthetic_submit_ms": 15674.318,
+          "assigned": {
+            "r17": 4
+          },
+          "tokens": 4,
+          "unused_budget": 8188,
+          "queues_before": {
+            "running": [
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 172032,
+              "offered": 4,
+              "allocated": 4
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "all_ready_16",
+      "compile_sizes_per_pcp_rank": [
+        4096
+      ],
+      "global_token_budget": 32768,
+      "mtp_checkpoint": true,
+      "batch_count": 7,
+      "request_chunk_count": 34,
+      "computed_tokens": 190749,
+      "mean_tokens_per_batch": 27249.85714285714,
+      "budget_utilization": 0.8315996442522321,
+      "small_batches_le_1024": 0,
+      "per_request": {
+        "r1": [
+          9216,
+          239
+        ],
+        "r2": [
+          9216,
+          239
+        ],
+        "r3": [
+          12288,
+          867
+        ],
+        "r4": [
+          12288,
+          867
+        ],
+        "r6": [
+          9216,
+          239
+        ],
+        "r7": [
+          9216,
+          867
+        ],
+        "r8": [
+          9216,
+          867
+        ],
+        "r9": [
+          21504,
+          18432,
+          1755
+        ],
+        "r10": [
+          6144,
+          239
+        ],
+        "r11": [
+          6144,
+          239
+        ],
+        "r12": [
+          6144,
+          239
+        ],
+        "r13": [
+          6144,
+          239
+        ],
+        "r14": [
+          9216,
+          867
+        ],
+        "r15": [
+          6144,
+          3072,
+          867
+        ],
+        "r16": [
+          9216,
+          867
+        ],
+        "r17": [
+          18432,
+          4
+        ]
+      },
+      "batches": [
+        {
+          "batch": 1,
+          "synthetic_submit_ms": 0.0,
+          "assigned": {
+            "r1": 9216,
+            "r2": 9216,
+            "r3": 12288
+          },
+          "tokens": 30720,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [],
+            "waiting": [
+              "r1",
+              "r2",
+              "r3",
+              "r4",
+              "r6",
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 39936,
+              "offered": 9455,
+              "allocated": 9216
+            },
+            {
+              "request": "r2",
+              "start": 39936,
+              "offered": 9455,
+              "allocated": 9216
+            },
+            {
+              "request": "r3",
+              "start": 79872,
+              "offered": 13155,
+              "allocated": 12288
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 2,
+          "synthetic_submit_ms": 0.001,
+          "assigned": {
+            "r1": 239,
+            "r2": 239,
+            "r3": 867,
+            "r4": 12288,
+            "r6": 9216,
+            "r7": 9216
+          },
+          "tokens": 32065,
+          "unused_budget": 703,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2",
+              "r3"
+            ],
+            "waiting": [
+              "r4",
+              "r6",
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r2",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r3",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 13155,
+              "allocated": 12288
+            },
+            {
+              "request": "r6",
+              "start": 39936,
+              "offered": 9455,
+              "allocated": 9216
+            },
+            {
+              "request": "r7",
+              "start": 82944,
+              "offered": 9919,
+              "allocated": 9216
+            },
+            {
+              "request": "r8",
+              "start": 82944,
+              "offered": 703,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 3,
+          "synthetic_submit_ms": 0.002,
+          "assigned": {
+            "r4": 867,
+            "r6": 239,
+            "r7": 867,
+            "r8": 9216,
+            "r9": 21504
+          },
+          "tokens": 32693,
+          "unused_budget": 75,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2",
+              "r3",
+              "r4",
+              "r6",
+              "r7"
+            ],
+            "waiting": [
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r6",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r7",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r8",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            },
+            {
+              "request": "r9",
+              "start": 307200,
+              "offered": 21579,
+              "allocated": 21504
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 75,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 4,
+          "synthetic_submit_ms": 0.003,
+          "assigned": {
+            "r8": 867,
+            "r9": 18432,
+            "r10": 6144,
+            "r11": 6144
+          },
+          "tokens": 31587,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2",
+              "r3",
+              "r4",
+              "r6",
+              "r7",
+              "r8",
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r9",
+              "start": 328704,
+              "offered": 20187,
+              "allocated": 18432
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r11",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r12",
+              "start": 43008,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 5,
+          "synthetic_submit_ms": 1.0,
+          "assigned": {
+            "r9": 1755,
+            "r10": 239,
+            "r11": 239,
+            "r12": 6144,
+            "r13": 6144,
+            "r14": 9216,
+            "r15": 6144
+          },
+          "tokens": 29881,
+          "unused_budget": 2887,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2",
+              "r3",
+              "r4",
+              "r6",
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11"
+            ],
+            "waiting": [
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 347136,
+              "offered": 1755,
+              "allocated": 1755
+            },
+            {
+              "request": "r10",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r11",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r12",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r13",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r14",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            },
+            {
+              "request": "r15",
+              "start": 82944,
+              "offered": 9031,
+              "allocated": 6144
+            },
+            {
+              "request": "r16",
+              "start": 82944,
+              "offered": 2887,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 6,
+          "synthetic_submit_ms": 2.0,
+          "assigned": {
+            "r12": 239,
+            "r13": 239,
+            "r14": 867,
+            "r15": 3072,
+            "r16": 9216,
+            "r17": 18432
+          },
+          "tokens": 32065,
+          "unused_budget": 703,
+          "queues_before": {
+            "running": [
+              "r4",
+              "r6",
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15"
+            ],
+            "waiting": [
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r13",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r14",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r15",
+              "start": 89088,
+              "offered": 3939,
+              "allocated": 3072
+            },
+            {
+              "request": "r16",
+              "start": 82944,
+              "offered": 10083,
+              "allocated": 9216
+            },
+            {
+              "request": "r17",
+              "start": 153600,
+              "offered": 18436,
+              "allocated": 18432
+            }
+          ]
+        },
+        {
+          "batch": 7,
+          "synthetic_submit_ms": 3.0,
+          "assigned": {
+            "r15": 867,
+            "r16": 867,
+            "r17": 4
+          },
+          "tokens": 1738,
+          "unused_budget": 31030,
+          "queues_before": {
+            "running": [
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r16",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r17",
+              "start": 172032,
+              "offered": 4,
+              "allocated": 4
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "all_ready_16",
+      "compile_sizes_per_pcp_rank": [
+        256,
+        512,
+        1024
+      ],
+      "global_token_budget": 8192,
+      "mtp_checkpoint": true,
+      "batch_count": 31,
+      "request_chunk_count": 51,
+      "computed_tokens": 190749,
+      "mean_tokens_per_batch": 6153.193548387097,
+      "budget_utilization": 0.7511222593245968,
+      "small_batches_le_1024": 1,
+      "per_request": {
+        "r1": [
+          6144,
+          3072,
+          239
+        ],
+        "r2": [
+          3072,
+          6144,
+          239
+        ],
+        "r3": [
+          6144,
+          6144,
+          867
+        ],
+        "r4": [
+          6144,
+          6144,
+          867
+        ],
+        "r6": [
+          6144,
+          3072,
+          239
+        ],
+        "r7": [
+          3072,
+          6144,
+          867
+        ],
+        "r8": [
+          6144,
+          3072,
+          867
+        ],
+        "r9": [
+          3072,
+          6144,
+          6144,
+          6144,
+          6144,
+          6144,
+          6144,
+          1755
+        ],
+        "r10": [
+          6144,
+          239
+        ],
+        "r11": [
+          6144,
+          239
+        ],
+        "r12": [
+          6144,
+          239
+        ],
+        "r13": [
+          6144,
+          239
+        ],
+        "r14": [
+          6144,
+          3072,
+          867
+        ],
+        "r15": [
+          3072,
+          6144,
+          867
+        ],
+        "r16": [
+          6144,
+          3072,
+          867
+        ],
+        "r17": [
+          3072,
+          6144,
+          6144,
+          3072,
+          4
+        ]
+      },
+      "batches": [
+        {
+          "batch": 1,
+          "synthetic_submit_ms": 0.0,
+          "assigned": {
+            "r1": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [],
+            "waiting": [
+              "r1",
+              "r2",
+              "r3",
+              "r4",
+              "r6",
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 39936,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r2",
+              "start": 39936,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 2,
+          "synthetic_submit_ms": 0.001,
+          "assigned": {
+            "r1": 3072,
+            "r2": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r1"
+            ],
+            "waiting": [
+              "r2",
+              "r3",
+              "r4",
+              "r6",
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 46080,
+              "offered": 3311,
+              "allocated": 3072
+            },
+            {
+              "request": "r2",
+              "start": 39936,
+              "offered": 5120,
+              "allocated": 3072
+            },
+            {
+              "request": "r3",
+              "start": 79872,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 3,
+          "synthetic_submit_ms": 0.002,
+          "assigned": {
+            "r1": 239,
+            "r2": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2"
+            ],
+            "waiting": [
+              "r3",
+              "r4",
+              "r6",
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r2",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r3",
+              "start": 79872,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 4,
+          "synthetic_submit_ms": 0.003,
+          "assigned": {
+            "r2": 239,
+            "r3": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2"
+            ],
+            "waiting": [
+              "r3",
+              "r4",
+              "r6",
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r3",
+              "start": 79872,
+              "offered": 7953,
+              "allocated": 6144
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 5,
+          "synthetic_submit_ms": 1.0,
+          "assigned": {
+            "r3": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2",
+              "r3"
+            ],
+            "waiting": [
+              "r4",
+              "r6",
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 86016,
+              "offered": 7011,
+              "allocated": 6144
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 6,
+          "synthetic_submit_ms": 2.0,
+          "assigned": {
+            "r3": 867,
+            "r4": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r1",
+              "r2",
+              "r3"
+            ],
+            "waiting": [
+              "r4",
+              "r6",
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r1",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r4",
+              "start": 79872,
+              "offered": 7325,
+              "allocated": 6144
+            },
+            {
+              "request": "r6",
+              "start": 39936,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 7,
+          "synthetic_submit_ms": 3.0,
+          "assigned": {
+            "r4": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r2",
+              "r3",
+              "r4"
+            ],
+            "waiting": [
+              "r6",
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r2",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 86016,
+              "offered": 7011,
+              "allocated": 6144
+            },
+            {
+              "request": "r6",
+              "start": 39936,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 8,
+          "synthetic_submit_ms": 4.0,
+          "assigned": {
+            "r4": 867,
+            "r6": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r3",
+              "r4"
+            ],
+            "waiting": [
+              "r6",
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r6",
+              "start": 39936,
+              "offered": 7325,
+              "allocated": 6144
+            },
+            {
+              "request": "r7",
+              "start": 82944,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 9,
+          "synthetic_submit_ms": 5.0,
+          "assigned": {
+            "r6": 3072,
+            "r7": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r3",
+              "r4",
+              "r6"
+            ],
+            "waiting": [
+              "r7",
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r3",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 46080,
+              "offered": 3311,
+              "allocated": 3072
+            },
+            {
+              "request": "r7",
+              "start": 82944,
+              "offered": 5120,
+              "allocated": 3072
+            },
+            {
+              "request": "r8",
+              "start": 82944,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 10,
+          "synthetic_submit_ms": 6.0,
+          "assigned": {
+            "r6": 239,
+            "r7": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r4",
+              "r6",
+              "r7"
+            ],
+            "waiting": [
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r7",
+              "start": 86016,
+              "offered": 7011,
+              "allocated": 6144
+            },
+            {
+              "request": "r8",
+              "start": 82944,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 11,
+          "synthetic_submit_ms": 7.0,
+          "assigned": {
+            "r7": 867,
+            "r8": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r4",
+              "r6",
+              "r7"
+            ],
+            "waiting": [
+              "r8",
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r4",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r8",
+              "start": 82944,
+              "offered": 7325,
+              "allocated": 6144
+            },
+            {
+              "request": "r9",
+              "start": 307200,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 12,
+          "synthetic_submit_ms": 8.0,
+          "assigned": {
+            "r8": 3072,
+            "r9": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r6",
+              "r7",
+              "r8"
+            ],
+            "waiting": [
+              "r9",
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 89088,
+              "offered": 3939,
+              "allocated": 3072
+            },
+            {
+              "request": "r9",
+              "start": 307200,
+              "offered": 5120,
+              "allocated": 3072
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 13,
+          "synthetic_submit_ms": 9.0,
+          "assigned": {
+            "r8": 867,
+            "r9": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r6",
+              "r7",
+              "r8",
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r6",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r9",
+              "start": 310272,
+              "offered": 7325,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 14,
+          "synthetic_submit_ms": 10.0,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r7",
+              "r8",
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r7",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 316416,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 15,
+          "synthetic_submit_ms": 11.0,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r8",
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 322560,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 16,
+          "synthetic_submit_ms": 12.0,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r8",
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r8",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r9",
+              "start": 328704,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 17,
+          "synthetic_submit_ms": 13.0,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 334848,
+              "offered": 8192,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 18,
+          "synthetic_submit_ms": 14.0,
+          "assigned": {
+            "r9": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 340992,
+              "offered": 7899,
+              "allocated": 6144
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 19,
+          "synthetic_submit_ms": 15.0,
+          "assigned": {
+            "r9": 1755,
+            "r10": 6144
+          },
+          "tokens": 7899,
+          "unused_budget": 293,
+          "queues_before": {
+            "running": [
+              "r9"
+            ],
+            "waiting": [
+              "r10",
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 347136,
+              "offered": 1755,
+              "allocated": 1755
+            },
+            {
+              "request": "r10",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r11",
+              "start": 43008,
+              "offered": 293,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 20,
+          "synthetic_submit_ms": 16.0,
+          "assigned": {
+            "r10": 239,
+            "r11": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r9",
+              "r10"
+            ],
+            "waiting": [
+              "r11",
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r11",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r12",
+              "start": 43008,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 21,
+          "synthetic_submit_ms": 17.0,
+          "assigned": {
+            "r11": 239,
+            "r12": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r9",
+              "r10",
+              "r11"
+            ],
+            "waiting": [
+              "r12",
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r12",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r13",
+              "start": 43008,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 22,
+          "synthetic_submit_ms": 18.0,
+          "assigned": {
+            "r12": 239,
+            "r13": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r9",
+              "r10",
+              "r11",
+              "r12"
+            ],
+            "waiting": [
+              "r13",
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r9",
+              "start": 348891,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r13",
+              "start": 43008,
+              "offered": 6383,
+              "allocated": 6144
+            },
+            {
+              "request": "r14",
+              "start": 82944,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 23,
+          "synthetic_submit_ms": 19.0,
+          "assigned": {
+            "r13": 239,
+            "r14": 6144
+          },
+          "tokens": 6383,
+          "unused_budget": 1809,
+          "queues_before": {
+            "running": [
+              "r10",
+              "r11",
+              "r12",
+              "r13"
+            ],
+            "waiting": [
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r10",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r13",
+              "start": 49152,
+              "offered": 239,
+              "allocated": 239
+            },
+            {
+              "request": "r14",
+              "start": 82944,
+              "offered": 7953,
+              "allocated": 6144
+            },
+            {
+              "request": "r15",
+              "start": 82944,
+              "offered": 1809,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 24,
+          "synthetic_submit_ms": 20.0,
+          "assigned": {
+            "r14": 3072,
+            "r15": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r11",
+              "r12",
+              "r13",
+              "r14"
+            ],
+            "waiting": [
+              "r15",
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r11",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r12",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 89088,
+              "offered": 3939,
+              "allocated": 3072
+            },
+            {
+              "request": "r15",
+              "start": 82944,
+              "offered": 5120,
+              "allocated": 3072
+            },
+            {
+              "request": "r16",
+              "start": 82944,
+              "offered": 2048,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 25,
+          "synthetic_submit_ms": 21.0,
+          "assigned": {
+            "r14": 867,
+            "r15": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r12",
+              "r13",
+              "r14",
+              "r15"
+            ],
+            "waiting": [
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r12",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r15",
+              "start": 86016,
+              "offered": 7011,
+              "allocated": 6144
+            },
+            {
+              "request": "r16",
+              "start": 82944,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 26,
+          "synthetic_submit_ms": 22.0,
+          "assigned": {
+            "r15": 867,
+            "r16": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r13",
+              "r14",
+              "r15"
+            ],
+            "waiting": [
+              "r16",
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r13",
+              "start": 49391,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r16",
+              "start": 82944,
+              "offered": 7325,
+              "allocated": 6144
+            },
+            {
+              "request": "r17",
+              "start": 153600,
+              "offered": 1181,
+              "allocated": 0
+            }
+          ]
+        },
+        {
+          "batch": 27,
+          "synthetic_submit_ms": 23.0,
+          "assigned": {
+            "r16": 3072,
+            "r17": 3072
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r14",
+              "r15",
+              "r16"
+            ],
+            "waiting": [
+              "r17"
+            ]
+          },
+          "split_calls": [
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 89088,
+              "offered": 3939,
+              "allocated": 3072
+            },
+            {
+              "request": "r17",
+              "start": 153600,
+              "offered": 5120,
+              "allocated": 3072
+            }
+          ]
+        },
+        {
+          "batch": 28,
+          "synthetic_submit_ms": 24.0,
+          "assigned": {
+            "r16": 867,
+            "r17": 6144
+          },
+          "tokens": 7011,
+          "unused_budget": 1181,
+          "queues_before": {
+            "running": [
+              "r14",
+              "r15",
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r14",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 92160,
+              "offered": 867,
+              "allocated": 867
+            },
+            {
+              "request": "r17",
+              "start": 156672,
+              "offered": 7325,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 29,
+          "synthetic_submit_ms": 25.0,
+          "assigned": {
+            "r17": 6144
+          },
+          "tokens": 6144,
+          "unused_budget": 2048,
+          "queues_before": {
+            "running": [
+              "r15",
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r15",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 162816,
+              "offered": 8192,
+              "allocated": 6144
+            }
+          ]
+        },
+        {
+          "batch": 30,
+          "synthetic_submit_ms": 26.0,
+          "assigned": {
+            "r17": 3072
+          },
+          "tokens": 3072,
+          "unused_budget": 5120,
+          "queues_before": {
+            "running": [
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 168960,
+              "offered": 3076,
+              "allocated": 3072
+            }
+          ]
+        },
+        {
+          "batch": 31,
+          "synthetic_submit_ms": 27.0,
+          "assigned": {
+            "r17": 4
+          },
+          "tokens": 4,
+          "unused_budget": 8188,
+          "queues_before": {
+            "running": [
+              "r16",
+              "r17"
+            ],
+            "waiting": []
+          },
+          "split_calls": [
+            {
+              "request": "r16",
+              "start": 93027,
+              "offered": 0,
+              "allocated": 0
+            },
+            {
+              "request": "r17",
+              "start": 172032,
+              "offered": 4,
+              "allocated": 4
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "Exact schedule/split/accounting functions; initialization and KV/output metadata are doubles",
+    "Fixed observed cache hits; no KV capacity pressure, shared-prefix boundary or cache warming",
+    "Four-slot synthetic FIFO; lazy push, TPU/MTP execution and real KV transfer are not modeled",
+    "Historical intervals are a sensitivity assumption, not a performance prediction",
+    "Compile sizes do not enter schedule(); global token budget controls chunk capacity",
+    "Batch counts are scheduler submissions, not measured TPU forward or MTP draft counts"
+  ]
+}

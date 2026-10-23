@@ -1,0 +1,25 @@
+{
+  "envs": {
+    "TPU_PP_DYNAMIC_CHUNKS": "0",
+    "TPU_PP_LAZY_PUSH": "1"
+  },
+  "engine_args": {
+    "prefill_context_parallel_size": 8,
+    "max_num_batched_tokens": 8192,
+    "long_prefill_token_threshold": 0,
+    "max_num_seqs": 64,
+    "pipeline_parallel_size": 4,
+    "async_scheduling": false,
+    "speculative_config": {
+      "method": "mtp",
+      "num_speculative_tokens": 1
+    },
+    "compilation_config": {
+      "compile_sizes": [
+        256,
+        512,
+        1024
+      ]
+    }
+  }
+}

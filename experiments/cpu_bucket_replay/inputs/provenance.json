@@ -1,0 +1,17 @@
+{
+  "vllm_source_commit": "2ba984a5d06db414f3b2474fe9338faf6cd80a1c",
+  "vllm_source_path": "vllm/v1/core/sched/scheduler.py",
+  "plugin_base_commit": "194a765fb77ae162cde2289831477a7a9ee40f7e",
+  "fixture_notes": {
+    "vllm_scheduler.py.txt": "Byte-for-byte scheduler snapshot; stored as text to avoid reformatting upstream code.",
+    "workload.json": "Anonymous prompt/cache lengths and relative arrivals; no prompt text or tokens.",
+    "observed_batches.json": "Derived scheduler submit/result timestamps; result consumption is not device completion.",
+    "scheduler_config.json": "Only the scheduling-related subset of the 1K reference configuration."
+  },
+  "sha256": {
+    "observed_batches.json": "3fe399133eb6b053dc7e12068be8c09f9c5f02e3972dcb083d183b272b57e7f3",
+    "scheduler_config.json": "84cef9228cf4d3b45efda4d1e8098675c5fb19e5cc81f52fafb7a46ac2ac8800",
+    "vllm_scheduler.py.txt": "abca7134821e2fb5cc8572df5c4a0b570ecf702646254327bc786fc452074983",
+    "workload.json": "c4be2f2a6e3deaf52ba16587d8802004801681594a888b2ad7cd689f4388a710"
+  }
+}
