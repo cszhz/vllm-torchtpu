@@ -92,6 +92,7 @@ FAULTS = (
         "f_qag_pair_drop",  # stage-B L2-Q: qag="pair" forwards one same-parity block too few
         "f_leaf_shift",
         "f_lv_short",  # LV: AR#1 moves one 4-row block too few (that block's rows lose the peers' partials)
+        "f_replica_nowrite",  # V16: only replica 0 of each DCP shard writes its cache copy (writer)
     )
 )  # L3: the expert-operand leaf / index is one MoE layer off -> RED
 # WHITEBOARD.v1's F-ALIAS-EARLY is not built (needs a hook between a

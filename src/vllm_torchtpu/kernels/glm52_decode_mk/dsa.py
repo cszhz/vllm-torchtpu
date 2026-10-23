@@ -96,6 +96,12 @@ FAULTS = (
     "f_lse_tile_row",
     # stage-B L2 `gearly` control: the early (previous-layer) issue reads layer l - 1's caches -> RED
     "f_early_stale",
+    # V16 (stageB/v16/DESIGN-ADDENDUM.md, VR > 1 builds only): tie allowance in PHYSICAL rank order instead of the
+    # virtual order v(r) = VR * (r % D) + r // D; replicas on half 1 use the other half's page parity; the scan / fix /
+    # union positions use the DCP-R rule (G = ILV * R, shard = rank) on the DCP-D cache
+    "f_vorder",
+    "f_replica_half",
+    "f_v16_owner",
 )
 # layer-transient buffers: produced and consumed between layer entry and routing (WHITEBOARD.v1 §5.3 / §7.1)
 ALIASED = (
@@ -384,6 +390,22 @@ def make(E):
         cfg.QMAX,
     )  # (8, 128) key tile = 4 rows x 2 chunks
     ILV, G_ = cfg.ILV, cfg.ILV * R
+    # V16 (VR > 1): the cache is DCP-D; rank me holds shard mk = me % D and is replica mh = me // D. Request b's local
+    # page j8 of that shard is this rank's iff (j8 + b) % VR == mh: its pool tile p is page j8 = VR * p + hb, hb =
+    # (mh + b) % VR (req[b, 13]). Tile order = local-index order, so tile-space positions / counts compare exactly.
+    VR, D_ = cfg.VR, cfg.D
+    if VR > 1:
+        if fault == "f_v16_owner":  # FAULT: the DCP-R position rule on the DCP-D cache
+            G_, mk, mh = ILV * R, me, me // D_
+        else:
+            G_, mk, mh = ILV * D_, me % D_, me // D_
+
+        def l8_of_tile(t, hb):
+            """tile-space position t (tile << 8 | slot) of a request with half offset hb -> shard-local index."""
+            return (VR * (t >> lg_pg) + hb) * pg + (t & (pg - 1))
+
+        def gpos_of_l8(l8):
+            return (l8 // ILV) * G_ + mk * ILV + l8 % ILV
     IH, IDIM, NH, KL, HR = cfg.IH, cfg.IDIM, cfg.NH, cfg.KL, cfg.HR
     assert IH * 8 <= 512 and NH <= 128
     MB_SH, SRC_MASK = E.MB_SH, E.SRC_MASK
@@ -488,6 +510,8 @@ def make(E):
             nq = qmeta[b, 1]
             seq = qmeta[b, 2]
             ok = jnp.logical_and(b < B, qmeta[b, 3] > 0)
+            if VR > 1:
+                return per_req_v16(b, c, t0, nq, seq, ok)
             nloc = (seq // G_) * ILV + jnp.clip(seq % G_ - ILV * me, 0, ILV)
             nl0 = (seq // G_) * ILV + jnp.clip(seq % G_, 0, ILV)
             p0 = seq - nq
@@ -506,6 +530,40 @@ def make(E):
                 2: 0,
                 4: 0,
                 12: 0,
+            }
+            for k_, v_ in vals.items():
+                req[b, k_] = jnp.asarray(v_, I32)
+            return c
+
+        def per_req_v16(b, c, t0, nq, seq, ok):
+            """V16: shard mk's local counts, this replica's tile count / half offset, nold in tile space."""
+            nloc = (seq // G_) * ILV + jnp.clip(seq % G_ - ILV * mk, 0, ILV)
+            nl0 = (seq // G_) * ILV + jnp.clip(seq % G_, 0, ILV)
+            p0 = seq - nq
+            nold8 = (p0 // G_) * ILV + jnp.clip(p0 % G_ - ILV * mk, 0, ILV)
+            hb = (mh + b) % VR
+            if fault == "f_replica_half":  # FAULT: half-1 replicas take half 0's pages
+                hb = jnp.where(mh == 1, hb ^ 1, hb)
+            np8 = (nloc + pg - 1) >> lg_pg
+            j8n = nold8 >> lg_pg
+            nold_t = ((j8n + VR - 1 - hb) // VR) * pg + jnp.where(
+                (j8n + VR - hb) % VR == 0, nold8 & (pg - 1), 0
+            )
+            vals = {
+                3: jnp.where(ok, (np8 + VR - 1 - hb) // VR, 0),
+                5: seq,
+                6: nold_t,
+                7: t0,
+                8: jnp.where(ok, nq, 0),
+                9: p0,
+                10: ok.astype(I32),
+                11: jnp.where(ok, (((nl0 + pg - 1) >> lg_pg) + VR - 1) // VR, 0),
+                0: 0,
+                1: 0,
+                2: 0,
+                4: 0,
+                12: 0,
+                13: hb,
             }
             for k_, v_ in vals.items():
                 req[b, k_] = jnp.asarray(v_, I32)
@@ -714,6 +772,7 @@ def make(E):
 
                 pbase = req[b, 4]
                 lane_r4 = lax.broadcasted_iota(I32, (4, pg), 1)
+                hb = req[b, 13] if VR > 1 else None
 
                 def page(p):
                     blk = ring[slot, p]  # [IR4, 4, pg] u8
@@ -736,7 +795,10 @@ def make(E):
                         )
                     score = acc * scale
                     lidx = (j * NPG + p) * pg + lane_r4
-                    gpos = (lidx // ILV) * G_ + me * ILV + lidx % ILV
+                    if VR > 1:
+                        gpos = gpos_of_l8(l8_of_tile(lidx, hb))
+                    else:
+                        gpos = (lidx // ILV) * G_ + me * ILV + lidx % ILV
                     ok = (gpos <= scr["b_lim"][...]) & (score != -jnp.inf)
                     key = jnp.where(ok, mono_key(score), jnp.int32(INT_MIN))  # [4, 256]
                     tile = jnp.concatenate([key[:, 0:128], key[:, 128:256]], axis=0)
@@ -806,7 +868,14 @@ def make(E):
                     t2 = jnp.minimum(t0 + qq, TMAX - 1)
                     pos2 = rmeta[t2, 1]
                     lo2 = (pos2 // G_) * ILV + pos2 % ILV
-                    hit = jnp.logical_and(qq < nq, (pos2 % G_) // ILV == me)
+                    if VR > 1:  # shard mk's position, on a page of this replica's parity
+                        j8 = lo2 >> lg_pg
+                        hit = jnp.logical_and(
+                            jnp.logical_and(qq < nq, (pos2 % G_) // ILV == mk),
+                            (j8 + VR - req[b, 13]) % VR == 0,
+                        )
+                    else:
+                        hit = jnp.logical_and(qq < nq, (pos2 % G_) // ILV == me)
 
                     @pl.when(hit)
                     def _(t2=t2, lo2=lo2, pos2=pos2):
@@ -822,7 +891,7 @@ def make(E):
                         kc = jnp.where(
                             caus & (sub8[:, 0:1] % 4 < nq), kc, jnp.int32(INT_MIN)
                         )
-                        ti = pbase + (lo2 >> lg_pg)
+                        ti = pbase + ((lo2 >> lg_pg) // VR if VR > 1 else (lo2 >> lg_pg))
                         cc = (lo2 >> 7) & 1
                         old = scr["b_keys"][ti]
                         scr["b_keys"][ti] = jnp.where(
@@ -1129,9 +1198,12 @@ def make(E):
             eqs = [a - b for a, b in zip(ge_s, gt_s)]
             before = jnp.zeros((8, 1), I32)
             eq_me = jnp.zeros((8, 1), I32)
+            vme = VR * (me % D_) + me // D_ if VR > 1 else None
             for s_ in range(R):
                 if fault == "tierank":
                     before = before + jnp.where(s_ > me, eqs[s_], 0)
+                elif VR > 1 and fault != "f_vorder":  # V16: virtual rank order v(s) = VR * (s % D) + s // D
+                    before = before + jnp.where(VR * (s_ % D_) + s_ // D_ < vme, eqs[s_], 0)
                 else:
                     before = before + jnp.where(s_ < me, eqs[s_], 0)
                 eq_me = jnp.where(s_ == me, eqs[s_], eq_me)
@@ -1563,7 +1635,10 @@ def make(E):
                     page = jnp.where(
                         page + 1 < E.nb, page + 1, 0
                     )  # stays in bounds (no UB on device)
-                gpos = (m // ILV) * G_ + me * ILV + m % ILV
+                if VR > 1:
+                    gpos = gpos_of_l8(l8_of_tile(m, req[b, 13]))
+                else:
+                    gpos = (m // ILV) * G_ + me * ILV + m % ILV
                 t2 = jnp.clip(t0 + (gpos - p0), 0, TMAX - 1)
                 src = jnp.where(
                     old, shl(page, 8) | (m & (pg - 1)), shl(t2, 2) | (m & 3)

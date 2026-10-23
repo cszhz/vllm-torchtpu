@@ -19,8 +19,10 @@ batches); `repack()` re-reads the router weight and bias after the harness re-dr
 
 The step_ok guard (WHITEBOARD.v3 §8 W4). The megakernel engages only when every precondition holds; otherwise the step
 runs the stock graphs, and every decline is counted under a named reason (no silent decline):
-- load time (else no megakernel is built; logged): GLM-5.2 DSA, TP == DCP == world == 16 with the DCP group = the TP
-  group = ranks 0..15 in rank order (the megakernel's mesh position, DCP KV ownership and rank operand coincide),
+- load time (else no megakernel is built; logged): GLM-5.2 DSA, TP == world == 16 and DCP == 16 with the DCP group = the
+  TP group = ranks 0..15 in rank order (the megakernel's mesh position, DCP KV ownership and rank operand coincide), or
+  DCP == 8 as V16 (stageB/v16/DESIGN-ADDENDUM.md: DCP groups {0..7}, {8..15}, rank_in_group = rank % 8; the two
+  replicas of each DCP shard split it by page parity, so the kernel's work and collectives stay 16-way),
   interleave 4, EP off, q_b column-parallel (qrep 0) or replicated over a q group = the world (qrep 1, sliced per
   layer: `qrep_layer` / `q_b_local`), MTP 3, block 256, one rope
   pair layout for every layer, MLA and indexer alike (`rope_layout`: glm-agentx's NeoX permutes -> MKConfig.rope_neox),
@@ -96,20 +98,21 @@ def _rows_env() -> list[int]:
     return rows
 
 
-def rank0_pages(seq: int, *, page: int, R: int, ilv: int) -> int:
+def rank0_pages(seq: int, *, page: int, R: int, ilv: int, vr: int = 1) -> int:
     """Rank 0's local page count for a request of `seq` tokens under DCP interleave ownership: the kernel's per-request
-    wave weight (dsa.py step_init `req[b, 11]`, nl0 = (seq // (R * ilv)) * ilv + min(seq % (R * ilv), ilv))."""
+    wave weight (dsa.py step_init `req[b, 11]`, nl0 = (seq // (R * ilv)) * ilv + min(seq % (R * ilv), ilv)). R is the
+    cache's DCP size; vr > 1 (V16): the replica's tiles, ceil(pages / vr) (the most any replica of any shard takes)."""
     g = R * ilv
     nl0 = (seq // g) * ilv + min(seq % g, ilv)
-    return -(-nl0 // page)
+    return -(-(-(-nl0 // page)) // vr)
 
 
-def check_pool(max_model_len: int, pools, *, page: int, R: int, ilv: int) -> int:
+def check_pool(max_model_len: int, pools, *, page: int, R: int, ilv: int, vr: int = 1) -> int:
     """The A0-10 pool guard (stageA/a0/RESULTS.md §8): step_init opens a new DSA wave only when the pool is already
     non-empty, so ONE request with more rank-0 pages than `Tiles.pool` overflows b_keys / b_blk (UB, no in-kernel
     check). vLLM never schedules seq > max_model_len and rank0_pages is non-decreasing in seq, so bounding a
     max_model_len request at load time bounds every step. -> that page count; raises Unsupported (no megakernel)."""
-    need = rank0_pages(max_model_len, page=page, R=R, ilv=ilv)
+    need = rank0_pages(max_model_len, page=page, R=R, ilv=ilv, vr=vr)
     for t, pool in pools.items():
         _need(
             need <= int(pool),
@@ -264,14 +267,19 @@ def q_b_local(
       kernel, its operands and its HBM stream are those of qrep 0.
 
     weight: either orientation ([QL, N] flipped, or [N, QL]); scale: per-channel, N elements. The served N must be
-    the form `qrep` names (HR*DQ for qrep 0, NH*DQ for qrep 1), else Unsupported (no megakernel)."""
-    nqb, nall = cfg.HR * cfg.DQ, cfg.NH * cfg.DQ
+    the form `qrep` names (HR*DQ for qrep 0, NH*DQ for qrep 1), else Unsupported (no megakernel).
+
+    V16 (DCP = R / 2, stageB/v16/DESIGN-ADDENDUM.md): the q group is the DCP group (D ranks, rank_in_group = rank % D)
+    and the replicated weight holds that group's D * HR heads in head order (lane rank // D holds heads
+    [lane * D * HR, (lane + 1) * D * HR)); rank r's column-parallel heads [r * HR, (r + 1) * HR) are the group's heads
+    [(r % D) * HR, +HR): columns [(r % D) * HR * DQ, +HR * DQ)."""
+    nqb, nall = cfg.HR * cfg.DQ, cfg.HR * cfg.D * cfg.DQ
     want = nall if qrep else nqb
     n = weight.numel() // cfg.QL
     _need(
         n == want and n * cfg.QL == weight.numel(),
         f"q_b_proj {tuple(weight.shape)}: want N {want} "
-        + ("(qrep 1: all NH heads)" if qrep else "(qrep 0: this rank's HR heads)"),
+        + ("(qrep 1: the q group's D * HR heads)" if qrep else "(qrep 0: this rank's HR heads)"),
     )
     _need(
         scale.numel() == n, f"q_b scale {tuple(scale.shape)} is not per-channel [{n}]"
@@ -279,7 +287,7 @@ def q_b_local(
     s = scale.reshape(-1).float()
     if not qrep:
         return _kn(weight, cfg.QL, n, "q_b_proj"), s
-    c0 = rank * nqb
+    c0 = (rank % cfg.D) * nqb
     if tuple(weight.shape) == (cfg.QL, n):
         w = weight[:, c0 : c0 + nqb]
     else:
@@ -292,18 +300,20 @@ def q_b_local(
     return _kn(w, cfg.QL, nqb, "q_b_proj (qrep slice)"), s[c0 : c0 + nqb]
 
 
-def qrep_layer(q_b_proj, R: int, tp_rank: int, layer: int) -> bool:
+def qrep_layer(q_b_proj, R: int, tp_rank: int, layer: int, dcp: int | None = None) -> bool:
     """Is this layer's q_b_proj replicated (vLLM sets `qrep_active` on DCPGroupColumnParallelLinear)? Accepted only
-    over a q group that is the whole TP = DCP world in rank order (group_size R, rank_in_group = this TP rank): then
-    the replicated weight is sliceable to this rank's column-parallel heads (`q_b_local`). Anything else raises."""
+    over a q group that is the DCP group in rank order (group_size = DCP, rank_in_group = this TP rank % DCP; at
+    DCP = TP that is the whole world): then the replicated weight is sliceable to this rank's column-parallel heads
+    (`q_b_local`). Anything else raises."""
     if not bool(getattr(q_b_proj, "qrep_active", False)):
         return False
+    D = int(dcp or R)
     gs = int(getattr(q_b_proj, "group_size", 0) or 0)
     rig = int(getattr(q_b_proj, "rank_in_group", -1))
     _need(
-        gs == R and rig == tp_rank,
+        gs == D and rig == tp_rank % D,
         f"layer {layer}: q_b_proj is replicated (qrep_active) over a q group of {gs} at rank_in_group {rig}; the "
-        f"megakernel slices this rank's heads only from a group = the TP = DCP world ({R}, rank {tp_rank})",
+        f"megakernel slices this rank's heads only from a group = the DCP group ({D}, rank {tp_rank % D})",
     )
     return True
 
@@ -527,7 +537,7 @@ def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups, stacked=False):
 
     call, info = K.build(
         cfg,
-        max_pages=max_pages,
+        max_pages=W.kernel_pages(cfg, max_pages),
         nb=nb,
         nbi=nbi,
         tiles=tiles,
@@ -536,7 +546,7 @@ def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups, stacked=False):
     )
     writer, winfo = build_writer(
         cfg, max_pages=max_pages, nb=nb, nbi=nbi, groups=groups
-    )
+    )  # the writer takes the FULL local tables (V16: the replica writes every token of its shard)
     assert len(info["c_names"]) == len(winfo["c_names"])
     n_d, n_e, n_c = len(info["dkinds"]), len(info["e_names"]), len(info["c_names"])
     TMAX = cfg.TMAX
@@ -555,6 +565,9 @@ def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups, stacked=False):
         scal, rmeta, qmeta, bt, bti, rvec = W.metadata(
             cfg, TMAX, pos, seq, qsl, btv, nb, nbi, max_pages, r
         )
+        wbt, wbti = bt, bti
+        if cfg.VR > 1:  # V16: this replica's half tables for the megakernel
+            bt, bti = W.v16_tables(cfg, bt, bti, r)
         tab = W.rope_table(cfg, csr)
         c1 = (
             list(cs) if stacked else [c[None] for c in cs]
@@ -576,7 +589,7 @@ def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups, stacked=False):
             *c1,
         )
         out, nrow, rrow, irec = outs[:4]
-        new = writer(scal, rmeta, bt, bti, nrow, rrow, irec, *c1)
+        new = writer(scal, rmeta, wbt, wbti, nrow, rrow, irec, *c1)
         return (out, *(new if stacked else [c[0] for c in new]))
 
     smap = jax.shard_map(
@@ -620,11 +633,11 @@ class Glm52DecodeMK:
         )
         dcp = int(getattr(pc, "decode_context_parallel_size", 1))
         _need(
-            dcp == R,
-            f"DCP {dcp} != TP {R}: the megakernel is built and verified for DCP = TP = {R} only (its DCP KV "
-            "ownership, q all-gather and A2A merge span the whole TP group; a smaller DCP group is a kernel change, "
-            f"not an adapter one). Serve it with DECODE_CONTEXT_PARALLEL_SIZE={R}",
+            dcp in (R, R // 2),
+            f"DCP {dcp}: the megakernel is built for DCP = TP = {R} or, as V16 (virtual DCP {R} on the DCP {R // 2} "
+            f"cache: the two replicas of each DCP shard split it by page parity), DCP = {R // 2}",
         )
+        self.dcp = dcp
         _need(dist.is_initialized() and dist.get_world_size() == R, "world != TP")
         _need(
             int(getattr(pc, "cp_kv_cache_interleave_size", 1)) == FULL.ILV,
@@ -636,7 +649,7 @@ class Glm52DecodeMK:
         )
         # qrep is judged per layer below (q_b_proj.qrep_active), not from parallel_config.dcp_q_replicate: vLLM's GLM
         # config hook sets that field True even when VLLM_DCP_Q_REPLICATE=0 turns runtime q-replication off.
-        self.rank_layout = self._check_rank_layout(R)
+        self.rank_layout = self._check_rank_layout(R, dcp)
         spec = runner.speculative_config
         _need(spec is not None and getattr(spec, "method", "") == "mtp", "MTP is off")
         qmax = 1 + int(spec.num_speculative_tokens)
@@ -685,6 +698,7 @@ class Glm52DecodeMK:
             TMAX=self.rows[-1],
             BM=int(runner.scheduler_config.max_num_seqs),
             rope_neox=rope_neox,
+            DCP=0 if dcp == R else dcp,
         )
         for got, want, what in (
             (hf.kv_lora_rank, base.KL, "kv_lora_rank"),
@@ -721,7 +735,7 @@ class Glm52DecodeMK:
             l
             for l in range(L)
             if qrep_layer(
-                bb.layers[l].self_attn.q_b_proj, R, int(self.rank_layout["tp"]), l
+                bb.layers[l].self_attn.q_b_proj, R, int(self.rank_layout["tp"]), l, dcp
             )
         ]
         self.rank = int(dist.get_rank())
@@ -739,7 +753,7 @@ class Glm52DecodeMK:
 
         self.mesh = get_pallas_mesh(axis_names=(AXIS,), mesh_shape=(R,))
         mml = int(runner.model_config.max_model_len)
-        self.max_pages = -(-mml // (cfg.page * R))
+        self.max_pages = -(-mml // (cfg.page * dcp))  # full local tables (V16: the kernel takes half of them)
         rot = bb.layers[0].self_attn.rotary_emb
         _need(rot.cos_sin_cache.shape[-1] == cfg.DR, "rope cache width")
         with torch.no_grad():
@@ -775,8 +789,9 @@ class Glm52DecodeMK:
             mml,
             {t: tl.pool for t, tl in self.tiles_by_rows.items()},
             page=cfg.page,
-            R=R,
+            R=dcp,
             ilv=cfg.ILV,
+            vr=cfg.VR,
         )
         self.caches = None
         self._steps = {}
@@ -785,7 +800,7 @@ class Glm52DecodeMK:
         logger.info(
             "GLM-5.2 decode megakernel: built for rows %s, L %d (fresh indexer layers %s, freq %d skip %d), "
             "rope cache rows %d (max_model_len %d), k_scales %s, trace %s, enabled %s, levers %s, rope %s, "
-            "q_b %s",
+            "q_b %s, dcp %s",
             self.rows,
             cfg.L,
             LY.layers_of(cfg, "iwq"),
@@ -801,25 +816,35 @@ class Glm52DecodeMK:
             f"qrep 1 (this rank's heads sliced, {len(self.qrep_layers)}/{cfg.L} layers)"
             if self.qrep_layers
             else "qrep 0 (column-parallel)",
+            f"{dcp} (V16-p: virtual DCP {R} on the DCP {dcp} cache, page-parity replica split)"
+            if cfg.VR > 1
+            else f"{dcp} (= TP)",
         )
 
     @staticmethod
-    def _check_rank_layout(R: int) -> dict:
+    def _check_rank_layout(R: int, dcp: int | None = None) -> dict:
         """The megakernel addresses peers and owns DCP KV positions by its mesh position, which get_pallas_mesh
         numbers by torch rank (distributed/dcp.py), and takes the rank as an operand: all of that is the stock DCP
-        ownership only when the DCP group and the TP group are both ranks 0..R-1 in rank order."""
+        ownership only when the TP group is ranks 0..R-1 in rank order and the DCP group is the rank's block of dcp
+        consecutive ranks (dcp = R: the same group; V16 dcp = R / 2: {0..D-1}, {D..R-1}) with rank_in_group = rank % dcp
+        (distributed/dcp.py: global_rank == lane * dcp + dcp_rank)."""
         import torch.distributed as dist
         from vllm.distributed import parallel_state as ps
 
+        D = int(dcp or R)
         rank = int(dist.get_rank())
         out = {"rank": rank}
-        for name, get in (("tp", ps.get_tp_group), ("dcp", ps.get_dcp_group)):
+        for name, get, n in (("tp", ps.get_tp_group, R), ("dcp", ps.get_dcp_group, D)):
             g = get()
             ranks = tuple(int(x) for x in g.ranks)
-            _need(ranks == tuple(range(R)), f"{name} group ranks {ranks} != 0..{R - 1}")
+            lo = rank // n * n
             _need(
-                int(g.rank_in_group) == rank,
-                f"{name} rank_in_group {g.rank_in_group} != rank {rank}",
+                ranks == tuple(range(lo, lo + n)),
+                f"{name} group ranks {ranks} != {lo}..{lo + n - 1}",
+            )
+            _need(
+                int(g.rank_in_group) == rank % n,
+                f"{name} rank_in_group {g.rank_in_group} != rank % {n} = {rank % n}",
             )
             out[name] = int(g.rank_in_group)
         return out
@@ -1566,6 +1591,8 @@ class Glm52DecodeMK:
             "n_caches": len(self.caches or []),
             "nb": getattr(self, "nb", None),
             "max_pages": self.max_pages,
+            "dcp": getattr(self, "dcp", None),
+            "v16": self.cfg.VR > 1,
             "pool_pages": getattr(self, "pool_pages", None),
             "trace": self.tiles.trace,
             "levers": list(self.levers),

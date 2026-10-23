@@ -329,7 +329,7 @@ def load_env(monkeypatch):
     monkeypatch.setattr(
         Glm52DecodeMK,
         "_check_rank_layout",
-        staticmethod(lambda R: {"rank": 0, "tp": 0, "dcp": 0}),
+        staticmethod(lambda R, dcp=None: {"rank": 0, "tp": 0, "dcp": 0}),
     )
 
 
@@ -366,11 +366,11 @@ def test_load_guard_refuses_qrep_group_not_the_world(load_env, qrep_layers, q_gr
     assert Glm52DecodeMK.maybe_create(runner) is None  # logged, stock forever
 
 
-@pytest.mark.parametrize("dcp", [8, 4, 1])
+@pytest.mark.parametrize("dcp", [4, 2, 1])
 def test_load_guard_refuses_dcp_not_tp_with_a_clear_reason(load_env, dcp, monkeypatch):
-    # the best served config's DECODE_CONTEXT_PARALLEL_SIZE=8 stays refused (DCP8 is a kernel project), loudly
+    # DCP 16 (= TP) and DCP 8 (V16) build; any other DCP is refused, loudly
     with pytest.raises(
-        Unsupported, match=rf"DCP {dcp} != TP 16: .*DECODE_CONTEXT_PARALLEL_SIZE=16"
+        Unsupported, match=rf"DCP {dcp}: the megakernel is built for DCP = TP = 16 or, as V16 .*DCP = 8"
     ):
         Glm52DecodeMK(_glm52_runner(dcp=dcp))
     warned = []
@@ -378,7 +378,20 @@ def test_load_guard_refuses_dcp_not_tp_with_a_clear_reason(load_env, dcp, monkey
     assert Glm52DecodeMK.maybe_create(_glm52_runner(dcp=dcp, qrep_layers=(0,))) is None
     assert len(warned) == 1, warned
     assert "disabled (not built; every step runs the stock graphs)" in warned[0]
-    assert f"DCP {dcp} != TP 16" in warned[0]
+    assert f"DCP {dcp}: the megakernel is built for" in warned[0]
+
+
+@pytest.mark.parametrize("qrep_layers", [(), (0,), tuple(range(C.FULL.L))])
+def test_load_guard_accepts_dcp8_v16(load_env, qrep_layers):
+    # the best served config's DECODE_CONTEXT_PARALLEL_SIZE=8 (+ VLLM_DCP_Q_REPLICATE=1: q group = the DCP8 group,
+    # rank_in_group = rank % 8 = 0 for the stubbed rank 0) builds as V16
+    with pytest.raises(_PastLoadGuards):
+        Glm52DecodeMK(_glm52_runner(dcp=8, qrep_layers=qrep_layers, q_group=8))
+
+
+def test_load_guard_refuses_dcp8_with_a_world_q_group(load_env):
+    with pytest.raises(Unsupported, match=r"q group of 16 at rank_in_group 0"):
+        Glm52DecodeMK(_glm52_runner(dcp=8, qrep_layers=(0,), q_group=16))
 
 
 def test_load_guard_does_not_read_the_config_qrep_field():
