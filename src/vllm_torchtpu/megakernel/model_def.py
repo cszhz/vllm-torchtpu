@@ -21,11 +21,10 @@ from typing import Any, ClassVar
 import jax
 
 from . import pool
-from .blocks.gdn import GDNBlock
 from .decls import (
-    BlockBinding,
     FrozenDict,
     KVCacheDecl,
+    ModuleBinding,
     RecurrentCacheDecl,
     _sub_cfg,
 )
@@ -38,17 +37,18 @@ from .derive import (
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .geometry import FromHF, LMHead, ModelGeometry, _BoundFromHF
+from .modules.gdn import GDNModule
 from .pool import PoolBackend, PoolLayout
 from .profile import Profile, get_profile, model_default_profile, register_profile
 from .reference import composed_reference_step
 from .schedule import (
-    BlockOrBinding,
     Every,
     FromHFLayerTypes,
+    ModuleOrBinding,
     ResolvedSchedule,
     Schedule,
 )
-from .spec import Block, ModelSpec
+from .spec import ModelSpec, Module
 from .validate import (
     model_label as _model_label,
 )
@@ -71,7 +71,7 @@ class ModelDef:
     geometry: ClassVar[Any] = None
     schedule: ClassVar[Schedule | None] = None
     embed: ClassVar[Any] = None
-    final_norm: ClassVar[BlockOrBinding | None] = None
+    final_norm: ClassVar[ModuleOrBinding | None] = None
     lm_head: ClassVar[LMHead | None] = None
     profiles: ClassVar[Mapping[str, Profile]] = FrozenDict()
     default_hf_config: ClassVar[Mapping[str, Any] | None] = None
@@ -112,11 +112,13 @@ class ModelDef:
 
     @classmethod
     def _find_binding(
-        cls, target_cls: type[Block], sched: ResolvedSchedule
-    ) -> BlockBinding | None:
+        cls, target_cls: type[Module], sched: ResolvedSchedule
+    ) -> ModuleBinding | None:
         for seq in (sched.mixer, sched.ffn):
             for b in seq:
-                if isinstance(b, BlockBinding) and issubclass(b.block_cls, target_cls):
+                if isinstance(b, ModuleBinding) and issubclass(
+                    b.module_cls, target_cls
+                ):
                     return b
         return None
 
@@ -163,7 +165,7 @@ class ModelDef:
         return pool.make_pool_backend(
             cls.pool_layout(g, R=R),
             check=getattr(g, "check", None),
-            rec_chunk=GDNBlock.chunk_rows,
+            rec_chunk=GDNModule.chunk_rows,
         )
 
     @classmethod
@@ -171,16 +173,16 @@ class ModelDef:
         cls,
         hf_config_or_geom: Any = None,
         *,
-        gdn_block: Block | None = None,
+        gdn_module: Module | None = None,
         moe_tp: bool | None = None,
         e_slots: int | None = None,
         R: int = 8,
     ) -> ModelSpec:
-        """Derive `ModelSpec` (`LayerType` + `SwitchSlot`s, deduping shared blocks)."""
+        """Derive `ModelSpec` (`LayerType` + `SwitchSlot`s, deduping shared modules)."""
         return derive_model_spec(
             cls,
             hf_config_or_geom,
-            gdn_block=gdn_block,
+            gdn_module=gdn_module,
             moe_tp=moe_tp,
             e_slots=e_slots,
             R=R,

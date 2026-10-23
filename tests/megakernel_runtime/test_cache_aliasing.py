@@ -82,8 +82,8 @@ def _tiny_exec(
     num_pages: int = 64,
     stack_e: bool = False,
 ) -> ExecSpec:
-    tiles = replace(TINY_TILES, bank=512 << 10).with_blocks(
-        {"gqa": {"kv_blk": min(TINY_TILES.block("gqa").kv_blk, ctx)}}
+    tiles = replace(TINY_TILES, bank=512 << 10).with_modules(
+        {"gqa": {"kv_blk": min(TINY_TILES.module("gqa").kv_blk, ctx)}}
     )
     return ExecSpec(
         R=R,

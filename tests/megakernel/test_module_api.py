@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit and CPU interpret parity tests for Block API v2 declarations and hooks."""
+"""Unit and CPU interpret parity tests for Module API declarations and hooks."""
 
 from __future__ import annotations
 
@@ -35,13 +35,13 @@ from vllm_torchtpu.megakernel import (
     Embedding,
     ExecSpec,
     FrozenDict,
-    GDNBlock,
-    GQABlock,
+    GDNModule,
+    GQAModule,
     KVCacheDecl,
     LayerType,
     MegakernelConfigError,
     ModelSpec,
-    MoEBlock,
+    MoEModule,
     Norm,
     ParamTransform,
     PoolLayout,
@@ -51,13 +51,13 @@ from vllm_torchtpu.megakernel import (
     kernel,
     planner,
 )
-from vllm_torchtpu.megakernel.blocks.gqa import GQATunables
-from vllm_torchtpu.megakernel.blocks.transforms import apply_hf_transforms
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.models.qwen35_pool import (
     qwen35_layer_cache_decls,
     qwen35_pool_layout,
 )
+from vllm_torchtpu.megakernel.modules.gqa import GQATunables
+from vllm_torchtpu.megakernel.modules.transforms import apply_hf_transforms
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rmsnorm, rnd, rup
 from vllm_torchtpu.megakernel.pool.config import resolved_max_pages_per_seq
 from vllm_torchtpu.megakernel.spec import combined_hf_param_shapes
@@ -93,16 +93,16 @@ def _cpu_mesh(R: int) -> jax.sharding.Mesh:
     return jax.sharding.Mesh(np.array(devs[:R]), ("tp",))
 
 
-def test_derive_qwen35_pool_layout_from_block_cache_decls():
+def test_derive_qwen35_pool_layout_from_module_cache_decls():
     """`derive_pool_layout` derives pool grouping and page counts from layer decls."""
     for g in (
         qwen35.FULL,
         qwen35.TINY,
         dataclasses.replace(qwen35.TINY, att_every=1),
     ):
-        gqa = GQABlock(geometry=g)
-        gdn = GDNBlock(geometry=g)
-        moe = MoEBlock(geometry=g)
+        gqa = GQAModule(geometry=g)
+        gdn = GDNModule(geometry=g)
+        moe = MoEModule(geometry=g)
         norm = Norm("input_layernorm", geometry=g)
         emb = Embedding("model.embed_tokens", geometry=g)
 
@@ -147,10 +147,10 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
         hf_cfg_tp
     )
     final_norm_blk = Norm.bind("model.norm", zero_centered=True).resolve(hf_cfg_tp)
-    gqa_blk = GQABlock.bind("self_attn").resolve(hf_cfg_tp)
-    gdn_blk = GDNBlock.bind("linear_attn").resolve(hf_cfg_tp)
-    moe_blk_tp = MoEBlock.bind("mlp", moe_tp=True).resolve(hf_cfg_tp)
-    moe_blk_ep = MoEBlock.bind("mlp", moe_tp=False).resolve(hf_cfg_tp)
+    gqa_blk = GQAModule.bind("self_attn").resolve(hf_cfg_tp)
+    gdn_blk = GDNModule.bind("linear_attn").resolve(hf_cfg_tp)
+    moe_blk_tp = MoEModule.bind("mlp", moe_tp=True).resolve(hf_cfg_tp)
+    moe_blk_ep = MoEModule.bind("mlp", moe_tp=False).resolve(hf_cfg_tp)
 
     # Check real HF checkpoint names, shapes, hf_shapes, and derived pads.
     gqa_by_name = {d.name: d for d in gqa_blk.hf_params("self_attn")}
@@ -172,7 +172,7 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
     assert gdn_by_name["dtb"].transform.pad is None
     assert gdn_by_name["conv"].transform.transpose is None
 
-    # Every canonical parameter in every block is covered by at least one VLLMAlias.
+    # Every canonical parameter in every module is covered by at least one VLLMAlias.
     for blk, sub in (
         (in_norm_blk, "input_layernorm"),
         (gqa_blk, "self_attn"),
@@ -202,7 +202,7 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
     ex = ExecSpec(R=2, B=2, T=1, ctx=128)
     for g_case in (qwen35.TINY, qwen35.TINY_EP):
         hf_cfg_case = _make_mock_hf_config(g_case)
-        moe_blk_case = MoEBlock.bind("mlp", moe_tp=g_case.moe_tp).resolve(hf_cfg_case)
+        moe_blk_case = MoEModule.bind("mlp", moe_tp=g_case.moe_tp).resolve(hf_cfg_case)
         rep_decls = (
             in_norm_blk.hf_params("input_layernorm")
             + gqa_blk.hf_params("self_attn")
@@ -270,24 +270,24 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
         )
 
 
-def test_block_bind_resolve_validation_and_fail_closed():
+def test_module_bind_resolve_validation_and_fail_closed():
     """Test fail-closed options, field/rename/transforms validation, and deepcopy."""
     g = qwen35.TINY
     hf_cfg = _make_mock_hf_config(g)
 
     # 1. Fail-closed on unimplemented options, MoE mismatch, and conv_kernel != 4
     with pytest.raises(MegakernelConfigError, match="qk_norm=True"):
-        GQABlock.bind("self_attn", qk_norm=False)
+        GQAModule.bind("self_attn", qk_norm=False)
     with pytest.raises(MegakernelConfigError, match="output_gate=True"):
-        GQABlock(output_gate=False)
+        GQAModule(output_gate=False)
     with pytest.raises(MegakernelConfigError, match="shared_gate=True"):
-        MoEBlock.bind("mlp", shared_gate=False)
+        MoEModule.bind("mlp", shared_gate=False)
     with pytest.raises(MegakernelConfigError, match="conv_kernel == 4"):
-        GDNBlock.bind("linear_attn", conv_kernel=3).resolve(hf_cfg)
+        GDNModule.bind("linear_attn", conv_kernel=3).resolve(hf_cfg)
     with pytest.raises(MegakernelConfigError, match="disagrees with geometry moe_tp"):
-        MoEBlock(geometry=qwen35.TINY_EP, moe_tp=True)
+        MoEModule(geometry=qwen35.TINY_EP, moe_tp=True)
     with pytest.raises(MegakernelConfigError, match="disagrees with geometry e_slots"):
-        MoEBlock(
+        MoEModule(
             geometry=dataclasses.replace(qwen35.TINY_EP, e_slots=72),
             moe_tp=False,
             e_slots=0,
@@ -295,21 +295,21 @@ def test_block_bind_resolve_validation_and_fail_closed():
 
     # 2. Explicit HF config key must exist (no silent fallback to default key)
     with pytest.raises(ValueError, match="num_attn_heads_typo"):
-        GQABlock.bind("self_attn", heads="num_attn_heads_typo").resolve(hf_cfg)
+        GQAModule.bind("self_attn", heads="num_attn_heads_typo").resolve(hf_cfg)
 
     # 3. Unknown/colliding rename or transforms keys raise ValueError; overrides apply
     with pytest.raises(ValueError, match="unknown rename key"):
-        GQABlock.bind("self_attn", rename={"nonexistent": "foo"})
+        GQAModule.bind("self_attn", rename={"nonexistent": "foo"})
     with pytest.raises(ValueError, match="rename target collision"):
-        GQABlock.bind("self_attn", rename={"q_proj": "k_proj"})
+        GQAModule.bind("self_attn", rename={"q_proj": "k_proj"})
     with pytest.raises(ValueError, match="rename target collision"):
-        GQABlock.bind("self_attn", rename={"q_proj": "dup_w", "k_proj": "dup_w"})
+        GQAModule.bind("self_attn", rename={"q_proj": "dup_w", "k_proj": "dup_w"})
     with pytest.raises(ValueError, match="unknown transforms key"):
-        GQABlock.bind("self_attn", transforms={"nonexistent": {"shard_axis": 0}})
+        GQAModule.bind("self_attn", transforms={"nonexistent": {"shard_axis": 0}})
     with pytest.raises(ValueError, match="unknown fields"):
-        GQABlock.bind("self_attn", transforms={"q_proj": {"bad_field": 1}})
+        GQAModule.bind("self_attn", transforms={"q_proj": {"bad_field": 1}})
 
-    gqa_custom = GQABlock.bind(
+    gqa_custom = GQAModule.bind(
         "self_attn",
         rotary_dim=32,
         rename={"q_proj": "custom_q"},
@@ -319,7 +319,7 @@ def test_block_bind_resolve_validation_and_fail_closed():
     custom_decls = {d.name: d for d in gqa_custom.hf_params()}
     assert "custom_q" in custom_decls
     assert custom_decls["custom_q"].transform == dataclasses.replace(
-        GQABlock.bind("self_attn").resolve(hf_cfg).hf_params()[0].transform,
+        GQAModule.bind("self_attn").resolve(hf_cfg).hf_params()[0].transform,
         shard_axis=None,
     )
 
@@ -332,7 +332,7 @@ def test_block_bind_resolve_validation_and_fail_closed():
         num_key_value_heads=2,
         rope_theta=10000.0,
     )
-    resolved_minimal = GQABlock.bind("self_attn").resolve(minimal_att_cfg)
+    resolved_minimal = GQAModule.bind("self_attn").resolve(minimal_att_cfg)
     assert resolved_minimal.HD == 64
     assert resolved_minimal.ROT == 64
     nested_rope_cfg = SimpleNamespace(
@@ -343,11 +343,11 @@ def test_block_bind_resolve_validation_and_fail_closed():
             rope_parameters={"rope_theta": 500000.0, "partial_rotary_factor": 0.5},
         )
     )
-    resolved_nested = GQABlock.bind("self_attn").resolve(nested_rope_cfg)
+    resolved_nested = GQAModule.bind("self_attn").resolve(nested_rope_cfg)
     assert resolved_nested.theta == 500000.0
     assert resolved_nested.ROT == 32
     with pytest.raises(ValueError, match="theta"):
-        GQABlock.bind("self_attn").resolve(
+        GQAModule.bind("self_attn").resolve(
             SimpleNamespace(
                 hidden_size=512, num_attention_heads=8, num_key_value_heads=2
             )
@@ -391,8 +391,8 @@ def test_block_bind_resolve_validation_and_fail_closed():
     spec = qwen35.qwen35_spec(qwen35.TINY)
     spec_copied = copy.deepcopy(spec)
     assert spec_copied.name == spec.name
-    assert len(spec_copied.all_blocks()) == len(spec.all_blocks())
-    binding = GQABlock.bind("self_attn", rename={"q_proj": "custom_q"})
+    assert len(spec_copied.all_modules()) == len(spec.all_modules())
+    binding = GQAModule.bind("self_attn", rename={"q_proj": "custom_q"})
     assert pickle.loads(pickle.dumps(binding)) == binding
     assert hash(binding) == hash(copy.deepcopy(binding))
     assert pickle.loads(pickle.dumps(gqa_custom)) == gqa_custom
@@ -404,10 +404,10 @@ def test_block_bind_resolve_validation_and_fail_closed():
     assert fd1 == {"a": [1, {"x": [2, 3]}], "b": 4}
     assert fd1.__eq__(42) is NotImplemented
     assert hash(fd1) == hash(fd2)
-    assert dict(MoEBlock().options) == {"shared_gate": True}
+    assert dict(MoEModule().options) == {"shared_gate": True}
 
 
-def _pack_single_block_step_inputs(
+def _pack_single_module_step_inputs(
     spec: ModelSpec,
     g: qwen35.Qwen35Geometry,
     ex: ExecSpec,
@@ -461,7 +461,7 @@ def _pack_single_block_step_inputs(
         if sm_key in logical_weights:
             set_sm(sm_key, logical_weights[sm_key])
 
-    blk_names = {b.name for b in spec.all_blocks()}
+    blk_names = {b.name for b in spec.all_modules()}
     if "gqa" in blk_names:
         set_sm("in_s", logical_weights["att_in_s"])
         set_sm("out_s", logical_weights["att_out_s"])
@@ -554,13 +554,13 @@ _TINY_STEP_TILES = Tiles(
     nbe=8,
     ebank=512 << 10,
     vmem_mib=64,
-    blocks={"gqa": GQATunables(kv_blk=128, nkv=1)},
+    modules={"gqa": GQATunables(kv_blk=128, nkv=1)},
 )
 
 
 @dataclasses.dataclass(frozen=True)
 class _SingleLayerGDNGeometry(qwen35.Qwen35Geometry):
-    """1-layer GDN-only geometry for isolated `GDNBlock` step testing."""
+    """1-layer GDN-only geometry for isolated `GDNModule` step testing."""
 
     @property
     def NGDN(self) -> int:
@@ -576,8 +576,8 @@ class _SingleLayerGDNGeometry(qwen35.Qwen35Geometry):
 
 @pytest.mark.parametrize("paged_kv", [False, True])
 @pytest.mark.parametrize("T", [1, 2])
-def test_gqa_block_reference_matches_kernel_make_step_cpu(T: int, paged_kv: bool):
-    """`GQABlock.reference` matches `kernel.make_step` on a 1-block attention model."""
+def test_gqa_module_reference_matches_kernel_make_step_cpu(T: int, paged_kv: bool):
+    """`GQAModule.reference` matches `kernel.make_step` on a 1-module GQA model."""
     g = dataclasses.replace(qwen35.TINY, L=1, att_every=1)
     cache_cfg = (
         CacheExec(paged_kv=True, num_pages=64)
@@ -592,7 +592,7 @@ def test_gqa_block_reference_matches_kernel_make_step_cpu(T: int, paged_kv: bool
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
         jax.random.PRNGKey(10 + T), g, ex
     )
-    gqa_blk = GQABlock(geometry=g)
+    gqa_blk = GQAModule(geometry=g)
     in_norm_blk = Norm(
         "input_layernorm", geometry=g, zero_centered=g.zero_centered_norm
     )
@@ -620,7 +620,7 @@ def test_gqa_block_reference_matches_kernel_make_step_cpu(T: int, paged_kv: bool
         layer_type=LayerType(name="gqa_only", slots=(gqa_blk,)),
         cache_backend=qwen35.qwen35_pool.qwen35_pool_backend(g) if paged_kv else None,
     )
-    pos_mk, hid_mk, w_mk, st_mk = _pack_single_block_step_inputs(
+    pos_mk, hid_mk, w_mk, st_mk = _pack_single_module_step_inputs(
         spec, g, ex, pos, hid_l, w_l, st_l, mesh
     )
     step, _ = kernel.make_step(mesh, spec, ex)
@@ -668,8 +668,8 @@ def test_gqa_block_reference_matches_kernel_make_step_cpu(T: int, paged_kv: bool
 
 
 @pytest.mark.parametrize("T", [1, 2])
-def test_gdn_block_reference_matches_kernel_make_step_cpu(T: int):
-    """`GDNBlock.reference` matches `kernel.make_step` on a 1-block GDN model."""
+def test_gdn_module_reference_matches_kernel_make_step_cpu(T: int):
+    """`GDNModule.reference` matches `kernel.make_step` on a 1-module GDN model."""
     ex = ExecSpec(R=2, B=2, T=T, ctx=128, interpret=True, tiles=_TINY_STEP_TILES)
     mesh = _cpu_mesh(ex.R)
 
@@ -709,7 +709,7 @@ def test_gdn_block_reference_matches_kernel_make_step_cpu(T: int):
         "conv": st_l4["conv"][:, :1],
         "rec": st_l4["rec"][:, :1],
     }
-    gdn_blk = GDNBlock(geometry=g)
+    gdn_blk = GDNModule(geometry=g)
     in_norm_blk = Norm(
         "input_layernorm", geometry=g, zero_centered=g.zero_centered_norm
     )
@@ -735,7 +735,7 @@ def test_gdn_block_reference_matches_kernel_make_step_cpu(T: int):
         config=g,
         layer_type=LayerType(name="gdn_only", slots=(gdn_blk,)),
     )
-    pos_mk, hid_mk, w_mk, st_mk = _pack_single_block_step_inputs(
+    pos_mk, hid_mk, w_mk, st_mk = _pack_single_module_step_inputs(
         spec, g, ex, pos, hid_l, w_l, st_l, mesh
     )
     step, _ = kernel.make_step(mesh, spec, ex)
@@ -747,7 +747,7 @@ def test_gdn_block_reference_matches_kernel_make_step_cpu(T: int):
     for r in range(ex.R):
         np.testing.assert_allclose(mk_hid_ranks[r], ref_out_np, atol=2e-2, rtol=2e-2)
 
-    lay_gdn = GDNBlock.lin_in_layout(g, ex)
+    lay_gdn = GDNModule.lin_in_layout(g, ex)
     rec_key = "rec_ckpt" if ex.VER else "rec"
     conv_key = "conv_ckpt" if ex.VER else "conv"
     rec_mk = np.asarray(
@@ -763,14 +763,14 @@ def test_gdn_block_reference_matches_kernel_make_step_cpu(T: int):
 
 
 @pytest.mark.parametrize("moe_tp", [True, False])
-def test_moe_block_reference_matches_kernel_make_step_cpu(moe_tp: bool):
-    """`MoEBlock.reference` matches `kernel.make_step` on a 1-block MoE model."""
+def test_moe_module_reference_matches_kernel_make_step_cpu(moe_tp: bool):
+    """`MoEModule.reference` matches `kernel.make_step` on a 1-module MoE model."""
     g = dataclasses.replace(qwen35.TINY, L=1, att_every=1, moe_tp=moe_tp)
     ex = ExecSpec(R=2, B=2, T=1, ctx=128, interpret=True, tiles=_TINY_STEP_TILES)
     mesh = _cpu_mesh(ex.R)
 
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.PRNGKey(30), g, ex)
-    moe_blk = MoEBlock(geometry=g, moe_tp=moe_tp)
+    moe_blk = MoEModule(geometry=g, moe_tp=moe_tp)
     post_norm_blk = Norm(
         "post_attention_layernorm", geometry=g, zero_centered=g.zero_centered_norm
     )
@@ -794,7 +794,7 @@ def test_moe_block_reference_matches_kernel_make_step_cpu(moe_tp: bool):
         config=g,
         layer_type=LayerType(name="moe_only", slots=(moe_blk,)),
     )
-    pos_mk, hid_mk, w_mk, st_mk = _pack_single_block_step_inputs(
+    pos_mk, hid_mk, w_mk, st_mk = _pack_single_module_step_inputs(
         spec, g, ex, pos, hid_l, w_l, st_l, mesh
     )
     step, _ = kernel.make_step(mesh, spec, ex)
@@ -806,6 +806,6 @@ def test_moe_block_reference_matches_kernel_make_step_cpu(moe_tp: bool):
     for r in range(ex.R):
         max_diff = float(np.max(np.abs(mk_hid_ranks[r] - ref_out_np)))
         assert max_diff < 2e-2, (
-            f"MoE kernel vs block.reference rank {r} (moe_tp={moe_tp}) "
+            f"MoE kernel vs module.reference rank {r} (moe_tp={moe_tp}) "
             f"max_diff={max_diff}"
         )

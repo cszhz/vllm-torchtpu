@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for `GQABlock` declarations and Pallas `interpret=True` execution."""
+"""Unit tests for `GQAModule` declarations and Pallas `interpret=True` execution."""
 
 from __future__ import annotations
 
@@ -24,20 +24,20 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.megakernel import comm, planner, stream, vmem
-from vllm_torchtpu.megakernel.blocks import GQABlock, MoEBlock
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.modules import GQAModule, MoEModule
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 
-_TINY_GQA_TILES = TINY_TILES.with_blocks({"gqa": {"kv_blk": 256, "nkv": 3}})
+_TINY_GQA_TILES = TINY_TILES.with_modules({"gqa": {"kv_blk": 256, "nkv": 3}})
 
 
-def test_gqa_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
-    """Verify `GQABlock` declarations drive `planner`/`vmem` and `emit` in Pallas."""
+def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
+    """Verify `GQAModule` declarations drive `planner`/`vmem` and `emit` in Pallas."""
     fake_ex = dataclasses.replace(fake_ex, tiles=_TINY_GQA_TILES)
     g_decl = FakeGeometry(L=2, att_every=1, H=256)
-    gqa_decl = GQABlock()
-    moe_decl = MoEBlock()
+    gqa_decl = GQAModule()
+    moe_decl = MoEModule()
     ms_decl = ModelSpec(
         "gqa_moe_test",
         config=g_decl,
@@ -54,7 +54,7 @@ def test_gqa_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
     # GQA scratch allocated, no GDN scratch allocated
     assert "kbuf" in scr_decl and "vbuf" in scr_decl and "wl_cnt" in scr_decl
     assert "recb" not in scr_decl and "sbuf" not in scr_decl and "convb" not in scr_decl
-    assert cp_decl.block("gqa").NAI == (2 * (g_decl.NH // fake_ex.R) + 2) * g_decl.HD
+    assert cp_decl.module("gqa").NAI == (2 * (g_decl.NH // fake_ex.R) + 2) * g_decl.HD
 
     ex = ExecSpec(
         B=4, T=1, R=1, ctx=256, stack_e=True, tiles=_TINY_GQA_TILES, interpret=True
@@ -72,8 +72,8 @@ def test_gqa_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
         IS=128,
         moe_tp=True,
     )
-    gqa = GQABlock()
-    moe = MoEBlock()
+    gqa = GQAModule()
+    moe = MoEModule()
     ms = ModelSpec(
         "gqa_moe_exec", config=g, layer_type=LayerType("lt", slots=(gqa, moe))
     )

@@ -117,7 +117,7 @@ def make_pooled_step(
         pool_gather=use_gpr,
     )
     pb.layout.validate(ex_paged)
-    # Block extra inputs (`Block.extra_inputs`) follow the pool arguments.
+    # Module extra inputs (`Module.extra_inputs`) follow the pool arguments.
     extras = extra_inputs(ms, ex_paged)
     n_extra = len(extras)
     _build_cache: dict[tuple[str, bool, int, bool], tuple[Any, dict[str, Any]]] = {}

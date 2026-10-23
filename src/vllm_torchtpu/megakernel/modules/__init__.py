@@ -11,34 +11,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Composable megakernel building blocks."""
+"""Composable megakernel modules."""
 
 from __future__ import annotations
 
 from .gdn import (
     GDN,
-    GDNBlock,
     GDNLinInLayout,
+    GDNModule,
     GDNParams,
 )
-from .gqa import GQA, GQABlock, GQAParams
-from .moe import MoE, MoEBlock, MoEDebug, MoEParams
-from .norm import Embedding, EmbeddingBlock, Norm, NormBlock
+from .gqa import GQA, GQAModule, GQAParams
+from .moe import MoE, MoEDebug, MoEModule, MoEParams
+from .norm import Embedding, EmbeddingModule, Norm, NormModule
 
 __all__ = [
     "Embedding",
-    "EmbeddingBlock",
+    "EmbeddingModule",
     "GDN",
-    "GDNBlock",
     "GDNLinInLayout",
+    "GDNModule",
     "GDNParams",
     "GQA",
-    "GQABlock",
+    "GQAModule",
     "GQAParams",
     "MoE",
-    "MoEBlock",
     "MoEDebug",
+    "MoEModule",
     "MoEParams",
     "Norm",
-    "NormBlock",
+    "NormModule",
 ]

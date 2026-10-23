@@ -21,8 +21,8 @@ import jax
 import jax.numpy as jnp
 
 from .. import planner
-from ..blocks.gdn import GDNBlock
 from ..exec_spec import ExecSpec
+from ..modules.gdn import GDNModule
 from ..ops import BF16, F32, FP8, I32
 
 
@@ -320,7 +320,7 @@ def split_hf_weights(
 
     # 4. GDN linear attention: [qkv | z | b(64) | a(64)] (NLI=BA+128, A_OFF=BA+64)
     if ngdn > 0:
-        lay_gdn = GDNBlock.lin_in_layout(g, ex)
+        lay_gdn = GDNModule.lin_in_layout(g, ex)
         kh, vh, KD, VD = lay_gdn.kh, lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
         b_pad = lay_gdn.A_OFF - lay_gdn.BA
         a_pad = lay_gdn.NLI - lay_gdn.A_OFF

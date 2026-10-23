@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`GQABlock` geometry, parameter, and KV-cache declarations."""
+"""`GQAModule` geometry, parameter, and KV-cache declarations."""
 
 from __future__ import annotations
 
@@ -20,11 +20,11 @@ from typing import Any
 
 from ...decls import (
     REQUIRED,
-    BlockBinding,
     HFParamDecl,
     KVCacheDecl,
+    ModuleBinding,
     ParamTransform,
-    ResolvedBlockGeometry,
+    ResolvedModuleGeometry,
     VLLMAlias,
     apply_decl_overrides,
 )
@@ -83,18 +83,18 @@ GQA_GEOMETRY_METHODS: dict[str, Any] = {
 def validate_gqa_options(options: Mapping[str, Any]) -> None:
     if not bool(options.get("qk_norm", True)):
         raise MegakernelConfigError(
-            "GQABlock requires qk_norm=True (the kernel always applies q/k RMSNorm)"
+            "GQAModule requires qk_norm=True (the kernel always applies q/k RMSNorm)"
         )
     if not bool(options.get("output_gate", True)):
         raise MegakernelConfigError(
-            "GQABlock requires output_gate=True (the kernel always applies the "
+            "GQAModule requires output_gate=True (the kernel always applies the "
             "sigmoid output gate)"
         )
 
 
 def resolve_gqa_binding(
-    cls: Any, binding: BlockBinding, resolved: ResolvedBlockGeometry
-) -> ResolvedBlockGeometry:
+    cls: Any, binding: ModuleBinding, resolved: ResolvedModuleGeometry
+) -> ResolvedModuleGeometry:
     vals = dict(resolved.values)
     H, NH = int(vals["hidden"]), int(vals["heads"])
     hd_raw = vals.get("head_dim")
@@ -118,8 +118,8 @@ def resolve_gqa_binding(
             "theta": float(vals["theta"]),
         }
     )
-    return ResolvedBlockGeometry(
-        block_cls=cls,
+    return ResolvedModuleGeometry(
+        module_cls=cls,
         prefix=binding.prefix,
         values=vals,
         options=binding.options,
@@ -135,11 +135,11 @@ def gqa_hf_params(
     qk_norm: bool = True,
     output_gate: bool = True,
 ) -> list[HFParamDecl]:
-    """Return canonical (unfused) HF parameter declarations for `GQABlock`."""
+    """Return canonical (unfused) HF parameter declarations for `GQAModule`."""
     p = f"{prefix}." if prefix else ""
     H, NH, NKV, HD = int(geom.H), int(geom.NH), int(geom.NKV), int(geom.HD)
     q_dim = NH * (2 if output_gate else 1) * HD
-    rename = geom.rename if isinstance(geom, ResolvedBlockGeometry) else {}
+    rename = geom.rename if isinstance(geom, ResolvedModuleGeometry) else {}
 
     def _n(canon: str) -> str:
         return rename.get(canon, canon)

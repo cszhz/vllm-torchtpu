@@ -69,12 +69,12 @@ def test_per_bucket_thresholds_come_from_tiles():
     )
     spec = qwen35.qwen35_spec(g)
     for B, rows, want in ((40, 40, True), (48, 40, False), (8, 4, False)):
-        tiles = dataclasses.replace(TINY_TILES, bank=512 << 10).with_blocks(
+        tiles = dataclasses.replace(TINY_TILES, bank=512 << 10).with_modules(
             {"moe": {"moe_group_rows": rows}}
         )
         ex = mk.ExecSpec(B=B, R=2, ctx=256, tiles=tiles, interpret=True)
         plan = mk.planner.plan(spec, ex)
-        assert plan.block_params["moe"].group_rel is want, (B, rows)
+        assert plan.module_params["moe"].group_rel is want, (B, rows)
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +114,7 @@ def test_profile_numerics_are_derived_and_enforced():
 
     # A profile declared exact that turns on an approx feature is rejected.
     def _kv_sub_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
-        return mk.default_tiles(B, R=R).with_blocks({"gqa": {"kv_sub": 1024}})
+        return mk.default_tiles(B, R=R).with_modules({"gqa": {"kv_sub": 1024}})
 
     with pytest.raises(ValueError, match="tiles.gqa.kv_sub"):
         mk.Profile(name="bad-exact", tiles=_kv_sub_rule)
@@ -123,7 +123,7 @@ def test_profile_numerics_are_derived_and_enforced():
 
     # Exact-class changes keep an exact profile exact.
     def _sched_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
-        return mk.default_tiles(B, R=R).with_blocks(
+        return mk.default_tiles(B, R=R).with_modules(
             {"gqa": {"pair_kv": True, "nkv": 4}}
         )
 
@@ -139,7 +139,7 @@ def test_model_profile_without_tiles_inherits_the_model_default_rule(monkeypatch
     )
 
     def _ref_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
-        return mk.default_tiles(B, R=R).with_blocks({"gqa": {"kv_sub": 1024}})
+        return mk.default_tiles(B, R=R).with_modules({"gqa": {"kv_sub": 1024}})
 
     ref = mk.register_profile(
         mk.Profile(
@@ -227,8 +227,8 @@ def _tiny(t: mk.Tiles) -> mk.Tiles:
         nbe=max(6, min(t.nbe, 12)),
         ebank=256 << 10,
         vmem_mib=32,
-    ).with_blocks(
-        {"gqa": {"kv_blk": 256, "kv_sub": 128 if t.block("gqa").kv_sub else 0}}
+    ).with_modules(
+        {"gqa": {"kv_blk": 256, "kv_sub": 128 if t.module("gqa").kv_sub else 0}}
     )
 
 
@@ -302,7 +302,7 @@ def _assert_same(a: list, b: list) -> None:
 def _plan_effect(field: str, g: Any, ex: mk.ExecSpec) -> Any:
     """The plan / scratch parameter an exact tile field controls (None: budget only)."""
     _, info = qwen35.build(g, ex)
-    bp, sp = info["plan"].block_params, info["core_plan"].stream
+    bp, sp = info["plan"].module_params, info["core_plan"].stream
     return {
         "nbd": sp.NBD,
         "gqa.nkv": bp["gqa"].NKV,
@@ -349,7 +349,7 @@ def test_exact_tile_fields_reproduce_model_default(
         assert before != after, (field, before, after)
     if "moe.pipe_ep" in extra:
         _, info = qwen35.build(g1, ex1)
-        assert info["plan"].block_params["moe"].PIPE_EP
+        assert info["plan"].module_params["moe"].PIPE_EP
     ref = _pooled_outputs(_QWEN35_DEFAULT, T=T, B=B, **extra)
     _assert_same(
         _pooled_outputs(_QWEN35_DEFAULT, T=T, B=B, **extra, **{field: value}), ref
@@ -363,7 +363,7 @@ def test_exact_kv_scatter_vec_ns_non_paged():
     g = _geom()
     outs = []
     for ns in (16, 0):
-        tiles = dataclasses.replace(TINY_TILES, bank=512 << 10).with_blocks(
+        tiles = dataclasses.replace(TINY_TILES, bank=512 << 10).with_modules(
             {"gqa": {"kv_scatter_vec_ns": ns}}
         )
         ex = mk.ExecSpec(B=B, T=1, R=R, ctx=256, tiles=tiles, interpret=True)
@@ -386,7 +386,7 @@ def _exact_sched_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
     """Test-only tile rule: the Qwen3.5 baseline plus exact-class schedule changes."""
     return dataclasses.replace(
         baseline_tiles(B, moe_tp=moe_tp, R=R), rel_fetch=True
-    ).with_blocks(
+    ).with_modules(
         {
             "gqa": {"pair_kv": True, "kv_ering": True, "gqa_qv": True, "nkv": 4},
             "moe": {"moe_group_rows": 0},
@@ -589,7 +589,7 @@ def test_exec_spec_pool_gather_values_and_explicit_split():
 
 
 def test_gq_pack_without_gqa_qv_is_config_error():
-    t = _tiny(mk.default_tiles(8, R=2)).with_blocks({"gqa": {"gq_pack": True}})
+    t = _tiny(mk.default_tiles(8, R=2)).with_modules({"gqa": {"gq_pack": True}})
     ex = mk.ExecSpec(
         R=2,
         B=8,

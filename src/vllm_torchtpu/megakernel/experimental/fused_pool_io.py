@@ -13,9 +13,9 @@
 # limitations under the License.
 """Experimental in-kernel fused KV and GDN pool I/O helpers (`CacheExec.FUSED`).
 
-`GQABlock` / `GDNBlock` reach these helpers only through the block hook
+`GQAModule` / `GDNModule` reach these helpers only through the module hook
 (`fused_io_hook.fused_io()`); this module registers itself there on
-import, so the blocks carry no import-time dependency on experimental code.
+import, so the modules carry no import-time dependency on experimental code.
 
 Contract & Aliasing Model (TPU vs. CPU `interpret=True`):
 ---------------------------------------------------------
@@ -28,7 +28,7 @@ aliasing contracts:
    - The pool tuple `ST[pool]` (`pool = POOL_STATE_NAME`) is
      declared `access="r"` on the communicating `pallas_call` (`O[pool]` is
      omitted, and `pallas_call` sets no pool `input_output_aliases`).
-   - Inside the kernel, `ctx.raw_refs = ST[pool]`; `GQABlock` and `GDNBlock`
+   - Inside the kernel, `ctx.raw_refs = ST[pool]`; `GQAModule` and `GDNModule`
      issue async HBM DMA reads and writes directly against `ctx.raw_refs`.
    - The outer `jax.jit` (`donate_argnums` on `raw_pools`) returns the donated
      `raw_pools` input references directly as outputs, so XLA aliases the outer
@@ -41,7 +41,7 @@ aliasing contracts:
 2. **CPU interpret mode (`ex.interpret != False`)**:
    - CPU `interpret=True` does not mutate `access="r"` inputs in-place across the
      `pallas_call` boundary unless aliased to an output.
-   - `GQABlock.outputs` declares `O[pool]` (`access="w"`), `kernel.build`
+   - `GQAModule.outputs` declares `O[pool]` (`access="w"`), `kernel.build`
      aliases `ST[pool] -> O[pool]` in `pallas_call(input_output_aliases=...)`,
      and `ctx.raw_refs = O[pool]`.
 
@@ -100,10 +100,10 @@ def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# GQA Fused Pool I/O (`GQABlock` when `CacheExec.FUSED`)
+# GQA Fused Pool I/O (`GQAModule` when `CacheExec.FUSED`)
 # ---------------------------------------------------------------------------
 def gqa_fused_states(ex: ExecSpec) -> list[StateDecl]:
-    """Extra SMEM state declarations for `GQABlock` when `CacheExec.FUSED`."""
+    """Extra SMEM state declarations for `GQAModule` when `CacheExec.FUSED`."""
     if cache_exec(ex).act_mode == "ref":
         return [
             StateDecl(
@@ -119,7 +119,7 @@ def gqa_fused_states(ex: ExecSpec) -> list[StateDecl]:
 
 
 def gqa_fused_outputs(g: Any, ex: ExecSpec) -> list[StateDecl]:
-    """Output declarations for `GQABlock` when `CacheExec.FUSED`."""
+    """Output declarations for `GQAModule` when `CacheExec.FUSED`."""
     if bool(ex.interpret):
         return [
             StateDecl(
@@ -449,14 +449,14 @@ def gqa_fused_epilogue(ctx: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# GDN Fused Pool I/O (`GDNBlock` when `CacheExec.FUSED`)
+# GDN Fused Pool I/O (`GDNModule` when `CacheExec.FUSED`)
 # ---------------------------------------------------------------------------
 def gdn_fused_scratch(ex: ExecSpec, gp: Any, plan: Any) -> dict[str, Any]:
     """Scratch buffers for in-kernel GDN checkpoint gather/scatter (`CacheExec.FUSED`).
 
     The staged checkpoint pages follow the pool backend's `PoolLayout`
-    (`gp.pool_layout`, checked by `GDNBlock.plan_params`), which also sets the
-    block's slot geometry (`GDN_PAGES` / `REC_PAGES`).
+    (`gp.pool_layout`, checked by `GDNModule.plan_params`), which also sets the
+    module's slot geometry (`GDN_PAGES` / `REC_PAGES`).
     """
     del plan
     page = gp.pool_layout.kv_page_shape

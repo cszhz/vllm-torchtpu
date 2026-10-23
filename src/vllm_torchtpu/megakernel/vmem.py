@@ -57,7 +57,7 @@ class StreamParams:
     branch_segs: tuple[list[tuple[str, int, int, int]], ...]
     t_cycle: int
     T_TOTAL: int
-    block_branch_idx: dict[str, int | None]
+    module_branch_idx: dict[str, int | None]
     lay: dict[str, tuple[int, int]]
     S: int
     typed: bool
@@ -78,9 +78,9 @@ class StreamParams:
             + jnp.maximum(0, rem - c0) * t1
         )
 
-    def block_ord(self, lyr: Any, block_name: str) -> Any:
-        """Return layer index into `block_name` stacked weights at layer `lyr`."""
-        b_idx = self.block_branch_idx.get(block_name)
+    def module_ord(self, lyr: Any, module_name: str) -> Any:
+        """Return layer index into `module_name` stacked weights at layer `lyr`."""
+        b_idx = self.module_branch_idx.get(module_name)
         if b_idx is None or len(self.branch_counts) == 1:
             return lyr
         c_b = self.branch_counts[b_idx]
@@ -149,7 +149,7 @@ class CorePlan:
     plan: Plan
     stream: StreamParams
     comm: CommParams
-    blocks: dict[str, Any]
+    modules: dict[str, Any]
     phase_map: dict[str, str]
     vmem_bytes: int
     vmem_shapes: dict[str, tuple[tuple[int, ...], Any]]
@@ -160,8 +160,8 @@ class CorePlan:
     smem_bytes: int = 0
     smem_shapes: dict[str, tuple[tuple[int, ...], Any]] | None = None
 
-    def block(self, name: str) -> Any:
-        return self.blocks[name]
+    def module(self, name: str) -> Any:
+        return self.modules[name]
 
 
 def _normalize_scratch_reqs(
@@ -177,7 +177,7 @@ def _merge_scratch(
     phase_map: dict[str, str],
     reqs: list[ScratchReq],
 ) -> None:
-    """Merge block `ScratchReq`s into `scratch`, overlaying compatible phases."""
+    """Merge module `ScratchReq`s into `scratch`, overlaying compatible phases."""
     for r in reqs:
         if r.name not in scratch:
             scratch[r.name] = r.spec
@@ -215,7 +215,7 @@ def build_scratch(
     ex: ExecSpec,
     p: Plan | None = None,
 ) -> tuple[CorePlan, dict[str, Any]]:
-    """Build `CorePlan` and allocate all core and block VMEM scratch buffers.
+    """Build `CorePlan` and allocate all core and module VMEM scratch buffers.
 
     `ex.tiles=None` uses the default tiles fitted to the model's VMEM budget,
     as `kernel.build` does (`fit_default_tiles`).
@@ -330,9 +330,9 @@ def build_scratch(
 
     phase_map: dict[str, str] = {k: "persistent" for k in scratch}
 
-    block_plans: dict[str, Any] = dict(p.block_params)
-    for b in model_spec.all_blocks():
-        reqs = _normalize_scratch_reqs(b.scratch(g, ex, p))
+    module_plans: dict[str, Any] = dict(p.module_params)
+    for m in model_spec.all_modules():
+        reqs = _normalize_scratch_reqs(m.scratch(g, ex, p))
         _merge_scratch(scratch, phase_map, reqs)
 
     if typed:
@@ -342,9 +342,9 @@ def build_scratch(
         for k in p.dynamic_kinds:
             scratch["ering_" + k] = pltpu.VMEM((NBE,) + vshape[k], vdtype[k])
             phase_map["ering_" + k] = "persistent"
-        # A block that stages its KV ring in the expert pool (`KVE`) needs the
+        # A module that stages its KV ring in the expert pool (`KVE`) needs the
         # typed pool to hold `(2, HD // 4, 4, BLK)` fp8 KV items.
-        kve = [bp for bp in block_plans.values() if getattr(bp, "KVE", False)]
+        kve = [mp for mp in module_plans.values() if getattr(mp, "KVE", False)]
         if p.dynamic_kinds and kve:
             scratch["epool"] = pltpu.VMEM((NBE, 2, g.HD // 4, 4, kve[0].BLK), FP8)
             phase_map["epool"] = "persistent"
@@ -365,7 +365,7 @@ def build_scratch(
             smem_shapes[x.name] = (tuple(x.shape), x.dtype)
     for k, st in p.state_decls.items():
         if st.memory_space == "smem":
-            l_cnt = max(1, p.block_layer_counts[p.state_owners[k]])
+            l_cnt = max(1, p.module_layer_counts[p.state_owners[k]])
             sh = (l_cnt, *st.shape) if st.per_layer else st.shape
             smem_bytes += math.prod(sh) * jnp.dtype(st.dtype).itemsize
             smem_shapes[k] = (tuple(sh), st.dtype)
@@ -429,7 +429,7 @@ def build_scratch(
         branch_segs=p.branch_segs,
         t_cycle=p.t_cycle,
         T_TOTAL=p.T_TOTAL,
-        block_branch_idx=p.block_branch_idx,
+        module_branch_idx=p.module_branch_idx,
         lay=lay,
         S=S,
         typed=typed,
@@ -462,7 +462,7 @@ def build_scratch(
         plan=p,
         stream=sp,
         comm=cp,
-        blocks=block_plans,
+        modules=module_plans,
         phase_map=phase_map,
         vmem_bytes=vmem_bytes,
         vmem_shapes=vmem_shapes,

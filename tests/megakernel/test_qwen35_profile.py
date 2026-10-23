@@ -30,10 +30,10 @@ def test_qwen35_baseline_tiles_ignore_moe_tp(R: int, moe_tp: bool):
     for B in range(1, 65):
         t = baseline_tiles(B, moe_tp=moe_tp, R=R)
         assert t == baseline_tiles(B, R=R)  # no moe_tp dependence
-        gqa, moe = t.block("gqa"), t.block("moe")
+        gqa, moe = t.module("gqa"), t.module("moe")
         assert gqa.kv_sub == 0 and not moe.route_vec and not t.dense_acc_pair
         assert not moe.pipe_ep and moe.pipe  # PIPE stays on (TP single tile)
-    assert Tiles(hier=1, mb8=2).with_blocks({"gqa": {"pack": 1}}) == DECODE_TILES
+    assert Tiles(hier=1, mb8=2).with_modules({"gqa": {"pack": 1}}) == DECODE_TILES
 
 
 @pytest.mark.parametrize("R", [2, 4])

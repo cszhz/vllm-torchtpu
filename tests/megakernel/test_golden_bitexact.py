@@ -65,8 +65,8 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
-from vllm_torchtpu.megakernel.blocks.gqa import GQATunables
 from vllm_torchtpu.megakernel.models import qwen35
+from vllm_torchtpu.megakernel.modules.gqa import GQATunables
 
 GOLDEN = pathlib.Path(__file__).parent / "golden" / "b1_bitexact.json"
 _META_KEY = "_meta"
@@ -201,11 +201,11 @@ def _tiny(t: mk.Tiles, ctx: int) -> mk.Tiles:
         nbe=max(6, min(t.nbe, 12)),
         ebank=256 << 10,
         vmem_mib=32,
-    ).with_blocks(
+    ).with_modules(
         {
             "gqa": {
                 "kv_blk": min(256, ctx),
-                "kv_sub": 128 if t.block("gqa").kv_sub else 0,
+                "kv_sub": 128 if t.module("gqa").kv_sub else 0,
             }
         }
     )
@@ -247,7 +247,7 @@ def run_ref_case(
     if rope_fp32:
         if "rope_fp32" not in GQATunables.__dataclass_fields__:
             pytest.skip("GQATunables.rope_fp32 not supported at this ref")
-        tiles = mk.Tiles(blocks={"gqa": GQATunables(rope_fp32=True)})
+        tiles = mk.Tiles(modules={"gqa": GQATunables(rope_fp32=True)})
     ex = mk.ExecSpec(R=R, B=B, T=T, ctx=ctx, cache=cache, tiles=tiles)
     pos, hid, w_l, st_l = qwen35.random_logical_inputs(jax.random.PRNGKey(seed), g, ex)
     out, st = qwen35.reference_step(g, ex, pos, hid, w_l, st_l, pool_io=paged_pool)
@@ -291,8 +291,8 @@ def run_case(
     if tiles_mode == "tiny":
         t = _tiny(t, ctx)
     else:  # production ring / bank sizes; only the KV block must fit `ctx`
-        gqa = t.block("gqa")
-        t = t.with_blocks(
+        gqa = t.module("gqa")
+        t = t.with_modules(
             {
                 "gqa": {
                     "kv_blk": min(gqa.kv_blk, ctx),

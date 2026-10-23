@@ -31,20 +31,12 @@ from vllm_torchtpu.megakernel import (
     derive,
     geometry,
     model_def,
+    module,
     profile,
     reference,
     schedule,
+    spec,
     validate,
-)
-from vllm_torchtpu.megakernel.blocks import (
-    GDN,
-    GQA,
-    Embedding,
-    GDNBlock,
-    GQABlock,
-    MoE,
-    MoEBlock,
-    Norm,
 )
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
@@ -72,6 +64,16 @@ from vllm_torchtpu.megakernel.models.qwen35_profile import (
     QWEN35_MODEL_NAME,
     TINY_TILES,
 )
+from vllm_torchtpu.megakernel.modules import (
+    GDN,
+    GQA,
+    Embedding,
+    GDNModule,
+    GQAModule,
+    MoE,
+    MoEModule,
+    Norm,
+)
 from vllm_torchtpu.megakernel.ops import BF16, F32, rnd
 from vllm_torchtpu.megakernel.profile import DEFAULT_PROFILE, Profile
 
@@ -88,8 +90,8 @@ def isolated_model_registry(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(profile, "_MODEL_DEFAULTS", dict(profile._MODEL_DEFAULTS))
 
 
-def assert_blocks_equal(ba: mk.Block, bb: mk.Block) -> None:
-    """Assert structural equality of two `Block` instances including `prefix`."""
+def assert_modules_equal(ba: mk.Module, bb: mk.Module) -> None:
+    """Assert structural equality of two `Module` instances including `prefix`."""
     assert type(ba) is type(bb)
     assert (
         ba.name,
@@ -104,18 +106,18 @@ def assert_blocks_equal(ba: mk.Block, bb: mk.Block) -> None:
         bb.prefix,
         bb.options,
     )
-    if isinstance(ba, GQABlock):
-        assert isinstance(bb, GQABlock)
+    if isinstance(ba, GQAModule):
+        assert isinstance(bb, GQAModule)
         assert (ba.pool_layout, ba.qk_norm, ba.output_gate) == (
             bb.pool_layout,
             bb.qk_norm,
             bb.output_gate,
         )
-    elif isinstance(ba, GDNBlock):
-        assert isinstance(bb, GDNBlock)
+    elif isinstance(ba, GDNModule):
+        assert isinstance(bb, GDNModule)
         assert ba.prefix == bb.prefix
-    elif isinstance(ba, MoEBlock):
-        assert isinstance(bb, MoEBlock)
+    elif isinstance(ba, MoEModule):
+        assert isinstance(bb, MoEModule)
         assert (
             ba.shared_gate,
             ba._explicit_moe_tp,
@@ -212,16 +214,16 @@ def assert_specs_equal(spec_a: mk.ModelSpec, spec_b: mk.ModelSpec) -> None:
             assert sa.branch_counts == sb.branch_counts
             assert sa.period == sb.period
             for ba, bb in zip(sa.branches, sb.branches, strict=True):
-                assert_blocks_equal(ba, bb)
+                assert_modules_equal(ba, bb)
         else:
-            assert isinstance(sa, mk.Block) and isinstance(sb, mk.Block)
-            assert_blocks_equal(sa, sb)
-    for ba, bb in zip(spec_a.all_blocks(), spec_b.all_blocks(), strict=True):
-        assert_blocks_equal(ba, bb)
+            assert isinstance(sa, mk.Module) and isinstance(sb, mk.Module)
+            assert_modules_equal(sa, sb)
+    for ba, bb in zip(spec_a.all_modules(), spec_b.all_modules(), strict=True):
+        assert_modules_equal(ba, bb)
 
 
-class _DenseMLPBlock(MoEBlock):
-    """Test-only dense-FFN override block (shared SwiGLU MLP without routed experts)."""
+class _DenseMLPModule(MoEModule):
+    """Test-only dense-FFN override module (shared SwiGLU MLP, no routed experts)."""
 
     routed_experts = False
 
@@ -265,7 +267,16 @@ class _DenseMLPBlock(MoEBlock):
 
 def test_core_model_def_modules_have_no_qwen_literals_and_fit_line_budget():
     """Core `ModelDef` modules have no Qwen names, no fmt: skip, and <= 400 lines."""
-    for mod in (derive, geometry, schedule, reference, validate, model_def):
+    for mod in (
+        module,
+        spec,
+        derive,
+        geometry,
+        schedule,
+        reference,
+        validate,
+        model_def,
+    ):
         path = Path(mod.__file__)
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines()
@@ -275,14 +286,14 @@ def test_core_model_def_modules_have_no_qwen_literals_and_fit_line_budget():
         low = text.lower()
         assert "qwen" not in low, f"{path.name} must not mention Qwen"
 
-    # Block and PoolBackend equality remain standard (callbacks compared in test helper)
-    b1 = MoEBlock(prefix="mlp")
-    b2 = MoEBlock(prefix="mlp")
-    b3 = MoEBlock(prefix="other")
+    # Module and PoolBackend equality remain standard (callbacks compared in helper)
+    b1 = MoEModule(prefix="mlp")
+    b2 = MoEModule(prefix="mlp")
+    b3 = MoEModule(prefix="other")
     assert b1 != b2 and b1 != b3
-    assert_blocks_equal(b1, b2)
+    assert_modules_equal(b1, b2)
     with pytest.raises(AssertionError):
-        assert_blocks_equal(b1, b3)
+        assert_modules_equal(b1, b3)
 
     mg = geometry.ModelGeometry(
         L=8,
@@ -302,12 +313,16 @@ def test_core_model_def_modules_have_no_qwen_literals_and_fit_line_budget():
         IS=1024,
     )
     play = qwen35_pool.qwen35_pool_layout(qwen35.TINY, R=8)
-    pb1 = mk.pool.make_pool_backend(play, check=mg.check, rec_chunk=GDNBlock.chunk_rows)
-    pb2 = mk.pool.make_pool_backend(play, check=mg.check, rec_chunk=GDNBlock.chunk_rows)
+    pb1 = mk.pool.make_pool_backend(
+        play, check=mg.check, rec_chunk=GDNModule.chunk_rows
+    )
+    pb2 = mk.pool.make_pool_backend(
+        play, check=mg.check, rec_chunk=GDNModule.chunk_rows
+    )
     pb3 = mk.pool.make_pool_backend(
         play,
         check=dataclasses.replace(mg, L=16).check,
-        rec_chunk=GDNBlock.chunk_rows,
+        rec_chunk=GDNModule.chunk_rows,
     )
     assert pb1 != pb2 and pb1 != pb3
     assert_pool_backends_equal(pb1, pb2)
@@ -372,7 +387,7 @@ def test_schedule_validation_errors_name_layer_index_and_value(isolated_model_re
     post_norm = Norm.bind("post_attention_layernorm", zero_centered=True)
     final_norm_b = Norm.bind("model.norm", zero_centered=True)
 
-    # 1. Layers without a block in Every / FromHFLayerTypes / Schedule / overrides
+    # 1. Layers without a module in Every / FromHFLayerTypes / Schedule / overrides
     with pytest.raises(MegakernelConfigError, match=r"layer 0.*None"):
         Every(n=2, last=attn, rest=None)
     with pytest.raises(MegakernelConfigError, match=r"layer 1.*None"):
@@ -403,7 +418,7 @@ def test_schedule_validation_errors_name_layer_index_and_value(isolated_model_re
             ffn=moe,
             overrides={1: {"mixer": attn}},
         ).resolve({}, 8)
-    assert "BlockBinding(" not in str(mix_ov_exc.value)
+    assert "ModuleBinding(" not in str(mix_ov_exc.value)
     assert "FrozenDict(" not in str(mix_ov_exc.value)
     with pytest.raises(MegakernelConfigError, match=r"layer 1 has 'gqa'"):
         Schedule(
@@ -887,7 +902,7 @@ def test_synthetic_model_def_every2_dense_override_cpu_kernel_vs_reference(
     mixer_slot, ffn_slot = ms.layer_type.slots
     assert isinstance(mixer_slot, mk.SwitchSlot)
     assert mixer_slot.branch_counts == (1, 1) and mixer_slot.period == 2
-    assert isinstance(ffn_slot, MoEBlock)
+    assert isinstance(ffn_slot, MoEModule)
 
     play = SynthHybrid.pool_layout(g_tiny, R=ex.R)
     assert play.num_pools == 2 and play.recurrent_slots_per_pool == 1
@@ -934,7 +949,7 @@ def test_synthetic_model_def_every2_dense_override_cpu_kernel_vs_reference(
 
     # Per-layer overrides that the single-LayerType kernel cannot represent fail closed
     # in to_model_spec naming the layer, the slot, and the binding.
-    dense_mlp = _DenseMLPBlock.bind(
+    dense_mlp = _DenseMLPModule.bind(
         prefix="mlp",
         experts="num_experts",
         top_k="num_experts_per_tok",
@@ -962,7 +977,7 @@ def test_synthetic_model_def_every2_dense_override_cpu_kernel_vs_reference(
         )
 
     with pytest.raises(
-        MegakernelConfigError, match=r"layer 0.*slot 'ffn'.*_DenseMLPBlock"
+        MegakernelConfigError, match=r"layer 0.*slot 'ffn'.*_DenseMLPModule"
     ):
         SynthDenseOverride.to_model_spec(g_tiny, R=ex.R)
 
@@ -980,7 +995,7 @@ def test_synthetic_model_def_every2_dense_override_cpu_kernel_vs_reference(
         MegakernelConfigError, match=r"layer 0.*slot 'mixer'.*alt_linear_attn"
     ) as exc_info:
         SynthMixerOverride.to_model_spec(g_tiny, R=ex.R)
-    assert "BlockBinding(" not in str(exc_info.value)
+    assert "ModuleBinding(" not in str(exc_info.value)
     assert "FrozenDict(" not in str(exc_info.value)
 
     eplb_moe = MoE.bind(
@@ -1010,7 +1025,7 @@ def test_synthetic_model_def_every2_dense_override_cpu_kernel_vs_reference(
         ),
     ) as opt_exc:
         _UnregisteredSynthOptOverride.to_model_spec(g_tiny, R=ex.R)
-    assert "BlockBinding(" not in str(opt_exc.value)
+    assert "ModuleBinding(" not in str(opt_exc.value)
     assert "FrozenDict(" not in str(opt_exc.value)
 
     class _UnregisteredSynthMissingFinalNorm(SynthHybrid):
@@ -1035,36 +1050,36 @@ def _independent_qwen35_pool_layout(
     g: qwen35.Qwen35Geometry, *, R: int = 8
 ) -> mk.PoolLayout:
     """Build expected `PoolLayout` from `cache_decl()` + `derive_pool_layout`."""
-    kv_decl = GQABlock(geometry=g).cache_decl(g)
+    kv_decl = GQAModule(geometry=g).cache_decl(g)
     assert kv_decl is not None
     if g.att_every == 1:
         decls: list[Any] = [kv_decl] * g.NATT
     else:
-        rec_decl = GDNBlock(geometry=g).cache_decl(g)
+        rec_decl = GDNModule(geometry=g).cache_decl(g)
         assert rec_decl is not None
         decls = ([rec_decl] * (g.att_every - 1) + [kv_decl]) * g.NATT
     return mk.pool.derive_pool_layout(decls, R=R)
 
 
 def _independent_qwen35_spec(
-    g: qwen35.Qwen35Geometry, *, gdn_block: mk.Block | None = None, R: int = 8
+    g: qwen35.Qwen35Geometry, *, gdn_module: mk.Module | None = None, R: int = 8
 ) -> mk.ModelSpec:
     """Build expected `ModelSpec` independently of `Qwen35.to_model_spec`."""
     play = _independent_qwen35_pool_layout(g, R=R)
-    gqa_blk = GQABlock(
+    gqa_blk = GQAModule(
         pool_layout=play, prefix="self_attn", qk_norm=True, output_gate=True
     )
-    moe_blk = MoEBlock(prefix="mlp", shared_gate=True)
+    moe_blk = MoEModule(prefix="mlp", shared_gate=True)
     if g.att_every == 1:
         mixer = mk.SwitchSlot("mixer", branches=(gqa_blk,), branch_counts=(1,))
     else:
-        gdn_blk = GDNBlock(prefix="linear_attn") if gdn_block is None else gdn_block
+        gdn_blk = GDNModule(prefix="linear_attn") if gdn_module is None else gdn_module
         mixer = mk.SwitchSlot(
             "mixer", branches=(gdn_blk, gqa_blk), branch_counts=(g.att_every - 1, 1)
         )
     lt = mk.LayerType(name="qwen35_layer", slots=(mixer, moe_blk))
     backend = mk.pool.make_pool_backend(
-        play, check=g.check, rec_chunk=GDNBlock.chunk_rows
+        play, check=g.check, rec_chunk=GDNModule.chunk_rows
     )
     return mk.ModelSpec(
         name=QWEN35_MODEL_NAME,
@@ -1375,10 +1390,10 @@ def test_qwen35_model_def_derived_geometry_spec_and_pool_layout_equivalence():
         (1, False, True),
     ],
 )
-def test_qwen35_model_def_composed_reference_matches_block_loop(
+def test_qwen35_model_def_composed_reference_matches_module_loop(
     t_val: int, moe_tp: bool, pool_io: bool
 ):
-    """Composed `Qwen35.reference_step` is bitwise identical to explicit block loop."""
+    """Composed `Qwen35.reference_step` is bitwise identical to explicit module loop."""
     g = dataclasses.replace(qwen35.TINY, moe_tp=moe_tp)
     ex = ExecSpec(R=2, B=2 * t_val, T=t_val, ctx=128)
     pos, hid, w_l, st_l = qwen35.random_logical_inputs(
@@ -1394,10 +1409,10 @@ def test_qwen35_model_def_composed_reference_matches_block_loop(
         "post_attention_layernorm", geometry=g, zero_centered=True, eps=g.eps
     )
     final_norm_blk = Norm("model.norm", geometry=g, zero_centered=True, eps=g.eps)
-    gqa_blk = GQABlock(geometry=g)
-    gdn_blk = GDNBlock(geometry=g)
-    moe_blk = MoEBlock(geometry=g)
-    lay_gdn = GDNBlock.lin_in_layout(g, ex)
+    gqa_blk = GQAModule(geometry=g)
+    gdn_blk = GDNModule(geometry=g)
+    moe_blk = MoEModule(geometry=g)
+    lay_gdn = GDNModule.lin_in_layout(g, ex)
     cr, hr = mk.rup(3 * ex.B, 8), mk.rup(3 + ex.T, 8)
     conv_in = st_l["conv"].astype(BF16).astype(F32) if pool_io else st_l["conv"]
     rec_in = st_l["rec"].reshape(

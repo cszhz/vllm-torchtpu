@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Composable GatedDeltaNet (`GDNBlock`) megakernel block."""
+"""Composable GatedDeltaNet (`GDNModule`) megakernel module."""
 
 from __future__ import annotations
 
@@ -23,17 +23,18 @@ from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
 from ...decls import (
-    BlockBinding,
     FrozenDict,
     HFParamDecl,
+    ModuleBinding,
     RecurrentCacheDecl,
-    ResolvedBlockGeometry,
+    ResolvedModuleGeometry,
 )
 from ...exec_spec import ExecSpec
 from ...fused_io_hook import fused_io
+from ...module import Module
 from ...ops import BF16, F32, FP8, I32, rup
 from ...pool.config import cache_exec
-from ...spec import Block, SmallField, StateDecl, WeightDecl
+from ...spec import SmallField, StateDecl, WeightDecl
 from .conv import conv_step, gdn_in
 from .decls import (
     GDN_FIELD_ALIASES,
@@ -56,8 +57,8 @@ from .reference import gdn_reference
 from .states import conv_out_src, rec_drain, rec_in
 
 
-class GDNBlock(Block):
-    """GatedDeltaNet block supporting decode (`T=1`), verify (`T>1`), and `GCH`."""
+class GDNModule(Module):
+    """GatedDeltaNet module supporting decode (`T=1`), verify (`T>1`), and `GCH`."""
 
     name = "gdn"
     reduction = "allreduce"
@@ -81,8 +82,8 @@ class GDNBlock(Block):
 
     @classmethod
     def _resolve_binding(
-        cls, binding: BlockBinding, hf_config: Any
-    ) -> ResolvedBlockGeometry:
+        cls, binding: ModuleBinding, hf_config: Any
+    ) -> ResolvedModuleGeometry:
         return resolve_gdn_binding(
             cls, binding, super()._resolve_binding(binding, hf_config)
         )
@@ -90,7 +91,7 @@ class GDNBlock(Block):
     @classmethod
     def chunk_rows(cls, ex: ExecSpec) -> tuple[int, int]:
         """`(gdn_rows, gdn_bufs)` of the chunked state path for `ex`."""
-        tt = ex.resolved_tiles.block(cls.name, GDNTunables)
+        tt = ex.resolved_tiles.module(cls.name, GDNTunables)
         return tt.gdn_rows, tt.gdn_bufs
 
     @staticmethod
@@ -246,7 +247,7 @@ class GDNBlock(Block):
         return derive_params(g, ex, plan, self.tunables(ex), self.name)
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
-        gp: GDNParams = plan.block_params[self.name]
+        gp: GDNParams = plan.module_params[self.name]
         if cache_exec(ex).FUSED:
             return fused_io().gdn_fused_scratch(ex, gp, plan)
         scr: dict[str, Any] = {
@@ -289,12 +290,12 @@ class GDNBlock(Block):
     def init_buffers(self, ctx: Any) -> None:
         if not cache_exec(ctx.ex).FUSED:
             return
-        fused_io().gdn_fused_init_buffers(ctx, ctx.block_params(self.name))
+        fused_io().gdn_fused_init_buffers(ctx, ctx.module_params(self.name))
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex = ctx.ex
-        gp: GDNParams = ctx.block_params(self.name)
-        o = ctx.stream.sp.block_ord(l, self.name)
+        gp: GDNParams = ctx.module_params(self.name)
+        o = ctx.stream.sp.module_ord(l, self.name)
         if cache_exec(ex).FUSED:
             return fused_io().gdn_fused_emit(ctx, gp, o, slot)
         scr, O, skip, sc, stream = ctx.scr, ctx.O, ctx.skip, ctx.sc, ctx.stream  # noqa: E741
@@ -323,7 +324,7 @@ class GDNBlock(Block):
                 return yo * ctx.sm(slot, "out_s")
 
     def epilogue(self, ctx: Any) -> None:
-        gp: GDNParams = ctx.block_params(self.name)
+        gp: GDNParams = ctx.module_params(self.name)
         if cache_exec(ctx.ex).FUSED:
             fused_io().gdn_fused_epilogue(ctx, gp)
             return
@@ -373,6 +374,6 @@ class GDNBlock(Block):
         self, params: Any, x: Any, state: Any = None, *, g: Any = None, **kw: Any
     ) -> tuple[jax.Array, dict[str, Any]]:
         assert state is not None, (
-            "GDNBlock.reference requires `state` with 'conv'/'rec'"
+            "GDNModule.reference requires `state` with 'conv'/'rec'"
         )
         return gdn_reference(params, x, state, g=self._require_geometry(g), **kw)

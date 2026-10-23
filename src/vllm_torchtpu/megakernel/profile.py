@@ -30,7 +30,7 @@ profile: the default profile of the profile's model (`Profile.model`), or the
   hierarchical all-reduce variants, fused pool I/O); must pass the accuracy
   ladder.
 
-Every tile knob (core `Tiles` fields and each block's `Tunables`) and pool-I/O
+Every tile knob (core `Tiles` fields and each module's `Tunables`) and pool-I/O
 mode declares its class (`exec_spec.tile_numerics()`, `pool.POOL_IO_NUMERICS`).
 `approx_features(profile)` lists the approx features a profile turns on
 relative to its reference; a profile declared `exact` that turns any of them on
@@ -217,11 +217,11 @@ _NUMERICS_GRID_R = (1, 2, 4, 8, 16)
 
 
 def _knob(t: Tiles, key: str) -> Any:
-    """Value of tile knob `key` (`field` or `<block>.<field>`) in `t`."""
+    """Value of tile knob `key` (`field` or `<module>.<field>`) in `t`."""
     if "." not in key:
         return getattr(t, key)
-    block, field = key.split(".", 1)
-    return getattr(t.block(block), field)
+    module, field = key.split(".", 1)
+    return getattr(t.module(module), field)
 
 
 def approx_features(profile: Profile) -> tuple[str, ...]:
@@ -231,8 +231,8 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
     profile is its own reference (no features). A tile field counts when the
     two tile rules give it different values on any bucket of the grid (`B` in
     1..64, `R` in {1, 2, 4, 8, 16}, `moe_tp` in {False, True}) and the knob is
-    `approx` in `exec_spec.tile_numerics()` (block knobs as
-    `tiles.<block>.<field>`); a pool-I/O mode the profile turns on and the
+    `approx` in `exec_spec.tile_numerics()` (module knobs as
+    `tiles.<module>.<field>`); a pool-I/O mode the profile turns on and the
     reference does not counts per `POOL_IO_NUMERICS`.
     """
     if profile.model_default:

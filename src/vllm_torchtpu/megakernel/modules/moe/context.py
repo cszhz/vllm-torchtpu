@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Per-trace emit state shared by the `MoEBlock` emit helpers."""
+"""Per-trace emit state shared by the `MoEModule` emit helpers."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from .params import MoEDebug, MoEParams
 
 @dataclass(frozen=True)
 class MoEEmit:
-    """References and constants one `MoEBlock.emit` trace reads.
+    """References and constants one `MoEModule.emit` trace reads.
 
     `lane_e8` / `lane128` / `row8` are the iotas the router and the expert
     weighting compare against; `EM` is the expert-id mask packed into the

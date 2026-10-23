@@ -36,7 +36,7 @@ class TwoRing:
     Maintains `self.cursor` across slots inside a layer and supports scoped
     consumption + optional lazy slot refill via `with stream.segment(lazy=...):`.
     Note: `dmatmul` and `segment` mutate Python-level cursor/offset tracking at trace
-    time and must only be called at the top level of `Block.emit` (or inside branches
+    time and must only be called at the top level of `Module.emit` (or inside branches
     dispatched via `stream.cond_branches`), never inside a `lax.fori_loop` or `pl.when`.
     """
 
@@ -139,10 +139,10 @@ class TwoRing:
 
     @contextlib.contextmanager
     def segment(self, *, lazy: bool = False):
-        """Scope a block's dense weight stream consumption and optional lazy refill."""
+        """Scope a module's dense weight stream consumption and optional lazy refill."""
         assert not self._in_segment, (
             "Nested stream.segment() is not allowed; call segment() only "
-            "at the top level of Block.emit()"
+            "at the top level of Module.emit()"
         )
         g_start = self.cursor
         seg_offsets = (
@@ -227,7 +227,7 @@ class TwoRing:
     def expert_stream(self):
         """Mark the expert ring (`epool`) as owned by dynamic expert streaming.
 
-        Tracked at trace time: `Block.emit` bodies are traced sequentially, so a
+        Tracked at trace time: `Module.emit` bodies are traced sequentially, so a
         `borrow_epool()` traced inside this window would alias in-flight expert
         DMAs and is rejected.
         """
@@ -239,7 +239,7 @@ class TwoRing:
             self._ering_busy = False
 
     def borrow_epool(self):
-        """Return `scr['epool']` for non-overlapping block use (e.g. GQA `KVE`)."""
+        """Return `scr['epool']` for non-overlapping module use (e.g. GQA `KVE`)."""
         assert not self._ering_busy, (
             "borrow_epool() cannot be called while dynamic expert streaming is active"
         )

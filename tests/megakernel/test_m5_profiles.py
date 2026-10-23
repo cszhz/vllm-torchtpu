@@ -34,16 +34,16 @@ from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_
 
 
 def _tile_value(t: mk.Tiles, name: str) -> object:
-    """Field `name` of `t`, looked up in core fields, then each block's tunables."""
+    """Field `name` of `t`, looked up in core fields, then each module's tunables."""
     if name in {f.name for f in dataclasses.fields(t)}:
         return getattr(t, name)
     owners = [
         b.name
-        for b in (mk.GQABlock, mk.GDNBlock, mk.MoEBlock)
+        for b in (mk.GQAModule, mk.GDNModule, mk.MoEModule)
         if name in getattr(b.Tunables, "NUMERICS", {})
     ]
     assert len(owners) == 1, (name, owners)
-    return getattr(t.block(owners[0]), name)
+    return getattr(t.module(owners[0]), name)
 
 
 def test_qwen35_baseline_tiles_match_frozen_kernel_schedule():
@@ -109,7 +109,7 @@ def test_candidate30_profile_carries_m5_tuning():
     assert p.pool_gather is None  # GPR auto
     assert p.fused_pool_io is False  # experimental: explicit opt-in only
     t4 = p.tiles_for(4, R=8)
-    assert (t4.block("gqa").kv_sub, t4.nbe, t4.hier, t4.block("moe").ecopy_opt) == (
+    assert (t4.module("gqa").kv_sub, t4.nbe, t4.hier, t4.module("moe").ecopy_opt) == (
         1024,
         20,
         1,
@@ -137,7 +137,7 @@ def test_candidate30_profile_carries_m5_tuning():
     t56 = p.tiles_for(56, R=8)
     assert (t56.nbd, t56.nbe, t56.hier) == (8, 12, 2)
     t16 = p.tiles_for(16, R=8)
-    assert (t16.block("gqa").nkv, t16.rsag, t16.hier, t16.nbe) == (4, True, 2, 12)
+    assert (t16.module("gqa").nkv, t16.rsag, t16.hier, t16.nbe) == (4, True, 2, 12)
     # HIER3 remap for power-of-2 R != 8 (B <= 32), flat ring otherwise
     assert candidate30_tiles(16, R=4).hier == 3
     assert candidate30_tiles(64, R=4).hier == 0
@@ -150,7 +150,7 @@ def test_candidate30_conv_stage_only_from_b8(R: int, moe_tp: bool):
     """Fused-path conv staging is on from B >= 8 only, as in candidate30's kernel."""
     for B in (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64):
         t = candidate30_tiles(B, moe_tp=moe_tp, R=R)
-        assert t.block("gdn").conv_stage is (B >= 8), (B, R, moe_tp)
+        assert t.module("gdn").conv_stage is (B >= 8), (B, R, moe_tp)
 
 
 def test_profile_exec_for_respects_explicit_tiles():

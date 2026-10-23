@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`MoEBlock` debug inputs: forced routing (`rbias`) and the row mask (`moe_rows`).
+"""`MoEModule` debug inputs: forced routing (`rbias`) and the row mask (`moe_rows`).
 
-The flags live in `DebugOptions.blocks["moe"]` (`MoEDebug`), not in `Tiles`, so
-they leave the default-tile VMEM fit on; each adds a block extra input that
+The flags live in `DebugOptions.modules["moe"]` (`MoEDebug`), not in `Tiles`, so
+they leave the default-tile VMEM fit on; each adds a module extra input that
 `kernel.make_step` and `cache.make_pooled_step` pass after the states.
 """
 
@@ -36,10 +36,10 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import cache, kernel, planner, vmem
-from vllm_torchtpu.megakernel.blocks import MoEBlock, MoEDebug
-from vllm_torchtpu.megakernel.blocks.moe import MoETunables
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
+from vllm_torchtpu.megakernel.modules import MoEDebug, MoEModule
+from vllm_torchtpu.megakernel.modules.moe import MoETunables
 
 R = 2
 _BOTH = MoEDebug(forced_routing=True, row_mask=True)
@@ -52,8 +52,8 @@ def _use_cpu_default_device():
 
 
 def _debug(flags: MoEDebug | None = None, skip: frozenset[str] = frozenset()) -> Any:
-    blocks = {MoEBlock.name: flags} if flags is not None else {}
-    return mk.DebugOptions(skip=skip, blocks=blocks)
+    modules = {MoEModule.name: flags} if flags is not None else {}
+    return mk.DebugOptions(skip=skip, modules=modules)
 
 
 def test_moe_debug_flags_declare_inputs_and_keep_the_default_tile_fit():
@@ -72,11 +72,11 @@ def test_moe_debug_flags_declare_inputs_and_keep_the_default_tile_fit():
     assert ex.tiles is None
     fitted = vmem.fit_default_tiles(spec, ex)
     assert fitted.tiles is not None and fitted.tiles != mk.default_tiles(64, R=8)
-    assert fitted.tiles.block(MoEBlock.name) == MoETunables()
+    assert fitted.tiles.module(MoEModule.name) == MoETunables()
     core_plan, _ = vmem.build_scratch(spec, fitted)
     assert core_plan.vmem_bytes <= fitted.tiles.vmem_mib * (1 << 20)
     with pytest.raises(TypeError, match="MoEDebug"):
-        MoEBlock().debug_flags(
+        MoEModule().debug_flags(
             dataclasses.replace(base, debug=_debug(MoETunables(pipe=False)))  # type: ignore[arg-type]
         )
 
@@ -89,7 +89,7 @@ def _geom() -> qwen35.Qwen35Geometry:
 
 
 def _exec(B: int, paged: bool) -> mk.ExecSpec:
-    tiles = dataclasses.replace(TINY_TILES, bank=512 << 10).with_blocks(
+    tiles = dataclasses.replace(TINY_TILES, bank=512 << 10).with_modules(
         {"gqa": {"kv_blk": 256}}
     )
     return mk.ExecSpec(

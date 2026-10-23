@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""M3a tests: Paged KV in `GQABlock`, 128K `page_table` SMEM, and KV page helpers."""
+"""M3a tests: Paged KV in `GQAModule`, 128K `page_table` SMEM, and KV page helpers."""
 
 from __future__ import annotations
 
@@ -89,10 +89,10 @@ def _tiny_exec(
     amask: int = 1,
     kv_sub: int = 0,
 ) -> mk.ExecSpec:
-    tiles = replace(TINY_TILES, bank=512 << 10).with_blocks(
+    tiles = replace(TINY_TILES, bank=512 << 10).with_modules(
         {
             "gqa": {
-                "kv_blk": min(TINY_TILES.block("gqa").kv_blk, ctx),
+                "kv_blk": min(TINY_TILES.module("gqa").kv_blk, ctx),
                 "kv_sub": kv_sub,
                 "amask": amask,
             },
@@ -346,7 +346,7 @@ def test_gather_gdn_states_cpu_interpret(T: int, NS: int, att_every: int):
 
 @pytest.mark.parametrize("T,B", [(1, 2), (2, 4)])
 def test_paged_gqa_make_step_cpu_interpret(T: int, B: int):
-    """Verify `GQABlock` with `paged_kv=True`, `G=2`, `NATT=2`, and permuted pages."""
+    """Verify `GQAModule` with `paged_kv=True`, `G=2`, `NATT=2`, and permuted pages."""
     mesh = _cpu_mesh(2)
     # L=8, att_every=4 -> NATT=2 attention pools; NKV=1 with R=2 -> G=2 (SPLIT=True)
     g = _tiny_geom(L=8, att_every=4, NKV=1)
@@ -1278,16 +1278,16 @@ def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
     ex_opt0_base = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=0)
     ex_opt0 = replace(
         ex_opt0_base,
-        tiles=ex_opt0_base.resolved_tiles.with_blocks({"moe": {"route_vec": False}}),
+        tiles=ex_opt0_base.resolved_tiles.with_modules({"moe": {"route_vec": False}}),
     )
     ex_po2c_base = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=1)
     ex_po2c = replace(
         ex_po2c_base,
-        tiles=ex_po2c_base.resolved_tiles.with_blocks({"moe": {"route_vec": False}}),
+        tiles=ex_po2c_base.resolved_tiles.with_modules({"moe": {"route_vec": False}}),
     )
     ex_vec = replace(
         ex_po2c_base,
-        tiles=ex_po2c_base.resolved_tiles.with_blocks({"moe": {"route_vec": True}}),
+        tiles=ex_po2c_base.resolved_tiles.with_modules({"moe": {"route_vec": True}}),
     )
     ex_eplb_unstacked = replace(ex_vec, stack_e=False)
 
@@ -1366,7 +1366,7 @@ def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
     ref_r1, _ = qwen35.reference_step(g_r1, ex_r1, pos, hid_l, w_r1_l, st_r1)
 
     # Directly verify GDN `lin_in` & `lin_in_s` layout against unsharded HF tensors
-    lay_gdn = mk.GDNBlock.lin_in_layout(g_ep, ex_base)
+    lay_gdn = mk.GDNModule.lin_in_layout(g_ep, ex_base)
     vh = lay_gdn.vh
     assert w_ep_l["lin_in"].shape == (ex_base.R, g_ep.NGDN, g_ep.H, lay_gdn.NLI)
     assert w_ep_l["lin_in_s"].shape == (ex_base.R, g_ep.NGDN, lay_gdn.NLI)
@@ -1666,12 +1666,12 @@ def test_gdn_gch_non_multiple_of_8_tail_and_padded_mr(T: int, B: int):
     ex_base = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False)
     ex_gch = replace(
         ex_base,
-        tiles=ex_base.resolved_tiles.with_blocks(
+        tiles=ex_base.resolved_tiles.with_modules(
             {"gdn": {"gdn_rows": 8, "gdn_bufs": 2}}
         ),
     )
     ex_noch = replace(
-        ex_base, tiles=ex_base.resolved_tiles.with_blocks({"gdn": {"gdn_rows": 0}})
+        ex_base, tiles=ex_base.resolved_tiles.with_modules({"gdn": {"gdn_rows": 0}})
     )
     assert ex_gch.B < ex_gch.MR
 
@@ -1687,7 +1687,7 @@ def test_gdn_gch_non_multiple_of_8_tail_and_padded_mr(T: int, B: int):
         pos, hid_l, w_l, st_l, g, ex_noch, mesh=mesh
     )
     step_gch, info_gch = qwen35.make_step(mesh, g, ex_gch, donate_states=False)
-    gp = info_gch["plan"].block_params["gdn"]
+    gp = info_gch["plan"].module_params["gdn"]
     assert gp.GCH and gp.CB == 8 and gp.NF == 2 and gp.TR == 4
     step_noch, _ = qwen35.make_step(mesh, g, ex_noch, donate_states=False)
     out_gch, st_out_gch = step_gch(pos_in, hid_gch, w_gch, st_gch)
@@ -1736,7 +1736,7 @@ def test_scatter_pool_states_odd_and_even_natt(natt: int, T: int, B: int):
     vnew_l = (
         jax.random.normal(k_v, (ex.R, g.NATT, ex.MR, g.HD), dtype=jnp.float32) * 2.0
     ).astype(mk.ops.FP8)
-    lay = mk.GDNBlock.lin_in_layout(g, ex)
+    lay = mk.GDNModule.lin_in_layout(g, ex)
     hr = mk.ops.rup(3 + T, 8)
     cr = mk.ops.rup(3 * B, 8)
     conv_new = (
@@ -1840,7 +1840,7 @@ def test_gather_gdn_states_cold_start_negative_read_offsets(T: int, B: int):
 
     # Sequence 0 is cold-start (roff = -1), sequence 1 has real state (roff = 0)
     roff_mixed = jnp.asarray([[-1, 0], [-1, 0], [-1, 0]], dtype=jnp.int32)
-    lay = mk.GDNBlock.lin_in_layout(g, ex)
+    lay = mk.GDNModule.lin_in_layout(g, ex)
     vh = lay.vh
 
     for r in range(ex.R):
@@ -2176,7 +2176,7 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
     ex = mk.with_cache(
         replace(
             ex_base,
-            tiles=ex_base.resolved_tiles.with_blocks(
+            tiles=ex_base.resolved_tiles.with_modules(
                 {"gdn": {"conv_stage": False, "gdn_head_major": True}}
             ),
         ),
@@ -2303,7 +2303,7 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
         # Verify conv_stage=True (conv_fast VMEM staging) on CPU interpret
         ex_cstage = mk.with_cache(
             replace(
-                ex, tiles=ex.resolved_tiles.with_blocks({"gdn": {"conv_stage": True}})
+                ex, tiles=ex.resolved_tiles.with_modules({"gdn": {"conv_stage": True}})
             ),
             fused_pool_io=True,
         )
@@ -2416,12 +2416,12 @@ def test_candidate30_fused_profile_vs_split(B: int, seed: int):
         nbe=max(6, min(t.nbe, 12)),
         ebank=256 << 10,
         vmem_mib=32,
-    ).with_blocks(
-        {"gqa": {"kv_blk": 256, "kv_sub": 128 if t.block("gqa").kv_sub else 0}}
+    ).with_modules(
+        {"gqa": {"kv_blk": 256, "kv_sub": 128 if t.module("gqa").kv_sub else 0}}
     )
     ex = mk.with_cache(replace(ex, tiles=t), pool_gather=False)
     assert mk.should_fuse_pool_io(spec, ex, fused_pool_io=prof.fused_pool_io)
-    assert t.block("gdn").conv_stage and t.block("gdn").gdn_head_major
+    assert t.module("gdn").conv_stage and t.module("gdn").gdn_head_major
 
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
         jax.random.key(810 + B + 1000 * seed), g, ex
@@ -2481,7 +2481,7 @@ def test_pool_gather_verify_wide_cpu_interpret():
     ex_gpr = mk.with_cache(
         replace(
             ex_gpr_base,
-            tiles=ex_gpr_base.resolved_tiles.with_blocks({"gqa": {"kv_ering": True}}),
+            tiles=ex_gpr_base.resolved_tiles.with_modules({"gqa": {"kv_ering": True}}),
         ),
         pool_gather=True,
     )
@@ -2493,10 +2493,10 @@ def test_pool_gather_verify_wide_cpu_interpret():
     step_split, info_split = mk.PallasWriter(fused_pool_io=False).make_step(
         mesh, spec, ex_split, donate=False
     )
-    assert info_gpr["plan"].block_params["gdn"].GPR is True
-    assert info_split["plan"].block_params["gdn"].GPR is False
+    assert info_gpr["plan"].module_params["gdn"].GPR is True
+    assert info_split["plan"].module_params["gdn"].GPR is False
     # KVE is enabled in CPU interpret mode when kv_ering=True
-    assert info_gpr["plan"].block_params["gqa"].KVE is True
+    assert info_gpr["plan"].module_params["gqa"].KVE is True
     assert "kvbuf" not in info_gpr["vmem_shapes"]
     assert info_gpr["plan"].s_names == (
         "ckpt_indices",
@@ -2622,7 +2622,7 @@ def test_pool_gather_verify_wide_cpu_interpret():
     ex_gq_on = mk.with_cache(
         replace(
             ex_gq_on,
-            tiles=ex_gq_on.resolved_tiles.with_blocks(
+            tiles=ex_gq_on.resolved_tiles.with_modules(
                 {
                     "gqa": {
                         "gqa_qv": True,
@@ -2637,13 +2637,13 @@ def test_pool_gather_verify_wide_cpu_interpret():
     )
     ex_gq_off = replace(
         ex_gq_on,
-        tiles=ex_gq_on.resolved_tiles.with_blocks(
+        tiles=ex_gq_on.resolved_tiles.with_modules(
             {"gqa": {"gqa_qv": False, "gq_pack": False, "kv_ering": False}}
         ),
     )
     ex_kve = replace(
         ex_gq_off,
-        tiles=ex_gq_off.resolved_tiles.with_blocks({"gqa": {"kv_ering": True}}),
+        tiles=ex_gq_off.resolved_tiles.with_modules({"gqa": {"kv_ering": True}}),
     )
     spec_gq = qwen35.qwen35_spec(g_gq)
     steps, infos = {}, {}
@@ -2651,7 +2651,7 @@ def test_pool_gather_verify_wide_cpu_interpret():
         steps[name], infos[name] = mk.PallasWriter(fused_pool_io=False).make_step(
             mesh4, spec_gq, ex_v, donate=False
         )
-    ap = {k: v["plan"].block_params["gqa"] for k, v in infos.items()}
+    ap = {k: v["plan"].module_params["gqa"] for k, v in infos.items()}
     assert (ap["on"].GQ, ap["on"].KVE) == (True, True)
     assert (ap["off"].GQ, ap["off"].KVE) == (False, False)
     assert (ap["kve"].GQ, ap["kve"].KVE) == (False, True)

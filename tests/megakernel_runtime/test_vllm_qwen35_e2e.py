@@ -94,8 +94,8 @@ def _tiny_exec(
     ctx: int = 256,
     num_pages: int = 96,
 ) -> ExecSpec:
-    tiles = replace(TINY_TILES, bank=512 << 10).with_blocks(
-        {"gqa": {"kv_blk": min(TINY_TILES.block("gqa").kv_blk, ctx)}}
+    tiles = replace(TINY_TILES, bank=512 << 10).with_modules(
+        {"gqa": {"kv_blk": min(TINY_TILES.module("gqa").kv_blk, ctx)}}
     )
     return ExecSpec(
         R=R,
@@ -142,7 +142,7 @@ def _make_backbone_from_logical_weights(
     tp_rank: int = 0,
 ) -> SimpleNamespace:
     """Build a synthetic PyTorch backbone whose weights match `w_logical`."""
-    gdn_lay = qwen35.GDNBlock.lin_in_layout(g, ex)
+    gdn_lay = qwen35.GDNModule.lin_in_layout(g, ex)
     qkvz_dim = gdn_lay.QKV + gdn_lay.Z
     layers: list[Any] = []
     for l_idx in range(g.L):

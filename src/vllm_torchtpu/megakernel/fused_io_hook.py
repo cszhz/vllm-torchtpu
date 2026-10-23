@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Hook through which blocks reach the optional fused pool I/O helpers.
+"""Hook through which modules reach the optional fused pool I/O helpers.
 
-`GQABlock` and `GDNBlock` never import `experimental.fused_pool_io`; when fused
+`GQAModule` and `GDNModule` never import `experimental.fused_pool_io`; when fused
 pool I/O is selected (`CacheExec.FUSED`) they call `fused_io()`, which returns
 the implementation that `experimental/fused_pool_io.py` registers on import
 (the package `__init__` imports `experimental`). Without a registered
@@ -22,7 +22,7 @@ implementation, `"auto"` fused selection falls back to split pool I/O
 `MegakernelConfigError`.
 
 This module depends only on `errors`, so importing the experimental helpers does
-not load any block.
+not load any module.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 
 class FusedPoolIO(Protocol):
-    """Fused pool I/O helpers called by `GQABlock` / `GDNBlock` (`CacheExec.FUSED`)."""
+    """Fused pool I/O helpers for `GQAModule` / `GDNModule` (`CacheExec.FUSED`)."""
 
     def gqa_fused_states(self, ex: ExecSpec) -> list[StateDecl]: ...
 

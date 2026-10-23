@@ -40,8 +40,8 @@ def _use_cpu_default_device():
 
 
 def _exec(R: int, B: int, T: int, ctx: int = 256) -> mk.ExecSpec:
-    tiles = replace(TINY_TILES, bank=512 << 10).with_blocks(
-        {"gqa": {"kv_blk": min(TINY_TILES.block("gqa").kv_blk, ctx)}}
+    tiles = replace(TINY_TILES, bank=512 << 10).with_modules(
+        {"gqa": {"kv_blk": min(TINY_TILES.module("gqa").kv_blk, ctx)}}
     )
     return mk.ExecSpec(
         R=R,
@@ -79,7 +79,7 @@ def test_gqa_pool_layout_must_match_the_pool_backend_layout():
 def test_gdn_in_kernel_pool_io_takes_slot_geometry_from_layout():
     spec, ex = _gpr_spec_and_exec()
     assert mk.cache_exec(ex).GPR
-    gp = mk.planner.plan(spec, ex).block_params["gdn"]
+    gp = mk.planner.plan(spec, ex).module_params["gdn"]
     lay = spec.cache_backend.layout
     assert gp.pool_layout is lay
     assert (
@@ -108,7 +108,7 @@ def test_qwen35_pool_layout_matches_geometry():
     assert (lay.num_pools, lay.slots_per_pool) == (g.NATT, g.att_every - 1)
     assert lay.num_recurrent_layers == g.NGDN
     for R in (1, 2, 8):
-        gdn = mk.GDNBlock.lin_in_layout(g, R)
+        gdn = mk.GDNModule.lin_in_layout(g, R)
         assert (lay.kh_per_rank(R), lay.vh_per_rank(R)) == (gdn.kh, gdn.vh)
         assert lay.qkv_per_rank(R) == gdn.QKV
     assert mk.qwen35_pool_backend(g).layout == lay
@@ -206,7 +206,7 @@ _MK_ROOT = Path(mk.__file__).resolve().parent
 
 def _guarded_files() -> list[Path]:
     files = [_MK_ROOT / "kernel.py", *sorted(_MK_ROOT.glob("cache*.py"))]
-    files += sorted((_MK_ROOT / "blocks").rglob("*.py"))
+    files += sorted((_MK_ROOT / "modules").rglob("*.py"))
     files += sorted((_MK_ROOT / "experimental").glob("*.py"))
     files += sorted((_MK_ROOT / "models").glob("*.py"))
     files += sorted((_MK_ROOT / "pool").glob("*.py"))
@@ -219,11 +219,11 @@ def _guarded_files() -> list[Path]:
         "cache_pooled_local.py",
         "cache_flat.py",
         "cache_experimental.py",
-        "blocks/gqa/block.py",
-        "blocks/gqa/kv.py",
-        "blocks/gdn/block.py",
-        "blocks/gdn/states.py",
-        "blocks/moe/block.py",
+        "modules/gqa/module.py",
+        "modules/gqa/kv.py",
+        "modules/gdn/module.py",
+        "modules/gdn/states.py",
+        "modules/moe/module.py",
         "experimental/fused_pool_io.py",
         "models/qwen35.py",
         "models/qwen35_pool.py",

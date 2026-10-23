@@ -52,7 +52,6 @@ except ImportError:
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel.blocks.gqa import GQABlock, GQATunables
 from vllm_torchtpu.megakernel.cache import (
     should_fuse_pool_io,
     should_use_pool_gather,
@@ -61,6 +60,7 @@ from vllm_torchtpu.megakernel.errors import MegakernelLayoutError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.model_def import ModelDef, get_model
 from vllm_torchtpu.megakernel.models import qwen35
+from vllm_torchtpu.megakernel.modules.gqa import GQAModule, GQATunables
 from vllm_torchtpu.megakernel.ops import rup
 from vllm_torchtpu.megakernel.pool.config import CacheExec, with_cache
 from vllm_torchtpu.megakernel.profile import (
@@ -1424,7 +1424,7 @@ class MegakernelDriver:
 
         kv_blk = int(
             self.profile.exec_for(self.base_exec, B=self.base_exec.B, T=1, g=self.geom)
-            .resolved_tiles.block(GQABlock.name, GQATunables)
+            .resolved_tiles.module(GQAModule.name, GQATunables)
             .kv_blk
         )
         aligned_ctx = ((self.max_pages_per_seq * self.page_size) // kv_blk) * kv_blk

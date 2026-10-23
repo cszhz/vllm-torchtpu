@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`MoEBlock` geometry and parameter declarations (`moe_hf_params`)."""
+"""`MoEModule` geometry and parameter declarations (`moe_hf_params`)."""
 
 from __future__ import annotations
 
@@ -20,10 +20,10 @@ from typing import Any
 
 from ...decls import (
     REQUIRED,
-    BlockBinding,
     HFParamDecl,
+    ModuleBinding,
     ParamTransform,
-    ResolvedBlockGeometry,
+    ResolvedModuleGeometry,
     VLLMAlias,
     apply_decl_overrides,
 )
@@ -98,14 +98,14 @@ MOE_GEOMETRY_METHODS: dict[str, Any] = {
 def validate_moe_options(options: Mapping[str, Any]) -> None:
     if not bool(options.get("shared_gate", True)):
         raise MegakernelConfigError(
-            "MoEBlock requires shared_gate=True (the kernel always gates the "
+            "MoEModule requires shared_gate=True (the kernel always gates the "
             "shared expert with sh_gate)"
         )
 
 
 def resolve_moe_binding(
-    cls: Any, binding: BlockBinding, resolved: ResolvedBlockGeometry
-) -> ResolvedBlockGeometry:
+    cls: Any, binding: ModuleBinding, resolved: ResolvedModuleGeometry
+) -> ResolvedModuleGeometry:
     vals = dict(resolved.values)
     opts = {k: v for k, v in binding.options.items() if v is not None}
     vals.update(
@@ -120,8 +120,8 @@ def resolve_moe_binding(
             "e_slots": int(opts.get("e_slots", 0)),
         }
     )
-    return ResolvedBlockGeometry(
-        block_cls=cls,
+    return ResolvedModuleGeometry(
+        module_cls=cls,
         prefix=binding.prefix,
         values=vals,
         options=opts,
@@ -137,7 +137,7 @@ def moe_hf_params(
     shared_gate: bool = True,
     moe_tp: bool | None = None,
 ) -> list[HFParamDecl]:
-    """Return canonical (unfused) HF parameter declarations for `MoEBlock`."""
+    """Return canonical (unfused) HF parameter declarations for `MoEModule`."""
     p = f"{prefix}." if prefix else ""
     H, E, IS = int(geom.H), int(geom.E), int(geom.IS)
     I = int(geom.I)  # noqa: E741
@@ -145,7 +145,7 @@ def moe_hf_params(
     shard_e13 = -1 if moe_tp else 0
     shard_e2 = 1 if moe_tp else 0
     shard_e2_s = None if moe_tp else 0
-    rename = geom.rename if isinstance(geom, ResolvedBlockGeometry) else {}
+    rename = geom.rename if isinstance(geom, ResolvedModuleGeometry) else {}
 
     def _n(canon: str) -> str:
         return rename.get(canon, canon)

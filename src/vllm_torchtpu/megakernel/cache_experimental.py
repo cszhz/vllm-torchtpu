@@ -24,7 +24,7 @@ HBM copy before the kernel. To avoid that 2.30 GiB/pool copy in 1-launch mode
    - The communicating `decode_megakernel` declares `ST[POOL_STATE_NAME]` with
      `access="r"` and sets **no** `pallas_call` `input_output_aliases` on the
      pools.
-   - `GQABlock` and `GDNBlock` (via `experimental/fused_pool_io.py`, reached
+   - `GQAModule` and `GDNModule` (via `experimental/fused_pool_io.py`, reached
      through `fused_io_hook`) issue async HBM DMA reads and writes
      directly against `ST[POOL_STATE_NAME]`.
    - The outer `jax.jit` (`donate_argnums` on `raw_pools`) returns the donated
@@ -42,7 +42,7 @@ HBM copy before the kernel. To avoid that 2.30 GiB/pool copy in 1-launch mode
      during warmup (eager mode included).
 
 2. **On CPU (`ex.interpret != False`)**:
-   - `GQABlock.outputs` declares `O[POOL_STATE_NAME]` (`access="w"`), and
+   - `GQAModule.outputs` declares `O[POOL_STATE_NAME]` (`access="w"`), and
      `kernel.build` sets `input_output_aliases` from `ST[POOL_STATE_NAME]` to
      `O[POOL_STATE_NAME]` so CPU `interpret=True` mutates the aliased output
      copy and returns it through `out_map[POOL_STATE_NAME]`.

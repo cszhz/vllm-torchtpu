@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`GQABlock` pure-JAX reference forward pass (`gqa_reference`)."""
+"""`GQAModule` pure-JAX reference forward pass (`gqa_reference`)."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def gqa_reference(
     att_idx: int = 0,
     layer_idx: int | None = None,
     paged_kv: bool | None = None,
-    block_name: str = "gqa",
+    module_name: str = "gqa",
 ) -> tuple[jax.Array, dict[str, Any]]:
     """Pure-JAX multi-rank GQA forward for one attention layer (`att_idx`)."""
     R, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
@@ -51,7 +51,7 @@ def gqa_reference(
     eps = float(getattr(g, "eps", 1e-6))
     zc = bool(getattr(g, "zero_centered_norm", True))
     use_paged_kv = cache_exec(ex).paged_kv if paged_kv is None else bool(paged_kv)
-    rope_round = not ex.resolve_tiles(g).block(block_name).rope_fp32
+    rope_round = not ex.resolve_tiles(g).module(module_name).rope_fp32
 
     half = ROT // 2
     inv = 1.0 / (theta ** (jnp.arange(half, dtype=F32)[None, :] * 2.0 / ROT))

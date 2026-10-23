@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Block `Tunables`: per-field numerics, the composed registry, perf-flag defaults."""
+"""Module `Tunables`: per-field numerics, the composed registry, perf-flag defaults."""
 
 from __future__ import annotations
 
@@ -24,12 +24,12 @@ from conftest import EXACT_FLIPS, tile_field
 
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import exec_spec
-from vllm_torchtpu.megakernel.blocks import GDNBlock, GQABlock, MoEBlock
+from vllm_torchtpu.megakernel.modules import GDNModule, GQAModule, MoEModule
 
-# Block and cache names the core spec modules must not mention (in any case).
+# Module and cache names the core spec modules must not mention (in any case).
 _NON_CORE_NAMES = ("gqa", "gdn", "moe", "pool", "fused", "paged", "ckpt")
 
-# Opt-in performance flags (core `field` / `<block>.<field>`), default off.
+# Opt-in performance flags (core `field` / `<module>.<field>`), default off.
 _PERF_FLAGS_OFF = {
     "moe.ecopy_opt": 0,
     "moe.pipe_ep": False,
@@ -47,12 +47,12 @@ _PERF_FLAGS_OFF = {
     "moe.moe_unroll": False,
     "rel_fetch": False,
 }
-_LIBRARY_BLOCKS = (GQABlock, GDNBlock, MoEBlock)
+_LIBRARY_MODULES = (GQAModule, GDNModule, MoEModule)
 
 
 def _library_numerics() -> dict[str, str]:
-    """`exec_spec.tile_numerics()` restricted to core and the library's blocks."""
-    names = {b.name for b in _LIBRARY_BLOCKS}
+    """`exec_spec.tile_numerics()` restricted to core and the library's modules."""
+    names = {m.name for m in _LIBRARY_MODULES}
     return {
         k: v
         for k, v in exec_spec.tile_numerics().items()
@@ -60,15 +60,15 @@ def _library_numerics() -> dict[str, str]:
     }
 
 
-@pytest.mark.parametrize("block", _LIBRARY_BLOCKS, ids=lambda b: b.name)
-def test_block_tunables_declare_numerics_for_every_field(block: type[mk.Block]):
-    cls = block.Tunables
-    assert cls is not None and exec_spec.tunables_class(block.name) is cls
+@pytest.mark.parametrize("module", _LIBRARY_MODULES, ids=lambda m: m.name)
+def test_module_tunables_declare_numerics_for_every_field(module: type[mk.Module]):
+    cls = module.Tunables
+    assert cls is not None and exec_spec.tunables_class(module.name) is cls
     numerics = dict(cls.NUMERICS)
     fields = {f.name for f in dataclasses.fields(cls)}
     assert set(numerics) == fields
     assert set(numerics.values()) <= {"exact", "approx"}
-    assert {f"{block.name}.{f}" for f in fields} <= set(exec_spec.tile_numerics())
+    assert {f"{module.name}.{f}" for f in fields} <= set(exec_spec.tile_numerics())
 
 
 def test_tile_numerics_classes_from_evidence():
@@ -96,16 +96,16 @@ def test_tiles_field_defaults_turn_perf_flags_off():
     t = mk.Tiles()
     for k, v in _PERF_FLAGS_OFF.items():
         assert tile_field(t, k) == v, k
-    assert t.block("gqa").kv_sub == 0
+    assert t.module("gqa").kv_sub == 0
     d = mk.default_tiles(8)
     for k, v in _PERF_FLAGS_OFF.items():
         assert tile_field(d, k) == v, k
 
 
-def test_core_spec_mentions_no_block_or_cache_names():
-    """`exec_spec.py` and `spec.py` are core: no block or pool name in them."""
-    for module in ("exec_spec.py", "spec.py"):
-        path = Path(exec_spec.__file__).parent / module
+def test_core_spec_mentions_no_module_or_cache_names():
+    """`exec_spec.py`, `module.py`, and `spec.py` are core: no module or pool name."""
+    for mod_file in ("exec_spec.py", "module.py", "spec.py"):
+        path = Path(exec_spec.__file__).parent / mod_file
         text = path.read_text(encoding="utf-8")
         for name in _NON_CORE_NAMES:
             hits = [
@@ -113,4 +113,4 @@ def test_core_spec_mentions_no_block_or_cache_names():
                 for i, line in enumerate(text.splitlines(), 1)
                 if re.search(name, line, flags=re.IGNORECASE)
             ]
-            assert not hits, (module, name, hits)
+            assert not hits, (mod_file, name, hits)

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Derive `PoolLayout` from per-layer block cache declarations."""
+"""Derive `PoolLayout` from per-layer module cache declarations."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def derive_pool_layout(
     slots_per_pool: int | None = None,
     R: int | None = None,
 ) -> PoolLayout:
-    """Derive a `PoolLayout` from a per-layer sequence of block cache decls.
+    """Derive a `PoolLayout` from a per-layer sequence of module cache decls.
 
     Recurrent layers attach to the next attention layer in the sequence, yielding
     `num_pools` (number of attention layers) and `slots_per_pool` (recurrent

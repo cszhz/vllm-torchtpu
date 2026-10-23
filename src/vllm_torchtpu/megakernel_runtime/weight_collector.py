@@ -39,9 +39,9 @@ import torch
 import torch.nn.functional as F
 
 from vllm_torchtpu.megakernel import planner
-from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen35
+from vllm_torchtpu.megakernel.modules.gdn import GDNModule
 from vllm_torchtpu.megakernel.ops import rup
 
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
@@ -195,7 +195,7 @@ def pack_lin_in_layer(
     in_s_width: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack a GDN layer's `in_proj_qkvz` + `in_proj_ba` into `lin_in` and `in_s`."""
-    lay = GDNBlock.lin_in_layout(g, ex)
+    lay = GDNModule.lin_in_layout(g, ex)
     nai = g.NAI(ex.R)
     qkvz_dim = lay.QKV + lay.Z
     w_qkvz, s_qkvz = extract_kn_fp8_weight(gdn_layer.in_proj_qkvz, g.H, qkvz_dim)
@@ -227,7 +227,7 @@ def pack_lin_out_layer(
     tk_lin_out: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack a GDN layer's `out_proj` into `[Z // tk_lin_out, tk_lin_out, H]`."""
-    lay = GDNBlock.lin_in_layout(g, ex)
+    lay = GDNModule.lin_in_layout(g, ex)
     w_kn, s_n = extract_kn_fp8_weight(gdn_layer.out_proj, lay.Z, g.H)
     return w_kn.view(lay.Z // tk_lin_out, tk_lin_out, g.H), s_n
 
@@ -242,7 +242,7 @@ def pack_att_in_layer(
     """Pack a full-attention layer's `qkv_proj` into `att_in` and `in_s`."""
     nh = g.nh(ex.R)
     nai = g.NAI(ex.R)
-    gdn_lay = GDNBlock.lin_in_layout(g, ex)
+    gdn_lay = GDNModule.lin_in_layout(g, ex)
     if hasattr(attn_layer, "qkv_proj"):
         w_kn, s_n = extract_kn_fp8_weight(attn_layer.qkv_proj, g.H, nai)
     else:
@@ -478,7 +478,7 @@ def pack_smalls_layer(
     """Pack a single layer's small parameters into `[1, S] float32`."""
     dev = in_s.device
     isr = g.ISR(ex.R)
-    gdn_lay = GDNBlock.lin_in_layout(g, ex)
+    gdn_lay = GDNModule.lin_in_layout(g, ex)
 
     in_norm_w = layer.input_layernorm.weight.data.float().reshape(g.H)
     post_norm_w = layer.post_attention_layernorm.weight.data.float().reshape(g.H)

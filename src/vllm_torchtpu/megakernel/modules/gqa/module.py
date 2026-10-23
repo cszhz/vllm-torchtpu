@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Grouped-Query Attention (`GQABlock`) with sequence-split KV ring and MTP."""
+"""Grouped-Query Attention (`GQAModule`) with sequence-split KV ring and MTP."""
 
 from __future__ import annotations
 
@@ -22,18 +22,19 @@ import jax.numpy as jnp
 from jax import lax
 
 from ...decls import (
-    BlockBinding,
     FrozenDict,
     HFParamDecl,
     KVCacheDecl,
-    ResolvedBlockGeometry,
+    ModuleBinding,
+    ResolvedModuleGeometry,
 )
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...fused_io_hook import fused_io
+from ...module import Module
 from ...ops import BF16, F32, FP8, I32, rnd
 from ...pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
-from ...spec import Block, SmallField, StateDecl, WeightDecl
+from ...spec import SmallField, StateDecl, WeightDecl
 from .attention import att_core
 from .context import GQAEmit
 from .decls import (
@@ -55,8 +56,8 @@ from .reference import gqa_reference
 from .staging import att_q, kv_new, q_exchange_start, q_gather_finish
 
 
-class GQABlock(Block):
-    """Full GQA block with QK RMSNorm, partial RoPE, Q/softmax exchange, and gate."""
+class GQAModule(Module):
+    """Full GQA module with QK RMSNorm, partial RoPE, Q/softmax exchange, and gate."""
 
     name: str = "gqa"
     reduction = "allreduce"
@@ -94,8 +95,8 @@ class GQABlock(Block):
 
     @classmethod
     def _resolve_binding(
-        cls, binding: BlockBinding, hf_config: Any
-    ) -> ResolvedBlockGeometry:
+        cls, binding: ModuleBinding, hf_config: Any
+    ) -> ResolvedModuleGeometry:
         return resolve_gqa_binding(
             cls, binding, super()._resolve_binding(binding, hf_config)
         )
@@ -112,7 +113,7 @@ class GQABlock(Block):
         lay_shape = tuple(self.pool_layout.kv_page_shape)
         if lay_shape != shape:
             raise MegakernelConfigError(
-                f"GQABlock paged KV reads need pool pages {shape}, but the pool "
+                f"GQAModule paged KV reads need pool pages {shape}, but the pool "
                 f"layout has {lay_shape}"
             )
         return lay_shape
@@ -194,21 +195,21 @@ class GQABlock(Block):
         mine, theirs = tuple(self.pool_layout.kv_page_shape), tuple(lay.kv_page_shape)
         if mine != theirs:
             raise MegakernelConfigError(
-                f"GQABlock pool_layout pages {mine} differ from the pool backend "
+                f"GQAModule pool_layout pages {mine} differ from the pool backend "
                 f"layout's {theirs} on ModelSpec {plan.model_spec.name!r}"
             )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
-        return gqa_scratch(ex, plan.block_params[self.name])
+        return gqa_scratch(ex, plan.module_params[self.name])
 
     def prologue(self, ctx: Any) -> None:
         """Build this rank's KV worklist (`wl_b`, `wl_t`, `wl_kp`, `wl_cnt[0]`)."""
-        build_worklist(ctx, ctx.block_params(self.name))
+        build_worklist(ctx, ctx.module_params(self.name))
 
     def init_buffers(self, ctx: Any) -> None:
         """Initialize attention-specific VMEM scratch buffers after barrier."""
         ex = ctx.ex
-        ap: GQAParams = ctx.block_params(self.name)
+        ap: GQAParams = ctx.module_params(self.name)
         scr, pos_ref = ctx.scr, ctx.pos_ref
         scr["knew"][...] = jnp.zeros((ex.MR, ap.HD), F32)
         scr["vnew"][...] = jnp.zeros((ex.MR, ap.HD), F32)
@@ -236,7 +237,7 @@ class GQABlock(Block):
             scr["rope"][1, :, :half_] = rnd(jnp.sin(ang_))
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
-        ap: GQAParams = ctx.block_params(self.name)
+        ap: GQAParams = ctx.module_params(self.name)
         cx = GQAEmit.build(ctx, ap, l, self.name)
         ex, scr, sc, stream, a = cx.ex, cx.scr, cx.sc, cx.stream, cx.a
         nh, HD, H, SPLIT, LAZY_ATT = ap.nh, ap.HD, ap.H, ap.SPLIT, ap.LAZY_ATT
@@ -323,7 +324,7 @@ class GQABlock(Block):
     def reference(
         self, params: Any, x: Any, state: Any = None, *, g: Any = None, **kw: Any
     ) -> tuple[Any, dict[str, Any]]:
-        assert state is not None, "GQABlock.reference requires `state` with 'kc'/'vc'"
+        assert state is not None, "GQAModule.reference requires `state` with 'kc'/'vc'"
         return gqa_reference(
-            params, x, state, g=self._require_geometry(g), block_name=self.name, **kw
+            params, x, state, g=self._require_geometry(g), module_name=self.name, **kw
         )

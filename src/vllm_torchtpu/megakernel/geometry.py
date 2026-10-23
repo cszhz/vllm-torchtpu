@@ -20,7 +20,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from .blocks.gdn import GDNBlock
 from .decls import (
     REQUIRED,
     FrozenDict,
@@ -28,6 +27,7 @@ from .decls import (
 )
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
+from .modules.gdn import GDNModule
 from .pool.config import cache_exec, resolved_max_pages_per_seq
 from .spec import ModelSpec
 
@@ -209,22 +209,22 @@ class ModelGeometry:
         return R // self.NKV
 
     def kh(self, R: int) -> int:
-        return GDNBlock.lin_in_layout(self, R).kh
+        return GDNModule.lin_in_layout(self, R).kh
 
     def vh(self, R: int) -> int:
-        return GDNBlock.lin_in_layout(self, R).vh
+        return GDNModule.lin_in_layout(self, R).vh
 
     def QKV(self, R: int) -> int:
-        return GDNBlock.lin_in_layout(self, R).QKV
+        return GDNModule.lin_in_layout(self, R).QKV
 
     def Z(self, R: int) -> int:
-        return GDNBlock.lin_in_layout(self, R).Z
+        return GDNModule.lin_in_layout(self, R).Z
 
     def BA(self, R: int) -> int:
-        return GDNBlock.lin_in_layout(self, R).BA
+        return GDNModule.lin_in_layout(self, R).BA
 
     def NLI(self, R: int) -> int:
-        return GDNBlock.lin_in_layout(self, R).NLI
+        return GDNModule.lin_in_layout(self, R).NLI
 
     def NAI(self, R: int) -> int:
         return (2 * self.nh(R) + 2) * self.HD
@@ -308,7 +308,7 @@ class ModelGeometry:
                 raise MegakernelConfigError(
                     f"Invalid GDN heads KH={self.KH}, VH={self.VH}, R={R}"
                 )
-            lay = GDNBlock.lin_in_layout(self, R)
+            lay = GDNModule.lin_in_layout(self, R)
             if lay.vh > 64:
                 raise MegakernelConfigError(f"GDN vh={lay.vh} exceeds 64")
             for n in (lay.KD, lay.VD, lay.QKV, lay.Z):

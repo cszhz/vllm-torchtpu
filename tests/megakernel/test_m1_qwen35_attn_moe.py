@@ -68,8 +68,8 @@ def test_m1_recorded_full_ep_build_invariants():
         "e2": 4,
     }
     assert info["T_TOTAL"] == 840
-    assert p.block_params["moe"].TE == 12
-    assert p.block_params["moe"].NSS == 3
+    assert p.module_params["moe"].TE == 12
+    assert p.module_params["moe"].NSS == 3
     # GDN-free M1 omits `recb`/`sbuf`/`convb` -> 48,033,792 < frozen's 49,178,624.
     # (M4b: 48,031,744; +2,048 B of always-allocated M5 GQA scratch `rcs`. The
     # `rope` table and the QV staging slabs are allocated only under `gqa_qv`.)
@@ -118,7 +118,7 @@ def test_m1_qwen35_pack_and_step_vs_logical_reference(
         IS=256,
         moe_tp=moe_tp,
     )
-    tiles = dataclasses.replace(TINY_TILES, bank=256 << 10).with_blocks(
+    tiles = dataclasses.replace(TINY_TILES, bank=256 << 10).with_modules(
         {"gqa": {"split": True}}
     )
     ex = ExecSpec(B=B, T=T, R=R, ctx=256, tiles=tiles, interpret=True)
@@ -177,7 +177,7 @@ def test_m1_qwen35_r8_multi_rank_interpret():
         IS=1024,
         moe_tp=False,
     )
-    tiles = dataclasses.replace(TINY_TILES, bank=256 << 10, hier=1, mb8=2).with_blocks(
+    tiles = dataclasses.replace(TINY_TILES, bank=256 << 10, hier=1, mb8=2).with_modules(
         {"gqa": {"split": True}}
     )
     ex = ExecSpec(B=2, T=1, R=8, ctx=256, tiles=tiles, interpret=True)
@@ -405,7 +405,7 @@ _FLAG_GEOM = dict(
 # so T13 == 2 * T2 and nbe=6 == TE (PIPE_EP preconditions).
 _FLAG_TILES_BASE = dataclasses.replace(
     TINY_TILES, bank=96 << 10, nbd=6, ebank=64 << 10, nbe=6
-).with_blocks({"gqa": {"kv_blk": 128, "nkv": 3}})
+).with_modules({"gqa": {"kv_blk": 128, "nkv": 3}})
 
 
 @pytest.fixture(scope="module")
@@ -447,10 +447,10 @@ def test_m5_flags_cpu_bit_exact_vs_default(m5_flag_base, flags):
     mesh1, g, ex, args, out_hid, out_st = m5_flag_base
     ex_opt = dataclasses.replace(ex, tiles=with_tile_fields(_FLAG_TILES_BASE, flags))
     step_opt, info_opt = qwen35.make_step(mesh1, g, ex_opt)
-    mp = info_opt["plan"].block_params["moe"]
+    mp = info_opt["plan"].module_params["moe"]
     assert mp.PIPE_EP is bool(flags.get("moe.pipe_ep", False))
     assert mp.topk_lanes is bool(flags.get("moe.topk_lanes", False))
-    assert info_opt["plan"].block_params["gqa"].PAIR_KV is bool(
+    assert info_opt["plan"].module_params["gqa"].PAIR_KV is bool(
         flags.get("gqa.pair_kv", False)
     )
     out_hid_opt, out_st_opt = step_opt(*args)
@@ -508,7 +508,7 @@ def test_m5_hier3_butterfly_all_reduce(R_test: int):
             TOPK=2,
         )
     )
-    tiles_h0 = dataclasses.replace(TINY_TILES, bank=256 << 10, hier=0).with_blocks(
+    tiles_h0 = dataclasses.replace(TINY_TILES, bank=256 << 10, hier=0).with_modules(
         {"gqa": {"split": False}}
     )
     tiles_h3 = dataclasses.replace(tiles_h0, hier=3)
@@ -531,10 +531,10 @@ def test_gqa_rope_fp32_ref_vs_kernel_parity():
     """Verify `GQATunables.rope_fp32=True` matches `reference_step` in the same mode."""
     mesh1 = Mesh(jax.devices("cpu")[:1], ("tp",))
     g = qwen35.Qwen35Geometry(**dict(_FLAG_GEOM, H=256))
-    tiles_def = dataclasses.replace(TINY_TILES, bank=256 << 10).with_blocks(
+    tiles_def = dataclasses.replace(TINY_TILES, bank=256 << 10).with_modules(
         {"gqa": {"kv_blk": 128, "nkv": 3, "rope_fp32": False}}
     )
-    tiles_fp32 = tiles_def.with_blocks({"gqa": {"rope_fp32": True}})
+    tiles_fp32 = tiles_def.with_modules({"gqa": {"rope_fp32": True}})
     ex_def = ExecSpec(B=2, T=1, R=1, ctx=256, tiles=tiles_def, interpret=True)
     ex_fp32 = dataclasses.replace(ex_def, tiles=tiles_fp32)
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
@@ -546,7 +546,7 @@ def test_gqa_rope_fp32_ref_vs_kernel_parity():
     args = qwen35.pack_inputs(pos, hid_l, w_l, st_l, g, ex_fp32, mesh=mesh1)
     step_def, _ = qwen35.make_step(mesh1, g, ex_def)
     step, info = qwen35.make_step(mesh1, g, ex_fp32)
-    assert info["plan"].block_params["gqa"].rope_fp32 is True
+    assert info["plan"].module_params["gqa"].rope_fp32 is True
     _, out_st_def = step_def(*args)
     out_hid, out_st = step(*args)
     assert not jnp.array_equal(out_st["kc"], out_st_def["kc"])

@@ -23,8 +23,8 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from .. import kernel, planner
-from ..blocks.gdn import GDNBlock
 from ..exec_spec import ExecSpec
+from ..modules.gdn import GDNModule
 from ..ops import BF16, F32, FP8, I32, rup
 from ..pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
 from . import qwen35_pool
@@ -32,8 +32,8 @@ from .qwen35_weights import default_eplb_cores, encode_eplb_ecopy
 
 
 def accept_states(g: Any, ex: ExecSpec, st: dict[str, Any], acc: Any) -> dict[str, Any]:
-    """Delegate verify-mode GDN state selection to `GDNBlock.accept`."""
-    return GDNBlock.accept(st, st, acc, T=ex.T, vh=g.vh(ex.R))
+    """Delegate verify-mode GDN state selection to `GDNModule.accept`."""
+    return GDNModule.accept(st, st, acc, T=ex.T, vh=g.vh(ex.R))
 
 
 def random_logical_inputs(
@@ -46,7 +46,7 @@ def random_logical_inputs(
     R, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
     L, H, E, HD = g.L, g.H, g.E, g.HD
     nh = g.nh(R)
-    lay_gdn = GDNBlock.lin_in_layout(g, ex)
+    lay_gdn = GDNModule.lin_in_layout(g, ex)
     vh, KD, VD = lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
     qkv, z, nli = lay_gdn.QKV, lay_gdn.Z, lay_gdn.NLI
     isr, ir, er, ew = g.ISR(R), g.IR(R), g.ER(R), g.EW(R)

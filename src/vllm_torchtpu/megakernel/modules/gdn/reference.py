@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`GDNBlock` pure-JAX reference forward pass (`gdn_reference`)."""
+"""`GDNModule` pure-JAX reference forward pass (`gdn_reference`)."""
 
 from __future__ import annotations
 

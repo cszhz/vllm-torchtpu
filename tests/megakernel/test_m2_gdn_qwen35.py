@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""M2 verification for `GDNBlock` and full hybrid `models.qwen35` (`att_every=4`)."""
+"""M2 verification for `GDNModule` and full hybrid `models.qwen35` (`att_every=4`)."""
 
 from __future__ import annotations
 
@@ -29,10 +29,10 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel import kernel, planner
-from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
+from vllm_torchtpu.megakernel.modules.gdn import GDNModule
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, rnd, rup
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 
@@ -116,11 +116,11 @@ def test_m2_recorded_full_ep_hybrid_build_invariants():
     assert info_10k["vmem_scratch_bytes"] == 49_762_304
 
 
-def test_m2_gdn_block_invariants_and_layout():
-    """Verify `GDNBlock.plan_params` enforces invariants and exposes `lin_in_layout`."""
+def test_m2_gdn_module_invariants_and_layout():
+    """Verify `GDNModule.plan_params` checks invariants and exposes `lin_in_layout`."""
     g = qwen35.FULL_EP
     ex = ExecSpec(B=4, T=1, R=8, ctx=4096)
-    lay = GDNBlock.lin_in_layout(g, ex)
+    lay = GDNModule.lin_in_layout(g, ex)
     assert (lay.kh, lay.vh, lay.QKV, lay.Z, lay.BA, lay.A_OFF, lay.NLI) == (
         2,
         8,
@@ -131,7 +131,7 @@ def test_m2_gdn_block_invariants_and_layout():
         2688,
     )
     p = planner.plan(qwen35.qwen35_spec(g), ex)
-    assert p.block_params["gdn"].l2_eps == 1e-6
+    assert p.module_params["gdn"].l2_eps == 1e-6
 
     # vh > 64 violates 64-lane b|a packing in ybuf[:, BA:BA+128]
     g_vh_over_64 = dataclasses.replace(g, KH=64, VH=128)
@@ -159,8 +159,8 @@ def test_m2_gdn_block_invariants_and_layout():
         pytest.param(20, 2, 8, marks=pytest.mark.slow),
     ],
 )
-def test_m2_gdn_block_standalone_interpret(B: int, T: int, gdn_rows: int):
-    """Test standalone `GDNBlock` across `T=1`, `T=2` verify, and `B=20` `GCH=True`."""
+def test_m2_gdn_module_standalone_interpret(B: int, T: int, gdn_rows: int):
+    """Test standalone `GDNModule` across `T=1`, `T=2` verify, and `B=20` `GCH=True`."""
     devs = jax.devices("cpu")
     mesh = Mesh(devs[:1], ("tp",))
     tp = NamedSharding(mesh, P("tp"))
@@ -187,19 +187,19 @@ def test_m2_gdn_block_standalone_interpret(B: int, T: int, gdn_rows: int):
     spec = ModelSpec(
         name="gdn_standalone",
         config=g,
-        layer_type=LayerType(name="gdn_layer", slots=(GDNBlock(),)),
+        layer_type=LayerType(name="gdn_layer", slots=(GDNModule(),)),
     )
     tiles = dataclasses.replace(
         TINY_TILES, bank=256 << 10, inplace=not T > 1
-    ).with_blocks({"gdn": {"gdn_rows": gdn_rows, "gdn_bufs": 2}})
+    ).with_modules({"gdn": {"gdn_rows": gdn_rows, "gdn_bufs": 2}})
     ex = ExecSpec(B=B, T=T, R=1, ctx=128, tiles=tiles, interpret=True)
     p = planner.plan(spec, ex)
-    gp = p.block_params["gdn"]
+    gp = p.module_params["gdn"]
     assert (B > 16 and gdn_rows > 0) == gp.GCH
 
     NS, M = ex.NS, ex.M
     L, H, KD, VD = g.L, g.H, g.KD, g.VD
-    lin_lay = GDNBlock.lin_in_layout(g, ex)
+    lin_lay = GDNModule.lin_in_layout(g, ex)
     kh, vh, QKV, Z, BA, NLI = (
         lin_lay.kh,
         lin_lay.vh,
@@ -426,7 +426,7 @@ def test_m2_qwen35_hybrid_pack_and_step_vs_logical_reference(
     )
     tiles = dataclasses.replace(
         TINY_TILES, bank=256 << 10, inplace=R == 1 and not T > 1
-    ).with_blocks(
+    ).with_modules(
         {"gqa": {"split": True}, "gdn": {"gdn_rows": gdn_rows, "gdn_bufs": 2}}
     )
     ex = ExecSpec(B=B, T=T, R=R, ctx=256, tiles=tiles, interpret=True)
@@ -466,7 +466,7 @@ def test_m2_qwen35_hybrid_pack_and_step_vs_logical_reference(
     if T > 1:
         acc = jnp.asarray([1, 2], dtype=I32)
         vh = g.vh(R)
-        jit_accept = jax.jit(lambda st, a: GDNBlock.accept(st, st, a, T=T, vh=vh))
+        jit_accept = jax.jit(lambda st, a: GDNModule.accept(st, st, a, T=T, vh=vh))
         acc_folded = jit_accept(out_st, acc)
         acc_unfolded = qwen35.accept_states(g, ex, ref_st, [1, 2])
         assert jnp.allclose(
@@ -510,7 +510,7 @@ def test_m2_qwen35_hybrid_r8_multi_rank_interpret(T: int):
     )
     tiles = dataclasses.replace(
         TINY_TILES, bank=256 << 10, hier=1, mb8=2, inplace=False
-    ).with_blocks({"gqa": {"split": True}})
+    ).with_modules({"gqa": {"split": True}})
     ex = ExecSpec(B=2 * T, T=T, R=8, ctx=256, tiles=tiles, interpret=True)
 
     key = jax.random.PRNGKey(909 + T)
@@ -633,7 +633,7 @@ def test_m2_bit_exact_vs_frozen_qwen35_hybrid(B: int, T: int, gdn_rows: int):
     )
     tiles_lib = dataclasses.replace(
         TINY_TILES, bank=256 << 10, inplace=not T > 1
-    ).with_blocks({"gdn": {"gdn_rows": gdn_rows, "gdn_bufs": 2}})
+    ).with_modules({"gdn": {"gdn_rows": gdn_rows, "gdn_bufs": 2}})
     ex = ExecSpec(B=B, T=T, R=1, ctx=256, tiles=tiles_lib, interpret=True)
     pos, hid_lib, w_lib, st_lib = qwen35.random_inputs(
         jax.random.PRNGKey(B * 10 + T), g, ex, mesh=mesh

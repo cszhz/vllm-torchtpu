@@ -31,16 +31,16 @@ from vllm_torchtpu.megakernel import comm, planner, stream, vmem
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rnd
 from vllm_torchtpu.megakernel.spec import (
-    Block,
     LayerType,
     ModelSpec,
+    Module,
     SwitchSlot,
     WeightDecl,
 )
 
 
-class _TwoTileBlock(Block):
-    """Minimal block declaring two static streamed weights for `TwoRing` testing."""
+class _TwoTileModule(Module):
+    """Minimal module declaring two static streamed weights for `TwoRing` testing."""
 
     name = "two_tile"
     reduction = "allreduce"
@@ -55,8 +55,8 @@ class _TwoTileBlock(Block):
         return {"acc": 256, "xb2": 128}
 
 
-class _AltTileBlock(Block):
-    """Alternate branch block for testing hybrid `SwitchSlot` prefetch in `TwoRing`."""
+class _AltTileModule(Module):
+    """Alternate branch module for testing hybrid `SwitchSlot` prefetch in `TwoRing`."""
 
     name = "alt_tile"
     reduction = "allreduce"
@@ -77,7 +77,7 @@ def test_tworing_stream_and_lazy_segment_in_pallas():
     ex = ExecSpec(B=4, T=1, R=1, ctx=128, tiles=tiles, interpret=True)
     g = FakeGeometry(L=2, H=256)
     ms = ModelSpec(
-        "tworing_test", config=g, layer_type=LayerType("lt", slots=(_TwoTileBlock(),))
+        "tworing_test", config=g, layer_type=LayerType("lt", slots=(_TwoTileModule(),))
     )
     cp, scratch = vmem.build_scratch(ms, ex)
     sp = cp.stream
@@ -150,7 +150,7 @@ def test_tworing_hybrid_switch_slot_in_pallas():
     ex = ExecSpec(B=4, T=1, R=1, ctx=128, tiles=tiles, interpret=True)
     g = FakeGeometry(L=2, att_every=2, H=256)
     sw = SwitchSlot(
-        "mixer", branches=(_AltTileBlock(), _TwoTileBlock()), branch_counts=(1, 1)
+        "mixer", branches=(_AltTileModule(), _TwoTileModule()), branch_counts=(1, 1)
     )
     ms = ModelSpec("hybrid_tworing", config=g, layer_type=LayerType("lt", slots=(sw,)))
     cp, scratch = vmem.build_scratch(ms, ex)
@@ -213,7 +213,7 @@ def test_tworing_hybrid_switch_slot_in_pallas():
         w2_full.reshape(wsh["w2"][0]),
     )
 
-    # Layer 0 runs _AltTileBlock; Layer 1 runs _TwoTileBlock
+    # Layer 0 runs _AltTileModule; Layer 1 runs _TwoTileModule
     ref = x.astype(F32)
     y0 = ref.astype(BF16).astype(F32) @ w_alt_full[0].astype(F32)
     ref = (ref + y0).astype(BF16).astype(F32)
@@ -230,7 +230,7 @@ def test_tworing_consumption_order_and_nesting_guards():
     ex = ExecSpec(B=4, T=1, R=1, ctx=128, tiles=tiles, interpret=True)
     g = FakeGeometry(L=2, H=256)
     ms = ModelSpec(
-        "guard_test", config=g, layer_type=LayerType("lt", slots=(_TwoTileBlock(),))
+        "guard_test", config=g, layer_type=LayerType("lt", slots=(_TwoTileModule(),))
     )
     cp, scratch = vmem.build_scratch(ms, ex)
     sp = cp.stream
@@ -297,7 +297,7 @@ def test_allreduce_ring_modes_in_pallas(R: int, hier: int, rsag: bool):
     ex = ExecSpec(B=4, T=1, R=R, ctx=128, tiles=tiles, interpret=True)
     g = FakeGeometry(L=2, H=1024)
     ms = ModelSpec(
-        "ar_test", config=g, layer_type=LayerType("lt", slots=(_TwoTileBlock(),))
+        "ar_test", config=g, layer_type=LayerType("lt", slots=(_TwoTileModule(),))
     )
     cp, scratch = vmem.build_scratch(ms, ex)
     s_names = list(scratch.keys())

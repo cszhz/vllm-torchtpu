@@ -11,19 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MoE block package: `MoEBlock` (`MoE`) and its parameters / tunables."""
+"""GQA module package: `GQAModule` (`GQA`) and its parameters / tunables."""
 
-from .block import MoEBlock
-from .params import MoEDebug, MoEParams, MoETunables
-from .topk import topk_rows_on_lanes
+from .module import GQAModule
+from .params import GQAParams, GQATunables
 
-MoE = MoEBlock
+GQA = GQAModule
 
-__all__ = [
-    "MoE",
-    "MoEBlock",
-    "MoEDebug",
-    "MoEParams",
-    "MoETunables",
-    "topk_rows_on_lanes",
-]
+__all__ = ["GQA", "GQAModule", "GQAParams", "GQATunables"]

@@ -19,22 +19,22 @@ import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
-from .blocks.gdn import GDNBlock
-from .blocks.gqa import GQABlock
-from .blocks.moe import MoEBlock
 from .decls import REQUIRED, _lookup_raw_key, _sub_cfg
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .geometry import ModelGeometry
+from .modules.gdn import GDNModule
+from .modules.gqa import GQAModule
+from .modules.moe import MoEModule
 from .pool import PoolLayout
 from .schedule import (
-    BlockOrBinding,
     FromHFLayerTypes,
+    ModuleOrBinding,
     ResolvedSchedule,
     Schedule,
-    _block_cls_of,
+    _module_cls_of,
 )
-from .spec import Block, LayerType, ModelSpec, SwitchSlot
+from .spec import LayerType, ModelSpec, Module, SwitchSlot
 from .validate import (
     describe_binding as _describe_binding,
 )
@@ -66,16 +66,16 @@ def _merged_cfg(hf_config: Any, extras: Mapping[str, Any]) -> dict[str, Any]:
     return base
 
 
-def instantiate_spec_block(
-    b: BlockOrBinding, *, pool_layout: PoolLayout | None = None
-) -> Block:
-    """Instantiate a `ModelSpec` `Block` from a `BlockBinding` or return `b`."""
-    if isinstance(b, Block):
-        return b
-    opts = {k: v for k, v in b.options.items() if v is not None}
-    if issubclass(b.block_cls, GQABlock):
-        return b.block_cls(pool_layout=pool_layout, prefix=b.prefix, **opts)
-    return b.block_cls(prefix=b.prefix, **opts)
+def instantiate_spec_module(
+    m: ModuleOrBinding, *, pool_layout: PoolLayout | None = None
+) -> Module:
+    """Instantiate a `ModelSpec` `Module` from a `ModuleBinding` or return `m`."""
+    if isinstance(m, Module):
+        return m
+    opts = {k: v for k, v in m.options.items() if v is not None}
+    if issubclass(m.module_cls, GQAModule):
+        return m.module_cls(pool_layout=pool_layout, prefix=m.prefix, **opts)
+    return m.module_cls(prefix=m.prefix, **opts)
 
 
 def derive_model_geometry(
@@ -115,9 +115,9 @@ def derive_model_geometry(
             "partial_rotary_factor": top.get("rope_partial"),
         },
     )
-    gqa_b = cls._find_binding(GQABlock, sched)
+    gqa_b = cls._find_binding(GQAModule, sched)
     if gqa_b is None:
-        raise MegakernelConfigError(f"ModelDef {mname!r} has no GQABlock in schedule")
+        raise MegakernelConfigError(f"ModelDef {mname!r} has no GQAModule in schedule")
     gqa_g = gqa_b.resolve(merged)
     NH, NKV, HD = int(gqa_g.NH), int(gqa_g.NKV), int(gqa_g.HD)
     if "rot" in gqa_b.explicit_fields or "rope_partial" not in top:
@@ -126,7 +126,7 @@ def derive_model_geometry(
         ROT = int(round(HD * float(top["rope_partial"])))
     theta = float(top["rope_theta"]) if "rope_theta" in top else float(gqa_g.theta)
 
-    gdn_b = cls._find_binding(GDNBlock, sched)
+    gdn_b = cls._find_binding(GDNModule, sched)
     if gdn_b is not None:
         gdn_g = gdn_b.resolve(merged)
         KH, VH = int(gdn_g.KH), int(gdn_g.VH)
@@ -136,9 +136,9 @@ def derive_model_geometry(
     else:
         KH = VH = KD = VD = 0
 
-    moe_b = cls._find_binding(MoEBlock, sched)
+    moe_b = cls._find_binding(MoEModule, sched)
     if moe_b is None:
-        raise MegakernelConfigError(f"ModelDef {mname!r} has no MoEBlock in schedule")
+        raise MegakernelConfigError(f"ModelDef {mname!r} has no MoEModule in schedule")
     exp_spec = moe_b.fields.get("experts", "num_experts")
     exp_key = exp_spec[0] if isinstance(exp_spec, tuple) else exp_spec
     if isinstance(exp_key, str):
@@ -187,7 +187,7 @@ def derive_model_spec(
     cls: Any,
     hf_config_or_geom: Any = None,
     *,
-    gdn_block: Block | None = None,
+    gdn_module: Module | None = None,
     moe_tp: bool | None = None,
     e_slots: int | None = None,
     R: int = 8,
@@ -243,8 +243,8 @@ def derive_model_spec(
             b
             for i, b in enumerate(sched.ffn)
             if "ffn" not in ovs.get(i, {})
-            and issubclass(_block_cls_of(b), MoEBlock)
-            and getattr(_block_cls_of(b), "routed_experts", True)
+            and issubclass(_module_cls_of(b), MoEModule)
+            and getattr(_module_cls_of(b), "routed_experts", True)
         ),
         None,
     )
@@ -256,21 +256,21 @@ def derive_model_spec(
                 "cannot be represented in ModelSpec"
             )
     play = cls.pool_layout(g, R=R)
-    branches: list[Block] = []
+    branches: list[Module] = []
     counts: list[int] = []
     for b in sched.mixer[:p]:
-        blk = (
-            gdn_block
-            if gdn_block is not None and issubclass(_block_cls_of(b), GDNBlock)
-            else instantiate_spec_block(b, pool_layout=play)
+        mod = (
+            gdn_module
+            if gdn_module is not None and issubclass(_module_cls_of(b), GDNModule)
+            else instantiate_spec_module(b, pool_layout=play)
         )
-        if branches and branches[-1].name == blk.name:
+        if branches and branches[-1].name == mod.name:
             counts[-1] += 1
         else:
-            branches.append(blk)
+            branches.append(mod)
             counts.append(1)
     mixer_slot = SwitchSlot("mixer", tuple(branches), tuple(counts))
-    ffn_blk = instantiate_spec_block(canon_ffn)
+    ffn_mod = instantiate_spec_module(canon_ffn)
     own_lt = cls.__dict__.get("layer_type_name") if isinstance(cls, type) else None
     lt_name = own_lt or (
         cls.layer_type_name
@@ -280,7 +280,7 @@ def derive_model_spec(
     return ModelSpec(
         name=mname,
         config=g,
-        layer_type=LayerType(name=lt_name, slots=(mixer_slot, ffn_blk)),
+        layer_type=LayerType(name=lt_name, slots=(mixer_slot, ffn_mod)),
         cache_backend=cls.pool_backend(g, R=R),
     )
 
@@ -294,10 +294,10 @@ def _synth_layer_types(cls: Any, g: ModelGeometry) -> tuple[str, list[str]] | No
         raise MegakernelConfigError(f"Invalid layers L={g.L}, att_every={g.att_every}")
     m = cls.schedule.mixer.mapping
     att_k = next(
-        (k for k, b in m.items() if issubclass(_block_cls_of(b), GQABlock)), None
+        (k for k, b in m.items() if issubclass(_module_cls_of(b), GQAModule)), None
     )
     rec_k = next(
-        (k for k, b in m.items() if issubclass(_block_cls_of(b), GDNBlock)), None
+        (k for k, b in m.items() if issubclass(_module_cls_of(b), GDNModule)), None
     )
     if att_k is None or (g.att_every > 1 and rec_k is None):
         raise MegakernelConfigError(
@@ -353,9 +353,9 @@ def shrink_model_hf_config(
         "shared_inter": g_tiny.IS,
     }
     for b, mapping in (
-        (cls._find_binding(GQABlock, sched), gqa_map),
-        (cls._find_binding(GDNBlock, sched), gdn_map),
-        (cls._find_binding(MoEBlock, sched), moe_map),
+        (cls._find_binding(GQAModule, sched), gqa_map),
+        (cls._find_binding(GDNModule, sched), gdn_map),
+        (cls._find_binding(MoEModule, sched), moe_map),
     ):
         if b is not None:
             for canon, val in mapping.items():
@@ -371,7 +371,7 @@ def shrink_model_hf_config(
 __all__ = [
     "derive_model_geometry",
     "derive_model_spec",
-    "instantiate_spec_block",
+    "instantiate_spec_module",
     "resolve_model_schedule",
     "shrink_model_hf_config",
 ]

@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GDN block package: `GDNBlock` (`GDN`) and its parameters / tunables."""
+"""GDN module package: `GDNModule` (`GDN`) and its parameters / tunables."""
 
-from .block import GDNBlock
+from .module import GDNModule
 from .params import GDNLinInLayout, GDNParams, GDNTunables
 
-GDN = GDNBlock
+GDN = GDNModule
 
-__all__ = ["GDN", "GDNBlock", "GDNLinInLayout", "GDNParams", "GDNTunables"]
+__all__ = ["GDN", "GDNLinInLayout", "GDNModule", "GDNParams", "GDNTunables"]

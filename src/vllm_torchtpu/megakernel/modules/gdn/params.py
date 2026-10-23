@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`GDNBlock` build-time parameters, tunables and their derivation."""
+"""`GDNModule` build-time parameters, tunables and their derivation."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ class GDNLinInLayout:
 
 @dataclass(frozen=True)
 class GDNParams:
-    """Block-local parameters owned and computed by `GDNBlock.plan_params`."""
+    """Module-local parameters owned and computed by `GDNModule.plan_params`."""
 
     kh: int
     vh: int
@@ -93,7 +93,7 @@ class GDNParams:
 
 @dataclass(frozen=True)
 class GDNTunables:
-    """`GDNBlock` knobs (`Tiles.blocks["gdn"]`); `NUMERICS` classes each field."""
+    """`GDNModule` knobs (`Tiles.modules["gdn"]`); `NUMERICS` classes each field."""
 
     gdn_rows: int = 8  # State row chunk size of the chunked (`GCH`) path
     gdn_bufs: int = 3  # State ring depth of the chunked path
@@ -139,7 +139,7 @@ def gdn_lin_in_layout(g: Any, ex_or_r: ExecSpec | int) -> GDNLinInLayout:
 def derive_params(
     g: Any, ex: ExecSpec, plan: Any, tt: GDNTunables, name: str
 ) -> GDNParams:
-    """`GDNParams` for geometry `g` under `ex` and the block's tunables `tt`."""
+    """`GDNParams` for geometry `g` under `ex` and the module's tunables `tt`."""
     tiles = ex.resolve_tiles(g)
     R, B, T = ex.R, ex.B, ex.T
     assert not (ex.VER and tiles.inplace), (
@@ -164,7 +164,7 @@ def derive_params(
     CR = rup(3 * B, 8)
     HR = rup(3 + T, 8)
 
-    ngdn = plan.block_layer_counts.get(name, 0)
+    ngdn = plan.module_layer_counts.get(name, 0)
     GCH = (
         (ex.WIDE or bool(cache_exec(ex).GPR))
         and tt.gdn_rows > 0
@@ -268,11 +268,11 @@ def derive_params(
 def checked_pool_layout(
     plan: Any, ex: ExecSpec, g_per_att: int, ssm_u32_rows: int
 ) -> Any:
-    """The model's `PoolLayout`, checked against this block's geometry.
+    """The model's `PoolLayout`, checked against this module's geometry.
 
     In-kernel pool I/O (GPR / fused) reads checkpoint slots straight from
     the pools, so the slot geometry must come from the pool backend's
-    layout; raise `MegakernelConfigError` when it can't serve this block.
+    layout; raise `MegakernelConfigError` when it can't serve this module.
     """
     pb = plan.model_spec.cache_backend
     if pb is None or pb.layout is None:

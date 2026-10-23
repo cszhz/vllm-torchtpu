@@ -50,13 +50,13 @@ from vllm_torchtpu.megakernel import (  # noqa: E402
     kernel,
     planner,
 )
-from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock  # noqa: E402
 from vllm_torchtpu.megakernel.cache import should_fuse_pool_io  # noqa: E402
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec  # noqa: E402
 from vllm_torchtpu.megakernel.models import qwen35  # noqa: E402
 from vllm_torchtpu.megakernel.models.qwen35_profile import (  # noqa: E402
     baseline_tiles,
 )
+from vllm_torchtpu.megakernel.modules.gdn import GDNModule  # noqa: E402
 from vllm_torchtpu.megakernel.ops import (  # noqa: E402
     BF16,
     F32,
@@ -599,7 +599,7 @@ def test_m2_tpu_v7x8_full_ep_parity_and_latency():
             acc_dev = jax.device_put((jnp.arange(ex.NS, dtype=I32) % T) + 1, rep)
             vh = g.vh(8)
             acc_st = jax.jit(
-                lambda s, a, _t=T, _vh=vh: GDNBlock.accept(s, s, a, T=_t, vh=_vh)
+                lambda s, a, _t=T, _vh=vh: GDNModule.accept(s, s, a, T=_t, vh=_vh)
             )(out_st_lib, acc_dev)
             jax.block_until_ready(acc_st["rec"])
             assert acc_st["conv"].shape == st_lib["conv"].shape
@@ -1867,7 +1867,7 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
     eplb_results = []
     for ecopy_opt in (0, 1):
         for T, B in [(1, 16), (4, 16)]:
-            tiles_lib_e = frozen_parity_tiles(B).with_blocks(
+            tiles_lib_e = frozen_parity_tiles(B).with_modules(
                 {"moe": {"ecopy_opt": ecopy_opt}}
             )
             ex_e = ExecSpec(B=B, T=T, R=8, ctx=4096, stack_e=True, tiles=tiles_lib_e)
@@ -2190,7 +2190,7 @@ def test_m5_tpu_v7x8_profile_ablation_bench():
         )
         assert np.all(np.isfinite(hid_np)), tag
         stats, raw = _time_pooled_step_fn(step, pos, hid, w_lib, raw, pt, ckpt, roff)
-        gpr = bool(info["plan"].block_params["gdn"].GPR)
+        gpr = bool(info["plan"].module_params["gdn"].GPR)
         del pos, hid, raw, pt, ckpt, roff, out, step
         gc.collect()
         return hid_np, stats, gpr, info["vmem_scratch_bytes"]
@@ -2226,8 +2226,8 @@ def test_m5_tpu_v7x8_profile_ablation_bench():
     print("=== M5_TPU_V7X8_BENCH_JSON_END ===", flush=True)
 
 
-# Block owning each bisect flag (`Tiles.blocks`).
-_BISECT_FLAG_BLOCK = {"gqa_qv": "gqa", "moe_unroll": "moe"}
+# Module owning each bisect flag (`Tiles.modules`).
+_BISECT_FLAG_MODULE = {"gqa_qv": "gqa", "moe_unroll": "moe"}
 
 
 @pytest.mark.parametrize(
@@ -2245,8 +2245,8 @@ def test_m5_tpu_v7x8_frozen_parity_bisect(variant: str, monkeypatch):
     monkeypatch.setitem(
         globals(),
         "frozen_parity_tiles",
-        lambda B, **kw: baseline_tiles(B, **kw).with_blocks(
-            {_BISECT_FLAG_BLOCK[f]: {f: v} for f, v in flags.items()}
+        lambda B, **kw: baseline_tiles(B, **kw).with_modules(
+            {_BISECT_FLAG_MODULE[f]: {f: v} for f, v in flags.items()}
         ),
     )
     print(f"\n=== M5_BISECT variant={variant} flags={flags}", flush=True)
@@ -2303,7 +2303,7 @@ def test_fused_vs_split_t4_tpu_bitwise(tiles: str, B: int, seed: int):
         ex = mk.with_cache(
             dataclasses.replace(
                 ex0,
-                tiles=ex0.resolved_tiles.with_blocks(
+                tiles=ex0.resolved_tiles.with_modules(
                     {"gdn": {"conv_stage": False, "gdn_head_major": True}}
                 ),
                 interpret=False,
@@ -2329,8 +2329,8 @@ def test_fused_vs_split_t4_tpu_bitwise(tiles: str, B: int, seed: int):
             nbe=max(6, min(t.nbe, 12)),
             ebank=256 << 10,
             vmem_mib=32,
-        ).with_blocks(
-            {"gqa": {"kv_blk": 256, "kv_sub": 128 if t.block("gqa").kv_sub else 0}}
+        ).with_modules(
+            {"gqa": {"kv_blk": 256, "kv_sub": 128 if t.module("gqa").kv_sub else 0}}
         )
         ex = mk.with_cache(
             dataclasses.replace(ex, tiles=t, interpret=False), pool_gather=False

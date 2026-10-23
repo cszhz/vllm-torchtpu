@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Declarative `Norm` and `Embedding` blocks (`bind`, `hf_params`, `reference`)."""
+"""Declarative `NormModule` and `EmbeddingModule` (`bind`, `hf_params`, `reference`)."""
 
 from __future__ import annotations
 
@@ -23,17 +23,17 @@ import jax.numpy as jnp
 
 from ..decls import (
     REQUIRED,
-    BlockBinding,
     FrozenDict,
     HFParamDecl,
+    ModuleBinding,
     ParamTransform,
-    ResolvedBlockGeometry,
+    ResolvedModuleGeometry,
     VLLMAlias,
     apply_decl_overrides,
     validate_rename_and_transforms,
 )
+from ..module import Module
 from ..ops import BF16, F32, I32, rmsnorm
-from ..spec import Block
 
 
 def _canonical_norm_name(prefix: str, explicit: str | None = None) -> str:
@@ -50,8 +50,8 @@ def _canonical_norm_name(prefix: str, explicit: str | None = None) -> str:
     return prefix.rsplit(".", 1)[-1] if prefix else "norm"
 
 
-class Norm(Block):
-    """RMSNorm block declaration (`bind`, `hf_params`, and pure-JAX `reference`)."""
+class NormModule(Module):
+    """RMSNorm module declaration (`bind`, `hf_params`, and pure-JAX `reference`)."""
 
     name: str = "norm"
     reduction = "none"
@@ -93,19 +93,19 @@ class Norm(Block):
         )
 
     @classmethod
-    def bind(cls, prefix: str = "", **hf_fields_or_options: Any) -> BlockBinding:
+    def bind(cls, prefix: str = "", **hf_fields_or_options: Any) -> ModuleBinding:
         canon = _canonical_norm_name(prefix, hf_fields_or_options.get("param_name"))
         rename = dict(hf_fields_or_options.get("rename", {}) or {})
         transforms = dict(hf_fields_or_options.get("transforms", {}) or {})
         if set(rename) - {canon}:
             raise ValueError(
-                f"Norm.bind got unknown rename key(s) {sorted(set(rename) - {canon})}; "
-                f"expected {[canon]}"
+                f"{cls.__name__}.bind got unknown rename key(s) "
+                f"{sorted(set(rename) - {canon})}; expected {[canon]}"
             )
         valid_tf = {canon} | set(rename.values())
         if set(transforms) - valid_tf:
             raise ValueError(
-                f"Norm.bind got unknown transforms key(s) "
+                f"{cls.__name__}.bind got unknown transforms key(s) "
                 f"{sorted(set(transforms) - valid_tf)}; expected {sorted(valid_tf)}"
             )
         validate_rename_and_transforms(
@@ -114,7 +114,7 @@ class Norm(Block):
         return super().bind(prefix, **hf_fields_or_options)
 
     @classmethod
-    def _from_resolved(cls, resolved: ResolvedBlockGeometry) -> Norm:
+    def _from_resolved(cls, resolved: ResolvedModuleGeometry) -> NormModule:
         return cls(
             prefix=resolved.prefix,
             geometry=resolved,
@@ -130,7 +130,7 @@ class Norm(Block):
     def renamed_param_name(self, prefix: str | None = None, g: Any = None) -> str:
         geom = g if g is not None else self.geometry
         canon = self.canonical_param_name(prefix)
-        if isinstance(geom, ResolvedBlockGeometry):
+        if isinstance(geom, ResolvedModuleGeometry):
             return geom.rename.get(canon, canon)
         return canon
 
@@ -177,7 +177,8 @@ class Norm(Block):
             key = self.renamed_param_name(self.prefix, geom)
             if key not in params:
                 raise KeyError(
-                    f"Norm.reference could not find weight {key!r} in params"
+                    f"{type(self).__name__}.reference could not find weight "
+                    f"{key!r} in params"
                 )
             w = params[key]
         else:
@@ -197,7 +198,7 @@ class Norm(Block):
         elif self.zero_centered is not None:
             zc_val = bool(self.zero_centered)
         elif (
-            isinstance(geom, ResolvedBlockGeometry) and "zero_centered" in geom.options
+            isinstance(geom, ResolvedModuleGeometry) and "zero_centered" in geom.options
         ):
             zc_val = bool(geom.options["zero_centered"])
         else:
@@ -209,8 +210,8 @@ class Norm(Block):
         return out, state
 
 
-class Embedding(Block):
-    """Token embedding block declaration (`bind`, `hf_params`, `reference`)."""
+class EmbeddingModule(Module):
+    """Token embedding module declaration (`bind`, `hf_params`, `reference`)."""
 
     name: str = "embedding"
     reduction = "none"
@@ -243,19 +244,19 @@ class Embedding(Block):
         self.options = FrozenDict({"param_name": param_name, "dtype": dtype})
 
     @classmethod
-    def bind(cls, prefix: str = "", **hf_fields_or_options: Any) -> BlockBinding:
+    def bind(cls, prefix: str = "", **hf_fields_or_options: Any) -> ModuleBinding:
         canon = str(hf_fields_or_options.get("param_name") or "embed_tokens")
         rename = dict(hf_fields_or_options.get("rename", {}) or {})
         transforms = dict(hf_fields_or_options.get("transforms", {}) or {})
         if set(rename) - {canon}:
             raise ValueError(
-                f"Embedding.bind got unknown rename key(s) "
+                f"{cls.__name__}.bind got unknown rename key(s) "
                 f"{sorted(set(rename) - {canon})}; expected {[canon]}"
             )
         valid_tf = {canon} | set(rename.values())
         if set(transforms) - valid_tf:
             raise ValueError(
-                f"Embedding.bind got unknown transforms key(s) "
+                f"{cls.__name__}.bind got unknown transforms key(s) "
                 f"{sorted(set(transforms) - valid_tf)}; expected {sorted(valid_tf)}"
             )
         validate_rename_and_transforms(
@@ -264,7 +265,7 @@ class Embedding(Block):
         return super().bind(prefix or "model.embed_tokens", **hf_fields_or_options)
 
     @classmethod
-    def _from_resolved(cls, resolved: ResolvedBlockGeometry) -> Embedding:
+    def _from_resolved(cls, resolved: ResolvedModuleGeometry) -> EmbeddingModule:
         return cls(
             prefix=resolved.prefix or "model.embed_tokens",
             geometry=resolved,
@@ -275,7 +276,7 @@ class Embedding(Block):
     def renamed_param_name(self, g: Any = None) -> str:
         geom = g if g is not None else self.geometry
         canon = self.param_name or "embed_tokens"
-        if isinstance(geom, ResolvedBlockGeometry):
+        if isinstance(geom, ResolvedModuleGeometry):
             return geom.rename.get(canon, canon)
         return canon
 
@@ -323,7 +324,8 @@ class Embedding(Block):
             key = self.renamed_param_name(geom)
             if key not in params:
                 raise KeyError(
-                    f"Embedding.reference could not find weight {key!r} in params"
+                    f"{type(self).__name__}.reference could not find weight "
+                    f"{key!r} in params"
                 )
             w = params[key]
         else:
@@ -334,12 +336,12 @@ class Embedding(Block):
         return out, state
 
 
-NormBlock = Norm
-EmbeddingBlock = Embedding
+Norm = NormModule
+Embedding = EmbeddingModule
 
 __all__ = [
     "Embedding",
-    "EmbeddingBlock",
+    "EmbeddingModule",
     "Norm",
-    "NormBlock",
+    "NormModule",
 ]

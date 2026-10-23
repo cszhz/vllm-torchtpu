@@ -140,36 +140,36 @@ def test_megakernel_portability_ast_guard():
                     )
 
 
-def test_blocks_do_not_import_experimental_code():
-    """Blocks reach fused pool I/O only via the core `fused_io_hook` module.
+def test_modules_do_not_import_experimental_code():
+    """Modules reach fused pool I/O only via the core `fused_io_hook` module.
 
-    No module under `blocks/` may import `experimental/` (or the fused helpers)
+    No module under `modules/` may import `experimental/` (or the fused helpers)
     at any level, so GQA / GDN can land without the experimental code.
     """
-    blocks_root = Path(megakernel.__file__).resolve().parent / "blocks"
-    py_files = sorted(blocks_root.rglob("*.py"))
-    rel_paths = {p.relative_to(blocks_root).as_posix() for p in py_files}
-    expected_block_files = {
+    modules_root = Path(megakernel.__file__).resolve().parent / "modules"
+    py_files = sorted(modules_root.rglob("*.py"))
+    rel_paths = {p.relative_to(modules_root).as_posix() for p in py_files}
+    expected_module_files = {
         "__init__.py",
         "norm.py",
         "gqa/__init__.py",
-        "gqa/block.py",
+        "gqa/module.py",
         "gqa/decls.py",
         "gqa/kv.py",
         "gqa/reference.py",
         "gdn/__init__.py",
-        "gdn/block.py",
+        "gdn/module.py",
         "gdn/decls.py",
         "gdn/states.py",
         "gdn/reference.py",
         "moe/__init__.py",
-        "moe/block.py",
+        "moe/module.py",
         "moe/decls.py",
         "moe/reference.py",
     }
-    assert expected_block_files <= rel_paths, expected_block_files - rel_paths
+    assert expected_module_files <= rel_paths, expected_module_files - rel_paths
     for path in py_files:
-        rel = path.relative_to(blocks_root).as_posix()
+        rel = path.relative_to(modules_root).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             # Only the library's own modules matter (relative imports or
@@ -185,7 +185,7 @@ def test_blocks_do_not_import_experimental_code():
                     names = [mod] + [a.name for a in node.names]
             for name in names:
                 assert "experimental" not in name and "fused_pool_io" not in name, (
-                    f"blocks/{rel}:{node.lineno} imports '{name}'; blocks "
+                    f"modules/{rel}:{node.lineno} imports '{name}'; modules "
                     "must reach fused pool I/O through fused_io_hook"
                 )
 
@@ -194,8 +194,9 @@ def test_pool_package_is_framework_free():
     """`megakernel/pool/` imports only stdlib, jax, numpy and core spec modules.
 
     The generic pool package must not depend on `models/` (no per-model code),
-    nor on blocks, the kernel builder or the cache pipes; its only internal
-    dependencies are `ops`, `errors`, `spec`, `exec_spec` and its own modules.
+    nor on modules, the kernel builder or the cache pipes; its only internal
+    dependencies are `ops`, `errors`, `spec`, `module`, `decls`, `exec_spec`
+    and its own modules.
     """
     pool_root = Path(megakernel.__file__).resolve().parent / "pool"
     py_files = sorted(pool_root.rglob("*.py"))
@@ -204,7 +205,7 @@ def test_pool_package_is_framework_free():
     assert len(required_pool_modules) > 1
     assert required_pool_modules <= rel_paths, required_pool_modules - rel_paths
     allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
-    allowed_core = {"ops", "errors", "spec", "decls", "exec_spec"}
+    allowed_core = {"ops", "errors", "spec", "module", "decls", "exec_spec"}
     for path in py_files:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
@@ -226,7 +227,7 @@ def test_pool_package_is_framework_free():
                         assert name.split(".")[0] in allowed_core, (
                             f"pool/{path.name}:{node.lineno} imports '..{name}'; "
                             f"pool/ may only use {sorted(allowed_core)} from core "
-                            "(never models/, blocks/, kernel or cache)"
+                            "(never models/, modules/, kernel or cache)"
                         )
                 else:
                     assert node.level == 1, (

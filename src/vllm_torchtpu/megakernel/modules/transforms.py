@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Internal helper to shard, pad, and fuse canonical MK-shaped block parameters.
+"""Internal helper to shard, pad, and fuse canonical MK-shaped module parameters.
 
 Takes tensors already keyed by canonical `HFParamDecl.name` in canonical
 `HFParamDecl.shape` (with optional leading layer dimension) and applies the

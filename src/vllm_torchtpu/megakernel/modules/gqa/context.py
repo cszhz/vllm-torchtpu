@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Per-trace emit state shared by the `GQABlock` emit helpers."""
+"""Per-trace emit state shared by the `GQAModule` emit helpers."""
 
 from __future__ import annotations
 
@@ -27,10 +27,10 @@ from .params import GQAParams
 
 @dataclass(frozen=True)
 class GQAEmit:
-    """References and per-layer values one `GQABlock.emit` trace reads.
+    """References and per-layer values one `GQAModule.emit` trace reads.
 
     `gi` is this rank's index in its KV-head group, `a` the layer's index into
-    the block's stacked states, `n_items` the KV worklist length and `KR` the
+    the module's stacked states, `n_items` the KV worklist length and `KR` the
     KV ring depth.
     """
 
@@ -61,7 +61,7 @@ class GQAEmit:
         ex = ctx.ex
         scr, stream = ctx.scr, ctx.stream
         gi = lax.rem(ctx.me, ap.G) if ap.SPLIT else jnp.int32(0)
-        a = stream.sp.block_ord(l, name)
+        a = stream.sp.module_ord(l, name)
         n_items = scr["wl_cnt"][0]
         return cls(
             ctx=ctx,

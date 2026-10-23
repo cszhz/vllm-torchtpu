@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`GQABlock` build-time parameters, tunables and their derivation."""
+"""`GQAModule` build-time parameters, tunables and their derivation."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ GQ_ML_LANES = 2 * 128
 
 @dataclass(frozen=True)
 class GQAParams:
-    """Block-owned build-time parameters for `GQABlock` (`direct_hbm` & `paged_kv`)."""
+    """Module-owned build-time parameters for `GQAModule` (`direct_hbm`/`paged_kv`)."""
 
     H: int
     nh: int
@@ -86,7 +86,7 @@ class GQAParams:
 
 @dataclass(frozen=True)
 class GQATunables:
-    """`GQABlock` knobs (`Tiles.blocks["gqa"]`); `NUMERICS` classes each field."""
+    """`GQAModule` knobs (`Tiles.modules["gqa"]`); `NUMERICS` classes each field."""
 
     kv_blk: int = 2048  # KV tokens per block
     nkv: int = 3  # KV ring depth
@@ -121,7 +121,7 @@ class GQATunables:
 
 
 def derive_params(g: Any, ex: ExecSpec, plan: Any, tt: GQATunables) -> GQAParams:
-    """`GQAParams` for geometry `g` under `ex` and the block's tunables `tt`."""
+    """`GQAParams` for geometry `g` under `ex` and the module's tunables `tt`."""
     tiles = ex.resolve_tiles(g)
     nh = g.NH // ex.R
     nai = (2 * nh + 2) * g.HD
@@ -255,7 +255,7 @@ def derive_params(g: Any, ex: ExecSpec, plan: Any, tt: GQATunables) -> GQAParams
 
 
 def gqa_scratch(ex: ExecSpec, ap: GQAParams) -> dict[str, Any]:
-    """Allocate `GQABlock` VMEM/SMEM/semaphore scratch descriptors."""
+    """Allocate `GQAModule` VMEM/SMEM/semaphore scratch descriptors."""
     scr: dict[str, Any] = {}
     if not cache_exec(ex).paged_kv:
         scr["kbuf"] = pltpu.VMEM((ap.NKV, ap.BLK, ap.HD), BF16)

@@ -26,10 +26,10 @@ import pytest
 import torch
 
 from vllm_torchtpu.megakernel import planner
-from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
+from vllm_torchtpu.megakernel.modules.gdn import GDNModule
 from vllm_torchtpu.megakernel.pool.config import CacheExec
 from vllm_torchtpu.megakernel_runtime.weight_collector import (
     WEIGHT_FLIPPED_ATTR,
@@ -81,7 +81,7 @@ def make_synthetic_qwen35_backbone(
     e_cores: list[list[list[int]]] | None = None,
 ) -> SimpleNamespace:
     """Construct a synthetic Qwen3.5 backbone matching `g` and `ex`."""
-    gdn_lay = GDNBlock.lin_in_layout(g, ex)
+    gdn_lay = GDNModule.lin_in_layout(g, ex)
     nh = g.nh(ex.R)
     nai = g.NAI(ex.R)
     q_dim = 2 * nh * g.HD
@@ -449,7 +449,7 @@ def test_pack_weights_value_parity_against_split_hf_weights() -> None:
     )
 
     tp_rank = 1
-    gdn_lay = GDNBlock.lin_in_layout(g, ex)
+    gdn_lay = GDNModule.lin_in_layout(g, ex)
     qkvz_dim = gdn_lay.QKV + gdn_lay.Z
     layers: list[Any] = []
     for l_idx in range(g.L):

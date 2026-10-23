@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`MoEBlock` build-time parameters and tunables."""
+"""`MoEModule` build-time parameters and tunables."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from ...ops import rup
 
 @dataclass(frozen=True)
 class MoEParams:
-    """Block-owned build-time parameters for `MoEBlock`."""
+    """Module-owned build-time parameters for `MoEModule`."""
 
     H: int
     E: int
@@ -51,7 +51,7 @@ class MoEParams:
     topk_packed: bool
     topk_lanes: bool
     # Resolved vectorized routing flag (`MoETunables.route_vec` gated by static
-    # preconditions in `MoEBlock.plan_params`).
+    # preconditions in `MoEModule.plan_params`).
     route_vec: bool
     r2_direct_store: bool
     unroll: bool
@@ -65,7 +65,7 @@ class MoEParams:
 
 @dataclass(frozen=True)
 class MoETunables:
-    """`MoEBlock` knobs (`Tiles.blocks["moe"]`); `NUMERICS` classes each field."""
+    """`MoEModule` knobs (`Tiles.modules["moe"]`); `NUMERICS` classes each field."""
 
     pipe: bool = True  # Software-pipeline single-tile experts
     topk: bool = True  # One-reduction top-k picks on packed (value, lane) keys
@@ -77,7 +77,7 @@ class MoETunables:
     pipe_ep: bool = False  # Software-pipeline EP experts with T13 == 2 * T2
     r2_direct_store: bool = False  # Direct VMEM store on r2 tile 0
     # Vectorized MXU expert route packing (a distinct routing/Po2C policy that
-    # supersedes `ecopy_opt` whenever its static gate in `MoEBlock.plan_params`
+    # supersedes `ecopy_opt` whenever its static gate in `MoEModule.plan_params`
     # holds; resolved into `MoEParams.route_vec`)
     route_vec: bool = False
     topk_lanes: bool = False  # Batcher odd-even top-k on lanes for E >= 128
@@ -100,9 +100,9 @@ class MoETunables:
 
 @dataclass(frozen=True)
 class MoEDebug:
-    """`MoEBlock` debug flags (`DebugOptions.blocks["moe"]`), not tuning knobs.
+    """`MoEModule` debug flags (`DebugOptions.modules["moe"]`), not tuning knobs.
 
-    Each flag adds a kernel input (`MoEBlock.extra_inputs`): `forced_routing`
+    Each flag adds a kernel input (`MoEModule.extra_inputs`): `forced_routing`
     routes from an external `rbias` HBM input `[L, M, E]` per rank instead of
     the router's probabilities (the expert weights still come from the
     router); `row_mask` builds the routed-expert list only from the rows whose

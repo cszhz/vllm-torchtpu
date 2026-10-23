@@ -21,21 +21,21 @@ import jax.numpy as jnp
 import pytest
 from conftest import (
     TINY_TILES,
-    FakeAltMixerBlock,
+    FakeAltMixerModule,
     FakeGeometry,
-    FakeMixerBlock,
+    FakeMixerModule,
     make_fake_model_spec,
 )
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.megakernel import block_options, planner, vmem
+from vllm_torchtpu.megakernel import module_options, planner, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.ops import F32, FP8
 from vllm_torchtpu.megakernel.spec import (
-    Block,
     LayerType,
     ModelSpec,
+    Module,
     ScratchReq,
     SmallField,
     SwitchSlot,
@@ -44,11 +44,11 @@ from vllm_torchtpu.megakernel.spec import (
 
 
 def test_planner_is_load_bearing_single_branch(fake_ex: ExecSpec):
-    """Verify `planner.plan` derives only weights/smalls/states from active blocks."""
+    """Verify `planner.plan` derives only weights/smalls/states from active modules."""
     ms = make_fake_model_spec(L=4, att_every=1, H=256)
     p = planner.plan(ms, fake_ex)
 
-    # Only FakeMixerBlock and FakeFFNBlock are in the spec -> no GDN declarations
+    # Only FakeMixerModule and FakeFFNModule are in the spec -> no GDN declarations
     assert p.static_kinds == ("att_in", "att_out", "router", "sh13", "sh2")
     assert p.dynamic_kinds == ("e13", "e2")
     assert "lin_in" not in p.kinds
@@ -75,9 +75,9 @@ def test_planner_hybrid_switch_slot(fake_ex: ExecSpec):
 
     assert p.period == 4
     assert p.branch_counts == (3, 1)
-    assert p.block_layer_counts["fake_gdn"] == 3
-    assert p.block_layer_counts["fake_gqa"] == 1
-    assert p.block_layer_counts["fake_moe"] == 4
+    assert p.module_layer_counts["fake_gdn"] == 3
+    assert p.module_layer_counts["fake_gqa"] == 1
+    assert p.module_layer_counts["fake_moe"] == 4
 
     wsh = planner.weight_shapes(ms, fake_ex, p)
     assert wsh["lin_in"][0][0] == 3
@@ -89,12 +89,12 @@ def test_planner_hybrid_switch_slot(fake_ex: ExecSpec):
     assert in_s_w == 640
 
     # >2 branches in a SwitchSlot raises AssertionError at plan time
-    class ThirdBranchBlock(Block):
+    class ThirdBranchModule(Module):
         name = "third"
 
     bad_sw = SwitchSlot(
         "mixer",
-        branches=(FakeAltMixerBlock(), FakeMixerBlock(), ThirdBranchBlock()),
+        branches=(FakeAltMixerModule(), FakeMixerModule(), ThirdBranchModule()),
         branch_counts=(1, 1, 2),
     )
     bad_ms = ModelSpec(
@@ -106,10 +106,10 @@ def test_planner_hybrid_switch_slot(fake_ex: ExecSpec):
         planner.plan(bad_ms, fake_ex)
 
 
-def test_planner_custom_block_extension(fake_ex: ExecSpec):
-    """Verify adding a custom `Block` updates `plan` without editing `planner.py`."""
+def test_planner_custom_module_extension(fake_ex: ExecSpec):
+    """Verify adding a custom `Module` updates `plan` without editing `planner.py`."""
 
-    class CustomMLPBlock(Block):
+    class CustomMLPModule(Module):
         name = "custom_mlp"
         reduction = "allreduce"
 
@@ -133,7 +133,7 @@ def test_planner_custom_block_extension(fake_ex: ExecSpec):
         name="custom_model",
         config=g,
         layer_type=LayerType(
-            "custom_layer", slots=(FakeMixerBlock(), CustomMLPBlock())
+            "custom_layer", slots=(FakeMixerModule(), CustomMLPModule())
         ),
     )
     p = planner.plan(ms, fake_ex)
@@ -152,7 +152,7 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     ms_hybrid = make_fake_model_spec(L=4, att_every=4, H=256)
     cp, scr = vmem.build_scratch(ms_hybrid, fake_ex)
 
-    # `branch_tmp` is declared by both FakeAltMixerBlock and FakeMixerBlock -> overlaid!
+    # `branch_tmp` is declared by FakeAltMixerModule and FakeMixerModule -> overlaid!
     assert "branch_tmp" in scr
     assert scr["branch_tmp"].shape == (fake_ex.MR * 2, 128)
     assert cp.phase_map["branch_tmp"] == "branch:gdn|branch:gqa"
@@ -172,7 +172,7 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     assert smem_scratch["smem_tmp"].memory_space == pltpu.SMEM
 
     # Persistent name collision must raise MegakernelConfigError
-    class CollidingBlock(Block):
+    class CollidingModule(Module):
         name = "colliding"
 
         def scratch(self, g, ex, plan):
@@ -181,7 +181,7 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     bad_ms = ModelSpec(
         name="bad",
         config=FakeGeometry(L=2, H=256),
-        layer_type=LayerType("bad_layer", slots=(FakeMixerBlock(), CollidingBlock())),
+        layer_type=LayerType("bad_layer", slots=(FakeMixerModule(), CollidingModule())),
     )
     with pytest.raises(
         MegakernelConfigError, match="Conflicting scratch buffer 'kbuf'"
@@ -200,24 +200,24 @@ def test_unsupported_stream_ring_is_config_error(
     fake_ex: ExecSpec, monkeypatch: pytest.MonkeyPatch
 ):
     """Unknown `WeightDecl.stream_ring` raises `MegakernelConfigError` at plan time."""
-    orig = FakeMixerBlock.weights
+    orig = FakeMixerModule.weights
 
     def _weights(
-        self: FakeMixerBlock, g: FakeGeometry, ex: ExecSpec
+        self: FakeMixerModule, g: FakeGeometry, ex: ExecSpec
     ) -> list[WeightDecl]:
         ws = orig(self, g, ex)
         return [dataclasses.replace(ws[0], stream_ring="bogus"), *ws[1:]]  # type: ignore[arg-type]
 
-    monkeypatch.setattr(FakeMixerBlock, "weights", _weights)
+    monkeypatch.setattr(FakeMixerModule, "weights", _weights)
     with pytest.raises(MegakernelConfigError, match="Unsupported stream_ring"):
         planner.plan(make_fake_model_spec(), fake_ex)
 
 
-def test_plan_fit_vmem_false_and_inactive_debug_block(
+def test_plan_fit_vmem_false_and_inactive_debug_module(
     fake_ex: ExecSpec, monkeypatch: pytest.MonkeyPatch
 ):
     """`plan(..., fit_vmem=False)` and `weight_shapes` skip VMEM fitting;
-    `plan` rejects `DebugOptions.blocks` targeting a block not in `model_spec`."""
+    `plan` rejects `DebugOptions.modules` targeting a module not in `model_spec`."""
     import jax
 
     from vllm_torchtpu.megakernel import exec_spec
@@ -240,12 +240,12 @@ def test_plan_fit_vmem_false_and_inactive_debug_block(
     class _InactiveDebug:
         flag: bool = False
 
-    monkeypatch.setitem(block_options._DEBUG, "fake_gdn", _InactiveDebug)
+    monkeypatch.setitem(module_options._DEBUG, "fake_gdn", _InactiveDebug)
     ex_bad_dbg = dataclasses.replace(
         fake_ex,
-        debug=exec_spec.DebugOptions(blocks={"fake_gdn": _InactiveDebug(flag=True)}),
+        debug=exec_spec.DebugOptions(modules={"fake_gdn": _InactiveDebug(flag=True)}),
     )
     with pytest.raises(
-        MegakernelConfigError, match="unknown or inactive block.*fake_gdn"
+        MegakernelConfigError, match="unknown or inactive module.*fake_gdn"
     ):
         planner.plan(ms, ex_bad_dbg)

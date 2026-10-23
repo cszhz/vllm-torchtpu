@@ -18,18 +18,18 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from .blocks.norm import NormBlock
-from .decls import BlockBinding, _lookup_raw_key
+from .decls import ModuleBinding, _lookup_raw_key
 from .errors import MegakernelConfigError
 from .geometry import FromHF
+from .modules.norm import NormModule
 from .profile import Profile
 from .schedule import (
-    BlockOrBinding,
     FromHFLayerTypes,
+    ModuleOrBinding,
     ResolvedSchedule,
     Schedule,
-    _block_cls_of,
-    _block_name_of,
+    _module_cls_of,
+    _module_name_of,
 )
 
 
@@ -42,49 +42,49 @@ def model_label(cls: Any, model_name: str | None = None) -> str:
 
 
 def describe_binding(
-    b: BlockOrBinding | None, expected: BlockOrBinding | None = None
+    m: ModuleOrBinding | None, expected: ModuleOrBinding | None = None
 ) -> str:
-    """Format a `Block` or `BlockBinding` for error messages."""
-    if b is None:
+    """Format a `Module` or `ModuleBinding` for error messages."""
+    if m is None:
         return "None"
-    label = f"{_block_name_of(b)}/{_block_cls_of(b).__name__}"
-    b_opts = {k: v for k, v in b.options.items() if v is not None}
+    label = f"{_module_name_of(m)}/{_module_cls_of(m).__name__}"
+    m_opts = {k: v for k, v in m.options.items() if v is not None}
     if expected is not None:
         exp_opts = {k: v for k, v in expected.options.items() if v is not None}
         diff = {
-            k: (b_opts.get(k), exp_opts.get(k))
-            for k in sorted(set(b_opts) | set(exp_opts))
-            if b_opts.get(k) != exp_opts.get(k)
+            k: (m_opts.get(k), exp_opts.get(k))
+            for k in sorted(set(m_opts) | set(exp_opts))
+            if m_opts.get(k) != exp_opts.get(k)
         }
         if diff:
             opts_str = ", ".join(
                 f"{k}={got!r} (expected {exp!r})" for k, (got, exp) in diff.items()
             )
-            return f"{label}(prefix={b.prefix!r}, {opts_str})"
-    if b_opts:
-        opts_str = ", ".join(f"{k}={v!r}" for k, v in sorted(b_opts.items()))
-        return f"{label}(prefix={b.prefix!r}, {opts_str})"
-    return f"{label}(prefix={b.prefix!r})"
+            return f"{label}(prefix={m.prefix!r}, {opts_str})"
+    if m_opts:
+        opts_str = ", ".join(f"{k}={v!r}" for k, v in sorted(m_opts.items()))
+        return f"{label}(prefix={m.prefix!r}, {opts_str})"
+    return f"{label}(prefix={m.prefix!r})"
 
 
 def norm_zc_and_eps(
-    b: BlockOrBinding,
+    m: ModuleOrBinding,
     merged: dict[str, Any] | None,
     default_eps: float | None = None,
 ) -> tuple[bool, float | None]:
-    """Extract `(zero_centered, eps)` from a norm `Block` or `BlockBinding`."""
-    if not issubclass(_block_cls_of(b), NormBlock):
+    """Extract `(zero_centered, eps)` from a norm `Module` or `ModuleBinding`."""
+    if not issubclass(_module_cls_of(m), NormModule):
         raise MegakernelConfigError(
-            f"Expected NormBlock binding, got {describe_binding(b)}"
+            f"Expected NormModule binding, got {describe_binding(m)}"
         )
-    zc = bool(b.options.get("zero_centered", False))
-    if isinstance(b, BlockBinding) and "eps" in b.explicit_fields:
+    zc = bool(m.options.get("zero_centered", False))
+    if isinstance(m, ModuleBinding) and "eps" in m.explicit_fields:
         if merged is not None:
-            return zc, float(b.resolve(merged).eps)
-        if isinstance(b.fields.get("eps"), (int, float)):
-            return zc, float(b.fields["eps"])
-    elif not isinstance(b, BlockBinding) and getattr(b, "eps", None) is not None:
-        return zc, float(b.eps)
+            return zc, float(m.resolve(merged).eps)
+        if isinstance(m.fields.get("eps"), (int, float)):
+            return zc, float(m.fields["eps"])
+    elif not isinstance(m, ModuleBinding) and getattr(m, "eps", None) is not None:
+        return zc, float(m.eps)
     return zc, default_eps
 
 
@@ -99,37 +99,37 @@ def validate_norms(
 ) -> bool:
     """Validate `pre_norm`, `post_norm`, and `final_norm` presence and agreement."""
     mname = model_label(cls, model_name)
-    entries: list[tuple[str, BlockOrBinding]] = []
+    entries: list[tuple[str, ModuleOrBinding]] = []
     for slot_name, seq in (
         ("pre_norm", sched.pre_norm),
         ("post_norm", sched.post_norm),
     ):
-        for i, b in enumerate(seq):
-            if b is None:
+        for i, m in enumerate(seq):
+            if m is None:
                 raise MegakernelConfigError(
                     f"ModelDef {mname!r}: layer {i} slot {slot_name!r} is None "
                     f"(kernel requires {slot_name} on every layer)"
                 )
-            entries.append((f"layer {i} slot {slot_name!r}", b))
+            entries.append((f"layer {i} slot {slot_name!r}", m))
     if cls.final_norm is None:
         raise MegakernelConfigError(
             f"ModelDef {mname!r}: final_norm is None (kernel requires final_norm)"
         )
     entries.append(("final_norm", cls.final_norm))
-    first_loc, first_b = entries[0]
-    first_zc, _ = norm_zc_and_eps(first_b, merged, eps)
+    first_loc, first_m = entries[0]
+    first_zc, _ = norm_zc_and_eps(first_m, merged, eps)
     target_zc = first_zc if expected_zc is None else expected_zc
-    for loc, b in entries:
-        zc_i, eps_i = norm_zc_and_eps(b, merged, eps)
+    for loc, m in entries:
+        zc_i, eps_i = norm_zc_and_eps(m, merged, eps)
         if zc_i != target_zc:
             raise MegakernelConfigError(
-                f"ModelDef {mname!r}: {loc} ({describe_binding(b)}) has "
+                f"ModelDef {mname!r}: {loc} ({describe_binding(m)}) has "
                 f"zero_centered={zc_i}, disagreeing with {first_loc} "
                 f"zero_centered={target_zc}"
             )
         if eps is not None and eps_i != eps:
             raise MegakernelConfigError(
-                f"ModelDef {mname!r}: {loc} ({describe_binding(b)}) has "
+                f"ModelDef {mname!r}: {loc} ({describe_binding(m)}) has "
                 f"eps={eps_i}, disagreeing with model eps={eps}"
             )
     return target_zc

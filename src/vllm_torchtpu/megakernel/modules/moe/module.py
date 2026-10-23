@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MoE block (`MoEBlock`): router, EP/TP dedup, shared and piped routed experts."""
+"""MoE module (`MoEModule`): router, EP/TP dedup, shared and piped routed experts."""
 
 from __future__ import annotations
 
@@ -26,15 +26,16 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ...decls import (
-    BlockBinding,
     FrozenDict,
     HFParamDecl,
-    ResolvedBlockGeometry,
+    ModuleBinding,
+    ResolvedModuleGeometry,
 )
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
+from ...module import Module
 from ...ops import BF16, F32, FP8, I32, rnd, rup
-from ...spec import Block, ExtraInput, SmallField, WeightDecl
+from ...spec import ExtraInput, SmallField, WeightDecl
 from .context import MoEEmit
 from .decls import (
     MOE_FIELD_ALIASES,
@@ -52,8 +53,8 @@ from .reference import moe_reference
 from .routing import route
 
 
-class MoEBlock(Block):
-    """Sparse + shared MoE block with dynamic `epool` streaming and `PIPE`."""
+class MoEModule(Module):
+    """Sparse + shared MoE module with dynamic `epool` streaming and `PIPE`."""
 
     name: str = "moe"
     reduction = "allreduce"
@@ -108,7 +109,7 @@ class MoEBlock(Block):
             and bool(g_tp) != self._explicit_moe_tp
         ):
             raise MegakernelConfigError(
-                f"MoEBlock(moe_tp={self._explicit_moe_tp}) disagrees with "
+                f"MoEModule(moe_tp={self._explicit_moe_tp}) disagrees with "
                 f"geometry moe_tp={g_tp}"
             )
         g_slots = getattr(g, "e_slots", None)
@@ -118,7 +119,7 @@ class MoEBlock(Block):
             and int(g_slots) != self._explicit_e_slots
         ):
             raise MegakernelConfigError(
-                f"MoEBlock(e_slots={self._explicit_e_slots}) disagrees with "
+                f"MoEModule(e_slots={self._explicit_e_slots}) disagrees with "
                 f"geometry e_slots={g_slots}"
             )
         moe_tp = (
@@ -139,8 +140,8 @@ class MoEBlock(Block):
 
     @classmethod
     def _resolve_binding(
-        cls, binding: BlockBinding, hf_config: Any
-    ) -> ResolvedBlockGeometry:
+        cls, binding: ModuleBinding, hf_config: Any
+    ) -> ResolvedModuleGeometry:
         return resolve_moe_binding(
             cls, binding, super()._resolve_binding(binding, hf_config)
         )
@@ -228,7 +229,7 @@ class MoEBlock(Block):
         )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
-        mp: MoEParams = plan.block_params[self.name]
+        mp: MoEParams = plan.module_params[self.name]
         nb_picks = rup(ex.B * mp.TOPK, 128)
         scr: dict[str, Any] = {
             "wn": pltpu.VMEM((ex.MR, mp.E), F32),
@@ -265,7 +266,7 @@ class MoEBlock(Block):
     def prologue(self, ctx: Any) -> None:
         """Start async zeroing of `seen` and prefetch layer-0 `ecopy`/`rb` if active."""
         ex = ctx.ex
-        mp: MoEParams = ctx.block_params(self.name)
+        mp: MoEParams = ctx.module_params(self.name)
         scr, W = ctx.scr, ctx.W
         scr["hitv"][...] = jnp.zeros((ex.MR, 128), I32)
         pltpu.make_async_copy(
@@ -292,7 +293,7 @@ class MoEBlock(Block):
 
     def on_layer_start(self, ctx: Any, lyr: Any, slot: Any) -> None:
         """Double-buffer `ecopy` SMEM table alongside `smalls`."""
-        mp: MoEParams = ctx.block_params(self.name)
+        mp: MoEParams = ctx.module_params(self.name)
         if not mp.ECOPY:
             return
         scr, W = ctx.scr, ctx.W
@@ -313,7 +314,7 @@ class MoEBlock(Block):
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex = ctx.ex
-        mp: MoEParams = ctx.block_params(self.name)
+        mp: MoEParams = ctx.module_params(self.name)
         m = MoEEmit.build(ctx, mp, self.debug_flags(ex))
         stream, scr, sc = m.stream, m.scr, m.sc
         MR, MB = ex.MR, ex.MB
@@ -322,7 +323,7 @@ class MoEBlock(Block):
         with stream.expert_stream(), stream.segment(lazy=LAZY_MOE):
             with sc("moe_router"):
                 assert ctx.norm_x is not None, (
-                    "MoEBlock requires input_norm='post_norm' to populate ctx.norm_x"
+                    "MoEModule requires input_norm='post_norm' to populate ctx.norm_x"
                 )
                 x = ctx.norm_x
                 logits = stream.dmatmul("router", scr["xb"], E)[0:MR]

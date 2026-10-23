@@ -37,7 +37,7 @@ unified `[num_pages, 2 * kvh, hd // 4, 4, page_size] fp8` block pools:
      (disabled by default everywhere: `fused_pool_io=False`).
    - On TPU (`ex.interpret=False`), `ST[POOL_STATE_NAME]` is declared
      `access="r"` with no Pallas-level alias (avoiding Mosaic's full-pool copy
-     on communicating kernels), `GQABlock` and `GDNBlock` issue async HBM DMA
+     on communicating kernels), `GQAModule` and `GDNModule` issue async HBM DMA
      reads/writes directly against `ST[POOL_STATE_NAME]`, and the outer
      `jax.jit` (`donate_argnums`) returns the donated input pool references
      directly as outputs (relying on outer XLA `input_output_alias` /

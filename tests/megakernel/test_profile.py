@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from vllm_torchtpu.megakernel import block_options, profile, profiles
+from vllm_torchtpu.megakernel import module_options, profile, profiles
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.pool.config import CacheExec, cache_exec, with_cache
 from vllm_torchtpu.megakernel.profile import (
@@ -41,20 +41,20 @@ from vllm_torchtpu.megakernel.profiles.default import default_tiles
 
 @dataclasses.dataclass(frozen=True)
 class _TestTunables:
-    """Test-only block tunables (registered under `_TEST_BLOCK`)."""
+    """Test-only module tunables (registered under `_TEST_MODULE`)."""
 
     width: int = 128
     fast: bool = False
     NUMERICS = {"width": "approx", "fast": "exact"}
 
 
-_TEST_BLOCK = "test_profile_block"
+_TEST_MODULE = "test_profile_module"
 
 
 @pytest.fixture(autouse=True)
 def _isolated_profile_state(monkeypatch: pytest.MonkeyPatch):
     """Register `_TestTunables` and isolate profile registry state per test."""
-    monkeypatch.setitem(block_options._TUNABLES, _TEST_BLOCK, _TestTunables)
+    monkeypatch.setitem(module_options._TUNABLES, _TEST_MODULE, _TestTunables)
     monkeypatch.setattr(profile, "_REGISTRY", {"default": DEFAULT_PROFILE})
     monkeypatch.setattr(profile, "_MODEL_DEFAULTS", {})
     monkeypatch.setattr(profile, "_BUILTINS_LOADED", True)
@@ -134,9 +134,9 @@ def test_profile_validation_and_numerics_enforcement():
             model_default=True,
         )
 
-    def _approx_block_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        return default_tiles(B, moe_tp=moe_tp, R=R).with_blocks(
-            {_TEST_BLOCK: {"width": 256}}
+    def _approx_module_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
+        return default_tiles(B, moe_tp=moe_tp, R=R).with_modules(
+            {_TEST_MODULE: {"width": 256}}
         )
 
     def _approx_core_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
@@ -144,8 +144,8 @@ def test_profile_validation_and_numerics_enforcement():
             default_tiles(B, moe_tp=moe_tp, R=R), dense_acc_pair=True
         )
 
-    with pytest.raises(ValueError, match=f"tiles.{_TEST_BLOCK}.width"):
-        Profile(name="bad-exact-block", tiles=_approx_block_rule)
+    with pytest.raises(ValueError, match=f"tiles.{_TEST_MODULE}.width"):
+        Profile(name="bad-exact-module", tiles=_approx_module_rule)
     with pytest.raises(ValueError, match=r"tiles\.dense_acc_pair"):
         Profile(name="bad-exact-core", tiles=_approx_core_rule)
     with pytest.raises(ValueError, match="fused_pool_io"):
@@ -157,7 +157,7 @@ def test_profile_validation_and_numerics_enforcement():
     def _exact_sched_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
         return dataclasses.replace(
             default_tiles(B, moe_tp=moe_tp, R=R), nbd=10, rel_fetch=True
-        ).with_blocks({_TEST_BLOCK: {"fast": True}})
+        ).with_modules({_TEST_MODULE: {"fast": True}})
 
     exact_prof = Profile(name="sched-only", tiles=_exact_sched_rule, pool_gather=None)
     assert exact_prof.numerics == "exact"
@@ -166,8 +166,8 @@ def test_profile_validation_and_numerics_enforcement():
 
 def test_approx_features_against_default_and_model_reference():
     def _ref_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        return default_tiles(B, moe_tp=moe_tp, R=R).with_blocks(
-            {_TEST_BLOCK: {"width": 256}}
+        return default_tiles(B, moe_tp=moe_tp, R=R).with_modules(
+            {_TEST_MODULE: {"width": 256}}
         )
 
     ref = register_profile(
@@ -182,8 +182,8 @@ def test_approx_features_against_default_and_model_reference():
     assert approx_features(ref) == ()
 
     def _tuned_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        base = _ref_rule(B, moe_tp=moe_tp, R=R).with_blocks(
-            {_TEST_BLOCK: {"fast": True}}
+        base = _ref_rule(B, moe_tp=moe_tp, R=R).with_modules(
+            {_TEST_MODULE: {"fast": True}}
         )
         if B == 64 and R == 16 and moe_tp:
             return dataclasses.replace(base, dense_acc_pair=True, dmm_unroll=8)
@@ -247,7 +247,7 @@ def test_model_profile_without_tiles_inherits_model_default_rule():
         return dataclasses.replace(
             default_tiles(B, moe_tp=moe_tp, R=R),
             nbd=10 if moe_tp else 12,
-        ).with_blocks({_TEST_BLOCK: {"width": 256}})
+        ).with_modules({_TEST_MODULE: {"width": 256}})
 
     ref = register_profile(
         Profile(

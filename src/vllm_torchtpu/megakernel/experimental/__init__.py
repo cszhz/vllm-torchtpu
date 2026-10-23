@@ -13,7 +13,7 @@
 # limitations under the License.
 """Experimental, opt-in megakernel features (not needed by the default path).
 
-Importing this package registers the fused pool I/O helpers with the block
+Importing this package registers the fused pool I/O helpers with the module
 hook (`fused_io_hook`).
 """
 

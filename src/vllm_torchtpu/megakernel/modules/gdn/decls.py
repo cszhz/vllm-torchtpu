@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`GDNBlock` geometry, parameter, and recurrent-cache declarations."""
+"""`GDNModule` geometry, parameter, and recurrent-cache declarations."""
 
 from __future__ import annotations
 
@@ -19,11 +19,11 @@ from typing import Any
 
 from ...decls import (
     REQUIRED,
-    BlockBinding,
     HFParamDecl,
+    ModuleBinding,
     ParamTransform,
     RecurrentCacheDecl,
-    ResolvedBlockGeometry,
+    ResolvedModuleGeometry,
     VLLMAlias,
     apply_decl_overrides,
 )
@@ -93,15 +93,15 @@ GDN_GEOMETRY_METHODS: dict[str, Any] = {
 def _check_conv_kernel(conv_kernel: int) -> int:
     if conv_kernel != 4:
         raise MegakernelConfigError(
-            "GDNBlock requires conv_kernel == 4 (3-tap causal conv window), "
+            "GDNModule requires conv_kernel == 4 (3-tap causal conv window), "
             f"got conv_kernel={conv_kernel}"
         )
     return conv_kernel
 
 
 def resolve_gdn_binding(
-    cls: Any, binding: BlockBinding, resolved: ResolvedBlockGeometry
-) -> ResolvedBlockGeometry:
+    cls: Any, binding: ModuleBinding, resolved: ResolvedModuleGeometry
+) -> ResolvedModuleGeometry:
     vals = dict(resolved.values)
     conv_k = _check_conv_kernel(int(vals.get("conv_kernel", 4)))
     vals.update(
@@ -117,8 +117,8 @@ def resolve_gdn_binding(
             "gdn_l2_eps": float(vals["gdn_l2_eps"]),
         }
     )
-    return ResolvedBlockGeometry(
-        block_cls=cls,
+    return ResolvedModuleGeometry(
+        module_cls=cls,
         prefix=binding.prefix,
         values=vals,
         options=binding.options,
@@ -128,7 +128,7 @@ def resolve_gdn_binding(
 
 
 def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
-    """Return canonical (unfused) HF parameter declarations for `GDNBlock`."""
+    """Return canonical (unfused) HF parameter declarations for `GDNModule`."""
     conv_kernel = _check_conv_kernel(int(getattr(geom, "conv_kernel", 4)))
     p = f"{prefix}." if prefix else ""
     H, KH, VH = int(geom.H), int(geom.KH), int(geom.VH)
@@ -138,7 +138,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
     lay = gdn_lin_in_layout(geom, 1)
     b_slot_width = lay.A_OFF - lay.BA
     a_slot_width = lay.NLI - lay.A_OFF
-    rename = geom.rename if isinstance(geom, ResolvedBlockGeometry) else {}
+    rename = geom.rename if isinstance(geom, ResolvedModuleGeometry) else {}
 
     def _n(canon: str) -> str:
         return rename.get(canon, canon)

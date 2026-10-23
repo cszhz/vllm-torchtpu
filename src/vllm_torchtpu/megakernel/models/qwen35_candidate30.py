@@ -29,17 +29,17 @@ from __future__ import annotations
 
 import dataclasses
 
-from ..blocks.gdn import GDNBlock
-from ..blocks.gqa import GQABlock
-from ..blocks.moe import MoEBlock
 from ..exec_spec import Tiles
+from ..modules.gdn import GDNModule
+from ..modules.gqa import GQAModule
+from ..modules.moe import MoEModule
 from ..profile import Baseline, Profile, register_profile
 from .qwen35_profile import QWEN35_MODEL_NAME
 
-_GQA, _GDN, _MOE = GQABlock.name, GDNBlock.name, MoEBlock.name
-# Opt-in performance flags enabled by this profile (core, then per block).
+_GQA, _GDN, _MOE = GQAModule.name, GDNModule.name, MoEModule.name
+# Opt-in performance flags enabled by this profile (core, then per module).
 _C30_CORE_FLAGS = dict(dense_acc_pair=True, dmm_unroll=8, rel_fetch=True)
-_C30_BLOCK_FLAGS = {
+_C30_MODULE_FLAGS = {
     _GQA: dict(kv_sub=1024, kv_ering=True, pair_kv=True, gq_pack=True, gqa_qv=True),
     _GDN: dict(gdn_head_major=True),
     _MOE: dict(
@@ -51,14 +51,14 @@ _C30_BLOCK_FLAGS = {
         moe_unroll=True,
     ),
 }
-_BASE = Tiles(hier=1, mb8=2, **_C30_CORE_FLAGS).with_blocks(
-    {**_C30_BLOCK_FLAGS, _GQA: {**_C30_BLOCK_FLAGS[_GQA], "pack": 1}}
+_BASE = Tiles(hier=1, mb8=2, **_C30_CORE_FLAGS).with_modules(
+    {**_C30_MODULE_FLAGS, _GQA: {**_C30_MODULE_FLAGS[_GQA], "pack": 1}}
 )
 # candidate30 stages the fused-path conv checkpoint only from this many verify rows
 # up (`CONV_STAGE_MIN_B` in its kernel); smaller buckets keep the plain conv path.
 CONV_STAGE_MIN_B = 8
-_VERIFY = dataclasses.replace(_BASE, rsag=True, hier=2).with_blocks({_GQA: {"nkv": 4}})
-_WIDE = dataclasses.replace(_VERIFY, nbd=10, vmem_mib=62, hier=0).with_blocks(
+_VERIFY = dataclasses.replace(_BASE, rsag=True, hier=2).with_modules({_GQA: {"nkv": 4}})
+_WIDE = dataclasses.replace(_VERIFY, nbd=10, vmem_mib=62, hier=0).with_modules(
     {_GQA: {"nkv": 3}}
 )
 
@@ -81,7 +81,7 @@ def candidate30_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
         t = dataclasses.replace(_BASE, nbe=nbe_small, rsag=True, hier=2)
     else:
         t = dataclasses.replace(_BASE, nbe=nbe_small)
-    t = t.with_blocks({_GDN: {"conv_stage": B >= CONV_STAGE_MIN_B}})
+    t = t.with_modules({_GDN: {"conv_stage": B >= CONV_STAGE_MIN_B}})
     if R != 8 and t.hier in (1, 2):
         is_pow2_r = R >= 2 and (R & (R - 1)) == 0
         t = dataclasses.replace(t, hier=3 if (B <= 32 and is_pow2_r) else 0)
@@ -89,7 +89,7 @@ def candidate30_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
 
 
 # candidate30 reference run (vLLM serving, v7x-8). The image's vllm-torchtpu
-# commit is `8743659cd` (a bit-exact block refactor of the `36beb0816` kernel).
+# commit is `8743659cd` (a bit-exact module refactor of the `36beb0816` kernel).
 CANDIDATE30_BASELINE = Baseline(
     ref="candidate30",
     commit="8743659cdfcfbb0d77d7fc454f519520d223e785",

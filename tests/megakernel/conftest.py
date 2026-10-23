@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared test fixtures and fake blocks for the TPU megakernel test suite."""
+"""Shared test fixtures and fake modules for the TPU megakernel test suite."""
 
 from __future__ import annotations
 
@@ -43,9 +43,9 @@ from jax.experimental.pallas import tpu as pltpu  # noqa: E402
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles  # noqa: E402
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, rmsnorm  # noqa: E402
 from vllm_torchtpu.megakernel.spec import (  # noqa: E402
-    Block,
     LayerType,
     ModelSpec,
+    Module,
     ScratchReq,
     SmallField,
     StateDecl,
@@ -93,7 +93,7 @@ class FakeGeometry:
 
 @dataclass(frozen=True)
 class FakeMixerTunables:
-    """Block-owned knobs of `FakeMixerBlock` (no core `Tiles` field needed)."""
+    """Module-owned knobs of `FakeMixerModule` (no core `Tiles` field needed)."""
 
     kv_blk: int = 256
     nkv: int = 3
@@ -101,8 +101,8 @@ class FakeMixerTunables:
     NUMERICS: ClassVar[dict[str, str]] = {"kv_blk": "approx", "nkv": "exact"}
 
 
-class FakeMixerBlock(Block):
-    """Fake attention-style mixer block for testing declarative planning and VMEM."""
+class FakeMixerModule(Module):
+    """Fake attention-style mixer module for testing declarative planning and VMEM."""
 
     name = "fake_gqa"
     reduction = "allreduce"
@@ -165,8 +165,8 @@ class FakeMixerBlock(Block):
         ]
 
 
-class FakeAltMixerBlock(Block):
-    """Fake linear-attention mixer block for testing multi-branch `SwitchSlot`."""
+class FakeAltMixerModule(Module):
+    """Fake linear-attention mixer module for testing multi-branch `SwitchSlot`."""
 
     name = "fake_gdn"
     reduction = "allreduce"
@@ -232,8 +232,8 @@ class FakeAltMixerBlock(Block):
         ]
 
 
-class FakeFFNBlock(Block):
-    """Fake MoE FFN block for testing declarative planning and VMEM."""
+class FakeFFNModule(Module):
+    """Fake MoE FFN module for testing declarative planning and VMEM."""
 
     name = "fake_moe"
     reduction = "allreduce"
@@ -312,16 +312,16 @@ def make_fake_model_spec(
     moe_tp: bool = False,
     e_slots: int = 0,
 ) -> ModelSpec:
-    """Create a `ModelSpec` built from fake mixer and FFN blocks."""
+    """Create a `ModelSpec` built from fake mixer and FFN modules."""
     g = FakeGeometry(L=L, att_every=att_every, H=H, moe_tp=moe_tp, e_slots=e_slots)
-    gqa = FakeMixerBlock()
-    moe = FakeFFNBlock()
+    gqa = FakeMixerModule()
+    moe = FakeFFNModule()
     if att_every == 1:
-        mixer: Block | SwitchSlot = SwitchSlot(
+        mixer: Module | SwitchSlot = SwitchSlot(
             "mixer", branches=(gqa,), branch_counts=(1,)
         )
     else:
-        gdn = FakeAltMixerBlock()
+        gdn = FakeAltMixerModule()
         mixer = SwitchSlot(
             "mixer", branches=(gdn, gqa), branch_counts=(att_every - 1, 1)
         )
@@ -339,7 +339,7 @@ def fake_ex() -> ExecSpec:
 
 @dataclass
 class MiniCtx:
-    """Minimal kernel execution context for testing block `emit` in Pallas."""
+    """Minimal kernel execution context for testing module `emit` in Pallas."""
 
     g: FakeGeometry
     ex: ExecSpec
@@ -357,8 +357,8 @@ class MiniCtx:
     sc: Any = lambda *_: contextlib.nullcontext()
     norm_x: Any = None
 
-    def block_params(self, name: str) -> Any:
-        return self.core_plan.block(name)
+    def module_params(self, name: str) -> Any:
+        return self.core_plan.module(name)
 
     def sm(self, slot: Any, name: str, width: int | None = None) -> Any:
         o, w = self.core_plan.stream.lay[name]
@@ -380,25 +380,25 @@ class MiniCtx:
 
 
 def with_tile_fields(t: Any, fields: Mapping[str, Any]) -> Any:
-    """`t` with knobs replaced: core `field` keys and `<block>.<field>` keys."""
+    """`t` with knobs replaced: core `field` keys and `<module>.<field>` keys."""
     core = {k: v for k, v in fields.items() if "." not in k}
-    blocks: dict[str, dict[str, Any]] = {}
+    modules: dict[str, dict[str, Any]] = {}
     for k, v in fields.items():
         if "." in k:
-            block, field = k.split(".", 1)
-            blocks.setdefault(block, {})[field] = v
-    return dataclasses.replace(t, **core).with_blocks(blocks)
+            module, field = k.split(".", 1)
+            modules.setdefault(module, {})[field] = v
+    return dataclasses.replace(t, **core).with_modules(modules)
 
 
 def tile_field(t: Any, key: str) -> Any:
-    """Value of knob `key` (`field` or `<block>.<field>`) in tiles `t`."""
+    """Value of knob `key` (`field` or `<module>.<field>`) in tiles `t`."""
     if "." not in key:
         return getattr(t, key)
-    block, field = key.split(".", 1)
-    return getattr(t.block(block), field)
+    module, field = key.split(".", 1)
+    return getattr(t.module(module), field)
 
 
-# Exact-class knobs (core `field` or `<block>.<field>`): (id, knob, value off the
+# Exact-class knobs (core `field` or `<module>.<field>`): (id, knob, value off the
 # model default, (T, B), extra knobs).
 EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ("nbd", "nbd", 8, (2, 4), {}),

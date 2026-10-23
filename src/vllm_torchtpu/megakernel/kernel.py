@@ -47,7 +47,7 @@ COLLECTIVE_ID = 0
 
 @dataclass
 class KernelContext:
-    """In-kernel execution context passed to `Block` methods."""
+    """In-kernel execution context passed to `Module` methods."""
 
     g: Any
     ex: ExecSpec
@@ -58,7 +58,7 @@ class KernelContext:
     ST: dict[str, Any]
     O: dict[str, Any]  # noqa: E741
     out_ref: Any
-    extra: dict[str, Any]  # `Block.extra_inputs` refs by name
+    extra: dict[str, Any]  # `Module.extra_inputs` refs by name
     scr: dict[str, Any]
     me: Any
     live: Any
@@ -69,9 +69,9 @@ class KernelContext:
     norm_x: Any = None
     raw_refs: Any = None
 
-    def block_params(self, name: str) -> Any:
-        """Return the build-time parameters computed by `Block.plan_params`."""
-        return self.core_plan.block(name)
+    def module_params(self, name: str) -> Any:
+        """Return the build-time parameters computed by `Module.plan_params`."""
+        return self.core_plan.module(name)
 
     def sm(self, slot: Any, name: str, width: int | None = None) -> Any:
         """Read `[1, width]` slice `name` from double-buffered `scr['sm'][slot]`."""
@@ -129,7 +129,7 @@ def build(
     st_names = p.s_names
     o_names = p.o_names
     n_w, n_s = len(w_names), len(st_names)
-    blocks = model_spec.all_blocks()
+    modules = model_spec.all_modules()
     extras = extra_inputs(model_spec, ex)
     x_names = [x.name for x in extras]
 
@@ -194,8 +194,8 @@ def build(
                         scr["sm_sem"].at[1 - slot],
                     ).start()
 
-                for b in blocks:
-                    b.on_layer_start(ctx, l, slot)
+                for m in modules:
+                    m.on_layer_start(ctx, l, slot)
 
             stream.begin_layer(l)
 
@@ -204,7 +204,7 @@ def build(
             ):
                 if isinstance(slot_entry, SwitchSlot):
                     active = slot_entry.active_branches
-                    norm_names = {b.input_norm for b in active}
+                    norm_names = {m.input_norm for m in active}
                     assert len(norm_names) == 1, norm_names
                     ctx.apply_input_norm(active[0].input_norm, slot)
                     if len(active) == 1:
@@ -214,21 +214,21 @@ def build(
                     elif len(active) == 2:
                         c0 = slot_entry.active_counts[0]
                         is_b1 = (l % slot_entry.period) >= c0
-                        b0, b1 = active[0], active[1]
+                        m0, m1 = active[0], active[1]
 
                         # Emit allreduce + add_residual inside each branch so
                         # the lowered `scf.if` yields `()` instead of returning
                         # a `vector<MBxHxf32>` tensor across the branch boundary
                         # (which would keep 64 VRegs live across `scf.if`).
-                        def _emit_branch(blk, ar_slot=ar_slot):
-                            part = blk.emit(ctx, l, slot)
+                        def _emit_branch(mod, ar_slot=ar_slot):
+                            part = mod.emit(ctx, l, slot)
                             if ar_slot is not None:
                                 comm.add_residual(comm.allreduce(ar_slot, part, first))
 
                         stream.cond_branches(
                             is_b1,
-                            lambda b1=b1: _emit_branch(b1),
-                            lambda b0=b0: _emit_branch(b0),
+                            lambda m1=m1: _emit_branch(m1),
+                            lambda m0=m0: _emit_branch(m0),
                             true_branch=1,
                             false_branch=0,
                         )
@@ -252,8 +252,8 @@ def build(
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).start()
 
-        for b in blocks:
-            b.prologue(ctx)
+        for m in modules:
+            m.prologue(ctx)
 
         if ex.R > 1:
             barrier = pltpu.get_barrier_semaphore()
@@ -268,15 +268,15 @@ def build(
 
         scr["res"][...] = jnp.where(live, hid_ref[: ex.MB].astype(F32), 0.0)
         scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
-        for b in blocks:
-            b.init_buffers(ctx)
+        for m in modules:
+            m.init_buffers(ctx)
 
         lax.fori_loop(0, g.L, layer, 0)
 
         # ------------------------------ step epilogue ------------------------------
         comm.drain_sends()
-        for b in blocks:
-            b.epilogue(ctx)
+        for m in modules:
+            m.epilogue(ctx)
 
         fn_cp = pltpu.make_async_copy(W["final_norm"], scr["fn"], scr["fn_sem"])
         fn_cp.start()
@@ -483,7 +483,7 @@ def make_step(
     st_names = p.s_names
     o_names = p.o_names
     wsh = info["wshape"]
-    blocks = model_spec.all_blocks()
+    modules = model_spec.all_modules()
     extras = extra_inputs(model_spec, ex)
 
     def local(pos, hidden, weights, states, *extra):
@@ -528,8 +528,8 @@ def make_step(
         hid = out_vals[0]
         raw_outs = dict(zip(o_names[1:], out_vals[1:]))
         new_states = {k: v for k, v in states.items() if _is_mutable_state(k)}
-        for b in blocks:
-            new_states.update(b.host_update_states(g, ex, pos, new_states, raw_outs))
+        for m in modules:
+            new_states.update(m.host_update_states(g, ex, pos, new_states, raw_outs))
         return hid, new_states
 
     def _is_mutable_state(k: str) -> bool:

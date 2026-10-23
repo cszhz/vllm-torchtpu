@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for `MoEBlock` declarations and Pallas `interpret=True` execution."""
+"""Unit tests for `MoEModule` declarations and Pallas `interpret=True` execution."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from conftest import TINY_TILES, FakeGeometry, FakeMixerBlock, MiniCtx
+from conftest import TINY_TILES, FakeGeometry, FakeMixerModule, MiniCtx
 from jax import lax
 from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
 from jax.experimental import pallas as pl
@@ -31,16 +31,16 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.megakernel import blocks, comm, planner, stream, vmem
-from vllm_torchtpu.megakernel.blocks import MoEBlock
+from vllm_torchtpu.megakernel import comm, modules, planner, stream, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.modules import MoEModule
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, rnd
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 
-BLOCKS_DIR = pathlib.Path(blocks.__file__).resolve().parent
+MODULES_DIR = pathlib.Path(modules.__file__).resolve().parent
 
-# Row-count names that must never be compared to a literal inside `blocks/`.
+# Row-count names that must never be compared to a literal inside `modules/`.
 _ROW_NAMES = {"B", "NS", "MR", "MB", "M", "CB"}
 # Remaining literal row-count comparisons are hardware / layout limits, not
 # per-bucket tuning (each one with its reason).
@@ -69,12 +69,12 @@ def _is_num(node: ast.AST) -> bool:
     )
 
 
-def test_blocks_have_no_row_count_literal_comparisons():
-    """Blocks read per-bucket tuning from `Tiles`, never `B <= 40`-style literals."""
-    assert (BLOCKS_DIR / "moe" / "block.py").is_file()
+def test_modules_have_no_row_count_literal_comparisons():
+    """Modules read per-bucket tuning from `Tiles`, never `B <= 40`-style literals."""
+    assert (MODULES_DIR / "moe" / "module.py").is_file()
     found = []
-    for path in sorted(BLOCKS_DIR.rglob("*.py")):
-        rel = path.relative_to(BLOCKS_DIR).as_posix()
+    for path in sorted(MODULES_DIR.rglob("*.py")):
+        rel = path.relative_to(MODULES_DIR).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Compare):
@@ -86,17 +86,17 @@ def test_blocks_have_no_row_count_literal_comparisons():
                     key = (rel, ast.unparse(node))
                     if key not in _ALLOWED:
                         found.append(f"{rel}:{node.lineno}: {key[1]}")
-    assert not found, "row-count literal comparisons in blocks/:\n" + "\n".join(found)
+    assert not found, "row-count literal comparisons in modules/:\n" + "\n".join(found)
 
 
-def test_moe_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
-    """Verify `MoEBlock` declarations drive `planner`/`vmem` and `emit` in Pallas."""
+def test_moe_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
+    """Verify `MoEModule` declarations drive `planner`/`vmem` and `emit` in Pallas."""
     g_decl = FakeGeometry(L=2, att_every=1, H=256)
-    moe_decl = MoEBlock()
+    moe_decl = MoEModule()
     ms_decl = ModelSpec(
         "moe_decl_test",
         config=g_decl,
-        layer_type=LayerType("lt", slots=(FakeMixerBlock(), moe_decl)),
+        layer_type=LayerType("lt", slots=(FakeMixerModule(), moe_decl)),
     )
 
     p_decl = planner.plan(ms_decl, fake_ex)
@@ -122,7 +122,7 @@ def test_moe_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
         and "es" in scr_decl
         and "st" in scr_decl
     )
-    assert cp_decl.block("moe").EW == g_decl.E // fake_ex.R
+    assert cp_decl.module("moe").EW == g_decl.E // fake_ex.R
 
     ex = ExecSpec(
         B=4, T=1, R=1, ctx=256, stack_e=True, tiles=TINY_TILES, interpret=True
@@ -140,7 +140,7 @@ def test_moe_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
         IS=128,
         moe_tp=True,
     )
-    moe = MoEBlock()
+    moe = MoEModule()
     ms = ModelSpec("moe_exec", config=g, layer_type=LayerType("lt", slots=(moe,)))
     cp, scratch = vmem.build_scratch(ms, ex)
     p = cp.plan
@@ -229,15 +229,15 @@ def test_moe_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
         (True, 2, True),
     ],
 )
-def test_moe_block_numerical_parity(moe_tp: bool, R: int, pipe: bool):
-    """Compare `MoEBlock.emit` in Pallas `interpret=True` against a JAX reference."""
+def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
+    """Compare `MoEModule.emit` in Pallas `interpret=True` against a JAX reference."""
     devs = jax.devices("cpu")
     assert len(devs) >= R
 
     H, E, TOPK, IR, ISR = 128, 128, 2, 128, 128
     ER = E // R
     EW = E if moe_tp else ER
-    tiles = dataclasses.replace(TINY_TILES, war=1, mb8=2).with_blocks(
+    tiles = dataclasses.replace(TINY_TILES, war=1, mb8=2).with_modules(
         {"moe": {"pipe": pipe}}
     )
     ex = ExecSpec(B=2, T=1, R=R, ctx=128, stack_e=True, tiles=tiles, interpret=True)
@@ -254,10 +254,10 @@ def test_moe_block_numerical_parity(moe_tp: bool, R: int, pipe: bool):
         IS=ISR * R,
         moe_tp=moe_tp,
     )
-    moe = MoEBlock()
+    moe = MoEModule()
     ms = ModelSpec("moe_num", config=g, layer_type=LayerType("lt", slots=(moe,)))
     cp, scratch = vmem.build_scratch(ms, ex)
-    assert cp.block("moe").PIPE is pipe
+    assert cp.module("moe").PIPE is pipe
     p = cp.plan
     wsh = planner.weight_shapes(ms, ex, p)
     osh = planner.kernel_out_shapes(ms, ex, p)
@@ -463,7 +463,7 @@ def test_moe_block_numerical_parity(moe_tp: bool, R: int, pipe: bool):
 
 def test_moe_topk_packed_and_route_vec_compile_time_bounds():
     """Verify compile-time checks guard bit-packed top-k and resolve `route_vec`."""
-    moe = MoEBlock()
+    moe = MoEModule()
     base_tiles = dataclasses.replace(TINY_TILES, bank=512 << 10)
     g_ok = FakeGeometry(
         L=1,
@@ -480,11 +480,11 @@ def test_moe_topk_packed_and_route_vec_compile_time_bounds():
         R=8,
         B=4,
         T=1,
-        tiles=base_tiles.with_blocks({"moe": {"topk": True, "route_vec": True}}),
+        tiles=base_tiles.with_modules({"moe": {"topk": True, "route_vec": True}}),
     )
     ms_ok = ModelSpec("moe_ok", config=g_ok, layer_type=LayerType("lt", slots=(moe,)))
     plan_ok = planner.plan(ms_ok, ex_ok)
-    mp_ok = plan_ok.block_params["moe"]
+    mp_ok = plan_ok.module_params["moe"]
     assert mp_ok.topk_packed is True
     assert mp_ok.route_vec is True
 
@@ -497,9 +497,9 @@ def test_moe_topk_packed_and_route_vec_compile_time_bounds():
         R=8,
         B=4,
         T=1,
-        tiles=base_tiles.with_blocks({"moe": {"topk": True, "route_vec": False}}),
+        tiles=base_tiles.with_modules({"moe": {"topk": True, "route_vec": False}}),
     )
-    assert planner.plan(ms_e384, ex_topk).block_params["moe"].topk_packed is True
+    assert planner.plan(ms_e384, ex_topk).module_params["moe"].topk_packed is True
 
     # E > 512 (e.g. 513, 1024) overflows the 9-bit float32 mantissa pack when topk=True.
     for bad_e in (513, 1024):
@@ -519,7 +519,7 @@ def test_moe_topk_packed_and_route_vec_compile_time_bounds():
         R=8,
         B=4,
         T=1,
-        tiles=base_tiles.with_blocks({"moe": {"topk": False, "route_vec": True}}),
+        tiles=base_tiles.with_modules({"moe": {"topk": False, "route_vec": True}}),
     )
     for fallback_g in (
         dataclasses.replace(g_ok, E=512, e_slots=80),
@@ -530,7 +530,7 @@ def test_moe_topk_packed_and_route_vec_compile_time_bounds():
         ms_fb = ModelSpec(
             "moe_fb", config=fallback_g, layer_type=LayerType("lt", slots=(moe,))
         )
-        assert planner.plan(ms_fb, ex_rvec).block_params["moe"].route_vec is False
+        assert planner.plan(ms_fb, ex_rvec).module_params["moe"].route_vec is False
 
 
 def _simulate_expert_ring_no_collision(mp, n_hit: int = 8) -> None:
@@ -718,7 +718,7 @@ def test_moe_deployment_ring_invariants():
                     tiles = tile_fn(B, moe_tp=moe_tp, R=8)
                     ex = ExecSpec(R=8, B=B, T=T, tiles=tiles)
                     cp, _ = vmem.build_scratch(ms, ex)
-                    mp = cp.block("moe")
+                    mp = cp.module("moe")
                     assert mp.NSS >= 3 + (mp.NBE - 1) // mp.TE
                     assert mp.NBE >= 2
                     assert not (mp.PIPE and mp.PIPE_EP)
@@ -796,7 +796,7 @@ def test_moe_dynamic_dma_race_invariants(
     e_slots: int,
     route_vec: bool,
 ):
-    """Run MoEBlock under Pallas vector-clock race detection (`on_wait` vs `eager`)."""
+    """Run MoEModule under Pallas vector-clock race detection (`on_wait` vs `eager`)."""
     del case_name
     R = 2
     devs = jax.devices("cpu")
@@ -814,7 +814,7 @@ def test_moe_dynamic_dma_race_invariants(
         ebank=ebank,
         war=1,
         mb8=2,
-    ).with_blocks(
+    ).with_modules(
         {
             "moe": {
                 "pipe": pipe,
@@ -840,7 +840,7 @@ def test_moe_dynamic_dma_race_invariants(
         moe_tp=False,
         e_slots=e_slots,
     )
-    moe = MoEBlock()
+    moe = MoEModule()
     ms = ModelSpec("moe_race", config=g, layer_type=LayerType("lt", slots=(moe,)))
 
     def _run_mode(dma_mode: str):
@@ -857,9 +857,9 @@ def test_moe_dynamic_dma_race_invariants(
             ),
         )
         cp, scratch = vmem.build_scratch(ms, ex)
-        assert cp.block("moe").route_vec is route_vec
+        assert cp.module("moe").route_vec is route_vec
         if pipe_ep:
-            assert cp.block("moe").PIPE_EP is True
+            assert cp.module("moe").PIPE_EP is True
         p = cp.plan
         wsh = planner.weight_shapes(ms, ex, p)
         osh = planner.kernel_out_shapes(ms, ex, p)
@@ -967,7 +967,7 @@ def test_moe_dynamic_dma_race_invariants(
             pltpu.make_async_copy(
                 W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
             ).wait()
-            # `MoEBlock.prologue` starts the async DMA into `scr["ecopy"].at[0]`
+            # `MoEModule.prologue` starts the async DMA into `scr["ecopy"].at[0]`
             # on `scr["ec_sem"].at[0]`; `kernel.py` calls `b.on_layer_start`
             # inside `smalls_sync` at the start of every layer to wait on
             # `scr["ec_sem"].at[slot]` before `po2c_pass1` reads `scr["ecopy"]`.
@@ -1015,7 +1015,7 @@ def test_moe_dynamic_dma_race_invariants(
         out = jax.block_until_ready(step(pos, hid_rep, *w_all))
         assert ipc.races is not None
         assert not ipc.races.races_found, (
-            f"Data race detected in MoEBlock under dma_execution_mode={dma_mode!r}"
+            f"Data race detected in MoEModule under dma_execution_mode={dma_mode!r}"
         )
         return np.asarray(out[:, : ex.B]).copy()
 

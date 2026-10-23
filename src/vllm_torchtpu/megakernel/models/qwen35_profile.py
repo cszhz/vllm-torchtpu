@@ -26,9 +26,9 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
-from ..blocks.gqa import GQABlock, GQATunables
-from ..blocks.moe import MoEBlock
 from ..exec_spec import Tiles
+from ..modules.gqa import GQAModule, GQATunables
+from ..modules.moe import MoEModule
 from ..profile import Profile, register_profile
 
 # `ModelSpec.name` and default HuggingFace config of the Qwen3.5-397B-A17B model.
@@ -56,20 +56,20 @@ DEFAULT_HF_CONFIG: dict[str, Any] = {
     "shared_expert_intermediate_size": 1024,
     "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 15,
 }
-_GQA, _MOE = GQABlock.name, MoEBlock.name
+_GQA, _MOE = GQAModule.name, MoEModule.name
 
 # Decode (`B <= 4`), verify (`8 < B <= 16`) and wide (`B > 16`) tiles.
-DECODE_TILES = Tiles(hier=1, mb8=2, blocks={_GQA: GQATunables(pack=1)})
-VERIFY_TILES = dataclasses.replace(DECODE_TILES, rsag=True, hier=2).with_blocks(
+DECODE_TILES = Tiles(hier=1, mb8=2, modules={_GQA: GQATunables(pack=1)})
+VERIFY_TILES = dataclasses.replace(DECODE_TILES, rsag=True, hier=2).with_modules(
     {_GQA: {"nkv": 4}, _MOE: {"ecopy_opt": 1}}
 )
-WIDE_TILES = dataclasses.replace(VERIFY_TILES, nbd=10, vmem_mib=62, hier=0).with_blocks(
-    {_GQA: {"nkv": 3}}
-)
+WIDE_TILES = dataclasses.replace(
+    VERIFY_TILES, nbd=10, vmem_mib=62, hier=0
+).with_modules({_GQA: {"nkv": 3}})
 # Small banks and rings for CPU interpret runs of tiny geometries.
 TINY_TILES = Tiles(
     bank=128 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32
-).with_blocks({_GQA: {"kv_blk": 256, "nkv": 3}})
+).with_modules({_GQA: {"kv_blk": 256, "nkv": 3}})
 
 
 def baseline_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
@@ -93,7 +93,7 @@ def baseline_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
     elif B > 8:
         t = VERIFY_TILES
     elif B > 4:
-        t = dataclasses.replace(DECODE_TILES, rsag=True, hier=2).with_blocks(
+        t = dataclasses.replace(DECODE_TILES, rsag=True, hier=2).with_modules(
             {_MOE: {"ecopy_opt": 1}}
         )
     else:
