@@ -11,12 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: pd-spec-pipeline-decode-20261023-r8
-exp_type: PROFILING
-artifact_type: trace
+name: pd-spec-pipeline-decode-20261024-r12-baseline
+exp_type: BENCHMARK
+artifact_type: generic
 cluster_name: gke-tpu-train-us-central1-1-prod
-profile: true
-tags: [profile, kimi-k3, dspark, pd-baseline]
+tags: [kimi-k3, dspark, pd-baseline]
 role_to_task_spec:
   worker:
     command: |
@@ -34,6 +33,8 @@ role_to_task_spec:
     device_topo: 2x2x1
     envs:
       K3_DSPARK_PD_COORD_DIR: /coord
+      K3_DSPARK_PD_CONFIG: kimi-k3-pruned75-dspark-tp8-ep-1p1d
+      K3_DSPARK_PD_CAPTURE_PROFILE: "0"
       MODEL_OVERRIDE: /models/Kimi-K3-pruned75
       MODEL_URI: ""
       DRAFT_MODEL_OVERRIDE: /models/Inferact/Kimi-K3-DSpark-Block5
@@ -45,7 +46,7 @@ role_to_task_spec:
       UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "10800"
-      USE_PHASED_PROFILER: "1"
+      USE_PHASED_PROFILER: "0"
     mounts:
       - name: pruned75
         type: gcs
@@ -64,7 +65,7 @@ role_to_task_spec:
       - name: coord
         type: gcs
         bucket: inference-model-storage-poc-tpu-hns
-        prefix: benchmarks/pd-spec-pipeline/20261023-r8
+        prefix: benchmarks/pd-spec-pipeline/20261024-r12-baseline
         mount_path: /coord
         mount_options: [implicit-dirs, metadata-cache:ttl-secs:0]
     sources:
@@ -72,5 +73,5 @@ role_to_task_spec:
         type: git
         repo: https://github.com/vllm-project/vllm-torchtpu.git
         ref: hafeng/spec_in_prefll_to_decode
-        commit: dd3e76120ed102cb15cba1205030f86c0ccd1f95
+        commit: 1cef8865d65be8c9435b8b979b15ff8426ad771e
         path: /workspace/vllm-torchtpu

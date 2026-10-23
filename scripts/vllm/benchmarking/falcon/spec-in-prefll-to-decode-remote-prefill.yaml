@@ -1,0 +1,77 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: pd-spec-pipeline-prefill-20261023-r11-remote
+exp_type: BENCHMARK
+artifact_type: generic
+cluster_name: gke-tpu-train-us-central1-1-prod
+tags: [kimi-k3, dspark, pd-remote-draft, smoke]
+role_to_task_spec:
+  worker:
+    command: |
+      bash -lc '
+        set -euo pipefail
+        cd /workspace/vllm-torchtpu
+        uv pip install --system --no-deps -e .
+        K3_DSPARK_PD_ROLE=prefill \
+          bash scripts/vllm/benchmarking/run_k3_dspark_tp8_pd_pair.sh
+      '
+    replica: 1
+    image: vllm/vllm-torchtpu:nightly
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    envs:
+      K3_DSPARK_PD_COORD_DIR: /coord
+      K3_DSPARK_PD_CONFIG: kimi-k3-pruned75-dspark-tp8-ep-remote
+      K3_DSPARK_PD_CAPTURE_PROFILE: "0"
+      MODEL_OVERRIDE: /models/Kimi-K3-pruned75
+      MODEL_URI: ""
+      DRAFT_MODEL_OVERRIDE: /models/Inferact/Kimi-K3-DSpark-Block5
+      DSPARK_NUM_SPECULATIVE_TOKENS: "5"
+      EXTRA_SERVE_ARGS: --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "10800"
+      USE_PHASED_PROFILER: "0"
+    mounts:
+      - name: pruned75
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: models/mgoin/Kimi-K3-pruned75/3c8e22fdac0c14409eebd48ba78c10a940f5267a
+        mount_path: /models/Kimi-K3-pruned75
+        read_only: true
+        mount_options: [implicit-dirs, read:enable-buffered-read:true]
+      - name: dspark-block5
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: models/Inferact/Kimi-K3-DSpark-Block5
+        mount_path: /models/Inferact/Kimi-K3-DSpark-Block5
+        read_only: true
+        mount_options: [implicit-dirs, read:enable-buffered-read:true]
+      - name: coord
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: benchmarks/pd-spec-pipeline/20261023-r11-remote
+        mount_path: /coord
+        mount_options: [implicit-dirs, metadata-cache:ttl-secs:0]
+    sources:
+      - name: vllm-torchtpu
+        type: git
+        repo: https://github.com/vllm-project/vllm-torchtpu.git
+        ref: hafeng/spec_in_prefll_to_decode
+        commit: 1cef8865d65be8c9435b8b979b15ff8426ad771e
+        path: /workspace/vllm-torchtpu
