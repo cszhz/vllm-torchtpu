@@ -750,6 +750,7 @@ def prepare(
     s_cap: int = 49152,
     u_cap: int = 16384,
     min_q_len: int = 17,
+    rows_per_token: int = 160,
 ) -> dict:
     """The union plan of a step (SparseCore), independent of q and the SWA
     pass: a caller can issue it ahead so it runs behind TensorCore work.
@@ -775,14 +776,34 @@ def prepare(
     qn = jnp.where(b < total_blocks, jnp.clip(cu_q_lens[seq_b + 1] - q0, 0, bq), 0)
     q0 = jnp.where(qn > 0, q0, 0)
     s_b = jnp.where(qn > 0, kv_lens[seq_b], 0)
-    idx, mask, usize = build_union_plan(
-        topk_indices, page_indices, jnp.stack([q0, qn, seq_b, s_b], axis=1),
-        max_num_seqs=nseq, s_cap=s_cap, u_cap=u_cap, page_size=page_size,
-    )  # fmt: skip
+    meta_rows = jnp.stack([q0, qn, seq_b, s_b], axis=1)
+    kw = dict(max_num_seqs=nseq, s_cap=s_cap, u_cap=u_cap, page_size=page_size)
+    # Union sizes first (a cheap pass); the full plan only for a step that
+    # will take the union path.
+    _, _, usize = build_union_plan(topk_indices, page_indices, meta_rows,
+                                   count_only=True, **kw)  # fmt: skip
     usize = jnp.where(qn > 0, usize, 0)
+    ntiles = (usize + TILE - 1) // TILE
+    rows_cap = cdiv(T * rows_per_token, 32768) * 32768
+    n_sparse = cu_q_lens[split_seq]
+    use_union = (
+        (n_sparse < cu_q_lens[distribution[2]])
+        & jnp.all(usize <= u_cap)
+        & (jnp.sum(ntiles) * TILE <= rows_cap)
+    )
+    W = u_cap // WORD_BITS
+
+    def full(_):
+        idx, mask, _ = build_union_plan(topk_indices, page_indices, meta_rows, **kw)
+        return idx, mask
+
+    def none(_):
+        return (jnp.zeros((nb_cap * u_cap,), jnp.int32), jnp.zeros((T, W), jnp.int32))
+
+    idx, mask = lax.cond(use_union, full, none, None)
     return dict(
         idx=idx, mask=mask, usize=usize, q0=q0, qn=qn, seq_b=seq_b,
-        total_blocks=total_blocks, n_sparse=cu_q_lens[split_seq],
+        total_blocks=total_blocks, n_sparse=n_sparse, use_union=use_union,
     )  # fmt: skip
 
 
@@ -823,7 +844,7 @@ def attention(
         plan = prepare(
             topk_indices, kv_lens, page_indices, cu_q_lens, distribution,
             page_size=cache_kv_nope.shape[1], bq=bq, s_cap=s_cap, u_cap=u_cap,
-            min_q_len=min_q_len,
+            min_q_len=min_q_len, rows_per_token=rows_per_token,
         )  # fmt: skip
     idx, mask, usize = plan["idx"], plan["mask"], plan["usize"]
     q0, qn, seq_b = plan["q0"], plan["qn"], plan["seq_b"]
@@ -834,11 +855,8 @@ def attention(
     tile_end = jnp.cumsum(ntiles)
     tile0 = tile_end - ntiles
     total_tiles = tile_end[-1]
-    use_union = (
-        (n_sparse < total_valid)
-        & jnp.all(usize <= u_cap)
-        & (total_tiles * TILE <= rows_cap)
-    )
+    use_union = plan["use_union"]
+    del total_valid
 
     def sparse_call(q, rows, num_valid):
         return sparse_mla.sparse_ragged_paged_attention(

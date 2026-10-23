@@ -280,6 +280,7 @@ def _attention_csa(
             main_distribution,
             page_size=main_cache_kv.shape[1],
             bq=union_bq,
+            rows_per_token=union_dense_rows_per_token,
         )
     extra, swa_output, union_plan = jax.lax.optimization_barrier(
         (extra, swa_output, union_plan)
