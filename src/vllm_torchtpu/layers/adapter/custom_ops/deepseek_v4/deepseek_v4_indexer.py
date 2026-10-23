@@ -37,7 +37,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config as compressor_config,
 )
-from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
+from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant, rope_quant_flat
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     KVLayout,
     get_kv_cache_shape,
@@ -81,6 +81,7 @@ def _indexer_impl(
     num_kv_pages_per_block: tuple[int, int, int],
     num_queries_per_block: tuple[int, int, int],
     verify_q_len: int | None = None,
+    flat_head_dim: int = 0,
     split_rank: jax.Array | None = None,
     kv_split: int = 1,
     row_window: tuple | None = None,
@@ -113,9 +114,20 @@ def _indexer_impl(
         # Note: vLLM's implementation rounds the scale factors up to the next
         # power of 2, but the plain `abs_max / dtype_max` the kernel returns is
         # sufficient here.
-        q_quant, q_scales = rope_quant(
-            q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
-        )
+        if flat_head_dim:
+            # TPU_DSV4_ROPE_QUANT_FLAT: ``q`` is the flat projection; the kernel
+            # reads its (8, 128) tiles and returns [tokens, heads, dim].
+            q_quant, q_scales = rope_quant_flat(
+                q,
+                positions,
+                cos_sin_cache,
+                num_heads=q.shape[1] // flat_head_dim,
+                quant_dtype=jnp.float8_e4m3fn,
+            )
+        else:
+            q_quant, q_scales = rope_quant(
+                q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
+            )
 
         # Fold the query quantization scales into the weights.
         weights = indexer_weights * softmax_scale * (n_head**-0.5) * q_scales
@@ -180,6 +192,7 @@ def _indexer_jax(
     num_kv_pages_per_block: tuple[int, int, int],
     num_queries_per_block: tuple[int, int, int],
     verify_q_len: int | None = None,
+    flat_head_dim: int = 0,
 ) -> jax.Array:
     return _indexer_impl(
         q, positions, cos_sin_cache, indexer_weights, cache_kv, seq_lens,
@@ -187,6 +200,7 @@ def _indexer_jax(
         k=k, compression_ratio=compression_ratio, softmax_scale=softmax_scale,
         n_head=n_head, num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block, verify_q_len=verify_q_len,
+        flat_head_dim=flat_head_dim,
     )
 
 
@@ -210,6 +224,7 @@ def _indexer_split_jax(
     num_queries_per_block: tuple[int, int, int],
     kv_split: int,
     verify_q_len: int | None = None,
+    flat_head_dim: int = 0,
 ) -> jax.Array:
     """This rank's kv_split share: i32[T, 2k] (global columns, score bits)."""
     return _indexer_impl(
@@ -218,12 +233,12 @@ def _indexer_split_jax(
         k=k, compression_ratio=compression_ratio, softmax_scale=softmax_scale,
         n_head=n_head, num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block, verify_q_len=verify_q_len,
-        split_rank=split_rank, kv_split=kv_split,
+        flat_head_dim=flat_head_dim, split_rank=split_rank, kv_split=kv_split,
     )
 
 
 def _indexer_token_split_jax(
-    q: jax.Array,  # [T / tp, H, D]: this rank's rows
+    q: jax.Array,  # [T / tp, H, D] (or [T / tp, H * D] flat): this rank's rows
     positions: jax.Array,  # [T / tp]
     cos_sin_cache: jax.Array,
     indexer_weights: jax.Array,  # [T / tp, H]
@@ -242,6 +257,7 @@ def _indexer_token_split_jax(
     num_kv_pages_per_block: tuple[int, int, int],
     num_queries_per_block: tuple[int, int, int],
     verify_q_len: int | None = None,
+    flat_head_dim: int = 0,
 ) -> jax.Array:
     """TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE: the top-k of rows
     [rank * T/tp, (rank + 1) * T/tp) only, as the whole batch selects them."""
@@ -257,6 +273,7 @@ def _indexer_token_split_jax(
         k=k, compression_ratio=compression_ratio, softmax_scale=softmax_scale,
         n_head=n_head, num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block, verify_q_len=verify_q_len,
+        flat_head_dim=flat_head_dim,
         row_window=(seq_lens, cu_q_lens, distribution, offset),
         row_window_tokens=window * tp,
     )  # fmt: skip
@@ -354,10 +371,12 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         mesh = get_pallas_op_mesh()
         spec = get_current_vllm_config().speculative_config
         verify_q_len = None if spec is None else spec.num_speculative_tokens + 1
+        flat = envs.TPU_DSV4_ROPE_QUANT_FLAT
         op_name = (
             f"pallas::deepseek_v4_indexer_tok_k{self.topk_tokens}"
             f"_c{self.compress_ratio}_h{self.n_head}_tp{tp}"
             f"{'' if verify_q_len is None else f'_vq{verify_q_len}'}"
+            f"{'_flat' if flat else ''}"
         )
         if op_name in _indexer_op_cache:
             return _indexer_op_cache[op_name]
@@ -366,6 +385,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             functools.partial(
                 _indexer_token_split_jax,
                 tp=tp,
+                flat_head_dim=self.head_dim if flat else 0,
                 k=self.topk_tokens,
                 compression_ratio=self.compress_ratio,
                 softmax_scale=self.softmax_scale,
@@ -376,7 +396,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             ),
             mesh=mesh,
             input_partition_specs=(
-                P(None, "model", None),  # q
+                P(None, "model") if flat else P(None, "model", None),  # q
                 P(None),  # positions
                 P(),  # cos_sin_cache
                 P(None, "model"),  # indexer_weights
@@ -411,6 +431,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         # them in `[distribution[0], distribution[1])`.
         spec = get_current_vllm_config().speculative_config
         verify_q_len = None if spec is None else spec.num_speculative_tokens + 1
+        flat = envs.TPU_DSV4_ROPE_QUANT_FLAT
 
         wrapped_fn = functools.partial(
             _indexer_jax if kv_split == 1 else _indexer_split_jax,
@@ -421,6 +442,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             num_kv_pages_per_block=envs.TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK,
             num_queries_per_block=envs.TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK,
             verify_q_len=verify_q_len,
+            flat_head_dim=self.head_dim if flat else 0,
             **({} if kv_split == 1 else {"kv_split": kv_split}),
         )
 
@@ -434,6 +456,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}"
             f"{'' if verify_q_len is None else f'_vq{verify_q_len}'}"
             f"{'' if kv_split == 1 else f'_split{kv_split}'}"
+            f"{'_flat' if flat else ''}"
         )
         global _indexer_op_cache
         if op_name in _indexer_op_cache:
@@ -447,7 +470,10 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             wrapped_fn,
             mesh=mesh,
             input_partition_specs=(
-                P(attn_data_axis, attn_head_axis, None),  # q
+                # q: flat [T, heads * dim] under TPU_DSV4_ROPE_QUANT_FLAT
+                P(attn_data_axis, attn_head_axis)
+                if flat
+                else P(attn_data_axis, attn_head_axis, None),
                 P(attn_data_axis),  # positions
                 P(),  # cos_sin_cache
                 P(attn_data_axis, attn_head_axis),  # indexer_weights
@@ -512,7 +538,8 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
                 for t in (query, indexer_weights, positions)
             )
         q, _ = self.wq_b(query)
-        q = q.view(-1, self.n_head, self.head_dim)
+        if not envs.TPU_DSV4_ROPE_QUANT_FLAT:
+            q = q.view(-1, self.n_head, self.head_dim)
 
         self.compressor(hidden_states, positions, rotary_emb)
 
