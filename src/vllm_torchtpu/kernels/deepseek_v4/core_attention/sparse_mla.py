@@ -183,7 +183,7 @@ def _attention_swa_decode_kernel(
     swa_accumution_hbm_ref,
     swa_l_hbm_ref,
     swa_m_hbm_ref,
-    swa_new_kv_hbm_ref,  # [max_num_tokens, token_bytes // 128, 128] uint8
+    swa_new_kv_hbm_ref,  # `mla_swa.prepare_kv_inputs` words
     swa_cache_hbm_ref,  # SWA cache: uint8 slabs or an int32 CSA host array
     o_hbm_ref,
     updated_swa_cache_hbm_ref,
@@ -198,6 +198,9 @@ def _attention_swa_decode_kernel(
     Decode token t is decode sequence t; start_end_seq_idx_ref[3] holds the
     number of decode tokens."""
     *scratch, swa_bkv_x2_vmem, swa_sems = scratch
+    swa_new_kv_hbm_ref = mla_swa.as_new_kv_rows(
+        swa_new_kv_hbm_ref, swa_bkv_x2_vmem.shape[3] * swa_bkv_x2_vmem.shape[4]
+    )
     cache = csa_cache_layout.as_u8_slabs(swa_cache_hbm_ref)
     updated_cache = csa_cache_layout.as_u8_slabs(updated_swa_cache_hbm_ref)
     total_num_pages, phys_page_size_per_kv_packing, kv_packing, lkv_dim = cache.shape
@@ -967,8 +970,8 @@ def sparse_ragged_paged_attention(
                 out_shape,
                 jax.ShapeDtypeStruct(swa_cache.shape, swa_cache.dtype),
             ]
-            slots = swa_decode.new_kv.shape[1]
-            lkv_dim = swa_decode.new_kv.shape[2]
+            lkv_dim = swa_decode.new_kv.shape[1]
+            slots = head_dim * jnp.dtype(q.dtype).itemsize // lkv_dim
             scratch_shapes += [
                 pltpu.VMEM(
                     (

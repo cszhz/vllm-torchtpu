@@ -128,7 +128,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    new_kv_hbm_ref,  # [max_num_tokens, token_bytes // 128, 128] uint8
+    new_kv_hbm_ref,  # `prepare_kv_inputs` words
     # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
     cache_kv_hbm_ref,
     in_output_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
@@ -184,6 +184,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     assert token_bytes % slot_bytes == 0
     slots_per_token = token_bytes // slot_bytes
     phys_tokens_per_page = physical_page_size_per_kv_packing // slots_per_token
+    new_kv_hbm_ref = as_new_kv_rows(new_kv_hbm_ref, token_bytes)
 
     max_num_seqs = kv_lens_ref.shape[0]
     num_page_indices = page_indices_ref.shape[0]
@@ -954,26 +955,30 @@ def prepare_q_inputs(
 
 
 def prepare_kv_inputs(kv: jax.Array):
-    """Reinterprets bf16 new KV as one raw uint8 byte row per token.
+    """bf16 new KV [tokens, head_dim] as the 32-bit words of its cache rows,
+    int32 [tokens * head_dim // 256, 128].
 
-    Each token's `actual_head_dim` bf16 values become `actual_head_dim * 2`
-    contiguous bytes. The bytes are laid out so that, once a token row is viewed
-    as ``[slots_per_token * kv_packing, 128]`` (128 = the kernel's lane width),
-    every pair of consecutive sublanes holds one bf16 value in little-endian byte
-    order (lo byte then hi byte).
+    Word w of a token's word row k holds bf16 256 k + w in its low half and
+    256 k + 128 + w in its high half: little endian, the bytes of the
+    token's uint8 slab rows, where every pair of consecutive sublanes holds
+    one bf16 value (lo byte then hi byte). The kernels view it through
+    `as_new_kv_rows`, a free bitcast.
     """
     assert kv.dtype == jnp.bfloat16
     tokens, head_dim = kv.shape
-    assert head_dim % 128 == 0
-    kv_u16 = jax.lax.bitcast_convert_type(kv, jnp.uint16)
-    kv_hi = ((kv_u16 >> 8) & 0xFF).astype(jnp.uint8)
-    kv_lo = (kv_u16 & 0xFF).astype(jnp.uint8)
-    nb = head_dim // 128
-    kv_hi = kv_hi.reshape(tokens, nb, 128)
-    kv_lo = kv_lo.reshape(tokens, nb, 128)
-    # (tokens, nb, 2, 128)
-    interleaved = jnp.stack([kv_lo, kv_hi], axis=2)
-    return interleaved.reshape(tokens, head_dim * 2)
+    assert head_dim % 256 == 0
+    bits = jax.lax.bitcast_convert_type(kv, jnp.int16).reshape(-1, 2, 128)
+    low = bits[:, 0].astype(jnp.int32) & 0xFFFF
+    return low | (bits[:, 1].astype(jnp.int32) << 16)
+
+
+def as_new_kv_rows(ref, token_bytes: int):
+    """View `prepare_kv_inputs` words as uint8 [tokens, token_bytes // 128,
+    128], one slab row group per token: Mosaic packs 4 consecutive uint8
+    rows into one 32-bit row, little endian, as the words hold them."""
+    rows, lanes = ref.shape
+    word_rows = token_bytes // (4 * lanes)
+    return ref.bitcast(jnp.uint8).reshape(rows // word_rows, 4 * word_rows, lanes)
 
 
 def prepare_outputs(
@@ -1031,7 +1036,7 @@ class SwaDecodeInputs(NamedTuple):
     a fused kernel with `decode_by_caller=True`: the operands the batched
     decode kernel would have taken (see `SwaDecodeWindowRefs`)."""
 
-    # [max_num_tokens, slots_per_token * kv_packing, lkv_dim] uint8
+    # `prepare_kv_inputs` words
     new_kv: jax.Array
     # The cache with the other rows' new kv written.
     cache_kv: jax.Array
@@ -1259,7 +1264,7 @@ class SwaDecodeWindowRefs(NamedTuple):
     #  lkv_dim] uint8 views of the cache and of the aliased updated cache.
     cache_hbm_ref: Any
     updated_cache_hbm_ref: Any
-    new_kv_hbm_ref: Any  # [max_num_tokens, token_bytes // 128, 128] uint8
+    new_kv_hbm_ref: Any  # [max_num_tokens, token_bytes // 128, 128] uint8 rows
     sliding_window: int
     logical_page_size: int
     bkv_p: int
@@ -1443,7 +1448,7 @@ def _mla_batched_decode_kernel(
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    new_kv_hbm_ref,  # [max_num_tokens, token_bytes // 128, 128] uint8
+    new_kv_hbm_ref,  # `prepare_kv_inputs` words
     # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
     cache_kv_hbm_ref,
     in_output_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
@@ -1496,6 +1501,7 @@ def _mla_batched_decode_kernel(
     slot_bytes = kv_packing * lkv_dim
     slots_per_token = token_bytes // slot_bytes
     phys_tokens_per_page = physical_page_size_per_kv_packing // slots_per_token
+    new_kv_hbm_ref = as_new_kv_rows(new_kv_hbm_ref, token_bytes)
 
     max_num_seqs = kv_lens_ref.shape[0]
 
@@ -1802,7 +1808,7 @@ def _mla_batched_decode_kernel(
 
 def run_mla_batched_decode_kernel(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
-    new_kv: jax.Array,  # [max_num_tokens, lkv_dim]
+    new_kv: jax.Array,  # `prepare_kv_inputs` words
     # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
     cache_kv: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_seqs]
@@ -2143,8 +2149,7 @@ def mla_sliding_window_ragged_paged_attention(
     slots_per_token = token_bytes // slot_bytes
     phys_tokens_per_page = physical_page_size_per_kv_packing // slots_per_token
 
-    new_kv = prepare_kv_inputs(new_kv)  # [max_num_tokens, token_bytes] uint8
-    new_kv = new_kv.reshape(new_kv.shape[0], slots_per_token * kv_packing, lkv_dim)
+    new_kv = prepare_kv_inputs(new_kv)
     assert logical_page_size <= phys_tokens_per_page
 
     _, num_q_heads, _ = q.shape
@@ -2163,7 +2168,7 @@ def mla_sliding_window_ragged_paged_attention(
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
-        new_kv: jax.Array,  # [max_num_tokens, lkv_dim]
+        new_kv: jax.Array,  # `prepare_kv_inputs` words
         # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
         cache_kv: jax.Array,
         kv_lens: jax.Array,  # i32[max_num_seqs]

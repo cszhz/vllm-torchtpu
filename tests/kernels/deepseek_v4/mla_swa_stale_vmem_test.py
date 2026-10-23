@@ -112,14 +112,12 @@ class MlaSwaStaleVmemTest(parameterized.TestCase):
         tok = jnp.asarray(
             rng.standard_normal((total_pages * PAGE, HEAD_DIM)), jnp.bfloat16
         )
-        self.cache = mla_swa.prepare_kv_inputs(tok).reshape(
-            total_pages, PAGE * 2, 4, 128
-        )
+        self.cache = mla_swa.prepare_kv_inputs(tok).reshape(total_pages, PAGE * 2, 128)
         self.q = jnp.asarray(
             rng.standard_normal((batch, HEADS, HEAD_DIM)), jnp.bfloat16
         )
         new_kv = jnp.asarray(rng.standard_normal((batch, HEAD_DIM)), jnp.bfloat16)
-        self.new_kv = mla_swa.prepare_kv_inputs(new_kv).reshape(batch, 8, 128)
+        self.new_kv = mla_swa.prepare_kv_inputs(new_kv)
         self.page_indices = jnp.arange(total_pages, dtype=jnp.int32)
         self.cu_q_lens = jnp.arange(batch + 1, dtype=jnp.int32)
         self.sinks = jnp.zeros((HEADS,), jnp.float32)
