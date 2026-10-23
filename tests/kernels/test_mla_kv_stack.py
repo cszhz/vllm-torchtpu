@@ -201,6 +201,30 @@ class StackedDcpWriterTest(parameterized.TestCase):
                 )
                 got_nope = np.asarray(split_kv_stack(got_nope, nope_stack.shape))
                 got_rope = np.asarray(split_kv_stack(got_rope, rope_stack.shape))
+                # The served form: the per-layer table + kv_stack (pages
+                # resolved per layer, then offset to the row) writes the same
+                # bytes as the rewritten table, everywhere in the stack.
+                kw_nope, kw_rope = update_sparse_mla_kv_cache_dcp_jax(
+                    merge_kv_stack(nope_stack, kv_stack),
+                    merge_kv_stack(rope_stack, kv_stack),
+                    inputs["kv_c"],
+                    inputs["k_pe"],
+                    inputs["seq_lens"],
+                    inputs["block_tables"],
+                    inputs["query_start_loc"],
+                    jnp.int32(rank),
+                    nope_spec=merged_nope_spec,
+                    rope_spec=merged_rope_spec,
+                    dcp_size=dcp_size,
+                    interleave_size=interleave,
+                    kv_stack=kv_stack,
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(split_kv_stack(kw_nope, nope_stack.shape)), got_nope
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(split_kv_stack(kw_rope, rope_stack.shape)), got_rope
+                )
                 self.assertFalse(
                     np.array_equal(np.asarray(want_nope), np.asarray(nope_stack[row])),
                     "degenerate: this rank wrote nothing",
@@ -299,3 +323,119 @@ class StackGroupSizesTest(parameterized.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "exceeds"):
             glm5_stack_group_sizes(2, 11, 10)
+
+
+class StackedPageSlotNoRewriteTest(parameterized.TestCase):
+    """`_get_dcp_page_and_slot(..., kv_stack=)` on the per-layer table resolves
+    every token to the page the rewritten table (`stack_page_table_dcp`) does on
+    the merged pool -- OOB rows included -- and its pre-offset part is the
+    per-layer computation itself (identical in every row: what lets XLA CSE it
+    across layers). A wrong row (positive control) lands elsewhere."""
+
+    @parameterized.parameters(4, 8, 16)
+    def test_matches_rewritten_table(self, dcp_size):
+        from vllm_torchtpu.kernels.mla.kv_cache_utils import _get_dcp_page_and_slot
+
+        n_layers, num_blocks, page_size, interleave = 5, 12, 32, 4
+        spec = SparseMLAKVCacheSpec.create(
+            KVCacheType.NOPE,
+            KVCacheLayout.SPARSECORE,
+            num_blocks,
+            page_size,
+            LKV_DIM,
+            KV_PACKING,
+        )
+        merged = dataclasses.replace(spec, num_pages=n_layers * num_blocks)
+        inputs = _dcp_inputs(dcp_size, interleave, page_size, 4, num_blocks)
+        num_tokens = inputs["kv_c"].shape[0]
+        args = (inputs["seq_lens"], inputs["block_tables"], inputs["query_start_loc"])
+        kw = dict(dcp_size=dcp_size, interleave_size=interleave)
+        for rank in range(dcp_size):
+            base_page, base_slot = _get_dcp_page_and_slot(
+                num_tokens, *args, jnp.int32(rank), nope_spec=spec, **kw
+            )
+            base_page = np.asarray(base_page)
+            valid = base_page != OOB_PAGE
+            self.assertTrue(valid.any() and (~valid).any(), "degenerate ownership")
+            for row in range(n_layers):
+                want = _get_dcp_page_and_slot(
+                    num_tokens,
+                    inputs["seq_lens"],
+                    stack_page_table_dcp(inputs["block_tables"], (row, num_blocks)),
+                    inputs["query_start_loc"],
+                    jnp.int32(rank),
+                    nope_spec=merged,
+                    **kw,
+                )
+                got = _get_dcp_page_and_slot(
+                    num_tokens,
+                    *args,
+                    jnp.int32(rank),
+                    nope_spec=merged,
+                    kv_stack=(row, num_blocks),
+                    **kw,
+                )
+                np.testing.assert_array_equal(np.asarray(got[0]), np.asarray(want[0]))
+                np.testing.assert_array_equal(np.asarray(got[1]), np.asarray(want[1]))
+                np.testing.assert_array_equal(
+                    np.asarray(got[0])[valid], base_page[valid] + row * num_blocks
+                )
+                np.testing.assert_array_equal(np.asarray(got[1]), np.asarray(base_slot))
+                wrong = _get_dcp_page_and_slot(
+                    num_tokens,
+                    *args,
+                    jnp.int32(rank),
+                    nope_spec=merged,
+                    kv_stack=((row + 1) % n_layers, num_blocks),
+                    **kw,
+                )
+                self.assertFalse(
+                    np.array_equal(np.asarray(wrong[0]), np.asarray(want[0])),
+                    "positive control: a wrong stack row must move the pages",
+                )
+
+
+class StackedGatherIndicesTest(parameterized.TestCase):
+    """The uncapped sparse-MLA row prep on the per-layer geometry + the stack
+    row offset (`sparse_ragged_paged_attention(kv_stack=)`) gathers, for every
+    valid top-k slot, the row the rewritten table gathers on the merged pool;
+    padding slots stay inside this layer's row of the stack, at the per-layer
+    padding rows shifted by the row offset."""
+
+    def test_offset_rows(self):
+        from jax.experimental.pallas import tpu as pltpu
+
+        with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()):
+            self._offset_rows()
+
+    def _offset_rows(self):
+        from vllm_torchtpu.kernels.mla.sparse.kernel import prepare_gather_indices
+
+        n_layers, num_blocks, page_size, pps = 5, 12, 32, 4
+        rng = np.random.default_rng(3)
+        table = rng.permutation(num_blocks)[: 3 * pps].astype(np.int32)
+        q_lens = np.asarray([40, 4, 3], np.int32)
+        qsl = jnp.asarray(np.concatenate([[0], np.cumsum(q_lens)]), jnp.int32)
+        topk = rng.integers(0, pps * page_size, (48, 64)).astype(np.int32)
+        topk[rng.random(topk.shape) < 0.3] = -1
+        topk = jnp.asarray(topk)
+        local = jnp.mod(jnp.asarray(table), num_blocks)
+        _, base = prepare_gather_indices(
+            topk, local, qsl, page_size=page_size, total_num_pages=num_blocks
+        )
+        pad = np.asarray(topk) == -1
+        for row in range(n_layers):
+            off = row * num_blocks * page_size
+            _, want = prepare_gather_indices(
+                topk,
+                jnp.mod(
+                    stack_page_table_dcp(jnp.asarray(table), (row, num_blocks)),
+                    n_layers * num_blocks,
+                ),
+                qsl,
+                page_size=page_size,
+                total_num_pages=n_layers * num_blocks,
+            )
+            got = np.asarray(base) + off
+            np.testing.assert_array_equal(got[~pad], np.asarray(want)[~pad])
+            self.assertTrue(((got >= off) & (got < off + num_blocks * page_size)).all())
