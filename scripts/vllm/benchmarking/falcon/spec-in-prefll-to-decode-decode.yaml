@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: spec-in-prefll-to-decode-decode-20261023-r2
+name: spec-in-prefll-to-decode-decode-20261023-r3
 exp_type: PROFILING
 artifact_type: trace
 cluster_name: gke-tpu-train-us-central1-2-prod
@@ -63,7 +63,7 @@ role_to_task_spec:
       - name: coord
         type: gcs
         bucket: inference-model-storage-poc-tpu-hns
-        prefix: benchmarks/spec-in-prefll-to-decode/20261023-r2
+        prefix: benchmarks/spec-in-prefll-to-decode/20261023-r3
         mount_path: /coord
         mount_options: [implicit-dirs, metadata-cache:ttl-secs:0]
     sources:
@@ -71,5 +71,5 @@ role_to_task_spec:
         type: git
         repo: https://github.com/vllm-project/vllm-torchtpu.git
         ref: hafeng/spec_in_prefll_to_decode
-        commit: a49678484def5963b29584f2454273a8ff0e460b
+        commit: d5cd16d93bf5e381cf0e712eb2166be73d1745f7
         path: /workspace/vllm-torchtpu
