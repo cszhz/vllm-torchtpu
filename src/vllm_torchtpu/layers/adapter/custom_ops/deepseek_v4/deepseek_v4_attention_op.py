@@ -49,6 +49,9 @@ HCA_KV_PAGES_PER_BLOCK = (128, 64, 64)
 # Largest HCA kv block the SWA batched decode kernel takes in: 256 tokens
 # overflows VMEM at 128 heads and 1024 tokens.
 HCA_FUSED_MAX_KV_TOKENS = 128
+# Queries per q chunk of the HCA-fused SWA prefill/mixed kernel; the SWA-only
+# kernels keep 4.
+HCA_FUSED_Q_COMPUTE_BLOCK_SIZE = 16
 
 logger.info(
     "DeepSeek-V4 attention: HCA pass fused into the SWA kernels for kv blocks "
@@ -74,6 +77,7 @@ def _run_swa(
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
     lane_padded_lm: bool = False,
+    q_compute_block_size: int = 4,
     **hca,
 ) -> tuple[jax.Array, ...]:
     """Sliding-window pass: updates the SWA cache and returns its partials.
@@ -106,7 +110,7 @@ def _run_swa(
         # The following parameters are tuned based on microbenchmark results.
         num_kv_pages_per_block=SWA_KV_PAGES_PER_BLOCK,
         num_queries_per_block=(1, 32, 32),
-        q_compute_block_size=4,
+        q_compute_block_size=q_compute_block_size,
         unnormalized_output=not swa_only,
         non_causal_block=non_causal_block,
         chunk_prefill_size=verify_q_len,
@@ -224,6 +228,7 @@ def _attention_hca(
         verify_q_len=verify_q_len,
         # The HCA kernel reads l/m at 128 lanes; skip the slice-then-pad.
         lane_padded_lm=True,
+        **(dict(q_compute_block_size=HCA_FUSED_Q_COMPUTE_BLOCK_SIZE) if hca else {}),
         **hca,
     )
     if hca:
