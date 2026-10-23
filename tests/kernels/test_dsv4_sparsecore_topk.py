@@ -575,3 +575,41 @@ def test_scheduling_group_ids_do_not_change_the_selection(kind):
         np.sort(np.take_along_axis(scores, np.maximum(plain, 0), axis=1), axis=1),
         np.sort(np.take_along_axis(scores, np.maximum(grouped, 0), axis=1), axis=1),
     )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("kind", ["random", "heavy_ties"])
+@pytest.mark.parametrize("b", [1, 8, 16, 32, 40])
+def test_flat_unpadded_scores_select_what_padded_2d_does(kind, b):
+    """A TensorCore [b, n // 128, 128] score buffer handed over as is, with no
+    padding rows, selects exactly what the padded [b, n] form does, order
+    included -- on the by-length and cooperative paths alike."""
+    n, k = N_1M // 4, 1024
+    rng = np.random.default_rng(SEED + 7 * b)
+    scores = _scores(kind, b, n, rng).view(np.int32)
+    lengths = rng.integers(0, n + 1, b).astype(np.int32)
+    edges = [n, 0, sc_module.BY_LENGTH_SLOT_WORDS + 1, k - 3]
+    lengths[: min(b, len(edges))] = edges[: min(b, len(edges))]
+    want = sparsecore_topk(jnp.asarray(scores), k, jnp.asarray(lengths))
+    got = sparsecore_topk(
+        jnp.asarray(scores.reshape(b, n // 128, 128)),
+        k,
+        jnp.asarray(lengths),
+        pad_rows=False,
+    )
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+@pytest.mark.tpu_test
+def test_flat_unpadded_scores_lower_without_a_relayout():
+    """The point of the flat form: no copy / pad / SparseCore data-format of the
+    score buffer between the producer and the top-k."""
+    b, n, k = 8, N_1M // 4, 1024
+
+    def f(x, lengths):
+        return sparsecore_topk(x * 1, k, lengths, pad_rows=False)
+
+    x = jnp.zeros((b, n // 128, 128), jnp.int32)
+    txt = jax.jit(f).lower(x, jnp.full((b,), n, jnp.int32)).compile().as_text()
+    assert "data-format" not in txt
+    assert f"s32[32,{n}]" not in txt

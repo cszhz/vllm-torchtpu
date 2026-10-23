@@ -1215,6 +1215,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "uniform_q_len",
+        "sc_flat_scores",
     ),
 )
 def streamindex_topk(
@@ -1244,6 +1245,7 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     uniform_q_len: int | None = None,
+    sc_flat_scores: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1305,6 +1307,13 @@ def streamindex_topk(
         a static q length and the (decode, prefill, mixed) block sizes' prefill
         entry, instead of the decode passes, which assume one query token. None
         keeps the segment on the decode passes.
+      sc_flat_scores: hand the SparseCore top-k the scoring kernel's
+        [T, S, 128] buffer as is, with no padding rows. Its bytes already are
+        the flat row-major rows the top-k reads, so XLA passes it through as a
+        bitcast; the default reshapes it to [T, S * 128] and pads the rows to
+        the top-k's wave size, which XLA lowers as a relayout, a pad and a
+        SparseCore data-format conversion of the whole (padded) buffer. Same
+        selection either way.
       return_scores: also return the score of each selected position, which is
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
@@ -1753,8 +1762,12 @@ def streamindex_topk(
                 out_dtype,
                 tc_group,
             )
-            scores = scores.reshape(chunk_len, -1)
-            if scores.shape[1] < k:
+            topk_kwargs = {}
+            if sc_flat_scores and scores.shape[1] * 128 >= k:
+                topk_kwargs["pad_rows"] = False
+            else:
+                scores = scores.reshape(chunk_len, -1)
+            if scores.ndim == 2 and scores.shape[1] < k:
                 scores = jnp.pad(
                     scores,
                     ((0, 0), (0, k - scores.shape[1])),
@@ -1769,6 +1782,7 @@ def streamindex_topk(
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=True,
+                    **topk_kwargs,
                 )
                 topk_scores_list.append(chunk_topk_scores)
             else:
@@ -1779,6 +1793,7 @@ def streamindex_topk(
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=False,
+                    **topk_kwargs,
                 )
             topk_idxs.append(chunk_topk_idxs)
 

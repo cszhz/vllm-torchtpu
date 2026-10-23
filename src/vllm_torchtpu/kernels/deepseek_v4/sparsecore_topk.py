@@ -33,6 +33,7 @@ or beyond ``row_lengths`` are never selected. NaNs are unsupported.
 """
 
 import functools
+import math
 from typing import Any, cast
 
 import jax
@@ -769,7 +770,7 @@ def _slice_buffer(
 
 
 def _sc_topk_direct(
-    scores: jax.Array,  # f32[b, n]
+    scores: jax.Array,  # f32[b, n], or i32[b, n // 128, 128] (see sparsecore_topk)
     k: int,
     row_lengths: jax.Array,  # i32[b]
     *,
@@ -779,6 +780,7 @@ def _sc_topk_direct(
     return_scores: bool = True,
     scheduling_group_id: int | None = None,
     buffer_words: int | None = None,
+    pad_rows: bool = True,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Single-stage SparseCore top-k on 32 subcores.
 
@@ -789,7 +791,8 @@ def _sc_topk_direct(
     ``scores`` may be f32 or the same values already bitcast to i32; the kernel
     compares raw bits either way.
     """
-    b, n = scores.shape
+    b = scores.shape[0]
+    n = math.prod(scores.shape[1:])
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
     if sc is None:
@@ -804,13 +807,21 @@ def _sc_topk_direct(
     slice_len = _align_to(n // p, LANES)
     num_waves = _cdiv(b, groups_per_chip)
     padded_b = num_waves * groups_per_chip
-    pad_b = padded_b - b
+    wave_loop = local_idxs is None
+    # The wave loop fetches a row only up to its length, and the padding rows
+    # have length 0, so it never reads them: they need not exist in HBM. Padding
+    # them would materialize a (padded_b, n) copy of the scores (4x at b=8) and,
+    # worse, forces XLA to relayout the scores twice around the pad.
+    pad_b = padded_b - b if (pad_rows or not wave_loop) else 0
     pad_n = slice_len * p - n
     if pad_b > 0 or pad_n > 0:
+        if words.ndim != 2:
+            raise ValueError(
+                f"scores of shape {scores.shape} would need padding; pass 2D scores"
+            )
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
 
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
-    wave_loop = local_idxs is None
     if wave_loop:
         # One flat copy, padded for the 16-lane reads at its end.
         lengths_in = jnp.pad(lengths, (0, LANES))
@@ -915,6 +926,7 @@ def _sc_topk_by_length(
     write_empty: bool = True,
     return_scores: bool = False,
     scheduling_group_id: int | None = None,
+    pad_rows: bool = True,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """One row per subcore (P == 1), each fetched up to its own length into a
     buffer narrower than the row width.
@@ -923,7 +935,7 @@ def _sc_topk_by_length(
     come out in column order. The caller routes rows longer than
     BY_LENGTH_SLOT_WORDS elsewhere.
     """
-    n = scores.shape[1]
+    n = math.prod(scores.shape[1:])
     return _sc_topk_direct(
         scores,
         k,
@@ -933,6 +945,7 @@ def _sc_topk_by_length(
         return_scores=return_scores,
         scheduling_group_id=scheduling_group_id,
         buffer_words=min(BY_LENGTH_SLOT_WORDS, _align_to(n, LANES)),
+        pad_rows=pad_rows,
     )
 
 
@@ -968,16 +981,18 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "write_empty_rows",
         "scheduling_group_id",
         "return_scores",
+        "pad_rows",
     ),
 )
 def sparsecore_topk(
-    scores: jax.Array,  # f32[b, n] or i32[b, n] of f32 bits
+    scores: jax.Array,  # f32[b, n] or i32[b, n] of f32 bits; or i32[b, n // 128, 128]
     k: int,
     row_lengths: jax.Array | None = None,  # i32[b], defaults to n
     *,
     write_empty_rows: bool = True,
     scheduling_group_id: int | None = None,
     return_scores: bool = False,
+    pad_rows: bool = True,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
@@ -989,11 +1004,19 @@ def sparsecore_topk(
     ``scores`` may be f32 or i32 holding those f32 bits; the comparison is on
     raw bits either way.
     """
-    if scores.ndim != 2:
+    if scores.ndim == 3:
+        # A TensorCore kernel's [b, n // 128, 128] output, row-major per row in
+        # HBM under its (8, 128) tiling: the same bytes as the flat buffer the
+        # SparseCore kernel reads. Flattening it straight to 1D is a bitcast;
+        # going through [b, n] first is a full (8, 128) relayout each way.
+        if scores.shape[2] != 128 or scores.shape[1] % 8:
+            raise ValueError(f"3D scores must be [b, 8m, 128], got {scores.shape}")
+    elif scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
     if scores.dtype not in (jnp.float32, jnp.int32):
         raise ValueError(f"scores must be f32 or i32, got {scores.dtype}")
-    b, n = scores.shape
+    b = scores.shape[0]
+    n = math.prod(scores.shape[1:])
     if n % LANES != 0:
         raise ValueError(f"{n=} must be a multiple of {LANES}")
     if k % LANES != 0 or not 0 < k <= 4096:
@@ -1014,6 +1037,7 @@ def sparsecore_topk(
             write_empty=write_empty_rows,
             return_scores=return_scores,
             scheduling_group_id=scheduling_group_id,
+            pad_rows=pad_rows,
         )
     # Rows are usually far shorter than n. A row that fits one subcore's buffer
     # is selected there, whole; only longer rows pay the cooperative path's
@@ -1032,6 +1056,7 @@ def sparsecore_topk(
         write_empty=write_empty_rows,
         return_scores=return_scores,
         scheduling_group_id=scheduling_group_id,
+        pad_rows=pad_rows,
     )
     if n <= BY_LENGTH_SLOT_WORDS:
         return by_length
@@ -1045,6 +1070,7 @@ def sparsecore_topk(
         write_empty=False,
         return_scores=return_scores,
         scheduling_group_id=scheduling_group_id,
+        pad_rows=pad_rows,
     )
     return jax.tree.map(
         lambda c, s: jnp.where(is_long[:, None], c, s), cooperative, by_length

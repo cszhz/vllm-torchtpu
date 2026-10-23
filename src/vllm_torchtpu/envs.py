@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_DSV4_SC_TOPK_FLAT_SCORES: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -931,6 +932,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Unset means unchunked: one single pass, no pipelining.
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
+    ),
+    # DSv4 indexer: hand the SparseCore top-k the scoring kernel's [T, S, 128]
+    # buffer as is, without padding rows, instead of reshaping it to [T, S*128]
+    # and padding the rows to the top-k's wave size. The bytes are identical, so
+    # XLA passes it as a bitcast; the padded form costs a relayout, a pad and a
+    # SparseCore data-format conversion (~48 us per CSA layer at T8/T16, 1M
+    # max-model-len). Same selection. Set 0 to restore the padded form.
+    "TPU_DSV4_SC_TOPK_FLAT_SCORES": env_bool(
+        "TPU_DSV4_SC_TOPK_FLAT_SCORES", default=True
     ),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
