@@ -183,11 +183,19 @@ class Tiles:
     esingle: bool = False  # L3-s: ONE issue site per MoE layer (bundles): the expert loop runs from step -1,
     # whose iteration primes the ring through the same refill site and then runs the
     # shared expert; uses the L3-b refill rule with k = ebatch (k = 1 included)
-    # LV (stageB/dcp8-design §3.4; stageB/lv-probe): live-row collectives. The residual all-reduces move only
-    # ceil(T / rb) * rb rows (rb = TMAX // 4), the "pair" q all-gather ceil-to-{4, 8k} rows, and the L4 A2A only the
-    # ceil(T / 4) live 4-row chunks (padded chunks are no longer sent at layer end). Exact: every row of every
-    # collective is independent, and rows >= T are masked before every consumer. Default off = the 03dbe3617 program.
+    # LV (stageB/dcp8-design §3.4; stageB/lv-probe, lv-prod): live-row collectives. The residual all-reduces move only
+    # n = ceil(T / 4) * 4 rows (collectives.lv_ar_rows / ar_pieces: Mosaic-exact row pieces), the "pair" q all-gather
+    # 4 or ceil(T / 8) * 8 rows, and the L4 A2A only the ceil(T / 4) live 4-row chunks (padded chunks are not sent at
+    # layer end). Exact: every row of every collective is independent, and rows >= T are masked before every
+    # consumer. Default off = the 03dbe3617 program.
     lv: bool = False
+    lv_eight: str = "split"  # an all-reduce of 8 (mod 16) rows: "split" = two 4-row pieces | "round" = 12 rows
+    lv_floor: int = 0  # rows below which nothing is trimmed (the next-smaller row bucket: T <= floor never runs here)
+    lv_loop: int = 0  # LV all-reduce per-peer issue / wait sites: 0 unrolled | 1 fori_loops (bundles) | 2 fori_loops
+    # except the all-rows transfer (unrolled, as stage B issues it)
+    lv_sites: str = "aqx"  # which collectives LV trims: a = all-reduces, q = q all-gather, x = A2A (arms)
+    lv_dead: bool = False  # TIMING-ONLY control: the LV all-reduce / q AG code is compiled under a never-true
+    # predicate and the stage-B code runs (prices code size / branch structure with no row saved)
 
 
 def bf(x):
@@ -494,15 +502,26 @@ def build(
         )
     OWX = OH if LSE_TILE else OW  # A2A payload row (u32 lanes)
     LV = bool(tiles.lv) and cfg.R > 1 and "coll" not in skip
-    if LV:
+    LVD = bool(tiles.lv_dead) and cfg.R > 1 and "coll" not in skip
+    assert not (LV and LVD), "lv_dead is the no-LV control"
+    if LV or LVD:
         assert LSE_TILE and RW == 4, ("LV rides on L4 C3: lse tile + 4-row A2A chunks", tiles.a2a_lse, RW)
         assert tiles.qag == "pair", ("LV trims the 'pair' q all-gather only", tiles.qag)
         assert not tiles.l2replay and not tiles.record and tiles.replay == "" and not tiles.shadow_a2a, (
             "LV: no timing-only record / replay / shadow arms"
         )
         assert tiles.fault != "f_ar_earlyread", "LV's all-reduce has no early-read fault variant"
-    AR_RB = TMAX // 4  # LV all-reduce row granularity (4 options per bucket)
-    Q_OPTS = (4,) + tuple(range(8, TMAX + 1, 8))  # LV q AG row counts (u32 DMA rows: < 8 or a multiple of 8)
+        assert set(tiles.lv_sites) <= set("aqx") and 0 <= tiles.lv_floor < TMAX and tiles.lv_floor % 4 == 0, (
+            tiles.lv_sites,
+            tiles.lv_floor,
+        )
+    LV_A = (LV or LVD) and "a" in tiles.lv_sites
+    LV_Q = (LV or LVD) and "q" in tiles.lv_sites
+    LV_X = LV and "x" in tiles.lv_sites
+    LV_FLOOR = int(tiles.lv_floor)
+    AR_OPTS = CO.lv_ar_options(M, LV_FLOOR, tiles.lv_eight) if LV_A else ()
+    # LV q AG row counts: u32 DMA rows must be < 8 or a multiple of 8 (12 does not compile), clamped to >= floor
+    Q_OPTS = tuple(sorted({min(max(n, LV_FLOOR), TMAX) for n in (4,) + tuple(range(8, TMAX + 1, 8))}))
     assert tiles.replay in ("", "a2a", "ar"), tiles.replay
     n_r = {"": 0, "a2a": 1, "ar": 2}[tiles.replay]
     NQB = HR * DQ
@@ -847,9 +866,11 @@ def build(
 
         me = scal[2]
         T = scal[0]
-        if LV:  # rank-uniform (T is replicated metadata), so every byte-counting wait stays balanced
-            nlb_ar = (T + (AR_RB - 1)) // AR_RB
-            nq_lv = jnp.where(T <= 4, 4, (T + 7) // 8 * 8)
+        if LV or LVD:  # rank-uniform (T is replicated metadata), so every byte-counting wait stays balanced
+            lv_live = T <= TMAX  # LV: always true (T <= TMAX by contract); lv_dead runs the LV code under its negation
+            lv_dead_p = jnp.logical_not(lv_live)
+            n_ar = CO.lv_ar_rows(T, M, LV_FLOOR, tiles.lv_eight)
+            nq_lv = jnp.minimum(jnp.maximum(jnp.where(T <= 4, 4, (T + 7) // 8 * 8), LV_FLOOR), TMAX)
             nch_lv = (T + (RW - 1)) // RW
         T_eff = (T - 1) if fault == "dropped_tail_row" else T
         row_m = lax.broadcasted_iota(I32, (M, 1), 0)
@@ -949,8 +970,11 @@ def build(
                 return scr["rbuf"][...]
             buf = scr["arbuf"]
             buf[...] = jnp.where(row_m < T_eff, bf(partial_f32), 0.0).astype(BF16)
-            if "coll" not in skip and LV:
+            if "coll" not in skip and LV_A and LV:
                 with sc(f"X_ar{which}"):
+                    short = (
+                        (fault == "f_lv_short" and which == 1)
+                    )  # FAULT: AR#1 moves the last 4-row block of the live rows too few
                     CO.all_reduce_lv(
                         R,
                         me,
@@ -958,12 +982,22 @@ def build(
                         M,
                         H,
                         ar_set(which),
-                        nlb_ar - (1 if (fault == "f_lv_short" and which == 1) else 0),
-                        AR_RB,
+                        jnp.where(n_ar > 4, n_ar - 4, n_ar) if short else n_ar,
+                        AR_OPTS,
                         drop_last=drop_last,
                         mids=mids,
+                        loop=int(tiles.lv_loop),
                     )
             elif "coll" not in skip:
+                if LV_A and LVD:  # TIMING-ONLY control: the LV all-reduce compiled, never run
+
+                    @pl.when(lv_dead_p)
+                    def _():
+                        CO.all_reduce_lv(
+                            R, me, buf, M, H, ar_set(which), n_ar, AR_OPTS, drop_last=drop_last, mids=mids,
+                            loop=int(tiles.lv_loop),
+                        )
+
                 with sc(f"X_ar{which}"):
                     if mids:
                         CO.all_reduce(
@@ -1043,8 +1077,15 @@ def build(
                 return scr["qall"].at[i] if n is None else scr["qall"].at[i, pl.ds(0, n)]
 
             def lvs(fn):
-                if LV:
+                if LV_Q and LV:
                     CO.row_switch(nq_lv, Q_OPTS, fn)
+                elif LV_Q and LVD:  # TIMING-ONLY control: the LV sites compiled, never run
+
+                    @pl.when(lv_dead_p)
+                    def _():
+                        CO.row_switch(nq_lv, Q_OPTS, fn)
+
+                    fn(None)
                 else:
                     fn(None)
 
@@ -1723,7 +1764,7 @@ def build(
                                 ):  # the chunks not started inside the attention loop
 
                                     tail = scr["a2a_n"][0] <= c_
-                                    if LV:  # padded chunks (no live row) are not sent
+                                    if LV_X:  # padded chunks (no live row) are not sent
                                         tail = jnp.logical_and(tail, c_ < nch_lv)
 
                                     @pl.when(tail)
@@ -1756,7 +1797,7 @@ def build(
                                     (
                                         scr["osend"].at[0, pl.ds(0, rw_)],
                                         scr["orecv"].at[0, pl.ds(0, rw_)],
-                                        nch_lv if LV else NCH,
+                                        nch_lv if LV_X else NCH,
                                     ),
                                     (
                                         scr["lsend"].at[pl.ds(0, HPAD)],

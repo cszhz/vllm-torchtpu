@@ -735,7 +735,7 @@ class Glm52DecodeMK:
         # stage-B levers (presets.py): GLM52_DECODE_MK_LEVERS = "" / "A" (stage A) | "B" (all) | "L4,L1,..."
         self.levers = PR.parse(os.environ.get("GLM52_DECODE_MK_LEVERS", ""))
         self.tiles_by_rows = {
-            t: dataclasses.replace(self.tiles, **PR.tiles_kwargs(t, self.levers))
+            t: dataclasses.replace(self.tiles, **PR.tiles_kwargs(t, self.levers, self.rows))
             for t in self.rows
         }
         self.pool_pages = check_pool(
