@@ -395,7 +395,7 @@ def make(E):
     # (mh + b) % VR (req[b, 13]). Tile order = local-index order, so tile-space positions / counts compare exactly.
     VR, D_ = cfg.VR, cfg.D
     if VR > 1:
-        if fault == "f_v16_owner":  # FAULT: the DCP-R position rule on the DCP-D cache
+        if tiles.fault == "f_v16_owner":  # FAULT: the DCP-R position rule on the DCP-D cache
             G_, mk, mh = ILV * R, me, me // D_
         else:
             G_, mk, mh = ILV * D_, me % D_, me // D_
