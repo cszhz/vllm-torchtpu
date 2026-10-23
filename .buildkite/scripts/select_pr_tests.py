@@ -52,20 +52,6 @@ ALL_PR_INTEGRATION_STEPS: tuple[str, ...] = (
     "integration_qwen35_gpc_correctness",
 )
 
-DISAGG_KV_INTEGRATION_STEPS: set[str] = {
-    "integration_qwen35_pcp4_dp4_disagg_correctness",
-    "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
-    "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-    "presubmit_disagg_single_host",
-    "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
-    "integration_qwen35_gpc_correctness",
-    "integration_qwen35_gpc_global_dram_pool",
-}
-
-K3_OFFLOAD_INTEGRATION_STEPS: set[str] = {
-    "integration_k3_pruned75_apc_offload_correctness"
-}
-
 INTEGRATION_FILE_TO_STEPS: dict[str, set[str]] = {
     "scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh": {
         "integration_qwen35_pcp4_dp4_disagg_correctness"
@@ -213,15 +199,6 @@ NIGHTLY_ONLY_INTEGRATION_EXACT: set[str] = {
     ".buildkite/kubernetes/benchmark_with_profile.sh",
 }
 
-NON_PR_BUILDKITE_PREFIXES: tuple[str, ...] = (
-    ".buildkite/features/",
-    ".buildkite/models/",
-    ".buildkite/parallelism/",
-    ".buildkite/quantization/",
-    ".buildkite/rl/",
-    ".buildkite/kernel_microbenchmarks/",
-)
-
 NON_PR_BUILDKITE_EXACT: set[str] = {
     ".buildkite/pipeline_perf.yml",
     ".buildkite/pipeline_promote.yml",
@@ -245,8 +222,6 @@ NON_PR_BUILDKITE_EXACT: set[str] = {
     ".buildkite/scripts/publish_wheel.sh",
     ".buildkite/scripts/upload_profile.sh",
 }
-
-SPEC_DECODE_TEST_FILE = "tests/entrypoints/llm/test_speculative_decoding.py"
 
 
 @dataclass
@@ -277,9 +252,19 @@ def _is_doc_or_non_pr_file(path: str) -> bool:
         "verified_commit_hashes.csv",
     }:
         return True
-    if path.startswith(("docs/", ".github/", "support_matrices/")):
-        return True
-    if path.startswith(NON_PR_BUILDKITE_PREFIXES):
+    if path.startswith(
+        (
+            "docs/",
+            ".github/",
+            "support_matrices/",
+            ".buildkite/features/",
+            ".buildkite/models/",
+            ".buildkite/parallelism/",
+            ".buildkite/quantization/",
+            ".buildkite/rl/",
+            ".buildkite/kernel_microbenchmarks/",
+        )
+    ):
         return True
     if path in NON_PR_BUILDKITE_EXACT:
         return True
@@ -504,7 +489,7 @@ def select_for_files(
 
         if f.startswith("tests/"):
             run_test_steps.update({"typecheck_full", "unit_tests_cpu_pr"})
-            if f == SPEC_DECODE_TEST_FILE:
+            if f == "tests/entrypoints/llm/test_speculative_decoding.py":
                 run_test_steps.update(
                     {
                         "unit_tests_spec_decode_pr",
@@ -596,7 +581,9 @@ def select_for_files(
                     "unit_tests_multichip_pr",
                 }
             )
-            run_integration_steps.update(K3_OFFLOAD_INTEGRATION_STEPS)
+            run_integration_steps.add(
+                "integration_k3_pruned75_apc_offload_correctness"
+            )
             full_general_tests = True
             full_multichip_tests = True
             reasons.append("Kimi-K3/MLA/offload module changes")
@@ -611,7 +598,17 @@ def select_for_files(
                     "unit_tests_multichip_pr",
                 }
             )
-            run_integration_steps.update(DISAGG_KV_INTEGRATION_STEPS)
+            run_integration_steps.update(
+                {
+                    "integration_qwen35_pcp4_dp4_disagg_correctness",
+                    "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
+                    "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
+                    "presubmit_disagg_single_host",
+                    "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
+                    "integration_qwen35_gpc_correctness",
+                    "integration_qwen35_gpc_global_dram_pool",
+                }
+            )
             full_general_tests = True
             full_multichip_tests = True
             reasons.append("KV-transfer module changes")
