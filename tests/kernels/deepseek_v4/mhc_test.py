@@ -787,5 +787,42 @@ class MhcStackedFnTpuTest(parameterized.TestCase):
         np.testing.assert_allclose(_to_np(got[2]), _to_np(want[2]), rtol=8e-3, atol=1e-6)
 
 
+@pytest.mark.tpu_test
+class MhcPostHeadTpuTest(parameterized.TestCase):
+    """Fused last post + hc head collapse + stream mean (post_head_kernel)."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.parameters(8, 16, 130)
+    def test_matches_post_then_head(self, num_tokens):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import post_head_kernel, post_kernel
+
+        rng = np.random.default_rng(31)
+        x, res, plm, crm = _make_post_inputs(rng, num_tokens, 7168)
+        fn = jnp.asarray(rng.standard_normal((HC_MULT, HC_MULT * 7168), np.float32) * 0.02)
+        sc = jnp.asarray((1 + 0.1 * rng.standard_normal(1)).astype(np.float32))
+        hb = jnp.asarray((0.5 * rng.standard_normal(HC_MULT)).astype(np.float32))
+        head, mean = post_head_kernel.mhc_post_head(
+            x, res, plm, crm, fn, sc, hb, RMS_EPS, HC_PRE_EPS, want_mean=True
+        )
+        rec = post_kernel.mhc_post(x, res, plm, crm)
+        # The stream mean: bit-identical to post followed by a 4-way mean.
+        f = _to_np(rec)
+        want_mean = (((f[:, 0] + f[:, 2]) + (f[:, 1] + f[:, 3])) * 0.25).astype(np.float32)
+        np.testing.assert_array_equal(
+            _to_np(mean), _to_np(jnp.asarray(want_mean).astype(jnp.bfloat16))
+        )
+        # The head: f32 projection, vs a float64 evaluation of mhc_collapse_head.
+        r64 = f.astype(np.float64).reshape(num_tokens, -1)
+        nrm = r64 / np.sqrt((r64 * r64).mean(-1, keepdims=True) + RMS_EPS)
+        z = nrm @ np.asarray(fn, np.float64).T
+        pm = 1 / (1 + np.exp(-(z * float(sc[0]) + np.asarray(hb, np.float64)))) + HC_PRE_EPS
+        y = (pm[:, :, None] * f.astype(np.float64)).sum(1)
+        np.testing.assert_allclose(_to_np(head), y, rtol=8e-3, atol=2e-2)
+
+
 if __name__ == "__main__":
     absltest.main()

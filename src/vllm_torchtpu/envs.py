@@ -136,6 +136,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_MHC_STACKED_FN: bool = False
     VLLM_TPU_DSV4_MHC_TOKEN_BLOCK: int = 0
     VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS: int = -1
+    VLLM_TPU_DSV4_MHC_POST_HEAD: bool = False
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -999,6 +1000,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS": env_int(
         "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS", -1
     ),
+    # DeepSeek-V4 mHC: fuse the posts that only feed the hc head collapse or
+    # DSpark's aux stream mean into one kernel each, so the (T, 4, H) streams
+    # are never written (one to three posts per forward).
+    "VLLM_TPU_DSV4_MHC_POST_HEAD": env_bool("VLLM_TPU_DSV4_MHC_POST_HEAD"),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),

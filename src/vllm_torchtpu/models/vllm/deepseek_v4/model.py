@@ -57,6 +57,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op impo
     KernelOpts,
     MHCOps,
     get_mhc_ops,
+    get_mhc_post_head_op,
     get_mhc_post_op,
     get_mhc_split_fn_op,
     get_mhc_stack_fn_op,
@@ -522,6 +523,13 @@ class DeepseekV4Model(nn.Module):
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
         residual, post_mix, res_mix = None, None, None
+        # The fused tail needs the head here and at least one layer to defer
+        # a post into it.
+        fuse_tail = (
+            envs.VLLM_TPU_DSV4_MHC_POST_HEAD
+            and get_pp_group().is_last_rank
+            and self.end_layer > self.start_layer
+        )
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None
         for idx, layer in enumerate(
@@ -537,12 +545,35 @@ class DeepseekV4Model(nn.Module):
                 residual,
             )
             if idx + 1 in self.aux_hidden_state_layers:
+                if fuse_tail and idx + 1 == self.end_layer:
+                    continue  # the fused tail below emits this aux mean
+                if fuse_tail:
+                    (aux_mean,) = self._post_head_op(False, True)(
+                        hidden_states, residual, post_mix, res_mix,
+                        self.hc_head_fn, self.hc_head_scale, self.hc_head_base,
+                    )
+                    aux_hidden_states.append(aux_mean)
+                    continue
                 # Reconstruct the full hc-stream state and collapse it the
                 # way the drafts were trained on: settle the deferred post,
                 # then mean over the hc streams (upstream numerics).
                 aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
+
+        if fuse_tail:
+            # One kernel: last post + hc head (+ the final aux mean).
+            want_mean = self.end_layer in self.aux_hidden_state_layers
+            outs = self._post_head_op(True, want_mean)(
+                hidden_states, residual, post_mix, res_mix,
+                self.hc_head_fn, self.hc_head_scale, self.hc_head_base,
+            )
+            if want_mean:
+                aux_hidden_states.append(outs[1])
+            hidden_states = self.norm(outs[0])
+            if aux_hidden_states:
+                return hidden_states, aux_hidden_states
+            return hidden_states
 
         if post_mix is not None:
             if (
@@ -571,6 +602,26 @@ class DeepseekV4Model(nn.Module):
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def _post_head_op(self, want_head: bool, want_mean: bool):
+        """The fused post + head / aux-mean op; built in the runner's op
+        prebuild (``post_head_ops``) before compile."""
+        ops = self.__dict__.setdefault("_post_head_ops", {})
+        key = (want_head, want_mean)
+        if key not in ops:
+            ops[key] = get_mhc_post_head_op(
+                self.rms_norm_eps, self.hc_eps, want_head=want_head,
+                want_mean=want_mean,
+            )
+        return ops[key]
+
+    @property
+    def post_head_ops(self):
+        """Prebuild every fused-tail variant outside the trace."""
+        if envs.VLLM_TPU_DSV4_MHC_POST_HEAD:
+            for key in ((True, False), (True, True), (False, True)):
+                self._post_head_op(*key)
+        return self.__dict__.get("_post_head_ops")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load checkpoint tensors into stacked, expert, sink and plain params."""

@@ -28,6 +28,7 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     fused_post_pre_kernel,
+    post_head_kernel,
     post_kernel,
     pre_kernel,
     utils,
@@ -640,6 +641,81 @@ def get_mhc_split_fn_op():
 
         def _fake(fn):
             return tuple(torch.empty_like(fn, dtype=torch.bfloat16) for _ in range(3))
+
+        op.register_fake(_fake)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
+def _mhc_post_head_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    hc_fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    want_head: bool,
+    want_mean: bool,
+) -> tuple[jax.Array, ...]:
+    """Last post + hc head collapse and/or the stream mean, one kernel."""
+    return post_head_kernel.mhc_post_head(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+        want_head=want_head,
+        want_mean=want_mean,
+    )
+
+
+def get_mhc_post_head_op(
+    rms_eps: float, hc_eps: float, *, want_head: bool, want_mean: bool
+):
+    """``post`` fused with what consumes its streams at the end of the stack:
+    the hc head collapse (``want_head``) and/or DSpark's aux stream mean
+    (``want_mean``). Returns a tuple: (head,), (mean,) or (head, mean)."""
+    assert want_head or want_mean
+    op_name = (
+        "pallas::deepseek_v4_mhc_post_head_v1"
+        + f"_r{_name_float(rms_eps)}_e{_name_float(hc_eps)}"
+        + ("_h" if want_head else "")
+        + ("_m" if want_mean else "")
+    )
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(
+                _mhc_post_head_jax,
+                rms_eps=rms_eps,
+                hc_eps=hc_eps,
+                want_head=want_head,
+                want_mean=want_mean,
+            ),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(ATTN_DATA_AXIS, None, None),  # residual
+                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+                P(),  # hc_fn
+                P(),  # hc_scale
+                P(),  # hc_base
+            ),
+        )
+        n_out = int(want_head) + int(want_mean)
+
+        def _fake(x, residual, *args, **kwargs):
+            return tuple(torch.empty_like(x) for _ in range(n_out))
 
         op.register_fake(_fake)
         _mhc_op_cache[op_name] = op
