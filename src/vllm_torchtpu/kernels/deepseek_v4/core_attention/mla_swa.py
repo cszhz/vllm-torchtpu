@@ -231,6 +231,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         bq_idx,
         bkv_idx,
         start_offset,
+        chunk_epilogue=None,
     ):
         assert len(q.shape) == 2
         assert len(kv.shape) == 2
@@ -302,10 +303,14 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             s_rowmax = jnp.max(s, axis=1)
             if single_bkv_block:
                 m_curr = s_rowmax
-                cm_ref[...] = m_curr
                 p = jnp.exp(s - m_curr[:, None])
                 pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
-                cl_ref[...] = jnp.sum(p, axis=1)
+                l_curr = jnp.sum(p, axis=1)
+                if chunk_epilogue is not None:
+                    chunk_epilogue(c * chunk_sz, chunk_sz, qc, pv, l_curr, m_curr)
+                    continue
+                cm_ref[...] = m_curr
+                cl_ref[...] = l_curr
                 cacc_ref[...] = pv
             else:
                 m_prev = load_with_init(cm_ref, jnp.finfo(jnp.float32).min)
@@ -666,31 +671,35 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 False,
             )
 
-    def fold_hca(bq_idx, bq_sem_idx, acc):
+    def fold_hca(bq_idx, q, acc, m_prev, l_prev, *, row_tok=0, num_tok=None):
         """One flash-attention step over the HCA block from the SWA state,
         then the sinks; the same ops as `mla._mla_ragged_paged_attention_kernel`
-        runs on the state this kernel would hand it through HBM."""
+        runs on the state this kernel would hand it through HBM. Covers the
+        `num_tok` queries of the bq block from query `row_tok` on; every op is
+        row-wise, so any row split gives the same values."""
+        if num_tok is None:
+            num_tok = bq_sz
         num_tokens = hca.kv_lens_to_attend_ref.shape[0]
         tokens_attend = jnp.stack(
             [
                 hca.kv_lens_to_attend_ref[
-                    jnp.minimum(q_start + bq_idx * bq_sz + i, num_tokens - 1)
+                    jnp.minimum(q_start + bq_idx * bq_sz + row_tok + i, num_tokens - 1)
                 ]
-                for i in range(bq_sz)
+                for i in range(num_tok)
             ]
         )
         kv_lens_to_attend = jnp.broadcast_to(
-            tokens_attend[:, None, None], (bq_sz, num_q_heads, hca_bkv_sz)
-        ).reshape(1, bq_sz * num_q_heads, hca_bkv_sz)
+            tokens_attend[:, None, None], (num_tok, num_q_heads, hca_bkv_sz)
+        ).reshape(1, num_tok * num_q_heads, hca_bkv_sz)
         kv = pltpu.bitcast(hca.bkv_x2_vmem[hca_slot], jnp.bfloat16).reshape(
             1, hca_bkv_sz, head_dim
         )
-        q = load_bq(bq_sem_idx)[None]
+        q = q[None]
 
         # The HBM handoff stores the SWA accumulator in q_dtype.
         acc = acc.astype(q_dtype).astype(jnp.float32)[None]
-        m_prev = m_ref[...][None]
-        l_prev = l_ref[...][None]
+        m_prev = m_prev[None]
+        l_prev = l_prev[None]
 
         s = jnp.einsum("bnd,bmd->bnm", q, kv, preferred_element_type=jnp.float32)
         s *= sm_scale
@@ -703,7 +712,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         l_curr = exp_m_diff * l_prev + jnp.sum(p, axis=2)
         acc = exp_m_diff[:, :, None] * acc + pv
 
-        attention_sinks = jnp.concat([attention_sinks_ref[...] for _ in range(bq_sz)])
+        attention_sinks = jnp.concat([attention_sinks_ref[...] for _ in range(num_tok)])
         exp_attention_sinks = jnp.exp(attention_sinks[None, :] - m_curr)
         l_sum = (l_curr + exp_attention_sinks)[:, :, None]
         if q_dtype == jnp.float32:
@@ -837,10 +846,31 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                     bq_idx=bq_idx,
                     bkv_idx=bkv_idx,
                     start_offset=cur_start_offset,
+                    chunk_epilogue=chunk_epilogue,
                 )
 
             # Wait for cur bq if not ready yet
             wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+            if hca is not None and single_bkv_block:
+                # Fold the HCA block into each q chunk as soon as its SWA state
+                # exists, writing the final rows to bo: no acc/l/m round trip
+                # through VMEM scratch for the whole bq block.
+                bo_sem_idx = sem_ids_ref[2]
+                sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
+                wait_send_bo(bo_sem_idx)
+
+                def chunk_epilogue(row_tok, num_tok, qc, pv, l_val, m_val):
+                    out = fold_hca(
+                        bq_idx, qc, pv, m_val, l_val, row_tok=row_tok, num_tok=num_tok
+                    )
+                    bo_x2_ref.at[bo_sem_idx, pl.ds(row_tok, num_tok)][...] = (
+                        out.reshape(num_tok, num_q_heads, head_dim)
+                    )
+
+                compute_with_bkv(0, None)
+                start_send_bo(seq_idx, bq_idx, bo_sem_idx)
+                return
+            chunk_epilogue = None
             if single_bkv_block:
                 compute_with_bkv(0, None)
             else:
@@ -856,7 +886,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             acc = acc_ref[...]
 
             if hca is not None:
-                out = fold_hca(bq_idx, bq_sem_idx, acc)
+                out = fold_hca(bq_idx, load_bq(bq_sem_idx), acc, m_ref[...], l_ref[...])
             elif unnormalized_output:
                 out = acc.astype(q_dtype)
             else:
