@@ -18,7 +18,12 @@ import numpy as np
 import pytest
 from absl.testing import absltest, parameterized
 
-from vllm_torchtpu.kernels.deepseek_v4.rope import qnorm_rope, rope, rope_quant
+from vllm_torchtpu.kernels.deepseek_v4.rope import (
+    qnorm_rope,
+    qnorm_rope_flat,
+    rope,
+    rope_quant,
+)
 
 pytestmark = pytest.mark.tpu_test
 
@@ -230,6 +235,25 @@ class QNormRopeTest(parameterized.TestCase):
             inverse=False,
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-2, atol=1e-2)
+
+    @parameterized.product(
+        num_tokens=(8, 64, 72, 1024),
+        num_heads=(16, 64),
+    )
+    def test_flat_input_is_bit_identical(self, num_tokens, num_heads):
+        """Reading the projection's tiles gives the 3-D path's bits."""
+        rng = np.random.default_rng(1)
+        x = jnp.asarray(
+            rng.normal(size=(num_tokens, num_heads * HEAD_DIM)) * 4, jnp.bfloat16
+        )
+        positions = jnp.asarray(rng.integers(0, 4096, size=(num_tokens,)), jnp.int32)
+        cos_sin_cache = jnp.asarray(make_cos_sin_cache(4096, ROTARY_DIM, 1))
+
+        expected = qnorm_rope(
+            x.reshape(num_tokens, num_heads, HEAD_DIM), positions, cos_sin_cache
+        )
+        actual = qnorm_rope_flat(x, positions, cos_sin_cache, num_heads=num_heads)
+        assert_bits_equal(actual, expected)
 
 
 if __name__ == "__main__":
