@@ -1040,7 +1040,7 @@ class SwaDecodeInputs(NamedTuple):
     new_kv: jax.Array
     # The cache with the other rows' new kv written.
     cache_kv: jax.Array
-    kv_lens: jax.Array  # i32[max_num_seqs], narrowed
+    kv_lens: jax.Array  # i32[max_num_seqs]
     copy_table: jax.Array  # `swa_decode_copy_table` of the decode rows
     num_decode_tokens: jax.Array  # i32, one token per decode sequence
 
@@ -2156,15 +2156,20 @@ def mla_sliding_window_ragged_paged_attention(
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
-    kv_lens, page_indices = narrow_page_indices(
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        sliding_window=sliding_window,
-        logical_page_size=logical_page_size,
-        max_q_len=q.shape[0],
-        max_kv_pages_per_block=max(num_kv_pages_per_blocks),
-    )
+
+    def narrowed_tables():
+        # Traced where a kernel reads the page table: the batched decode
+        # kernels read `swa_decode_copy_table` instead, so decode-only steps
+        # that skip the prefill/mixed launches skip this too.
+        return narrow_page_indices(
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            sliding_window=sliding_window,
+            logical_page_size=logical_page_size,
+            max_q_len=q.shape[0],
+            max_kv_pages_per_block=max(num_kv_pages_per_blocks),
+        )
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
@@ -2425,8 +2430,7 @@ def mla_sliding_window_ragged_paged_attention(
             q,
             new_kv,
             cache_kv,
-            kv_lens,
-            page_indices,
+            *narrowed_tables(),
             cu_q_lens,
             start_seq_idx=jnp.array(0),
             end_seq_idx=distribution[0],
@@ -2442,6 +2446,8 @@ def mla_sliding_window_ragged_paged_attention(
         )
 
     def run_non_decode(output, updated_kv, out_l, out_m):
+        narrow_kv_lens, narrow_page_indices_ = narrowed_tables()
+
         def run_case(**kwargs):
             if hca_decode is not None:
                 # Finish the rows in `output`, the buffer that holds q with
@@ -2450,8 +2456,8 @@ def mla_sliding_window_ragged_paged_attention(
                     output,
                     new_kv,
                     updated_kv,
-                    kv_lens,
-                    page_indices,
+                    narrow_kv_lens,
+                    narrow_page_indices_,
                     cu_q_lens,
                     in_output=None,
                     in_l=out_l,
@@ -2463,8 +2469,8 @@ def mla_sliding_window_ragged_paged_attention(
                 q,
                 new_kv,
                 updated_kv,
-                kv_lens,
-                page_indices,
+                narrow_kv_lens,
+                narrow_page_indices_,
                 cu_q_lens,
                 in_output=output,
                 in_l=out_l,
