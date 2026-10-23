@@ -926,7 +926,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # position, (pos + 1) // ratio, in multi-token forwards (chunked prefill,
     # speculative verify). 0 restores the old bound, under which a row can
     # select a group that a later token of the same forward completes.
-    "TPU_STREAMIDX_STRICT_CAUSAL": env_bool("TPU_STREAMIDX_STRICT_CAUSAL", default=True),
+    "TPU_STREAMIDX_STRICT_CAUSAL": env_bool(
+        "TPU_STREAMIDX_STRICT_CAUSAL", default=True
+    ),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
