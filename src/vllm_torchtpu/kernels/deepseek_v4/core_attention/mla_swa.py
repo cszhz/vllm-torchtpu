@@ -1204,6 +1204,12 @@ class SwaDecodeWindowRefs(NamedTuple):
         start_offset, bkv_sz_frm_cache = _swa_decode_window_span(
             kv_len, sliding_window=self.sliding_window, bkv_sz=self.bkv_sz
         )
+        if wait:
+            # One wait for all the copies below: the semaphore counts bytes.
+            n = bkv_sz_frm_cache + sz
+            _dma(bkv_s_ref.at[pl.ds(0, n)], bkv_s_ref.at[pl.ds(0, n)], sem, wait=True)
+            return
+
         kv_p_start = start_offset // lps
         page_off = start_offset - kv_p_start * lps
         page_indices_offset = jnp.minimum(
@@ -1228,7 +1234,6 @@ class SwaDecodeWindowRefs(NamedTuple):
                 ],
                 bkv_s_ref.at[pl.ds(vmem_off, chunk_sz)],
                 sem,
-                wait=wait,
             )
             page_off = 0
             vmem_off += chunk_sz
@@ -1240,7 +1245,6 @@ class SwaDecodeWindowRefs(NamedTuple):
             self.new_kv_hbm_ref.at[pl.ds(q_token_idx, sz)],
             new_kv_vmem_ref.at[pl.ds(bkv_sz_frm_cache, sz)],
             sem,
-            wait=wait,
         )
 
     def store_new_kv(self, seq_idx, valid, bkv_s_ref, sem, *, wait=False):
