@@ -917,6 +917,12 @@ DECODE_ASYNC_GROUP_SIZES = True
 #: to VMEM directly. Needs DECODE_ASYNC_GROUP_SIZES.
 DECODE_GROUP_SIZES_IN_VMEM = True
 
+#: Whether the decode path picks tile 0's expert from vector loads of the
+#: VMEM group_sizes operand, so its weight DMAs start without waiting on the
+#: copy into SMEM; the metadata fill waits on it after. Needs
+#: DECODE_GROUP_SIZES_IN_VMEM.
+DECODE_FIRST_GROUP_ON_VECTOR = True
+
 #: Whether the decode path pins its unpadded lhs operand to HBM. Left to XLA,
 #: it can be placed in VMEM, and each call then starts ~0.65 us after the
 #: op before it (measured in a 16-call profile).
@@ -1035,20 +1041,11 @@ def decode_weight_copies(
     return weights, scale
 
 
-def start_first_decode_fetch(
-    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
-    rhs_hbm_ref: WeightsRef,
-    dec: DecodeRefs,
-    *,
-    cfgs: GmmConfigs,
+def first_nonempty_group_scan(
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group] SMEM
+    size_group: int,
 ) -> jax.Array:
-    """Starts the first non-empty group's fetch into slot 0 before metadata exists.
-
-    With group_offset 0 that group is gm tile 0's, so its weights stream while
-    the metadata is filled. Returns its id, or size_group if every group is
-    empty and nothing was started. `decode_kernel` checks it against tile 0.
-    """
-    size_group = cfgs.dims.size_group
+    """The first group with rows, or size_group, by scalar loads."""
     chunk = math.gcd(size_group, FIRST_SCAN_CHUNK)
 
     # The scan stops after the chunk holding the first non-empty group, and its
@@ -1068,6 +1065,39 @@ def start_first_decode_fetch(
     _, first_group = lax.while_loop(
         not_found, scan_chunk, (jnp.int32(0), jnp.int32(size_group))
     )
+    return first_group
+
+
+def first_nonempty_group_vector(
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group] VMEM
+    size_group: int,
+) -> jax.Array:
+    """The first group with rows, or size_group, by vector loads."""
+    sizes = lhs_group_sizes_ref[:size_group]
+    ids = lax.broadcasted_iota(jnp.int32, sizes.shape, 0).astype(jnp.float32)
+    # Group ids are exact in f32, which takes one cross-lane min (int32 two).
+    first = jnp.min(jnp.where(sizes > 0, ids, jnp.float32(size_group)))
+    return first.astype(jnp.int32)
+
+
+def start_first_decode_fetch(
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group], SMEM or VMEM
+    rhs_hbm_ref: WeightsRef,
+    dec: DecodeRefs,
+    *,
+    cfgs: GmmConfigs,
+) -> jax.Array:
+    """Starts the first non-empty group's fetch into slot 0 before metadata exists.
+
+    With group_offset 0 that group is gm tile 0's, so its weights stream while
+    the metadata is filled. Returns its id, or size_group if every group is
+    empty and nothing was started. `decode_kernel` checks it against tile 0.
+    """
+    size_group = cfgs.dims.size_group
+    if lhs_group_sizes_ref.memory_space == pltpu.VMEM:
+        first_group = first_nonempty_group_vector(lhs_group_sizes_ref, size_group)
+    else:
+        first_group = first_nonempty_group_scan(lhs_group_sizes_ref, size_group)
 
     @pl.when(first_group < size_group)
     def _():
@@ -1157,6 +1187,7 @@ def decode_kernel(
             dec.lhs_sem.at[part],
         )
 
+    sizes_copy = None
     if dec.group_sizes is not None:
         # lhs_group_sizes_ref is in HBM or VMEM; lhs needs no group size to start.
         sizes_copy = pltpu.make_async_copy(
@@ -1165,12 +1196,17 @@ def decode_kernel(
         sizes_copy.start()
         if not lhs_in_vmem:
             lhs_copy(0).start()
-        sizes_copy.wait()
-        lhs_group_sizes_ref = dec.group_sizes
+        if not (DECODE_FIRST_GROUP_ON_VECTOR and DECODE_GROUP_SIZES_IN_VMEM):
+            sizes_copy.wait()
+            lhs_group_sizes_ref = dec.group_sizes
+            sizes_copy = None
 
     first_group = start_first_decode_fetch(
         lhs_group_sizes_ref, rhs_hbm_ref, dec, cfgs=cfgs
     )
+    if sizes_copy is not None:
+        sizes_copy.wait()
+        lhs_group_sizes_ref = dec.group_sizes
     num_gm = fill_metadata_single_tile(
         lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs
     )
