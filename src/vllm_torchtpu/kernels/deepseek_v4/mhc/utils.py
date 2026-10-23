@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import cast
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.pallas import tpu as pltpu
 
 # bf16 tiles are (16, 128); keep token blocks sublane-aligned.
 SUBLANE = 16
@@ -26,30 +25,6 @@ SUBLANE = 16
 # fused_moe use the same constant). Never rely on the backend default —
 # it varies by Mosaic version.
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
-
-
-LANES = 128
-
-
-def xla_row_sum(v: jax.Array) -> jax.Array:
-    """In-kernel row sum of an f32 (tb, n * 128) block, in XLA TPU's order.
-
-    XLA reduces a row in two stages: an elementwise chain over the 128-lane
-    column tiles, left to right, then a lane reduce that sums lane groups
-    {8k + s} over k in order and folds the 8 partials pairwise (+4, +2, +1).
-    Repeating that order keeps an in-kernel RMS sum bit-identical to the XLA
-    reduce it replaces. Returns (tb, 1).
-    """
-    n = v.shape[1] // LANES
-    acc = v[:, 0:LANES]
-    for k in range(1, n):
-        acc = acc + v[:, k * LANES : (k + 1) * LANES]
-    part = acc
-    for k in range(1, LANES // 8):
-        part = part + pltpu.roll(acc, LANES - 8 * k, axis=1)
-    for shift in (4, 2, 1):
-        part = part + pltpu.roll(part, LANES - shift, axis=1)
-    return part[:, 0:1]
 
 
 def round_up(x: int, multiple: int) -> int:
@@ -79,16 +54,12 @@ def select_token_block(
     return tb, round_up(num_tokens, tb)
 
 
-def with_absent_refs(kernel: Callable, passed: Sequence[bool]) -> Callable:
-    """The body for a call that passes only some of ``kernel``'s refs.
+def without_shared(kernel: Callable) -> Callable:
+    """A kernel body taking ``(x_ref, shared_ref, ...)``, for a call that
+    passes no shared-expert block: ``shared_ref`` is None."""
 
-    ``passed[i]`` says whether the kernel's i-th ref is passed; the others
-    reach the kernel as None.
-    """
-
-    def body(*refs):
-        it = iter(refs)
-        return kernel(*[next(it) if p else None for p in passed])
+    def body(x_ref, *refs):
+        return kernel(x_ref, None, *refs)
 
     return body
 

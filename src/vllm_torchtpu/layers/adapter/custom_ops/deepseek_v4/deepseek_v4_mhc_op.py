@@ -219,41 +219,6 @@ def _mhc_fused_post_pre_shared_jax(
     )
 
 
-def _mhc_fused_post_pre_normed_jax(
-    x: jax.Array,
-    residual: jax.Array,
-    post_layer_mix: jax.Array,
-    comb_res_mix: jax.Array,
-    fn: jax.Array,
-    hc_scale: jax.Array,
-    hc_base: jax.Array,
-    norm_weight: jax.Array,
-    *,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """The seam op with the next sublayer's RMSNorm applied to its input."""
-    return fused_post_pre_kernel.mhc_fused_post_pre(
-        x,
-        residual,
-        post_layer_mix,
-        comb_res_mix,
-        fn,
-        hc_scale,
-        hc_base,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-        norm_weight=norm_weight,
-        norm_eps=rms_eps,
-    )
-
-
 def _mhc_fused_post_pre_jax(
     x: jax.Array,
     residual: jax.Array,
@@ -571,11 +536,8 @@ def _mhc_fused_post_pre_op(
     sinkhorn_repeat: int,
     *,
     single_stream_residual: bool = False,
-    normed: bool = False,
 ):
-    variant = ("_res1" if single_stream_residual else "") + (
-        "_normed" if normed else ""
-    )
+    variant = "_res1" if single_stream_residual else ""
     op_name = f"pallas::deepseek_v4_mhc_fused_post_pre{variant}_v1" + _gate_suffix(
         rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
     )
@@ -589,7 +551,7 @@ def _mhc_fused_post_pre_op(
         op = pallas.jax_op(
             op_name,
             functools.partial(
-                _mhc_fused_post_pre_normed_jax if normed else _mhc_fused_post_pre_jax,
+                _mhc_fused_post_pre_jax,
                 rms_eps=rms_eps,
                 hc_pre_eps=hc_pre_eps,
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
@@ -605,7 +567,6 @@ def _mhc_fused_post_pre_op(
                 P(),  # fn
                 P(),  # hc_scale
                 P(),  # hc_base
-                *([P()] if normed else []),  # norm_weight
             ),
         )
         op.register_fake(_fake_mhc_fused_post_pre)
@@ -629,24 +590,20 @@ class MHCOps(NamedTuple):
     ``fused(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base)``
         residual_cur -- the ``post`` output -- then ``pre``'s three outputs
         computed from it.
+    ``pre_single_stream(x, fn, hc_scale, hc_base)`` / ``fused_from_single_stream``
+        ``pre`` / ``fused`` for a residual whose hc_mult streams are copies
+        of one (..., hidden_size) stream, which is passed instead.
     ``fused_with_shared(routed, shared, residual, ...)``
         ``fused`` on an MoE output given as its routed sum (before the
         routed scale) and its f32 shared-expert output.
-    ``fused_normed(..., norm_weight)``
-        ``fused`` returning the layer input through an RMSNorm with
-        ``norm_weight`` and epsilon ``rms_eps``.
-    ``pre_single_stream(x, ...)`` / ``fused_normed_from_single_stream(x, r, ...)``
-        ``pre`` / ``fused_normed`` for a residual whose hc_mult streams are
-        copies of one (..., hidden_size) stream, which is passed instead.
     """
 
     pre: Any
     fused: Any
     post: Any
-    fused_with_shared: Any
-    fused_normed: Any
     pre_single_stream: Any
-    fused_normed_from_single_stream: Any
+    fused_from_single_stream: Any
+    fused_with_shared: Any
 
 
 def get_mhc_ops(
@@ -673,6 +630,17 @@ def get_mhc_ops(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         ),
         post=get_mhc_post_op(),
+        pre_single_stream=_mhc_pre_single_stream_op(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        ),
+        fused_from_single_stream=_mhc_fused_post_pre_op(
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            single_stream_residual=True,
+        ),
         fused_with_shared=_mhc_fused_post_pre_shared_op(
             rms_eps,
             hc_pre_eps,
@@ -680,25 +648,5 @@ def get_mhc_ops(
             hc_post_mult_value,
             sinkhorn_repeat,
             routed_scale,
-        ),
-        fused_normed=_mhc_fused_post_pre_op(
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            normed=True,
-        ),
-        pre_single_stream=_mhc_pre_single_stream_op(
-            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
-        ),
-        fused_normed_from_single_stream=_mhc_fused_post_pre_op(
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            single_stream_residual=True,
-            normed=True,
         ),
     )
