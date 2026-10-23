@@ -20,6 +20,7 @@ from vllm.v1.request import Request
 
 from vllm_torchtpu.core import checkpoint_free_order as cfo
 from vllm_torchtpu.core import fine_prefix_hits as fph
+from vllm_torchtpu.core import hca_state_checkpoint as hsc
 
 FULL = 1024
 FULL_GROUP = 2
@@ -36,7 +37,10 @@ def _swa(block_size, window, head_size):
     )
 
 
-def _manager(num_blocks, tokens_per_state=128):
+def _manager(num_blocks, tokens_per_state=128, drop_hca=False):
+    # TPU_KV_DROP_HCA_STATE_CHECKPOINT declares the 128-ratio compressor state
+    # (st32) not prefix-cacheable.
+    hca_cls = hsc.state_spec_cls(128, 128, FULL, drop_hca)
     groups = [
         KVCacheGroupSpec(["swa0"], _swa(128, 128, 512)),
         KVCacheGroupSpec(["swa1"], _swa(128, 128, 512)),
@@ -51,7 +55,16 @@ def _manager(num_blocks, tokens_per_state=128):
             ),
         ),
         KVCacheGroupSpec(["st16"], _swa(16, 8, 4096)),
-        KVCacheGroupSpec(["st32"], _swa(32, 128, 2048)),
+        KVCacheGroupSpec(
+            ["st32"],
+            hca_cls(
+                block_size=32,
+                num_kv_heads=1,
+                head_size=2048,
+                dtype=torch.uint8,
+                sliding_window=128,
+            ),
+        ),
     ]
     config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -243,3 +256,27 @@ def test_rejects_unit_below_compression_ratio(monkeypatch):
     fph.install(UNIT, monkeypatch.setattr)
     with pytest.raises(ValueError, match="compression ratio 256"):
         _manager(64, tokens_per_state=256)
+
+
+@pytest.mark.parametrize("decode_steps", [10, 300], ids=["tail-open", "tail-full"])
+def test_fine_hits_with_dropped_hca_state_checkpoint(fine, decode_steps):
+    """TPU_KV_DROP_HCA_STATE_CHECKPOINT (served on rc7) leaves the 128-ratio
+    state group out of the lookup; fine hits are whole 128-token runs, so the
+    hit is unchanged and that group still caches nothing."""
+    mgr = _manager(400, drop_hca=True)
+    _run(mgr, TURN1, decode_steps)
+    req = _request(TURN2, 10)
+    blocks, hit, _ = mgr.get_computed_blocks(req)
+    assert hit == (40_320 if fine else 39 * FULL)
+    assert blocks.blocks[4] == []
+    assert mgr.allocate_slots(
+        req, 128, num_new_computed_tokens=hit, new_computed_blocks=blocks
+    )
+    copies, _ = mgr.take_kv_cache_block_copies()
+    assert len(copies) == (1 if fine else 0)
+    assert not any(
+        blk.block_hash is not None
+        for blk in mgr.coordinator.single_type_managers[4].req_to_blocks[
+            req.request_id
+        ]
+    )

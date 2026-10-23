@@ -67,7 +67,9 @@ def _validate(coordinator, unit: int) -> None:
 
     hash_bs = coordinator.hash_block_size
     sched_bs = coordinator.scheduler_block_size
-    if not coordinator.enable_caching:
+    # vLLM 0.31 keeps enable_caching on the block pool and the managers, not
+    # on the coordinator.
+    if not coordinator.block_pool.enable_caching:
         fail("needs prefix caching")
     if coordinator.enable_partial_hash_hits:
         fail("vLLM's own partial hash hits are already active")
