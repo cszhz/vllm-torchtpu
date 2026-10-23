@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
@@ -451,6 +452,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
+    # Hand the pooled GDN kernel a load-time float32 copy of the conv weight
+    # in its `[kernel_size, 1, dim]` order. Otherwise every GDN layer swaps
+    # and casts the bf16 `[dim, 1, kernel_size]` weight on every forward.
+    "VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR": env_bool("VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR"),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.
