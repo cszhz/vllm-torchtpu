@@ -13,6 +13,7 @@
 * `candidate`: the instruments' candidate contract (glm_ref.step's signature, aux = the kernel's debug exports).
 """
 
+import dataclasses
 import functools
 
 import jax
@@ -81,6 +82,26 @@ def metadata(
     scal = scal.at[3].set(delay[0]).at[4].set(delay[1]).at[5].set(delay[2])
     rvec = jnp.zeros((M, 128), I32).at[:TMAX, 0].set(valid).at[:TMAX, 1].set(p)
     return scal, rmeta, qmeta, bt, bti, rvec
+
+
+def kernel_pages(cfg, max_pages):
+    """The megakernel's block-table width: the full DCP-D local table width at VR == 1; this replica's half table
+    (ceil(max_pages / VR) tiles) under V16."""
+    return -(-max_pages // cfg.VR)
+
+
+def v16_tables(cfg, bt, bti, rank):
+    """V16 (stageB/v16/DESIGN-ADDENDUM.md §1): the full DCP-D local tables [BM, W] -> this rank's half tables
+    [BM, ceil(W / VR)]: tile p of request b is local page VR * p + (rank // D + b) % VR (indices past W clip to the last
+    column; such tiles are never scanned: the kernel's tile count is (np - hb + VR - 1) // VR)."""
+    VR, D = cfg.VR, cfg.D
+    W = bt.shape[1]
+    Wh = -(-W // VR)
+    b = jnp.arange(bt.shape[0], dtype=I32)[:, None]
+    p = jnp.arange(Wh, dtype=I32)[None, :]
+    idx = jnp.minimum(VR * p + (rank // D + b) % VR, W - 1)
+    idx = jnp.broadcast_to(idx, (bt.shape[0], Wh))
+    return jnp.take_along_axis(bt, idx, axis=1), jnp.take_along_axis(bti, idx, axis=1)
 
 
 def rope_table(cfg, cos_sin_rows):
@@ -239,7 +260,7 @@ def _built(cfg, max_pages, nb, nbi, tiles, interpret, debug, stack_e, groups_ite
     groups = dict(groups_items) if groups_items else None
     call, info = K.build(
         cfg,
-        max_pages=max_pages,
+        max_pages=kernel_pages(cfg, max_pages),
         nb=nb,
         nbi=nbi,
         tiles=tiles,
@@ -255,7 +276,7 @@ def _built(cfg, max_pages, nb, nbi, tiles, interpret, debug, stack_e, groups_ite
         nbi=nbi,
         interpret=interpret,
         groups=groups,
-        fault="dcp_owner" if tiles.fault == "dcp_owner" else "",
+        fault=tiles.fault if tiles.fault in ("dcp_owner", "f_replica_nowrite") else "",
     )
     return call, info, writer, winfo
 
@@ -315,6 +336,7 @@ def candidate_factory(
     delay=(-1, 0, -1),
     debug=True,
     embed_from_ref=True,
+    dcp=0,
 ):
     """A per-rank step with glm_ref.step's signature for the instruments (check.check_candidate /
     test_accuracy.run_candidate_suite). `force` / `fault` are ignored; the kernel-side fault is tiles.fault."""
@@ -329,6 +351,8 @@ def candidate_factory(
         B = ids.shape[0]
         Sl = seq_lens.shape[0]
         cfg = from_dims(d, R, B)
+        if dcp and dcp != R:  # V16: the caches / block tables are DCP-dcp (the A0 harness's DCP view)
+            cfg = dataclasses.replace(cfg, DCP=dcp)
         assert Sl <= cfg.BMAX, (Sl, cfg.BMAX)
         nb = int(caches[0]["nope"].shape[0])
         idx_c = [c["idx"] for c in caches if "idx" in c]
@@ -353,6 +377,9 @@ def candidate_factory(
         scal, rmeta, qmeta, bt, bti, rvec = metadata(
             cfg, B, positions, seq_lens, qsl, bt2, nb, nbi, max_pages, r, delay=delay
         )
+        wbt, wbti = bt, bti  # the writer's tables: the full local tables
+        if cfg.VR > 1:
+            bt, bti = v16_tables(cfg, bt, bti, r)
         rpos = positions + (1 if tiles.fault == "rope_off_by_one" else 0)
         rows = params["rope_table"][
             jnp.clip(rpos, 0, params["rope_table"].shape[0] - 1)
@@ -385,7 +412,7 @@ def candidate_factory(
                 *cops,
             )
             out, nrow, rrow, irec = outs[:4]
-            new = writer(scal, rmeta, bt, bti, nrow, rrow, irec, *cops)
+            new = writer(scal, rmeta, wbt, wbti, nrow, rrow, irec, *cops)
         new_caches = unstack_caches(cfg, list(new), info["groups"])
         aux = {}
         if debug:

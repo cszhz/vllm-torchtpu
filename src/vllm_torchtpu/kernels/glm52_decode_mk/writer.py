@@ -39,7 +39,8 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
     ILV = (
         1 if fault == "dcp_owner" else cfg.ILV
     )  # FAULT dcp_owner: interleave 1 ownership on the write
-    G_ = ILV * R
+    VR, D_ = cfg.VR, cfg.D
+    G_ = ILV * R if VR == 1 else ILV * D_  # V16: DCP-D ownership, every replica writes its own copy
     IR4 = cfg.IREC // 4
     ck = LY.cache_kinds(cfg, nb, nbi)
     G = cache_groups(groups, ck)
@@ -95,6 +96,11 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
 
         def mine(t_):
             pos = rmeta[t_, 1]
+            if VR > 1:  # V16: shard me % D; bt / bti are the FULL DCP-D tables (wrapper.metadata)
+                own = (pos % G_) // ILV == me % D_
+                if fault == "f_replica_nowrite":  # FAULT: only replica 0 writes
+                    own = jnp.logical_and(own, me < D_)
+                return jnp.logical_and(jnp.logical_and(t_ < T, rmeta[t_, 0] > 0), own)
             return jnp.logical_and(
                 jnp.logical_and(t_ < T, rmeta[t_, 0] > 0), (pos % G_) // ILV == me
             )

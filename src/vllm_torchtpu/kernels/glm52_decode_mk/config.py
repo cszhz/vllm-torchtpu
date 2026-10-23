@@ -54,8 +54,21 @@ class MKConfig:
     # the indexer q / k arrive (and the caches hold k_pe / k) in that order. Same per-element rope arithmetic on the
     # same operand pairs (bit-identical rope values, permuted); only the partner lane differs (kernel.rope).
     rope_neox: bool = False
+    # DCP size of the KV cache (0 = R: TP = DCP, the incumbent). D = R / 2 is V16 (stageB/v16/DESIGN-ADDENDUM.md):
+    # the cache is DCP-D (shard k = r % D held by the VR = R / D replicas k, k + D, ...); the replicas split shard k by
+    # page parity (request b's local page j belongs to replica (j + b) % VR), so every rank does a DCP-R share of the
+    # work and every collective stays R-way.
+    DCP: int = 0
 
     # ---- per rank ----
+    @property
+    def D(self):  # KV-cache DCP size
+        return self.DCP or self.R
+
+    @property
+    def VR(self):  # replicas per DCP shard (1: incumbent; 2: V16)
+        return self.R // self.D
+
     @property
     def HR(self):
         return self.NH // self.R
@@ -120,10 +133,11 @@ class MKConfig:
         return l >= self.first_dense
 
     def owner(self, p):
-        return (p % (self.ILV * self.R)) // self.ILV
+        """DCP shard (= the rank at VR == 1) of global position p."""
+        return (p % (self.ILV * self.D)) // self.ILV
 
     def local(self, p):
-        return (p // (self.ILV * self.R)) * self.ILV + p % self.ILV
+        return (p // (self.ILV * self.D)) * self.ILV + p % self.ILV
 
     def check(self):
         """Admission asserts for the couplings the kernel hard-codes (WHITEBOARD.v1 §18 / task: ILV % 4 == 0,
@@ -164,6 +178,11 @@ class MKConfig:
             self.HR * self.KL
         ) % 256 == 0, self.HR
         assert self.E >= self.TOPK and 1 <= self.BM <= self.TMAX
+        assert self.D >= 1 and self.R % self.D == 0 and self.VR in (1, 2), (
+            "V16: DCP = R or R / 2",
+            self.R,
+            self.DCP,
+        )
         return self
 
 
