@@ -385,6 +385,11 @@ class VllmDeepseekV4MLAAttention(
                     envs.TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE
                 ),
                 "csa_gather_no_pad": envs.TPU_DSV4_CSA_GATHER_NO_PAD,
+                "union_dense": envs.TPU_DSV4_CSA_UNION_DENSE,
+                "union_dense_min_tokens": envs.TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS,
+                "union_dense_rows_per_token": (
+                    envs.TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN
+                ),
             }
             if is_csa
             else {

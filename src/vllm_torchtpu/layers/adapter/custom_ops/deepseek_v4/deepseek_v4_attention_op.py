@@ -26,6 +26,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_union_dense
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import (
     mla_ragged_paged_attention,
 )
@@ -214,6 +215,9 @@ def _attention_csa(
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
     csa_gather_no_pad: bool = False,
+    union_dense: bool = False,
+    union_dense_min_tokens: int = 512,
+    union_dense_rows_per_token: int = 160,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -257,6 +261,31 @@ def _attention_csa(
     # top-k then completes behind the q projection and SWA, which do not need
     # it, instead of stalling the TensorCore before them.
     extra, swa_output = jax.lax.optimization_barrier((extra, swa_output))
+
+    if union_dense and q.shape[0] >= union_dense_min_tokens:
+        output = csa_union_dense.attention(
+            q,
+            main_cache_kv,
+            main_cache_rope,
+            extra,
+            main_kv_lens,
+            main_page_indices,
+            main_cu_q_lens,
+            main_distribution,
+            attention_sinks,
+            swa_output,
+            swa_l,
+            swa_m,
+            sm_scale=sm_scale,
+            # ~1024 MXU rows per pushed KV tile: 64 tokens x 16 heads (TP8),
+            # 32 x 32 (TP4).
+            bq=64 if q.shape[1] <= 16 else 32,
+            rows_per_token=union_dense_rows_per_token,
+            sparse_chunk=gather_and_attention_chunk_size,
+            sparse_batch=attention_kernel_batch_size,
+            gather_no_pad=csa_gather_no_pad,
+        )
+        return output, updated_sw_cache
 
     output = sparse_ragged_paged_attention(
         q=q,

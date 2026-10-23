@@ -166,6 +166,9 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     TPU_DSV4_CSA_GATHER_NO_PAD: bool = True
+    TPU_DSV4_CSA_UNION_DENSE: bool = False
+    TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS: int = 512
+    TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = True
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = True
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
@@ -1164,6 +1167,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DSv4 CSA: size the SparseCore KV gather's per-subcore chunk so its output
     # needs no padding rows, and hence no slice copy after it.
     "TPU_DSV4_CSA_GATHER_NO_PAD": env_bool("TPU_DSV4_CSA_GATHER_NO_PAD", True),
+    # CSA prefill (buckets of at least ..._MIN_TOKENS tokens): attend each query
+    # block's (64 tokens at <= 16 local heads, else 32) union of top-k rows once,
+    # gathered on SparseCore, with a per-token selection mask
+    # (`csa_union_dense`), instead of gathering every token's own 1024 rows.
+    # Same keys per token. A step whose union rows exceed ROWS_PER_TOKEN x
+    # tokens (where it would not pay) falls back to the sparse path.
+    "TPU_DSV4_CSA_UNION_DENSE": env_bool("TPU_DSV4_CSA_UNION_DENSE"),
+    "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS": env_int(
+        "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS", 512
+    ),
+    "TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN": env_int(
+        "TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN", 160
+    ),
     # DSpark greedy drafting: shard the Markov head over the vocabulary and
     # exchange per-rank (max, argmax) pairs instead of reading the replicated
     # full-vocabulary weight at every draft position.
