@@ -773,6 +773,11 @@ class TPUWorker(WorkerBase):
         # from scanning those objects mid-step.
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
+        from vllm_torchtpu.runner.compile_watch import (
+            install_post_warmup_compile_log,
+        )
+
+        install_post_warmup_compile_log()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
