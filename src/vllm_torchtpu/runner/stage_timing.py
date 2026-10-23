@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from torch_tpu._internal.stream.streams import TpuEvent
+from vllm.distributed.kv_transfer import has_kv_transfer_group
 
 
 @dataclass
@@ -37,6 +38,8 @@ class RunnerStageTiming:
         # Bound in-flight device timings; a full collector keeps CPU samples only.
         self._slots = threading.BoundedSemaphore(self.MAX_IN_FLIGHT_DEVICE_TIMINGS)
         self._samples_lock = threading.Lock()
+        # Whether a KV connector exists to report samples through.
+        self._sink = False
         threading.Thread(target=self._collect_device_time, daemon=True).start()
 
     def _collect_device_time(self) -> None:
@@ -51,14 +54,30 @@ class RunnerStageTiming:
                 self._device_samples.append((self._rank, pending.stage, seconds))
             self._slots.release()
 
+    def _has_sink(self) -> bool:
+        """Samples only reach the metrics through a KV connector's stats
+        (`TPUModelRunner.get_finished_kv_transfers`); without one they are
+        discarded every step, so skip recording them -- each device timing
+        costs two TpuEvent records on the serving thread."""
+        if not self._sink:
+            # Re-checked until true: warmup can run before the connector exists.
+            self._sink = has_kv_transfer_group()
+        return self._sink
+
     @contextlib.contextmanager
     def host_stage(self, stage: str) -> Iterator[None]:
+        if not self._has_sink():
+            yield
+            return
         cpu_start = time.perf_counter()
         yield
         self._cpu_samples.append((self._rank, stage, time.perf_counter() - cpu_start))
 
     @contextlib.contextmanager
     def stage(self, stage: str) -> Iterator[None]:
+        if not self._has_sink():
+            yield
+            return
         if not self._slots.acquire(blocking=False):
             with self.host_stage(stage):
                 yield
