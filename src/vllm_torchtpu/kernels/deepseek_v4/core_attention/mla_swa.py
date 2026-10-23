@@ -282,9 +282,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             qc = q[
                 start_row : start_row + chunk_size
             ]  # [chunk_sz * num_q_heads, head_dim]
-            cl_ref = l_ref.at[start_row : start_row + chunk_size]
-            cm_ref = m_ref.at[start_row : start_row + chunk_size]
-            cacc_ref = acc_ref.at[start_row : start_row + chunk_size]
+            rows = slice(start_row, start_row + chunk_size)
 
             # Follow FlashAttention-2 forward pass.
             # q_span is per-row (identical across the bkv columns and across the
@@ -326,10 +324,11 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                         q_tok_offset + c * chunk_sz, chunk_sz, qc, pv, l_curr, m_curr
                     )
                     continue
-                cm_ref[...] = m_curr
-                cl_ref[...] = l_curr
-                cacc_ref[...] = pv
+                m_ref.at[rows][...] = m_curr
+                l_ref.at[rows][...] = l_curr
+                acc_ref.at[rows][...] = pv
             else:
+                cl_ref, cm_ref, cacc_ref = l_ref.at[rows], m_ref.at[rows], acc_ref.at[rows]
                 m_prev = load_with_init(cm_ref, jnp.finfo(jnp.float32).min)
                 m_curr = jnp.maximum(m_prev, s_rowmax)
                 cm_ref[...] = m_curr
@@ -2320,14 +2319,18 @@ def mla_sliding_window_ragged_paged_attention(
         )
         bm_double_buf = bl_double_buf
 
+        # The HCA-fused kernel folds every q chunk straight into bo when a bq
+        # block reads a single kv block; it then never touches these.
+        chunk_folded = hca is not None and bq_sz + sliding_window - 1 <= bkv_sz
+        scratch_rows = num_q_heads if chunk_folded else bq_sz * num_q_heads
         l_scratch = pltpu.VMEM(
-            (bq_sz * num_q_heads,),
+            (scratch_rows,),
             jnp.float32,
         )
         m_scratch = l_scratch
 
         acc_scratch = pltpu.VMEM(
-            (bq_sz * num_q_heads, head_dim),
+            (scratch_rows, head_dim),
             jnp.float32,
         )
 
