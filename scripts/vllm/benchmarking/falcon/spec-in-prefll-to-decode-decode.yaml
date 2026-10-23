@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: spec-in-prefll-to-decode-decode-20261023-r4
+name: spec-in-prefll-to-decode-decode-20261023-r5
 exp_type: PROFILING
 artifact_type: trace
-cluster_name: gke-tpu-train-us-central1-2-prod
+cluster_name: gke-tpu-train-us-central1-1-prod
 profile: true
 tags: [profile, kimi-k3, dspark, pd-baseline]
 role_to_task_spec:
@@ -64,7 +64,7 @@ role_to_task_spec:
       - name: coord
         type: gcs
         bucket: inference-model-storage-poc-tpu-hns
-        prefix: benchmarks/spec-in-prefll-to-decode/20261023-r4
+        prefix: benchmarks/spec-in-prefll-to-decode/20261023-r5
         mount_path: /coord
         mount_options: [implicit-dirs, metadata-cache:ttl-secs:0]
     sources:
