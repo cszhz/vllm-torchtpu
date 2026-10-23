@@ -736,6 +736,54 @@ def compact_tiles(idx, tile_end, tile0, total_tiles, u_cap, rows_cap):
     return idx.reshape(-1, TILE)[src_tile].reshape(-1)
 
 
+def prepare(
+    topk_indices: jax.Array,  # i32[T, K]
+    kv_lens: jax.Array,  # i32[max_num_seqs] compressed KV length
+    page_indices: jax.Array,  # i32[max_num_seqs * pps]
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    page_size: int,
+    bq: int = 64,
+    s_cap: int = 49152,
+    u_cap: int = 16384,
+    min_q_len: int = 17,
+) -> dict:
+    """The union plan of a step (SparseCore), independent of q and the SWA
+    pass: a caller can issue it ahead so it runs behind TensorCore work.
+
+    Routes the trailing sequences of at least `min_q_len` tokens whose
+    compressed KV fits `s_cap`; the leading rest stay on the sparse path."""
+    T = topk_indices.shape[0]
+    nseq = kv_lens.shape[0]
+    seq_ids = jnp.arange(nseq, dtype=jnp.int32)
+    qlen = cu_q_lens[1:] - cu_q_lens[:-1]
+    live = seq_ids < distribution[2]
+    ud_ok = (qlen >= min_q_len) & (kv_lens <= s_cap) & (kv_lens > 0)
+    split_seq = jnp.max(jnp.where(live & ~ud_ok, seq_ids + 1, 0)).astype(jnp.int32)
+    routed = live & (seq_ids >= split_seq)
+    nblk = jnp.where(routed, (qlen + bq - 1) // bq, 0)
+    blk_end = jnp.cumsum(nblk)
+    total_blocks = blk_end[-1]
+    nb_cap = T // bq + nseq
+    b = jnp.arange(nb_cap, dtype=jnp.int32)
+    seq_b = jnp.clip(jnp.searchsorted(blk_end, b, side="right"), 0, nseq - 1).astype(jnp.int32)
+    j = b - (blk_end[seq_b] - nblk[seq_b])
+    q0 = cu_q_lens[seq_b] + j * bq
+    qn = jnp.where(b < total_blocks, jnp.clip(cu_q_lens[seq_b + 1] - q0, 0, bq), 0)
+    q0 = jnp.where(qn > 0, q0, 0)
+    s_b = jnp.where(qn > 0, kv_lens[seq_b], 0)
+    idx, mask, usize = build_union_plan(
+        topk_indices, page_indices, jnp.stack([q0, qn, seq_b, s_b], axis=1),
+        max_num_seqs=nseq, s_cap=s_cap, u_cap=u_cap, page_size=page_size,
+    )  # fmt: skip
+    usize = jnp.where(qn > 0, usize, 0)
+    return dict(
+        idx=idx, mask=mask, usize=usize, q0=q0, qn=qn, seq_b=seq_b,
+        total_blocks=total_blocks, n_sparse=cu_q_lens[split_seq],
+    )  # fmt: skip
+
+
 def attention(
     q: jax.Array,  # [T, actual_heads, D]
     cache_kv_nope: jax.Array,  # i32[total_pages, page_size, 128]
@@ -759,25 +807,35 @@ def attention(
     sparse_chunk: int = 64,
     sparse_batch: int = 16,
     gather_no_pad: bool | None = None,
+    plan: dict | None = None,
 ) -> jax.Array:
-    """CSA attention: union-dense for the trailing sequences of at least
-    `min_q_len` tokens whose compressed KV fits `s_cap`; the per-token sparse
-    gather for the leading rest. Falls back to the sparse path for the whole
-    step when a block's union exceeds `u_cap` or the step's union rows exceed
-    `rows_per_token * T`."""
+    """CSA attention: union-dense for the planned blocks (`prepare`; built
+    here when `plan` is None), the per-token sparse gather for the leading
+    rest. Falls back to the sparse path for the whole step when a block's union
+    exceeds `u_cap` or the step's union rows exceed `rows_per_token * T`."""
     from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather, sparse_mla
 
     T = q.shape[0]
-    page_size = cache_kv_nope.shape[1]
-    nseq = kv_lens.shape[0]
-    seq_ids = jnp.arange(nseq, dtype=jnp.int32)
-    qlen = cu_q_lens[1:] - cu_q_lens[:-1]
-    live = seq_ids < distribution[2]
-    ud_ok = (qlen >= min_q_len) & (kv_lens <= s_cap) & (kv_lens > 0)
-    split_seq = jnp.max(jnp.where(live & ~ud_ok, seq_ids + 1, 0)).astype(jnp.int32)
-    n_sparse = cu_q_lens[split_seq]
+    if plan is None:
+        plan = prepare(
+            topk_indices, kv_lens, page_indices, cu_q_lens, distribution,
+            page_size=cache_kv_nope.shape[1], bq=bq, s_cap=s_cap, u_cap=u_cap,
+            min_q_len=min_q_len,
+        )  # fmt: skip
+    idx, mask, usize = plan["idx"], plan["mask"], plan["usize"]
+    q0, qn, seq_b = plan["q0"], plan["qn"], plan["seq_b"]
+    n_sparse = plan["n_sparse"]
     total_valid = cu_q_lens[distribution[2]]
     rows_cap = cdiv(T * rows_per_token, 32768) * 32768
+    ntiles = (usize + TILE - 1) // TILE
+    tile_end = jnp.cumsum(ntiles)
+    tile0 = tile_end - ntiles
+    total_tiles = tile_end[-1]
+    use_union = (
+        (n_sparse < total_valid)
+        & jnp.all(usize <= u_cap)
+        & (total_tiles * TILE <= rows_cap)
+    )
 
     def sparse_call(q, rows, num_valid):
         return sparse_mla.sparse_ragged_paged_attention(
@@ -795,54 +853,25 @@ def attention(
     def all_sparse(q):
         return sparse_call(q, T, None)
 
-    def with_union(q):
-        routed = live & (seq_ids >= split_seq)
-        nblk = jnp.where(routed, (qlen + bq - 1) // bq, 0)
-        blk_end = jnp.cumsum(nblk)
-        total_blocks = blk_end[-1]
-        nb_cap = T // bq + nseq
-        b = jnp.arange(nb_cap, dtype=jnp.int32)
-        seq_b = jnp.clip(jnp.searchsorted(blk_end, b, side="right"), 0, nseq - 1).astype(jnp.int32)
-        j = b - (blk_end[seq_b] - nblk[seq_b])
-        q0 = cu_q_lens[seq_b] + j * bq
-        qn = jnp.where(b < total_blocks, jnp.clip(cu_q_lens[seq_b + 1] - q0, 0, bq), 0)
-        q0 = jnp.where(qn > 0, q0, 0)
-        s_b = jnp.where(qn > 0, kv_lens[seq_b], 0)
-        meta_rows = jnp.stack([q0, qn, seq_b, s_b], axis=1)
-        plan_kw = dict(max_num_seqs=nseq, s_cap=s_cap, u_cap=u_cap, page_size=page_size)
-        # Union sizes first (a cheap SparseCore pass), so a step that would
-        # not pay falls back before the expensive plan is built.
-        _, _, usize = build_union_plan(topk_indices, page_indices, meta_rows,
-                                       count_only=True, **plan_kw)  # fmt: skip
-        usize = jnp.where(qn > 0, usize, 0)
-        ntiles = (usize + TILE - 1) // TILE
-        tile_end = jnp.cumsum(ntiles)
-        tile0 = tile_end - ntiles
-        total_tiles = tile_end[-1]
-        fits = jnp.all(usize <= u_cap) & (total_tiles * TILE <= rows_cap)
+    def union_path(q):
+        if T <= 64:
+            q = sparse_call(q, T, n_sparse)
+        else:
+            q = lax.cond(
+                n_sparse <= 64,
+                lambda q: q.at[:64].set(sparse_call(q, 64, n_sparse)),
+                lambda q: sparse_call(q, T, n_sparse),
+                q,
+            )
+        compact = compact_tiles(idx, tile_end, tile0, total_tiles, u_cap, rows_cap)
+        nope_g, rope_g = csa_gather.csa_gather(
+            cache_kv_nope, cache_kv_rope, compact,
+            num_valid_indices=total_tiles * TILE, top_k=TILE,
+        )  # fmt: skip
+        meta = jnp.stack([q0, qn, tile0, ntiles, usize, seq_b]).astype(jnp.int32)
+        return union_dense_attention(
+            q, nope_g, rope_g, mask, meta, plan["total_blocks"], attention_sinks,
+            swa_accumution, swa_l, swa_m, sm_scale=sm_scale, bq=bq,
+        )  # fmt: skip
 
-        def union_path(q):
-            idx, mask, _ = build_union_plan(topk_indices, page_indices, meta_rows, **plan_kw)
-            if T <= 64:
-                q = sparse_call(q, T, n_sparse)
-            else:
-                q = lax.cond(
-                    n_sparse <= 64,
-                    lambda q: q.at[:64].set(sparse_call(q, 64, n_sparse)),
-                    lambda q: sparse_call(q, T, n_sparse),
-                    q,
-                )
-            compact = compact_tiles(idx, tile_end, tile0, total_tiles, u_cap, rows_cap)
-            nope_g, rope_g = csa_gather.csa_gather(
-                cache_kv_nope, cache_kv_rope, compact,
-                num_valid_indices=total_tiles * TILE, top_k=TILE,
-            )  # fmt: skip
-            meta = jnp.stack([q0, qn, tile0, ntiles, usize, seq_b]).astype(jnp.int32)
-            return union_dense_attention(
-                q, nope_g, rope_g, mask, meta, total_blocks, attention_sinks,
-                swa_accumution, swa_l, swa_m, sm_scale=sm_scale, bq=bq,
-            )  # fmt: skip
-
-        return lax.cond(fits, union_path, all_sparse, q)
-
-    return lax.cond(n_sparse < total_valid, with_union, all_sparse, q)
+    return lax.cond(use_union, union_path, all_sparse, q)

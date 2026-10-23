@@ -261,13 +261,31 @@ def _attention_csa(
     # First use of the top-k after the SWA pass: the indexer's SparseCore
     # top-k then completes behind the q projection and SWA, which do not need
     # it, instead of stalling the TensorCore before them.
-    extra, swa_output = jax.lax.optimization_barrier((extra, swa_output))
-
-    if (
+    use_union_dense = (
         union_dense
         and q.shape[0] >= union_dense_min_tokens
         and q.shape[1] <= union_dense_max_heads
-    ):
+    )
+    # ~1024 MXU rows per pushed KV tile: 64 tokens x 16 heads (TP8), 32 x 32.
+    union_bq = 64 if q.shape[1] <= 16 else 32
+    union_plan = None
+    if use_union_dense:
+        # The union plan needs only the top-k: issued here, its SparseCore
+        # kernels run behind the SWA pass on the TensorCore.
+        union_plan = csa_union_dense.prepare(
+            extra,
+            main_kv_lens,
+            main_page_indices,
+            main_cu_q_lens,
+            main_distribution,
+            page_size=main_cache_kv.shape[1],
+            bq=union_bq,
+        )
+    extra, swa_output, union_plan = jax.lax.optimization_barrier(
+        (extra, swa_output, union_plan)
+    )
+
+    if use_union_dense:
         output = csa_union_dense.attention(
             q,
             main_cache_kv,
@@ -282,13 +300,12 @@ def _attention_csa(
             swa_l,
             swa_m,
             sm_scale=sm_scale,
-            # ~1024 MXU rows per pushed KV tile: 64 tokens x 16 heads (TP8),
-            # 32 x 32 (TP4).
-            bq=64 if q.shape[1] <= 16 else 32,
+            bq=union_bq,
             rows_per_token=union_dense_rows_per_token,
             sparse_chunk=gather_and_attention_chunk_size,
             sparse_batch=attention_kernel_batch_size,
             gather_no_pad=csa_gather_no_pad,
+            plan=union_plan,
         )
         return output, updated_sw_cache
 
