@@ -341,13 +341,45 @@ def build_decode_plan(
     if quantized:
         inputs.append(scale_bits_g.astype(i32).reshape(ep, t_local))
     vmem = pltpu.MemorySpace.VMEM
+    n_in, n_out = len(inputs), len(out_shape)
+    if interpret:
+        out_space, body = vmem, kernel
+    else:
+        # The plan is computed into VMEM scratch and DMA'd to HBM outputs by
+        # the kernel itself, all copies in flight at once. Left as VMEM
+        # outputs, XLA placed them in VMEM and then copied each one to HBM for
+        # the fused EP kernel, serially, ~0.59 us apiece (8 per decode layer
+        # at TP8 T16, j-6cb83e31).
+        out_space = pltpu.MemorySpace.HBM
+
+        def body(me_ref, *refs):
+            ins = refs[:n_in]
+            outs_hbm = refs[n_in : n_in + n_out]
+            scratch = refs[n_in + n_out : n_in + 2 * n_out]
+            sem = refs[n_in + 2 * n_out]
+            kernel(me_ref, *ins, *scratch)
+            copies = [
+                pltpu.make_async_copy(src, dst, sem)
+                for src, dst in zip(scratch, outs_hbm)
+            ]
+            for c in copies:
+                c.start()
+            for c in copies:
+                c.wait()
+
     outs = pl.pallas_call(
-        kernel,
+        body,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             grid=(),
             in_specs=[pl.BlockSpec(memory_space=vmem) for _ in inputs],
-            out_specs=[pl.BlockSpec(memory_space=vmem) for _ in out_shape],
+            out_specs=[pl.BlockSpec(memory_space=out_space) for _ in out_shape],
+            scratch_shapes=(
+                []
+                if interpret
+                else [pltpu.VMEM(o.shape, o.dtype) for o in out_shape]
+                + [pltpu.SemaphoreType.DMA]
+            ),
         ),
         out_shape=out_shape,
         interpret=interpret,
