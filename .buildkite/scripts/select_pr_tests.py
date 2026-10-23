@@ -54,13 +54,20 @@ ALL_PR_INTEGRATION_STEPS: tuple[str, ...] = (
 
 INTEGRATION_FILE_TO_STEPS: dict[str, set[str]] = {
     "scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh": {
-        "integration_qwen35_pcp4_dp4_disagg_correctness"
+        "integration_qwen35_pcp4_dp4_disagg_correctness",
+        "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
     },
     "examples/disagg/launch_qwen35_p4d2_v2_baseline.sh": {
-        "integration_qwen35_pcp4_dp4_disagg_correctness"
+        "integration_qwen35_pcp4_dp4_disagg_correctness",
+        "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
     },
     "scripts/vllm/integration/run_qwen35_pcp4_2tp2dp_disagg_correctness.sh": {
         "integration_qwen35_pcp4_2tp2dp_disagg_correctness"
+    },
+    "scripts/vllm/integration/qwen35_pd_disagg_common_env.sh": {
+        "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
+        "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
+        "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
     },
     "scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh": {
         "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness"
@@ -100,12 +107,14 @@ INTEGRATION_FILE_TO_STEPS: dict[str, set[str]] = {
     },
     "scripts/vllm/integration/smoke_prefix_cache_correctness.py": {
         "integration_qwen35_pcp4_dp4_disagg_correctness",
+        "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
         "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
         "integration_qwen35_apc_correctness",
         "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
     },
     "scripts/vllm/integration/smoke_prefix_cache_e2e_divergence.py": {
         "integration_qwen35_pcp4_dp4_disagg_correctness",
+        "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
         "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
         "integration_qwen35_apc_correctness",
         "integration_k3_pruned75_apc_offload_correctness",
@@ -187,6 +196,7 @@ NIGHTLY_ONLY_INTEGRATION_EXACT: set[str] = {
     "scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh",
     "scripts/vllm/integration/run_pcp_correctness.sh",
     "scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh",
+    "scripts/vllm/integration/run_qwen35_pp_disagg_offload.sh",
     "scripts/vllm/integration/smoke_block_major_offload.py",
     ".buildkite/kubernetes/manifests/workloads/dsv4-pd-disagg.yaml",
     ".buildkite/kubernetes/manifests/workloads/kimi-k3-1p1d-4dp8tp.yaml",
