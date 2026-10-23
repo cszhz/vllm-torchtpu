@@ -465,4 +465,12 @@ def build_decode_combine(arrivals, arrival_scales, pos, mirror_pos, weights, out
         ),
         out_shape=jax.ShapeDtypeStruct((t_local, lane_blocks, lanes), out_dtype),
         name="fused_ep_moe_v2_decode_combine",
-    )(tables, arrivals, arrival_scales)
+    )(
+        tables,
+        # Pinned to HBM: the kernel DMAs only n rows of each, but an
+        # unconstrained operand is prefetched whole into VMEM by XLA first
+        # (the [recv_rows, 56, 128] arrivals and the scale mirror, 1.8 + 1.0 us
+        # on the critical path per decode layer at TP8 T16).
+        pltpu.with_memory_space_constraint(arrivals, hbm),
+        pltpu.with_memory_space_constraint(arrival_scales, hbm),
+    )
