@@ -451,6 +451,8 @@ def _mk(stack=None, perlayer=False, groups_nope=2):
     mk.cache_form = None
     mk.call_shapes, mk.warm_shapes = {}, {}
     mk._steps = {}
+    # levers without LV (bind_caches reads lv_full since a66f6c89f)
+    mk.lv_full, mk._steps_full = False, {}
     mk.dense, mk.experts, mk.max_pages = [], [], 256
     mk.smalls = torch.zeros(1)
     layers = [types.SimpleNamespace(self_attn=_SelfAttn(l in IDX)) for l in range(L)]
