@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -45,6 +46,7 @@ from vllm_torchtpu.spec_decode.utils import (
     maybe_share_lm_head,
     normalize_draft_config,
 )
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
@@ -548,14 +550,27 @@ class DFlashProposer:
 
     def _update_context_kv(self, chunks: list[DraftChunkInputs]) -> int:
         """Update all context chunks before any draft forward (DP lockstep)."""
-        extra_chunks = 0
-        if self._dp_lockstep_sharded():
-            extra_chunks = max(0, self.runner._dp_step_num_chunks - len(chunks))
-        for chunk in chunks:
-            self._update_draft_kv_cache_from_target(chunk)
-        for _ in range(extra_chunks):
-            self._dp_dummy_kv_update()
+        with self._profile_stage("draft_context_update"):
+            extra_chunks = 0
+            if self._dp_lockstep_sharded():
+                extra_chunks = max(0, self.runner._dp_step_num_chunks - len(chunks))
+            for chunk in chunks:
+                self._update_draft_kv_cache_from_target(chunk)
+            for _ in range(extra_chunks):
+                self._dp_dummy_kv_update()
         return extra_chunks
+
+    @contextlib.contextmanager
+    def _profile_stage(self, name: str) -> Iterator[None]:
+        """Record a draft sub-stage in runner metrics and TPU traces."""
+        stage_timing = getattr(self.runner, "_stage_timing", None)
+        timing_scope = (
+            stage_timing.stage(name)
+            if stage_timing is not None
+            else contextlib.nullcontext()
+        )
+        with timing_scope, TraceAnnotation(name):
+            yield
 
     @torch.no_grad()
     def prepare_prefill_handoff(self) -> None:
@@ -620,44 +635,49 @@ class DFlashProposer:
         extra_chunks = self._update_context_kv(chunks)
 
         # 2. Process each chunk
-        draft_logits_per_chunk = []
-        for i, chunk in enumerate(chunks):
-            next_tokens_device = (
-                next_tokens_per_chunk[i] if next_tokens_per_chunk else None
-            )
-            chunk_seed = device_seed[i] if device_seed is not None else None
-            input_ids, positions, seq_lens = self._prepare_dflash_inputs(
-                chunk, next_tokens_device=next_tokens_device, device_seed=chunk_seed
-            )
-            padded_len = input_ids.shape[0]
-            draft_attn_metadata = self._build_draft_attn_metadata(
-                chunk, padded_len, seq_lens
-            )
-            # The padding mask still describes the target's last chunk; a
-            # MoE draft layer would skip real draft rows past its valid count.
-            token_padding.mark_padding(chunk.num_reqs * block_size, padded_len)
-
-            with (
-                # Precomputed so set_forward_context does not run its
-                # own cross-DP CPU all_reduce per draft forward; must
-                # pair exactly with the idle replay's calls.
-                set_forward_context(
-                    draft_attn_metadata,
-                    self.vllm_config,
-                    num_tokens=padded_len,
-                    num_tokens_across_dp=runner._dp_num_tokens_across_dp(padded_len),
-                ),
-                set_vllm_model_wrapper_context(
-                    mesh=self.runner.mesh, vllm_config=self.vllm_config
-                ),
-            ):
-                draft_tokens_chunk, _ = self._dflash_forward_and_sample(
-                    input_ids, positions, block_size
+        with self._profile_stage("draft_generate"):
+            draft_logits_per_chunk = []
+            for i, chunk in enumerate(chunks):
+                next_tokens_device = (
+                    next_tokens_per_chunk[i] if next_tokens_per_chunk else None
                 )
+                chunk_seed = device_seed[i] if device_seed is not None else None
+                input_ids, positions, seq_lens = self._prepare_dflash_inputs(
+                    chunk,
+                    next_tokens_device=next_tokens_device,
+                    device_seed=chunk_seed,
+                )
+                padded_len = input_ids.shape[0]
+                draft_attn_metadata = self._build_draft_attn_metadata(
+                    chunk, padded_len, seq_lens
+                )
+                # The padding mask still describes the target's last chunk; a
+                # MoE draft layer would skip real draft rows past its valid count.
+                token_padding.mark_padding(chunk.num_reqs * block_size, padded_len)
 
-            draft_logits_per_chunk.append(draft_tokens_chunk)
-        for _ in range(extra_chunks):
-            self._dp_dummy_forward()
+                with (
+                    # Precomputed so set_forward_context does not run its
+                    # own cross-DP CPU all_reduce per draft forward; must
+                    # pair exactly with the idle replay's calls.
+                    set_forward_context(
+                        draft_attn_metadata,
+                        self.vllm_config,
+                        num_tokens=padded_len,
+                        num_tokens_across_dp=runner._dp_num_tokens_across_dp(
+                            padded_len
+                        ),
+                    ),
+                    set_vllm_model_wrapper_context(
+                        mesh=self.runner.mesh, vllm_config=self.vllm_config
+                    ),
+                ):
+                    draft_tokens_chunk, _ = self._dflash_forward_and_sample(
+                        input_ids, positions, block_size
+                    )
+
+                draft_logits_per_chunk.append(draft_tokens_chunk)
+            for _ in range(extra_chunks):
+                self._dp_dummy_forward()
 
         # 3. Extract K tokens from logits
         if return_device:

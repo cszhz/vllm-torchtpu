@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import inspect
 from types import SimpleNamespace
 from unittest import mock
@@ -783,11 +784,14 @@ def _padding_mask_at_draft_forward(proposer, run, num_rows: int) -> list[bool]:
 def test_propose_marks_padding_for_draft_rows():
     proposer = _make_proposer(draft_tp=1)
     proposer.speculative_config.num_speculative_tokens = 3
+    stage_timing = mock.MagicMock()
+    stage_timing.stage.side_effect = lambda _name: contextlib.nullcontext()
     proposer.runner = SimpleNamespace(
         device=torch.device("cpu"),
         input_batch=SimpleNamespace(num_reqs=2),
         mesh=None,
         max_num_reqs=8,
+        _stage_timing=stage_timing,
         _dp_lockstep_enabled=lambda: False,
         _dp_num_tokens_across_dp=lambda num_tokens: None,
     )
@@ -812,15 +816,28 @@ def test_propose_marks_padding_for_draft_rows():
     )
     proposer._build_draft_attn_metadata = mock.MagicMock(return_value={})
 
-    mask = _padding_mask_at_draft_forward(
-        proposer,
-        lambda: proposer.propose(
-            [], [], None, None, return_device=True, device_seed=[torch.zeros(2)]
-        ),
-        num_rows=16,
-    )
+    with mock.patch.object(
+        dflash_module,
+        "TraceAnnotation",
+        side_effect=lambda _name: contextlib.nullcontext(),
+    ) as trace_annotation:
+        mask = _padding_mask_at_draft_forward(
+            proposer,
+            lambda: proposer.propose(
+                [], [], None, None, return_device=True, device_seed=[torch.zeros(2)]
+            ),
+            num_rows=16,
+        )
 
     assert mask == [False] * 8 + [True] * 8
+    assert stage_timing.stage.call_args_list == [
+        mock.call("draft_context_update"),
+        mock.call("draft_generate"),
+    ]
+    assert trace_annotation.call_args_list == [
+        mock.call("draft_context_update"),
+        mock.call("draft_generate"),
+    ]
 
 
 def test_dummy_draft_forward_marks_all_rows_padding(monkeypatch):
