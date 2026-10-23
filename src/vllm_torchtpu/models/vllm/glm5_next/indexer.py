@@ -223,12 +223,20 @@ class Glm5NextPoolKeyCache(DeepseekV32IndexerCache):
         return Glm5NextPoolKeyBackend
 
 
+def member_ring(kpool: int, vllm_config: VllmConfig) -> int:
+    """Rows of a request's member ring: ``kpool`` plus the speculative
+    lookahead (`_kpool_index_v3_jax`)."""
+    spec = vllm_config.speculative_config
+    return kpool + (spec.num_speculative_tokens if spec is not None else 0)
+
+
 class Glm5NextMemberState(nn.Module, MambaBase):
-    """Per-request ``[kpool, 2 * head_dim]`` bf16 slot: the incomplete pool.
+    """Per-request ``[ring, 2 * head_dim]`` bf16 slot: the incomplete pool.
 
     Declared as a recurrent (mamba) state, which vLLM keeps one slot per
     running request for, instead of a paged per-token cache: a member row is
-    dead as soon as its pool is keyed. See `_kpool_index_v3_jax`.
+    dead as soon as its pool is keyed. ``ring`` is ``kpool`` plus the
+    speculative lookahead; see `_kpool_index_v3_jax`.
     """
 
     def __init__(
@@ -236,6 +244,7 @@ class Glm5NextMemberState(nn.Module, MambaBase):
     ) -> None:
         super().__init__()
         self.kpool = kpool
+        self.ring = member_ring(kpool, vllm_config)
         self.row_width = 2 * head_dim
         self.prefix = prefix
         self.kv_cache = None
@@ -254,7 +263,7 @@ class Glm5NextMemberState(nn.Module, MambaBase):
         return True
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
-        return ((self.kpool, self.row_width),)
+        return ((self.ring, self.row_width),)
 
     def get_state_dtype(self) -> tuple[torch.dtype]:
         return (torch.bfloat16,)
@@ -597,7 +606,7 @@ def _pool_key_records(keys: jax.Array, record_width: int) -> jax.Array:
 
 
 def _kpool_index_v3_jax(
-    member_state: jax.Array,  # bf16 [slots, kpool, 2 * head_dim]
+    member_state: jax.Array,  # bf16 [slots, ring, 2 * head_dim]
     key_cache: jax.Array,  # u8 [blocks, bs/kpool/4, 4, record_width]
     k_new: jax.Array,  # bf16 [tokens, head_dim]
     gate_new: jax.Array,  # bf16 [tokens, head_dim]
@@ -628,13 +637,19 @@ def _kpool_index_v3_jax(
     reads ``max_pools`` keys per sequence per step whatever its length.)
 
     A pool's members are needed only until the pool is complete, so instead
-    of a paged per-token cache each request keeps one slot holding the
-    ``[k | gate]`` rows of its pool still being filled (``member_state[slot,
-    m]`` is member ``m``). A pool completed in this step takes each member
-    from this step's rows when the member was produced in this step, and from
-    the slot otherwise (it was produced in an earlier step, and the pool was
-    that request's trailing pool then). Afterwards each request writes the
-    rows of its new trailing incomplete pool, if any, into its slot.
+    of a paged per-token cache each request keeps one slot: a ring of ``ring
+    = member_state.shape[1]`` ``[k | gate]`` rows, position ``p`` at row ``p
+    % ring``. A pool completed in this step takes each member from this
+    step's rows when the member was produced in this step, and from the ring
+    otherwise. Afterwards each request writes the rows of its last ``ring``
+    positions into the ring. With ``ring == kpool`` that is the trailing
+    incomplete pool (plus rows nothing reads again). Speculative decoding
+    needs ``ring >= kpool + num_spec``: a verify window may complete a pool
+    with draft tokens that are then rejected, and the next step must still
+    find the members of the pool its last *accepted* token is in -- written
+    because every position of the window is, and not overwritten because
+    they and every position the window wrote lie within ``kpool - 1 +
+    num_spec < ring`` positions of each other, so no two share a row.
 
     With ``shard_axis`` set (inside a shard_map over the TP world), a step of
     at least ``shard_min_tokens`` tokens selects for this rank's token slice
@@ -663,18 +678,19 @@ def _kpool_index_v3_jax(
     in_step = mem_pos >= first_pos[:, None]
     mem_row = cu_q_lens[seq_id][:, None] + (mem_pos - first_pos[:, None])
     from_step = rows[jnp.clip(mem_row, 0, num_tokens - 1)]
-    from_state = member_state[slot]  # [tokens, kpool, 2 * hd]
+    ring = member_state.shape[1]
+    from_state = member_state[slot[:, None], mem_pos % ring]  # [tokens, kpool, 2 * hd]
     members = jnp.where(in_step[..., None], from_step, from_state).astype(jnp.float32)
     m_k, m_gate = jnp.split(members, 2, axis=-1)
     probs = jax.nn.softmax(m_gate + ape, axis=-2)
     new_keys = jnp.sum(probs * m_k, axis=-2)  # [tokens, head_dim]
 
-    # Each request's trailing incomplete pool goes to its slot. Only those
-    # rows are written, so every (slot, member) is written at most once and
-    # the scatter has no duplicate indices to order.
+    # Each request's last `ring` positions go to its ring: consecutive
+    # positions, so every (slot, row) is written at most once and the
+    # scatter has no duplicate indices to order.
     seq_len = seq_lens[seq_id]
-    trailing = live & (pool_of == (seq_len - 1) // kpool) & (seq_len % kpool != 0)
-    member_state = member_state.at[jnp.where(trailing, slot, 2**30), pos % kpool].set(
+    recent = live & (pos >= seq_len - ring)
+    member_state = member_state.at[jnp.where(recent, slot, 2**30), pos % ring].set(
         rows, mode="drop"
     )
 
@@ -938,10 +954,20 @@ def scatter_pooled_member(pool, rows, state_indices, kpool: int):
     return pool_adapters.scatter_region(pool, rows, state_indices, tok0=0, ntok=kpool)
 
 
-def _with_pooled_member(fn, kpool: int):
+def _with_pooled_member(fn, ring: int):
     """Let `fn` (member_state, key_cache, *rest) run on the unified pool:
-    gather the member rows into a dense buffer (`gather_pooled_member`), run
-    `fn` with identity slots, and scatter them back."""
+    gather each request's member ring (``ring`` rows, see
+    `_kpool_index_v3_jax`) into a dense buffer (`gather_pooled_member`), run
+    `fn` with identity slots, and scatter it back.
+
+    Under speculative decoding the member state is a mamba group like KDA's,
+    so a request owns ``num_spec + 1`` checkpoint blocks (``ckpt_indices``)
+    and its state is the one ``read_offsets`` (indexed by state block)
+    selects. The ring is read from that block and written to *every*
+    checkpoint block: whichever one the next step selects then holds it.
+    Rows written for rejected drafts are harmless (see the ring sizing in
+    `_kpool_index_v3_jax`).
+    """
 
     def wrapped(
         member_state,
@@ -956,8 +982,15 @@ def _with_pooled_member(fn, kpool: int):
         distribution,
         state_indices,
         key_page_indices,
+        ckpt_indices=None,
+        read_offsets=None,
     ):
         if member_state.ndim != 4:
+            if ckpt_indices is not None:
+                raise NotImplementedError(
+                    "GLM-5.3 speculative decoding needs the unified pool "
+                    "(TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1)"
+                )
             return fn(
                 member_state,
                 key_cache,
@@ -974,8 +1007,14 @@ def _with_pooled_member(fn, kpool: int):
             )
         pool = member_state
         n = state_indices.shape[0]
-        rows = gather_pooled_member(pool, state_indices, kpool)
-        dense = rows.reshape(n, kpool, 2 * k_new.shape[-1])
+        read_blocks = state_indices
+        if ckpt_indices is not None:
+            offsets = read_offsets[state_indices]
+            read_blocks = jnp.take_along_axis(ckpt_indices, offsets[:, None], axis=1)[
+                :, 0
+            ]
+        rows = gather_pooled_member(pool, read_blocks, ring)
+        dense = rows.reshape(n, ring, 2 * k_new.shape[-1])
         identity = jnp.arange(n, dtype=state_indices.dtype)
         dense, key_cache, topk = fn(
             dense,
@@ -991,16 +1030,26 @@ def _with_pooled_member(fn, kpool: int):
             identity,
             key_page_indices,
         )
-        pool = scatter_pooled_member(
-            pool, dense.reshape(rows.shape), state_indices, kpool
-        )
+        new_rows = dense.reshape(rows.shape)
+        if ckpt_indices is None:
+            pool = scatter_pooled_member(pool, new_rows, state_indices, ring)
+        else:
+            window = ckpt_indices.shape[1]
+            pool = scatter_pooled_member(
+                pool,
+                jnp.repeat(new_rows, window, axis=0),
+                ckpt_indices.reshape(-1),
+                ring,
+            )
         return pool, key_cache, topk
 
     return wrapped
 
 
 @functools.cache
-def _build_kpool_index_v3_sp_op(kpool: int, select_k: int, width: int):
+def _build_kpool_index_v3_sp_op(
+    kpool: int, select_k: int, width: int, ring: int | None = None
+):
     """The v3 indexer for a sequence-parallel step (see `sp.py`).
 
     `k_new`/`gate_new` cover the whole step and update both states exactly as
@@ -1069,7 +1118,7 @@ def _build_kpool_index_v3_sp_op(kpool: int, select_k: int, width: int):
         )
         return member_state, key_cache, topk
 
-    _local = _with_pooled_member(_local, kpool)
+    _local = _with_pooled_member(_local, ring or kpool)
 
     def _bound(
         member_state: jax.Array,
@@ -1084,6 +1133,8 @@ def _build_kpool_index_v3_sp_op(kpool: int, select_k: int, width: int):
         distribution: jax.Array,
         state_indices: jax.Array,
         key_page_indices: jax.Array,
+        ckpt_indices: jax.Array | None = None,
+        read_offsets: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         args = (
             member_state,
@@ -1098,6 +1149,8 @@ def _build_kpool_index_v3_sp_op(kpool: int, select_k: int, width: int):
             distribution,
             state_indices,
             key_page_indices,
+            ckpt_indices,
+            read_offsets,
         )
         return jax.jit(
             jax.experimental.shard_map.shard_map(
@@ -1114,7 +1167,7 @@ def _build_kpool_index_v3_sp_op(kpool: int, select_k: int, width: int):
         _bound,
         donate_argnums=(0, 1),
         mesh=mesh,
-        input_partition_specs=(P(),) * 12,
+        input_partition_specs=(P(),) * 14,
         output_partition_specs=(P(), P(), P()),
     )
 
@@ -1151,7 +1204,11 @@ def _token_shard_min_tokens() -> int:
 
 @functools.cache
 def _build_kpool_index_v3_op(
-    kpool: int, select_k: int, width: int, shard_min_tokens: int = 0
+    kpool: int,
+    select_k: int,
+    width: int,
+    shard_min_tokens: int = 0,
+    ring: int | None = None,
 ):
     """`_kpool_index_v3_jax` as a torch op; both states updated in place."""
     mesh = None
@@ -1174,7 +1231,7 @@ def _build_kpool_index_v3_op(
             shard_min_tokens=shard_min_tokens,
         )
 
-    _call = _with_pooled_member(_dense_call, kpool)
+    _call = _with_pooled_member(_dense_call, ring or kpool)
 
     # `pallas.jax_op` reads the annotations to build the torch schema.
     def _bound(
@@ -1190,6 +1247,8 @@ def _build_kpool_index_v3_op(
         distribution: jax.Array,
         state_indices: jax.Array,
         key_page_indices: jax.Array,
+        ckpt_indices: jax.Array | None = None,
+        read_offsets: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         args = (
             member_state,
@@ -1204,6 +1263,8 @@ def _build_kpool_index_v3_op(
             distribution,
             state_indices,
             key_page_indices,
+            ckpt_indices,
+            read_offsets,
         )
         if mesh is None:
             return _call(*args)
@@ -1229,7 +1290,7 @@ def _build_kpool_index_v3_op(
             _bound,
             donate_argnums=(0, 1),
             mesh=mesh,
-            input_partition_specs=(P(),) * 12,
+            input_partition_specs=(P(),) * 14,
             output_partition_specs=(P(), P(), P()),
         )
 
@@ -1377,13 +1438,14 @@ class Glm5NextIndexer(nn.Module):
                     vllm_config=vllm_config,
                 ),
             )
+            ring = self.member_state.ring
             self.index_op = _build_kpool_index_v3_op(
-                self.kpool, self.select_k, self.width, _token_shard_min_tokens()
+                self.kpool, self.select_k, self.width, _token_shard_min_tokens(), ring
             )
             from vllm_torchtpu.models.vllm.glm5_next.sp import sp_min_tokens
 
             self.index_op_sp = (
-                _build_kpool_index_v3_sp_op(self.kpool, self.select_k, self.width)
+                _build_kpool_index_v3_sp_op(self.kpool, self.select_k, self.width, ring)
                 if sp_min_tokens()
                 else None
             )
@@ -1438,6 +1500,8 @@ class Glm5NextIndexer(nn.Module):
             key_md.request_distribution,
             member_md.mamba_state_indices,
             key_md.block_tables,
+            member_md.mamba_ckpt_indices,
+            member_md.mamba_slot_read_offsets,
         )
 
     def _bound_metadatas(self) -> list[AttentionMetadata] | None:
@@ -1513,6 +1577,8 @@ class Glm5NextIndexer(nn.Module):
                 key_md.request_distribution,
                 member_md.mamba_state_indices,
                 key_md.block_tables,
+                member_md.mamba_ckpt_indices,
+                member_md.mamba_slot_read_offsets,
             )
 
         if _DEBUG_KEEP_TOPK:

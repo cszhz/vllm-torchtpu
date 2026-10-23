@@ -265,7 +265,12 @@ class Glm5NextMLA(nn.Module):
         vllm_config: VllmConfig,
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
+        all_heads_twins: bool = True,
     ) -> None:
+        """``all_heads_twins=False`` keeps the plain TP path even when
+        `sp_all_heads` is on: the MTP draft is traced once for every token
+        bucket, and the all-heads path specializes its trace to the token
+        count (only the backbone is re-traced per bucket group)."""
         super().__init__()
         if not getattr(config, "mla_use_nope", False):
             raise ValueError("GLM-5.3-Flash MLA is NoPE-only")
@@ -343,7 +348,7 @@ class Glm5NextMLA(nn.Module):
         # the quantization config treats them alike; `load_weights` feeds
         # both from the same checkpoint tensors.
         q_b_proj_sp = o_proj_sp = None
-        if self.indexer is not None and sp_all_heads():
+        if self.indexer is not None and sp_all_heads() and all_heads_twins:
             q_b_proj_sp = ReplicatedLinear(
                 self.q_lora_rank,
                 config.num_attention_heads * self.qk_nope_head_dim,

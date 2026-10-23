@@ -27,6 +27,7 @@ _GLM5_NEXT_MODEL = (
     "vllm_torchtpu.models.vllm.glm5_next:Glm5NextForConditionalGeneration"
 )
 _GLM5_NEXT_TEXT_MODEL = "vllm_torchtpu.models.vllm.glm5_next:Glm5NextForCausalLM"
+_GLM5_NEXT_MTP = "vllm_torchtpu.models.vllm.glm5_next.mtp:Glm5NextMTP"
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -54,5 +55,17 @@ def register_models() -> None:
     # and `is_hybrid=False`, which runs and produces garbage.
     ModelRegistry.register_model("Glm5NextForConditionalGeneration", _GLM5_NEXT_MODEL)
     ModelRegistry.register_model("Glm5NextForCausalLM", _GLM5_NEXT_TEXT_MODEL)
+    # MTP draft head (checkpoint layer 45). `glm5_next_spec_patch` rewrites a
+    # draft config's architectures to `Glm5NextMTPModel`; the class name is
+    # registered too so an explicit --speculative-config also resolves.
+    ModelRegistry.register_model("Glm5NextMTPModel", _GLM5_NEXT_MTP)
+    ModelRegistry.register_model("Glm5NextMTP", _GLM5_NEXT_MTP)
+    # Teach vLLM that glm5_next has an MTP head before any SpeculativeConfig
+    # is built. A module beside the package, not inside it: this runs on
+    # every model's boot path, and importing a submodule would import the
+    # whole glm5_next package first (see the module docstring).
+    from vllm_torchtpu.models.vllm import glm5_next_spec_patch
+
+    glm5_next_spec_patch.install()
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig

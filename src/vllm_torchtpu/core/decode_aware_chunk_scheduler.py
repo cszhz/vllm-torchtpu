@@ -80,7 +80,9 @@ class SharedPrefillBudgetScheduler(AsyncScheduler):
         if prefilling > 1 and self.need_mamba_block_aligned_split:
             # Per-request caps in `_mamba_block_aligned_split` instead of one
             # uniform cap here.
-            self._fill = [self.max_num_scheduled_tokens - decoding, prefilling]
+            # A decode (or verify window) takes 1 + num_spec tokens.
+            decode_tokens = decoding * (1 + self.num_spec_tokens)
+            self._fill = [self.max_num_scheduled_tokens - decode_tokens, prefilling]
             threshold = 0
         elif prefilling > 1:
             share = self.max_num_scheduled_tokens // prefilling

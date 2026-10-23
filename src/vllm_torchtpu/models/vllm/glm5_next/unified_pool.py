@@ -206,7 +206,11 @@ def materialize(
     expected_page = page_bytes(vllm_config, block_size)
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
-        if spec.block_size != block_size or spec.page_size_bytes != expected_page:
+        # A mamba group's block_size is the tokens one state covers: the pool
+        # block size in align mode, the whole context otherwise. Only its
+        # page has to match.
+        size_ok = isinstance(spec, MambaSpec) or spec.block_size == block_size
+        if not size_ok or spec.page_size_bytes != expected_page:
             raise AssertionError(
                 "GLM-5.3 unified pool expects every group at block_size "
                 f"{block_size} and page {expected_page} B, got "
