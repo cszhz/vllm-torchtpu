@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
+    VLLM_TPU_QSA_TOPK_STATS: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
@@ -456,6 +457,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_DECODE_QUERY_BLOCK": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_QUERY_BLOCK", 0
     ),
+    # Debug only: every N QSA selections, print top-k statistics (run lengths
+    # of selected groups, overlap of a request's verify rows) from a host
+    # callback. 0 (default) adds nothing to the program.
+    "VLLM_TPU_QSA_TOPK_STATS": env_nonnegative_int("VLLM_TPU_QSA_TOPK_STATS", 0),
     # Compressed keys per KV block of the shared-stream pass above (a multiple
     # of 128). Only read when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.
     "VLLM_TPU_QSA_DECODE_KV_BLOCK": env_nonnegative_int(
