@@ -2023,6 +2023,7 @@ def run_mla_batched_decode_kernel(
         "lane_padded_lm",
         "hca_num_kv_pages_per_block",
         "decode_by_caller",
+        "skip_non_decode_by_cond",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -2066,6 +2067,10 @@ def mla_sliding_window_ragged_paged_attention(
     # Skip the decode rows and append their `SwaDecodeInputs` to the result:
     # a fused kernel runs them (see `sparse_mla.SwaDecodeRefs`).
     decode_by_caller: bool = False,
+    # Branch around the prefill/mixed launches so decode-only steps skip them.
+    # XLA does not schedule a conditional under an in-flight SparseCore call,
+    # so a caller whose steps carry prefill rows may want the plain launches.
+    skip_non_decode_by_cond: bool = True,
 ) -> tuple[
     jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     jax.Array,  # [total_num_pages, physical_page_size_per_kv_packing, 4, 128] uint8
@@ -2507,16 +2512,21 @@ def mla_sliding_window_ragged_paged_attention(
         )
         return output, updated_kv, out_l, out_m
 
-    # Skip the prefill and mixed launches in decode-only steps.
-    output, updated_kv, out_l, out_m = lax.cond(
-        distribution[2] > distribution[0],
-        run_non_decode,
-        lambda *state: state,
-        output,
-        updated_kv,
-        out_l,
-        out_m,
-    )
+    if skip_non_decode_by_cond:
+        # Skip the prefill and mixed launches in decode-only steps.
+        output, updated_kv, out_l, out_m = lax.cond(
+            distribution[2] > distribution[0],
+            run_non_decode,
+            lambda *state: state,
+            output,
+            updated_kv,
+            out_l,
+            out_m,
+        )
+    else:
+        output, updated_kv, out_l, out_m = run_non_decode(
+            output, updated_kv, out_l, out_m
+        )
     output = prepare_outputs(
         output, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
