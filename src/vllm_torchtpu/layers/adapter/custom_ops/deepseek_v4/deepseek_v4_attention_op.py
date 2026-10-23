@@ -344,10 +344,12 @@ def _attention_csa(
         gather_and_attention_chunk_size = 32
         attention_kernel_batch_size = 8
 
-    # First use of the top-k after the SWA pass: the indexer's SparseCore
-    # top-k then completes behind the q projection and SWA, which do not need
-    # it, instead of stalling the TensorCore before them.
-    extra, swa_output = jax.lax.optimization_barrier((extra, swa_output))
+    # First use of the top-k once the compressor has stored the main cache the
+    # gathers read: the indexer's SparseCore top-k completes behind that
+    # store instead of stalling the TensorCore before it, and the SparseCore
+    # gathers start there, with the SWA pass running under them rather than
+    # in front of them.
+    extra, main_cache_rope = jax.lax.optimization_barrier((extra, main_cache_rope))
 
     output = sparse_ragged_paged_attention(
         q=q,
