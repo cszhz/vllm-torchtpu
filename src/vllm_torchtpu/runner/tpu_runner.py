@@ -1026,6 +1026,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         self._remote_dspark_transport: RemoteDSparkTransport | None = None
         self._remote_dspark_proposal_rank = False
+        self._remote_dspark_producer_request_ids: list[str] | None = None
         if self._remote_dspark_role:
             if speculative_config is None or speculative_config.method != "dspark":
                 raise ValueError("remote DSpark requires speculative method dspark")
@@ -3766,6 +3767,19 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if (
+            self._remote_dspark_role == "consumer"
+            and scheduler_output.scheduled_spec_decode_tokens
+            and self._remote_dspark_proposal_rank
+        ):
+            logger.info(
+                "Remote DSpark target verify scheduled: requests=%d lengths=%s",
+                len(scheduler_output.scheduled_spec_decode_tokens),
+                [
+                    len(tokens)
+                    for tokens in scheduler_output.scheduled_spec_decode_tokens.values()
+                ],
+            )
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
@@ -3813,19 +3827,6 @@ class TPUModelRunner(GPUModelRunner):
 
         remote_feedback: dict[str, Any] | None = None
         if (
-            self._remote_dspark_role == "consumer"
-            and scheduler_output.scheduled_spec_decode_tokens
-            and self._remote_dspark_proposal_rank
-        ):
-            logger.info(
-                "Remote DSpark target verify start: requests=%d lengths=%s",
-                len(scheduler_output.scheduled_spec_decode_tokens),
-                [
-                    len(tokens)
-                    for tokens in scheduler_output.scheduled_spec_decode_tokens.values()
-                ],
-            )
-        if (
             self._remote_dspark_role == "producer"
             and scheduler_output.scheduled_spec_decode_tokens
         ):
@@ -3842,10 +3843,23 @@ class TPUModelRunner(GPUModelRunner):
             expected_req_ids = list(
                 self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
-            if remote_feedback.get("request_ids") != expected_req_ids:
+            feedback_req_ids = remote_feedback.get("request_ids")
+            if not isinstance(feedback_req_ids, list):
+                raise RuntimeError("remote DSpark feedback request_ids must be a list")
+            if (
+                self._remote_dspark_proposal_rank
+                and feedback_req_ids != expected_req_ids
+            ):
                 raise RuntimeError(
                     "remote DSpark feedback request order mismatch: expected "
-                    f"{expected_req_ids}, got {remote_feedback.get('request_ids')}"
+                    f"{expected_req_ids}, got {feedback_req_ids}"
+                )
+            if not self._remote_dspark_proposal_rank and len(feedback_req_ids) != len(
+                expected_req_ids
+            ):
+                raise RuntimeError(
+                    "remote DSpark feedback row count mismatch: expected "
+                    f"{len(expected_req_ids)}, got {len(feedback_req_ids)}"
                 )
 
         # Run the multimodal (vision) encoder. vLLM's base
@@ -4363,8 +4377,25 @@ class TPUModelRunner(GPUModelRunner):
             if not self._remote_dspark_proposal_rank:
                 return None
             assert transport is not None
-            request_ids, token_ids = transport.recv_proposal()
-            return DraftTokenIds(request_ids, token_ids)
+            producer_request_ids, token_ids = transport.recv_proposal()
+            consumer_request_ids = list(
+                self.input_batch.req_ids[: self.input_batch.num_reqs]
+            )
+            if len(producer_request_ids) != len(consumer_request_ids) or len(
+                token_ids
+            ) != len(consumer_request_ids):
+                raise RuntimeError(
+                    "remote DSpark proposal row count does not match the consumer "
+                    f"batch: producer={len(producer_request_ids)} "
+                    f"tokens={len(token_ids)} consumer={len(consumer_request_ids)}"
+                )
+            self._remote_dspark_producer_request_ids = producer_request_ids
+            logger.info(
+                "Remote DSpark proposal request mapping: producer=%s consumer=%s",
+                producer_request_ids,
+                consumer_request_ids,
+            )
+            return DraftTokenIds(consumer_request_ids, token_ids)
         drafts = self.spec_decode_manager.take_draft_token_ids()
         if (
             self._remote_dspark_role == "producer"
@@ -4396,9 +4427,21 @@ class TPUModelRunner(GPUModelRunner):
             aux_hidden_states.append(
                 [tensor.detach().cpu() for tensor in cast(list[torch.Tensor], tensors)]
             )
+        feedback_request_ids = request_ids
+        if self._remote_dspark_proposal_rank:
+            if self._remote_dspark_producer_request_ids is None:
+                raise RuntimeError(
+                    "remote DSpark feedback has no matching producer proposal"
+                )
+            if len(self._remote_dspark_producer_request_ids) != len(request_ids):
+                raise RuntimeError(
+                    "remote DSpark feedback row count does not match the proposal"
+                )
+            feedback_request_ids = self._remote_dspark_producer_request_ids
+            self._remote_dspark_producer_request_ids = None
         transport.send_feedback(
             {
-                "request_ids": request_ids,
+                "request_ids": feedback_request_ids,
                 "next_tokens_per_chunk": [
                     tensor.detach().cpu() for tensor in next_tokens_per_chunk
                 ],
