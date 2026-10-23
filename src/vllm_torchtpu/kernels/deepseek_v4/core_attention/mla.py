@@ -985,7 +985,7 @@ def mla_ragged_paged_attention(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_batch_size: int = 8,
     # The SWA kernel already wrote the final output of the decode sequences
-    # into `swa_accumution`; run only prefill and mixed, writing in place there.
+    # over their rows of `q`; run only prefill and mixed.
     decode_in_swa_kernel: bool = False,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
@@ -1012,8 +1012,8 @@ def mla_ragged_paged_attention(
       vmem_limit_bytes: the vmem limit for the pallas kernel.
       decode_batch_size: number of decode sequences to be batched in one block.
       decode_in_swa_kernel: decode sequences were finished by the SWA kernel
-        (`mla_sliding_window_ragged_paged_attention` with `hca_decode`); skip
-        them and return `swa_accumution` updated in place.
+        (`mla_sliding_window_ragged_paged_attention` with `hca_decode`), which
+        wrote their output over their rows of `q`; skip them.
 
     Returns:
       The output of attention.
@@ -1195,8 +1195,9 @@ def mla_ragged_paged_attention(
                     disable_bounds_checks=True,
                 ),
                 out_shape=jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                # Inputs: 7 scalar prefetches, sinks, q (8), cache_kv, swa (10).
-                input_output_aliases={10 if decode_in_swa_kernel else 8: 0},
+                input_output_aliases={
+                    8: 0,  # Alias output activation with q
+                },
                 name=scope_name,
             )
         )
@@ -1289,10 +1290,9 @@ def mla_ragged_paged_attention(
         )
 
     def run_case(**kwargs):
-        """Runs one case, which writes its rows in place into the aliased
-        buffer: `swa_accumution` when `decode_in_swa_kernel`, else `q`."""
-        nonlocal q, swa_accumution
-        out = run_mla_kernel(
+        """Runs one case, which writes its rows over `q` in place."""
+        nonlocal q
+        q = run_mla_kernel(
             q,
             cache_kv,
             kv_lens,
@@ -1305,10 +1305,6 @@ def mla_ragged_paged_attention(
             swa_m,
             **kwargs,
         )
-        if decode_in_swa_kernel:
-            swa_accumution = out
-        else:
-            q = out
 
     decode_bkv_p = num_kv_pages_per_blocks[0]
     if decode_in_swa_kernel:
@@ -1365,9 +1361,7 @@ def mla_ragged_paged_attention(
         case=MlaCase.MIXED,
     )
     output = prepare_outputs(
-        swa_accumution if decode_in_swa_kernel else q,
-        actual_num_q_heads,
-        actual_head_dim,
+        q, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
 
     return output

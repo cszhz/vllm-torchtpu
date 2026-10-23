@@ -196,7 +196,7 @@ def _attention_hca(
             hca_num_kv_pages_per_block=hca_bkv_p,
         )
 
-    swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
+    swa_output, updated_sw_cache, swa_l, swa_m, *decoded_q = _run_swa(
         q=q,
         new_kv=new_kv,
         sw_cache=sw_cache,
@@ -215,6 +215,9 @@ def _attention_hca(
         lane_padded_lm=True,
         **hca_decode,
     )
+    if decoded_q:
+        # The fused kernel wrote the decode rows' output over q.
+        (q,) = decoded_q
 
     if swa_only:
         return swa_output, updated_sw_cache

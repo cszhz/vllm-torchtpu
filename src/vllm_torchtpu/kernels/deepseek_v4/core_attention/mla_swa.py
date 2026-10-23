@@ -948,14 +948,16 @@ def _mla_batched_decode_hca_kernel(
     q_hbm_ref,
     new_kv_hbm_ref,
     cache_kv_hbm_ref,
-    in_output_hbm_ref,
     in_l_hbm_ref,
     in_m_hbm_ref,
     hca_cache_hbm_ref,
     *outputs_and_scratch,
     **kwargs,
 ):
-    """`_mla_batched_decode_kernel` with the HCA operands of `HcaDecodeRefs`."""
+    """`_mla_batched_decode_kernel` with the HCA operands of `HcaDecodeRefs`.
+
+    q is aliased with the output: each batch's q rows are fetched before its
+    output rows are written over them."""
     *refs, hca_bkv_x2_vmem, hca_sems = outputs_and_scratch
     _mla_batched_decode_kernel(
         kv_lens_ref,
@@ -966,7 +968,7 @@ def _mla_batched_decode_hca_kernel(
         q_hbm_ref,
         new_kv_hbm_ref,
         cache_kv_hbm_ref,
-        in_output_hbm_ref,
+        None,  # in_output: q is the aliased buffer.
         in_l_hbm_ref,
         in_m_hbm_ref,
         *refs,
@@ -1482,7 +1484,9 @@ def run_mla_batched_decode_kernel(
     num_queries_per_block: int,
     start_seq_idx: jax.Array,  # i32
     end_seq_idx: jax.Array,  # i32
-    in_output: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
+    # [max_num_tokens, actual_num_q_heads, head_dim]; None with `hca_decode`,
+    # which writes the output over q.
+    in_output: jax.Array | None,
     in_l: jax.Array,  # [max_num_tokens, num_l_heads]
     in_m: jax.Array,  # [max_num_tokens, num_l_heads]
     attention_sinks: jax.Array,  # float32[num_q_heads]
@@ -1495,6 +1499,7 @@ def run_mla_batched_decode_kernel(
     seq_batch_sz: int = 32,
     hca_decode: HcaDecodeInputs | None = None,
 ):
+    assert (in_output is None) == (hca_decode is not None)
     num_decode_seqs = end_seq_idx - start_seq_idx
     bkv_p = num_kv_pages_per_block
     bkv_sz = bkv_p * logical_page_size
@@ -1533,15 +1538,13 @@ def run_mla_batched_decode_kernel(
             hca_decode.page_indices,
         )
 
-    in_specs = [
-        pl.BlockSpec(memory_space=pltpu.VMEM),  # attention_sinks
-        pl.BlockSpec(memory_space=pltpu.HBM),  # q
-        pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv
-        pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv
-        pl.BlockSpec(memory_space=pltpu.HBM),  # in_output
-        pl.BlockSpec(memory_space=pltpu.HBM),  # in_l
-        pl.BlockSpec(memory_space=pltpu.HBM),  # in_m
-    ]
+    operands = (attention_sinks, q, new_kv, cache_kv)
+    if in_output is not None:
+        operands += (in_output,)
+    operands += (in_l, in_m)
+    # attention_sinks in VMEM, the rest in HBM.
+    in_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)]
+    in_specs += [pl.BlockSpec(memory_space=pltpu.HBM) for _ in operands[1:]]
     out_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # out
         pl.BlockSpec(memory_space=pltpu.HBM),  # updated_cache_kv
@@ -1554,11 +1557,12 @@ def run_mla_batched_decode_kernel(
         jax.ShapeDtypeStruct(shape=(q.shape[0], num_l_heads), dtype=jnp.float32),
         jax.ShapeDtypeStruct(shape=(q.shape[0], num_l_heads), dtype=jnp.float32),
     ]
+    base = len(scalar_prefetches)
     input_output_aliases = {
-        len(scalar_prefetches) + 4: 0,  # Alias in_output with out
-        len(scalar_prefetches) + 3: 1,  # Alias cache_kv with updated_cache_kv
-        len(scalar_prefetches) + 5: 2,  # Alias in_l with out_l
-        len(scalar_prefetches) + 6: 3,  # Alias in_m with out_m
+        base + (1 if in_output is None else 4): 0,  # q or in_output with out
+        base + 3: 1,  # Alias cache_kv with updated_cache_kv
+        base + len(operands) - 2: 2,  # Alias in_l with out_l
+        base + len(operands) - 1: 3,  # Alias in_m with out_m
     }
 
     # Double buffered VMEM allocations
@@ -1651,17 +1655,7 @@ def run_mla_batched_decode_kernel(
             name=scope_name,
         )
     )
-    return kernel(
-        *scalar_prefetches,
-        attention_sinks,
-        q,
-        new_kv,
-        cache_kv,
-        in_output,
-        in_l,
-        in_m,
-        *hca_operands,
-    )
+    return kernel(*scalar_prefetches, *operands, *hca_operands)
 
 
 @functools.partial(
@@ -1713,7 +1707,7 @@ def mla_sliding_window_ragged_paged_attention(
     # Return l/m at the kernel's 128-lane width instead of slicing to the heads.
     lane_padded_lm: bool = False,
     # Fuse the HCA pass into the batched decode kernel (see `HcaDecodeInputs`):
-    # decode rows of the output are then final, other rows stay unnormalized.
+    # a fifth result is q with the decode rows' final output written over it.
     hca_cache_kv: jax.Array | None = None,
     hca_kv_lens: jax.Array | None = None,
     hca_kv_lens_to_attend: jax.Array | None = None,
@@ -2010,9 +2004,6 @@ def mla_sliding_window_ragged_paged_attention(
             hca_page_indices,
             hca_num_kv_pages_per_block,
         )
-        # The HCA kernel this replaces wrote its output over q; rows no kernel
-        # writes (padding tokens) keep q's values.
-        in_output = q
 
     if uses_batched_decode(
         sliding_window, logical_page_size, num_kv_pages_per_blocks[0]
@@ -2028,7 +2019,7 @@ def mla_sliding_window_ragged_paged_attention(
             num_queries_per_block=num_queries_per_blocks[0],
             start_seq_idx=jnp.array(0),
             end_seq_idx=distribution[0],
-            in_output=in_output,
+            in_output=None if hca_decode is not None else in_output,
             in_l=l,
             in_m=m,
             attention_sinks=attention_sinks,
@@ -2060,6 +2051,11 @@ def mla_sliding_window_ragged_paged_attention(
             num_queries_per_block=num_queries_per_blocks[0],
             case=MlaCase.DECODE,
         )
+
+    if hca_decode is not None:
+        # Decode rows are final in the buffer that held q, other rows still
+        # hold q: the other cases read q there and write their own buffer.
+        q, output = output, in_output
 
     if chunk_prefill_size is not None:
         # Handle prefill where the query length is fixed per sequence.
@@ -2110,4 +2106,7 @@ def mla_sliding_window_ragged_paged_attention(
         out_l = out_l[:, :actual_num_q_heads]
         out_m = out_m[:, :actual_num_q_heads]
 
+    if hca_decode is not None:
+        decoded_q = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
+        return output, updated_kv, out_l, out_m, decoded_q
     return output, updated_kv, out_l, out_m
