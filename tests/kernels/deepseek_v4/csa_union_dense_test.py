@@ -102,6 +102,7 @@ def _union(c, bq):
         ([(7, 30000), (7, 9000), (498, 31000)], 32, 32),  # TP4 shape
         ([(130, 0)], 16, 64),  # everything visible, -1 padded rows
         ([(2048, 22528)], 16, 64),  # kv_len 6144 (multiple of 16), own block picked
+        ([(7, 9000), (1024, 250000)], 16, 64),  # kv_len 62.7k, near s_cap
     ],
 )
 def test_union_matches_sparse(seqs, heads, bq):
@@ -135,12 +136,12 @@ def test_plan_matches_numpy(bq):
     rows = np.stack([meta[0], meta[1], meta[5], sel_len[meta[5]] * (meta[1] > 0)], 1)
     idx, mask, usize = csa_union_dense.build_union_plan(
         c["topk"], c["pages"], jnp.asarray(rows.astype(np.int32)),
-        max_num_seqs=4, s_cap=49152, u_cap=u_cap, page_size=PAGE_SIZE,
+        max_num_seqs=4, s_cap=65536, u_cap=u_cap, page_size=PAGE_SIZE,
     )  # fmt: skip
     idx, mask, usize = np.asarray(idx), np.asarray(mask), np.asarray(usize)
     _, _, ucount = csa_union_dense.build_union_plan(
         c["topk"], c["pages"], jnp.asarray(rows.astype(np.int32)),
-        max_num_seqs=4, s_cap=49152, u_cap=u_cap, page_size=PAGE_SIZE, count_only=True,
+        max_num_seqs=4, s_cap=65536, u_cap=u_cap, page_size=PAGE_SIZE, count_only=True,
     )  # fmt: skip
     np.testing.assert_array_equal(np.asarray(ucount)[:nb], usize[:nb])
     for b in range(nb):

@@ -411,7 +411,7 @@ def union_dense_attention(
 # ----------------------------------------------------------------------------
 # Device union builder (SparseCore): one q block per vector subcore.
 
-ROWS_PER_DMA = 8
+ROWS_PER_DMA = 4  # topk rows per DMA (2 slots); leaves SC VMEM for s_cap 64k
 
 
 def _union_sc_kernel(
@@ -758,7 +758,7 @@ def prepare(
     *,
     page_size: int,
     bq: int = 64,
-    s_cap: int = 49152,
+    s_cap: int = 65536,
     u_cap: int = 16384,
     min_q_len: int = 17,
     rows_per_token: int = 160,
@@ -794,12 +794,20 @@ def prepare(
     kw = dict(max_num_seqs=nseq, s_cap=s_cap, u_cap=u_cap, page_size=page_size)
     # Union sizes first (a cheap pass); the full plan only for a step that
     # will take the union path.
-    _, _, usize = build_union_plan(topk_indices, page_indices, meta_rows,
-                                   count_only=True, **kw)  # fmt: skip
+    n_sparse = cu_q_lens[split_seq]
+    has_routed = n_sparse < cu_q_lens[distribution[2]]
+    # No routed sequence (all deep-context or verify-only): skip the
+    # SparseCore work entirely.
+    usize = lax.cond(
+        has_routed,
+        lambda _: build_union_plan(topk_indices, page_indices, meta_rows,
+                                   count_only=True, **kw)[2],
+        lambda _: jnp.zeros((nb_cap,), jnp.int32),
+        None,
+    )  # fmt: skip
     usize = jnp.where(qn > 0, usize, 0)
     ntiles = (usize + TILE - 1) // TILE
     rows_cap = cdiv(T * rows_per_token, 32768) * 32768
-    n_sparse = cu_q_lens[split_seq]
     use_union = (
         (n_sparse < cu_q_lens[distribution[2]])
         & jnp.all(usize <= u_cap)
@@ -844,7 +852,7 @@ def attention(
     *,
     sm_scale: float,
     bq: int = 64,
-    s_cap: int = 49152,
+    s_cap: int = 65536,
     u_cap: int = 16384,
     rows_per_token: int = 160,
     min_q_len: int = 17,
