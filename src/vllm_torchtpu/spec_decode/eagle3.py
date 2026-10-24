@@ -1168,6 +1168,8 @@ class Eagle3Proposer:
             out = program(None, positions, hidden_states, seq_lens)
         if _t3.AOT_SKIP_GUARDS:
             _t3.maybe_skip_aot_guards(program)
+            if _t3.AB_PERIOD_MS > 0:
+                _t3.ab_toggle_aot_guards(program)
         return out
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
@@ -3333,6 +3335,8 @@ class Eagle3Proposer:
             out = model(**kwargs)
         if _t3.AOT_SKIP_GUARDS:
             _t3.maybe_skip_aot_guards(model)
+            if _t3.AB_PERIOD_MS > 0:
+                _t3.ab_toggle_aot_guards(model)
 
         return self._unwrap_model_out(out)
 

@@ -373,3 +373,64 @@ def test_prof_python_tracer_override(monkeypatch):
     assert options.get_default_standard_opts()["python_tracer_level"] == 0
     monkeypatch.setenv("VLLM_TPU_T3_PROF_PYTRACE", "")
     assert options.get_default_standard_opts()["python_tracer_level"] == base
+
+
+# --- VLLM_TPU_T3_AB_PERIOD_MS in-process A/B ---------------------------------
+
+
+def _clock(monkeypatch, t):
+    import time as _time_mod
+
+    monkeypatch.setattr(_time_mod, "time", lambda: t[0])
+
+
+def test_ab_phase_and_timer_suffix(monkeypatch, timers_on):
+    t = [0.05]
+    _clock(monkeypatch, t)
+    monkeypatch.setattr(t3_host, "AB_PERIOD_MS", 100.0)
+    assert t3_host.ab_on() is True  # window 0
+    t3_host.record("k", 1.0)
+    t[0] = 0.15
+    assert t3_host.ab_on() is False  # window 1
+    t3_host.record("k", 2.0)
+    assert t3_host._aggs["k.on"].vals == [1.0]
+    assert t3_host._aggs["k.off"].vals == [2.0]
+    monkeypatch.setattr(t3_host, "AB_PERIOD_MS", 0.0)
+    assert t3_host.ab_on() is True
+
+
+def test_ab_memo_only_in_on_windows(memo_on, monkeypatch):
+    t = [0.05]
+    _clock(monkeypatch, t)
+    monkeypatch.setattr(qx, "_AB_PERIOD_MS", 100.0)
+    w = _wrapped(_fn_scale)
+    x = torch.arange(6.0)
+    for _ in range(3):
+        torch.testing.assert_close(w(x, 2), _fn_scale(x, 2))
+    hits_on = qx._MEMO_STATS["hit"]
+    assert hits_on >= 1
+    t[0] = 0.15  # off window: memo bypassed, guard path still right
+    for _ in range(3):
+        torch.testing.assert_close(w(x, 2), _fn_scale(x, 2))
+    assert qx._MEMO_STATS["hit"] == hits_on
+
+
+def test_ab_aot_guard_toggle(monkeypatch):
+    t3_host._reset_for_tests()
+    t = [0.05]
+    _clock(monkeypatch, t)
+    monkeypatch.setattr(t3_host, "AOT_SKIP_GUARDS", True)
+    monkeypatch.setattr(t3_host, "AB_PERIOD_MS", 100.0)
+    m = _module(evaluate=False)
+    assert t3_host.maybe_skip_aot_guards(m) is True
+    assert m.aot_compiled_fn._guard_check_enabled is False  # on window: skip
+    t[0] = 0.15
+    t3_host.ab_toggle_aot_guards(m)
+    assert m.aot_compiled_fn._guard_check_enabled is True  # off window: check
+    t[0] = 0.25
+    t3_host.ab_toggle_aot_guards(m)
+    assert m.aot_compiled_fn._guard_check_enabled is False
+    keep = _module(evaluate=True)  # evaluate_guards=True is never toggled
+    assert t3_host.maybe_skip_aot_guards(keep) is False
+    t3_host.ab_toggle_aot_guards(keep)
+    assert keep.aot_compiled_fn._guard_check_enabled is True

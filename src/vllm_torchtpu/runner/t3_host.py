@@ -45,7 +45,32 @@ def _flag(name: str) -> bool:
 
 AOT_SKIP_GUARDS = _flag("VLLM_TPU_T3_AOT_SKIP_GUARDS")
 
+# VLLM_TPU_T3_AB_PERIOD_MS=N (default 0 = off): in-process A/B. The trims that
+# consult ab_on() are active only in even wall-clock windows of N ms and off
+# in odd ones; every process on a host sees the same phase. Timers record
+# each key twice, under ".on" / ".off", so one run compares both arms under
+# identical load and content.
+AB_PERIOD_MS = float(os.environ.get("VLLM_TPU_T3_AB_PERIOD_MS", "0") or 0)
+
+
+def ab_on() -> bool:
+    """True when the A/B toggle is off (trims follow their flags) or in an
+    even window."""
+    if AB_PERIOD_MS <= 0:
+        return True
+    import time
+
+    return int(time.time() * 1000.0 / AB_PERIOD_MS) % 2 == 0
+
 _done: set[int] = set()
+_ab_modules: dict[int, Any] = {}
+
+
+def ab_toggle_aot_guards(module: Any) -> None:
+    """A/B mode only: set the module's guard check for the current window."""
+    fn = _ab_modules.get(id(module))
+    if fn is not None:
+        fn._guard_check_enabled = not ab_on()
 
 
 def _evaluate_guards(module: Any) -> bool:
@@ -84,6 +109,11 @@ def maybe_skip_aot_guards(module: Any) -> bool:
     disable = getattr(fn, "disable_guard_check", None)
     if disable is None:
         return False
+    if AB_PERIOD_MS > 0:
+        # A/B mode: re-decide on every call (see ab_toggle_aot_guards).
+        _ab_modules[key] = fn
+        fn._guard_check_enabled = not ab_on()
+        return True
     disable()
     logger.info(
         "VLLM_TPU_T3_AOT_SKIP_GUARDS: per-call guard check off for %s "
@@ -95,6 +125,7 @@ def maybe_skip_aot_guards(module: Any) -> bool:
 
 def _reset_for_tests() -> None:
     _done.clear()
+    _ab_modules.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +182,8 @@ def flush(force: bool = False) -> None:
 
 
 def record(key: str, ms: float) -> None:
+    if AB_PERIOD_MS > 0:
+        key = key + (".on" if ab_on() else ".off")
     a = _aggs.get(key)
     if a is None:
         a = _aggs[key] = _Agg()

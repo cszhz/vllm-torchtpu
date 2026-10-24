@@ -79,6 +79,18 @@ def _memo_key(args: tuple | list) -> tuple | None:
     return tuple(parts)
 
 
+_AB_PERIOD_MS = float(os.environ.get("VLLM_TPU_T3_AB_PERIOD_MS", "0") or 0)
+
+
+def _ab_on() -> bool:
+    """VLLM_TPU_T3_AB_PERIOD_MS in-process A/B (see runner/t3_host.py)."""
+    if _AB_PERIOD_MS <= 0:
+        return True
+    import time
+
+    return int(time.time() * 1000.0 / _AB_PERIOD_MS) % 2 == 0
+
+
 def memo_stats() -> dict[str, int]:
     return dict(_MEMO_STATS)
 _LOG_EVERY = 20000
@@ -264,7 +276,7 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                 and stance_mod._stance.stance == "default"
                 and not torch.compiler.is_compiling()
             ):
-                if _MEMO_MODE and not kwargs and len(args) == nargs:
+                if _MEMO_MODE and not kwargs and len(args) == nargs and _ab_on():
                     count = _entry_count(code)
                     if count == state["count"]:
                         hit = _memo_dispatch(args, count)
