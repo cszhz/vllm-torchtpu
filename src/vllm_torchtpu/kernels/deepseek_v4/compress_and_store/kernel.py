@@ -208,7 +208,7 @@ def _merge_group(n: int) -> slice:
 
 def kernel_fn(
     # prefetched inputs (scalar)
-    token_pages_ref,
+    window_runs_ref,
     positions_ref,
     kv_slot_mapping_ref,
     is_first_mask_ref,
@@ -250,7 +250,7 @@ def kernel_fn(
         state_cache_ref=state_cache_ref,
         cos_sin_cache_ref=cos_sin_cache_ref,
         positions_ref=positions_ref,
-        token_pages_ref=token_pages_ref,
+        window_runs_ref=window_runs_ref,
         kv_slot_mapping_ref=kv_slot_mapping_ref,
         is_first_mask_ref=is_first_mask_ref,
         is_first_mask_rope_ref=is_first_mask_rope_ref,
@@ -305,6 +305,27 @@ def kernel_fn(
             sems.at[1],
             wave=rmw_ref.shape[0],
         )
+
+
+def _window_runs(positions, token_to_req_indices, block_table, stride, cfgs):
+    """Every token's window runs as `page << run_offset_bits | offset`.
+
+    Run c covers states `[start + c * run, start + (c + 1) * run)` of the
+    window ending at the token's position. Looked up here so the kernel keeps
+    one SMEM word per run (the full block table does not fit at long context
+    lengths) and spends no scalar work locating it. The clamps only matter for
+    padding tokens, whose output is dropped: they keep its reads in bounds.
+    """
+    block_size, run = cfgs.state_block_size, cfgs.window_run
+    pages = cfgs.pages_to_buffer_per_token
+    runs = jnp.arange(cfgs.window_runs, dtype=positions.dtype) * run
+    run_start = positions[:, None] - cfgs.window + 1 + runs[None, :]
+    block_curr = positions[:, None] // block_size
+    block = run_start // block_size
+    block = jnp.maximum(jnp.clip(block, block_curr - (pages - 1), block_curr), 0)
+    page = block_table[token_to_req_indices[:, None] * stride + block]
+    offset = jnp.minimum(run_start % block_size, block_size - run)
+    return ((page << cfgs.run_offset_bits) | offset).reshape(-1)
 
 
 def _select_mode(head_dim: int, overlap: bool) -> config.Mode:
@@ -469,20 +490,14 @@ def compress_norm_rope_store(
             # TODO: this is confusing, should probably find a better name for it
             pack_factor=cfgs.hbm_pack,
         )
-    # Look up each token's state pages here so the kernel keeps only those
-    # entries in SMEM; the full block table does not fit at long context lengths.
-    pages_per_token = cfgs.pages_to_buffer_per_token
-    offsets = jnp.arange(1 - pages_per_token, 1, dtype=positions.dtype)
-    window_blocks = jnp.maximum(
-        positions[:, None] // state_block_size + offsets[None, :], 0
+    window_runs = _window_runs(
+        positions, token_to_req_indices, block_table, block_table_stride, cfgs
     )
-    rows = token_to_req_indices[:, None] * block_table_stride
-    token_pages = block_table[rows + window_blocks].reshape(-1)
     # Outer pallas_call operands, in call order. Optional operands are passed as
     # None to keep kernel_fn's argument positions fixed; pallas drops the Nones
     # when indexing, so alias indices count only the operands actually present.
     scalar_prefetch = (
-        token_pages,
+        window_runs,
         positions,
         kv_slot_mapping,
         is_first_mask,

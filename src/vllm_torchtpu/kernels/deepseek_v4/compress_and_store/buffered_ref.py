@@ -107,29 +107,20 @@ class WindowRef(_BufferedRef):
         sem = self.sem_recvs.at[slot]
         pid = grid_indices[0]
 
-        state_ref, positions_ref, token_pages_ref = src_ref
+        state_ref, window_runs_ref = src_ref
         cfgs = self.cfgs
         tile_n = cfgs.tile_sizes.tile_n
-        window = cfgs.window
-        block_size = cfgs.state_block_size
-        pages = cfgs.pages_to_buffer_per_token
         run = cfgs.window_run
+        runs = cfgs.window_runs
+        bits = cfgs.run_offset_bits
         window_u8 = _window_bytes(self.window_ref.at[slot], cfgs)
 
         for n in range(tile_n):
-            idx = jnp.minimum(pid * tile_n + n, cfgs.dims.size_n - 1)
-            pos = positions_ref[idx]
-            start = pos - window + 1
-            block_curr = _floor_div(pos, block_size)
-            for c in range(window // run):
-                run_start = start + c * run
-                block = _floor_div(run_start, block_size)
-                # Same page as the per-position lookup of the old gather; the
-                # clamps only matter for padding tokens, whose output is dropped.
-                p = jnp.clip(block - block_curr + pages - 1, 0, pages - 1)
-                page = token_pages_ref[idx * pages + p]
-                offset = jnp.minimum(run_start - block * block_size, block_size - run)
-                is_prev = cfgs.dims.overlap and c * run < window // 2
+            for c in range(runs):
+                code = window_runs_ref[(pid * tile_n + n) * runs + c]
+                page = jax.lax.shift_right_arithmetic(code, jnp.int32(bits))
+                offset = code & jnp.int32((1 << bits) - 1)
+                is_prev = cfgs.dims.overlap and c * run < cfgs.window // 2
                 for field in range(config.N_FIELDS):
                     src = _state_rows(state_ref, cfgs, page, offset, field, is_prev)
                     dest = window_u8.at[field, n, pl.ds(c * run, run)]
@@ -498,7 +489,7 @@ def create_allocs_and_specs(
     state_cache_ref,
     cos_sin_cache_ref,
     positions_ref,
-    token_pages_ref,
+    window_runs_ref,
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
@@ -593,8 +584,7 @@ def create_allocs_and_specs(
     )
     window_args = (
         cache_ref if state_cache_ref is None else state_cache_ref,
-        positions_ref,
-        token_pages_ref,
+        window_runs_ref,
     )
 
     # rope

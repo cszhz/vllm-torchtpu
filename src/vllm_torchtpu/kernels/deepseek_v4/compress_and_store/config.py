@@ -497,6 +497,16 @@ class Configs:
         """
         return math.gcd(self.dims.compress_ratio, self.state_block_size)
 
+    @property
+    def window_runs(self) -> int:
+        """`window_run`-state runs per window, one state DMA (per field) each."""
+        return self.window // self.window_run
+
+    @property
+    def run_offset_bits(self) -> int:
+        """Low bits of a window run's code holding its state offset in a page."""
+        return (self.state_block_size - 1).bit_length()
+
     # --- shapes (single source of truth for every reshape / BlockSpec) ---------
     @property
     def _tile_n(self) -> int:
