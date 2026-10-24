@@ -222,36 +222,52 @@ def rope_words_tiled(rope_slot_ropped, rope_head_dim):
     bits = bits.astype(jnp.int32)
     half = rope_head_dim // 2
     # Lane c picks up channel c + half as its high half.
-    return bits | (pltpu.roll(bits, bits.shape[-1] - half, 2) << 16)
+    return bits | (pltpu.roll(bits, bits.shape[-1] - half, bits.ndim - 1) << 16)
 
 
-def merge_rope_row(
-    row,  # (1, 128) int32, the RoPE row as read from HBM
-    kv_slots,  # (tile_n,) int, token index of every token in the tile
-    words,  # rope_words_tiled(...)
+def merge_rope_rows(
+    rows,  # (tile_n, 128) int32, each token's RoPE row as read from HBM
+    kv_slots,  # (tile_n, 128) int32, each token's slot, broadcast along lanes
+    words,  # (tile_n, 128) int32, rope_words_tiled(...)
     rope_lane,  # int, lane of RoPE word 0 in `words`
-    n,  # int, the token whose row this is
+    group,  # int, rows only merge tokens of the same aligned `group` of the tile
 ):
-    """Writes every tile token whose RoPE lands in token n's row into it.
+    """Writes every token whose RoPE lands in token n's row into row n, for all n.
 
     Token ``j`` of a row owns words ``[32 j, 32 j + 32)`` (see
-    `csa_cache_layout`), so one rotation puts a token's words in its window.
+    `csa_cache_layout`). Candidates for row n are the tokens of n's group,
+    applied in token order (a later one wins), as sublane rotations of the
+    whole tile, so no token needs a branch of its own.
     """
     per_row = csa_cache_layout.ROPE_TOKENS_PER_ROW
     width = csa_cache_layout.ROPE_WORDS
-    lanes = row.shape[-1]
-    window = jax.lax.broadcasted_iota(jnp.int32, row.shape, 1) // width
-    curr_slot = kv_slots[n]
-    curr_row = curr_slot // per_row
+    assert per_row & (per_row - 1) == 0 and group & (group - 1) == 0, (per_row, group)
+    tile_n, lanes = rows.shape
+    window = jax.lax.broadcasted_iota(jnp.int32, rows.shape, 1) // width
+    # Every token's words at the window its slot owns in a row.
+    placed = words
+    for j in range(per_row):
+        rolled = pltpu.roll(words, (j * width - rope_lane) % lanes, 1)
+        placed = jnp.where(window == j, rolled, placed)
+    shift = per_row.bit_length() - 1
+    valid = kv_slots >= 0
+    row = jax.lax.shift_right_arithmetic(kv_slots, jnp.int32(shift))
+    in_group = jax.lax.broadcasted_iota(jnp.int32, rows.shape, 0) & (group - 1)
 
-    for i in range(kv_slots.shape[0]):
-        slot_i = kv_slots[i]
-        hit = (slot_i >= 0) & (curr_slot >= 0) & (slot_i // per_row == curr_row)
-        pos_i = slot_i % per_row
-        for j in range(per_row):
-            placed = pltpu.roll(words[i], (j * width - rope_lane) % lanes, 1)
-            row = jnp.where(hit & (pos_i == j) & (window == j), placed, row)
-    return row
+    for s in range(1 - group, group):
+        # Token n + s, for every n.
+        slot_s = pltpu.roll(kv_slots, -s % tile_n, 0) if s else kv_slots
+        placed_s = pltpu.roll(placed, -s % tile_n, 0) if s else placed
+        hit = (
+            (in_group + s >= 0)
+            & (in_group + s < group)
+            & valid
+            & (slot_s >= 0)
+            & (jax.lax.shift_right_arithmetic(slot_s, jnp.int32(shift)) == row)
+            & (window == (slot_s & (per_row - 1)))
+        )
+        rows = jnp.where(hit, placed_s, rows)
+    return rows
 
 
 def merge_slot_updates(

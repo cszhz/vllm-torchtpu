@@ -172,30 +172,26 @@ def inner_kernel(
         if cfgs.dims.has_rope_cache:
             # RoPE row of 4 tokens, token j in words [32 j, 32 j + 32) (see
             # `csa_cache_layout`); rope_in_vmem holds each row-writer's row,
-            # merged into rope_out_vmem.
-            words = compute.rope_words_tiled(rope_ropped, cfgs.dims.rope_head_dim)
-            rope_lane = config.LANE - cfgs.dims.rope_head_dim
-            kv_slots = []
-            for i in range(tile_n):
-                kv_slots.append(kv_slot_mapping_ref[global_idx + i])
-            kv_slots = jnp.stack(kv_slots)
-            for n in range(tile_n):
-                is_first = is_first_mask_rope_ref[global_idx + n]
-
-                @pl.when(is_first)
-                def _merge_rope():
-                    group = _merge_group(n)
-                    row = pltpu.bitcast(rope_in_vmem[n], jnp.int32)  # (1, 128)
-                    rope_out_vmem[n] = pltpu.bitcast(
-                        compute.merge_rope_row(
-                            row,
-                            kv_slots[group],
-                            words[group],
-                            rope_lane,
-                            n % MERGE_GROUP,
-                        ),
-                        jnp.uint8,
-                    )
+            # merged into rope_out_vmem. Rows of other tokens are computed
+            # too, but not written back (RoPEOutputRef).
+            lanes = config.LANE
+            words = compute.rope_words_tiled(
+                rope_ropped.reshape(tile_n, lanes), cfgs.dims.rope_head_dim
+            )
+            kv_slots = jnp.stack(
+                [kv_slot_mapping_ref[global_idx + i] for i in range(tile_n)]
+            )
+            rows = pltpu.bitcast(rope_in_vmem[...], jnp.int32).reshape(tile_n, lanes)
+            merged = compute.merge_rope_rows(
+                rows,
+                jnp.broadcast_to(kv_slots[:, None], (tile_n, lanes)),
+                words,
+                lanes - cfgs.dims.rope_head_dim,
+                MERGE_GROUP,
+            )
+            rope_out_vmem[...] = pltpu.bitcast(
+                merged.reshape(tile_n, 1, lanes), jnp.uint8
+            )
 
     else:
         # hca: bitcast bf16 -> uint8 and match the output block shape.
