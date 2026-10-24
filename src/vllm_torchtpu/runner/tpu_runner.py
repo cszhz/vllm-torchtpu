@@ -5356,6 +5356,8 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if _t3_host.STEP_HOOK:
+            _t3_host.on_step()
         if self._mtp_prefill_only:
             self._strip_prefill_only_padding(scheduler_output)
         # Update cached state

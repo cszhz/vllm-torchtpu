@@ -1021,6 +1021,10 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     def schedule(self, *args, **kwargs):
         from vllm_torchtpu.runner import lightweight_step_stats
+        from vllm_torchtpu.runner import t3_host as _t3_host
+
+        if _t3_host.STEP_HOOK:
+            _t3_host.on_step()
 
         _stats_on = lightweight_step_stats.is_enabled()
         _sched_t0_ns = time.perf_counter_ns() if _stats_on else 0
