@@ -209,7 +209,7 @@ class OutputRef(_BufferedRef):
         # [num_page, kv_block_size / 4, 4, 256]
         page_size = self.cfgs.kv_block_size
 
-        @pl.loop(0, tile_n)
+        @pl.loop(0, tile_n, unroll=True)
         def loop_body(n):
             idx_n = global_idx + n
             kv_slot = kv_slot_mapping_ref[idx_n]
@@ -238,7 +238,7 @@ class OutputRef(_BufferedRef):
         global_idx = pid * tile_n
         _, kv_slot_mapping_ref, _ = src_ref
 
-        @pl.loop(0, tile_n)
+        @pl.loop(0, tile_n, unroll=True)
         def loop_body(n):
             idx_n = global_idx + n
             kv_slot = kv_slot_mapping_ref[idx_n]
@@ -269,7 +269,7 @@ class OutputRef(_BufferedRef):
         if self.cfgs.dims.mode == config.Mode.CSA_INDEXER:
             cache_ref, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
 
-            @pl.loop(0, tile_n)
+            @pl.loop(0, tile_n, unroll=True)
             def loop_body(n):
                 idx_n = global_idx + n
                 kv_slot = kv_slot_mapping_ref[idx_n]
@@ -291,7 +291,7 @@ class OutputRef(_BufferedRef):
 
             # HCA: [num_pages, kv_block_size * 2, 4, 128] uint8
             # CSA: [num_pages, kv_block_size, 4, 128] uint8
-            @pl.loop(0, tile_n)
+            @pl.loop(0, tile_n, unroll=True)
             def loop_body(n):
                 idx_n = global_idx + n
                 kv_slot = kv_slot_mapping_ref[idx_n]
@@ -324,7 +324,7 @@ class OutputRef(_BufferedRef):
         if is_indexer:
             _, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
 
-            @pl.loop(0, tile_n)
+            @pl.loop(0, tile_n, unroll=True)
             def loop_body(n):
                 idx_n = global_idx + n
                 kv_slot = kv_slot_mapping_ref[idx_n]
@@ -341,7 +341,7 @@ class OutputRef(_BufferedRef):
         else:
             _, kv_slot_mapping_ref = dest_ref
 
-            @pl.loop(0, tile_n)
+            @pl.loop(0, tile_n, unroll=True)
             def loop_body(n):
                 idx_n = global_idx + n
                 kv_slot = kv_slot_mapping_ref[idx_n]
@@ -380,7 +380,7 @@ class RoPEInputRef(_BufferedRef):
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
 
-        @pl.loop(0, tile_n)
+        @pl.loop(0, tile_n, unroll=True)
         def loop_body(n):
             idx_n = global_idx + n
             kv_slot = kv_slot_mapping_ref[idx_n]
@@ -410,7 +410,7 @@ class RoPEInputRef(_BufferedRef):
         global_idx = pid * tile_n
         _, kv_slot_mapping_ref, is_first_mask_ref = src_ref
 
-        @pl.loop(0, tile_n)
+        @pl.loop(0, tile_n, unroll=True)
         def loop_body(n):
             idx_n = global_idx + n
             kv_slot = kv_slot_mapping_ref[idx_n]
@@ -445,7 +445,7 @@ class RoPEOutputRef(_BufferedRef):
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
 
-        @pl.loop(0, tile_n)
+        @pl.loop(0, tile_n, unroll=True)
         def loop_body(n):
             idx_n = global_idx + n
             kv_slot = kv_slot_mapping_ref[idx_n]
@@ -474,7 +474,7 @@ class RoPEOutputRef(_BufferedRef):
 
         _, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
 
-        @pl.loop(0, tile_n)
+        @pl.loop(0, tile_n, unroll=True)
         def loop_body(n):
             idx_n = global_idx + n
             kv_slot = kv_slot_mapping_ref[idx_n]
