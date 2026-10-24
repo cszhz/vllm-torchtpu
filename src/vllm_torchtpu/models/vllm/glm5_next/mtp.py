@@ -192,6 +192,11 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             inputs_embeds = self.embed_input_ids(input_ids)
         layer = self._layer(spec_step_idx)
         hidden_states = layer(positions, previous_hidden_states, inputs_embeds)
+        # Normed here, not in `compute_logits`: the proposer chains this output
+        # into the next draft step as well, and the first step's input is the
+        # target's final-normed hidden. Carrying the pre-norm hidden instead
+        # (vLLM's DeepSeek MTP, and upstream's 82f82c089) measured worse on
+        # GSM8K at K=3: per-position acceptance 0.90/0.71/0.43 vs 0.90/0.75/0.57.
         return layer.shared_head_norm(hidden_states)
 
 
