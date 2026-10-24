@@ -169,7 +169,7 @@ if TYPE_CHECKING:
     TPU_DSV4_CSA_UNION_DENSE: bool = False
     TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS: int = 512
     TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
-    TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 16
+    TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = True
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = True
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
@@ -1181,10 +1181,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN": env_int(
         "TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN", 160
     ),
-    # Only at most this many local query heads (16 = TP8). At 32 (TP4, T512
-    # buckets) the SparseCore plan's fixed cost eats the kernel gain.
+    # Only at most this many local query heads (16 = TP8, 32 = TP4). At TP4 (T512
+    # buckets) the plan runs as one pass on two subcores per block.
     "TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS": env_int(
-        "TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS", 16
+        "TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS", 32
     ),
     # DSpark greedy drafting: shard the Markov head over the vocabulary and
     # exchange per-rank (max, argmax) pairs instead of reading the replicated

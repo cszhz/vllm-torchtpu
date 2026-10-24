@@ -444,6 +444,7 @@ def _union_sc_kernel(
     num_cores: int,
     num_subcores: int,
     count_only: bool = False,
+    split: int = 1,
 ):
     W = u_cap // WORD_BITS
     R = ROWS_PER_DMA
@@ -498,9 +499,14 @@ def _union_sc_kernel(
             def _():
                 chunk(2 * cp + 1, 1)
 
-    @pl.loop(0, (nb_cap + workers - 1) // workers)
+    # `split` subcores share a block: each counts the whole block (cheap) and
+    # then writes its slice of the union rows and of the token masks.
+    per_wave = workers // split
+    part = wid % split
+
+    @pl.loop(0, (nb_cap + per_wave - 1) // per_wave)
     def _wave(w):
-        b = w * workers + wid
+        b = w * per_wave + wid // split
 
         @pl.when(b < nb_cap)
         def _():
@@ -557,8 +563,10 @@ def _union_sc_kernel(
                     U = plsc.cumsum(acc)[L - 1]
                 else:
                     U = plsc.parallel_loop(0, n16, carry=jnp.int32(0))(emit)
-                ubuf[...] = jnp.full((L,), U, jnp.int32)
-                pltpu.sync_copy(ubuf, cnt_out.at[pl.ds(b * L, L)])
+                @pl.when(part == 0)
+                def _():
+                    ubuf[...] = jnp.full((L,), U, jnp.int32)
+                    pltpu.sync_copy(ubuf, cnt_out.at[pl.ds(b * L, L)])
 
                 if count_only:
                     return
@@ -576,10 +584,12 @@ def _union_sc_kernel(
                         plsc.addupdate_scatter(cnt, (pos,), r - c, mask=v)
 
                     u_pad = ((U + tile - 1) // tile) * tile
+                    u_part = u_pad // split  # tile is a multiple of split * L
+                    r0 = part * u_part
 
-                    @plsc.parallel_loop(0, u_pad // L)
+                    @plsc.parallel_loop(0, u_part // L)
                     def _(j):
-                        r = iota + j * L
+                        r = iota + j * L + r0
                         src = jnp.where(r < U, r, lax.rem(r - U, U))
                         pos = plsc.load_gather(ulist, [src])
                         pg = plsc.load_gather(
@@ -590,7 +600,9 @@ def _union_sc_kernel(
                             jnp.bitwise_and(pos, page_size - 1),
                         )
 
-                    pltpu.sync_copy(urow.at[pl.ds(0, u_pad)], idx_out.at[pl.ds(b * u_cap, u_pad)])
+                    pltpu.sync_copy(
+                        urow.at[pl.ds(0, u_part)], idx_out.at[pl.ds(b * u_cap + r0, u_part)]
+                    )
                     nsb = (U + SUPER_BLOCK - 1) // SUPER_BLOCK
 
                     nw = nsb * LANES  # mask words this block uses (rest stay 0)
@@ -599,10 +611,14 @@ def _union_sc_kernel(
                     def _(i):
                         mbuf[pl.ds(i * L, L)] = zeros
 
+                    hq = (qn + split - 1) // split
+                    mq0 = q0 + part * hq
+                    mqn = jnp.clip(qn - part * hq, 0, hq)
+
                     def out_desc(c, slot, n):
                         return pltpu.make_async_copy(
                             mbuf.at[pl.ds(slot * R * W, n * W)],
-                            mask_out.at[pl.ds((q0 + c * R) * W, n * W)],
+                            mask_out.at[pl.ds((mq0 + c * R) * W, n * W)],
                             osems.at[slot],
                         )
 
@@ -638,22 +654,24 @@ def _union_sc_kernel(
                                 mbuf, (word + row0,), jnp.left_shift(ones, bit), mask=v
                             )
 
-                    rows_pass(q0, qn, mask_row, before=before, after=after)
-                    nchunks = (qn + R - 1) // R
-                    last = nchunks - 1
-
-                    @pl.when(last % 2 == 0)
+                    @pl.when(mqn > 0)
                     def _():
-                        out_desc(last, 0, qn - last * R).wait()
+                        rows_pass(mq0, mqn, mask_row, before=before, after=after)
+                        nchunks = (mqn + R - 1) // R
+                        last = nchunks - 1
 
-                        @pl.when(last >= 1)
+                        @pl.when(last % 2 == 0)
                         def _():
-                            out_desc(last - 1, 1, R).wait()
+                            out_desc(last, 0, mqn - last * R).wait()
 
-                    @pl.when(last % 2 == 1)
-                    def _():
-                        out_desc(last, 1, qn - last * R).wait()
-                        out_desc(last - 1, 0, R).wait()
+                            @pl.when(last >= 1)
+                            def _():
+                                out_desc(last - 1, 1, R).wait()
+
+                        @pl.when(last % 2 == 1)
+                        def _():
+                            out_desc(last, 1, mqn - last * R).wait()
+                            out_desc(last - 1, 0, R).wait()
 
 
 def build_union_plan(
@@ -667,8 +685,10 @@ def build_union_plan(
     page_size: int,
     tile: int = TILE,
     count_only: bool = False,
+    split: int = 1,
 ):
-    """SparseCore union builder (`count_only`: union sizes only).
+    """SparseCore union builder (`count_only`: union sizes only; `split`
+    subcores per q block).
 
     Returns idx i32[nb_cap * u_cap] (physical rows; block b's tile-padded union
     in [b * u_cap, b * u_cap + ceil(U_b / tile) * tile)), mask i32[T, u_cap // 32]
@@ -708,6 +728,7 @@ def build_union_plan(
             num_cores=sc.num_cores,
             num_subcores=sc.num_subcores,
             count_only=count_only,
+            split=split,
         ),
         out_type=(
             jax.ShapeDtypeStruct((nb_cap * u_cap,), jnp.int32),
@@ -762,6 +783,8 @@ def prepare(
     u_cap: int = 16384,
     min_q_len: int = 17,
     rows_per_token: int = 160,
+    count_first: bool = True,
+    split: int = 1,
 ) -> dict:
     """The union plan of a step (SparseCore), independent of q and the SWA
     pass: a caller can issue it ahead so it runs behind TensorCore work.
@@ -791,45 +814,48 @@ def prepare(
     q0 = jnp.where(qn > 0, q0, 0)
     s_b = jnp.where(qn > 0, sel_len[seq_b], 0)
     meta_rows = jnp.stack([q0, qn, seq_b, s_b], axis=1)
-    kw = dict(max_num_seqs=nseq, s_cap=s_cap, u_cap=u_cap, page_size=page_size)
-    # Union sizes first (a cheap pass); the full plan only for a step that
-    # will take the union path.
+    kw = dict(max_num_seqs=nseq, s_cap=s_cap, u_cap=u_cap, page_size=page_size,
+              split=split)  # fmt: skip
     n_sparse = cu_q_lens[split_seq]
     has_routed = n_sparse < cu_q_lens[distribution[2]]
-    # No routed sequence (all deep-context or verify-only): skip the
-    # SparseCore work entirely.
-    usize = lax.cond(
-        has_routed,
-        lambda _: build_union_plan(topk_indices, page_indices, meta_rows,
-                                   count_only=True, **kw)[2],
-        lambda _: jnp.zeros((nb_cap,), jnp.int32),
-        None,
-    )  # fmt: skip
-    usize = jnp.where(qn > 0, usize, 0)
-    ntiles = (usize + TILE - 1) // TILE
     rows_cap = cdiv(T * rows_per_token, 32768) * 32768
-    use_union = (
-        (n_sparse < cu_q_lens[distribution[2]])
-        & jnp.all(usize <= u_cap)
-        & (jnp.sum(ntiles) * TILE <= rows_cap)
-    )
     W = u_cap // WORD_BITS
-
-    def full(_):
-        idx, mask, u_full = build_union_plan(topk_indices, page_indices, meta_rows, **kw)
-        return idx, mask, jnp.where(qn > 0, u_full, 0)
 
     def none(_):
         return (
             jnp.zeros((nb_cap * u_cap,), jnp.int32),
             jnp.zeros((T, W), jnp.int32),
-            jnp.zeros_like(usize),
+            jnp.zeros((nb_cap,), jnp.int32),
         )
 
-    idx, mask, u_full = lax.cond(use_union, full, none, None)
-    # The tile layout follows the pass that wrote the rows; both passes must
-    # agree, and the step falls back if they do not.
-    use_union = use_union & jnp.all(u_full == usize)
+    def full(_):
+        idx, mask, u_full = build_union_plan(topk_indices, page_indices, meta_rows, **kw)
+        return idx, mask, jnp.where(qn > 0, u_full, 0)
+
+    def fits(usize):
+        ntiles = (usize + TILE - 1) // TILE
+        return jnp.all(usize <= u_cap) & (jnp.sum(ntiles) * TILE <= rows_cap)
+
+    if count_first:
+        # Union sizes first (a cheap pass), the full plan only for a step that
+        # will take the union path; nothing when no sequence is routed.
+        usize = lax.cond(
+            has_routed,
+            lambda _: build_union_plan(topk_indices, page_indices, meta_rows,
+                                       count_only=True, **kw)[2],
+            lambda _: jnp.zeros((nb_cap,), jnp.int32),
+            None,
+        )  # fmt: skip
+        usize = jnp.where(qn > 0, usize, 0)
+        use_union = has_routed & fits(usize)
+        idx, mask, u_full = lax.cond(use_union, full, none, None)
+        # The tile layout follows the pass that wrote the rows; both passes
+        # must agree, and the step falls back if they do not.
+        use_union = use_union & jnp.all(u_full == usize)
+    else:
+        # One pass (where fallbacks are rare and the plan's fixed cost matters).
+        idx, mask, usize = lax.cond(has_routed, full, none, None)
+        use_union = has_routed & fits(usize)
     return dict(
         idx=idx, mask=mask, usize=usize, q0=q0, qn=qn, seq_b=seq_b,
         total_blocks=total_blocks, n_sparse=n_sparse, use_union=use_union,
@@ -861,6 +887,8 @@ def attention(
     gather_no_pad: bool | None = None,
     plan: dict | None = None,
     groups: int = 4,
+    count_first: bool = True,
+    split: int = 1,
 ) -> jax.Array:
     """CSA attention: union-dense for the planned blocks (`prepare`; built
     here when `plan` is None), the per-token sparse gather for the leading
@@ -874,6 +902,7 @@ def attention(
             topk_indices, kv_lens, page_indices, cu_q_lens, distribution,
             page_size=cache_kv_nope.shape[1], bq=bq, s_cap=s_cap, u_cap=u_cap,
             min_q_len=min_q_len, rows_per_token=rows_per_token,
+            count_first=count_first, split=split,
         )  # fmt: skip
     idx, mask, usize = plan["idx"], plan["mask"], plan["usize"]
     q0, qn, seq_b = plan["q0"], plan["qn"], plan["seq_b"]

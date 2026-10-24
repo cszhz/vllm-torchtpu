@@ -218,7 +218,7 @@ def _attention_csa(
     union_dense: bool = False,
     union_dense_min_tokens: int = 512,
     union_dense_rows_per_token: int = 160,
-    union_dense_max_heads: int = 16,
+    union_dense_max_heads: int = 32,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -281,6 +281,9 @@ def _attention_csa(
             page_size=main_cache_kv.shape[1],
             bq=union_bq,
             rows_per_token=union_dense_rows_per_token,
+            # TP4 (32 heads, T512 buckets): one pass, two subcores per block.
+            count_first=q.shape[1] <= 16,
+            split=1 if q.shape[1] <= 16 else 2,
         )
     extra, swa_output, union_plan = jax.lax.optimization_barrier(
         (extra, swa_output, union_plan)
