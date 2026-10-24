@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_torchtpu import envs
+from vllm_torchtpu import envs as vllm_torchtpu_envs
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_qsa_op
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -391,10 +392,19 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             keywords["main_slot"] = main_slot
         self._op = partial(build_pooled_qsa_op(), **keywords)
         self._rows_op = partial(build_pooled_qsa_rows_op(), **keywords)
-        # Built on first use (`select_for_kernel`): default serving never
-        # registers the select op.
+        # The select op (`select_for_kernel`) is built here, outside the traced
+        # forward (jax_op inspects the step signature, which Dynamo cannot trace),
+        # and only when the megakernel is enabled: default serving never
+        # registers it.
         self._select_keywords = keywords
         self._select_op = None
+        raw_mk = str(vllm_torchtpu_envs.VLLM_TPU_MEGAKERNEL or "").strip().lower()
+        if raw_mk and raw_mk not in ("0", "false", "off"):
+            from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                build_pooled_qsa_select_op,
+            )
+
+            self._select_op = partial(build_pooled_qsa_select_op(), **keywords)
         self.main_slot = max(main_slot, 0)
         self._shard_op = None
         if envs.VLLM_TPU_QSA_INDEXER_SHARD and self.tp_size > 1:
@@ -640,11 +650,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             else {}
         )
         if self._select_op is None:
-            from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
-                build_pooled_qsa_select_op,
+            raise RuntimeError(
+                "select_for_kernel needs VLLM_TPU_MEGAKERNEL set at construction "
+                "(the select op is not built lazily inside forward)"
             )
-
-            self._select_op = partial(build_pooled_qsa_select_op(), **self._select_keywords)
         q, gate, pages, kv_lens = self._select_op(
             self.q_proj(hidden),
             self.k_proj(hidden),
