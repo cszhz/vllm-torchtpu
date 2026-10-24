@@ -226,6 +226,21 @@ class TileSizes:
     tile_k: int
     tile_n: int
     bucket_base: int
+    # Rows between consecutive m-buckets above bucket_base, picked by the
+    # smallest bucket covering the tile's rows. None keeps multiples of
+    # bucket_base, picked by m_end_local // bucket_base.
+    bucket_step: int | None = None
+
+    @property
+    def bucket_sizes(self) -> tuple[int, ...]:
+        step = self.bucket_step or self.bucket_base
+        return tuple(range(self.bucket_base, self.tile_m + 1, step))
+
+    def bucket_index(self, m_end_local: jax.Array) -> jax.Array:
+        if self.bucket_step is None:
+            return m_end_local // self.bucket_base
+        rows_above_base = jnp.maximum(m_end_local - self.bucket_base, 0)
+        return pl.cdiv(rows_above_base, self.bucket_step)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -618,9 +633,7 @@ def inner_kernel(
         else:
             acc_ref[:acc_m] = acc
 
-    def run_matmul_step(bucket_idx: int):
-        bucket_m = cfgs.tiles.bucket_base * (bucket_idx + 1)
-
+    def run_matmul_step(bucket_m: int):
         @jax.named_scope(f"bm{bucket_m}_first_last")
         def matmul_first_last():
             _matmul(is_first_k_step=True, is_last_k_step=True, bucket_m=bucket_m)
@@ -656,11 +669,11 @@ def inner_kernel(
             # partial m is only invoked at last matmul.
             lax.cond(is_first_k_step, matmul_first_last, matmul_last)
 
-    branches = []
-    for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
-        branches.append(functools.partial(run_matmul_step, bucket_idx=bucket_idx))
-    bucket_idx = m_end_local // cfgs.tiles.bucket_base
-    lax.switch(bucket_idx, branches)
+    branches = [
+        functools.partial(run_matmul_step, bucket_m=bucket_m)
+        for bucket_m in cfgs.tiles.bucket_sizes
+    ]
+    lax.switch(cfgs.tiles.bucket_index(m_end_local), branches)
 
 
 def fill_metadata(
