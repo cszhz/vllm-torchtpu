@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_LANE_QUANT: bool = True
     MOE_FUSED_EP_V2_ONESHOT_GATHER: bool = True
     MOE_FUSED_EP_V2_COMBINE_RESTORE: bool = False
+    MOE_FUSED_EP_V2_FOLD_RESTORE_INTO_SHARED_AR: bool = False
     MOE_FUSED_EP_V2_TAIL_BARRIER: bool = False
     MOE_FUSED_EP_V2_FILL_SCHEDULE: bool = True
     TPU_EXPERT_PLACEMENT: str = ""
@@ -924,6 +925,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Decode buckets with DECODE_COMBINE and PALLAS_RESTORE in effect: one
     # Pallas call sums the arrivals and pushes them to every TP member.
     "MOE_FUSED_EP_V2_COMBINE_RESTORE": env_bool("MOE_FUSED_EP_V2_COMBINE_RESTORE"),
+    # Fused EP MoE v2, in-op shared expert at decode buckets (Pallas restore +
+    # small all-reduce in effect): add each core's routed rows into its slot of
+    # the shared partial and let the one small all-reduce sum both, instead of
+    # a restore all-gather followed by the shared all-reduce. Not bit-exact
+    # (one extra bf16 rounding moves before the reduce).
+    "MOE_FUSED_EP_V2_FOLD_RESTORE_INTO_SHARED_AR": env_bool(
+        "MOE_FUSED_EP_V2_FOLD_RESTORE_INTO_SHARED_AR"
+    ),
     # A JSON file naming, per MoE layer, which global experts each EP rank
     # holds and in what slot order (expert_placement.py), or the name of one
     # shipped in vllm_torchtpu/expert_placements/. Empty: the checkpoint's

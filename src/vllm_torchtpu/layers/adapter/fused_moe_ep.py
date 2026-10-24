@@ -208,6 +208,7 @@ def _build_op(
     shared_out_scale=1.0,
     shared_rs_min_rows=0,
     shared_small_ar_max_rows=0,
+    shared_fold_restore=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -246,6 +247,7 @@ def _build_op(
         shared_out_scale,
         shared_rs_min_rows,
         shared_small_ar_max_rows,
+        shared_fold_restore,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -275,6 +277,7 @@ def _build_op(
             shared_out_scale=shared_out_scale,
             shared_rs_min_rows=shared_rs_min_rows,
             shared_small_ar_max_rows=shared_small_ar_max_rows,
+            shared_fold_restore=shared_fold_restore,
         )
         if shared_in_op
         else {}
@@ -1116,6 +1119,9 @@ def prebuild_fused_moe_ep(
             _small_ar_max_rows(replica_width)
             if shared_in_op and envs.TPU_SMALL_ALL_REDUCE
             else 0
+        ),
+        shared_fold_restore=bool(
+            shared_in_op and envs.MOE_FUSED_EP_V2_FOLD_RESTORE_INTO_SHARED_AR
         ),
     )
     if shared_in_op:

@@ -47,7 +47,7 @@ def mesh():
     return Mesh(np.asarray([devices[i] for i in order]), (AXIS,))
 
 
-def _inputs(mesh, groups, rows):
+def _inputs(mesh, groups, rows, hidden=HIDDEN):
     ep = mesh.shape[AXIS]
     owner = [0] * ep
     for i, group in enumerate(groups):
@@ -62,20 +62,20 @@ def _inputs(mesh, groups, rows):
         gid = jnp.asarray(owner, dtype=jnp.int32)[me]
         tk = jax.random.split(jax.random.fold_in(jax.random.key(123), gid), 2)
         wk = jax.random.split(jax.random.fold_in(jax.random.key(456), me), 3)
-        x = (jax.random.normal(tk[0], (rows, HIDDEN)) * 0.2).astype(jnp.bfloat16)
+        x = (jax.random.normal(tk[0], (rows, hidden)) * 0.2).astype(jnp.bfloat16)
         gate = jax.random.normal(tk[1], (rows, 2 * ep))
         # Each member of a group holds a different partial: the TP shards of a
         # row-parallel down projection.
-        shared = (jax.random.normal(wk[2], (rows, HIDDEN)) * 0.3).astype(jnp.bfloat16)
+        shared = (jax.random.normal(wk[2], (rows, hidden)) * 0.3).astype(jnp.bfloat16)
 
         def weights(key, width):
-            raw = jax.random.normal(key, (2, HIDDEN, width)) / jnp.sqrt(float(HIDDEN))
+            raw = jax.random.normal(key, (2, hidden, width)) / jnp.sqrt(float(hidden))
             maximum = float(jnp.finfo(jnp.float8_e4m3fn).max)
             scale = jnp.maximum(jnp.max(jnp.abs(raw), axis=1, keepdims=True) / maximum, 1e-12)
             return (raw / scale).astype(jnp.float8_e4m3fn), scale[:, 0, :]
 
-        w1, s1 = weights(wk[0], 1024)
-        w2, s2 = weights(wk[1], HIDDEN)
+        w1, s1 = weights(wk[0], 2 * hidden)  # inter == hidden, so w2 [2, hidden, hidden] matches
+        w2, s2 = weights(wk[1], hidden)
         return x, w1, w2, s1, s2, gate, shared
 
     out = jax.jit(
@@ -195,4 +195,52 @@ def test_single_host_shared_in_op(mesh, groups, rows, scale):
         not np.allclose(_by_rank(_reference(mesh, routed, shared * 0, groups, scale), rows)[r],
                         want[r], rtol=1e-2, atol=1e-2)
         for r in want
+    )
+
+
+_DECODE_GLUE = dict(decode_combine=True, pallas_restore=True)
+
+
+@pytest.mark.parametrize(
+    "groups, rows",
+    [(_TP8, 8), (_TP8, 16), (_TP8, 32), (_TP4_PERMUTED, 8), (_TP4_PERMUTED, 16)],
+    ids=["tp8-r8", "tp8-r16", "tp8-r32", "tp4-r8", "tp4-r16"],
+)
+@pytest.mark.parametrize("scale", [1.0, 2.5])
+def test_decode_fold_restore_into_shared_all_reduce(mesh, groups, rows, scale):
+    # 1024 = 8 cores x 128 lanes: the small all-reduce applies at TP8 too.
+    """shared_fold_restore: decode buckets with the Pallas restore and the
+    small all-reduce. Routed rows join the shared partial before the one
+    all-reduce, so this is held to the unfolded small-AR path's own error vs an
+    exact f32 sum (not its bits), and every replica must hold identical rows."""
+    rank, inputs, shared = _inputs(mesh, groups, rows, hidden=1024)
+    routed = _layer(mesh, rank, inputs, groups, **_DECODE_GLUE)
+    exact = _by_rank(_exact(mesh, routed, shared, groups, scale), rows)
+    common = dict(shared_in_op=True, shared_out_scale=scale,
+                  shared_rs_min_rows=rows + 1, shared_small_ar_max_rows=rows,
+                  **_DECODE_GLUE)
+    base = _by_rank(_layer(mesh, rank, inputs, groups, shared, **common), rows)
+    fold = _by_rank(
+        _layer(mesh, rank, inputs, groups, shared, shared_fold_restore=True, **common),
+        rows,
+    )
+    same = all(np.array_equal(fold[r], base[r]) for r in base)
+    for r in base:
+        assert np.isfinite(fold[r]).all()
+        norm = max(np.linalg.norm(exact[r]), 1e-20)
+        err_fold = float(np.linalg.norm(fold[r] - exact[r]) / norm)
+        err_base = float(np.linalg.norm(base[r] - exact[r]) / norm)
+        print(f"rank {r}: rel-L2 vs exact fold {err_fold:.2e} base {err_base:.2e} "
+              f"maxabs fold-base {np.abs(fold[r] - base[r]).max():.3e}")
+        assert err_fold < max(2.5 * err_base, 2.0**-9), (r, err_fold, err_base)
+    print(f"bit-identical to the unfolded path: {same}")
+    # The fold must have run: one fewer bf16 rounding changes some bits.
+    assert not same, "fold path did not run (bits identical to the unfolded path)"
+    for g in groups:
+        for m in g[1:]:
+            np.testing.assert_array_equal(fold[m], fold[g[0]])
+    # Fault injection: the fold without the routed rows must be caught.
+    zero_routed = _by_rank(_exact(mesh, routed * 0, shared, groups, scale), rows)
+    assert any(
+        not np.allclose(zero_routed[r], exact[r], rtol=1e-2, atol=1e-2) for r in exact
     )
