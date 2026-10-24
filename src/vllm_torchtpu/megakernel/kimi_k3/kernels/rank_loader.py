@@ -238,16 +238,30 @@ FP4_VALUES = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0,
                       np.float32)
 
 
+MAX_COPY_SLOTS = 16  # copy slot j is local expert id 112 + j; the expert loop's lane masks hold ids < 128
+
+
+def _plan_path(path):
+    if not os.path.isabs(path) and not os.path.exists(path):
+        # A bare name: one of the plans shipped in kimi_k3/data.
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", path)
+    return path
+
+
+def _check_slots(path, experts):
+    if experts.ndim != 3 or experts.shape[1] != 8 or not 1 <= experts.shape[2] <= MAX_COPY_SLOTS:
+        raise ValueError(f"plan {path}: experts must be [layers, 8, S] with 1 <= S <= {MAX_COPY_SLOTS}")
+
+
 def hot_plan(rank: int, layers: int):
     """This rank's hot copy slots, [layers - 1, S] local ids of its own EP group (-1 empty), or None.
     Fails closed when the plan places another group's expert here (home-only copies)."""
     path = _config().kd_hot_plan
     if not path:
         return None
-    if not os.path.isabs(path) and not os.path.exists(path):
-        # A bare name: one of the plans shipped in kimi_k3/data.
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", path)
+    path = _plan_path(path)
     experts = np.load(path)["experts"][: layers - 1]
+    _check_slots(path, experts)
     group = rank // 4
     mine = experts[:, group, :]
     if not np.all((mine < 0) | (mine // HOT_LOCAL == group)):
@@ -324,6 +338,69 @@ def _hot_table(latent_norm, experts):
     return table
 
 
+def replica_plan(rank: int, layers: int):
+    """MXFP4 replicas (KernelConfig.kd_replica_plan): this rank's EP group's slots as global expert ids
+    [layers - 1, S] (-1 empty), the whole plan [layers - 1, 8, S] and the dispatch order [layers - 1, 8 S],
+    or None. Fails closed on malformed plans."""
+    path = _config().kd_replica_plan
+    if not path:
+        return None
+    path = _plan_path(path)
+    plan = np.load(path)
+    experts = plan["experts"][: layers - 1].astype(np.int64)
+    _check_slots(path, experts)
+    order = plan["order"][: layers - 1].astype(np.int64)
+    count = experts.shape[2]
+    if order.shape != (experts.shape[0], 8 * count) or any(
+        sorted(order[layer].tolist()) != list(range(8 * count)) for layer in range(order.shape[0])
+    ):
+        raise ValueError(f"replica plan {path}: order must permute the 8 S slots of every layer")
+    for layer in range(experts.shape[0]):
+        used = experts[layer][experts[layer] >= 0]
+        if used.max(initial=-1) >= 8 * HOT_LOCAL or len(set(used.tolist())) != used.size:
+            raise ValueError(f"replica plan {path}: layer {layer} has invalid or repeated experts")
+    return experts[:, rank // 4, :], experts, order
+
+
+def _extend_replicas(rank_dir, presharded, name, part, lo, slots, rank):
+    """Append S MXFP4 replica entries per layer to one layer-range part of an expert family: slot j holds this
+    rank's TP4 quarter of global expert slots[layer, j], read from the owning group's rank directory."""
+    n_layers = part.shape[0]
+    count = slots.shape[1]
+    extra = np.zeros((n_layers, count, *part.shape[2:]), part.dtype)
+    sources = {}
+    for i in range(n_layers):
+        for j, expert in enumerate(slots[lo + i]):
+            if expert < 0:
+                continue
+            owner = 4 * (int(expert) // HOT_LOCAL) + rank % 4
+            if owner == rank:
+                extra[i, j] = part[i, int(expert) % HOT_LOCAL]
+                continue
+            if owner not in sources:
+                sources[owner] = RankDir(presharded, owner, rank_dir.index["layers"])
+            extra[i, j] = _family_slice(sources[owner], name, lo + i, int(expert) % HOT_LOCAL)
+    return np.concatenate([part, extra], axis=1)
+
+
+def _replica_table(latent_norm, experts, order):
+    """The replica table in latent_norm's zero padding lanes (as f32), entries in dispatch order:
+    3584 + i expert id, 3584 + 8S + i holder group, 3584 + 16S + i local slot id (112 + j)."""
+    count = experts.shape[2]
+    entries = 8 * count
+    table = latent_norm.copy()
+    if np.any(table[:, 0, 3584:3584 + 3 * entries] != 0):
+        raise ValueError("latent_norm padding lanes are not zero")
+    for layer in range(experts.shape[0]):
+        for i, flat in enumerate(order[layer]):
+            g, j = divmod(int(flat), count)
+            expert = experts[layer, g, j]
+            table[layer, 0, 3584 + i] = expert
+            table[layer, 0, 3584 + entries + i] = g if expert >= 0 else -1
+            table[layer, 0, 3584 + 2 * entries + i] = HOT_LOCAL + j if expert >= 0 else -1
+    return table
+
+
 def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: bool = False,
                      attention_dp: int = 1) -> Iterator[tuple[str, str, np.ndarray]]:
     """The decode megakernel's weights for ``rank`` (MXFP4 experts as stored).
@@ -338,6 +415,7 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
     """
     rank_dir = RankDir(presharded, rank, layers)
     plan = hot_plan(rank, layers)
+    replicas = replica_plan(rank, layers)
     jobs = list(_expert_jobs(rank_dir, split_experts))
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for key, value in _budgeted(jobs):
@@ -346,10 +424,17 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
             index = int(part.split("/")[0]) if part else 0
             lo = rank_dir.families[family]["layer_ranges"][index][0] if part else 0
             value = _extend_hot(rank_dir, family, value, lo, plan[0])
+        if replicas is not None and key != "dense":
+            family, _, part = key.partition("@")
+            index = int(part.split("/")[0]) if part else 0
+            lo = rank_dir.families[family]["layer_ranges"][index][0] if part else 0
+            value = _extend_replicas(rank_dir, presharded, family, value, lo, replicas[0], rank)
         if key == "dense":
             families = split_kda_projection(value)
             if plan is not None:
                 families["latent_norm"] = _hot_table(families["latent_norm"], plan[1])
+            if replicas is not None:
+                families["latent_norm"] = _replica_table(families["latent_norm"], replicas[1], replicas[2])
             if attention_dp > 1:
                 families.update(attention_dp_families(families, presharded, rank, layers, attention_dp))
             for name, family in families.items():

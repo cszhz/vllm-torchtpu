@@ -76,6 +76,10 @@ MAX_BATCH = 128
 _HOT: list = []
 _HOT_BASE: list = []
 HOT_LOCAL_EXPERTS = 112  # EP8 local experts; copy slot j is local id 112 + j (family entries 112 + 2j, 113 + 2j)
+# MXFP4 hot-expert replicas (KernelConfig.kd_replica_plan): the expert families carry S extra entries,
+# replica slot j = local expert id 112 + j, run by the MXFP4 expert loop like a local expert.
+REPLICAS = bool(_config().kd_replica_plan)
+REPLICA_LANE = 3584  # replica table in latent_norm's zero padding lanes (see rank_loader._replica_table)
 SCATTER_BATCHES = (8, 12, 16, 20, 24, 28, 32, 64, 96, 128)
 
 
@@ -128,6 +132,68 @@ def _gated_activation(gate, value):
         * 25
         * jnp.tanh(value / 25)
     ).astype(jnp.bfloat16)
+def _mxfp4_visit_cost(rows):
+    """Modeled expert-loop time of one MXFP4 visit (us): per visit, per row, per extra 8-row pass (fit to measured
+    per-group expert time, R^2 0.82)."""
+    return jnp.where(rows > 0, 1.74 + 0.31 * rows + 0.67 * (jnp.ceil(rows / 8.0) - 1.0), 0.0)
+
+
+def _replica_dispatch(winners, table, entries, local_expert_count, counts):
+    """Which routes move to a replica. ``winners`` [B, k] global expert ids, ``table`` [1, 256] (this layer's
+    replica lanes: ids, holder groups, local slots), ``counts`` [1, E] the step's per-expert route counts.
+    Greedy over the entries in table order: each replicated expert's routes stay home, split by row parity (odd
+    rows move) or all move, whichever minimises the modeled slowest group after the move. Every per-entry value
+    stays a [1, 1] vector: holding the entries as scalars overflows the scalar unit for large tables.
+    Returns to_copy [B, k] bool, holder group and local slot id [B, k] int32."""
+    def entry(lane):
+        return table[:, lane : lane + 1].astype(jnp.int32)
+
+    def total(x):
+        return jnp.sum(x, axis=(0, 1), keepdims=True)
+
+    row = jax.lax.broadcasted_iota(jnp.int32, winners.shape, 0)
+    group_lane = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
+    expert_lane = jax.lax.broadcasted_iota(jnp.int32, counts.shape, 1)
+    replicated = jnp.zeros(counts.shape, jnp.bool_)
+    for i in range(entries):
+        replicated = replicated | (expert_lane == entry(i))
+    cost = jnp.where(replicated, 0.0, _mxfp4_visit_cost(counts))
+    expert_group = jnp.floor((expert_lane.astype(jnp.float32) + 0.5) / local_expert_count)
+    load = jnp.zeros((1, 128), jnp.float32)
+    for g in range(8):
+        load = load + jnp.where(group_lane == g, total(jnp.where(expert_group == g, cost, 0.0)), 0.0)
+    to_copy = jnp.zeros(winners.shape, jnp.bool_)
+    holder = jnp.zeros(winners.shape, jnp.int32)
+    slot = jnp.zeros(winners.shape, jnp.int32)
+    odd = (row % 2) == 1
+    for i in range(entries):
+        expert = entry(i)
+        routes = winners == expert
+        rows = total(jnp.where(expert_lane == expert, counts, 0.0))
+        home_group = expert // local_expert_count
+        copy_group = entry(entries + i)
+        best_metric = best_choice = best_add = None
+        for choice, moved_rows in ((0, jnp.zeros_like(rows)), (1, jnp.floor(rows / 2.0)), (2, rows)):
+            add = (
+                jnp.where(group_lane == home_group, _mxfp4_visit_cost(rows - moved_rows), 0.0)
+                + jnp.where(group_lane == copy_group, _mxfp4_visit_cost(moved_rows), 0.0)
+            )
+            metric = jnp.max(load + add, axis=1, keepdims=True) + 1e-3 * total(add)
+            if best_metric is None:
+                best_metric, best_choice, best_add = metric, jnp.full((1, 1), choice, jnp.int32), add
+            else:
+                better = metric < best_metric
+                best_metric = jnp.where(better, metric, best_metric)
+                best_choice = jnp.where(better, choice, best_choice)
+                best_add = jnp.where(better, add, best_add)
+        load = load + best_add
+        moved = routes & ((best_choice == 2) | ((best_choice == 1) & odd))
+        to_copy = to_copy | moved
+        holder = jnp.where(moved, copy_group, holder)
+        slot = jnp.where(moved, entry(2 * entries + i), slot)
+    return to_copy, holder, slot
+
+
 def _route_hidden_states(
     hidden_states,
     routing_projection_vmem,
@@ -144,6 +210,8 @@ def _route_hidden_states(
     after_scores=None,
     after_score_send=None,
     live_rows=None,
+    replica_table=None,
+    replica_entries=0,
 ):
     """Project and select local expert routes through one shared B1/B2 path.
 
@@ -203,6 +271,55 @@ def _route_hidden_states(
     probability_totals = jnp.zeros((batch_size,), jnp.float32)
     expert_ids = jnp.arange(expert_count)[None, :]
     route_slots = jnp.arange(selected_expert_count)[None, :]
+    if replica_table is not None:
+        # Replicas: all selections first, then the replica dispatch, then this rank's local routes.
+        winners_by_slot, probabilities_by_slot = [], []
+        expert_counts = jnp.zeros((1, expert_count), jnp.float32)
+        for selection in range(selected_expert_count):
+            winners = jnp.argmax(routing_scores_vmem[:, :expert_count], axis=1).astype(jnp.int32)
+            winner_mask = expert_ids == winners[:, None]
+            probabilities = jnp.sum(jnp.where(winner_mask, uncorrected_probabilities, 0), axis=1)
+            probability_totals += probabilities
+            routing_scores_vmem[:, :expert_count] = jnp.where(
+                winner_mask, -jnp.inf, routing_scores_vmem[:, :expert_count]
+            )
+            winners_by_slot.append(winners)
+            probabilities_by_slot.append(probabilities)
+            # (A 1-D boolean -> [B, 1] reshape does not lower; mask the ids of dead rows instead.)
+            live_mask = (
+                winner_mask if live_rows is None
+                else expert_ids == jnp.where(live_rows, winners, -1)[:, None]
+            )
+            expert_counts = expert_counts + jnp.sum(live_mask.astype(jnp.float32), axis=0, keepdims=True)
+            after_selection(selection)
+        all_winners = jnp.stack(winners_by_slot, axis=1)
+        all_probabilities = jnp.stack(probabilities_by_slot, axis=1)
+        to_copy, holder, slot = _replica_dispatch(
+            all_winners, replica_table, replica_entries, local_expert_count, expert_counts
+        )
+        group = rank // expert_tensor_parallel
+        # (Boolean selects do not lower in Mosaic; combine with logic ops.)
+        owned_all = (to_copy & (holder == group)) | (
+            ~to_copy & (all_winners // local_expert_count == group)
+        )
+        local_all = jnp.where(to_copy, slot, all_winners % local_expert_count)
+        for selection in range(selected_expert_count):
+            counts_before_selection = local_route_counts
+            owned_locally = owned_all[:, selection]
+            if live_rows is not None:
+                owned_locally &= live_rows
+            destination_mask = owned_locally[:, None] & (route_slots == counts_before_selection[:, None])
+            selected_experts = jnp.where(destination_mask, local_all[:, selection][:, None], selected_experts)
+            selected_probabilities = jnp.where(
+                destination_mask, all_probabilities[:, selection][:, None], selected_probabilities
+            )
+            local_route_counts = counts_before_selection + owned_locally.astype(jnp.int32)
+        return (
+            selected_experts,
+            selected_probabilities,
+            local_route_counts,
+            probability_totals if live_rows is None else jnp.where(live_rows, probability_totals, 1.0),
+        )
     # Only top-k rank is sequential. Every score reduction and ownership
     # operation carries the leading batch dimension with no per-row control.
     for selection in range(selected_expert_count):
@@ -467,7 +584,8 @@ def _hot_home_routes(latent_norm, selected_experts, local_route_counts, slot_cou
         )
     copy_of = jnp.full((1, 128), -1, jnp.int32)
     for j in range(slot_count):
-        expert = jnp.sum(jnp.where(entry_lanes == group * slot_count + j, table, 0.0)).astype(jnp.int32)
+        # A [1, 1] vector, not a scalar: per-slot scalars kept live overflow the scalar unit for large plans.
+        expert = jnp.sum(jnp.where(entry_lanes == group * slot_count + j, table, 0.0), axis=1, keepdims=True).astype(jnp.int32)
         local = expert - HOT_LOCAL_EXPERTS * group
         home = (expert >= 0) & (local >= 0) & (local < HOT_LOCAL_EXPERTS)
         copy_of = jnp.where(home & (lanes == local), HOT_LOCAL_EXPERTS + j, copy_of)
@@ -496,7 +614,7 @@ def _run_hot_experts(hot, source, selected_experts, selected_probabilities, vali
         return expert, remaining & (lanes != expert)
 
     def copies(expert, buffer):
-        entry = HOT_LOCAL_EXPERTS + 2 * jnp.clip(expert - HOT_LOCAL_EXPERTS, 0, 7)
+        entry = HOT_LOCAL_EXPERTS + 2 * jnp.clip(expert - HOT_LOCAL_EXPERTS, 0, hot.slots - 1)
         semaphores = hot.semaphores
         gate_up, gate_up_scales, down, down_scales = slots
         return (
@@ -2419,6 +2537,12 @@ def moe(
     latent_size = weights.latent_normalization.shape[-1]
     expert_output_size = weights.expert_down_projection.shape[-1]
     local_expert_count = weights.expert_gate_up_projection.shape[0]
+    # Replicas: entries 112.. of the local expert families are replica slots.
+    replica_slots = local_expert_count - expert_count // 8 if REPLICAS else 0
+    if replica_slots:
+        local_expert_count = expert_count // 8
+        if not 0 < replica_slots <= 16:
+            raise ValueError("replica slots must be 1..16 (local ids < 128)")
     expert_tensor_parallel = 32 * local_expert_count // expert_count
     down_is_reblocked_fp8 = (
         weights.expert_down_projection.dtype == jnp.float8_e4m3fn
@@ -2856,6 +2980,10 @@ def moe(
                     overlap_router_score_exchange if overlap_router_latent else None
                 ),
                 live_rows=live_rows,
+                replica_table=(
+                    weights.latent_normalization[:, REPLICA_LANE : REPLICA_LANE + 256] if replica_slots else None
+                ),
+                replica_entries=8 * replica_slots,
             )
         )
         if hot_info is not None:
@@ -3405,7 +3533,7 @@ def moe(
             group_pending_routes=group_pending_expert_routes,
             progress=poll_shared,
             hot=(None if hot_info is None else SimpleNamespace(
-                refs=hot_info[0], layer=hot_info[1], views=hot_info[2],
+                refs=hot_info[0], layer=hot_info[1], views=hot_info[2], slots=hot_info[3],
                 semaphores=weights.expert_copy_semaphores)),
             )
         @pl.when(progress_state[0] == 0)
@@ -3441,7 +3569,7 @@ def moe(
             group_pending_routes=group_pending_expert_routes,
             progress=None,
             hot=(None if hot_info is None else SimpleNamespace(
-                refs=hot_info[0], layer=hot_info[1], views=hot_info[2],
+                refs=hot_info[0], layer=hot_info[1], views=hot_info[2], slots=hot_info[3],
                 semaphores=weights.expert_copy_semaphores)),
             )
 
@@ -8595,7 +8723,9 @@ def stack(
                 mixture_output_vmem = (
                     owned_rows_vmem if moe_token_scatter_output else mixture_vmem
                 )
-                hot_slots = (local_weights["expert_gu"].shape[0] - HOT_LOCAL_EXPERTS) // 2
+                hot_slots = 0 if REPLICAS else (local_weights["expert_gu"].shape[0] - HOT_LOCAL_EXPERTS) // 2
+                if hot_slots > 16:
+                    raise ValueError("hot-expert copies: at most 16 slots (local ids < 128)")
                 _HOT[:] = (
                     [(layer_weights, layer_index, hot_fp8_views(), hot_slots)]
                     if hot_slots > 0 and alias_expert_scales and POOLED_WEIGHTS and batch_size in (32, 64, 96, 128)

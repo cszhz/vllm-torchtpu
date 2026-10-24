@@ -88,11 +88,23 @@ class KernelConfig:
     )
     # A hot expert's routes use its fp8 copy from this many rows.
     hot_min_rows: int = 9
+    # Hot-expert MXFP4 replicas on other EP groups (off when empty; exclusive
+    # with kd_hot_plan): an npz with ``experts`` [92, 8, S] (global expert id
+    # replicated in copy slot j of EP group g, -1: empty) and ``order``
+    # [92, 8 S] (the dispatch order of the slots). Per step, each replicated
+    # expert's routes stay home, split by row parity, or move to the replica,
+    # whichever gives the lowest modeled slowest-group expert time. A bare
+    # name loads from kimi_k3/data.
+    kd_replica_plan: str = dataclasses.field(
+        default_factory=lambda: os.environ.get("K3_REPLICA_PLAN", "")
+    )
     pool_report: bool = False
     vmem_report: bool = False
     vmem_pad_kb: int = 0
 
     def __post_init__(self) -> None:
+        if self.kd_hot_plan and self.kd_replica_plan:
+            raise ValueError("kd_hot_plan and kd_replica_plan are exclusive")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
