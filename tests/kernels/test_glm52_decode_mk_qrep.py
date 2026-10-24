@@ -61,10 +61,11 @@ def checkpoint():
 
 
 @contextlib.contextmanager
-def _served(rank):
-    """TP16 rank `rank`, DCP 16: what get_tensor_model_parallel_* / get_current_vllm_config say on that rank."""
+def _served(rank, dcp=R):
+    """TP16 rank `rank`, DCP `dcp` (16, or 8 for V16): what get_tensor_model_parallel_* / get_current_vllm_config say
+    on that rank."""
     vc = types.SimpleNamespace(
-        parallel_config=types.SimpleNamespace(decode_context_parallel_size=R)
+        parallel_config=types.SimpleNamespace(decode_context_parallel_size=dcp)
     )
     with contextlib.ExitStack() as st:
         for t in (
@@ -90,14 +91,14 @@ def _served(rank):
         yield
 
 
-def _q_b_proj(cls, rank, checkpoint):
+def _q_b_proj(cls, rank, checkpoint, dcp=R):
     w, s_inv = checkpoint
     quant = VllmFp8Config(
         is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
         weight_block_size=[128, 128],
     )
-    with _served(rank):
+    with _served(rank, dcp):
         layer = cls(
             input_size=QL,
             output_size=N,
@@ -136,13 +137,13 @@ def _permute_neox(q_b_proj, group_size):
     assert wr._rope_neox_permuted
 
 
-def _operands(layer, rank, qrep):
+def _operands(layer, rank, qrep, cfg=CF):
     """The megakernel's q_b operands from a processed q_b_proj, exactly as Glm52DecodeMK builds them: `q_b_local`
     (via `_layer`), the stacked dense copy (`_collect_weights`: _own(torch.stack)) and the q_b_s field of a smalls
     row (`_build_smalls`: f32, zero-padded to a lane multiple)."""
     n = layer.weight.numel() // QL
     qw, qs = VA.q_b_local(
-        layer.weight, VA._scale(layer, n, "q_b_proj"), CF, rank, qrep=qrep
+        layer.weight, VA._scale(layer, n, "q_b_proj"), cfg, rank, qrep=qrep
     )
     qb = VA._own(torch.stack([qw.detach()]))
     q_b_s = torch.nn.functional.pad(qs.reshape(-1).float(), (0, rup(NQB) - NQB))
@@ -178,3 +179,28 @@ def test_qrep1_q_b_operand_equals_qrep0(checkpoint, rank, neox):
             _q_b_proj(ColumnParallelLinear, rank, checkpoint), rank, qrep=False
         )
         assert not torch.equal(_bytes(plain), _bytes(qb1))
+
+
+@pytest.mark.parametrize("neox", [False, True], ids=["interleaved", "neox"])
+@pytest.mark.parametrize("rank", [0, 5, 8, R - 1])
+def test_v16_dcp8_qrep1_q_b_operand_equals_qrep0(checkpoint, rank, neox):
+    """V16 (DCP 8, VLLM_DCP_Q_REPLICATE=1): the real DCPGroupColumnParallelLinear holds lane rank // 8's 32 heads;
+    q_b_local's slice [(rank % 8) * HR, +HR) of it is byte-identical to the TP16 column-parallel shard."""
+    import dataclasses
+
+    cfg8 = dataclasses.replace(CF, DCP=8)
+    tp = _q_b_proj(ColumnParallelLinear, rank, checkpoint)
+    rep = _q_b_proj(DCPGroupColumnParallelLinear, rank, checkpoint, dcp=8)
+    assert rep.qrep_active and rep.group_size == 8 and rep.rank_in_group == rank % 8
+    assert tuple(rep.weight.shape) == (QL, N // 2)
+    if neox:
+        _permute_neox(tp, 1)
+        _permute_neox(rep, 8)
+    assert VA.qrep_layer(rep, R, rank, 0, 8)
+    qb0, s0 = _operands(tp, rank, qrep=False)
+    qb1, s1 = _operands(rep, rank, qrep=True, cfg=cfg8)
+    assert torch.equal(_bytes(qb1), _bytes(qb0))
+    assert torch.equal(_bytes(s1), _bytes(s0))
+    # positive control: the replica's neighbour in the group holds other heads
+    qbn, _ = _operands(rep, rank + 1 if rank % 8 != 7 else rank - 1, qrep=True, cfg=cfg8)
+    assert not torch.equal(_bytes(qbn), _bytes(qb0))
