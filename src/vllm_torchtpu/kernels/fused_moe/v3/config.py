@@ -244,6 +244,13 @@ class Config:
         tables inside the dense-slots program itself, under its first weight
         refills, on the shard's unpadded rows (padding and valid-row masks in
         the program); supersedes dense_slots_pallas_tables.
+      dense_slots_skip_unrouted: the dense-slots program streams the weights
+        of only its live local experts (those with at least one routed row)
+        instead of all of them; bit-identical output, fewer weight bytes when
+        the routing leaves experts cold.
+      dense_slots_weight_slots: the dense-slots program's VMEM weight slots
+        (whole experts); it keeps slots - 1 expert refills in flight. 0 (the
+        default) means 3 slots, 2 in flight. Same values, another schedule.
       gdn_decode_tile_size: not a fused-EP setting: the GDN decode kernel's
         tile size (kernels/gdn/v3/wrapper.py reads it from this JSON when
         TPU_GDN_DECODE_TILE_SIZE is unset; 0 leaves the kernel's choice). It
@@ -286,6 +293,8 @@ class Config:
     dense_slots_fused: bool = False
     dense_slots_pallas_tables: bool = False
     dense_slots_merged: bool = False
+    dense_slots_skip_unrouted: bool = False
+    dense_slots_weight_slots: int = 0
     gdn_decode_tile_size: int = 0
 
     @property
@@ -416,6 +425,9 @@ class Config:
         if self.dense_slots_max_tokens <= 0 or self.dense_slots_max_tokens % 8:
             raise ValueError(f"dense_slots_max_tokens {self.dense_slots_max_tokens}: a "
                              "positive multiple of 8")
+        if self.dense_slots_weight_slots not in (0, 2, 3, 4, 5):
+            raise ValueError(f"dense_slots_weight_slots {self.dense_slots_weight_slots}: 0 "
+                             "(the default, 3) or 2..5")
         if self.gdn_decode_tile_size < 0:
             raise ValueError(f"gdn_decode_tile_size {self.gdn_decode_tile_size}: 0 (the "
                              "kernel's choice) or a positive tile size")
