@@ -260,3 +260,116 @@ def test_connector_env_cache(monkeypatch):
     glm = tc._use_raiden_glm_admission()
     assert tc._use_raiden_glm_admission() is glm
     assert set(tc._t3_env_cache) == {"stage3", "glm"}
+
+
+# --- VLLM_TPU_T3_TIMERS / VLLM_TPU_T3_PROF_PYTRACE (measurement only) -------
+
+
+class _FakeRunner:
+    def __init__(self):
+        self.calls = []
+
+    def execute_model(self, x):
+        self.calls.append("exec")
+        self.forward_model(x)
+        return x + 1
+
+    def forward_model(self, x):
+        self.calls.append("fwd")
+        return x
+
+    def sample_tokens(self, g):
+        self.calls.append("sample")
+        return g
+
+
+@pytest.fixture
+def timers_on(monkeypatch):
+    monkeypatch.setattr(t3_host, "TIMERS", True)
+    monkeypatch.setattr(t3_host, "_aggs", {})
+    yield
+
+
+def test_timers_off_by_default_installs_nothing(monkeypatch):
+    monkeypatch.setattr(t3_host, "TIMERS", False)
+    cls = type("R", (_FakeRunner,), {})
+    t3_host.install_runner_timers(cls)
+    assert not getattr(cls.execute_model, "_t3_timed", False)
+
+
+def test_runner_timers_record_and_preserve_results(timers_on):
+    cls = type("R", (_FakeRunner,), {})
+    t3_host.install_runner_timers(cls)
+    r = cls()
+    for i in range(3):
+        assert r.execute_model(i) == i + 1
+        assert r.sample_tokens(i) == i
+    assert r.calls == ["exec", "fwd", "sample"] * 3
+    keys = set(t3_host._aggs)
+    for k in ("w.execute_model", "w.sample_tokens", "w.forward_model",
+              "w.gap_sample_end_to_exec_start", "w.exec_start_to_forward_start",
+              "w.forward_start_period", "w.exec_start_period"):
+        assert k in keys, k
+    assert len(t3_host._aggs["w.execute_model"].vals) == 3
+    assert len(t3_host._aggs["w.gap_sample_end_to_exec_start"].vals) == 2
+    # Idempotent: a second install does not double-wrap.
+    t3_host.install_runner_timers(cls)
+    r.execute_model(0)
+    assert len(t3_host._aggs["w.execute_model"].vals) == 4
+    t3_host.flush(force=True)
+    assert all(not a.vals for a in t3_host._aggs.values())
+
+
+def test_engine_core_timers(timers_on, monkeypatch):
+    class Sched:
+        def schedule(self, *a):
+            return "so"
+
+        def update_from_output(self, so, mo):
+            return {"out": 1}
+
+    class Exec:
+        def execute_model(self, so, non_block=True):
+            return "f"
+
+        def sample_tokens(self, g, non_block=True):
+            return "f2"
+
+    class EngineCore:
+        def __init__(self):
+            self.scheduler = Sched()
+            self.model_executor = Exec()
+
+        def step_with_batch_queue(self):
+            so = self.scheduler.schedule()
+            self.model_executor.execute_model(so)
+            self.model_executor.sample_tokens(None)
+            return self.scheduler.update_from_output(so, None), True
+
+    fake = types.ModuleType("vllm.v1.engine.core")
+    fake.EngineCore = EngineCore
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.core", fake)
+    import vllm.v1.engine as _eng
+
+    monkeypatch.setattr(_eng, "core", fake, raising=False)
+    t3_host.install_engine_core_timers()
+    ec = EngineCore()
+    assert ec.step_with_batch_queue() == ({"out": 1}, True)
+    assert ec.step_with_batch_queue() == ({"out": 1}, True)
+    keys = set(t3_host._aggs)
+    for k in ("ec.step_with_batch_queue", "ec.step_with_output", "ec.schedule",
+              "ec.update_from_output", "ec.submit_execute_model",
+              "ec.submit_sample_tokens", "ec.gap_between_steps"):
+        assert k in keys, k
+    assert len(t3_host._aggs["ec.schedule"].vals) == 2
+
+
+def test_prof_python_tracer_override(monkeypatch):
+    from vllm_torchtpu.tracing import options
+
+    monkeypatch.delenv("VLLM_TPU_T3_PROF_PYTRACE", raising=False)
+    base = options.get_default_standard_opts()["python_tracer_level"]
+    monkeypatch.setenv("VLLM_TPU_T3_PROF_PYTRACE", "0")
+    assert options.get_default_standard_opts()["python_tracer_level"] == 0
+    monkeypatch.setenv("VLLM_TPU_T3_PROF_PYTRACE", "")
+    assert options.get_default_standard_opts()["python_tracer_level"] == base

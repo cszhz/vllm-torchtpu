@@ -192,6 +192,13 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        if os.environ.get("VLLM_TPU_T3_TIMERS", "0").strip() == "1":
+            # IX track 3 (default off): time the engine core's step loop. The
+            # EngineCore binds step_fn after building its scheduler, so a
+            # class-level patch made here is the one the busy loop calls.
+            from vllm_torchtpu.runner import t3_host
+
+            t3_host.install_engine_core_timers()
         self._paw_n = 0
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0

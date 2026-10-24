@@ -11182,3 +11182,10 @@ def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
     if num_slices_per_block > 64:
         num_slices_per_block = 64
     return num_slices_per_block
+
+
+# IX track 3: VLLM_TPU_T3_TIMERS=1 installs light host timers (default off).
+from vllm_torchtpu.runner import t3_host as _t3_host  # noqa: E402
+
+if _t3_host.TIMERS:
+    _t3_host.install_runner_timers(TPUModelRunner)

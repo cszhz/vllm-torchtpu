@@ -95,3 +95,194 @@ def maybe_skip_aot_guards(module: Any) -> bool:
 
 def _reset_for_tests() -> None:
     _done.clear()
+
+
+# ---------------------------------------------------------------------------
+# VLLM_TPU_T3_TIMERS=1 (default off): light host timers for serving.
+# Wraps a few methods with perf_counter pairs, aggregates in memory and logs
+# one summary line per key every VLLM_TPU_T3_TIMERS_PERIOD_S (default 30 s)
+# per process. No per-step logging. Measurement only.
+# ---------------------------------------------------------------------------
+
+import functools as _functools
+import time as _time
+
+TIMERS = os.environ.get("VLLM_TPU_T3_TIMERS", "0").strip() == "1"
+_PERIOD_S = float(os.environ.get("VLLM_TPU_T3_TIMERS_PERIOD_S", "30"))
+_MAX_SAMPLES = 20000
+
+
+class _Agg:
+    __slots__ = ("vals",)
+
+    def __init__(self) -> None:
+        self.vals: list[float] = []
+
+    def add(self, ms: float) -> None:
+        if len(self.vals) < _MAX_SAMPLES:
+            self.vals.append(ms)
+
+
+_aggs: dict[str, _Agg] = {}
+_last_flush = [_time.monotonic()]
+_tag = [""]
+
+
+def _q(v: list[float], p: float) -> float:
+    return v[min(len(v) - 1, int(p * len(v)))]
+
+
+def flush(force: bool = False) -> None:
+    now = _time.monotonic()
+    if not force and now - _last_flush[0] < _PERIOD_S:
+        return
+    window = now - _last_flush[0]
+    _last_flush[0] = now
+    items = [(k, sorted(a.vals)) for k, a in _aggs.items() if a.vals]
+    for a in _aggs.values():
+        a.vals = []
+    for k, v in sorted(items):
+        logger.info(
+            "[t3timers]%s %s n=%d window_s=%.1f mean=%.4f p10=%.4f p50=%.4f "
+            "p90=%.4f p99=%.4f ms",
+            _tag[0], k, len(v), window, sum(v) / len(v), _q(v, 0.1), _q(v, 0.5),
+            _q(v, 0.9), _q(v, 0.99),
+        )
+
+
+def record(key: str, ms: float) -> None:
+    a = _aggs.get(key)
+    if a is None:
+        a = _aggs[key] = _Agg()
+    a.add(ms)
+
+
+def _wrap_method(owner: Any, name: str, key: str, after: Any = None) -> bool:
+    fn = getattr(owner, name, None)
+    if fn is None or getattr(fn, "_t3_timed", False):
+        return False
+    pc = _time.perf_counter
+
+    @_functools.wraps(fn)
+    def timed(*a: Any, **k: Any) -> Any:
+        t0 = pc()
+        try:
+            return fn(*a, **k)
+        finally:
+            t1 = pc()
+            record(key, (t1 - t0) * 1e3)
+            if after is not None:
+                after(t0, t1)
+
+    timed._t3_timed = True  # type: ignore[attr-defined]
+    setattr(owner, name, timed)
+    return True
+
+
+def install_runner_timers(runner_cls: Any) -> None:
+    """Worker-side timers on the TPU model runner (and, when importable, the
+    drafter and KV connector worker)."""
+    if not TIMERS:
+        return
+    _tag[0] = f"[worker pid={os.getpid()}]"
+    state = {"exec_t0": None, "samp_t1": None, "fwd_t0": None, "exec_entry": None}
+
+    def after_exec(t0: float, t1: float) -> None:
+        if state["samp_t1"] is not None:
+            record("w.gap_sample_end_to_exec_start", (t0 - state["samp_t1"]) * 1e3)
+        if state["exec_t0"] is not None:
+            record("w.exec_start_period", (t0 - state["exec_t0"]) * 1e3)
+        state["exec_t0"] = t0
+
+    def after_sample(t0: float, t1: float) -> None:
+        state["samp_t1"] = t1
+        flush()
+
+    def after_fwd(t0: float, t1: float) -> None:
+        if state["exec_t0"] is not None:
+            record("w.exec_start_to_forward_start", (t0 - state["exec_t0"]) * 1e3)
+        if state["fwd_t0"] is not None:
+            record("w.forward_start_period", (t0 - state["fwd_t0"]) * 1e3)
+        state["fwd_t0"] = t0
+
+    _wrap_method(runner_cls, "execute_model", "w.execute_model", after_exec)
+    _wrap_method(runner_cls, "sample_tokens", "w.sample_tokens", after_sample)
+    _wrap_method(runner_cls, "forward_model", "w.forward_model", after_fwd)
+    for name in (
+        "_prepare_inputs",
+        "_update_states",
+        "get_finished_kv_transfers",
+        "maybe_setup_kv_connector",
+        "_sample_spec_verify_chunk",
+        "_modify_prev_results",
+        "_assemble_async_spec_substitution",
+        "_record_input_staging_fence",
+        "_wait_input_staging_fence",
+    ):
+        _wrap_method(runner_cls, name, f"w.{name}")
+    try:
+        from vllm_torchtpu.runner.speculative_decoding_manager import (
+            SpeculativeDecodingManager,
+        )
+
+        _wrap_method(
+            SpeculativeDecodingManager, "propose_draft_token_ids", "w.propose"
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    logger.info("VLLM_TPU_T3_TIMERS: worker timers installed (period %.0f s)", _PERIOD_S)
+
+
+def install_engine_core_timers() -> None:
+    """Engine-core timers: the batch-queue step, its schedule / update phases,
+    executor submits, and the idle gap between steps."""
+    if not TIMERS:
+        return
+    try:
+        from vllm.v1.engine import core as _core
+    except Exception:  # noqa: BLE001
+        return
+    ec = getattr(_core, "EngineCore", None)
+    fn = getattr(ec, "step_with_batch_queue", None)
+    if fn is None or getattr(fn, "_t3_timed", False):
+        return
+    pc = _time.perf_counter
+    st = {"t1": None, "inst": set()}
+
+    def _instrument(self: Any) -> None:
+        if id(self) in st["inst"]:
+            return
+        st["inst"].add(id(self))
+        _tag[0] = f"[engine_core pid={os.getpid()}]"
+        sch = getattr(self, "scheduler", None)
+        if sch is not None:
+            _wrap_method(sch, "schedule", "ec.schedule")
+            _wrap_method(sch, "update_from_output", "ec.update_from_output")
+        ex = getattr(self, "model_executor", None)
+        if ex is not None:
+            _wrap_method(ex, "execute_model", "ec.submit_execute_model")
+            _wrap_method(ex, "sample_tokens", "ec.submit_sample_tokens")
+        logger.info("VLLM_TPU_T3_TIMERS: engine-core timers installed (period %.0f s)", _PERIOD_S)
+
+    @_functools.wraps(fn)
+    def step_with_batch_queue(self: Any, *a: Any, **k: Any) -> Any:
+        _instrument(self)
+        t0 = pc()
+        if st["t1"] is not None:
+            record("ec.gap_between_steps", (t0 - st["t1"]) * 1e3)
+        try:
+            out = fn(self, *a, **k)
+        finally:
+            t1 = pc()
+            st["t1"] = t1
+            record("ec.step_with_batch_queue", (t1 - t0) * 1e3)
+        try:
+            if out is not None and out[0] is not None:
+                record("ec.step_with_output", (t1 - t0) * 1e3)
+        except Exception:  # noqa: BLE001
+            pass
+        flush()
+        return out
+
+    step_with_batch_queue._t3_timed = True  # type: ignore[attr-defined]
+    ec.step_with_batch_queue = step_with_batch_queue
