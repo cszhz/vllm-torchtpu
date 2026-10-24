@@ -16,9 +16,11 @@ import socket
 import threading
 
 import pytest
+import torch
 
 from vllm_torchtpu.spec_decode.remote_dspark import (
     DraftProposal,
+    PackedTensorRows,
     RemoteDraftPipeline,
     RemoteDraftProtocolError,
     RemoteDSparkTransport,
@@ -62,6 +64,27 @@ def test_transport_proposal_feedback_round_trip():
 
     consumer.send_feedback({"request_ids": ["req-a"]})
     assert producer[0].recv_feedback()["request_ids"] == ["req-a"]
+
+
+def test_packed_tensor_rows_round_trip():
+    tensor = torch.arange(24, dtype=torch.bfloat16).reshape(6, 4)
+
+    packed = PackedTensorRows.from_tensor(tensor, live_rows=2)
+
+    assert packed.tensor.shape == (2, 4)
+    assert packed.transferred_bytes == 16
+    assert packed.padded_bytes == 48
+    restored = packed.restore(torch.device("cpu"), padding_value=-1)
+    torch.testing.assert_close(restored[:2], tensor[:2])
+    torch.testing.assert_close(
+        restored[2:], torch.full((4, 4), -1.0, dtype=torch.bfloat16)
+    )
+
+
+def test_packed_tensor_rows_rejects_invalid_live_count():
+    tensor = torch.zeros((2, 4))
+    with pytest.raises(ValueError, match="outside"):
+        PackedTensorRows.from_tensor(tensor, live_rows=3)
 
 
 def test_only_output_rank_owns_remote_proposals():

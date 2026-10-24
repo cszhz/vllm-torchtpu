@@ -24,6 +24,8 @@ import time
 from enum import StrEnum
 from typing import Any
 
+import torch
+
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -49,6 +51,54 @@ def is_remote_draft_proposal_rank(rank: int, pipeline_parallel_size: int) -> boo
 
 class RemoteDraftProtocolError(RuntimeError):
     """A remote draft message violates request ordering or KV ownership."""
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedTensorRows:
+    """A tensor transferred with only its live leading-dimension rows."""
+
+    tensor: torch.Tensor
+    padded_rows: int
+
+    def __post_init__(self) -> None:
+        if self.tensor.device.type != "cpu":
+            raise ValueError("packed remote tensor must reside on CPU")
+        if self.padded_rows < self.tensor.shape[0]:
+            raise ValueError(
+                "packed remote tensor row count exceeds its padded row count"
+            )
+
+    @classmethod
+    def from_tensor(cls, tensor: torch.Tensor, live_rows: int) -> PackedTensorRows:
+        if live_rows < 0 or live_rows > tensor.shape[0]:
+            raise ValueError(
+                f"live row count {live_rows} is outside [0, {tensor.shape[0]}]"
+            )
+        host_tensor = tensor.detach().cpu()
+        return cls(host_tensor[:live_rows].clone(), tensor.shape[0])
+
+    @property
+    def transferred_bytes(self) -> int:
+        return self.tensor.numel() * self.tensor.element_size()
+
+    @property
+    def padded_bytes(self) -> int:
+        if self.tensor.shape[0] == 0:
+            return 0
+        return self.transferred_bytes * self.padded_rows // self.tensor.shape[0]
+
+    def restore(self, device: torch.device, *, padding_value: int = 0) -> torch.Tensor:
+        tensor = self.tensor
+        missing_rows = self.padded_rows - tensor.shape[0]
+        if missing_rows:
+            padding = torch.full(
+                (missing_rows, *tensor.shape[1:]),
+                padding_value,
+                dtype=tensor.dtype,
+                device="cpu",
+            )
+            tensor = torch.cat((tensor, padding), dim=0)
+        return tensor.to(device, non_blocking=True)
 
 
 class RemoteDSparkTransport:

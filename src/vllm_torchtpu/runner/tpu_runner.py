@@ -179,6 +179,7 @@ from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.remote_dspark import (
+    PackedTensorRows,
     RemoteDSparkTransport,
     is_remote_draft_proposal_rank,
 )
@@ -4130,9 +4131,15 @@ class TPUModelRunner(GPUModelRunner):
                             "remote DSpark feedback has fewer chunks than the "
                             "producer batch"
                         )
+                    packed_aux = feedback_chunks[chunk_index]
+                    if not all(
+                        isinstance(tensor, PackedTensorRows) for tensor in packed_aux
+                    ):
+                        raise RuntimeError(
+                            "remote DSpark aux hidden states must use packed rows"
+                        )
                     aux_hidden_states = [
-                        tensor.to(self.device, non_blocking=True)
-                        for tensor in feedback_chunks[chunk_index]
+                        tensor.restore(self.device) for tensor in packed_aux
                     ]
                     hidden_states = torch.empty(
                         (num_tokens_padded, 1),
@@ -4263,7 +4270,7 @@ class TPUModelRunner(GPUModelRunner):
             top_tokens=top_tokens,
             remote_next_tokens_per_chunk=(
                 [
-                    tensor.to(self.device, non_blocking=True)
+                    tensor.restore(self.device, padding_value=INVALID_TOKEN_ID)
                     for tensor in remote_feedback["next_tokens_per_chunk"]
                 ]
                 if remote_feedback is not None
@@ -4414,7 +4421,7 @@ class TPUModelRunner(GPUModelRunner):
     ) -> None:
         transport = self._remote_dspark_transport
         assert transport is not None
-        aux_hidden_states: list[list[torch.Tensor]] = []
+        aux_hidden_states: list[list[PackedTensorRows]] = []
         for chunk in draft_chunks:
             aux = chunk.aux_hidden_states
             tensors = list(aux) if isinstance(aux, (list, tuple)) else [aux]
@@ -4424,8 +4431,28 @@ class TPUModelRunner(GPUModelRunner):
                 raise RuntimeError(
                     "remote DSpark consumer did not capture target aux hidden states"
                 )
+            live_tokens = int(chunk.query_start_loc_np[-1])
             aux_hidden_states.append(
-                [tensor.detach().cpu() for tensor in cast(list[torch.Tensor], tensors)]
+                [
+                    PackedTensorRows.from_tensor(tensor, live_tokens)
+                    for tensor in cast(list[torch.Tensor], tensors)
+                ]
+            )
+        packed_next_tokens = [
+            PackedTensorRows.from_tensor(tensor, chunk.num_reqs)
+            for tensor, chunk in zip(next_tokens_per_chunk, draft_chunks, strict=True)
+        ]
+        if self._profiler_rank == 0:
+            packed_tensors = [
+                tensor
+                for chunk_tensors in aux_hidden_states
+                for tensor in chunk_tensors
+            ] + packed_next_tokens
+            logger.info(
+                "Remote DSpark feedback compacted: transferred_bytes=%d "
+                "padded_bytes=%d",
+                sum(tensor.transferred_bytes for tensor in packed_tensors),
+                sum(tensor.padded_bytes for tensor in packed_tensors),
             )
         feedback_request_ids = request_ids
         if self._remote_dspark_proposal_rank:
@@ -4442,9 +4469,7 @@ class TPUModelRunner(GPUModelRunner):
         transport.send_feedback(
             {
                 "request_ids": feedback_request_ids,
-                "next_tokens_per_chunk": [
-                    tensor.detach().cpu() for tensor in next_tokens_per_chunk
-                ],
+                "next_tokens_per_chunk": packed_next_tokens,
                 "aux_hidden_states": aux_hidden_states,
             }
         )
