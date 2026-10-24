@@ -349,10 +349,14 @@ class OutputRef(_BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class RoPEOutputRef(_BufferedRef):
+class RoPEInputRef(_BufferedRef):
     # VMEM block: cfgs.rope_output_shape() -> (tile_n, 4, LANE) uint8, each
-    # token's whole 4-token RoPE row, read-modify-written.
-    # Only used for CSA (has_rope_cache=True).
+    # row-writer's current 4-token RoPE row, which the body merges into
+    # RoPEOutputRef. Only used for CSA (has_rope_cache=True).
+    #
+    # Reads and writes use separate buffers: emit_pipeline issues step k+1's
+    # copy_in before it waits on step k-1's copy_out, and with one
+    # INPUT_OUTPUT buffer both use the same slot.
 
     def copy_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
@@ -410,6 +414,13 @@ class RoPEOutputRef(_BufferedRef):
                     vmem_ref.at[n, :, :],
                     sem,
                 ).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class RoPEOutputRef(_BufferedRef):
+    # VMEM block: cfgs.rope_output_shape() -> (tile_n, 4, LANE) uint8, each
+    # row-writer's merged RoPE row (see RoPEInputRef).
 
     def copy_out(self, dest_ref, grid_indices):
         assert self.sem_sends is not None
@@ -482,12 +493,25 @@ def create_allocs_and_specs(
     is_first_mask_ref,
     is_first_mask_rope_ref,
 ) -> tuple[
-    tuple[CosSinRef | None, OutputRef, WindowRef, RoPEOutputRef | None],
-    tuple[pl.BlockSpec | None, pl.BlockSpec, pl.BlockSpec, pl.BlockSpec | None],
+    tuple[
+        CosSinRef | None,
+        OutputRef,
+        WindowRef,
+        RoPEInputRef | None,
+        RoPEOutputRef | None,
+    ],
+    tuple[
+        pl.BlockSpec | None,
+        pl.BlockSpec,
+        pl.BlockSpec,
+        pl.BlockSpec | None,
+        pl.BlockSpec | None,
+    ],
     tuple[
         tuple[Any, ...] | None,
         tuple[Any, ...],
         tuple[Any, ...],
+        tuple[Any, ...] | None,
         tuple[Any, ...] | None,
     ],
 ]:
@@ -570,20 +594,28 @@ def create_allocs_and_specs(
             memory_space=pltpu.VMEM,
             index_map=lambda i: (i, 0, 0),
         )
-        rope_alloc = RoPEOutputRef.create(
+        rope_in_alloc = RoPEInputRef.create(
             spec=rope_spec,
             dtype_or_type=jnp.uint8,
-            buffer_type=pltpu.BufferType.INPUT_OUTPUT,
+            buffer_type=pltpu.BufferType.INPUT,
+            buffer_count=2,
+            use_lookahead=False,
+            cfgs=cfgs,
+        )
+        rope_out_alloc = RoPEOutputRef.create(
+            spec=rope_spec,
+            dtype_or_type=jnp.uint8,
+            buffer_type=pltpu.BufferType.OUTPUT,
             buffer_count=2,
             use_lookahead=False,
             cfgs=cfgs,
         )
         rope_args = (rope_cache_ref, kv_slot_mapping_ref, is_first_mask_rope_ref)
     else:
-        rope_alloc = rope_spec = rope_args = None
+        rope_in_alloc = rope_out_alloc = rope_spec = rope_args = None
 
     return (
-        (cos_sin_alloc, output_alloc, window_alloc, rope_alloc),
-        (cos_sin_spec, output_spec, window_spec, rope_spec),
-        (cos_sin_args, output_args, window_args, rope_args),
+        (cos_sin_alloc, output_alloc, window_alloc, rope_in_alloc, rope_out_alloc),
+        (cos_sin_spec, output_spec, window_spec, rope_spec, rope_spec),
+        (cos_sin_args, output_args, window_args, rope_args, rope_args),
     )
