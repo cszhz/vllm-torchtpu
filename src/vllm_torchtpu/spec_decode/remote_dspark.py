@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import math
 import pickle
 import socket
 import struct
 import time
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -51,6 +52,130 @@ def is_remote_draft_proposal_rank(rank: int, pipeline_parallel_size: int) -> boo
 
 class RemoteDraftProtocolError(RuntimeError):
     """A remote draft message violates request ordering or KV ownership."""
+
+
+class _WeightSynchronizer(Protocol):
+    def bind_weights(self, device_tensors: list[list[torch.Tensor]]) -> None: ...
+
+    def push_weights(self, peers: list[str]) -> None: ...
+
+    def wait_for_transfer_completion(self, uuid: int | None = None) -> None: ...
+
+    def get_local_endpoints(self) -> list[dict[str, Any]]: ...
+
+
+def _new_sender_synchronizer(
+    tensors: tuple[torch.Tensor, ...], rank: int
+) -> _WeightSynchronizer:
+    from tpu_sync.api.torch.weight_synchronizer import WeightSynchronizer
+
+    return WeightSynchronizer(
+        [[tensor] for tensor in tensors],
+        global_shard_indices=[rank],
+    )
+
+
+def _new_receiver_synchronizer(
+    tensors: tuple[torch.Tensor, ...], rank: int, bind_ip: str
+) -> _WeightSynchronizer:
+    from tpu_sync.api.torch.weight_synchronizer import WeightSynchronizer
+
+    return WeightSynchronizer(
+        [[tensor] for tensor in tensors],
+        local_port=0,
+        parallelism=1,
+        bind_ip=bind_ip,
+        auto_h2d=True,
+        global_shard_indices=[rank],
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class RemoteTensorSpec:
+    """Shape and dtype needed to create one native transfer buffer."""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+    @classmethod
+    def from_tensor(cls, tensor: torch.Tensor) -> RemoteTensorSpec:
+        if tensor.ndim == 0:
+            raise ValueError("remote DSpark tensors must have a row dimension")
+        return cls(tuple(tensor.shape), tensor.dtype)
+
+    def allocate(self, device: torch.device) -> torch.Tensor:
+        return torch.empty(self.shape, dtype=self.dtype, device=device)
+
+    @property
+    def num_bytes(self) -> int:
+        return math.prod(self.shape) * self.dtype.itemsize
+
+
+@dataclasses.dataclass(frozen=True)
+class RemoteTensorTransfer:
+    """Control-plane reference to tensors sent through TPU Sync."""
+
+    channel: int
+    specs: tuple[RemoteTensorSpec, ...]
+    live_rows: int
+
+    def __post_init__(self) -> None:
+        if self.channel < 0:
+            raise ValueError("remote tensor channel must be nonnegative")
+        if not self.specs:
+            raise ValueError("remote tensor transfer must contain tensors")
+        padded_rows = self.specs[0].shape[0]
+        if any(spec.shape[0] != padded_rows for spec in self.specs):
+            raise ValueError("remote tensor layers must have equal row counts")
+        if self.live_rows < 0 or self.live_rows > padded_rows:
+            raise ValueError(
+                f"live row count {self.live_rows} is outside [0, {padded_rows}]"
+            )
+
+    @classmethod
+    def from_tensors(
+        cls, channel: int, tensors: tuple[torch.Tensor, ...], live_rows: int
+    ) -> RemoteTensorTransfer:
+        return cls(
+            channel=channel,
+            specs=tuple(RemoteTensorSpec.from_tensor(tensor) for tensor in tensors),
+            live_rows=live_rows,
+        )
+
+    @property
+    def transferred_bytes(self) -> int:
+        return sum(spec.num_bytes for spec in self.specs)
+
+    @property
+    def padded_bytes(self) -> int:
+        return self.transferred_bytes
+
+
+@dataclasses.dataclass(frozen=True)
+class RemoteDeviceTensorRows:
+    """P-side tensors populated in place by TPU Sync."""
+
+    tensors: tuple[torch.Tensor, ...]
+    live_rows: int
+
+    def restore_tensors(self, device: torch.device) -> list[torch.Tensor]:
+        if any(tensor.device.type != device.type for tensor in self.tensors):
+            raise RuntimeError(
+                "remote DSpark TPU Sync buffers are not on the draft device"
+            )
+        return list(self.tensors)
+
+
+@dataclasses.dataclass
+class _SenderTensorChannel:
+    synchronizer: _WeightSynchronizer
+    peers: list[str]
+
+
+@dataclasses.dataclass
+class _ReceiverTensorChannel:
+    synchronizer: _WeightSynchronizer
+    tensors: tuple[torch.Tensor, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -141,6 +266,7 @@ class RemoteDSparkTransport:
         port: int,
         rank: int,
         timeout_s: float,
+        device: torch.device,
     ) -> None:
         if role not in ("producer", "consumer"):
             raise ValueError(f"remote DSpark role must be producer or consumer: {role}")
@@ -153,8 +279,16 @@ class RemoteDSparkTransport:
 
         self.role = role
         self.rank = rank
+        self._device = device
+        self._producer_host = producer_host
         self._round_id = 0
         self._proposal_outstanding = False
+        self._tensor_senders: dict[
+            tuple[int, tuple[RemoteTensorSpec, ...]], _SenderTensorChannel
+        ] = {}
+        self._tensor_receivers: dict[
+            tuple[int, tuple[RemoteTensorSpec, ...]], _ReceiverTensorChannel
+        ] = {}
         address = (producer_host, port + rank)
         if role == "producer":
             stream = self._accept(address, timeout_s)
@@ -286,10 +420,78 @@ class RemoteDSparkTransport:
         self._send({"kind": "feedback", "round_id": self._round_id, **payload})
         self._round_id += 1
 
+    def send_tensor_rows(
+        self,
+        *,
+        channel: int,
+        tensors: list[torch.Tensor],
+        live_rows: int,
+    ) -> RemoteTensorTransfer:
+        """Push one group of same-row tensors into P-side TPU buffers."""
+        if self.role != "consumer":
+            raise RemoteDraftProtocolError("only the consumer sends feedback tensors")
+        if not tensors:
+            raise ValueError("remote tensor transfer must contain tensors")
+        device = tensors[0].device
+        if any(tensor.device != device for tensor in tensors):
+            raise ValueError("remote tensor layers must reside on one device")
+        contiguous = tuple(tensor.contiguous() for tensor in tensors)
+        transfer = RemoteTensorTransfer.from_tensors(channel, contiguous, live_rows)
+        key = (transfer.channel, transfer.specs)
+        sender = self._tensor_senders.get(key)
+        if sender is None:
+            self._send(
+                {
+                    "kind": "tensor_setup",
+                    "round_id": self._round_id,
+                    "transfer": transfer,
+                }
+            )
+            response = self._recv()
+            if (
+                response.get("kind") != "tensor_setup_ack"
+                or response.get("round_id") != self._round_id
+                or response.get("transfer") != transfer
+            ):
+                raise RemoteDraftProtocolError(
+                    "remote DSpark TPU Sync setup acknowledgement did not match "
+                    f"round {self._round_id} channel {channel}"
+                )
+            peers = response.get("peers")
+            if (
+                not isinstance(peers, list)
+                or not peers
+                or not all(isinstance(peer, str) for peer in peers)
+            ):
+                raise RemoteDraftProtocolError(
+                    "remote DSpark TPU Sync setup returned invalid peers"
+                )
+            sender = _SenderTensorChannel(
+                _new_sender_synchronizer(contiguous, self.rank), peers
+            )
+            self._tensor_senders[key] = sender
+        else:
+            sender.synchronizer.bind_weights([[tensor] for tensor in contiguous])
+        sender.synchronizer.push_weights(sender.peers)
+        return transfer
+
     def recv_feedback(self) -> dict[str, Any]:
         if self.role != "producer":
             raise RemoteDraftProtocolError("only the producer receives feedback")
         message = self._recv_round("feedback")
+        aux_hidden_states = message.get("aux_hidden_states")
+        if isinstance(aux_hidden_states, list) and any(
+            isinstance(tensor, RemoteTensorTransfer) for tensor in aux_hidden_states
+        ):
+            if not all(
+                isinstance(tensor, RemoteTensorTransfer) for tensor in aux_hidden_states
+            ):
+                raise RemoteDraftProtocolError(
+                    "remote DSpark feedback mixed native and pickle tensors"
+                )
+            message["aux_hidden_states"] = [
+                self._receive_tensor_rows(transfer) for transfer in aux_hidden_states
+            ]
         if self.rank == 0:
             logger.info(
                 "Remote DSpark feedback receive: round=%d requests=%d",
@@ -302,6 +504,9 @@ class RemoteDSparkTransport:
 
     def _recv_round(self, kind: str) -> dict[str, Any]:
         message = self._recv()
+        while message.get("kind") == "tensor_setup":
+            self._handle_tensor_setup(message)
+            message = self._recv()
         if message.get("kind") != kind or message.get("round_id") != self._round_id:
             raise RemoteDraftProtocolError(
                 f"remote DSpark rank {self.rank} expected {kind} round "
@@ -309,6 +514,54 @@ class RemoteDSparkTransport:
                 f"{message.get('round_id')}"
             )
         return message
+
+    def _handle_tensor_setup(self, message: dict[str, Any]) -> None:
+        if self.role != "producer":
+            raise RemoteDraftProtocolError(
+                "only the producer receives TPU Sync tensor setup"
+            )
+        transfer = message.get("transfer")
+        if message.get("round_id") != self._round_id or not isinstance(
+            transfer, RemoteTensorTransfer
+        ):
+            raise RemoteDraftProtocolError(
+                f"remote DSpark rank {self.rank} received invalid TPU Sync setup"
+            )
+        key = (transfer.channel, transfer.specs)
+        receiver = self._tensor_receivers.get(key)
+        if receiver is None:
+            tensors = tuple(spec.allocate(self._device) for spec in transfer.specs)
+            synchronizer = _new_receiver_synchronizer(
+                tensors, self.rank, self._producer_host
+            )
+            receiver = _ReceiverTensorChannel(synchronizer, tensors)
+            self._tensor_receivers[key] = receiver
+        endpoints = receiver.synchronizer.get_local_endpoints()
+        peers = [endpoint.get("endpoint") for endpoint in endpoints]
+        if not peers or not all(isinstance(peer, str) for peer in peers):
+            raise RemoteDraftProtocolError(
+                "remote DSpark TPU Sync receiver returned invalid endpoints"
+            )
+        self._send(
+            {
+                "kind": "tensor_setup_ack",
+                "round_id": self._round_id,
+                "transfer": transfer,
+                "peers": peers,
+            }
+        )
+
+    def _receive_tensor_rows(
+        self, transfer: RemoteTensorTransfer
+    ) -> RemoteDeviceTensorRows:
+        key = (transfer.channel, transfer.specs)
+        receiver = self._tensor_receivers.get(key)
+        if receiver is None:
+            raise RemoteDraftProtocolError(
+                "remote DSpark feedback referenced an unknown TPU Sync channel"
+            )
+        receiver.synchronizer.wait_for_transfer_completion()
+        return RemoteDeviceTensorRows(receiver.tensors, transfer.live_rows)
 
     def _send(self, message: dict[str, Any]) -> None:
         payload = pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL)

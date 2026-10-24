@@ -18,9 +18,11 @@ import threading
 import pytest
 import torch
 
+import vllm_torchtpu.spec_decode.remote_dspark as remote_dspark_module
 from vllm_torchtpu.spec_decode.remote_dspark import (
     DraftProposal,
     PackedTensorRows,
+    RemoteDeviceTensorRows,
     RemoteDraftPipeline,
     RemoteDraftProtocolError,
     RemoteDSparkTransport,
@@ -45,6 +47,7 @@ def test_transport_proposal_feedback_round_trip():
                 port=port,
                 rank=0,
                 timeout_s=5,
+                device=torch.device("cpu"),
             )
         )
 
@@ -56,6 +59,7 @@ def test_transport_proposal_feedback_round_trip():
         port=port,
         rank=0,
         timeout_s=5,
+        device=torch.device("cpu"),
     )
     accept_thread.join(timeout=5)
     assert not accept_thread.is_alive()
@@ -105,6 +109,125 @@ def test_packed_tensor_rows_rejects_invalid_live_count():
         PackedTensorRows.from_tensor(tensor, live_rows=3)
 
 
+def test_tpu_sync_feedback_reuses_native_channel(monkeypatch):
+    class _FakeWeightSynchronizer:
+        def __init__(
+            self,
+            tensors: tuple[torch.Tensor, ...],
+            endpoint: str | None = None,
+        ) -> None:
+            self.tensors = tensors
+            self.endpoint = endpoint
+            self.bind_count = 0
+            self.wait_count = 0
+            synchronizers.append(self)
+
+        def bind_weights(self, device_tensors: list[list[torch.Tensor]]) -> None:
+            self.tensors = tuple(layer[0] for layer in device_tensors)
+            self.bind_count += 1
+
+        def push_weights(self, peers: list[str]) -> None:
+            assert len(peers) == 1
+            receiver = receivers[peers[0]]
+            for source, destination in zip(self.tensors, receiver.tensors, strict=True):
+                destination.copy_(source)
+
+        def wait_for_transfer_completion(self, uuid: int | None = None) -> None:
+            assert uuid is None
+            self.wait_count += 1
+
+        def get_local_endpoints(self) -> list[dict[str, str]]:
+            assert self.endpoint is not None
+            return [{"endpoint": self.endpoint}]
+
+    receivers: dict[str, _FakeWeightSynchronizer] = {}
+    synchronizers: list[_FakeWeightSynchronizer] = []
+
+    def new_sender(
+        tensors: tuple[torch.Tensor, ...], rank: int
+    ) -> _FakeWeightSynchronizer:
+        assert rank == 0
+        return _FakeWeightSynchronizer(tensors)
+
+    def new_receiver(
+        tensors: tuple[torch.Tensor, ...], rank: int, bind_ip: str
+    ) -> _FakeWeightSynchronizer:
+        assert rank == 0
+        assert bind_ip == "127.0.0.1"
+        endpoint = f"fake://receiver-{len(receivers)}"
+        receiver = _FakeWeightSynchronizer(tensors, endpoint)
+        receivers[endpoint] = receiver
+        return receiver
+
+    monkeypatch.setattr(remote_dspark_module, "_new_sender_synchronizer", new_sender)
+    monkeypatch.setattr(
+        remote_dspark_module, "_new_receiver_synchronizer", new_receiver
+    )
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    producer: list[RemoteDSparkTransport] = []
+
+    def accept_producer() -> None:
+        producer.append(
+            RemoteDSparkTransport(
+                role="producer",
+                producer_host="127.0.0.1",
+                port=port,
+                rank=0,
+                timeout_s=5,
+                device=torch.device("cpu"),
+            )
+        )
+
+    accept_thread = threading.Thread(target=accept_producer)
+    accept_thread.start()
+    consumer = RemoteDSparkTransport(
+        role="consumer",
+        producer_host="127.0.0.1",
+        port=port,
+        rank=0,
+        timeout_s=5,
+        device=torch.device("cpu"),
+    )
+    accept_thread.join(timeout=5)
+    assert not accept_thread.is_alive()
+
+    def receive_one(feedback: list[dict]) -> None:
+        feedback.append(producer[0].recv_feedback())
+
+    for offset in (0, 100):
+        feedback: list[dict] = []
+        receive_thread = threading.Thread(target=receive_one, args=(feedback,))
+        receive_thread.start()
+        first = torch.arange(24, dtype=torch.bfloat16).reshape(6, 4) + offset
+        second = first + 50
+        transfer = consumer.send_tensor_rows(
+            channel=0,
+            tensors=[first, second],
+            live_rows=2,
+        )
+        consumer.send_feedback(
+            {"request_ids": ["req-a"], "aux_hidden_states": [transfer]}
+        )
+        receive_thread.join(timeout=5)
+        assert not receive_thread.is_alive()
+        received = feedback[0]["aux_hidden_states"][0]
+        assert isinstance(received, RemoteDeviceTensorRows)
+        restored = received.restore_tensors(torch.device("cpu"))
+        torch.testing.assert_close(restored[0], first)
+        torch.testing.assert_close(restored[1], second)
+        assert received.live_rows == 2
+
+    assert len(synchronizers) == 2
+    sender = next(sync for sync in synchronizers if sync.endpoint is None)
+    receiver = next(sync for sync in synchronizers if sync.endpoint is not None)
+    assert sender.bind_count == 1
+    assert receiver.wait_count == 2
+
+
 def test_only_output_rank_owns_remote_proposals():
     assert is_remote_draft_proposal_rank(0, 1)
     assert not is_remote_draft_proposal_rank(1, 1)
@@ -131,6 +254,7 @@ def test_feedback_channel_does_not_require_a_rank_local_proposal():
                 port=port,
                 rank=1,
                 timeout_s=5,
+                device=torch.device("cpu"),
             )
         )
 
@@ -142,6 +266,7 @@ def test_feedback_channel_does_not_require_a_rank_local_proposal():
         port=port,
         rank=1,
         timeout_s=5,
+        device=torch.device("cpu"),
     )
     accept_thread.join(timeout=5)
     assert not accept_thread.is_alive()
@@ -167,6 +292,7 @@ def test_next_proposal_can_abandon_terminal_round_without_feedback():
                 port=port,
                 rank=0,
                 timeout_s=5,
+                device=torch.device("cpu"),
             )
         )
 
@@ -178,6 +304,7 @@ def test_next_proposal_can_abandon_terminal_round_without_feedback():
         port=port,
         rank=0,
         timeout_s=5,
+        device=torch.device("cpu"),
     )
     accept_thread.join(timeout=5)
 
