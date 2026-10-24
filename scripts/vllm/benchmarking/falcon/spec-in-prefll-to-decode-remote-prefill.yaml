@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: pd-spec-pipeline-prefill-20261024-r29-compact-feedback
+name: pd-spec-pipeline-prefill-20261024-r30-compact-buckets
 exp_type: BENCHMARK
 artifact_type: generic
 cluster_name: gke-tpu-train-us-central1-1-prod
@@ -39,6 +39,7 @@ role_to_task_spec:
       K3_DSPARK_PD_INPUT_LEN: "128"
       K3_DSPARK_PD_NUM_PROMPTS: "1"
       K3_DSPARK_PD_WARMUP_PROMPTS: "1"
+      K3_COMPILE_SIZES: "1,8,128"
       MODEL_OVERRIDE: /models/Kimi-K3-pruned75
       MODEL_URI: ""
       DRAFT_MODEL_OVERRIDE: /models/Inferact/Kimi-K3-DSpark-Block5
@@ -69,7 +70,7 @@ role_to_task_spec:
       - name: coord
         type: gcs
         bucket: inference-model-storage-poc-tpu-hns
-        prefix: benchmarks/pd-spec-pipeline/20261024-r29-compact-feedback
+        prefix: benchmarks/pd-spec-pipeline/20261024-r30-compact-buckets
         mount_path: /coord
         mount_options: [implicit-dirs, metadata-cache:ttl-secs:0]
     sources:
@@ -77,5 +78,5 @@ role_to_task_spec:
         type: git
         repo: https://github.com/vllm-project/vllm-torchtpu.git
         ref: hafeng/spec_in_prefll_to_decode
-        commit: 3abafc815
+        commit: 1e102bbf5
         path: /workspace/vllm-torchtpu
