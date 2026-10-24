@@ -123,7 +123,7 @@ class WindowRef(_BufferedRef):
                 is_prev = cfgs.dims.overlap and c * run < cfgs.window // 2
                 for field in range(config.N_FIELDS):
                     src = _state_rows(state_ref, cfgs, page, offset, field, is_prev)
-                    dest = window_u8.at[field, n, pl.ds(c * run, run)]
+                    dest = window_u8.at[field, pl.ds(c * run, run), n]
                     if cfgs.dims.mode == config.Mode.CSA_INDEXER:
                         dest = dest.at[:, 0]
                     pltpu.make_async_copy(src, dest, sem).start()
@@ -546,7 +546,7 @@ def create_allocs_and_specs(
     window_spec = pl.BlockSpec(
         block_shape=cfgs.window_shape(),
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (0, i, 0, 0, 0),
+        index_map=lambda i: (0, 0, i, 0),
     )
     window_alloc = WindowRef.create(
         spec=window_spec,

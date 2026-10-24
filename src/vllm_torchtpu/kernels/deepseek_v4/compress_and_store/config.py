@@ -513,8 +513,12 @@ class Configs:
         return self.tile_sizes.tile_n
 
     def window_shape(self) -> tuple[int, ...]:
-        """f32 window block: (fields, tile, window, head_tiles, lane)."""
-        return (N_FIELDS, self._tile_n, self.window, self.head_tiles, LANE)
+        """f32 window block: (fields, window, tile * head_tiles, lane).
+
+        Window-major, so the softmax over the window combines whole (8, 128)
+        vregs; a (head_tiles, 128) minor tile would leave sublanes empty.
+        """
+        return (N_FIELDS, self.window, self._tile_n * self.head_tiles, LANE)
 
     def window_bytes_shape(self) -> tuple[int, ...]:
         """uint8 view of the window block; each f32 lane -> FP32_BYTES rows.
@@ -527,8 +531,8 @@ class Configs:
         """
         return (
             N_FIELDS,
-            self._tile_n,
             self.window,
+            self._tile_n,
             self.head_tiles,
             FP32_BYTES,
             LANE,

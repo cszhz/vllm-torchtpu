@@ -67,22 +67,25 @@ def inner_kernel(
     pid = pl.program_id(0)
     global_idx = pid * tile_n
 
-    kv_val = window_vmem.at[0][...]  # (tile_n, window, head_tiles, 128)
-    scores_val = window_vmem.at[1][...]  # (tile_n, window, head_tiles, 128)
+    kv_val = window_vmem.at[0][...]  # (window, tile_n * head_tiles, 128)
+    scores_val = window_vmem.at[1][...]  # (window, tile_n * head_tiles, 128)
     rms_weight_tiled = rms_weight_vmem_ref[...].astype(jnp.float32)  # (head_tiles, 128)
 
     # --- windowed softmax ---
     def masked_sum():
-        # Window entries before position 0 are masked out.
-        start = jnp.stack(
-            [positions_ref[global_idx + i] - window + 1 for i in range(tile_n)]
-        )
-        curr_pos = start[:, None] + jnp.arange(window)[None, :]  # (tile_n, window)
-        mask_float = (curr_pos >= 0).astype(scores_val.dtype)
-        mask = mask_float[:, :, None, None] > 0.5  # (tile_n, window, 1, 1)
+        # Window entries before position 0 are masked out. Block row r holds
+        # head tile r % head_tiles of token r // head_tiles.
+        row_shape = kv_val.shape[1:]
+        row_token = jax.lax.broadcasted_iota(jnp.int32, row_shape, 0) // head_tiles
+        start = jnp.zeros(row_shape, jnp.int32)
+        for i in range(tile_n):
+            token_start = positions_ref[global_idx + i] - window + 1
+            start = jnp.where(row_token == i, token_start, start)
+        offset = jax.lax.broadcasted_iota(jnp.int32, kv_val.shape, 0)
+        mask = start[None] + offset >= 0  # (window, tile_n * head_tiles, 128)
         neg_inf = jnp.array(-jnp.inf, dtype=scores_val.dtype)
         return _window_sum(
-            jnp.where(mask, kv_val, 0.0), jnp.where(mask, scores_val, neg_inf), 1
+            jnp.where(mask, kv_val, 0.0), jnp.where(mask, scores_val, neg_inf), 0
         )
 
     # A tile whose real tokens all see a full window needs no mask; padding
@@ -90,8 +93,8 @@ def inner_kernel(
     compressed = jax.lax.cond(
         masked_tiles_ref[pid] != 0,
         masked_sum,
-        lambda: _window_sum(kv_val, scores_val, 1),
-    )  # (tile_n, head_tiles, 128)
+        lambda: _window_sum(kv_val, scores_val, 0),
+    ).reshape(tile_n, head_tiles, 128)
 
     # --- rms norm ---
     variance = jnp.mean(jnp.square(compressed), axis=(1, 2), keepdims=True)
