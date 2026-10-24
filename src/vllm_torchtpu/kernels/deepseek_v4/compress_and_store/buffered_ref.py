@@ -151,6 +151,23 @@ def _floor_mod(x, d: int):
     return x % d
 
 
+def _wait_tokens(buf, sem, count, tile_n: int):
+    """Waits for `count` per-token DMAs of `buf[n]` each, all signalling `sem`.
+
+    The semaphore counts bytes, so `count` is waited for as the sum of its
+    power-of-two parts, one predicated wait each, instead of one per token.
+    """
+    part = 1 << (tile_n.bit_length() - 1)
+    while part:
+
+        @pl.when((count & part) != 0)
+        def _wait(part=part):
+            rows = buf.at[pl.ds(0, part)]
+            pltpu.make_async_copy(rows, rows, sem).wait()
+
+        part >>= 1
+
+
 def _window_bytes(window_ref, cfgs: config.Configs):
     """uint8 view of one f32 window block (each f32 lane -> 4 byte rows)."""
     return window_ref.bitcast(jnp.uint8).reshape(cfgs.window_bytes_shape())
@@ -278,7 +295,7 @@ class OutputRef(_BufferedRef):
                     dest = cache_ref.at[p, s_row, :, :]
                     pltpu.make_async_copy(src, dest, sem).start()
         else:
-            cache_ref, kv_slot_mapping_ref = dest_ref
+            cache_ref, kv_slot_mapping_ref, _ = dest_ref
 
             # HCA: [num_pages, kv_block_size * 2, 4, 128] uint8
             # CSA: [num_pages, kv_block_size, 4, 128] uint8
@@ -330,22 +347,9 @@ class OutputRef(_BufferedRef):
                         sem,
                     ).wait()
         else:
-            _, kv_slot_mapping_ref = dest_ref
-
-            @pl.loop(0, tile_n, unroll=True)
-            def loop_body(n):
-                idx_n = global_idx + n
-                kv_slot = kv_slot_mapping_ref[idx_n]
-
-                @pl.when(kv_slot >= 0)
-                def _wait_nope():
-                    @pl.loop(0, self.cfgs.record_rows, unroll=True)
-                    def wait_loop(o):
-                        pltpu.make_async_copy(
-                            vmem_ref.at[n, o, :, :],
-                            vmem_ref.at[n, o, :, :],
-                            sem,
-                        ).wait()
+            _, _, dma_counts_ref = dest_ref
+            # copy_out wrote one record per token with a valid slot.
+            _wait_tokens(vmem_ref, sem, dma_counts_ref[2 * pid], tile_n)
 
 
 @jax.tree_util.register_dataclass
@@ -362,7 +366,7 @@ class RoPEInputRef(_BufferedRef):
     def copy_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
-        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref = src_ref
+        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref, _ = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         dest_ref = cast(jax.Ref, self.window_ref.at[slot])
@@ -396,25 +400,10 @@ class RoPEInputRef(_BufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         pid = grid_indices[0]
-
-        tile_n = self.cfgs.tile_sizes.tile_n
-        global_idx = pid * tile_n
-        _, kv_slot_mapping_ref, is_first_mask_ref = src_ref
-
-        @pl.loop(0, tile_n, unroll=True)
-        def loop_body(n):
-            idx_n = global_idx + n
-            kv_slot = kv_slot_mapping_ref[idx_n]
-            is_first = is_first_mask_ref[idx_n]
-            valid = kv_slot >= 0
-
-            @pl.when(valid & is_first)
-            def _wait_rope():
-                pltpu.make_async_copy(
-                    vmem_ref.at[n, :, :],
-                    vmem_ref.at[n, :, :],
-                    sem,
-                ).wait()
+        *_, dma_counts_ref = src_ref
+        _wait_tokens(
+            vmem_ref, sem, dma_counts_ref[2 * pid + 1], self.cfgs.tile_sizes.tile_n
+        )
 
 
 @jax.tree_util.register_dataclass
@@ -426,7 +415,7 @@ class RoPEOutputRef(_BufferedRef):
     def copy_out(self, dest_ref, grid_indices):
         assert self.sem_sends is not None
         assert self.window_ref is not None
-        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
+        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref, _ = dest_ref
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
 
@@ -459,26 +448,10 @@ class RoPEOutputRef(_BufferedRef):
         sem = self.sem_sends.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         pid = grid_indices[0]
-
-        tile_n = self.cfgs.tile_sizes.tile_n
-        global_idx = pid * tile_n
-
-        _, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
-
-        @pl.loop(0, tile_n, unroll=True)
-        def loop_body(n):
-            idx_n = global_idx + n
-            kv_slot = kv_slot_mapping_ref[idx_n]
-            is_first = is_first_mask_ref[idx_n]
-            valid = kv_slot >= 0
-
-            @pl.when(valid & is_first)
-            def _wait_rope():
-                pltpu.make_async_copy(
-                    vmem_ref.at[n, :, :],
-                    vmem_ref.at[n, :, :],
-                    sem,
-                ).wait()
+        *_, dma_counts_ref = dest_ref
+        _wait_tokens(
+            vmem_ref, sem, dma_counts_ref[2 * pid + 1], self.cfgs.tile_sizes.tile_n
+        )
 
 
 def create_allocs_and_specs(
@@ -493,6 +466,7 @@ def create_allocs_and_specs(
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
+    dma_counts_ref,
 ) -> tuple[
     tuple[
         CosSinRef | None,
@@ -566,7 +540,7 @@ def create_allocs_and_specs(
     if is_indexer and not cfgs.dims.seq_along_lane:
         output_args = (cache_ref, kv_slot_mapping_ref, is_first_mask_ref)
     else:
-        output_args = (cache_ref, kv_slot_mapping_ref)
+        output_args = (cache_ref, kv_slot_mapping_ref, dma_counts_ref)
 
     # window
     window_spec = pl.BlockSpec(
@@ -610,7 +584,12 @@ def create_allocs_and_specs(
             use_lookahead=False,
             cfgs=cfgs,
         )
-        rope_args = (rope_cache_ref, kv_slot_mapping_ref, is_first_mask_rope_ref)
+        rope_args = (
+            rope_cache_ref,
+            kv_slot_mapping_ref,
+            is_first_mask_rope_ref,
+            dma_counts_ref,
+        )
     else:
         rope_in_alloc = rope_out_alloc = rope_spec = rope_args = None
 

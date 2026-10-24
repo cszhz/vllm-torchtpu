@@ -213,6 +213,7 @@ def kernel_fn(
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
+    dma_counts_ref,
     grid_size_ref,
     rms_weight_ref,
     # HBM inputs (dynamic access)
@@ -254,6 +255,7 @@ def kernel_fn(
         kv_slot_mapping_ref=kv_slot_mapping_ref,
         is_first_mask_ref=is_first_mask_ref,
         is_first_mask_rope_ref=is_first_mask_rope_ref,
+        dma_counts_ref=dma_counts_ref,
     )
     records_t_ref = sal_scratch[0] if cfgs.dims.seq_along_lane else None
 
@@ -305,6 +307,18 @@ def kernel_fn(
             sems.at[1],
             wave=rmw_ref.shape[0],
         )
+
+
+def _tile_dma_counts(kv_slot_mapping, is_first_mask_rope, cfgs):
+    """Per grid step: [record DMAs, RoPE row DMAs], as `buffered_ref` issues them.
+
+    Lets a step wait for its per-token DMAs by count (`_wait_tokens`).
+    """
+    if cfgs.dims.seq_along_lane:
+        return jnp.zeros((1,), jnp.int32)  # SAL issues no per-token DMAs.
+    valid = (kv_slot_mapping >= 0).reshape(-1, cfgs.tile_sizes.tile_n)
+    rope = valid & is_first_mask_rope.reshape(valid.shape)
+    return jnp.stack([valid.sum(1), rope.sum(1)], 1).astype(jnp.int32).reshape(-1)
 
 
 def _window_runs(positions, token_to_req_indices, block_table, stride, cfgs):
@@ -490,6 +504,7 @@ def compress_norm_rope_store(
             # TODO: this is confusing, should probably find a better name for it
             pack_factor=cfgs.hbm_pack,
         )
+    dma_counts = _tile_dma_counts(kv_slot_mapping, is_first_mask_rope, cfgs)
     window_runs = _window_runs(
         positions, token_to_req_indices, block_table, block_table_stride, cfgs
     )
@@ -502,6 +517,7 @@ def compress_norm_rope_store(
         kv_slot_mapping,
         is_first_mask,
         is_first_mask_rope,
+        dma_counts,
         grid_size,
     )
     cos_sin_operand = cos_sin_cache if cfgs.dims.has_rope else None
