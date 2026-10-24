@@ -184,6 +184,7 @@ from vllm_torchtpu.spec_decode.remote_dspark import (
     RemoteDSparkTransport,
     RemoteTensorTransfer,
     is_remote_draft_proposal_rank,
+    is_remote_dspark_prefill_request,
 )
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
@@ -4412,7 +4413,16 @@ class TPUModelRunner(GPUModelRunner):
             and drafts is not None
         ):
             assert transport is not None
-            transport.send_proposal(drafts.req_ids, drafts.draft_token_ids)
+            remote_rows = [
+                (request_id, token_ids)
+                for request_id, token_ids in zip(
+                    drafts.req_ids, drafts.draft_token_ids, strict=True
+                )
+                if not is_remote_dspark_prefill_request(request_id)
+            ]
+            if remote_rows:
+                request_ids, token_ids = zip(*remote_rows, strict=True)
+                transport.send_proposal(list(request_ids), list(token_ids))
         return drafts
 
     def _send_remote_dspark_feedback(

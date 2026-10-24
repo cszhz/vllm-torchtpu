@@ -14,11 +14,19 @@
 # limitations under the License.
 
 # shellcheck source=/dev/null
-source "$(dirname "${BASH_SOURCE[0]}")/kimi-k3-pruned75-dspark-tp8-ep.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/kimi-k3-pruned75-dspark-tp8-ep-1p1d.sh"
 
 case "${K3_DSPARK_PD_ROLE:-}" in
-    prefill) export VLLM_TPU_REMOTE_DSPARK_ROLE=producer ;;
-    decode) export VLLM_TPU_REMOTE_DSPARK_ROLE=consumer ;;
+    prefill)
+        export VLLM_TPU_REMOTE_DSPARK_ROLE=producer
+        export TPU_RAIDEN_JOB_NAME=spec-in-prefll-to-decode-remote-prefill
+        export TPU_RAIDEN_ENGINE_ID=spec-in-prefll-to-decode-remote-prefill-engine
+        ;;
+    decode)
+        export VLLM_TPU_REMOTE_DSPARK_ROLE=consumer
+        export TPU_RAIDEN_JOB_NAME=spec-in-prefll-to-decode-remote-decode
+        export TPU_RAIDEN_ENGINE_ID=spec-in-prefll-to-decode-remote-decode-engine
+        ;;
     *)
         echo "ERROR: K3_DSPARK_PD_ROLE must be prefill or decode" >&2
         return 1

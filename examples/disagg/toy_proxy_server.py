@@ -34,6 +34,12 @@ from starlette.background import BackgroundTask
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+_REMOTE_DSPARK_PREFILL_SUFFIX = ".remote-dspark-prefill"
+
+
+def _remote_dspark_prefill_request_id(request_id: str) -> str:
+    return f"{request_id}{_REMOTE_DSPARK_PREFILL_SUFFIX}"
+
 
 class _ProxyLatencyTracker:
     """Small running latency summary for the proxy path."""
@@ -597,6 +603,10 @@ async def send_request_to_prefill(
     # Must overwrite these for prefill workers.
     req_data["stream"] = False
     req_data["max_tokens"] = 1
+    req_data["kv_transfer_params"] = {
+        "do_remote_decode": True,
+        "do_remote_prefill": False,
+    }
     if "max_completion_tokens" in req_data:
         req_data["max_completion_tokens"] = 1
     if "stream_options" in req_data:
@@ -623,6 +633,10 @@ async def send_shadow_request_to_prefill(
     """Run the P-side remote-draft lifecycle without exposing its response."""
     shadow_data = req_data.copy()
     shadow_data["stream"] = False
+    shadow_data["kv_transfer_params"] = {
+        "do_remote_decode": False,
+        "do_remote_prefill": False,
+    }
     shadow_data.pop("stream_options", None)
     headers = {
         "Content-Type": "application/json",
@@ -763,6 +777,14 @@ async def _handle_completions(api: str, request: Request):
             flush=True,
         )
         if remote_dspark:
+            response = await send_request_to_prefill(
+                prefill_client_info,
+                api,
+                req_data,
+                _remote_dspark_prefill_request_id(request_id),
+                forwarded,
+            )
+            response_json = response.json()
             remote_draft_bypass = await request.app.state.remote_draft_barrier.wait()
             shadow_task = asyncio.create_task(
                 send_shadow_request_to_prefill(
@@ -772,7 +794,6 @@ async def _handle_completions(api: str, request: Request):
             await asyncio.sleep(
                 _env_float("VLLM_TPU_REMOTE_DSPARK_ADMISSION_DELAY_S", 0.05)
             )
-            response_json = {}
         else:
             response = await send_request_to_prefill(
                 prefill_client_info, api, req_data, request_id, forwarded

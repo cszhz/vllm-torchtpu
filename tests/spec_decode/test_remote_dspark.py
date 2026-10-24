@@ -29,7 +29,13 @@ from vllm_torchtpu.spec_decode.remote_dspark import (
     RequestPhase,
     VerifyFeedback,
     is_remote_draft_proposal_rank,
+    is_remote_dspark_prefill_request,
 )
+
+
+def test_remote_dspark_prefill_request_marker() -> None:
+    assert is_remote_dspark_prefill_request("request.remote-dspark-prefill")
+    assert not is_remote_dspark_prefill_request("request")
 
 
 def test_transport_proposal_feedback_round_trip():

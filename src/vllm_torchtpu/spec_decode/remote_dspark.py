@@ -33,6 +33,12 @@ logger = init_logger(__name__)
 
 _FRAME_HEADER = struct.Struct("!Q")
 _MAX_FRAME_BYTES = 1 << 30
+_REMOTE_DSPARK_PREFILL_SUFFIX = ".remote-dspark-prefill"
+
+
+def is_remote_dspark_prefill_request(request_id: str) -> bool:
+    """Return whether this is the short, Target-KV-producing P request."""
+    return request_id.endswith(_REMOTE_DSPARK_PREFILL_SUFFIX)
 
 
 def is_remote_draft_proposal_rank(rank: int, pipeline_parallel_size: int) -> bool:
