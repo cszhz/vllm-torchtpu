@@ -434,3 +434,60 @@ def test_ab_aot_guard_toggle(monkeypatch):
     assert t3_host.maybe_skip_aot_guards(keep) is False
     t3_host.ab_toggle_aot_guards(keep)
     assert keep.aot_compiled_fn._guard_check_enabled is True
+
+
+# --- VLLM_TPU_T3_CONN_STATS_EVERY ------------------------------------------
+
+
+def _get_finished(monkeypatch, every, samples=((), ())):
+    from vllm_torchtpu.runner import tpu_runner as tr
+
+    calls = {"stats": 0}
+
+    class Conn:
+        def get_transfer_results(self, finished):
+            return types.SimpleNamespace(
+                finished_sending=set(), finished_recving=set(), failed_recving=set()
+            )
+
+        def get_block_ids_with_load_errors(self):
+            return set()
+
+        def build_connector_worker_meta(self):
+            return None
+
+        def get_kv_connector_stats(self):
+            calls["stats"] += 1
+            return {"n": calls["stats"]}
+
+        def clear_connector_metadata(self):
+            pass
+
+    conn = Conn()
+    monkeypatch.setattr(tr, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(tr, "get_kv_transfer_group", lambda: conn)
+    monkeypatch.setattr(t3_host, "CONN_STATS_EVERY", every)
+    monkeypatch.setattr(t3_host, "AB_PERIOD_MS", 0.0)
+    runner = types.SimpleNamespace(
+        _stage_timing=types.SimpleNamespace(take_samples=lambda: samples),
+        kv_cache_config=types.SimpleNamespace(kv_cache_groups=[1]),
+    )
+    so = types.SimpleNamespace(finished_req_ids=set())
+    outs = [tr.TPUModelRunner.get_finished_kv_transfers(runner, so)[6] for _ in range(8)]
+    return outs, calls["stats"]
+
+
+def test_conn_stats_every_step_by_default(monkeypatch):
+    outs, n = _get_finished(monkeypatch, 1)
+    assert n == 8 and all(o is not None for o in outs)
+
+
+def test_conn_stats_throttled(monkeypatch):
+    outs, n = _get_finished(monkeypatch, 4)
+    assert n == 2
+    assert [o is not None for o in outs] == [False, False, False, True] * 2
+
+
+def test_conn_stats_polled_when_runner_timings_pending(monkeypatch):
+    outs, n = _get_finished(monkeypatch, 4, samples=([1.0], []))
+    assert n == 8 and all(o is not None for o in outs)

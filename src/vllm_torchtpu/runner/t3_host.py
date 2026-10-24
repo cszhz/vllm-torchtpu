@@ -45,6 +45,17 @@ def _flag(name: str) -> bool:
 
 AOT_SKIP_GUARDS = _flag("VLLM_TPU_T3_AOT_SKIP_GUARDS")
 
+# VLLM_TPU_T3_CONN_STATS_EVERY=N: poll the KV connector's stats every N decode
+# steps instead of every step (default 1 = every step; 16 under
+# VLLM_TPU_T3_HOST=1 unless set explicitly).
+CONN_STATS_EVERY = int(
+    os.environ.get(
+        "VLLM_TPU_T3_CONN_STATS_EVERY",
+        "16" if _flag("VLLM_TPU_T3_CONN_STATS") else "1",
+    )
+    or 1
+)
+
 # VLLM_TPU_T3_AB_PERIOD_MS=N (default 0 = off): in-process A/B. The trims that
 # consult ab_on() are active only in even wall-clock windows of N ms and off
 # in odd ones; every process on a host sees the same phase. Timers record
