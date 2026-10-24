@@ -95,9 +95,10 @@ class CosSinRef(_BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PageBufferRef(_BufferedRef):
-    # VMEM block: cfgs.page_buffer_shape()
-    #   (tile_n, pages_to_buffer_per_token, page_size, hbm_pack, LANE) uint8
+class WindowRef(_BufferedRef):
+    # VMEM block: cfgs.window_shape() f32, written through its uint8 view
+    # cfgs.window_bytes_shape(): every token's window of state rows, DMA'd
+    # straight from HBM into the layout the body computes on.
 
     def copy_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
@@ -106,35 +107,77 @@ class PageBufferRef(_BufferedRef):
         sem = self.sem_recvs.at[slot]
         pid = grid_indices[0]
 
-        state_cache_ref, token_pages_ref = src_ref
+        state_ref, positions_ref, token_pages_ref = src_ref
+        cfgs = self.cfgs
+        tile_n = cfgs.tile_sizes.tile_n
+        window = cfgs.window
+        block_size = cfgs.state_block_size
+        pages = cfgs.pages_to_buffer_per_token
+        run = cfgs.window_run
+        window_u8 = _window_bytes(self.window_ref.at[slot], cfgs)
 
-        tile_n = self.cfgs.tile_sizes.tile_n
-        pages_to_buffer_per_token = self.cfgs.pages_to_buffer_per_token
-
-        page_buffer_ref = cast(jax.Ref, self.window_ref.at[slot])
-        global_idx = pid * tile_n
-
-        @pl.loop(0, tile_n * pages_to_buffer_per_token, unroll=True)
-        def loop_body(idx):
-            n = idx // pages_to_buffer_per_token
-            p = idx % pages_to_buffer_per_token
-            idx_n = global_idx + n
-
-            # compress_norm_rope_store looks up each token's window pages,
-            # oldest first.
-            page = token_pages_ref[idx_n * pages_to_buffer_per_token + p]
-
-            src = state_cache_ref.at[page, :, :, :]
-            dest = page_buffer_ref.at[n, p, :, :, :]
-            pltpu.make_async_copy(src, dest, sem).start()
+        for n in range(tile_n):
+            idx = jnp.minimum(pid * tile_n + n, cfgs.dims.size_n - 1)
+            pos = positions_ref[idx]
+            start = pos - window + 1
+            block_curr = _floor_div(pos, block_size)
+            for c in range(window // run):
+                run_start = start + c * run
+                block = _floor_div(run_start, block_size)
+                # Same page as the per-position lookup of the old gather; the
+                # clamps only matter for padding tokens, whose output is dropped.
+                p = jnp.clip(block - block_curr + pages - 1, 0, pages - 1)
+                page = token_pages_ref[idx * pages + p]
+                offset = jnp.minimum(run_start - block * block_size, block_size - run)
+                is_prev = cfgs.dims.overlap and c * run < window // 2
+                for field in range(config.N_FIELDS):
+                    src = _state_rows(state_ref, cfgs, page, offset, field, is_prev)
+                    dest = window_u8.at[field, n, pl.ds(c * run, run)]
+                    if cfgs.dims.mode == config.Mode.CSA_INDEXER:
+                        dest = dest.at[:, 0]
+                    pltpu.make_async_copy(src, dest, sem).start()
 
     def wait_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        pltpu.make_async_copy(vmem_ref, vmem_ref, sem).wait()
+        window_u8 = _window_bytes(self.window_ref.at[slot], self.cfgs)
+        pltpu.make_async_copy(window_u8, window_u8, sem).wait()
+
+
+def _floor_div(x, d: int):
+    """`x // d` for a static `d`; a shift when `d` is a power of two."""
+    if d & (d - 1) == 0:
+        return jax.lax.shift_right_arithmetic(x, jnp.int32(d.bit_length() - 1))
+    return x // d
+
+
+def _window_bytes(window_ref, cfgs: config.Configs):
+    """uint8 view of one f32 window block (each f32 lane -> 4 byte rows)."""
+    return window_ref.bitcast(jnp.uint8).reshape(cfgs.window_bytes_shape())
+
+
+def _state_rows(state_ref, cfgs: config.Configs, page, offset, field, is_prev):
+    """HBM rows of `field` for `window_run` consecutive states from `offset`.
+
+    Mirrors where `proj_and_save_state` puts a state: HCA/CSA keep one field
+    (half) per `head_tiles` rows, [kv_prev, kv_curr, score_prev, score_curr]
+    when overlapping; the indexer keeps kv and score as one row each, with the
+    prev/curr halves in lanes 0:128 / 128:256.
+    """
+    run, rows = cfgs.window_run, cfgs.state_rows_per_token
+    states = state_ref.at[page, pl.ds(offset * rows, run * rows)]
+    states = states.reshape(run, rows, *state_ref.shape[2:])
+    if cfgs.dims.mode == config.Mode.CSA_INDEXER:
+        lane = 0 if is_prev or not cfgs.dims.overlap else config.LANE
+        return states.at[:, field, :, pl.ds(lane, config.LANE)]
+    field_rows = cfgs.field_rows
+    if cfgs.dims.overlap:
+        row = (2 * field + int(not is_prev)) * field_rows
+    else:
+        row = field * field_rows
+    return states.at[:, pl.ds(row, cfgs.head_tiles)]
 
 
 @jax.tree_util.register_dataclass
@@ -439,7 +482,7 @@ def create_allocs_and_specs(
     is_first_mask_ref,
     is_first_mask_rope_ref,
 ) -> tuple[
-    tuple[CosSinRef | None, OutputRef, PageBufferRef, RoPEOutputRef | None],
+    tuple[CosSinRef | None, OutputRef, WindowRef, RoPEOutputRef | None],
     tuple[pl.BlockSpec | None, pl.BlockSpec, pl.BlockSpec, pl.BlockSpec | None],
     tuple[
         tuple[Any, ...] | None,
@@ -500,22 +543,23 @@ def create_allocs_and_specs(
     else:
         output_args = (cache_ref, kv_slot_mapping_ref)
 
-    # page_buffer
-    page_buffer_spec = pl.BlockSpec(
-        block_shape=cfgs.page_buffer_shape(),
+    # window
+    window_spec = pl.BlockSpec(
+        block_shape=cfgs.window_shape(),
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0, 0, 0),
+        index_map=lambda i: (0, i, 0, 0, 0),
     )
-    page_buffer_alloc = PageBufferRef.create(
-        spec=page_buffer_spec,
-        dtype_or_type=jnp.uint8,
+    window_alloc = WindowRef.create(
+        spec=window_spec,
+        dtype_or_type=jnp.float32,
         buffer_type=pltpu.BufferType.INPUT,
         buffer_count=2,
         use_lookahead=False,
         cfgs=cfgs,
     )
-    page_buffer_args = (
+    window_args = (
         cache_ref if state_cache_ref is None else state_cache_ref,
+        positions_ref,
         token_pages_ref,
     )
 
@@ -539,7 +583,7 @@ def create_allocs_and_specs(
         rope_alloc = rope_spec = rope_args = None
 
     return (
-        (cos_sin_alloc, output_alloc, page_buffer_alloc, rope_alloc),
-        (cos_sin_spec, output_spec, page_buffer_spec, rope_spec),
-        (cos_sin_args, output_args, page_buffer_args, rope_args),
+        (cos_sin_alloc, output_alloc, window_alloc, rope_alloc),
+        (cos_sin_spec, output_spec, window_spec, rope_spec),
+        (cos_sin_args, output_args, window_args, rope_args),
     )
