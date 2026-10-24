@@ -3837,7 +3837,7 @@ class TPUModelRunner(GPUModelRunner):
                 logger.info(
                     "Remote DSpark producer applying feedback: valid_tokens=%s",
                     [
-                        int((tokens >= 0).sum().item())
+                        int((tokens.tensor >= 0).sum().item())
                         for tokens in remote_feedback["next_tokens_per_chunk"]
                     ],
                 )
