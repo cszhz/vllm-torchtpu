@@ -23,6 +23,7 @@ from .pool_manifest import (
     TAG_GDN_CONV,
     TAG_GDN_SSM,
     TAG_MLA_NOPE,
+    TAG_MLA_ROPE,
     PoolManifest,
 )
 from .tags import class_tag
