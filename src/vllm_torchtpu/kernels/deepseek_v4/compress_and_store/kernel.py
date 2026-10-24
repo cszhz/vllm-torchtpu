@@ -55,6 +55,7 @@ def inner_kernel(
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
+    masked_tiles_ref,
     records_t_ref=None,
     *,
     cfgs: config.Configs,
@@ -66,28 +67,31 @@ def inner_kernel(
     pid = pl.program_id(0)
     global_idx = pid * tile_n
 
-    # Per-token window start = position - window + 1
-    start_list = []
-    for i in range(tile_n):
-        idx = global_idx + i
-        safe_idx = jax.lax.select(idx < cfgs.dims.size_n, idx, 0)
-        start_list.append(positions_ref[safe_idx] - window + 1)
-    start = jnp.stack(start_list)  # (tile_n,)
-
     kv_val = window_vmem.at[0][...]  # (tile_n, window, head_tiles, 128)
     scores_val = window_vmem.at[1][...]  # (tile_n, window, head_tiles, 128)
     rms_weight_tiled = rms_weight_vmem_ref[...].astype(jnp.float32)  # (head_tiles, 128)
 
     # --- windowed softmax ---
-    curr_pos = start[:, None] + jnp.arange(window)[None, :]  # (tile_n, window)
-    mask = curr_pos >= 0  # (tile_n, window)
-    mask_float = mask.astype(scores_val.dtype)
-    mask_float_reshaped = mask_float[:, :, None, None]  # (tile_n, window, 1, 1)
-    neg_inf = jnp.array(-jnp.inf, dtype=scores_val.dtype)
-    masked_scores = jnp.where(mask_float_reshaped > 0.5, scores_val, neg_inf)
-    weights = jax.nn.softmax(masked_scores, axis=1)
-    kv_val = jnp.where(mask_float_reshaped > 0.5, kv_val, 0.0)
-    compressed = jnp.sum(weights * kv_val, axis=1)  # (tile_n, head_tiles, 128)
+    def masked_sum():
+        # Window entries before position 0 are masked out.
+        start = jnp.stack(
+            [positions_ref[global_idx + i] - window + 1 for i in range(tile_n)]
+        )
+        curr_pos = start[:, None] + jnp.arange(window)[None, :]  # (tile_n, window)
+        mask_float = (curr_pos >= 0).astype(scores_val.dtype)
+        mask = mask_float[:, :, None, None] > 0.5  # (tile_n, window, 1, 1)
+        neg_inf = jnp.array(-jnp.inf, dtype=scores_val.dtype)
+        return _window_sum(
+            jnp.where(mask, kv_val, 0.0), jnp.where(mask, scores_val, neg_inf), 1
+        )
+
+    # A tile whose real tokens all see a full window needs no mask; padding
+    # tokens' results are never stored.
+    compressed = jax.lax.cond(
+        masked_tiles_ref[pid] != 0,
+        masked_sum,
+        lambda: _window_sum(kv_val, scores_val, 1),
+    )  # (tile_n, head_tiles, 128)
 
     # --- rms norm ---
     variance = jnp.mean(jnp.square(compressed), axis=(1, 2), keepdims=True)
@@ -200,6 +204,12 @@ def inner_kernel(
         ).reshape(tile_n, cfgs.record_rows, cfgs.hbm_pack, 128)
 
 
+def _window_sum(kv, scores, axis: int):
+    """Softmax(scores)-weighted sum of kv over the window `axis`."""
+    weights = jax.nn.softmax(scores, axis=axis)
+    return jnp.sum(weights * kv, axis=axis)
+
+
 def _merge_group(n: int) -> slice:
     """The `MERGE_GROUP` tokens of the step whose rows token `n` merges."""
     start = n // MERGE_GROUP * MERGE_GROUP
@@ -214,6 +224,7 @@ def kernel_fn(
     is_first_mask_ref,
     is_first_mask_rope_ref,
     dma_counts_ref,
+    masked_tiles_ref,
     grid_size_ref,
     rms_weight_ref,
     # HBM inputs (dynamic access)
@@ -276,6 +287,7 @@ def kernel_fn(
                 kv_slot_mapping_ref,
                 is_first_mask_ref,
                 is_first_mask_rope_ref,
+                masked_tiles_ref,
             )
             + ((records_t_ref,) if records_t_ref is not None else ()),
             allocations=allocations,
@@ -319,6 +331,12 @@ def _tile_dma_counts(kv_slot_mapping, is_first_mask_rope, cfgs):
     valid = (kv_slot_mapping >= 0).reshape(-1, cfgs.tile_sizes.tile_n)
     rope = valid & is_first_mask_rope.reshape(valid.shape)
     return jnp.stack([valid.sum(1), rope.sum(1)], 1).astype(jnp.int32).reshape(-1)
+
+
+def _masked_tiles(positions, kv_slot_mapping, cfgs):
+    """Per grid step: whether a real token's window reaches before position 0."""
+    short = (kv_slot_mapping >= 0) & (positions < cfgs.window - 1)
+    return jnp.any(short.reshape(-1, cfgs.tile_sizes.tile_n), axis=1).astype(jnp.int32)
 
 
 def _window_runs(positions, token_to_req_indices, block_table, stride, cfgs):
@@ -518,6 +536,7 @@ def compress_norm_rope_store(
         is_first_mask,
         is_first_mask_rope,
         dma_counts,
+        _masked_tiles(positions, kv_slot_mapping, cfgs),
         grid_size,
     )
     cos_sin_operand = cos_sin_cache if cfgs.dims.has_rope else None
