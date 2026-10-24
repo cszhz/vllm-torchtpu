@@ -80,3 +80,10 @@ def test_off_never_carries_and_never_records(reload_with):
     res = types.SimpleNamespace()
     dc.tag_results(res)
     assert not hasattr(res, "_decode_carry_seq")
+
+
+def test_enabled_follows_the_switch(reload_with):
+    reload_with()
+    assert ffc.enabled() is False
+    reload_with(VLLM_TPU_FAST_FORWARD_CONTEXT="1")
+    assert ffc.enabled() is True
