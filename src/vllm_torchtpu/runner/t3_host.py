@@ -404,3 +404,61 @@ def on_step() -> None:
                 "VLLM_TPU_T3 step knobs: switch_us=%s gc=%s (pid %d)",
                 SWITCH_US, GC_MODE or "default", os.getpid(),
             )
+
+
+# ---------------------------------------------------------------------------
+# VLLM_TPU_T3_MTP_MEMO=1 (default: the master switch): memoize the MTP
+# megakernel step-0 eligibility decision (Eagle3Proposer._use_mtp_mk_step0)
+# on everything it reads: request count, the chunk's query_start_loc prefix,
+# the token count, the position override, and the step-0 attention metadata's
+# shapes (seq_lens, query_start_loc, block_tables numel). A hit replays the
+# same decision and still counts it in the megakernel's step mix.
+# ---------------------------------------------------------------------------
+
+MTP_DECISION_MEMO = _flag("VLLM_TPU_T3_MTP_MEMO")
+
+
+def _mtp_key(mk: Any, chunk: Any, attn_metadata: Any, num_tokens: int, num_reqs: int, qsl: Any):
+    if qsl is None or getattr(chunk.attn_ctx, "position_ids_override", None) is not None:
+        return None
+    md = attn_metadata.get(mk.layer_name) if isinstance(attn_metadata, dict) else None
+    if md is None:
+        return None
+    try:
+        return (
+            num_reqs,
+            int(num_tokens),
+            tuple(qsl[: num_reqs + 1].tolist()),
+            tuple(md.seq_lens.shape),
+            tuple(md.query_start_loc.shape),
+            int(md.block_tables.numel()),
+            bool(getattr(mk, "bound", False)),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def mtp_step0_memo_get(owner: Any, mk: Any, chunk: Any, attn_metadata: Any, num_tokens: int, num_reqs: int, qsl: Any):
+    if not ab_on():
+        return None
+    memo = owner.__dict__.get("_t3_mtp_memo")
+    if not memo:
+        return None
+    key = _mtp_key(mk, chunk, attn_metadata, num_tokens, num_reqs, qsl)
+    if key is None:
+        return None
+    hit = memo.get(key)
+    if hit is None:
+        return None
+    ok, note_key = hit
+    mk.note_step(note_key, ok)
+    return ok
+
+
+def mtp_step0_memo_put(owner: Any, mk: Any, chunk: Any, attn_metadata: Any, num_tokens: int, num_reqs: int, qsl: Any, ok: bool) -> None:
+    key = _mtp_key(mk, chunk, attn_metadata, num_tokens, num_reqs, qsl)
+    if key is None:
+        return
+    memo = owner.__dict__.setdefault("_t3_mtp_memo", {})
+    if len(memo) < 256:
+        memo[key] = (bool(ok), f"s0_n{int(num_tokens)}")

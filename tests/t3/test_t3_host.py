@@ -562,3 +562,99 @@ def test_timers_extra_spec(timers_on, monkeypatch):
     t3_host.install_runner_timers(cls)
     assert K().m(3) == 6 and mod.f(1) == 2
     assert "x.K.m" in t3_host._aggs and "x.f" in t3_host._aggs
+
+
+# --- VLLM_TPU_T3_MTP_MEMO / VLLM_TPU_T3_CARRY_FAST ---------------------------
+
+import numpy as np  # noqa: E402
+
+
+class _MD:
+    def __init__(self, n_seqs, bt_numel):
+        self.seq_lens = torch.zeros(n_seqs)
+        self.query_start_loc = torch.zeros(n_seqs + 1)
+        self.block_tables = torch.zeros(bt_numel)
+
+
+class _MK:
+    layer_name = "L"
+    bound = True
+
+    def __init__(self):
+        self.notes = []
+        self.calls = 0
+
+    def note_step(self, key, run):
+        self.notes.append((key, run))
+        return run
+
+    def use_for_step(self, attn_metadata, num_rows, *, step0):
+        self.calls += 1
+        md = attn_metadata["L"]
+        ok = num_rows <= 8 and md.block_tables.numel() % md.seq_lens.shape[0] == 0
+        return self.note_step(f"s0_n{num_rows}", ok)
+
+
+def _chunk(qsl, override=None):
+    return types.SimpleNamespace(
+        num_reqs=len(qsl) - 1, query_start_loc_np=np.asarray(qsl),
+        attn_ctx=types.SimpleNamespace(position_ids_override=override))
+
+
+def _decide(owner, mk, chunk, md, n):
+    """Mirror of Eagle3Proposer._use_mtp_mk_step0 with the memo hooks."""
+    num_reqs = chunk.num_reqs
+    qsl = chunk.query_start_loc_np
+    if t3_host.MTP_DECISION_MEMO:
+        hit = t3_host.mtp_step0_memo_get(owner, mk, chunk, md, n, num_reqs, qsl)
+        if hit is not None:
+            return hit
+    ok = mk.use_for_step(md, n, step0=True)
+    if t3_host.MTP_DECISION_MEMO:
+        t3_host.mtp_step0_memo_put(owner, mk, chunk, md, n, num_reqs, qsl, ok)
+    return ok
+
+
+def test_mtp_memo_replays_decision_and_counts(monkeypatch):
+    monkeypatch.setattr(t3_host, "MTP_DECISION_MEMO", True)
+    monkeypatch.setattr(t3_host, "AB_PERIOD_MS", 0.0)
+    owner, mk = types.SimpleNamespace(), _MK()
+    md = {"L": _MD(1, 64)}
+    c = _chunk([0, 4])
+    assert [_decide(owner, mk, c, md, 4) for _ in range(5)] == [True] * 5
+    assert mk.calls == 1 and len(mk.notes) == 5
+    assert mk.notes[-1] == ("s0_n4", True)
+    # Any input of the decision changing misses the memo and recomputes.
+    assert _decide(owner, mk, c, md, 16) is False and mk.calls == 2
+    assert _decide(owner, mk, c, {"L": _MD(1, 63)}, 4) is True and mk.calls == 3
+    assert _decide(owner, mk, c, {"L": _MD(2, 63)}, 4) is False and mk.calls == 4
+    assert _decide(owner, mk, _chunk([0, 4], override=object()), md, 4) is True
+    assert mk.calls == 5  # position override: never memoized
+    assert _decide(owner, mk, _chunk([0, 4, 8]), {"L": _MD(2, 64)}, 8) is True
+    assert mk.calls == 6
+
+
+def test_mtp_memo_off(monkeypatch):
+    monkeypatch.setattr(t3_host, "MTP_DECISION_MEMO", False)
+    owner, mk = types.SimpleNamespace(), _MK()
+    md = {"L": _MD(1, 64)}
+    for _ in range(3):
+        _decide(owner, mk, _chunk([0, 4]), md, 4)
+    assert mk.calls == 3
+
+
+def test_carry_fast_positions_match(monkeypatch):
+    from vllm_torchtpu.runner import decode_carry as dc
+
+    buf = torch.arange(3 * 16, dtype=torch.int64).reshape(3, 16)
+    runner = types.SimpleNamespace(uses_mrope=True, mrope_positions=types.SimpleNamespace(cpu=buf))
+    monkeypatch.setattr(dc, "_T3_FAST", False)
+    ref = dc._host_positions(runner, 5)
+    monkeypatch.setattr(dc, "_T3_FAST", True)
+    fast = dc._host_positions(runner, 5)
+    assert fast.dtype == ref.dtype == np.int64 and np.array_equal(fast, ref)
+    buf[1, 2] = 999  # the cached view sees in-place updates
+    assert dc._host_positions(runner, 5)[1, 2] == 999
+    new = torch.zeros(3, 16, dtype=torch.int64)
+    runner.mrope_positions.cpu = new  # a replaced buffer refreshes the view
+    assert dc._host_positions(runner, 5).sum() == 0
