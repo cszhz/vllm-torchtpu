@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock
+import os
+from unittest.mock import MagicMock, patch
 
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
@@ -521,6 +522,120 @@ class TestAttentionMetadataBuilderPlumbing:
 
         builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
         assert source.call_count == 1  # build() did not read it again
+
+    @patch.dict(os.environ, {"VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "1"})
+    def test_unchanged_tables_skip_repacking(self):
+        """With no BlockTable mutation since the last walk and the same walk
+        geometry, staging reuses the previous upload without reading the CPU
+        tables; a mutation or a different window re-packs."""
+        from vllm_torchtpu.layers.core import attention_metadata as am
+
+        runner = self._make_runner_mock(num_groups=2)
+        runner._block_table_stage_cpu = None
+        builders = [
+            self._make_builder(runner, kv_cache_group_id=gid) for gid in range(2)
+        ]
+        self._make_attn_groups(runner, builders)
+
+        def ctx(num_reqs=2):
+            c = AttentionMetadataBuilderContext(
+                num_reqs=num_reqs,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones((4,), dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            )
+            runner._attn_metadata_builder_ctx = c
+            return c
+
+        source = runner.input_batch.block_table[0].get_cpu_tensor
+        c1 = ctx()
+        stage_block_table_uploads(runner, c1, 4)
+        calls = source.call_count
+        c2 = ctx()
+        stage_block_table_uploads(runner, c2, 4)
+        assert source.call_count == calls  # reused, not re-packed
+        for gid in (0, 1):
+            assert torch.equal(
+                c1.staged_block_tables[gid], c2.staged_block_tables[gid]
+            )
+
+        am._BLOCK_TABLE_VERSION[0] += 1  # any BlockTable mutation
+        stage_block_table_uploads(runner, ctx(), 4)
+        assert source.call_count == calls + 1
+
+        stage_block_table_uploads(runner, ctx(num_reqs=1), 4)  # new window
+        assert source.call_count == calls + 2
+
+    @patch.dict(os.environ, {"VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "1"})
+    def test_reused_upload_reuses_tables_and_rederives_mamba_indices(self):
+        """A reused upload keeps the previous walk's table outputs but must
+        re-derive the mamba indices from the new seq_lens."""
+        window = 3
+        runner = self._make_runner_mock(num_groups=3, max_num_blocks_per_req=6)
+        runner._unified_kv_layout = True
+        runner._block_table_stage_cpu = None
+        attn = self._make_builder(runner, kv_cache_group_id=0)
+        mambas = [
+            self._make_mamba_builder(runner, kv_cache_group_id=gid) for gid in (1, 2)
+        ]
+        self._make_attn_groups(runner, [attn] + mambas)
+
+        def walk(seq_lens, staged):
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=4,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+                mamba_ckpt_window=window,
+                unified_mamba_state_indices=[],
+            )
+            runner._attn_metadata_builder_ctx = ctx
+            if staged:
+                stage_block_table_uploads(runner, ctx, 4)
+            metas = [
+                b.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
+                for b in [attn] + mambas
+            ]
+            return ctx, metas
+
+        ctx1, _ = walk([0, 17, 33, 33], staged=True)
+        ctx2, metas2 = walk([0, 18, 49, 33], staged=True)  # 49 crosses a block
+        assert ctx2.staged_block_tables is ctx1.staged_block_tables
+        _, plain = walk([0, 18, 49, 33], staged=False)
+        for a, b in zip(metas2, plain):
+            assert torch.equal(a.block_tables, b.block_tables)
+            if b.mamba_state_indices is not None:
+                assert torch.equal(a.mamba_state_indices, b.mamba_state_indices)
+                assert torch.equal(a.mamba_ckpt_indices, b.mamba_ckpt_indices)
+
+    def test_block_table_mutations_bump_the_version(self):
+        import numpy as np
+        from types import SimpleNamespace
+
+        from vllm.v1.worker.block_table import BlockTable
+
+        from vllm_torchtpu.layers.core import attention_metadata as am
+
+        bt = SimpleNamespace(
+            num_blocks_per_row=np.array([2, 0], dtype=np.int32),
+            block_table=SimpleNamespace(np=np.ones((2, 4), dtype=np.int32)),
+            use_hybrid_blocks=False,
+        )
+        v = am._BLOCK_TABLE_VERSION[0]
+        BlockTable.append_row(bt, [], 0)  # no blocks: contents unchanged
+        assert am._BLOCK_TABLE_VERSION[0] == v
+        BlockTable.append_row(bt, [7], 1)
+        assert am._BLOCK_TABLE_VERSION[0] > v
+        v = am._BLOCK_TABLE_VERSION[0]
+        BlockTable.move_row(bt, 1, 0)
+        assert am._BLOCK_TABLE_VERSION[0] > v
+        v = am._BLOCK_TABLE_VERSION[0]
+        BlockTable.clear_row(bt, 0)
+        assert am._BLOCK_TABLE_VERSION[0] > v
 
     def test_staging_respects_gid_subset_and_dummy_override(self):
         runner = self._make_runner_mock(num_groups=2)
