@@ -407,6 +407,8 @@ def inner_kernel(
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
+    gm_id: jax.Array | None = None,
+    single_k_step: bool = False,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -423,12 +425,16 @@ def inner_kernel(
         tiled_out_ref: Contains value out[m_start:m_end, n_start:n_end]
         partial_out_ref: Contains last size_lhs_sublane rows of the previous output.
             Will be initialized to zero if this is first tile for grid[n_id, :, :].
-        acc_ref: Reference to the accumulator.
+        acc_ref: Reference to the accumulator. Unused when single_k_step.
         metadata_ref: Reference to the metadata.
         cfgs: GmmConfigs.
+        gm_id: The gm tile index, for callers whose grid has no gm axis 1.
+        single_k_step: The whole contraction is one step, so only the
+            first-and-last-k-step body is emitted.
     """
 
-    gm_id = pl.program_id(1)
+    if gm_id is None:
+        gm_id = pl.program_id(1)
     m_start = metadata_ref.gm_id_to_m_offset[gm_id]
     m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
     m_offset = m_start - m_start % cfgs.dims.size_lhs_sublane
@@ -474,7 +480,7 @@ def inner_kernel(
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
 
-                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
+                acc_n = jnp.zeros((bucket_m, col_size), dtype=cfgs.acc_dtype)
                 for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
                     end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
 
@@ -482,14 +488,14 @@ def inner_kernel(
                         tiled_lhs[:, start_k:end_k],
                         tiled_rhs[start_k:end_k, start_n:end_n],
                         preferred_element_type=jnp.float32,
-                    ).astype(acc_ref.dtype)
+                    ).astype(cfgs.acc_dtype)
 
                     if cfgs.rhs_cfgs.should_dequantize_after_matmul:
                         b_id = start_k // rhs_qbs
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m
                         )[b_id, :, start_n : start_n + col_size]
-                        block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
+                        block_acc *= rhs_scale_replicated.astype(cfgs.acc_dtype)
 
                     acc_n += block_acc
                 acc_list.append(acc_n)
@@ -515,7 +521,7 @@ def inner_kernel(
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
 
-                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
+                acc_n = jnp.zeros((bucket_m, col_size), dtype=cfgs.acc_dtype)
                 for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
 
@@ -545,9 +551,9 @@ def inner_kernel(
                         block_lhs_q,
                         block_rhs,
                         preferred_element_type=preferred_element_type,
-                    ).astype(acc_ref.dtype)
+                    ).astype(cfgs.acc_dtype)
 
-                    block_acc *= block_scale.astype(acc_ref.dtype)
+                    block_acc *= block_scale.astype(cfgs.acc_dtype)
 
                     # Apply rhs subchannel scale per quant block.
                     if cfgs.rhs_cfgs.should_dequantize_after_matmul:
@@ -555,7 +561,7 @@ def inner_kernel(
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m
                         )[b_id, :, start_n : start_n + col_size]
-                        block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
+                        block_acc *= rhs_scale_replicated.astype(cfgs.acc_dtype)
 
                     acc_n += block_acc
                 acc_list.append(acc_n)
@@ -630,6 +636,10 @@ def inner_kernel(
         @jax.named_scope(f"bm{bucket_m}_last")
         def matmul_last():
             _matmul(is_first_k_step=False, is_last_k_step=True, bucket_m=bucket_m)
+
+        if single_k_step:
+            matmul_first_last()
+            return
 
         num_k = pl.num_programs(2)
         k_id = pl.program_id(2)
