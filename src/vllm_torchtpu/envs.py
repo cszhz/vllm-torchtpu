@@ -78,12 +78,17 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
     VLLM_TPU_QSA_RING_SELECT: bool = False
     VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
+    VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
+    VLLM_TPU_QSA_BF16_REDUCE_PRECISION: bool = False
+    VLLM_TPU_QSA_INDEXER_HOIST_META: bool = False
+    VLLM_TPU_QSA_INDEXER_MIXED_ONLY: bool = False
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -103,6 +108,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
+    MOE_ADAPTIVE_2D_CHANNEL_SCALES: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -454,6 +460,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
+    # Hand the pooled GDN kernel a load-time float32 copy of the conv weight
+    # in its `[kernel_size, 1, dim]` order. Otherwise every GDN layer swaps
+    # and casts the bf16 `[dim, 1, kernel_size]` weight on every forward.
+    "VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR": env_bool("VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR"),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.
@@ -490,6 +500,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # power of two <= N that divides the request rows.
     "VLLM_TPU_QSA_RING_DMA_BATCH": env_nonnegative_int(
         "VLLM_TPU_QSA_RING_DMA_BATCH", 0
+    ),
+    # Qwen4-exp QSA: round to BF16 with lax.reduce_precision instead of the
+    # integer bit trick. Same RNE; the boundary stays observable to XLA and
+    # fuses into neighbouring ops instead of running as its own fusion.
+    "VLLM_TPU_QSA_BF16_REDUCE_PRECISION": env_bool(
+        "VLLM_TPU_QSA_BF16_REDUCE_PRECISION", default=False
+    ),
+    # Qwen4-exp QSA indexer: build StreamIndex's step-level metadata (and the
+    # pass schedules of decode / verify calls) outside the early-exit cond, so
+    # XLA computes them once per step instead of once per QSA layer.
+    "VLLM_TPU_QSA_INDEXER_HOIST_META": env_bool(
+        "VLLM_TPU_QSA_INDEXER_HOIST_META", default=False
+    ),
+    # Qwen4-exp QSA indexer on decode / verify steps: score every request in the
+    # mixed pass and drop the two one-token decode passes (empty on verify
+    # steps). Bypasses VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK on one-token steps.
+    "VLLM_TPU_QSA_INDEXER_MIXED_ONLY": env_bool(
+        "VLLM_TPU_QSA_INDEXER_MIXED_ONLY", default=False
     ),
     # Qwen4-exp QSA decode/verify attention: run the decode rows (and the
     # decode prefix of mixed steps) on the fused sparse GQA decode kernel
@@ -864,6 +892,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ascending device-id order, so the SparseCore gather gets its
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
+    # Give the adaptive fused MoE per-channel weight scales [E, N] buffers of
+    # their own at load time. Squeezing the GMM [E, 1, 1, N] scales in the hot
+    # path relayouts both scales of every MoE layer on every forward.
+    "MOE_ADAPTIVE_2D_CHANNEL_SCALES": env_bool("MOE_ADAPTIVE_2D_CHANNEL_SCALES"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the

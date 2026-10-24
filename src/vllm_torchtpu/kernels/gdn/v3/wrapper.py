@@ -356,6 +356,7 @@ def outer_kernel(
         "d_v",
         "kernel_size",
         "num_spec_tokens",
+        "conv_weight_kmajor",
         "decode_tile_size",
         "mixed_tile_size",
         "batched_only",
@@ -394,6 +395,7 @@ def fused_conv1d_gdn(
     state_source: jax.Array | None = None,
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
+    conv_weight_kmajor: bool = False,
     batched_only: bool = False,
     prefill_only: bool = False,
     zero_initialize_out: bool = True,
@@ -532,7 +534,12 @@ def fused_conv1d_gdn(
 
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape[0], qkv.shape[-1]
-    assert conv_weight.shape == (dim, 1, kernel_size)
+    if conv_weight_kmajor:
+        # Already float32 in the kernel's [kernel_size, 1, dim] order.
+        assert conv_weight.shape == (kernel_size, 1, dim)
+        assert conv_weight.dtype == jnp.float32
+    else:
+        assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
     assert query_start_loc.shape == (num_seqs + 1,)
@@ -644,7 +651,8 @@ def fused_conv1d_gdn(
     if not pooled:
         conv_state_shape = cast(jax.Array, conv_state).shape
         conv_state = cast(jax.Array, conv_state).reshape(-1, kernel_size - 1, 1, dim)
-    conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
+    if not conv_weight_kmajor:
+        conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
 
     # Step 4: Wrap inputs for the kernel.
