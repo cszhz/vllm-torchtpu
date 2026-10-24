@@ -81,6 +81,24 @@ def test_packed_tensor_rows_round_trip():
     )
 
 
+def test_packed_tensor_rows_bundles_layers_behind_one_transfer():
+    first = torch.arange(24, dtype=torch.bfloat16).reshape(6, 4)
+    second = first + 100
+
+    packed = PackedTensorRows.from_tensors([first, second], live_rows=2)
+
+    assert packed.tensor.shape == (2, 2, 4)
+    assert packed.transferred_bytes == 32
+    assert packed.padded_bytes == 96
+    restored = packed.restore_tensors(torch.device("cpu"))
+    assert len(restored) == 2
+    torch.testing.assert_close(restored[0][:2], first[:2])
+    torch.testing.assert_close(restored[1][:2], second[:2])
+    padding = torch.zeros((4, 4), dtype=torch.bfloat16)
+    torch.testing.assert_close(restored[0][2:], padding)
+    torch.testing.assert_close(restored[1][2:], padding)
+
+
 def test_packed_tensor_rows_rejects_invalid_live_count():
     tensor = torch.zeros((2, 4))
     with pytest.raises(ValueError, match="outside"):

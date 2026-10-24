@@ -4132,15 +4132,11 @@ class TPUModelRunner(GPUModelRunner):
                             "producer batch"
                         )
                     packed_aux = feedback_chunks[chunk_index]
-                    if not all(
-                        isinstance(tensor, PackedTensorRows) for tensor in packed_aux
-                    ):
+                    if not isinstance(packed_aux, PackedTensorRows):
                         raise RuntimeError(
-                            "remote DSpark aux hidden states must use packed rows"
+                            "remote DSpark aux hidden states must use a packed bundle"
                         )
-                    aux_hidden_states = [
-                        tensor.restore(self.device) for tensor in packed_aux
-                    ]
+                    aux_hidden_states = packed_aux.restore_tensors(self.device)
                     hidden_states = torch.empty(
                         (num_tokens_padded, 1),
                         dtype=aux_hidden_states[0].dtype,
@@ -4421,7 +4417,7 @@ class TPUModelRunner(GPUModelRunner):
     ) -> None:
         transport = self._remote_dspark_transport
         assert transport is not None
-        aux_hidden_states: list[list[PackedTensorRows]] = []
+        aux_hidden_states: list[PackedTensorRows] = []
         for chunk in draft_chunks:
             aux = chunk.aux_hidden_states
             tensors = list(aux) if isinstance(aux, (list, tuple)) else [aux]
@@ -4433,21 +4429,16 @@ class TPUModelRunner(GPUModelRunner):
                 )
             live_tokens = int(chunk.query_start_loc_np[-1])
             aux_hidden_states.append(
-                [
-                    PackedTensorRows.from_tensor(tensor, live_tokens)
-                    for tensor in cast(list[torch.Tensor], tensors)
-                ]
+                PackedTensorRows.from_tensors(
+                    cast(list[torch.Tensor], tensors), live_tokens
+                )
             )
         packed_next_tokens = [
             PackedTensorRows.from_tensor(tensor, chunk.num_reqs)
             for tensor, chunk in zip(next_tokens_per_chunk, draft_chunks, strict=True)
         ]
         if self._profiler_rank == 0:
-            packed_tensors = [
-                tensor
-                for chunk_tensors in aux_hidden_states
-                for tensor in chunk_tensors
-            ] + packed_next_tokens
+            packed_tensors = aux_hidden_states + packed_next_tokens
             logger.info(
                 "Remote DSpark feedback compacted: transferred_bytes=%d "
                 "padded_bytes=%d",

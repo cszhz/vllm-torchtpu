@@ -77,6 +77,22 @@ class PackedTensorRows:
         host_tensor = tensor.detach().cpu()
         return cls(host_tensor[:live_rows].clone(), tensor.shape[0])
 
+    @classmethod
+    def from_tensors(
+        cls, tensors: list[torch.Tensor], live_rows: int
+    ) -> PackedTensorRows:
+        """Pack same-shaped tensors behind one device-to-host transfer."""
+        if not tensors:
+            raise ValueError("remote tensor bundle must not be empty")
+        first = tensors[0]
+        signature = (first.shape, first.dtype, first.device)
+        if any(
+            (tensor.shape, tensor.dtype, tensor.device) != signature
+            for tensor in tensors[1:]
+        ):
+            raise ValueError("remote tensor bundle members must have one signature")
+        return cls.from_tensor(torch.stack(tensors, dim=1), live_rows)
+
     @property
     def transferred_bytes(self) -> int:
         return self.tensor.numel() * self.tensor.element_size()
@@ -99,6 +115,12 @@ class PackedTensorRows:
             )
             tensor = torch.cat((tensor, padding), dim=0)
         return tensor.to(device, non_blocking=True)
+
+    def restore_tensors(self, device: torch.device) -> list[torch.Tensor]:
+        """Restore one transfer and expose its layer dimension as views."""
+        if self.tensor.ndim < 2:
+            raise ValueError("remote tensor bundle has no layer dimension")
+        return list(self.restore(device).unbind(dim=1))
 
 
 class RemoteDSparkTransport:
