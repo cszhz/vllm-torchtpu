@@ -22,6 +22,7 @@
 MODEL="${MODEL_OVERRIDE:-mgoin/Kimi-K3-pruned75}"
 DRAFT_MODEL="${DRAFT_MODEL_OVERRIDE:-Inferact/Kimi-K3-DSpark}"
 DSPARK_NUM_SPECULATIVE_TOKENS="${DSPARK_NUM_SPECULATIVE_TOKENS:-7}"
+K3_COMPILE_SIZES="${K3_COMPILE_SIZES:-1,8,16,32,64,1024}"
 # `${VAR-default}` intentionally preserves an explicit empty value. Falcon
 # mounts the same GCS prefix locally and sets MODEL_OVERRIDE to that path,
 # while CI uses this URI with the RunAI streamer.
@@ -56,6 +57,6 @@ _loader_args=""
 if [ -n "$MODEL_URI" ]; then
     _loader_args='--model-loader-extra-config {"memory_limit":17179869184}'
 fi
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} ${_loader_args} --block-size 256 --compilation-config {\"compile_sizes\":[1,8,16,32,64,1024]} --speculative-config {\"method\":\"dspark\",\"model\":\"${DRAFT_MODEL}\",\"num_speculative_tokens\":${DSPARK_NUM_SPECULATIVE_TOKENS},\"draft_tensor_parallel_size\":8,\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"standard\"}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} ${_loader_args} --block-size 256 --compilation-config {\"compile_sizes\":[${K3_COMPILE_SIZES}]} --speculative-config {\"method\":\"dspark\",\"model\":\"${DRAFT_MODEL}\",\"num_speculative_tokens\":${DSPARK_NUM_SPECULATIVE_TOKENS},\"draft_tensor_parallel_size\":8,\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"standard\"}"
 
 EVAL_TOLERANCE="0.025"
