@@ -103,6 +103,10 @@ def _union(c, bq):
         ([(130, 0)], 16, 64),  # everything visible, -1 padded rows
         ([(2048, 22528)], 16, 64),  # kv_len 6144 (multiple of 16), own block picked
         ([(7, 9000), (1024, 250000)], 16, 64),  # kv_len 62.7k, near s_cap
+        # sparse prefix of 70 rows (a deep seq past s_cap in front): 70 % 16 = 6,
+        # the regression behind the served SparseCore halt (page ids unwritten
+        # for rows the sparse batches round up to)
+        ([(70, 300000), (954, 22000)], 16, 64),
     ],
 )
 def test_union_matches_sparse(seqs, heads, bq):

@@ -857,8 +857,19 @@ def sparse_ragged_paged_attention(
             swa_m,
         )
 
-    # Rows past an explicit bound are never gathered, so skip their page ids.
+    # Rows past an explicit bound are never gathered, so skip their page ids --
+    # but the attention batches below round the bound up (to a multiple of the
+    # kernel batch, within its gather chunk) and gather those rows too, so the
+    # page ids must cover whole chunks. A bound at the batch/8-row granularity
+    # left page ids unwritten for gathered rows: wild gather addresses.
     page_ids_bound = num_valid_tokens
+    if page_ids_bound is not None:
+        page_ids_bound = jnp.minimum(
+            q.shape[0],
+            (page_ids_bound + gather_and_attention_chunk_size - 1)
+            // gather_and_attention_chunk_size
+            * gather_and_attention_chunk_size,
+        )
     if num_valid_tokens is None:
         num_valid_tokens = cu_q_lens[distribution[2]]
     tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
