@@ -103,10 +103,18 @@ class DeepseekV4MoE(nn.Module):
                 hidden_act=config.hidden_act,
                 swiglu_limit=self.swiglu_limit,
                 quant_config=quant_config,
-                reduce_results=False,
-                is_sequence_parallel=self.is_sequence_parallel,
                 prefix=f"{prefix}.shared_experts",
+                is_sequence_parallel=self.is_sequence_parallel,
+                # The served recipe's source patch keys on the literal
+                # reduce_results=False followed by a comma (it would add a second
+                # is_sequence_parallel); keep this the call's last argument.
+                reduce_results=False
             )
+            if self.is_sequence_parallel:
+                # The same recipe patch scales a replicated shared expert by
+                # 1/tp so that a TP reduction of identical copies sums to one;
+                # under sequence parallelism nothing reduces it.
+                object.__setattr__(self.shared_experts, "_tp_scale", 1.0)
 
         self.tp_rank = get_tensor_model_parallel_rank()
         assert config.n_routed_experts % self.tp_size == 0
