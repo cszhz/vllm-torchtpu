@@ -243,10 +243,20 @@ PY
         python3 - "$verification_path" "$expected_verifications" <<'PY'
 import json
 import sys
+import time
 
 path, expected = sys.argv[1], int(sys.argv[2])
-with open(path) as verification_file:
-    records = [json.loads(line) for line in verification_file if line.strip()]
+deadline = time.monotonic() + 60
+records = []
+while time.monotonic() < deadline:
+    try:
+        with open(path) as verification_file:
+            records = [json.loads(line) for line in verification_file if line.strip()]
+    except FileNotFoundError:
+        records = []
+    if len(records) >= expected:
+        break
+    time.sleep(0.1)
 if len(records) != expected:
     raise RuntimeError(
         f"remote DSpark recorded {len(records)} verifications; expected {expected}"

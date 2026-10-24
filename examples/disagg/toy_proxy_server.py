@@ -816,8 +816,9 @@ async def _handle_completions(api: str, request: Request):
         logger.debug("Using %s %s", prefill_client_info, decode_client_info)
 
         # Stream response from decode service
+        decode_chunks = []
+
         async def generate_stream():
-            decode_chunks = []
             try:
                 t_decode_send = time.time()
                 t_decode_send_perf = time.perf_counter()
@@ -850,30 +851,31 @@ async def _handle_completions(api: str, request: Request):
                     yield chunk
             finally:
                 release_decode()
-                try:
-                    if shadow_task is not None:
-                        try:
-                            shadow_response = await shadow_task
-                            shadow_response.raise_for_status()
-                            shadow_text = _completion_text(
-                                shadow_response.content, False
-                            )
-                            decode_text = _completion_text(
-                                b"".join(decode_chunks), bool(req_data.get("stream"))
-                            )
-                            _record_remote_draft_verification(
-                                request_id,
-                                shadow_text=shadow_text,
-                                decode_text=decode_text,
-                            )
-                        except Exception as error:
-                            _record_remote_draft_verification(
-                                request_id,
-                                error=error,
-                            )
-                finally:
-                    if remote_draft_bypass:
-                        await request.app.state.remote_draft_barrier.complete_bypass()
+
+        async def finalize_response() -> None:
+            release_decode()
+            try:
+                if shadow_task is not None:
+                    try:
+                        shadow_response = await shadow_task
+                        shadow_response.raise_for_status()
+                        shadow_text = _completion_text(shadow_response.content, False)
+                        decode_text = _completion_text(
+                            b"".join(decode_chunks), bool(req_data.get("stream"))
+                        )
+                        _record_remote_draft_verification(
+                            request_id,
+                            shadow_text=shadow_text,
+                            decode_text=decode_text,
+                        )
+                    except Exception as error:
+                        _record_remote_draft_verification(
+                            request_id,
+                            error=error,
+                        )
+            finally:
+                if remote_draft_bypass:
+                    await request.app.state.remote_draft_barrier.complete_bypass()
 
         # text/event-stream when the caller asked for a stream, which is what
         # the decode instance is actually sending back. Declared as
@@ -887,7 +889,7 @@ async def _handle_completions(api: str, request: Request):
         return StreamingResponse(
             generate_stream(),
             media_type=media_type,
-            background=BackgroundTask(release_decode),
+            background=BackgroundTask(finalize_response),
         )
 
     except Exception as e:
