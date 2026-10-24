@@ -23,7 +23,12 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
-from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    get_packing_factor,
+    gmm_v2,
+    gmm_v2_fused,
+    plan_fusion,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -184,6 +189,16 @@ def quantize_to_native_fp4_kmajor(
     return packed, scale
 
 
+def _is_fp4_weight(rhs: jax.Array) -> bool:
+    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
+    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
+    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
+    return (
+        jnp.issubdtype(rhs.dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+    )
+
+
 def gmm_wrapper(
     lhs,
     rhs,
@@ -196,13 +211,7 @@ def gmm_wrapper(
     preferred_element_type=None,
     rhs_quant_dtype=None,
 ):
-    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
-    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
-    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (
-        jnp.issubdtype(rhs.dtype, jnp.floating)
-        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
-    )
+    is_fp4_weight = _is_fp4_weight(rhs)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -408,6 +417,82 @@ def prepare_routed_gmm_inputs(
     )
 
 
+def _expert_gmms(
+    x,
+    w1,
+    w1_scale,
+    w1_bias,
+    w2,
+    w2_scale,
+    w2_bias,
+    group_sizes,
+    group_offset,
+    *,
+    activation: str,
+    rhs_quant_dtype: jnp.dtype | None,
+) -> jax.Array:
+    """gmm2(act(gmm1(x))): one fused call at prefill sizes, else two gmm_v2."""
+    maybe_quantize_lhs = not _is_fp4_weight(w1)
+    vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    plan = None
+    if maybe_quantize_lhs == (not _is_fp4_weight(w2)):
+        plan = plan_fusion(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            w2,
+            w2_scale,
+            w2_bias,
+            group_sizes,
+            group_offset,
+            fuse_act=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            out_dtype=x.dtype,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+    if plan is not None:
+        return gmm_v2_fused(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            w2,
+            w2_scale,
+            w2_bias,
+            group_sizes,
+            group_offset,
+            plan,
+            vmem_limit_bytes,
+        )
+
+    gmm1_res = gmm_wrapper(
+        x,
+        w1,
+        w1_scale,
+        w1_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        fuse_act=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+    return gmm_wrapper(
+        gmm1_res,
+        w2,
+        w2_scale,
+        w2_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        preferred_element_type=x.dtype,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -438,34 +523,22 @@ def moe_gmm(
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    gmm1_res = gmm_wrapper(
+    gmm2_res = _expert_gmms(
         x,
         w1,
         w1_scale,
         w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        fuse_act=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
-
-    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
-    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
-
-    gmm2_res = gmm_wrapper(
-        gmm1_res,
         w2,
         w2_scale,
         w2_bias,
         group_sizes,
         group_offset,
-        zero_initialize=False,
-        preferred_element_type=x.dtype,
+        activation=activation,
         rhs_quant_dtype=rhs_quant_dtype,
     )
+    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
+    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
+
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     use_local_ragged_combine = (
