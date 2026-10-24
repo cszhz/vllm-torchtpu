@@ -5240,9 +5240,6 @@ class TPUModelRunner(GPUModelRunner):
         if self._is_dspark_pd_producer and not state.remote_next_tokens_per_chunk:
             assert isinstance(self.drafter, DFlashProposer)
             self.drafter.prepare_prefill_handoff()
-            # Context projections are deferred TPU graphs. A hardware-only
-            # barrier does not materialize their writes before Raiden reads.
-            synchronize_tensors()
 
         if self._remote_dspark_role == "producer" and request_seq_lens:
             self._remote_dspark_awaiting_feedback = True
@@ -5272,7 +5269,18 @@ class TPUModelRunner(GPUModelRunner):
         # writes no KV. The wait above also proves the previous forward
         # finished, so a store deferred behind it can be handed to raiden in
         # this step rather than the next.
+        if self._remote_dspark_role == "producer" and request_seq_lens:
+            logger.info(
+                "Remote DSpark Raiden save wait start: rank=%d requests=%d",
+                self._profiler_rank,
+                len(request_seq_lens),
+            )
         self.maybe_wait_for_kv_save()
+        if self._remote_dspark_role == "producer" and request_seq_lens:
+            logger.info(
+                "Remote DSpark Raiden save wait complete: rank=%d",
+                self._profiler_rank,
+            )
         (
             finished_sending,
             finished_recving,

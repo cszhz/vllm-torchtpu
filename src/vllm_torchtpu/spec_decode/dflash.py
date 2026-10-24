@@ -518,7 +518,7 @@ class DFlashProposer:
             draft_md_list.append(md)
         return tuple(draft_md_list)
 
-    def _update_draft_kv_cache_from_target(self, chunk) -> None:
+    def _update_draft_kv_cache_from_target(self, chunk) -> list[torch.Tensor]:
         """
         Projects the target model's hidden states into the draft model's KV cache.
 
@@ -528,7 +528,7 @@ class DFlashProposer:
         into the draft KV cache.
         """
         if chunk.aux_hidden_states is None:
-            return
+            return []
 
         target_hidden = chunk.aux_hidden_states
         aux_hidden = (
@@ -547,21 +547,29 @@ class DFlashProposer:
         with set_vllm_model_wrapper_context(
             mesh=self.runner.mesh, vllm_config=self.vllm_config
         ):
-            self._tpu_precompute_and_update_kv_cache(
+            outputs = self._tpu_precompute_and_update_kv_cache(
                 target_hidden, positions, draft_md_tuple
             )
+        if isinstance(outputs, torch.Tensor):
+            return [outputs]
+        return list(outputs)
 
-    def _update_context_kv(self, chunks: list[DraftChunkInputs]) -> int:
+    def _update_context_kv(
+        self, chunks: list[DraftChunkInputs]
+    ) -> tuple[int, list[torch.Tensor]]:
         """Update all context chunks before any draft forward (DP lockstep)."""
         with self._profile_stage("draft_context_update"):
             extra_chunks = 0
+            outputs = []
             if self._dp_lockstep_sharded():
                 extra_chunks = max(0, self.runner._dp_step_num_chunks - len(chunks))
             for chunk in chunks:
-                self._update_draft_kv_cache_from_target(chunk)
+                chunk_outputs = self._update_draft_kv_cache_from_target(chunk)
+                if chunk_outputs:
+                    outputs.extend(chunk_outputs)
             for _ in range(extra_chunks):
                 self._dp_dummy_kv_update()
-        return extra_chunks
+        return extra_chunks, outputs
 
     @contextlib.contextmanager
     def _profile_stage(self, name: str) -> Iterator[None]:
@@ -592,7 +600,21 @@ class DFlashProposer:
                 raise RuntimeError(
                     "PD context update requires target aux hidden states."
                 )
-        self._update_context_kv(chunks)
+        _, outputs = self._update_context_kv(chunks)
+        if not outputs:
+            raise RuntimeError("PD context update produced no materialization roots.")
+        logger.info(
+            "DSpark PD prefill context materialization start: rank=%d chunks=%d "
+            "outputs=%d",
+            self.runner._profiler_rank,
+            len(chunks),
+            len(outputs),
+        )
+        synchronize_tensors(outputs)
+        logger.info(
+            "DSpark PD prefill context materialization complete: rank=%d",
+            self.runner._profiler_rank,
+        )
 
     @torch.no_grad()
     def propose(
@@ -635,7 +657,7 @@ class DFlashProposer:
         # ALL KV updates before ALL draft forwards, so the padding must
         # follow the same phase structure (never interleave per chunk).
         # 1. Hoist all KV cache updates across chunks to the top of propose
-        extra_chunks = self._update_context_kv(chunks)
+        extra_chunks, _ = self._update_context_kv(chunks)
 
         # 2. Process each chunk
         with self._profile_stage("draft_generate"):

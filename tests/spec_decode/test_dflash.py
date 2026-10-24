@@ -840,6 +840,21 @@ def test_propose_marks_padding_for_draft_rows():
     ]
 
 
+def test_prepare_prefill_handoff_materializes_context_outputs(monkeypatch):
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner._profiler_rank = 3
+    proposer.draft_chunks = [SimpleNamespace(aux_hidden_states=[torch.zeros((1, 2))])]
+    outputs = [torch.zeros((1, 2)), torch.zeros((1, 2))]
+    proposer._update_context_kv = mock.MagicMock(return_value=(0, outputs))
+    synchronize = mock.MagicMock()
+    monkeypatch.setattr(dflash_module, "synchronize_tensors", synchronize)
+
+    proposer.prepare_prefill_handoff()
+
+    proposer._update_context_kv.assert_called_once_with(proposer.draft_chunks)
+    synchronize.assert_called_once_with(outputs)
+
+
 def test_dummy_draft_forward_marks_all_rows_padding(monkeypatch):
     proposer = _make_proposer(draft_tp=1)
     proposer.speculative_config.num_speculative_tokens = 3
