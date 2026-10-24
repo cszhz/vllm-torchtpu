@@ -543,3 +543,22 @@ def test_gc_freeze_after_n_steps(monkeypatch):
     finally:
         gc_mod.unfreeze()
         gc_mod.set_threshold(*orig)
+
+
+def test_timers_extra_spec(timers_on, monkeypatch):
+    mod = types.ModuleType("t3_fake_mod")
+
+    class K:
+        def m(self, x):
+            return x * 2
+
+    def f(x):
+        return x + 1
+
+    mod.K, mod.f = K, f
+    monkeypatch.setitem(sys.modules, "t3_fake_mod", mod)
+    monkeypatch.setenv("VLLM_TPU_T3_TIMERS_EXTRA", "t3_fake_mod:K.m, t3_fake_mod:f, t3_fake_mod:missing")
+    cls = type("R", (_FakeRunner,), {})
+    t3_host.install_runner_timers(cls)
+    assert K().m(3) == 6 and mod.f(1) == 2
+    assert "x.K.m" in t3_host._aggs and "x.f" in t3_host._aggs

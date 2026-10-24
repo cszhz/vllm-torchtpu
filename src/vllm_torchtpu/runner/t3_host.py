@@ -274,6 +274,19 @@ def install_runner_timers(runner_cls: Any) -> None:
         )
     except Exception:  # noqa: BLE001
         pass
+    # VLLM_TPU_T3_TIMERS_EXTRA="pkg.module:Class.method,pkg.module:function,...":
+    # extra methods/functions to time (worker side), keyed "x.<Class.method>".
+    import importlib
+
+    for spec in [x.strip() for x in os.environ.get("VLLM_TPU_T3_TIMERS_EXTRA", "").split(",") if x.strip()]:
+        try:
+            mod_name, attr = spec.split(":", 1)
+            mod = importlib.import_module(mod_name)
+            owner, name = (mod, attr) if "." not in attr else (getattr(mod, attr.split(".", 1)[0]), attr.split(".", 1)[1])
+            if not _wrap_method(owner, name, f"x.{attr}"):
+                logger.warning("VLLM_TPU_T3_TIMERS_EXTRA: could not wrap %s", spec)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("VLLM_TPU_T3_TIMERS_EXTRA: %s: %r", spec, e)
     logger.info("VLLM_TPU_T3_TIMERS: worker timers installed (period %.0f s)", _PERIOD_S)
 
 
