@@ -1451,3 +1451,371 @@ def gmm_v2(
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
     )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]
+
+
+# Fused MoE expert GEMMs: gmm1 -> activation -> gmm2 in one Pallas call.
+#
+# One pipeline walks the gm tiles once and runs both matmuls per tile with
+# inner_kernel and gmm_v2's tiling (whole K, whole N, the same quantization
+# blocks and accumulator dtype), so the activated [size_m, intermediate] tensor
+# stays in VMEM. Every output row depends only on its own input row, so the
+# result is bit-identical to the two gmm_v2 calls.
+
+# Calls with at least this many lhs rows (prefill) run fused.
+FUSED_MIN_SIZE_M = 16384
+# The m tile both matmuls run on, and its m-bucket granularity. Every bucket
+# is a separate unrolled body of both matmuls, so the bucket count sets the
+# kernel's code size.
+FUSED_TILE_M = 256
+FUSED_BUCKET_BASE = 128
+# Weight buffers per matmul: 3 fetches each expert two gm steps ahead, as
+# gmm_v2 does.
+FUSED_WEIGHT_BUFFER_COUNT = 3
+# VMEM the estimate below does not model (Mosaic's internal values).
+FUSED_VMEM_HEADROOM_BYTES = 8 * 1024 * 1024
+
+
+class _FusedIndexMaps(IndexMaps):
+    """gmm_v2's index maps on a ``(num_gm,)`` grid: n and k are one block."""
+
+    def lhs(self, gm_id: jax.Array):
+        return self.lhs_index_map(0, gm_id, 0)
+
+    def weight(self, gm_id: jax.Array):
+        return self.rhs_weight_index_map(0, gm_id, 0)
+
+    def scale(self, gm_id: jax.Array):
+        return self.rhs_scale_index_map(0, gm_id, 0)
+
+    def bias(self, gm_id: jax.Array):
+        return self.rhs_bias_index_map(0, gm_id, 0)
+
+    def out(self, gm_id: jax.Array):
+        # out_index_map, with the last gm tile read off grid axis 0.
+        sublane = self.cfgs.dims.size_lhs_sublane
+        is_last_gm = gm_id == (pl.num_programs(0) - 1)
+        m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
+        m_end = self.metadata_ref.gm_id_to_m_offset[gm_id + 1]
+        row_start = m_start // sublane
+        row_end = jnp.where(is_last_gm, pl.cdiv(m_end, sublane), m_end // sublane)
+        return (pl.ds(row_start, row_end - row_start), 0, 0)
+
+
+def _weights_spec(cfgs: GmmConfigs, index_maps: _FusedIndexMaps) -> WeightsRef:
+    tiles = cfgs.tiles
+    weight_spec = pl.BlockSpec(
+        (None, tiles.tile_k, tiles.tile_n),
+        index_maps.weight,
+        pipeline_mode=pl.Buffered(buffer_count=FUSED_WEIGHT_BUFFER_COUNT),
+    )
+    scale_spec = bias_spec = None
+    if cfgs.rhs_cfgs.has_scale:
+        scale_spec = pl.BlockSpec(
+            (None, cfgs.num_quant_blocks_per_tile_k, 1, tiles.tile_n),
+            index_maps.scale,
+        )
+    if cfgs.rhs_cfgs.has_bias:
+        bias_spec = pl.BlockSpec((None, 1, tiles.tile_n), index_maps.bias)
+    return WeightsRef(weight=weight_spec, scale=scale_spec, bias=bias_spec)
+
+
+def _unpacked(w_ref: WeightsRef, cfgs: GmmConfigs) -> WeightsRef:
+    if not cfgs.rhs_cfgs.should_unpack:
+        return w_ref
+    weight = w_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
+    return dataclasses.replace(w_ref, weight=weight)
+
+
+def fused_inner_kernel(
+    lhs_ref,  # [tile_m // sublane, sublane, size_k1]
+    w1_ref,  # FusedWeightsRef or WeightsRef, [size_k1, size_n1]
+    w2_ref,  # WeightsRef, [size_k2, size_n2]
+    out_ref,  # [tile_m // sublane, sublane, size_n2]
+    mid_ref,  # [tile_m // sublane + 1, sublane, size_k2]
+    partial_out1_ref,  # [sublane, size_k2]
+    partial_out2_ref,  # [sublane, size_n2]
+    metadata_ref: MetadataRef,
+    *,
+    cfgs1: GmmConfigs,
+    cfgs2: GmmConfigs,
+):
+    """One gm tile: gmm1 (with its activation) into mid_ref, then gmm2.
+
+    mid_ref is gmm1's output tile and gmm2's lhs tile, in the same sublane
+    layout gmm_v2 uses for both, so gmm2 reads what gmm1 wrote with no copy.
+    gmm1's sublane straddle adds the previous group's last rows into row 0;
+    gmm2 masks those rows, exactly as it masks them when reading from HBM.
+    """
+    gm_id = pl.program_id(0)
+    inner = functools.partial(
+        inner_kernel, gm_id=gm_id, single_k_step=True, acc_ref=None
+    )
+    inner(
+        lhs_ref,
+        w1_ref,
+        mid_ref,
+        partial_out1_ref,
+        metadata_ref=metadata_ref,
+        cfgs=cfgs1,
+    )
+    inner(
+        mid_ref,
+        w2_ref,
+        out_ref,
+        partial_out2_ref,
+        metadata_ref=metadata_ref,
+        cfgs=cfgs2,
+    )
+
+
+def fused_kernel_main(
+    # Scalar prefetch
+    lhs_group_sizes_ref,  # int32[size_lhs_group]
+    group_offset_ref,  # int32[1]
+    # In
+    lhs_ref,  # [size_m, size_k1]
+    w1_ref: WeightsRef,  # [size_group, size_k1, size_n1]
+    w2_ref: WeightsRef,  # [size_group, size_k2, size_n2]
+    # Out
+    out_ref,  # [size_m, size_n2]
+    # Scratch
+    mid_ref,
+    partial_out1_ref,
+    partial_out2_ref,
+    metadata_ref: MetadataRef,
+    *,
+    cfgs1: GmmConfigs,
+    cfgs2: GmmConfigs,
+):
+    w1_ref = _unpacked(w1_ref, cfgs1)
+    w2_ref = _unpacked(w2_ref, cfgs2)
+
+    # One gm tiling serves both matmuls: fill_metadata reads only group sizes,
+    # tile_m and the sublane size, which the two configs share.
+    num_gm = fill_metadata(
+        lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs1
+    )
+
+    maps1 = _FusedIndexMaps(metadata_ref, cfgs1)
+    maps2 = _FusedIndexMaps(metadata_ref, cfgs2)
+    sublane = cfgs1.dims.size_lhs_sublane
+    bounded_gm = pl.BoundedSlice(cfgs1.tiles.tile_m // sublane)
+    lhs_spec = pl.BlockSpec((bounded_gm, sublane, cfgs1.tiles.tile_k), maps1.lhs)
+    out_spec = pl.BlockSpec((bounded_gm, sublane, cfgs2.tiles.tile_n), maps2.out)
+    w1_spec = _weights_spec(cfgs1, maps1)
+    w2_spec = _weights_spec(cfgs2, maps2)
+
+    if cfgs1.fuse_act is not None:
+        # kernel_main's gate/up split: the up half arrives as its own block.
+        w1_up_ref = jax.tree.map(lambda x: x.at[..., cfgs1.out_size_n :], w1_ref)
+        w1_ref = FusedWeightsRef(gate=w1_ref, up=w1_up_ref)
+        w1_spec = FusedWeightsRef(gate=w1_spec, up=w1_spec)
+
+    pipeline_fn = pltpu.emit_pipeline(
+        functools.partial(fused_inner_kernel, cfgs1=cfgs1, cfgs2=cfgs2),
+        grid=(num_gm,),
+        in_specs=(lhs_spec, w1_spec, w2_spec),
+        out_specs=out_spec,
+    )
+    lhs_in = lhs_ref.reshape(-1, sublane, lhs_ref.shape[-1])
+    out_in = out_ref.reshape(-1, sublane, out_ref.shape[-1])
+    scratches = [mid_ref, partial_out1_ref, partial_out2_ref, metadata_ref]
+    pipeline_fn(lhs_in, w1_ref, w2_ref, out_in, scratches=scratches)
+
+
+def _fused_tiles(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act):
+    """Whole-expert k and n tiles, as gmm_v2 picks for these shapes."""
+    del lhs_cfgs, rhs_cfgs, vmem_limit_bytes
+    out_size_n = dims.size_n if fuse_act is None else dims.size_n // 2
+    return TileSizes(
+        tile_m=FUSED_TILE_M,
+        tile_k=dims.size_k,
+        tile_n=out_size_n,
+        bucket_base=FUSED_BUCKET_BASE,
+    )
+
+
+def _rhs_vmem_bytes(cfgs: GmmConfigs) -> int:
+    dims, rhs_cfgs = cfgs.dims, cfgs.rhs_cfgs
+    rhs_bits = jax.dtypes.itemsize_bits(rhs_cfgs.quant_dtype or rhs_cfgs.dtype)
+    total = FUSED_WEIGHT_BUFFER_COUNT * dims.size_k * dims.size_n * rhs_bits // 8
+    if rhs_cfgs.has_scale:
+        total += 2 * cfgs.num_quant_blocks_per_tile_k * dims.size_n * 4
+    if rhs_cfgs.has_bias:
+        total += 2 * dims.size_n * 4
+    if rhs_cfgs.should_dequantize_before_matmul:
+        # The whole slab is dequantized into a live lhs-dtype value.
+        total += dims.size_k * dims.size_n * jnp.dtype(cfgs.lhs_cfgs.dtype).itemsize
+    return total
+
+
+def fused_vmem_bytes(cfgs1: GmmConfigs, cfgs2: GmmConfigs) -> int:
+    tile_m = cfgs1.tiles.tile_m
+    sublane = cfgs1.dims.size_lhs_sublane
+    lhs_bytes = jnp.dtype(cfgs1.lhs_cfgs.dtype).itemsize
+    mid_bytes = cfgs1.out_dtype.itemsize
+    out_bytes = cfgs2.out_dtype.itemsize
+    size_k1, size_k2, size_n2 = cfgs1.dims.size_k, cfgs2.dims.size_k, cfgs2.dims.size_n
+    total = _rhs_vmem_bytes(cfgs1) + _rhs_vmem_bytes(cfgs2)
+    total += 2 * tile_m * size_k1 * lhs_bytes + 2 * tile_m * size_n2 * out_bytes
+    total += (tile_m + sublane) * size_k2 * mid_bytes
+    total += sublane * (size_k2 * mid_bytes + size_n2 * out_bytes)
+    for cfgs in (cfgs1, cfgs2):
+        if cfgs.lhs_cfgs.should_quantize:
+            q_bytes = jnp.dtype(cfgs.lhs_cfgs.quant_dtype).itemsize
+            total += tile_m * cfgs.dims.size_k * q_bytes
+    return total + FUSED_VMEM_HEADROOM_BYTES
+
+
+def plan_fusion(
+    lhs,
+    w1,
+    w1_scale,
+    w1_bias,
+    w2,
+    w2_scale,
+    w2_bias,
+    group_sizes,
+    group_offset,
+    *,
+    fuse_act: str | None,
+    rhs_quant_dtype: jnp.dtype | None,
+    maybe_quantize_lhs: bool,
+    out_dtype: jnp.dtype,
+    vmem_limit_bytes: int,
+) -> tuple[GmmConfigs, GmmConfigs] | None:
+    """The two matmuls' configs, or None when they cannot run fused.
+
+    Shape and dtype arithmetic only; ``lhs`` may be a ShapeDtypeStruct.
+    """
+    configs = functools.partial(
+        make_gmm_configs,
+        group_sizes=group_sizes,
+        group_offset=group_offset,
+        tile_info=_fused_tiles,
+        vmem_limit_bytes=vmem_limit_bytes,
+        acc_dtype=None,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        zero_initialize=False,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    cfgs1 = configs(lhs, w1, w1_scale, w1_bias, out_dtype=None, fuse_act=fuse_act)
+    size_k2 = w2.shape[1] * get_packing_factor(w2.dtype, rhs_quant_dtype)
+    mid = jax.ShapeDtypeStruct((cfgs1.dims.size_m, size_k2), cfgs1.out_dtype)
+    cfgs2 = configs(mid, w2, w2_scale, w2_bias, out_dtype=out_dtype, fuse_act=None)
+
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    tile_m = cfgs1.tiles.tile_m
+    fusable = (
+        cfgs1.out_size_n == size_k2
+        and cfgs1.acc_dtype == cfgs2.acc_dtype
+        and cfgs1.dims.size_lhs_sublane == cfgs2.dims.size_lhs_sublane
+        and cfgs1.dims.size_m >= FUSED_MIN_SIZE_M
+        and cfgs1.dims.size_m % cfgs1.dims.size_lhs_sublane == 0
+        and tile_m <= cfgs1.dims.size_m
+        and tile_m % cfgs1.dims.size_lhs_sublane == 0
+        and tile_m % cfgs1.tiles.bucket_base == 0
+        and all(
+            cfgs.out_size_n % num_lanes == 0 and cfgs.dims.size_k % num_lanes == 0
+            for cfgs in (cfgs1, cfgs2)
+        )
+        and fused_vmem_bytes(cfgs1, cfgs2) <= vmem_limit_bytes
+    )
+    return (cfgs1, cfgs2) if fusable else None
+
+
+def get_fused_scope_name(cfgs1: GmmConfigs, cfgs2: GmmConfigs) -> str:
+    d1, d2, tiles = cfgs1.dims, cfgs2.dims, cfgs1.tiles
+    return (
+        f"gmm_v2_fused-g_{d1.size_group}-m_{d1.size_m}-k1_{d1.size_k}"
+        f"-n1_{d1.size_n}-act_{cfgs1.fuse_act}-k2_{d2.size_k}-n2_{d2.size_n}"
+        f"-tm_{tiles.tile_m}-bb_{tiles.bucket_base}"
+    )
+
+
+def get_fused_cost_estimate(cfgs1: GmmConfigs, cfgs2: GmmConfigs) -> pl.CostEstimate:
+    cost1 = get_cost_estimate(cfgs1)
+    cost2 = get_cost_estimate(cfgs2)
+    # The intermediate is neither written nor read back.
+    mid_bytes = cfgs1.dims.size_m * cfgs1.out_size_n * cfgs1.out_dtype.itemsize
+    return pl.CostEstimate(
+        flops=cost1.flops + cost2.flops,
+        bytes_accessed=cost1.bytes_accessed + cost2.bytes_accessed - 2 * mid_bytes,
+        transcendentals=0,
+    )
+
+
+def gmm_v2_fused(
+    lhs: jax.Array,  # [size_m, size_k1]
+    w1: jax.Array,  # [size_group, size_k1, size_n1]
+    w1_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2: jax.Array,  # [size_group, size_k2, size_n2]
+    w2_scale: jax.Array | None,
+    w2_bias: jax.Array | None,
+    group_sizes: jax.Array,  # int32[size_lhs_group]
+    group_offset: jax.Array,  # int32[1]
+    plan: tuple[GmmConfigs, GmmConfigs],
+    vmem_limit_bytes: int,
+) -> jax.Array:
+    """``gmm2(act(gmm1(lhs)))`` for a ``plan`` from ``plan_fusion``.
+
+    Bit-identical to gmm_v2(lhs, w1, ..., fuse_act=act) followed by
+    gmm_v2(mid, w2, ...), both with zero_initialize=False: rows outside every
+    group are left unwritten.
+    """
+    cfgs1, cfgs2 = plan
+    dims1, tiles = cfgs1.dims, cfgs1.tiles
+    size_m = lhs.shape[0]
+    assert size_m == dims1.size_m and size_m % dims1.size_lhs_sublane == 0
+    sublane = dims1.size_lhs_sublane
+
+    def weights(w, scale, bias):
+        hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+        if scale is not None:
+            scale = scale.astype(jnp.float32)
+        if bias is not None:
+            bias = bias.astype(jnp.float32)
+        spec = WeightsRef(
+            weight=hbm,
+            scale=None if scale is None else hbm,
+            bias=None if bias is None else hbm,
+        )
+        return WeightsRef(weight=w, scale=scale, bias=bias), spec
+
+    w1_ref, w1_spec = weights(w1, w1_scale, w1_bias)
+    w2_ref, w2_spec = weights(w2, w2_scale, w2_bias)
+
+    max_num_gm = dims1.size_group + pl.cdiv(size_m, tiles.tile_m) - 1
+    scratch_shapes = [
+        # mid_ref. inner_kernel stages the straddle row by reading row
+        # m_end_local // sublane, one past a full tile, so keep a guard row.
+        pltpu.VMEM(
+            (tiles.tile_m // sublane + 1, sublane, cfgs2.dims.size_k),
+            cfgs1.out_dtype,
+        ),
+        pltpu.VMEM((sublane, cfgs1.out_size_n), cfgs1.out_dtype),
+        pltpu.VMEM((sublane, cfgs2.out_size_n), cfgs2.out_dtype),
+        MetadataRef(
+            gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
+            gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
+        ),
+    ]
+    out_shape = jax.ShapeDtypeStruct((size_m, cfgs2.out_size_n), cfgs2.out_dtype)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    return pl.pallas_call(
+        functools.partial(fused_kernel_main, cfgs1=cfgs1, cfgs2=cfgs2),
+        out_shape=out_shape,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[hbm, w1_spec, w2_spec],
+            out_specs=hbm,
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        name=get_fused_scope_name(cfgs1, cfgs2),
+        cost_estimate=get_fused_cost_estimate(cfgs1, cfgs2),
+    )(group_sizes, group_offset, lhs, w1_ref, w2_ref)
