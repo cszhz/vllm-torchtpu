@@ -35,10 +35,10 @@ _SAL_MAX_WAVE = 128
 
 # Boundary tokens per grid step. The step's DMA issue and its dependent
 # compute chain are mostly latency, so more tokens per step amortize them.
-TILE_N = 8
+TILE_N = 16
 # HCA's window is 16x CSA's; at 16 tokens its double-buffered window block
 # alone overflows scoped VMEM.
-HCA_TILE_N = 8
+HCA_TILE_N = 4
 # Tokens a cache-row merge (`is_first_mask`) looks across: the 4-token groups
 # `prepare_boundary_batch` aligns rows to, as when a step held 4 tokens.
 MERGE_GROUP = 4
