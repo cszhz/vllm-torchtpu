@@ -56,6 +56,17 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 SCHEDULER_CLS = "vllm_torchtpu.core.pp_chunk_scheduler.TpuPipelineChunkScheduler"
+# ix-unified-port: the final lineage's flavour, selected with TPU_PP_SCHEDULER=final.
+SCHEDULER_CLS_FINAL = (
+    "vllm_torchtpu.core.pp_chunk_scheduler_final.TpuPipelineChunkSchedulerFinal"
+)
+
+
+def pp_scheduler_cls() -> str:
+    """The pipeline chunk scheduler class to install: unified's unless
+    TPU_PP_SCHEDULER=final (ix-unified-port)."""
+    flavour = os.environ.get("TPU_PP_SCHEDULER", "").strip().lower()
+    return SCHEDULER_CLS_FINAL if flavour == "final" else SCHEDULER_CLS
 
 
 def uses_dynamic_chunks(vllm_config: Any) -> bool:
@@ -64,7 +75,7 @@ def uses_dynamic_chunks(vllm_config: Any) -> bool:
     return (
         vllm_config is not None
         and vllm_config.parallel_config.pipeline_parallel_size > 1
-        and vllm_config.scheduler_config.scheduler_cls == SCHEDULER_CLS
+        and vllm_config.scheduler_config.scheduler_cls in (SCHEDULER_CLS, SCHEDULER_CLS_FINAL)
     )
 
 
@@ -723,7 +734,9 @@ class TpuPipelineChunkScheduler(Scheduler):
 
 def profile_and_install_cost_model(scheduler: Any, executor: Any) -> None:
     """Time every stage's forwards and hand the scheduler the model."""
-    if not isinstance(scheduler, TpuPipelineChunkScheduler):
+    from vllm_torchtpu.core.pp_chunk_scheduler_final import TpuPipelineChunkSchedulerFinal
+
+    if not isinstance(scheduler, (TpuPipelineChunkScheduler, TpuPipelineChunkSchedulerFinal)):
         return
     reports = executor.collective_rpc("profile_pipeline_chunks")
     granularity = max(int(report["granularity"]) for report in reports)
