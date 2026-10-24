@@ -35,7 +35,7 @@ _SAL_MAX_WAVE = 128
 
 # Boundary tokens per grid step. The step's DMA issue and its dependent
 # compute chain are mostly latency, so more tokens per step amortize them.
-TILE_N = 16
+TILE_N = 32
 # HCA's window is 16x CSA's; at 16 tokens its double-buffered window block
 # alone overflows scoped VMEM.
 HCA_TILE_N = 4
