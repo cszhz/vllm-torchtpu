@@ -1056,6 +1056,7 @@ class TPUModelRunner(GPUModelRunner):
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
+        self._megakernel: Any = None
 
         # Hand-off wave over ICI; built in capture_model, where every stage
         # reaches the same point.
@@ -5289,6 +5290,9 @@ class TPUModelRunner(GPUModelRunner):
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
+        from vllm_torchtpu import megakernel_runtime
+
+        self._megakernel = megakernel_runtime.maybe_create(self)
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -6507,6 +6511,8 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, self.max_num_tokens, self._pp_intermediate_template
             )
             self._pp_wave.warmup()
+        if self._megakernel is not None:
+            self._megakernel.bind_and_warmup(self)
         if self.enforce_eager:
             return
         with self.maybe_setup_dummy_loras(self.lora_config):
@@ -7604,6 +7610,21 @@ class TPUModelRunner(GPUModelRunner):
         intermediate_tensors=None,
         model_kwargs=None,
     ):
+        if self._megakernel is not None:
+            extra = (
+                {"model_kwargs": model_kwargs}
+                if getattr(self._megakernel, "takes_model_kwargs", False)
+                else {}
+            )
+            hit, out = self._megakernel.try_forward(
+                self, input_ids, positions, inputs_embeds, intermediate_tensors, **extra
+            )
+            if hit:
+                # A driver may return (hidden_states, aux_hidden_states).
+                if isinstance(out, tuple) and len(out) == 2:
+                    return out
+                return out, None
+
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
         kwargs = {} if model_kwargs is None else dict(model_kwargs)

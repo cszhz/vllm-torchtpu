@@ -52,6 +52,8 @@ from .model import (
     verify_moe_checkpoint,
 )
 
+from .qsa import QSAMetadata
+
 _CHECKPOINT_LAYER = re.compile(r"^mtp\.layers\.(\d+)\.")
 
 
@@ -157,6 +159,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             prefill_norm_tile=int(tiles.get("hc_prefill_norm_tile", 0)),
             prefill_full_tile=int(tiles.get("hc_prefill_full_tile", 0)),
         )
+        # Set by the Qwen3.8 megakernel driver before the first trace: the
+        # layer's o_proj, both HCs and the MoE as one tail-kernel call.
+        self.mk_tail: nn.Module | None = None
 
     def fuse_inputs(self, input_ids, hidden_states, inputs_embeds=None):
         """[T, hc*H] decoder input from the token and the previous hidden."""
@@ -184,6 +189,32 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         # length before this chunk. Loop steps advance seq_lens in place.
         context = (seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
         tables = cast(torch.Tensor, metadata.block_tables)
+        tail = self.mk_tail
+        # No branch on the token count: vLLM rejects a traced graph that does
+        # (ShapeSpecializationError). The tail op resolves concrete rows itself;
+        # the driver attaches it only when step 0 uses draft rows, so the
+        # all-token path below is the fused loop's (<= request capacity rows).
+        if tail is not None:
+            # Stock attention (caches written for every token), then the kernel.
+            block, _ = layer.attn_hyper_connection.mix(hidden)
+            qsa_md = QSAMetadata(
+                starts,
+                context,
+                torch.zeros_like(seq_lens, dtype=torch.int32),
+                tables,
+                tables,
+            )
+            pos = positions.to(torch.int64)
+            if rows is not None:
+                rows = rows.to(torch.int64)
+                attention = layer.self_attn.attend_with_indices(
+                    block, pos, qsa_md, rows=rows
+                )[0]
+                hidden = hidden[rows.clamp_min(0)]
+            else:
+                attention = layer.self_attn.attend(block, pos, qsa_md)
+            hidden = tail(hidden, attention)
+            return self.hyper_connection_mixer.mix(hidden)[0], hidden
         if rows is not None:
             hidden = layer.forward_rows(
                 hidden,
