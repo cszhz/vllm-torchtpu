@@ -80,9 +80,19 @@ if TYPE_CHECKING:
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
+    VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
+    VLLM_TPU_QSA_RING_SELECT: bool = False
+    VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
+    VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
+    VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
+    VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
+    VLLM_TPU_QSA_DECODE_FAST_FETCH: bool = False
+    VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE: bool = False
+    VLLM_TPU_QSA_DECODE_RPA_BKV: int = 256
+    VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -460,12 +470,70 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_DECODE_KV_BLOCK": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_KV_BLOCK", 1024
     ),
+    # Compressed keys per KV block for the one-token requests of that pass on
+    # steps of at most one token per request (MTP draft rows, plain decode);
+    # verify steps keep 256. Exact selection at any block size. Only read
+    # when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.
+    "VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK": env_nonnegative_int(
+        "VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK", 256
+    ),
+    # Qwen4-exp pooled QSA: request row r owns ring row r, so the indexer
+    # update's whole-row ring/tag gathers and final scatter become selects.
+    "VLLM_TPU_QSA_RING_SELECT": env_bool("VLLM_TPU_QSA_RING_SELECT", default=False),
+    # Qwen4-exp QSA ring/tag state I/O: concurrent row DMAs per tile. 0 uses
+    # the measured table (pool pages without an entry, e.g. 512-token FP8
+    # pages, fall back to one serial DMA per request); N > 0 uses the largest
+    # power of two <= N that divides the request rows.
+    "VLLM_TPU_QSA_RING_DMA_BATCH": env_nonnegative_int(
+        "VLLM_TPU_QSA_RING_DMA_BATCH", 0
+    ),
     # Qwen4-exp QSA decode/verify attention: run the decode rows (and the
     # decode prefix of mixed steps) on the fused sparse GQA decode kernel
     # (kernels/sparse_gqa_decode) instead of batched RPA. Inputs outside the
     # kernel's static envelope (non-TPU7x, unsupported shapes) still use RPA.
     "VLLM_TPU_QSA_FUSED_SPARSE_DECODE": env_bool(
         "VLLM_TPU_QSA_FUSED_SPARSE_DECODE", default=False
+    ),
+    # Qwen4-exp QSA decode/verify attention: present every head slot of the
+    # main KV row (zero queries for the other layer's head) so all QSA layers
+    # share one decode kernel configuration and XLA computes the decode
+    # schedule once per step; RPA also skips its empty mixed pass.
+    "VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE": env_bool(
+        "VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE", default=False
+    ),
+    # Qwen4-exp QSA decode/verify attention on RPA: fetch each KV page with
+    # one scalar load instead of three (the decode KV fetch issues one DMA
+    # per 4-token group and is scalar-issue bound). Same DMAs and results.
+    "VLLM_TPU_QSA_DECODE_LEAN_FETCH": env_bool(
+        "VLLM_TPU_QSA_DECODE_LEAN_FETCH", default=False
+    ),
+    # Qwen4-exp QSA decode/verify attention on RPA with FP8 main KV rows:
+    # each layer attends its own head slot of the packed row (one KV head,
+    # only its K/V pair unpacked) instead of unpacking every slot and, for a
+    # paired page's second layer, presenting both heads with zero queries.
+    "VLLM_TPU_QSA_DECODE_SLOT_READ": env_bool(
+        "VLLM_TPU_QSA_DECODE_SLOT_READ", default=False
+    ),
+    # Qwen4-exp QSA decode/verify attention on RPA (implies the lean fetch):
+    # full KV tiles fetch with static page sizes and page ids read at static
+    # offsets, cutting the scalar work per DMA that bounds the decode kernel.
+    "VLLM_TPU_QSA_DECODE_FAST_FETCH": env_bool(
+        "VLLM_TPU_QSA_DECODE_FAST_FETCH", default=False
+    ),
+    # Qwen4-exp QSA decode/verify attention on RPA: compact KV schedule (one
+    # entry per lane-tile instead of one per 4-token page), which lets the
+    # decode KV block grow past 256 tokens within the SMEM schedule budget.
+    # The RPA body has a fixed cost per step, so fewer, larger steps help.
+    "VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE": env_bool(
+        "VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE", default=False
+    ),
+    # Decode KV tokens per RPA step and lanes (requests) per step with the
+    # compact schedule; only read when it is on.
+    "VLLM_TPU_QSA_DECODE_RPA_BKV": env_nonnegative_int(
+        "VLLM_TPU_QSA_DECODE_RPA_BKV", 256
+    ),
+    "VLLM_TPU_QSA_DECODE_RPA_LANES": env_nonnegative_int(
+        "VLLM_TPU_QSA_DECODE_RPA_LANES", 8
     ),
     # Qwen4-exp QSA prefill: build the per-query selection bitset with a
     # compare-and-accumulate Pallas kernel. Off falls back to the vmapped

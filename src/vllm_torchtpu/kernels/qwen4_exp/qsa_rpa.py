@@ -81,12 +81,23 @@ def _rpa_attention_batch(
     kv_heads,
     ratio,
     bkv_size=256,
+    batch_size=8,
     k_scale=1.0,
     v_scale=1.0,
     kv_head_offset=0,
+    decode_only=False,
+    lean_fetch=False,
+    slot_read=False,
+    compact=False,
+    fast_fetch=False,
 ):
     from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
+    kv_slot = None
+    if slot_read and slot_readable(cache, kv_heads, kv_head_offset):
+        # Read this layer's pair of the packed row directly: one KV head, no
+        # zero queries for the other layer's head, one pair unpacked.
+        kv_slot, kv_head_offset = kv_head_offset, 0
     pages, kv_lens, cu_q_lens, distribution = virtual_page_metadata(
         blocks, lengths, table, ratio=ratio, page_size=cache.shape[1]
     )
@@ -108,7 +119,9 @@ def _rpa_attention_batch(
     dummy_k = jnp.zeros(
         (q.shape[0], kv_heads + kv_head_offset, query.shape[-1]), cache.dtype
     )
-    decode = configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=bkv_size, batch_size=8)
+    decode = configs.BlockSizes(
+        bq_sz=1, bq_c_sz=1, bkv_sz=bkv_size, batch_size=batch_size
+    )
     prefill = configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=bkv_size, batch_size=1)
     out, next_cache = wrapper.ragged_paged_attention(
         query,
@@ -128,6 +141,12 @@ def _rpa_attention_batch(
         kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
         decode_block_sizes=decode,
         prefill_block_sizes=prefill,
+        # virtual_page_metadata makes every row a decode row.
+        decode_only=decode_only,
+        lean_kv_fetch=lean_fetch or fast_fetch,
+        fast_kv_fetch=fast_fetch,
+        kv_slot=kv_slot,
+        compact_kv_schedule=compact,
     )
     out = out[jnp.minimum(cu_q_lens[:-1], len(q) - 1), :, : q.shape[-1]]
     if kv_head_offset:
@@ -138,6 +157,17 @@ def _rpa_attention_batch(
     )
     out = jnp.where((lengths > 0)[:, None, None], out, 0)
     return out, next_cache.reshape(cache.shape)
+
+
+def slot_readable(cache, kv_heads, kv_head_offset):
+    """RPA can attend head slot ``kv_head_offset`` of a packed row directly:
+    one KV head and rows of one packed sublane (FP8 paired pages)."""
+    return (
+        kv_heads == 1
+        and cache.ndim == 5
+        and cache.shape[2] == 1
+        and kv_head_offset < cache.shape[3] // 2
+    )
 
 
 def rpa_query_batch_size(page_columns):
@@ -161,6 +191,11 @@ def rpa_attention(
     k_scale=1.0,
     v_scale=1.0,
     kv_head_offset=0,
+    decode_only=False,
+    lean_fetch=False,
+    slot_read=False,
+    compact=False,
+    fast_fetch=False,
 ):
     batch_size = rpa_query_batch_size(blocks.shape[1] + 1)
     attend = functools.partial(
@@ -169,6 +204,19 @@ def rpa_attention(
         ratio=ratio,
         k_scale=k_scale,
         v_scale=v_scale,
+        **({"decode_only": True} if decode_only else {}),
+        **({"lean_fetch": True} if lean_fetch else {}),
+        **({"slot_read": True} if slot_read else {}),
+        **({"fast_fetch": True} if fast_fetch else {}),
+        **(
+            dict(
+                compact=True,
+                bkv_size=envs.VLLM_TPU_QSA_DECODE_RPA_BKV,
+                batch_size=envs.VLLM_TPU_QSA_DECODE_RPA_LANES,
+            )
+            if compact
+            else {}
+        ),
         **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
     )
     if len(q) <= batch_size:
@@ -272,12 +320,75 @@ def decode_attention(
     v_scale=1.0,
     kv_head_offset=0,
     fused=None,
+    shared_schedule=None,
 ):
     """Per-row decode attention: fused sparse decode when enabled, else RPA.
 
     ``fused`` defaults to ``VLLM_TPU_QSA_FUSED_SPARSE_DECODE`` (read at trace
     time). Ineligible inputs fall back to RPA.
+
+    ``shared_schedule`` (default ``VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE``)
+    presents every head slot of the cache row, with zero queries for the heads
+    that are not this layer's, so both layers of a paired main KV page (and
+    unpaired layers, whose FP8 rows hold the same slots) launch one kernel
+    configuration. The decode schedule depends only on the step's lengths
+    and that configuration, so XLA computes it once per step instead of once
+    per slot; RPA also skips its empty mixed-sequence pass. With
+    ``VLLM_TPU_QSA_DECODE_SLOT_READ`` RPA reads each layer's own head slot
+    instead, so every layer already launches one KV head and nothing is
+    padded.
     """
+    shared = (
+        envs.VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE
+        if shared_schedule is None
+        else shared_schedule
+    )
+    trailing = 0
+    if shared and cache.ndim == 5:
+        trailing = cache.shape[2] * cache.shape[3] // 2 - kv_head_offset - kv_heads
+    use_fused = envs.VLLM_TPU_QSA_FUSED_SPARSE_DECODE if fused is None else fused
+    if envs.VLLM_TPU_QSA_DECODE_SLOT_READ and not use_fused and slot_readable(
+        cache, kv_heads, kv_head_offset
+    ):
+        # Every layer already launches one KV head (slot reads); no padding.
+        trailing = 0
+    if not shared or trailing <= 0 or q.shape[1] % kv_heads:
+        trailing = 0
+    pad = ((0, 0), (0, trailing * (q.shape[1] // kv_heads)), (0, 0))
+    out, cache = _decode_attention(
+        jnp.pad(q, pad) if trailing else q,
+        jnp.pad(gate, pad) if trailing else gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        kv_heads=kv_heads + trailing,
+        ratio=ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_head_offset=kv_head_offset,
+        fused=fused,
+        decode_only=shared,
+    )
+    return (out[:, : q.shape[1]] if trailing else out), cache
+
+
+def _decode_attention(
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    kv_heads,
+    ratio,
+    k_scale,
+    v_scale,
+    kv_head_offset,
+    fused,
+    decode_only=False,
+):
     options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
     if kv_head_offset:
         options["kv_head_offset"] = kv_head_offset
@@ -285,6 +396,17 @@ def decode_attention(
         result = fused_sparse_decode(q, gate, blocks, lengths, table, cache, **options)
         if result is not None:
             return result
+    if decode_only:
+        options["decode_only"] = True
+    if envs.VLLM_TPU_QSA_DECODE_LEAN_FETCH:
+        options["lean_fetch"] = True
+    if envs.VLLM_TPU_QSA_DECODE_SLOT_READ:
+        options["slot_read"] = True
+    if envs.VLLM_TPU_QSA_DECODE_FAST_FETCH:
+        options["fast_fetch"] = True
+    if envs.VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE:
+        options["compact"] = True
+
     return rpa_attention(q, gate, blocks, lengths, table, cache, **options)
 
 
