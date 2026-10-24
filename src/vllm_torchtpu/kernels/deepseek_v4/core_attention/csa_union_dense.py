@@ -518,7 +518,11 @@ def _union_sc_kernel(
                 )
                 n16 = (S + L - 1) // L
 
-                @plsc.parallel_loop(0, n16)
+                # Sequential on purpose: under a parallel_loop the zero stores
+                # are not ordered against the count scatters below, and a
+                # surviving stale count made the count pass and the plan pass
+                # disagree on U (tiles past the written rows -> garbage rows).
+                @pl.loop(0, n16)
                 def _(i):
                     cnt[pl.ds(i * L, L)] = zeros
 
@@ -804,13 +808,20 @@ def prepare(
     W = u_cap // WORD_BITS
 
     def full(_):
-        idx, mask, _ = build_union_plan(topk_indices, page_indices, meta_rows, **kw)
-        return idx, mask
+        idx, mask, u_full = build_union_plan(topk_indices, page_indices, meta_rows, **kw)
+        return idx, mask, jnp.where(qn > 0, u_full, 0)
 
     def none(_):
-        return (jnp.zeros((nb_cap * u_cap,), jnp.int32), jnp.zeros((T, W), jnp.int32))
+        return (
+            jnp.zeros((nb_cap * u_cap,), jnp.int32),
+            jnp.zeros((T, W), jnp.int32),
+            jnp.zeros_like(usize),
+        )
 
-    idx, mask = lax.cond(use_union, full, none, None)
+    idx, mask, u_full = lax.cond(use_union, full, none, None)
+    # The tile layout follows the pass that wrote the rows; both passes must
+    # agree, and the step falls back if they do not.
+    use_union = use_union & jnp.all(u_full == usize)
     return dict(
         idx=idx, mask=mask, usize=usize, q0=q0, qn=qn, seq_b=seq_b,
         total_blocks=total_blocks, n_sparse=n_sparse, use_union=use_union,
