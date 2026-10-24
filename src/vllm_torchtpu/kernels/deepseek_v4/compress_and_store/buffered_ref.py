@@ -76,7 +76,7 @@ class CosSinRef(_BufferedRef):
         def loop_body(i):
             global_idx = pid * tile_n + i
             position = positions_ref[global_idx]
-            compressed_pos = (position // compress_ratio) * compress_ratio
+            compressed_pos = _floor_div(position, compress_ratio) * compress_ratio
 
             src = cos_sin_cache_ref.at[
                 compressed_pos, pl.ds(0, self.window_ref.shape[-1])
@@ -153,6 +153,13 @@ def _floor_div(x, d: int):
     return x // d
 
 
+def _floor_mod(x, d: int):
+    """`x % d` for a static `d`; a mask when `d` is a power of two."""
+    if d & (d - 1) == 0:
+        return x & jnp.int32(d - 1)
+    return x % d
+
+
 def _window_bytes(window_ref, cfgs: config.Configs):
     """uint8 view of one f32 window block (each f32 lane -> 4 byte rows)."""
     return window_ref.bitcast(jnp.uint8).reshape(cfgs.window_bytes_shape())
@@ -210,9 +217,11 @@ class OutputRef(_BufferedRef):
 
             @pl.when(valid)
             def _read_nope():
-                p = kv_slot // page_size
+                p = _floor_div(kv_slot, page_size)
                 # we fetch the entire tile (4, 128), with 4 pages per tile
-                s_row = (kv_slot % page_size) // (self.cfgs.tokens_in_second_minor)
+                s_row = _floor_div(
+                    _floor_mod(kv_slot, page_size), self.cfgs.tokens_in_second_minor
+                )
                 src = cache_ref.at[p, s_row, :, :]
                 dest = dest_ref.at[n, 0, :, :]
                 pltpu.make_async_copy(src, dest, sem).start()
@@ -269,9 +278,10 @@ class OutputRef(_BufferedRef):
 
                 @pl.when(valid)
                 def _write_nope():
-                    p = kv_slot // self.cfgs.kv_block_size
-                    s_row = (kv_slot % self.cfgs.kv_block_size) // (
-                        self.cfgs.tokens_in_second_minor
+                    p = _floor_div(kv_slot, self.cfgs.kv_block_size)
+                    s_row = _floor_div(
+                        _floor_mod(kv_slot, self.cfgs.kv_block_size),
+                        self.cfgs.tokens_in_second_minor,
                     )
                     src = src_ref.at[n, 0, :, :]
                     dest = cache_ref.at[p, s_row, :, :]
@@ -288,8 +298,8 @@ class OutputRef(_BufferedRef):
 
                 @pl.when(kv_slot >= 0)
                 def _write_nope():
-                    p = kv_slot // self.cfgs.physical_page_size
-                    s = kv_slot % self.cfgs.physical_page_size
+                    p = _floor_div(kv_slot, self.cfgs.physical_page_size)
+                    s = _floor_mod(kv_slot, self.cfgs.physical_page_size)
 
                     @pl.loop(0, self.cfgs.record_rows, unroll=True)
                     def write_loop(o):
@@ -381,9 +391,9 @@ class RoPEInputRef(_BufferedRef):
             def _read_rope():
                 # divide by 4 because we pack 4 pages into 1 tile
                 # layout: [num_page, kv_block_size / 4, 4, 256]
-                rope_slot = kv_slot // 4
-                rope_p = rope_slot // self.cfgs.rope_page_size
-                s_row = rope_slot % self.cfgs.rope_page_size
+                rope_slot = _floor_div(kv_slot, 4)
+                rope_p = _floor_div(rope_slot, self.cfgs.rope_page_size)
+                s_row = _floor_mod(rope_slot, self.cfgs.rope_page_size)
                 src = rope_cache_ref.at[rope_p, s_row, :, :]
                 dest = dest_ref.at[n, :, :]
                 pltpu.make_async_copy(src, dest, sem).start()
@@ -444,9 +454,9 @@ class RoPEOutputRef(_BufferedRef):
 
             @pl.when(valid & is_first)
             def _write_rope():
-                rope_slot = kv_slot // 4
-                rope_p = rope_slot // self.cfgs.rope_page_size
-                s_row = rope_slot % self.cfgs.rope_page_size
+                rope_slot = _floor_div(kv_slot, 4)
+                rope_p = _floor_div(rope_slot, self.cfgs.rope_page_size)
+                s_row = _floor_mod(rope_slot, self.cfgs.rope_page_size)
                 src_rope = src_ref.at[n, :, :]
                 dest_rope = rope_cache_ref.at[rope_p, s_row, :, :]
                 pltpu.make_async_copy(src_rope, dest_rope, sem).start()
