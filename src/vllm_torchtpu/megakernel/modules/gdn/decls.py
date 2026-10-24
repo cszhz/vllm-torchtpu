@@ -29,7 +29,7 @@ from ...decls import (
 )
 from ...errors import MegakernelConfigError
 from ...ops import BF16, F32, FP8
-from .params import gdn_lin_in_layout
+from .params import gdn_lin_in_layout, resolve_gdn_options
 
 GDN_PARAM_NAMES: frozenset[str] = frozenset(
     {
@@ -80,6 +80,12 @@ GDN_FIELD_ALIASES: dict[str, str] = {
     "rms_norm_eps": "eps",
 }
 
+# Requested options: None inherits the geometry attribute, then GDN_OPTION_DEFAULTS.
+GDN_OPTIONS: dict[str, Any] = dict.fromkeys(
+    ("decay_type", "decay_law", "gate_type", "decay_bound")
+)
+
+
 GDN_GEOMETRY_METHODS: dict[str, Any] = {
     "kh_rep": lambda g, R: max(1, R // int(g.KH)) if int(g.KH) > 0 else 1,
     "kh": lambda g, R: gdn_lin_in_layout(g, R).kh,
@@ -104,6 +110,7 @@ def resolve_gdn_binding(
     cls: Any, binding: ModuleBinding, resolved: ResolvedModuleGeometry
 ) -> ResolvedModuleGeometry:
     vals = dict(resolved.values)
+    opts = resolve_gdn_options(binding.options, None)
     conv_k = _check_conv_kernel(int(vals.get("conv_kernel", 4)))
     vals.update(
         {
@@ -116,6 +123,7 @@ def resolve_gdn_binding(
             "conv_taps": conv_k - 1,
             "eps": float(vals["eps"]),
             "gdn_l2_eps": float(vals["gdn_l2_eps"]),
+            **opts,
         }
     )
     return ResolvedModuleGeometry(
@@ -130,6 +138,12 @@ def resolve_gdn_binding(
 
 def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
     """Return canonical (unfused) HF parameter declarations for `GDNModule`."""
+    if resolve_gdn_options({}, geom)["decay_type"] == "key":
+        raise MegakernelConfigError(
+            "gdn_hf_params only supports Qwen3.5/3.8 fused in_proj_qkvz/in_proj_ba "
+            "checkpoints (decay_type='head'); KDA decay_type='key' checkpoints "
+            "use split projection weights"
+        )
     conv_kernel = _check_conv_kernel(int(getattr(geom, "conv_kernel", 4)))
     p = f"{prefix}." if prefix else ""
     H, KH, VH = int(geom.H), int(geom.KH), int(geom.VH)
