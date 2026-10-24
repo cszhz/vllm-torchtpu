@@ -482,12 +482,14 @@ def fused_conv1d_gdn(
         out: Fused output tensor.
     """
     # Conv1D consumes FP32 while outputs retain the projection activation dtype.
-    prepared_qkv = isinstance(qkv, Conv1DInput)
     if isinstance(qkv, Conv1DInput):
         act_out_dtype = qkv.output_dtype
         qkv = qkv.values
         if qkv.ndim != 3 or qkv.shape[1] != 1 or qkv.dtype != jnp.float32:
-            raise ValueError("Conv1DInput requires FP32 [tokens, 1, features]")
+            raise ValueError(
+                "Conv1DInput requires FP32 [tokens, 1, features]; "
+                f"got shape={qkv.shape}, dtype={qkv.dtype}"
+            )
     else:
         act_out_dtype = qkv.dtype
     pooled = state_plan is not None
@@ -506,8 +508,7 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    if not prepared_qkv:
-        qkv = qkv.astype(jnp.float32)
+    qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
 
