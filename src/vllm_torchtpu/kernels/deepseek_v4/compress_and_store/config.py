@@ -45,6 +45,7 @@ Modes:
 
 import dataclasses
 import enum
+import math
 from typing import Any
 
 import jax
@@ -484,8 +485,17 @@ class Configs:
 
     @property
     def pages_to_buffer_per_token(self) -> int:
-        """Pages that must be resident to cover one token's window (+1 guard)."""
+        """State pages looked up per token to cover its window (+1 guard)."""
         return pl.cdiv(self.window, self.state_block_size) + 1
+
+    @property
+    def window_run(self) -> int:
+        """States a window is fetched in per DMA.
+
+        A boundary token's window starts at a multiple of `compress_ratio`, so
+        runs of this many states never cross a state page.
+        """
+        return math.gcd(self.dims.compress_ratio, self.state_block_size)
 
     # --- shapes (single source of truth for every reshape / BlockSpec) ---------
     @property
@@ -493,11 +503,11 @@ class Configs:
         return self.tile_sizes.tile_n
 
     def window_shape(self) -> tuple[int, ...]:
-        """f32 window scratch: (fields, tile, window, head_tiles, lane)."""
+        """f32 window block: (fields, tile, window, head_tiles, lane)."""
         return (N_FIELDS, self._tile_n, self.window, self.head_tiles, LANE)
 
     def window_bytes_shape(self) -> tuple[int, ...]:
-        """uint8 view of the window scratch; each f32 lane -> FP32_BYTES rows.
+        """uint8 view of the window block; each f32 lane -> FP32_BYTES rows.
 
         Note: that trailing FP32_BYTES (4) is bytes-per-f32, NOT the HBM SLOT_PACK
         (also 4) -- they're numerically equal but mean different things.
@@ -529,18 +539,6 @@ class Configs:
         assert self.dims.seq_along_lane
         padded = pl.cdiv(max(self.dims.size_n, 1), LANE) * LANE
         return (SAL_SUBLANE_GROUPS, SLOT_PACK, padded)
-
-    def page_buffer_shape(self) -> tuple[int, ...]:
-        """Page-buffer VMEM block: (tile, pages, state page rows) + cache_last_dims.
-
-        Pages are DMA'd whole out of the *state* array, so this is sized by
-        `state_physical_page_size`, not by the compressed-KV page.
-        """
-        return (
-            self._tile_n,
-            self.pages_to_buffer_per_token,
-            self.state_physical_page_size,
-        ) + self.cache_last_dims
 
     def rope_output_shape(self) -> tuple[int, ...]:
         """RoPE output VMEM block: (tile, 4, lane)."""
