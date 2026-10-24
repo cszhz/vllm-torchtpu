@@ -59,7 +59,7 @@ class _WeightSynchronizer(Protocol):
 
     def push_weights(self, peers: list[str]) -> None: ...
 
-    def wait_for_transfer_completion(self, uuid: int | None = None) -> None: ...
+    def h2d(self) -> None: ...
 
     def get_local_endpoints(self) -> list[dict[str, Any]]: ...
 
@@ -85,7 +85,7 @@ def _new_receiver_synchronizer(
         local_port=0,
         parallelism=1,
         bind_ip=bind_ip,
-        auto_h2d=True,
+        auto_h2d=False,
         global_shard_indices=[rank],
     )
 
@@ -492,6 +492,8 @@ class RemoteDSparkTransport:
             message["aux_hidden_states"] = [
                 self._receive_tensor_rows(transfer) for transfer in aux_hidden_states
             ]
+            if self._device.type == "tpu":
+                torch.accelerator.synchronize()
         if self.rank == 0:
             logger.info(
                 "Remote DSpark feedback receive: round=%d requests=%d",
@@ -560,7 +562,7 @@ class RemoteDSparkTransport:
             raise RemoteDraftProtocolError(
                 "remote DSpark feedback referenced an unknown TPU Sync channel"
             )
-        receiver.synchronizer.wait_for_transfer_completion()
+        receiver.synchronizer.h2d()
         return RemoteDeviceTensorRows(receiver.tensors, transfer.live_rows)
 
     def _send(self, message: dict[str, Any]) -> None:

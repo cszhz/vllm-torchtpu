@@ -119,7 +119,7 @@ def test_tpu_sync_feedback_reuses_native_channel(monkeypatch):
             self.tensors = tensors
             self.endpoint = endpoint
             self.bind_count = 0
-            self.wait_count = 0
+            self.h2d_count = 0
             synchronizers.append(self)
 
         def bind_weights(self, device_tensors: list[list[torch.Tensor]]) -> None:
@@ -132,9 +132,8 @@ def test_tpu_sync_feedback_reuses_native_channel(monkeypatch):
             for source, destination in zip(self.tensors, receiver.tensors, strict=True):
                 destination.copy_(source)
 
-        def wait_for_transfer_completion(self, uuid: int | None = None) -> None:
-            assert uuid is None
-            self.wait_count += 1
+        def h2d(self) -> None:
+            self.h2d_count += 1
 
         def get_local_endpoints(self) -> list[dict[str, str]]:
             assert self.endpoint is not None
@@ -225,7 +224,7 @@ def test_tpu_sync_feedback_reuses_native_channel(monkeypatch):
     sender = next(sync for sync in synchronizers if sync.endpoint is None)
     receiver = next(sync for sync in synchronizers if sync.endpoint is not None)
     assert sender.bind_count == 1
-    assert receiver.wait_count == 2
+    assert receiver.h2d_count == 2
 
 
 def test_only_output_rank_owns_remote_proposals():
