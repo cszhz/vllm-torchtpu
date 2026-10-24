@@ -22,6 +22,7 @@ from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm_torchtpu.runner import fast_forward_context as _ffc
+from vllm_torchtpu.runner import t3_host as _t3
 from vllm_torchtpu.runner.fast_forward_context import fast_set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
@@ -1164,7 +1165,10 @@ class Eagle3Proposer:
                 program(None, positions, hidden_states, seq_lens)
                 seq_lens.copy_(seq_lens_step1)
                 setattr(self, warm_attr, True)
-            return program(None, positions, hidden_states, seq_lens)
+            out = program(None, positions, hidden_states, seq_lens)
+        if _t3.AOT_SKIP_GUARDS:
+            _t3.maybe_skip_aot_guards(program)
+        return out
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
@@ -3327,6 +3331,8 @@ class Eagle3Proposer:
                 model(**kwargs)
                 self._mtp_mk_step0_warm = True
             out = model(**kwargs)
+        if _t3.AOT_SKIP_GUARDS:
+            _t3.maybe_skip_aot_guards(model)
 
         return self._unwrap_model_out(out)
 
