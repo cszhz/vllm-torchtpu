@@ -46,6 +46,7 @@ def _make_scheduler(
     window: int = 64,
     enable_caching: bool = True,
     raise_on_lookup: bool = False,
+    max_wait_s: float = 0.0,
 ) -> PrefixAwareScheduler:
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
     q = FCFSRequestQueue()
@@ -59,6 +60,7 @@ def _make_scheduler(
     s._paw_cold_tokens = 0
     s._paw_prompt_tokens = 0
     s._paw_scoring_broken = False
+    s._max_wait_s = max_wait_s
 
     coordinator = MagicMock()
 
@@ -132,6 +134,45 @@ def test_preempted_tier_outranks_normal():
     assert q is not None
     order = [r.request_id for r in q]
     assert order == ["preempted", "warm"]
+
+
+def test_aged_cold_request_outranks_warm():
+    now = time.time()
+    r_cold = _make_request("cold", num_tokens=100_000, arrival_time=now - 60)
+    r_warm = _make_request("warm", num_tokens=1000, arrival_time=now - 1)
+    s = _make_scheduler([r_cold, r_warm], {"cold": 0, "warm": 900}, max_wait_s=30)
+
+    q = s._select_waiting_queue_for_scheduling()
+    assert q is not None
+    assert [r.request_id for r in q] == ["cold", "warm"]
+
+
+def test_aged_requests_admit_oldest_first():
+    now = time.time()
+    r_newer = _make_request("newer", num_tokens=1000, arrival_time=now - 40)
+    r_older = _make_request("older", num_tokens=100_000, arrival_time=now - 50)
+    s = _make_scheduler(
+        [r_newer, r_older], {"newer": 900, "older": 0}, max_wait_s=30
+    )
+
+    q = s._select_waiting_queue_for_scheduling()
+    assert q is not None
+    assert [r.request_id for r in q] == ["older", "newer"]
+
+
+def test_preempted_tier_outranks_aged():
+    now = time.time()
+    r_aged = _make_request("aged", num_tokens=1000, arrival_time=now - 60)
+    r_preempted = _make_request(
+        "preempted", num_tokens=1000, arrival_time=now - 1, num_preemptions=1
+    )
+    s = _make_scheduler(
+        [r_aged, r_preempted], {"aged": 0, "preempted": 0}, max_wait_s=30
+    )
+
+    q = s._select_waiting_queue_for_scheduling()
+    assert q is not None
+    assert [r.request_id for r in q] == ["preempted", "aged"]
 
 
 def test_window_bounds_evaluation():

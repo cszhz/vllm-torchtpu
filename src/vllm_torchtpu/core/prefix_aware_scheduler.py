@@ -24,10 +24,15 @@ prioritizes requests with the fewest uncached prompt tokens. It modifies only
 the admission ordering; memory management, eviction, and preemption policies
 remain untouched.
 
+Ranking by cold tokens alone has no aging, so under load a long cold prompt
+can lose to every warmer arrival. VLLM_TPU_PREFIX_AWARE_MAX_WAIT_S > 0 bounds
+that: a request waiting longer is admitted ahead of warmer ones, oldest first.
+
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
 """
 
+import time
 from itertools import islice
 from typing import cast
 
@@ -40,13 +45,16 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu import envs
+
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
 
 # Priority tiers: lower values admit earlier.
 _TIER_PREEMPTED = 1
-_TIER_NORMAL = 2
+_TIER_AGED = 2
+_TIER_NORMAL = 3
 
 
 class PrefixAwareScheduler(AsyncScheduler):
@@ -61,8 +69,13 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+        self._max_wait_s = float(envs.VLLM_TPU_PREFIX_AWARE_MAX_WAIT_S)
 
-        logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
+        logger.info(
+            "PrefixAwareScheduler ACTIVE (window=%d, max_wait_s=%.1f)",
+            self.WINDOW,
+            self._max_wait_s,
+        )
 
     def _prefix_warmth(self, request: Request) -> int:
         """Prompt tokens of ``request`` resident in the KV cache."""
@@ -85,12 +98,18 @@ class PrefixAwareScheduler(AsyncScheduler):
             return 0
 
     def _rank_and_warmth(
-        self, request: Request
+        self, request: Request, now: float
     ) -> tuple[tuple[int, float, float], int]:
         """Return (sort_key, warmth). Lower sort_key is admitted first."""
         warmth = self._prefix_warmth(request)
         cold_tokens = float(request.num_tokens - warmth)
-        tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
+        if request.num_preemptions > 0:
+            tier = _TIER_PREEMPTED
+        elif self._max_wait_s > 0 and now - request.arrival_time > self._max_wait_s:
+            # Aged requests go oldest first, whatever their warmth.
+            return (_TIER_AGED, 0.0, request.arrival_time), warmth
+        else:
+            tier = _TIER_NORMAL
         return (tier, cold_tokens, request.arrival_time), warmth
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
@@ -106,7 +125,8 @@ class PrefixAwareScheduler(AsyncScheduler):
 
         window = list(islice(queue, self.WINDOW))
         head = window[0]
-        scored = [(self._rank_and_warmth(r), r) for r in window]
+        now = time.time()
+        scored = [(self._rank_and_warmth(r, now), r) for r in window]
         (best_rank, best_warmth), best = min(scored, key=lambda t: t[0][0])
 
         if best is not head and best_rank < scored[0][0][0]:

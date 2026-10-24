@@ -218,6 +218,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT: bool = True
     TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
     TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
+    VLLM_TPU_PREFIX_AWARE_MAX_WAIT_S: float = 0.0
     TPU_KV_STAGE_WAIT_TIMEOUT_SECS: float = 30.0
     TPU_KV_SHM_POOL_GB: float = 128.0
     TPU_KV_TRANSFER_NAMESPACE: str = ""
@@ -1670,6 +1671,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TEST-ONLY fault injection, in seconds; 0 disables it.
     "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S": env_float(
         "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0
+    ),
+    # PrefixAwareScheduler aging, in seconds: a ready request waiting longer
+    # than this is admitted ahead of warmer ones, oldest first; 0 disables it.
+    "VLLM_TPU_PREFIX_AWARE_MAX_WAIT_S": env_float(
+        "VLLM_TPU_PREFIX_AWARE_MAX_WAIT_S", 0.0
     ),
     # Seconds; non-positive falls back to 30 downstream.
     "TPU_KV_STAGE_WAIT_TIMEOUT_SECS": env_float("TPU_KV_STAGE_WAIT_TIMEOUT_SECS", 30.0),
