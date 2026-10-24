@@ -297,9 +297,15 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         x = self._norm(self.attn_norm, x)
         if self.seq_parallel:
+            # The views pin the row counts to the trace's own symbols (the
+            # token count T of `positions`, and the local count of the
+            # residual): the collectives' fakes return (T // tp) * tp and
+            # T // tp, and TorchTPU refuses an allocation sized by an
+            # expression it cannot resolve to an input dimension.
             sp_ops = self.__dict__["_sp_ops"]
-            x = self.attn(positions, sp_ops["ag"](x))
-            x = sp_ops["rs"](x)
+            n_local = x.shape[0]
+            x = self.attn(positions, sp_ops["ag"](x).view(positions.shape[0], -1))
+            x = sp_ops["rs"](x).view(n_local, -1)
         else:
             x = self.attn(positions, x)
 
@@ -644,7 +650,7 @@ class DeepseekV4Model(nn.Module):
                 aux_hidden_states.append(outs[1])
             hidden_states = self.norm(outs[0])
             hidden_states, aux_hidden_states = self._sp_gather(
-                hidden_states, aux_hidden_states
+                hidden_states, aux_hidden_states, positions.shape[0]
             )
             if aux_hidden_states:
                 return hidden_states, aux_hidden_states
@@ -675,18 +681,23 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
         hidden_states, aux_hidden_states = self._sp_gather(
-            hidden_states, aux_hidden_states
+            hidden_states, aux_hidden_states, positions.shape[0]
         )
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def _sp_gather(self, hidden_states, aux_hidden_states):
-        """Undo the sequence-parallel split on the backbone's outputs."""
+    def _sp_gather(self, hidden_states, aux_hidden_states, rows):
+        """Undo the sequence-parallel split on the backbone's outputs. `rows`
+        is the step's token count (an input dimension of the trace)."""
         if not self.seq_parallel:
             return hidden_states, aux_hidden_states
         ag = self.__dict__["_sp_ops"]["ag"]
-        return ag(hidden_states), [ag(a) for a in aux_hidden_states]
+
+        def gather(t):
+            return ag(t).view(rows, *t.shape[1:])
+
+        return gather(hidden_states), [gather(a) for a in aux_hidden_states]
 
     def _post_head_op(self, want_head: bool, want_mean: bool):
         """The fused post + head / aux-mean op; built in the runner's op
