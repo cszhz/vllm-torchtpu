@@ -33,6 +33,16 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import kv_cache_append
 # the staged lanes in VMEM, and DMAing the batch back to HBM.
 _SAL_MAX_WAVE = 128
 
+# Boundary tokens per grid step. The step's DMA issue and its dependent
+# compute chain are mostly latency, so more tokens per step amortize them.
+TILE_N = 8
+# HCA's window is 16x CSA's; at 16 tokens its double-buffered window block
+# alone overflows scoped VMEM.
+HCA_TILE_N = 8
+# Tokens a cache-row merge (`is_first_mask`) looks across: the 4-token groups
+# `prepare_boundary_batch` aligns rows to, as when a step held 4 tokens.
+MERGE_GROUP = 4
+
 
 def inner_kernel(
     cos_sin_vmem,
@@ -147,12 +157,13 @@ def inner_kernel(
                 def _merge_nope():
                     # only applicable to csa-indexer
                     # out_vmem shape: (tile_n, 1, 4, 256)
+                    group = _merge_group(n)
                     slots_val = out_vmem[n, 0]
                     out_vmem[n, 0] = compute.merge_slot_updates(
                         slots_val,
-                        kv_slots,
-                        nope_val_padded,
-                        n,
+                        kv_slots[group],
+                        nope_val_padded[group],
+                        n % MERGE_GROUP,
                     )
 
         else:
@@ -171,9 +182,16 @@ def inner_kernel(
 
                 @pl.when(is_first)
                 def _merge_rope():
+                    group = _merge_group(n)
                     row = pltpu.bitcast(rope_out_vmem[n], jnp.int32)  # (1, 128)
                     rope_out_vmem[n] = pltpu.bitcast(
-                        compute.merge_rope_row(row, kv_slots, words, rope_lane, n),
+                        compute.merge_rope_row(
+                            row,
+                            kv_slots[group],
+                            words[group],
+                            rope_lane,
+                            n % MERGE_GROUP,
+                        ),
                         jnp.uint8,
                     )
 
@@ -182,6 +200,12 @@ def inner_kernel(
         out_vmem[...] = pltpu.bitcast(
             normed.astype(cfgs.dims.nope_dtype), jnp.uint8
         ).reshape(tile_n, cfgs.record_rows, cfgs.hbm_pack, 128)
+
+
+def _merge_group(n: int) -> slice:
+    """The `MERGE_GROUP` tokens of the step whose rows token `n` merges."""
+    start = n // MERGE_GROUP * MERGE_GROUP
+    return slice(start, start + MERGE_GROUP)
 
 
 def kernel_fn(
@@ -379,21 +403,29 @@ def compress_norm_rope_store(
     assert block_table.ndim == 1
     assert block_table.shape[0] % block_table_stride == 0
 
-    num_tokens = positions.shape[0]
     head_dim = rms_weight.shape[0]
+    mode = _select_mode(head_dim, overlap)
+    tile_n = HCA_TILE_N if mode == config.Mode.HCA else TILE_N
+    # Every grid step reads tile_n tokens' scalars; pad so none reads past them.
+    pad = -positions.shape[0] % tile_n
+    if pad:
+        positions = jnp.pad(positions, (0, pad))
+        token_to_req_indices = jnp.pad(token_to_req_indices, (0, pad))
+        kv_slot_mapping = jnp.pad(kv_slot_mapping, (0, pad), constant_values=-1)
+    num_tokens = positions.shape[0]
     rope_head_dim = cos_sin_cache.shape[1] if cos_sin_cache is not None else 0
 
     state_operand = None if state_cache is None or state_cache is cache else state_cache
     state_source = cache if state_operand is None else state_operand
 
     cfgs = config.Configs.make(
-        _select_mode(head_dim, overlap),
+        mode,
         size_n=num_tokens,
         physical_page_size=cache.shape[1],
         state_physical_page_size=state_source.shape[1],
         state_block_size=state_block_size,
         rms_eps=rms_eps,
-        tile_n=4,
+        tile_n=tile_n,
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
@@ -430,12 +462,12 @@ def compress_norm_rope_store(
     else:
         is_first_mask = compute_is_first_mask(
             kv_slot_mapping,
-            cfgs.tile_sizes.tile_n,
+            MERGE_GROUP,
             pack_factor=cfgs.tokens_in_second_minor,
         )
         is_first_mask_rope = compute_is_first_mask(
             kv_slot_mapping,
-            cfgs.tile_sizes.tile_n,
+            MERGE_GROUP,
             # TODO: this is confusing, should probably find a better name for it
             pack_factor=cfgs.hbm_pack,
         )
