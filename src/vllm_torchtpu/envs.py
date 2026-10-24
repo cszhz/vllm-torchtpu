@@ -170,6 +170,7 @@ if TYPE_CHECKING:
     TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS: int = 512
     TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
     TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
+    TPU_DSV4_SEQ_PARALLEL: bool = False
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = True
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = True
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
@@ -1186,6 +1187,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS": env_int(
         "TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS", 32
     ),
+    # DeepSeek-V4 sequence parallelism over the TP group: the mHC residual
+    # stream, the mHC seams and the MoE (router, fused EP, a replicated shared
+    # expert) run on this rank's 1/tp of the tokens. Attention all-gathers its
+    # input and reduce-scatters its output (instead of one all-reduce), and the
+    # fused EP needs no restore all-gather or shared reduce-scatter.
+    "TPU_DSV4_SEQ_PARALLEL": env_bool("TPU_DSV4_SEQ_PARALLEL"),
     # DSpark greedy drafting: shard the Markov head over the vocabulary and
     # exchange per-rank (max, argmax) pairs instead of reading the replicated
     # full-vocabulary weight at every draft position.

@@ -26,6 +26,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_dp_group,
     get_pp_group,
+    get_tp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -65,7 +66,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op impo
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
-from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
+from vllm_torchtpu.models.vllm.deepseek_v4.moe import (
+    DeepseekV4MoE,
+    dsv4_sequence_parallel,
+)
 from vllm_torchtpu.utils import fresh_buffer, host_rss_gib, release_memory_to_os
 
 logger = init_logger(__name__)
@@ -80,6 +84,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list | None = None,
+        seq_parallel: bool | None = None,
     ):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -101,7 +106,23 @@ class DeepseekV4DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
         )
-        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        # Sequence parallel: the layer's residual stream holds this rank's
+        # 1/tp of the tokens; attention gathers its input and scatters its
+        # (TP-partial) output, so wo_b must not all-reduce. The DSpark draft
+        # layers (blocks of K + 1 rows) pass False.
+        self.seq_parallel = (
+            dsv4_sequence_parallel() if seq_parallel is None else seq_parallel
+        )
+        self.ffn = DeepseekV4MoE(
+            vllm_config, prefix=f"{prefix}.ffn", seq_parallel=self.seq_parallel
+        )
+        if self.seq_parallel:
+            if envs.TPU_DSV4_ATTN_INTRA_CHIP_TP:
+                raise ValueError(
+                    "TPU_DSV4_SEQ_PARALLEL and TPU_DSV4_ATTN_INTRA_CHIP_TP are "
+                    "exclusive"
+                )
+            self.attn.wo_b.reduce_results = False
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -268,7 +289,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         x = self._norm(self.attn_norm, x)
-        x = self.attn(positions, x)
+        if self.seq_parallel:
+            group = get_tp_group()
+            x = self.attn(positions, group.all_gather(x, dim=0))
+            x = group.reduce_scatter(x, dim=0)
+        else:
+            x = self.attn(positions, x)
 
         residual, post_mix, res_mix, x = self.mhc_ops.fused(
             x,
@@ -438,6 +464,23 @@ class DeepseekV4Model(nn.Module):
         # ``DeepseekV4ForCausalLM.set_aux_hidden_state_layers`` before warmup.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
+        # TPU_DSV4_SEQ_PARALLEL: the layers run on this rank's 1/tp of the
+        # tokens (contiguous block `tp_rank`); the outputs are gathered back.
+        self.seq_parallel = dsv4_sequence_parallel()
+        if self.seq_parallel and get_pp_group().world_size > 1:
+            raise ValueError("TPU_DSV4_SEQ_PARALLEL does not support PP")
+
+    def _sp_local_rows(self, tensors, rank):
+        """This rank's contiguous 1/tp block of each tensor's rows. The rank is
+        device data, so every TP rank traces the same graph."""
+        tp = get_tp_group().world_size
+        return [
+            None
+            if t is None
+            else t.reshape(tp, -1, *t.shape[1:]).index_select(0, rank)[0]
+            for t in tensors
+        ]
+
     @property
     def mhc_post_op(self):
         """The op that settles the post the last decoder layer deferred.
@@ -516,6 +559,13 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            if self.seq_parallel:
+                from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (  # noqa: E501
+                    tp_rank_as_data,
+                )
+
+                sp_rank = tp_rank_as_data(get_tp_group(), hidden_states.device)
+                (hidden_states,) = self._sp_local_rows([hidden_states], sp_rank)
             hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
@@ -528,6 +578,8 @@ class DeepseekV4Model(nn.Module):
         moe_input_ids = input_ids
         if input_ids is not None and self.start_layer < self.config.num_hash_layers:
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
+            if self.seq_parallel:
+                (moe_input_ids,) = self._sp_local_rows([moe_input_ids], sp_rank)
 
         residual, post_mix, res_mix = None, None, None
         # The fused tail needs the head here and at least one layer to defer
@@ -578,6 +630,9 @@ class DeepseekV4Model(nn.Module):
             if want_mean:
                 aux_hidden_states.append(outs[1])
             hidden_states = self.norm(outs[0])
+            hidden_states, aux_hidden_states = self._sp_gather(
+                hidden_states, aux_hidden_states
+            )
             if aux_hidden_states:
                 return hidden_states, aux_hidden_states
             return hidden_states
@@ -606,9 +661,21 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        hidden_states, aux_hidden_states = self._sp_gather(
+            hidden_states, aux_hidden_states
+        )
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def _sp_gather(self, hidden_states, aux_hidden_states):
+        """Undo the sequence-parallel split on the backbone's outputs."""
+        if not self.seq_parallel:
+            return hidden_states, aux_hidden_states
+        group = get_tp_group()
+        return group.all_gather(hidden_states, dim=0), [
+            group.all_gather(a, dim=0) for a in aux_hidden_states
+        ]
 
     def _post_head_op(self, want_head: bool, want_mean: bool):
         """The fused post + head / aux-mean op; built in the runner's op
