@@ -441,6 +441,47 @@ def _compact_writeback_slot_ids_for_cache_rank(
     return compact_slots.at[offsets].set(slots, mode="drop")
 
 
+def _compute_pcp_capture_source_rows_for_cache_rank(
+    kv_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    cache_rank: int | jax.Array,
+    *,
+    local_tokens: int,
+    pcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Rank-major source row for each capture offset owned by cache_rank.
+
+    Uses the same capture offsets as _compute_misaligned_writeback_slots, so
+    captured row i lands in compact writeback slot i.
+    """
+    rank_major_query_rows = _compute_pcp_rank_major_query_row_mapping_from_metadata(
+        kv_lens,
+        cu_q_lens,
+        distribution,
+        local_padded_tokens=local_tokens,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+    )
+    # Capture offsets ignore block tables, so one dummy block suffices.
+    wb_mapping = _compute_pcp_kv_writeback_mapping(
+        rank_major_query_rows,
+        jnp.zeros((int(kv_lens.shape[0]), 1), dtype=jnp.int32),
+        local_kv_cache_num_blocks=1,
+        page_size=interleave_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+    )
+    num_rows = pcp_size * local_tokens
+    owned = wb_mapping.cache_owner_ranks == jnp.asarray(cache_rank, dtype=jnp.int32)
+    offsets = jnp.where(owned, wb_mapping.capture_offsets, local_tokens)
+    rows = jnp.where(owned, jnp.arange(num_rows, dtype=jnp.int32), -1)
+    source_rows = jnp.full((local_tokens,), -1, dtype=jnp.int32)
+    source_rows = source_rows.at[offsets].set(rows, mode="drop")
+    return jnp.clip(source_rows, 0, num_rows - 1), source_rows >= 0
+
+
 def _build_writeback_segment_descriptors(
     compact_slot_ids: jax.Array,
     writeback_count: jax.Array,

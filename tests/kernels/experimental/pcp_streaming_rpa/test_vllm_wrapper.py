@@ -20,6 +20,9 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import kernel as pcp_kernel
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import (
+    stage_plan as pcp_stage_plan,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import wrapper as pcp_wrapper
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
     build_pcp_rank_major_token_order,
@@ -862,3 +865,91 @@ def test_metadata_entry_caps_stacked_q_heads_at_q_per_kv(
 
     assert captured["num_stacked_q_heads"] == expected_stacked
     assert q_per_kv % captured["num_stacked_q_heads"] == 0
+
+
+@pytest.mark.parametrize(
+    ("q_lens", "hist_lens"),
+    [
+        ([192], [301]),
+        ([95, 95], [0, 0]),
+        ([96, 96], [0, 0]),
+        ([97, 97], [0, 0]),
+        ([127, 127], [0, 0]),
+    ],
+)
+def test_capture_source_rows_follow_token_cache_owner(q_lens, hist_lens):
+    pcp_size, interleave_size, local_tokens, max_num_seqs = 2, 32, 128, 2
+    pad = max_num_seqs - len(q_lens)
+    cu_q_lens = jnp.asarray(
+        np.concatenate([[0], np.cumsum(q_lens + [0] * pad)]), dtype=jnp.int32
+    )
+    kv_lens = jnp.asarray(
+        [h + q for h, q in zip(hist_lens, q_lens)] + [0] * pad, dtype=jnp.int32
+    )
+    distribution = jnp.asarray([0, 0, len(q_lens)], dtype=jnp.int32)
+    rows = pcp_stage_plan._compute_pcp_rank_major_query_row_mapping_from_metadata(
+        kv_lens,
+        cu_q_lens,
+        distribution,
+        local_padded_tokens=local_tokens,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+    )
+    positions = np.asarray(rows.absolute_positions)
+    requests = np.asarray(rows.request_indices)
+    seen = []
+    for rank in range(pcp_size):
+        src, valid = pcp_kernel._compute_pcp_capture_source_rows_for_cache_rank(
+            kv_lens,
+            cu_q_lens,
+            distribution,
+            rank,
+            local_tokens=local_tokens,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+        )
+        src = np.asarray(src)[np.asarray(valid)]
+        expected = [
+            (r, p)
+            for r, (h, q) in enumerate(zip(hist_lens, q_lens))
+            for p in range(h, h + q)
+            if (p // interleave_size) % pcp_size == rank
+        ]
+        actual = [(int(r), int(p)) for r, p in zip(requests[src], positions[src])]
+        assert actual == expected
+        seen.extend(src.tolist())
+    assert len(seen) == len(set(seen)) == sum(q_lens)
+
+
+def test_gather_vpage_group_zeroes_unwritten_fp8_slots(monkeypatch):
+    nan = jnp.asarray(0x7F, dtype=jnp.uint8).view(jnp.float8_e4m3fn)
+    tokens = jnp.arange(16)[None, :, None]
+    raw = jnp.broadcast_to(
+        jnp.where(tokens < 5, jnp.asarray(1.5, dtype=jnp.float8_e4m3fn), nan),
+        (1, 16, 128),
+    )
+    monkeypatch.setattr(
+        pcp_kernel, "_gather_vpages_to_head_major", lambda *_a, **_k: (raw, raw)
+    )
+    plan = SimpleNamespace(
+        sorted_block_ids=jnp.asarray([0, 1], dtype=jnp.int32),
+        sorted_seg_ids=jnp.asarray([0, -1], dtype=jnp.int32),
+        sorted_vpage_valid_tokens=jnp.asarray([5, 0], dtype=jnp.int32),
+    )
+    k_hm, v_hm, kv_seg_ids = pcp_kernel._gather_vpage_group_kv_and_seg(
+        jnp.zeros((2, 4, 1, 4, 128), dtype=jnp.float8_e4m3fn),
+        plan,
+        0,
+        2,
+        kv_heads=1,
+        head_dim=128,
+        page_size=4,
+        pcp_size=2,
+        interleave_size=2,
+        kv_layout=pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE,
+        pcp_axis_name="pcp",
+    )
+    assert not bool(jnp.isnan(k_hm.astype(jnp.float32)).any())
+    assert not bool(jnp.isnan(v_hm.astype(jnp.float32)).any())
+    assert bool((k_hm[:, :5].astype(jnp.float32) == 1.5).all())
+    assert int((kv_seg_ids == 0).sum()) == 5

@@ -53,6 +53,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.stage_plan import (
     PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS,
     PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
+    _compute_pcp_capture_source_rows_for_cache_rank,
 )
 
 AXIS = "pcp"
@@ -2520,6 +2521,12 @@ def _gather_vpage_group_kv_and_seg(
         pcp_axis_name=pcp_axis_name,
     )
     token_in_vpage = lax.broadcasted_iota(jnp.int32, (group_size, virtual_page_size), 1)
+    # Unwritten slots may hold NaN (fp8 pools are torch.empty); s @ v would
+    # spread it through zero softmax weights, so zero them here.
+    kv_valid = (token_in_vpage < valid_tokens[:, None]) & (seg_ids[:, None] >= 0)
+    kv_valid = kv_valid.reshape(1, group_size * virtual_page_size, 1)
+    k_hm = jnp.where(kv_valid, k_hm, jnp.zeros((), dtype=k_hm.dtype))
+    v_hm = jnp.where(kv_valid, v_hm, jnp.zeros((), dtype=v_hm.dtype))
     kv_seg_ids = jnp.where(
         token_in_vpage < valid_tokens[:, None], seg_ids[:, None], -2
     ).reshape(group_size * virtual_page_size)
@@ -2887,14 +2894,6 @@ def _causal_mask_function(q_ids: jax.Array, kv_ids: jax.Array) -> jax.Array:
     return q_ids >= kv_ids
 
 
-def _rank_chunk_count_before(
-    chunk_pos: jax.Array, rank: jax.Array, pcp_size: int
-) -> jax.Array:
-    full_cycles = chunk_pos // pcp_size
-    rem = chunk_pos - full_cycles * pcp_size
-    return full_cycles + jnp.clip(rem - rank, 0, 1)
-
-
 def _route_current_kv_to_captured_kv(
     current_kv_local: jax.Array,
     cu_q_lens: jax.Array,
@@ -2902,115 +2901,39 @@ def _route_current_kv_to_captured_kv(
     distribution: jax.Array,
     *,
     local_tokens: int,
-    max_num_seqs: int,
     pcp_size: int,
     interleave_size: int,
     kv_layout: KVLayout,
     pcp_axis_name: str,
 ) -> jax.Array:
-    """Routes current_kv_local to cache-owner captured_kv_local.
-
-    The caller checks alignment.
-    """
-    active_reqs = jnp.clip(distribution[2], 0, max_num_seqs)
-    req_ids = lax.broadcasted_iota(jnp.int32, (max_num_seqs,), 0)
-    q_starts = cu_q_lens[:max_num_seqs]
-    q_ends = cu_q_lens[1 : max_num_seqs + 1]
-    q_len_raw = q_ends - q_starts
-    req_active = jnp.logical_and(req_ids < active_reqs, q_len_raw > 0)
-    q_lens = jnp.where(req_active, q_len_raw, 0)
-    total_kv_lens = jnp.where(req_active, kv_lens[:max_num_seqs], 0)
-    hist_tokens = jnp.maximum(total_kv_lens - q_lens, 0)
-
-    num_local_chunks = local_tokens // interleave_size
-    num_total_chunks = pcp_size * num_local_chunks
-    ranks = lax.broadcasted_iota(jnp.int32, (1, pcp_size), 1)
-    q_starts_c = (q_starts // interleave_size)[:, None]
-    q_ends_c = (q_ends // interleave_size)[:, None]
-    hist_c = (hist_tokens // interleave_size)[:, None]
-    kv_ends_c = (total_kv_lens // interleave_size)[:, None]
-
-    local_c_counts = jnp.where(
-        req_active[:, None],
-        _rank_chunk_count_before(q_ends_c, ranks, pcp_size)
-        - _rank_chunk_count_before(q_starts_c, ranks, pcp_size),
-        0,
-    )
-    local_c_ends = jnp.cumsum(local_c_counts, axis=0)
-    local_c_starts = local_c_ends - local_c_counts
-
+    """Routes current_kv_local rows to this cache rank's captured rows by token."""
     my_rank = _get_pcp_rank_without_axis_index(pcp_axis_name, pcp_size)
-    wb_k0 = _rank_chunk_count_before(hist_c[:, 0], my_rank, pcp_size)
-    wb_c_counts = jnp.where(
-        req_active,
-        _rank_chunk_count_before(kv_ends_c[:, 0], my_rank, pcp_size) - wb_k0,
-        0,
+    src_rows, row_valid = _compute_pcp_capture_source_rows_for_cache_rank(
+        kv_lens,
+        cu_q_lens,
+        distribution,
+        my_rank,
+        local_tokens=local_tokens,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
     )
-    wb_c_ends = jnp.cumsum(wb_c_counts, axis=0)
-    wb_c_starts = wb_c_ends - wb_c_counts
-
-    d_c = lax.broadcasted_iota(jnp.int32, (num_local_chunks, 1), 0)
-    in_req = jnp.logical_and(
-        req_active[None, :],
-        jnp.logical_and(d_c >= wb_c_starts[None, :], d_c < wb_c_ends[None, :]),
-    )
-    d_req = jnp.clip(
-        jnp.sum(jnp.where(in_req, req_ids[None, :] + 1, 0), axis=1) - 1,
-        0,
-        max_num_seqs - 1,
-    )
-    d_valid = jnp.any(in_req, axis=1)
-    m_wb = d_c[:, 0] - wb_c_starts[d_req]
-    abs_c = (wb_k0[d_req] + m_wb) * pcp_size + my_rank
-    g_c = q_starts_c[d_req, 0] + (abs_c - hist_c[d_req, 0])
-    src_rank = jnp.mod(g_c, pcp_size)
-    src_k0 = _rank_chunk_count_before(q_starts_c[d_req, 0], src_rank, pcp_size)
-    req_one_hot = d_req[:, None] == req_ids[None, :]
-    rank_one_hot = src_rank[:, None] == ranks
-    src_c_start = jnp.sum(
-        jnp.where(
-            req_one_hot[:, :, None] & rank_one_hot[:, None, :],
-            local_c_starts[None, :, :],
-            0,
-        ),
-        axis=(1, 2),
-    )
-    src_c = src_c_start + (g_c // pcp_size - src_k0)
-    flat_src_c = jnp.where(
-        d_valid,
-        jnp.clip(src_rank * num_local_chunks + src_c, 0, num_total_chunks - 1),
-        0,
-    )
-    onehot = flat_src_c[:, None] == lax.broadcasted_iota(
-        jnp.int32, (num_local_chunks, num_total_chunks), 1
-    )
+    zero = jnp.zeros((), dtype=current_kv_local.dtype)
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
-        kv_c = current_kv_local.reshape(
-            *current_kv_local.shape[:-1], num_local_chunks, interleave_size
+        # Tokens are the minor axis; lanes past local_tokens are padding.
+        all_kv = lax.all_gather(
+            current_kv_local[..., :local_tokens],
+            axis_name=pcp_axis_name,
+            axis=-1,
+            tiled=True,
         )
-        all_kv_c = lax.all_gather(kv_c, axis_name=pcp_axis_name, axis=-2, tiled=True)
-        sel = jnp.sum(
-            jnp.where(
-                onehot[None, None, None, :, :, None],
-                all_kv_c[:, :, :, None, :, :],
-                jnp.zeros((1,), dtype=current_kv_local.dtype),
-            ),
-            axis=-2,
-        )
-        return sel.reshape(current_kv_local.shape)
-    kv_c = current_kv_local.reshape(
-        num_local_chunks, interleave_size, *current_kv_local.shape[1:]
+        captured = jnp.where(row_valid, all_kv[..., src_rows], zero)
+        pad = current_kv_local.shape[-1] - local_tokens
+        return jnp.pad(captured, [(0, 0)] * (captured.ndim - 1) + [(0, pad)])
+    all_kv = lax.all_gather(
+        current_kv_local, axis_name=pcp_axis_name, axis=0, tiled=True
     )
-    all_kv_c = lax.all_gather(kv_c, axis_name=pcp_axis_name, axis=0, tiled=True)
-    sel = jnp.sum(
-        jnp.where(
-            onehot[:, :, None, None, None, None],
-            all_kv_c[None, :, :, :, :, :],
-            jnp.zeros((1,), dtype=current_kv_local.dtype),
-        ),
-        axis=1,
-    )
-    return sel.reshape(current_kv_local.shape)
+    row_valid = row_valid.reshape((local_tokens,) + (1,) * (current_kv_local.ndim - 1))
+    return jnp.where(row_valid, all_kv[src_rows], zero)
 
 
 def pcp_streaming_attention_page_groups_packed_local_from_metadata(
@@ -3073,7 +2996,6 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
 
     local_tokens, kv_heads, q_per_kv, head_dim = q_local.shape
     q_heads = kv_heads * q_per_kv
-    max_num_seqs = int(kv_lens.shape[0])
 
     captured_kv_local = lax.cond(
         stage_plan.needs_reroute,
@@ -3083,7 +3005,6 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
             kv_lens,
             distribution,
             local_tokens=local_tokens,
-            max_num_seqs=max_num_seqs,
             pcp_size=pcp_size,
             interleave_size=interleave_size,
             kv_layout=kv_layout,
