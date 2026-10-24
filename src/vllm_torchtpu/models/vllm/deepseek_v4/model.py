@@ -184,6 +184,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 opts=self.mhc_opts,
             )
             object.__setattr__(self, "_mhc_ops_instance", ops)
+            if self.seq_parallel:
+                # Built outside the trace alongside the mHC ops.
+                from vllm_torchtpu.models.vllm.deepseek_v4.seq_parallel import (
+                    build_sp_ops,
+                )
+
+                object.__setattr__(self, "_sp_ops", build_sp_ops())
         return ops
 
     def split_hc_fns(self) -> None:
@@ -290,9 +297,9 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         x = self._norm(self.attn_norm, x)
         if self.seq_parallel:
-            group = get_tp_group()
-            x = self.attn(positions, group.all_gather(x, dim=0))
-            x = group.reduce_scatter(x, dim=0)
+            sp_ops = self.__dict__["_sp_ops"]
+            x = self.attn(positions, sp_ops["ag"](x))
+            x = sp_ops["rs"](x)
         else:
             x = self.attn(positions, x)
 
@@ -493,6 +500,12 @@ class DeepseekV4Model(nn.Module):
         if op is None:
             op = get_mhc_post_op()
             object.__setattr__(self, "_mhc_post_op_instance", op)
+            if getattr(self, "seq_parallel", False):
+                from vllm_torchtpu.models.vllm.deepseek_v4.seq_parallel import (
+                    build_sp_ops,
+                )
+
+                object.__setattr__(self, "_sp_ops", build_sp_ops())
         return op
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -672,10 +685,8 @@ class DeepseekV4Model(nn.Module):
         """Undo the sequence-parallel split on the backbone's outputs."""
         if not self.seq_parallel:
             return hidden_states, aux_hidden_states
-        group = get_tp_group()
-        return group.all_gather(hidden_states, dim=0), [
-            group.all_gather(a, dim=0) for a in aux_hidden_states
-        ]
+        ag = self.__dict__["_sp_ops"]["ag"]
+        return ag(hidden_states), [ag(a) for a in aux_hidden_states]
 
     def _post_head_op(self, want_head: bool, want_mean: bool):
         """The fused post + head / aux-mean op; built in the runner's op
