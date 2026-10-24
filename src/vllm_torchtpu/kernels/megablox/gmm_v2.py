@@ -1476,11 +1476,14 @@ def gmm_v2(
 
 # Calls with at least this many lhs rows (prefill) run fused.
 FUSED_MIN_SIZE_M = 16384
-# The m tile both matmuls run on, and its m-bucket granularity. Every bucket
-# is a separate unrolled body of both matmuls, so the bucket count sets the
-# kernel's code size.
+# The m tile both matmuls run on and its m-bucket ladder: FUSED_BUCKET_BASE,
+# then steps of FUSED_BUCKET_STEP up to FUSED_TILE_M. Every bucket is a
+# separate unrolled body of both matmuls, ~49 bundles per row plus ~1.8k, so
+# the ladder's summed rows set the kernel's code size; 160..256 keeps it at
+# golden's gate/up size (~46k bundles).
 FUSED_TILE_M = 256
-FUSED_BUCKET_BASE = 128
+FUSED_BUCKET_BASE = 160
+FUSED_BUCKET_STEP = 32
 # Weight buffers per matmul: 3 fetches each expert two gm steps ahead, as
 # gmm_v2 does.
 FUSED_WEIGHT_BUFFER_COUNT = 3
@@ -1645,6 +1648,7 @@ def _fused_tiles(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act):
         tile_k=dims.size_k,
         tile_n=out_size_n,
         bucket_base=FUSED_BUCKET_BASE,
+        bucket_step=FUSED_BUCKET_STEP,
     )
 
 
@@ -1718,7 +1722,9 @@ def plan_fusion(
     cfgs2 = configs(mid, w2, w2_scale, w2_bias, out_dtype=out_dtype, fuse_act=None)
 
     num_lanes = pltpu.get_tpu_info().num_lanes
-    tile_m = cfgs1.tiles.tile_m
+    tiles = cfgs1.tiles
+    tile_m = tiles.tile_m
+    sublane = cfgs1.dims.size_lhs_sublane
     fusable = (
         cfgs1.out_size_n == size_k2
         and cfgs1.acc_dtype == cfgs2.acc_dtype
@@ -1727,7 +1733,8 @@ def plan_fusion(
         and cfgs1.dims.size_m % cfgs1.dims.size_lhs_sublane == 0
         and tile_m <= cfgs1.dims.size_m
         and tile_m % cfgs1.dims.size_lhs_sublane == 0
-        and tile_m % cfgs1.tiles.bucket_base == 0
+        and tiles.bucket_sizes[-1] == tile_m
+        and all(bucket_m % sublane == 0 for bucket_m in tiles.bucket_sizes)
         and all(
             cfgs.out_size_n % num_lanes == 0 and cfgs.dims.size_k % num_lanes == 0
             for cfgs in (cfgs1, cfgs2)
@@ -1742,7 +1749,7 @@ def get_fused_scope_name(cfgs1: GmmConfigs, cfgs2: GmmConfigs) -> str:
     return (
         f"gmm_v2_fused-g_{d1.size_group}-m_{d1.size_m}-k1_{d1.size_k}"
         f"-n1_{d1.size_n}-act_{cfgs1.fuse_act}-k2_{d2.size_k}-n2_{d2.size_n}"
-        f"-tm_{tiles.tile_m}-bb_{tiles.bucket_base}"
+        f"-tm_{tiles.tile_m}-bb_{tiles.bucket_base}-bs_{tiles.bucket_step}"
     )
 
 
