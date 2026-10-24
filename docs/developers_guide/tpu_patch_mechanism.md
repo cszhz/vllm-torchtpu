@@ -95,12 +95,16 @@ instead. A diffusion worker runs `diffusion_worker` and then
 `_configure_torchtpu_eager_mode`, list `diffusion_worker` to make that
 dependency explicit.
 
-Model-specific diffusion patches live in `src/vllm_torchtpu/omni/patches.py`.
-Each callback accepts `od_config` and returns `False` unless
-`od_config.model_class_name` is one of the vLLM-Omni pipelines that build the
-patched classes (keys of `vllm_omni/diffusion/registry.py`). Import the
-patched module after that check, so that only the served model's module is
-imported. Register the callback under the model-specific diffusion section:
+Diffusion patches live in `src/vllm_torchtpu/omni/patches.py`. Register a
+patch to a shared layer module, such as `_patch_wan_pair_swap_rope`, at
+`diffusion_worker` for every model when it is safe for every user of the
+patched class. A model-specific callback accepts `od_config` and returns
+`False` unless `od_config.model_class_name` is one of the vLLM-Omni pipelines
+that build the patched classes (keys of `vllm_omni/diffusion/registry.py`).
+Import the patched module after that check, so that only the served model's
+module is imported. Add a new pipeline set to `_PATCHED_PIPELINES` and to
+`tests_omni/test_patch_pipelines.py`, which compares the sets with the real
+registry. Register the callback under the model-specific diffusion section:
 
 ```python
 Patch(
@@ -109,6 +113,15 @@ Patch(
     od_config=True,
 ),
 ```
+
+After the `diffusion_model_load` pass, `OmniTpuPlatform` logs
+`No model-specific TPU diffusion patch applies to pipeline <name>.` at INFO
+when the served pipeline is in no set. `OmniTpuPlatform.get_diffusion_attn_backend_cls`
+logs a warning when it runs in a process that entered neither
+`diffusion_model_load` nor `worker_init`, which means that vLLM-Omni built the
+pipeline without calling `init_diffusion_model_runner_runtime`.
+`patch_registry.entered(stage)` reports whether a stage was applied in the
+process.
 
 ## Completion, retries, and model selection
 

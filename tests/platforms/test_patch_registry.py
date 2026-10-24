@@ -221,6 +221,16 @@ def test_invalid_stage_is_rejected(registry):
         reg.apply("worker")
 
 
+def test_entered_reports_applied_stages(registry):
+    reg, _ = registry
+    reg.apply("diffusion_worker")
+    with pytest.raises(ValueError, match="Unknown TPU patch stage"):
+        reg.apply("worker")
+    assert reg.entered("diffusion_worker") is True
+    assert reg.entered("diffusion_model_load") is False
+    assert reg.entered("worker") is False
+
+
 def test_manifest_preserves_lifecycle_dependencies():
     reg = _load_registry()
     targets = [p.target for p in reg.PATCHES]
@@ -265,10 +275,10 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_configure_torchtpu_eager_mode",
         "_patch_diffusion_ipc_cpu_pack",
         "_patch_diffusion_startup_warmup_sync",
+        "_patch_wan_pair_swap_rope",
     ]
     assert stages["diffusion_model_load"] == [
         "_patch_qwen_image_rope_txt_freqs_clone",
-        "_patch_wan_pair_swap_rope",
         "_patch_wan_ffn_gelu_fence",
         "_patch_wan_fused_qk_norm_rope",
         "_patch_wan_fresh_timestep",

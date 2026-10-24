@@ -18,7 +18,8 @@ applies these patches at the diffusion stages that OmniTpuPlatform enters:
 omni_platform, diffusion_worker and diffusion_model_load. Model-specific
 patches take od_config and return False unless od_config.model_class_name
 names a pipeline that builds the patched classes, so a model's module is only
-imported when that model is served.
+imported when that model is served. Patches to shared layer modules run at
+diffusion_worker for every model.
 """
 
 from functools import cache as run_once
@@ -56,15 +57,22 @@ _WAN_PIPELINES = frozenset(
         "CausVidWanPipeline",
     }
 )
-# LingBot-World and ABot-World build their own blocks around RotaryEmbeddingWan.
-_WAN_ROPE_PIPELINES = _WAN_PIPELINES | {
-    "LingBotWorldCausalDMDPipeline",
-    "ABotWorldCausalPipeline",
-}
+# Every pipeline that some model-specific patch above applies to.
+_PATCHED_PIPELINES = _QWEN_IMAGE_PIPELINES | _WAN_PIPELINES
 
 
 def _serves(od_config: "OmniDiffusionConfig | None", pipelines: frozenset[str]) -> bool:
     return od_config is not None and od_config.model_class_name in pipelines
+
+
+def log_unpatched_pipeline(od_config: "OmniDiffusionConfig | None") -> None:
+    """Logs the served pipeline when no model-specific TPU patch applies to it."""
+    if _serves(od_config, _PATCHED_PIPELINES):
+        return
+    logger.info(
+        "No model-specific TPU diffusion patch applies to pipeline %s.",
+        None if od_config is None else od_config.model_class_name,
+    )
 
 
 @run_once
@@ -168,9 +176,7 @@ def _clone_txt_freqs(forward: Any) -> Any:
     return _forward
 
 
-def _patch_wan_pair_swap_rope(
-    od_config: "OmniDiffusionConfig | None" = None,
-) -> bool | None:
+def _patch_wan_pair_swap_rope() -> None:
     # -------------------------------------------------------------------------
     # TODO: Remove this patch once torch_tpu lowers size-2 minor unflatten/stack
     # without relayouts, or vLLM-Omni's CustomOp gains an out-of-tree dispatch
@@ -188,9 +194,11 @@ def _patch_wan_pair_swap_rope(
     #
     # Complex sliced views crash on TPU under inference mode, which rules
     # out the complex-number RoPE form.
+    #
+    # Scope: every model. RotaryEmbeddingWan lives in a shared layer module,
+    # and the replacement falls back to _forward_method for calls that are not
+    # interleaved, not half-dim or not bf16.
     # -------------------------------------------------------------------------
-    if not _serves(od_config, _WAN_ROPE_PIPELINES):
-        return False
     from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 
     from vllm_torchtpu.omni.rope import rotary_embedding_wan_forward

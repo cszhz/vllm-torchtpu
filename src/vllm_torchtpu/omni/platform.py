@@ -14,16 +14,21 @@
 """TPU platform plugin for vllm-omni."""
 
 import os
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
 from torch_tpu._internal.utils import hardware
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 from vllm_torchtpu import patch_registry
 from vllm_torchtpu.env_override import set_libtpu_flag_default
+from vllm_torchtpu.omni.patches import log_unpatched_pipeline
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
 
@@ -51,19 +56,20 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         patch_registry.apply("omni_platform")
 
     @classmethod
-    def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
+    def init_diffusion_worker_vllm_config(cls, vllm_config: VllmConfig) -> None:
         super().init_diffusion_worker_vllm_config(vllm_config)
         patch_registry.apply("diffusion_worker")
 
     @classmethod
     def init_diffusion_model_runner_runtime(
         cls,
-        vllm_config: Any,
-        od_config: Any,
+        vllm_config: VllmConfig,
+        od_config: "OmniDiffusionConfig",
         device: torch.device,
     ) -> None:
         super().init_diffusion_model_runner_runtime(vllm_config, od_config, device)
         patch_registry.apply("diffusion_model_load", od_config=od_config)
+        log_unpatched_pipeline(od_config)
 
     @classmethod
     def get_diffusion_attn_backend_cls(
@@ -72,6 +78,19 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         head_size: int,
         allow_trtllm_default: bool = False,
     ) -> str:
+        # TPUWorker processes (e.g. GENERATION stages) also build diffusion
+        # attention layers; they enter worker_init, not the diffusion stages.
+        if not (
+            patch_registry.entered("diffusion_model_load")
+            or patch_registry.entered("worker_init")
+        ):
+            logger.warning_once(
+                "Diffusion attention is being built before the "
+                "diffusion_model_load TPU patch stage ran in this process, so "
+                "no model-specific diffusion patch is applied. Check that "
+                "vLLM-Omni calls OmniPlatform.init_diffusion_model_runner_runtime "
+                "before it builds the pipeline."
+            )
         if selected_backend is not None and selected_backend.upper() in (
             "SDPA",
             "TPU_SDPA",

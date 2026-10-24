@@ -92,6 +92,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import (
 
 from vllm_torchtpu import patch_registry
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.omni.patches import _patch_wan_pair_swap_rope
 from vllm_torchtpu.omni.rope import can_fuse_qk_norm_rope
 
 logger = init_logger(__name__)
@@ -267,7 +268,7 @@ ROPE_FREQS_ATOL = 1e-4
 
 
 def test_wan_rotary_embedding_pair_swap_bit_exact_on_tpu() -> None:
-    _apply_model_patches()
+    _patch_wan_pair_swap_rope()
 
     torch.manual_seed(42)
     rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)

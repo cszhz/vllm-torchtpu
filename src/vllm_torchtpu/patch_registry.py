@@ -184,15 +184,14 @@ PATCHES = (
         "vllm_torchtpu.omni.patches:_patch_diffusion_startup_warmup_sync",
         ("diffusion_worker",),
     ),
+    Patch(
+        "vllm_torchtpu.omni.patches:_patch_wan_pair_swap_rope",
+        ("diffusion_worker",),
+    ),
     # Model-specific diffusion patches. Append new ones here with
     # stages=("diffusion_model_load",) and od_config=True.
     Patch(
         "vllm_torchtpu.omni.patches:_patch_qwen_image_rope_txt_freqs_clone",
-        ("diffusion_model_load",),
-        od_config=True,
-    ),
-    Patch(
-        "vllm_torchtpu.omni.patches:_patch_wan_pair_swap_rope",
         ("diffusion_model_load",),
         od_config=True,
     ),
@@ -216,6 +215,7 @@ PATCHES = (
 _applied: set[str] = set()
 _applying: set[str] = set()
 _active_stages: set[Stage] = set()
+_entered_stages: set[Stage] = set()
 _lock = RLock()
 _logger = logging.getLogger("vllm." + __name__)
 
@@ -255,6 +255,7 @@ def apply(
     if stage not in get_args(Stage):
         raise ValueError(f"Unknown TPU patch stage: {stage}")
     with _lock:
+        _entered_stages.add(stage)
         if stage in _active_stages:
             return
         _active_stages.add(stage)
@@ -287,3 +288,8 @@ def apply(
                 _logger.info(
                     "Completed TPU patch callbacks at %s: %s", stage, ", ".join(applied)
                 )
+
+
+def entered(stage: Stage) -> bool:
+    """Returns whether `apply` has been called for `stage` in this process."""
+    return stage in _entered_stages

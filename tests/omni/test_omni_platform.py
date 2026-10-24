@@ -14,12 +14,13 @@
 import os
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
 
 from .mock_omni import (  # isort: split
+    _MockColumnParallelGELU,
     _MockRMSNorm,
     _MockRotaryEmbeddingWan,
     vllm_omni_mock,
@@ -29,6 +30,8 @@ import vllm_omni
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu import patch_registry
+from vllm_torchtpu.omni import patches as omni_patches
+from vllm_torchtpu.omni import platform as omni_platform
 from vllm_torchtpu.omni import register_omni_tpu_platform
 from vllm_torchtpu.omni import rope as omni_rope
 from vllm_torchtpu.omni.attention import (
@@ -137,9 +140,8 @@ def test_diffusion_model_load_patches_only_the_served_model(monkeypatch):
     qwen_forwards = [rope_cls.forward for rope_cls in qwen_ropes]
     for rope_cls in qwen_ropes:
         monkeypatch.setattr(rope_cls, "forward", rope_cls.forward)
-    monkeypatch.setattr(
-        _MockRotaryEmbeddingWan, "forward", _MockRotaryEmbeddingWan.forward
-    )
+    gelu_forward = _MockColumnParallelGELU.forward
+    monkeypatch.setattr(_MockColumnParallelGELU, "forward", gelu_forward)
     with monkeypatch.context() as blocked:
         # Wan modules are unimportable here, so loading Qwen-Image only
         # succeeds if no Wan patch imports them.
@@ -152,14 +154,70 @@ def test_diffusion_model_load_patches_only_the_served_model(monkeypatch):
         rope_cls.forward is not forward
         for rope_cls, forward in zip(qwen_ropes, qwen_forwards, strict=True)
     )
-    assert _MockRotaryEmbeddingWan.forward is not rotary_embedding_wan_forward
+    assert _MockColumnParallelGELU.forward is gelu_forward
 
+    OmniTpuPlatform.init_diffusion_model_runner_runtime(None, _WAN, torch.device("cpu"))
+    assert _MockColumnParallelGELU.forward is not gelu_forward
+
+
+@pytest.mark.parametrize(
+    ("od_config", "logged_name"),
+    [
+        (SimpleNamespace(model_class_name="FluxPipeline"), "FluxPipeline"),
+        (SimpleNamespace(model_class_name=None), None),
+        (None, None),
+    ],
+)
+def test_model_load_logs_unpatched_pipeline(monkeypatch, od_config, logged_name):
+    monkeypatch.setattr(patch_registry, "_applied", set())
+    info = MagicMock()
+    monkeypatch.setattr(omni_patches.logger, "info", info)
     OmniTpuPlatform.init_diffusion_model_runner_runtime(
-        None,
-        SimpleNamespace(model_class_name="LingBotWorldCausalDMDPipeline"),
-        torch.device("cpu"),
+        None, od_config, torch.device("cpu")
     )
-    assert _MockRotaryEmbeddingWan.forward is rotary_embedding_wan_forward
+    info.assert_called_once_with(
+        "No model-specific TPU diffusion patch applies to pipeline %s.", logged_name
+    )
+
+
+def test_model_load_does_not_log_patched_pipeline(monkeypatch):
+    monkeypatch.setattr(patch_registry, "_applied", set())
+    for rope_cls in (
+        qwen_image_transformer.QwenEmbedRope,
+        qwen_image_transformer.QwenEmbedLayer3DRope,
+    ):
+        monkeypatch.setattr(rope_cls, "forward", rope_cls.forward)
+    info = MagicMock()
+    monkeypatch.setattr(omni_patches.logger, "info", info)
+    OmniTpuPlatform.init_diffusion_model_runner_runtime(
+        None, _QWEN_IMAGE, torch.device("cpu")
+    )
+    assert (
+        call(
+            "No model-specific TPU diffusion patch applies to pipeline %s.",
+            "QwenImagePipeline",
+        )
+        not in info.call_args_list
+    )
+
+
+@pytest.mark.parametrize(
+    ("entered_stages", "warns"),
+    [
+        (set(), True),
+        ({"diffusion_worker"}, True),
+        ({"diffusion_model_load"}, False),
+        ({"worker_init"}, False),
+    ],
+)
+def test_backend_selection_warns_without_model_load_stage(
+    monkeypatch, entered_stages, warns
+):
+    monkeypatch.setattr(patch_registry, "_entered_stages", entered_stages)
+    warning_once = MagicMock()
+    monkeypatch.setattr(omni_platform.logger, "warning_once", warning_once)
+    OmniTpuPlatform.get_diffusion_attn_backend_cls(None, 64)
+    assert warning_once.call_count == int(warns)
 
 
 def test_rope_pair_swap_matches_native():
@@ -184,10 +242,13 @@ def test_rope_pair_swap_matches_native():
     )
 
 
-def test_rope_patch_installed():
+def test_rope_patch_installed(monkeypatch):
     from unittest.mock import MagicMock
 
-    _patch_wan_pair_swap_rope(od_config=_WAN)
+    monkeypatch.setattr(
+        _MockRotaryEmbeddingWan, "forward", _MockRotaryEmbeddingWan.forward
+    )
+    _patch_wan_pair_swap_rope()
     assert _MockRotaryEmbeddingWan.forward is rotary_embedding_wan_forward
     # Interleaved half-dim calls use apply_rotary_pair_swap (bit-exact in bf16).
     rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
