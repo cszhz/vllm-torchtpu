@@ -72,6 +72,10 @@ def _scoped(name):
 
 # Largest supported decode batch; SCATTER_BATCHES lists the token-scatter batches.
 MAX_BATCH = 128
+# Hot-expert copies: [(layer weight refs, layer index, fp8 slot-pair views)] while a layer's MoE traces.
+_HOT: list = []
+_HOT_BASE: list = []
+HOT_LOCAL_EXPERTS = 112  # EP8 local experts; copy slot j is local id 112 + j (family entries 112 + 2j, 113 + 2j)
 SCATTER_BATCHES = (8, 12, 16, 20, 24, 28, 32, 64, 96, 128)
 
 
@@ -390,6 +394,7 @@ def _start_initial_expert_weight_copies(
     slot_count,
     already_started,
     group_pending_routes,
+    skip_copies=False,
 ):
     """Prefetch the first routed experts in their execution order.
 
@@ -398,7 +403,7 @@ def _start_initial_expert_weight_copies(
     """
     selected_expert_count = selected_experts.shape[1]
     route_slots = jnp.arange(selected_expert_count)[None, :]
-    processed = jnp.zeros(selected_experts.shape, jnp.bool_)
+    processed = (selected_experts >= HOT_LOCAL_EXPERTS) if skip_copies else jnp.zeros(selected_experts.shape, jnp.bool_)
 
     def next_expert(completed):
         pending = (route_slots < local_route_counts[:, None]) & ~completed
@@ -442,6 +447,133 @@ def _start_initial_expert_weight_copies(
             _start_async_copies(copy_expert(expert, slot))
 
         processed |= consumed
+
+
+def _hot_home_routes(latent_norm, selected_experts, local_route_counts, slot_count):
+    """Home-only copy routing: a route to one of this group's hot experts takes its copy (local id
+    112 + j) when the expert has at least hot_min_rows rows this step. The table is in the
+    zero padding lanes of latent_norm (3584 + g S + j: global expert id)."""
+    group = jax.lax.axis_index("tp") // 4
+    table = latent_norm[0:1, 3584 : 3584 + 8 * slot_count]
+    lanes = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
+    entry_lanes = jax.lax.broadcasted_iota(jnp.int32, table.shape, 1)
+    count = selected_experts.shape[1]
+    valid = jnp.arange(count)[None, :] < local_route_counts[:, None]
+    rows = jnp.zeros((1, 128), jnp.float32)
+    for slot in range(count):
+        rows += jnp.sum(
+            (valid[:, slot : slot + 1] & (selected_experts[:, slot : slot + 1] == lanes)).astype(jnp.float32),
+            axis=0, keepdims=True,
+        )
+    copy_of = jnp.full((1, 128), -1, jnp.int32)
+    for j in range(slot_count):
+        expert = jnp.sum(jnp.where(entry_lanes == group * slot_count + j, table, 0.0)).astype(jnp.int32)
+        local = expert - HOT_LOCAL_EXPERTS * group
+        home = (expert >= 0) & (local >= 0) & (local < HOT_LOCAL_EXPERTS)
+        copy_of = jnp.where(home & (lanes == local), HOT_LOCAL_EXPERTS + j, copy_of)
+    copy_of = jnp.where(rows >= _config().hot_min_rows, copy_of, -1)
+    columns = []
+    for slot in range(count):
+        target = jnp.sum(
+            jnp.where(selected_experts[:, slot : slot + 1] == lanes, copy_of, 0) + 0, axis=1, keepdims=True
+        ) + jnp.sum(jnp.where(selected_experts[:, slot : slot + 1] == lanes, 0, 0), axis=1, keepdims=True)
+        hit = jnp.any((selected_experts[:, slot : slot + 1] == lanes) & (copy_of >= 0), axis=1, keepdims=True)
+        columns.append(jnp.where(valid[:, slot : slot + 1] & hit, target, selected_experts[:, slot : slot + 1]))
+    return jnp.concatenate(columns, axis=1)
+
+
+def _run_hot_experts(hot, source, selected_experts, selected_probabilities, valid_routes, probability_totals,
+                     expert_output, slots, *, expert_input_size, expert_width, expert_output_size):
+    """Every routed copy slot (local id 112 + j) as one fp8 product per 32 of its rows; the slot's
+    entries stream from HBM into MXFP4 slot pairs (0, 1) and (2, 3), double-buffered."""
+    batch_size = selected_experts.shape[0]
+    lanes = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
+    lane_values = lanes.astype(jnp.float32)
+    refs, layer = hot.refs, hot.layer - 1
+
+    def lowest(remaining):
+        expert = jnp.min(jnp.where(remaining, lane_values, 128.0)).astype(jnp.int32)
+        return expert, remaining & (lanes != expert)
+
+    def copies(expert, buffer):
+        entry = HOT_LOCAL_EXPERTS + 2 * jnp.clip(expert - HOT_LOCAL_EXPERTS, 0, 7)
+        semaphores = hot.semaphores
+        gate_up, gate_up_scales, down, down_scales = slots
+        return (
+            tpu.make_async_copy(refs["expert_gu"].at[layer, pl.ds(entry, 2)],
+                                gate_up.at[pl.ds(2 * buffer, 2)], semaphores.at[2 * buffer, 0]),
+            tpu.make_async_copy(refs["expert_gus"].at[layer, entry],
+                                gate_up_scales.at[2 * buffer], semaphores.at[2 * buffer, 1]),
+            tpu.make_async_copy(refs["expert_down"].at[layer, pl.ds(entry, 2)],
+                                down.at[pl.ds(2 * buffer, 2)], semaphores.at[2 * buffer, 2]),
+            tpu.make_async_copy(refs["expert_ds"].at[layer, entry],
+                                down_scales.at[2 * buffer], semaphores.at[2 * buffer, 3]),
+        )
+
+    def start(expert, buffer):
+        @pl.when(expert < 128)
+        def _():
+            for copy in copies(expert, buffer):
+                copy.start()
+
+    index = jnp.arange(batch_size)
+    chunk = 32
+
+    def compute(expert, buffer):
+        @pl.when(expert < 128)
+        def _():
+            view = hot.views[buffer]
+            for copy in copies(expert, buffer):
+                copy.wait()
+            mask = valid_routes & (selected_experts == expert)
+            active = jnp.any(mask, axis=1)
+            weights = jnp.where(
+                active, jnp.sum(jnp.where(mask, selected_probabilities, 0.0), axis=1) / probability_totals, 0.0
+            )
+            before = jnp.sum(
+                jnp.where(index[None, :] < index[:, None], active[None, :].astype(jnp.float32), 0.0), axis=1
+            )
+            rows = jnp.sum(active.astype(jnp.int32))
+
+            @pl.loop(0, (rows + chunk - 1) // chunk)
+            def run_chunk(part):
+                positions = (part * chunk + jnp.arange(chunk)).astype(jnp.float32)
+                pick = active[None, :] & (before[None, :] == positions[:, None])
+                staged = _dot(pick.astype(jnp.bfloat16), source[:, :expert_input_size])
+                gate_up = jax.lax.dot_general(
+                    staged.astype(jnp.bfloat16), view.gu[...], (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                ) * view.gs[...]
+                gate_up = gate_up.astype(jnp.bfloat16).astype(jnp.float32)
+                middle = _gated_activation(gate_up[:, :expert_width], gate_up[:, expert_width:])
+                product = jax.lax.dot_general(
+                    middle, view.down[...], (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32,
+                ) * view.ds[...]
+                put = active[:, None] & (before[:, None] == positions[None, :])
+                expert_output[:, :expert_output_size] += (
+                    _dot(put.astype(jnp.bfloat16), product.astype(jnp.bfloat16)) * weights[:, None]
+                )
+
+    first, remaining = lowest(hot.lanes)
+    second, remaining = lowest(remaining)
+    start(first, 0)
+    start(second, 1)
+
+    def pair(iteration, carry):
+        first, second, remaining = carry
+        compute(first, 0)
+        third, remaining = lowest(remaining != 0)
+        start(third, 0)
+        compute(second, 1)
+        fourth, remaining = lowest(remaining)
+        start(fourth, 1)
+        return third, fourth, remaining.astype(jnp.int32)
+
+    jax.lax.fori_loop(
+        0, (jnp.sum(hot.lanes.astype(jnp.int32)) + 1) // 2, pair, (first, second, remaining.astype(jnp.int32))
+    )
+
+
 def _quantized_expert_dot(
     source,
     packed,
@@ -851,6 +983,7 @@ def _run_routed_expert_stream(
     expert_output_size,
     group_pending_routes,
     progress=None,
+    hot=None,
 ):
     """Execute the next route shared by any ready batch rows.
 
@@ -1473,6 +1606,10 @@ def _run_routed_expert_stream(
                 axis=0,
                 keepdims=True,
             )
+        if hot is not None:
+            copy_lanes = used & (jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1) >= HOT_LOCAL_EXPERTS)
+            hot = SimpleNamespace(**vars(hot), lanes=copy_lanes)
+            used = used & ~copy_lanes
         pair_count = (jnp.sum(used.astype(jnp.int32)) + 1) // 2
     else:
         # Rows advance through their own route order, so one expert can be
@@ -1904,6 +2041,16 @@ def _run_routed_expert_stream(
             def run_original_expert_pair(iteration):
                 run_next_expert_pair(iteration)
 
+    if hot is not None and group_pending_routes:
+        with _phase("e_hot"):
+            _run_hot_experts(
+                hot, source, selected_experts, selected_probabilities, valid_routes, probability_totals,
+                expert_output,
+                (expert_gate_up_vmem, expert_gate_up_scale_vmem, expert_down_vmem, expert_down_scale_vmem),
+                expert_input_size=expert_input_size, expert_width=expert_width,
+                expert_output_size=expert_output_size,
+            )
+
 
 def projection_staging_scratch(batch_size: int, attention_dp: int = 1) -> tuple[Any, ...]:
     """Above B32: send/receive staging of the attention projection's four
@@ -2288,6 +2435,9 @@ def moe(
     )
     shared_width = weights.shared_down_projection.shape[0]
     expert_prefetch_slot_count = 4
+    hot_info = _HOT.pop() if _HOT else None
+    if not (group_pending_expert_routes and batch_size in (32, 64, 96, 128)):
+        hot_info = None
 
     if not 1 <= batch_size <= MAX_BATCH:
         raise ValueError(f"MoE supports 1 to {MAX_BATCH} rows")
@@ -2708,6 +2858,10 @@ def moe(
                 live_rows=live_rows,
             )
         )
+        if hot_info is not None:
+            selected_experts = _hot_home_routes(
+                weights.latent_normalization, selected_experts, local_route_counts, hot_info[3]
+            )
         selected_experts_vmem[...] = jnp.pad(
             selected_experts,
             ((0, 0), (0, 128 - selected_expert_count)),
@@ -2730,6 +2884,7 @@ def moe(
             slot_count=expert_prefetch_slot_count,
             already_started=prefetched_expert_count,
             group_pending_routes=group_pending_expert_routes,
+            skip_copies=hot_info is not None,
         )
 
         if not overlap_latent_gather:
@@ -3249,6 +3404,9 @@ def moe(
             expert_output_size=expert_output_size,
             group_pending_routes=group_pending_expert_routes,
             progress=poll_shared,
+            hot=(None if hot_info is None else SimpleNamespace(
+                refs=hot_info[0], layer=hot_info[1], views=hot_info[2],
+                semaphores=weights.expert_copy_semaphores)),
             )
         @pl.when(progress_state[0] == 0)
         def drain_shared():
@@ -3282,6 +3440,9 @@ def moe(
             expert_output_size=expert_output_size,
             group_pending_routes=group_pending_expert_routes,
             progress=None,
+            hot=(None if hot_info is None else SimpleNamespace(
+                refs=hot_info[0], layer=hot_info[1], views=hot_info[2],
+                semaphores=weights.expert_copy_semaphores)),
             )
 
     def consume_routed_chunk(first, rows):
@@ -6771,11 +6932,39 @@ def stack(
                 offset += storage_size
             return views
 
+        def hot_fp8_views():
+            """fp8 gate/up, down and column-scale views over MXFP4 slot pairs (0, 1) and (2, 3)."""
+            base = _HOT_BASE[-1] if _HOT_BASE else 0
+            names = ("expert_gu", "expert_down", "expert_gus", "expert_ds")
+            sizes = [pool_alias.storage_size((4, *pool_weights[n].shape[1:]), pool_weights[n].dtype) for n in names]
+            starts = [base + sum(sizes[:i]) for i in range(4)]
+            gate_up_rows = pool_weights["expert_gu"].shape[1] * 8
+            down_rows = pool_weights["expert_down"].shape[1] * 8
+            gate_up_columns = pool_weights["expert_gu"].shape[2]
+            down_columns = pool_weights["expert_down"].shape[2]
+
+            def view(start, shape, dtype):
+                size = math.prod(shape) * jnp.dtype(dtype).itemsize
+                return pool_alias.view(
+                    projection_expert_pool_vmem.at[pl.ds(start // 128, size // 128), :], shape, jnp.dtype(dtype)
+                )
+
+            return [
+                SimpleNamespace(
+                    gu=view(starts[0] + k * (sizes[0] // 2), (gate_up_rows, gate_up_columns), jnp.float8_e4m3fn),
+                    down=view(starts[1] + k * (sizes[1] // 2), (down_rows, down_columns), jnp.float8_e4m3fn),
+                    gs=view(starts[2] + k * (sizes[2] // 2), (1, gate_up_columns), jnp.float32),
+                    ds=view(starts[3] + k * (sizes[3] // 2), (1, down_columns), jnp.float32),
+                )
+                for k in range(2)
+            ]
+
         def attention_views(base=0):
             """The KDA and MLA input projections of one layer from ``base``."""
             return pool_views(KDA[:4], base=base), pool_views(MLA[:2], base=base)
 
         def expert_views(base=0):
+            _HOT_BASE[:] = [base]
             if alias_expert_scales:
                 views = pool_views(
                     ("expert_gu", "expert_down", "expert_gus", "expert_ds"),
@@ -8406,6 +8595,12 @@ def stack(
                 mixture_output_vmem = (
                     owned_rows_vmem if moe_token_scatter_output else mixture_vmem
                 )
+                hot_slots = (local_weights["expert_gu"].shape[0] - HOT_LOCAL_EXPERTS) // 2
+                _HOT[:] = (
+                    [(layer_weights, layer_index, hot_fp8_views(), hot_slots)]
+                    if hot_slots > 0 and alias_expert_scales and POOLED_WEIGHTS and batch_size in (32, 64, 96, 128)
+                    else []
+                )
                 moe(
                     normalized_vmem,
                     mixture_output_vmem,
@@ -8421,13 +8616,17 @@ def stack(
                         latent_norm_vmem,
                         layer_weights["shared_gu"].at[layer_index - 1],
                         layer_weights["shared_down"].at[layer_index - 1],
-                        layer_weights["expert_gu"].at[layer_index - 1],
+                        (layer_weights["expert_gu"].at[layer_index - 1, :HOT_LOCAL_EXPERTS] if hot_slots > 0
+                         else layer_weights["expert_gu"].at[layer_index - 1]),
                         gate_up_vmem,
-                        layer_weights["expert_gus"].at[layer_index - 1],
+                        (layer_weights["expert_gus"].at[layer_index - 1, :HOT_LOCAL_EXPERTS] if hot_slots > 0
+                         else layer_weights["expert_gus"].at[layer_index - 1]),
                         gate_up_scales_vmem,
-                        layer_weights["expert_down"].at[layer_index - 1],
+                        (layer_weights["expert_down"].at[layer_index - 1, :HOT_LOCAL_EXPERTS] if hot_slots > 0
+                         else layer_weights["expert_down"].at[layer_index - 1]),
                         down_vmem,
-                        layer_weights["expert_ds"].at[layer_index - 1],
+                        (layer_weights["expert_ds"].at[layer_index - 1, :HOT_LOCAL_EXPERTS] if hot_slots > 0
+                         else layer_weights["expert_ds"].at[layer_index - 1]),
                         down_scales_vmem,
                         expert_semaphores,
                     ),

@@ -11,6 +11,7 @@ the standalone tools install overrides before building the program.
 import dataclasses
 import hashlib
 import json
+import os
 from typing import Any
 
 from vllm_torchtpu.megakernel.config import set_active_kernel_config
@@ -79,6 +80,14 @@ class KernelConfig:
     dcp_skip: tuple[str, ...] = ()
     debug_skip: tuple[str, ...] = ()
     phase_scopes: bool = False
+    # Hot-expert fp8 copies (off when empty): an npz whose ``experts``
+    # [92, 8, S] holds the global expert id in copy slot j of EP group g
+    # per MoE layer (-1: empty). A bare name loads from kimi_k3/data.
+    kd_hot_plan: str = dataclasses.field(
+        default_factory=lambda: os.environ.get("K3_HOT_PLAN", "")
+    )
+    # A hot expert's routes use its fp8 copy from this many rows.
+    hot_min_rows: int = 9
     pool_report: bool = False
     vmem_report: bool = False
     vmem_pad_kb: int = 0
