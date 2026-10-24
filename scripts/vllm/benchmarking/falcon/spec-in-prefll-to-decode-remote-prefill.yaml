@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: pd-spec-pipeline-prefill-20261024-r32-tpu-sync
+name: pd-spec-pipeline-prefill-20261024-r38-explicit-h2d
 exp_type: BENCHMARK
 artifact_type: generic
 cluster_name: gke-tpu-train-us-central1-1-prod
@@ -70,7 +70,7 @@ role_to_task_spec:
       - name: coord
         type: gcs
         bucket: inference-model-storage-poc-tpu-hns
-        prefix: benchmarks/pd-spec-pipeline/20261024-r32-tpu-sync
+        prefix: benchmarks/pd-spec-pipeline/20261024-r38-explicit-h2d
         mount_path: /coord
         mount_options: [implicit-dirs, metadata-cache:ttl-secs:0]
     sources:
@@ -78,5 +78,5 @@ role_to_task_spec:
         type: git
         repo: https://github.com/vllm-project/vllm-torchtpu.git
         ref: hafeng/spec_in_prefll_to_decode
-        commit: ef4b85f6a
+        commit: 8eb8202ac
         path: /workspace/vllm-torchtpu
