@@ -66,7 +66,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
-from vllm_torchtpu.utils import host_rss_gib, release_memory_to_os
+from vllm_torchtpu.utils import fresh_buffer, host_rss_gib, release_memory_to_os
 
 logger = init_logger(__name__)
 
@@ -169,13 +169,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         """Split hc_attn_fn / hc_ffn_fn into the bf16 chunks the mHC ops take.
 
         The split depends only on the weight; doing it here, once after the
-        weights land, keeps it out of every forward.
+        weights land, keeps it out of every forward. Each buffer goes through
+        `fresh_buffer`: a view or an aliased clone would otherwise be
+        re-materialized as a `tt_jit_as_strided` program before every forward
+        (~62 per decode step measured, j-decf9ff4 vs mHC off j-4eccc700).
         """
         if self.mhc_opts.stacked_fn:
             stack = get_mhc_stack_fn_op()
             for name in ("hc_attn_fn", "hc_ffn_fn"):
                 self.register_buffer(
-                    f"{name}_cat", stack(getattr(self, name)), persistent=False
+                    f"{name}_cat",
+                    fresh_buffer(stack(getattr(self, name))),
+                    persistent=False,
                 )
         else:
             split = get_mhc_split_fn_op()
@@ -183,7 +188,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 for suffix, chunk in zip(
                     ("hi", "mid", "lo"), split(getattr(self, name))
                 ):
-                    self.register_buffer(f"{name}_{suffix}", chunk, persistent=False)
+                    self.register_buffer(
+                        f"{name}_{suffix}", fresh_buffer(chunk), persistent=False
+                    )
         if self.fuse_norm:
             # The kernels read the norm weight as (1, H); reshaping (H,) in
             # the forward is a relayout copy per seam (~1.4 us at decode).
@@ -191,7 +198,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 w = getattr(self, norm_name).weight
                 self.register_buffer(
                     f"{norm_name}_w2d",
-                    w.detach().reshape(1, -1).clone(),
+                    fresh_buffer(w.detach().reshape(1, -1)),
                     persistent=False,
                 )
 
