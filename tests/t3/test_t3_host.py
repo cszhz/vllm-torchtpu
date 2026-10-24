@@ -658,3 +658,21 @@ def test_carry_fast_positions_match(monkeypatch):
     new = torch.zeros(3, 16, dtype=torch.int64)
     runner.mrope_positions.cpu = new  # a replaced buffer refreshes the view
     assert dc._host_positions(runner, 5).sum() == 0
+
+
+def test_dp_size_cache(monkeypatch):
+    from vllm_torchtpu import utils as vu
+
+    pc1 = types.SimpleNamespace(data_parallel_size=4)
+    pc2 = types.SimpleNamespace(data_parallel_size=2)
+    monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
+    monkeypatch.setattr(vu, "_t3_dp_size", [None, 0])
+    monkeypatch.setattr(vu, "_T3_DP_CACHE", False)
+    assert vu.get_dp_size(pc1) == 4
+    monkeypatch.setattr(vu, "_T3_DP_CACHE", True)
+    assert vu.get_dp_size(pc1) == 4
+    pc1.data_parallel_size = 8  # cached for the same config object
+    assert vu.get_dp_size(pc1) == 4
+    assert vu.get_dp_size(pc2) == 2  # another config object refreshes
+    monkeypatch.setenv("TORCH_TPU_DP_SIZE", "3")
+    assert vu.get_dp_size(types.SimpleNamespace(data_parallel_size=1)) == 3
