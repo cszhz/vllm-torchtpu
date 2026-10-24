@@ -159,6 +159,13 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             prefill_norm_tile=int(tiles.get("hc_prefill_norm_tile", 0)),
             prefill_full_tile=int(tiles.get("hc_prefill_full_tile", 0)),
         )
+        # The draft is traced once for every token bucket (see
+        # draft_additional_config), so its HCs also keep the unfused decode
+        # mix (TPU_QWEN4_HC_DECODE_FUSED picks the fused path by the token
+        # count while tracing).
+        for module in self.modules():
+            if isinstance(module, GatedResidual):
+                module.disable_decode_fused()
         # Set by the Qwen3.8 megakernel driver before the first trace: the
         # layer's o_proj, both HCs and the MoE as one tail-kernel call.
         self.mk_tail: nn.Module | None = None
