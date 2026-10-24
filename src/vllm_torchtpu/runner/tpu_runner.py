@@ -184,7 +184,6 @@ from vllm_torchtpu.spec_decode.remote_dspark import (
     RemoteDSparkTransport,
     RemoteTensorTransfer,
     is_remote_draft_proposal_rank,
-    is_remote_dspark_prefill_request,
 )
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
@@ -1031,15 +1030,12 @@ class TPUModelRunner(GPUModelRunner):
         self._remote_dspark_transport: RemoteDSparkTransport | None = None
         self._remote_dspark_proposal_rank = False
         self._remote_dspark_producer_request_ids: list[str] | None = None
+        self._remote_dspark_awaiting_feedback = False
         if self._remote_dspark_role:
             if speculative_config is None or speculative_config.method != "dspark":
                 raise ValueError("remote DSpark requires speculative method dspark")
             if self.scheduler_config.async_scheduling:
                 raise ValueError("remote DSpark currently requires sync scheduling")
-            if transfer_config is not None:
-                raise ValueError(
-                    "remote DSpark prototype does not combine with KV transfer"
-                )
             self._remote_dspark_proposal_rank = is_remote_draft_proposal_rank(
                 self._profiler_rank,
                 self.parallel_config.pipeline_parallel_size,
@@ -3833,10 +3829,11 @@ class TPUModelRunner(GPUModelRunner):
         remote_feedback: dict[str, Any] | None = None
         if (
             self._remote_dspark_role == "producer"
-            and scheduler_output.scheduled_spec_decode_tokens
+            and self._remote_dspark_awaiting_feedback
         ):
             assert self._remote_dspark_transport is not None
             remote_feedback = self._remote_dspark_transport.recv_feedback()
+            self._remote_dspark_awaiting_feedback = False
             if self._profiler_rank == 0:
                 logger.info(
                     "Remote DSpark producer applying feedback: valid_tokens=%s",
@@ -4413,16 +4410,7 @@ class TPUModelRunner(GPUModelRunner):
             and drafts is not None
         ):
             assert transport is not None
-            remote_rows = [
-                (request_id, token_ids)
-                for request_id, token_ids in zip(
-                    drafts.req_ids, drafts.draft_token_ids, strict=True
-                )
-                if not is_remote_dspark_prefill_request(request_id)
-            ]
-            if remote_rows:
-                request_ids, token_ids = zip(*remote_rows, strict=True)
-                transport.send_proposal(list(request_ids), list(token_ids))
+            transport.send_proposal(drafts.req_ids, drafts.draft_token_ids)
         return drafts
 
     def _send_remote_dspark_feedback(
@@ -4430,6 +4418,8 @@ class TPUModelRunner(GPUModelRunner):
         request_ids: list[str],
         next_tokens_per_chunk: list[torch.Tensor],
         draft_chunks: list[DraftChunkInputs],
+        *,
+        bootstrap: bool,
     ) -> None:
         transport = self._remote_dspark_transport
         assert transport is not None
@@ -4478,16 +4468,22 @@ class TPUModelRunner(GPUModelRunner):
             )
         feedback_request_ids = request_ids
         if self._remote_dspark_proposal_rank:
-            if self._remote_dspark_producer_request_ids is None:
+            if bootstrap:
+                if self._remote_dspark_producer_request_ids is not None:
+                    raise RuntimeError(
+                        "remote DSpark bootstrap unexpectedly has a proposal mapping"
+                    )
+            elif self._remote_dspark_producer_request_ids is None:
                 raise RuntimeError(
                     "remote DSpark feedback has no matching producer proposal"
                 )
-            if len(self._remote_dspark_producer_request_ids) != len(request_ids):
+            elif len(self._remote_dspark_producer_request_ids) != len(request_ids):
                 raise RuntimeError(
                     "remote DSpark feedback row count does not match the proposal"
                 )
-            feedback_request_ids = self._remote_dspark_producer_request_ids
-            self._remote_dspark_producer_request_ids = None
+            else:
+                feedback_request_ids = self._remote_dspark_producer_request_ids
+                self._remote_dspark_producer_request_ids = None
         transport.send_feedback(
             {
                 "request_ids": feedback_request_ids,
@@ -4889,9 +4885,9 @@ class TPUModelRunner(GPUModelRunner):
             )
             self._update_num_xla_graphs("pooling_step")
         elif state.remote_next_tokens_per_chunk:
-            if not is_spec_step or grammar_output is not None or needs_logprobs:
+            if grammar_output is not None or needs_logprobs:
                 raise RuntimeError(
-                    "remote DSpark producer only supports greedy verify steps "
+                    "remote DSpark producer only supports greedy steps "
                     "without grammar or logprobs"
                 )
             if len(state.remote_next_tokens_per_chunk) != len(state.num_reqs_list):
@@ -5074,6 +5070,8 @@ class TPUModelRunner(GPUModelRunner):
                 # inside AsyncTPUCopyState to avoid per-`num_reqs` recompiles.
                 combined_selected_tokens.append(selected_token_ids)
                 combined_selected_tokens_real_lens.append(num_reqs)
+                if self._remote_dspark_role == "consumer":
+                    next_tokens_per_chunk.append(selected_token_ids)
                 if self.scheduler_config.async_scheduling:
                     next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
                     for req_idx in range(cur_start_idx, cur_end_idx):
@@ -5125,9 +5123,12 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
 
-        if self._remote_dspark_role == "consumer" and is_spec_step:
+        if self._remote_dspark_role == "consumer":
             self._send_remote_dspark_feedback(
-                req_ids, next_tokens_per_chunk, state.draft_chunks
+                req_ids,
+                next_tokens_per_chunk,
+                state.draft_chunks,
+                bootstrap=not is_spec_step,
             )
 
         request_seq_lens = []
@@ -5180,7 +5181,13 @@ class TPUModelRunner(GPUModelRunner):
         if (
             self._is_async_drafter
             and combined_selected_tokens
-            and not self._is_dspark_pd_producer
+            and (
+                not self._is_dspark_pd_producer
+                or (
+                    self._remote_dspark_role == "producer"
+                    and bool(state.remote_next_tokens_per_chunk)
+                )
+            )
         ):
             if is_spec_step:
                 with self._stage_timing.stage("draft_propose"):
@@ -5230,12 +5237,15 @@ class TPUModelRunner(GPUModelRunner):
                         device_seed=device_seed,
                     )
 
-        if self._is_dspark_pd_producer:
+        if self._is_dspark_pd_producer and not state.remote_next_tokens_per_chunk:
             assert isinstance(self.drafter, DFlashProposer)
             self.drafter.prepare_prefill_handoff()
             # Context projections are deferred TPU graphs. A hardware-only
             # barrier does not materialize their writes before Raiden reads.
             synchronize_tensors()
+
+        if self._remote_dspark_role == "producer" and request_seq_lens:
+            self._remote_dspark_awaiting_feedback = True
 
         if copy_state is not None and self._fence_spec_kv_under_token_copy:
             # A Raiden producer registers a request's KV blocks ahead of its

@@ -7289,6 +7289,33 @@ class TestPipelineParallelRegisterAhead:
         assert delay
         assert params["uuid"] == 777
 
+    def test_stage3_remote_dspark_publishes_long_lived_request_once(self):
+        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+        req = _stage3_request("remote", self.PROMPT, max_tokens=16)
+        req.kv_transfer_params = {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "_remote_dspark": True,
+        }
+        with (
+            _stage3_producer_env(777),
+            patch(f"{_MOD}.publish_remote_dspark_handoff") as publish,
+        ):
+            meta = self._register_ahead(producer, req)
+            finish = producer.request_finished(req, [100, 101])
+            after_finish = producer.build_connector_meta(_scheduler_output())
+
+        send = meta.reqs_to_send["remote"]
+        assert send.uuid == 777
+        assert send.num_tokens == self.PROMPT - 1
+        publish.assert_called_once()
+        published_req_id, published_params = publish.call_args.args
+        assert published_req_id == "remote"
+        assert published_params["uuid"] == 777
+        assert finish == (False, None)
+        assert after_finish.reqs_to_send == {}
+        assert producer._stage3_early_sends == {}
+
     def test_stage3_pp_abort_releases_ahead_registration(self):
         producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
         req = _stage3_request("aborted", self.PROMPT)

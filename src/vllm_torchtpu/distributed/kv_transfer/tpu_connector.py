@@ -105,6 +105,10 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.spec_decode.remote_dspark import (
+    is_remote_dspark_request,
+    publish_remote_dspark_handoff,
+)
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -2130,9 +2134,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         executing that step, before the finish response can reach a
         consumer.
 
-        Only requests that finish right after their prompt (max_tokens == 1,
-        not resumable) are published here; the finish adopts the uuid through
-        the dedup record or, when it does not match, releases it.
+        Requests that finish right after their prompt (max_tokens == 1) and
+        marked long-lived remote DSpark requests are published here. A normal
+        finish adopts the uuid through the dedup record or releases it when it
+        does not match. A remote DSpark request keeps running after the handle
+        is published and suppresses finish-time republishing.
 
         Block tables are accumulated from the scheduler output the way the
         workers accumulate theirs: a new request's table is taken whole, a
@@ -2167,7 +2173,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             request = self._stage3_early_requests.get(req_id)
             if request is None or req_id in self._stage3_finished_sends:
                 continue
-            if int(request.max_tokens) != 1 or request.resumable:
+            remote_dspark = is_remote_dspark_request(request.kv_transfer_params)
+            if request.resumable or (
+                int(request.max_tokens) != 1 and not remote_dspark
+            ):
                 continue
             computed_tokens = computed_before.get(req_id, 0) + int(num_new_tokens)
             if computed_tokens < int(request.num_prompt_tokens):
@@ -2194,6 +2203,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             )
             if delay_free_blocks:
                 self._stage3_early_sends[req_id] = int(params["uuid"])
+                if remote_dspark:
+                    publish_remote_dspark_handoff(req_id, params)
+                    logger.info(
+                        "Published remote DSpark Raiden handoff: req_id=%s uuid=%s",
+                        req_id,
+                        params["uuid"],
+                    )
 
     def request_finished(
         self,
@@ -2208,6 +2224,19 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         early_uuid = self._stage3_early_sends.get(req_id)
         self._stage3_early_requests.pop(req_id, None)
         self._stage3_block_tables.pop(req_id, None)
+        if early_uuid is not None and is_remote_dspark_request(
+            request.kv_transfer_params
+        ):
+            self._stage3_early_sends.pop(req_id, None)
+            if request.status not in (
+                RequestStatus.FINISHED_LENGTH_CAPPED,
+                RequestStatus.FINISHED_STOPPED,
+            ):
+                record = self._stage3_finished_sends.get(req_id)
+                if record is not None and record[0] == early_uuid:
+                    del self._stage3_finished_sends[req_id]
+                self.reqs_to_release[req_id] = early_uuid
+            return False, None
         delay_free_blocks, params = self._request_finished_stage3(
             request, block_ids, mamba_block_ids, group_block_ids
         )

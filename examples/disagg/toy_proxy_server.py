@@ -31,14 +31,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
+from vllm_torchtpu.spec_decode.remote_dspark import (
+    mark_remote_dspark_request,
+    remote_dspark_handoff_path,
+    take_remote_dspark_handoff,
+)
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-
-_REMOTE_DSPARK_PREFILL_SUFFIX = ".remote-dspark-prefill"
-
-
-def _remote_dspark_prefill_request_id(request_id: str) -> str:
-    return f"{request_id}{_REMOTE_DSPARK_PREFILL_SUFFIX}"
 
 
 class _ProxyLatencyTracker:
@@ -399,6 +399,7 @@ def _record_remote_draft_verification(
     *,
     shadow_text: str | None = None,
     decode_text: str | None = None,
+    lifecycle_complete: bool = False,
     error: Exception | None = None,
 ) -> None:
     path = os.getenv("VLLM_TPU_REMOTE_DSPARK_VERIFICATION_PATH")
@@ -407,6 +408,11 @@ def _record_remote_draft_verification(
             "request_id": request_id,
             "status": "error",
             "error": repr(error),
+        }
+    elif lifecycle_complete:
+        record = {
+            "request_id": request_id,
+            "status": "complete",
         }
     else:
         assert shadow_text is not None
@@ -623,21 +629,32 @@ async def send_request_to_prefill(
     )
 
 
-async def send_shadow_request_to_prefill(
+async def send_remote_dspark_request_to_prefill(
     client_info: dict,
     endpoint: str,
     req_data: dict,
     request_id: str,
     forwarded: dict | None = None,
 ):
-    """Run the P-side remote-draft lifecycle without exposing its response."""
-    shadow_data = req_data.copy()
-    shadow_data["stream"] = False
-    shadow_data["kv_transfer_params"] = {
-        "do_remote_decode": False,
-        "do_remote_prefill": False,
-    }
-    shadow_data.pop("stream_options", None)
+    """Run one P request that publishes Target KV and keeps Draft KV alive."""
+    producer_data = req_data.copy()
+    producer_data["stream"] = False
+    producer_data["kv_transfer_params"] = mark_remote_dspark_request(
+        {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+        }
+    )
+    # P's truncated prompt uses one generated-token slot as the boundary
+    # placeholder. Give it one private slot so its draft lifecycle lasts as
+    # long as D's externally visible completion.
+    if "max_tokens" in producer_data:
+        producer_data["max_tokens"] = int(producer_data["max_tokens"]) + 1
+    if "max_completion_tokens" in producer_data:
+        producer_data["max_completion_tokens"] = (
+            int(producer_data["max_completion_tokens"]) + 1
+        )
+    producer_data.pop("stream_options", None)
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
@@ -647,10 +664,34 @@ async def send_shadow_request_to_prefill(
     return await _post_with_retries(
         client_info,
         endpoint,
-        shadow_data,
+        producer_data,
         headers,
         request_id,
         phase="REMOTE_DRAFT",
+    )
+
+
+async def wait_for_remote_dspark_handoff(
+    request_id: str,
+    producer_task: asyncio.Task,
+) -> dict[str, Any]:
+    """Wait for the P scheduler to publish its early Raiden handle."""
+    timeout_s = _env_float("VLLM_TPU_REMOTE_DSPARK_TIMEOUT_S", 900.0)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        params = take_remote_dspark_handoff(request_id)
+        if params is not None:
+            return params
+        if producer_task.done():
+            response = await producer_task
+            response.raise_for_status()
+            raise RuntimeError(
+                f"P request {request_id!r} completed without a Raiden handoff"
+            )
+        await asyncio.sleep(0.01)
+    producer_task.cancel()
+    raise TimeoutError(
+        f"timed out waiting for remote DSpark handoff for {request_id!r}"
     )
 
 
@@ -767,7 +808,7 @@ async def _handle_completions(api: str, request: Request):
             )
 
         remote_dspark = os.getenv("VLLM_TPU_REMOTE_DSPARK_SHADOW", "0") == "1"
-        shadow_task = None
+        producer_task = None
         remote_draft_bypass = False
         # Send request to prefill service
         t_prefill_send = time.time()
@@ -777,20 +818,16 @@ async def _handle_completions(api: str, request: Request):
             flush=True,
         )
         if remote_dspark:
-            response = await send_request_to_prefill(
-                prefill_client_info,
-                api,
-                req_data,
-                _remote_dspark_prefill_request_id(request_id),
-                forwarded,
-            )
-            response_json = response.json()
-            remote_draft_bypass = await request.app.state.remote_draft_barrier.wait()
-            shadow_task = asyncio.create_task(
-                send_shadow_request_to_prefill(
+            remote_dspark_handoff_path(request_id).unlink(missing_ok=True)
+            producer_task = asyncio.create_task(
+                send_remote_dspark_request_to_prefill(
                     prefill_client_info, api, req_data, request_id, forwarded
                 )
             )
+            kv_transfer_params = await wait_for_remote_dspark_handoff(
+                request_id, producer_task
+            )
+            remote_draft_bypass = await request.app.state.remote_draft_barrier.wait()
             await asyncio.sleep(
                 _env_float("VLLM_TPU_REMOTE_DSPARK_ADMISSION_DELAY_S", 0.05)
             )
@@ -799,6 +836,7 @@ async def _handle_completions(api: str, request: Request):
                 prefill_client_info, api, req_data, request_id, forwarded
             )
             response_json = response.json()
+            kv_transfer_params = response_json.get("kv_transfer_params", {})
         t_prefill_recv = time.time()
         t_prefill_recv_perf = time.perf_counter()
         prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
@@ -808,7 +846,6 @@ async def _handle_completions(api: str, request: Request):
         )
 
         # Extract the needed fields
-        kv_transfer_params = response_json.get("kv_transfer_params", {})
         kv_uuid = kv_transfer_params.get("uuid") if kv_transfer_params else None
         kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
         print(
@@ -837,8 +874,6 @@ async def _handle_completions(api: str, request: Request):
         logger.debug("Using %s %s", prefill_client_info, decode_client_info)
 
         # Stream response from decode service
-        decode_chunks = []
-
         async def generate_stream():
             try:
                 t_decode_send = time.time()
@@ -867,8 +902,6 @@ async def _handle_completions(api: str, request: Request):
                             flush=True,
                         )
                         first = False
-                    if shadow_task is not None:
-                        decode_chunks.append(chunk)
                     yield chunk
             finally:
                 release_decode()
@@ -876,18 +909,13 @@ async def _handle_completions(api: str, request: Request):
         async def finalize_response() -> None:
             release_decode()
             try:
-                if shadow_task is not None:
+                if producer_task is not None:
                     try:
-                        shadow_response = await shadow_task
-                        shadow_response.raise_for_status()
-                        shadow_text = _completion_text(shadow_response.content, False)
-                        decode_text = _completion_text(
-                            b"".join(decode_chunks), bool(req_data.get("stream"))
-                        )
+                        producer_response = await producer_task
+                        producer_response.raise_for_status()
                         _record_remote_draft_verification(
                             request_id,
-                            shadow_text=shadow_text,
-                            decode_text=decode_text,
+                            lifecycle_complete=True,
                         )
                     except Exception as error:
                         _record_remote_draft_verification(

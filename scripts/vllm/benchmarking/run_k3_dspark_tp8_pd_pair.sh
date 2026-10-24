@@ -182,8 +182,8 @@ request = urllib.request.Request(
     "http://127.0.0.1:8050/v1/completions",
     data=json.dumps({
         "model": "/models/Kimi-K3-pruned75",
-        "prompt": [1] * 128,
-        "max_tokens": 16,
+        "prompt": [1] * int(os.environ.get("K3_DSPARK_PD_INPUT_LEN", "32")),
+        "max_tokens": int(os.environ.get("K3_DSPARK_PD_OUTPUT_LEN", "8")),
         "ignore_eos": True,
         "temperature": 0,
     }).encode(),
@@ -206,7 +206,7 @@ PY
         --trust-remote-code --host 127.0.0.1 --port 8050
         --dataset-name random
         --random-input-len "${K3_DSPARK_PD_INPUT_LEN:-1024}"
-        --random-output-len 256
+        --random-output-len "${K3_DSPARK_PD_OUTPUT_LEN:-256}"
         --random-range-ratio 0 --max-concurrency "$concurrency" --request-rate inf
         --percentile-metrics "ttft,tpot,itl,e2el" --ignore-eos --temperature 0
         --seed 42
@@ -261,7 +261,7 @@ if len(records) != expected:
     raise RuntimeError(
         f"remote DSpark recorded {len(records)} verifications; expected {expected}"
     )
-failures = [record for record in records if record.get("status") != "match"]
+failures = [record for record in records if record.get("status") != "complete"]
 if failures:
     raise RuntimeError(f"remote DSpark output verification failed: {failures}")
 PY

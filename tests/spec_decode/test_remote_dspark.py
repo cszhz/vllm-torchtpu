@@ -29,13 +29,32 @@ from vllm_torchtpu.spec_decode.remote_dspark import (
     RequestPhase,
     VerifyFeedback,
     is_remote_draft_proposal_rank,
-    is_remote_dspark_prefill_request,
+    is_remote_dspark_request,
+    mark_remote_dspark_request,
+    publish_remote_dspark_handoff,
+    remote_dspark_handoff_path,
+    take_remote_dspark_handoff,
 )
 
 
-def test_remote_dspark_prefill_request_marker() -> None:
-    assert is_remote_dspark_prefill_request("request.remote-dspark-prefill")
-    assert not is_remote_dspark_prefill_request("request")
+def test_remote_dspark_request_marker() -> None:
+    params = mark_remote_dspark_request({"do_remote_decode": True})
+
+    assert is_remote_dspark_request(params)
+    assert not is_remote_dspark_request({"do_remote_decode": True})
+
+
+def test_remote_dspark_handoff_is_atomic_and_consumed_once(tmp_path) -> None:
+    request_id = "request/with unsafe path characters"
+    params = {"uuid": 7, "num_tokens": 31}
+
+    publish_remote_dspark_handoff(request_id, params, tmp_path)
+
+    path = remote_dspark_handoff_path(request_id, tmp_path)
+    assert path.parent == tmp_path
+    assert "/" not in path.name
+    assert take_remote_dspark_handoff(request_id, tmp_path) == params
+    assert take_remote_dspark_handoff(request_id, tmp_path) is None
 
 
 def test_transport_proposal_feedback_round_trip():
@@ -74,6 +93,44 @@ def test_transport_proposal_feedback_round_trip():
 
     consumer.send_feedback({"request_ids": ["req-a"]})
     assert producer[0].recv_feedback()["request_ids"] == ["req-a"]
+
+
+def test_transport_accepts_bootstrap_feedback_before_first_proposal():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    producer: list[RemoteDSparkTransport] = []
+
+    def accept_producer() -> None:
+        producer.append(
+            RemoteDSparkTransport(
+                role="producer",
+                producer_host="127.0.0.1",
+                port=port,
+                rank=0,
+                timeout_s=5,
+                device=torch.device("cpu"),
+            )
+        )
+
+    accept_thread = threading.Thread(target=accept_producer)
+    accept_thread.start()
+    consumer = RemoteDSparkTransport(
+        role="consumer",
+        producer_host="127.0.0.1",
+        port=port,
+        rank=0,
+        timeout_s=5,
+        device=torch.device("cpu"),
+    )
+    accept_thread.join(timeout=5)
+    assert not accept_thread.is_alive()
+
+    consumer.send_feedback({"request_ids": ["req-a"]})
+    assert producer[0].recv_feedback()["request_ids"] == ["req-a"]
+    producer[0].send_proposal(["req-a"], [[11, 12]])
+    assert consumer.recv_proposal() == (["req-a"], [[11, 12]])
 
 
 def test_packed_tensor_rows_round_trip():

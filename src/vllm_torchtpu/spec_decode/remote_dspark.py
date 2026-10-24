@@ -17,28 +17,90 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import hashlib
+import json
 import math
+import os
 import pickle
 import socket
 import struct
 import time
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Protocol
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
 _FRAME_HEADER = struct.Struct("!Q")
 _MAX_FRAME_BYTES = 1 << 30
-_REMOTE_DSPARK_PREFILL_SUFFIX = ".remote-dspark-prefill"
+_REMOTE_DSPARK_KV_PARAM = "_remote_dspark"
+_REMOTE_DSPARK_HANDOFF_PREFIX = "vllm-remote-dspark-handoff"
 
 
-def is_remote_dspark_prefill_request(request_id: str) -> bool:
-    """Return whether this is the short, Target-KV-producing P request."""
-    return request_id.endswith(_REMOTE_DSPARK_PREFILL_SUFFIX)
+def is_remote_dspark_request(params: object) -> bool:
+    """Return whether KV params mark a long-lived remote DSpark request."""
+    return isinstance(params, dict) and params.get(_REMOTE_DSPARK_KV_PARAM) is True
+
+
+def mark_remote_dspark_request(params: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of KV params marked for the remote DSpark lifecycle."""
+    return {**params, _REMOTE_DSPARK_KV_PARAM: True}
+
+
+def remote_dspark_handoff_path(
+    request_id: str, socket_dir: str | os.PathLike[str] | None = None
+) -> Path:
+    """Return the local control-plane path for a request's Raiden handle."""
+    digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+    directory = Path(socket_dir if socket_dir is not None else envs.TPU_IPC_SOCKET_DIR)
+    return directory / f"{_REMOTE_DSPARK_HANDOFF_PREFIX}-{digest}.json"
+
+
+def publish_remote_dspark_handoff(
+    request_id: str,
+    kv_transfer_params: dict[str, Any],
+    socket_dir: str | os.PathLike[str] | None = None,
+) -> None:
+    """Atomically publish the early Raiden handle to the colocated proxy."""
+    path = remote_dspark_handoff_path(request_id, socket_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    payload = {
+        "request_id": request_id,
+        "kv_transfer_params": kv_transfer_params,
+    }
+    try:
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def take_remote_dspark_handoff(
+    request_id: str, socket_dir: str | os.PathLike[str] | None = None
+) -> dict[str, Any] | None:
+    """Consume a published Raiden handle, or return None while it is pending."""
+    path = remote_dspark_handoff_path(request_id, socket_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if not isinstance(payload, dict) or payload.get("request_id") != request_id:
+        raise RemoteDraftProtocolError(
+            f"remote DSpark handoff does not match request {request_id!r}"
+        )
+    params = payload.get("kv_transfer_params")
+    if not isinstance(params, dict) or params.get("uuid") is None:
+        raise RemoteDraftProtocolError(
+            f"remote DSpark handoff for {request_id!r} has no Raiden uuid"
+        )
+    path.unlink()
+    return params
 
 
 def is_remote_draft_proposal_rank(rank: int, pipeline_parallel_size: int) -> bool:

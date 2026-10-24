@@ -41,9 +41,9 @@ _replace_prompt_with_rendered_token_ids = (
 _RemoteDraftAdmissionBarrier = _toy_proxy_server._RemoteDraftAdmissionBarrier
 _completion_text = _toy_proxy_server._completion_text
 _record_remote_draft_verification = _toy_proxy_server._record_remote_draft_verification
-_remote_dspark_prefill_request_id = _toy_proxy_server._remote_dspark_prefill_request_id
-send_request_to_prefill = _toy_proxy_server.send_request_to_prefill
-send_shadow_request_to_prefill = _toy_proxy_server.send_shadow_request_to_prefill
+send_remote_dspark_request_to_prefill = (
+    _toy_proxy_server.send_remote_dspark_request_to_prefill
+)
 
 
 def test_remote_draft_admission_barrier_releases_complete_waves() -> None:
@@ -88,16 +88,7 @@ def test_remote_draft_admission_barrier_bypasses_probe() -> None:
     asyncio.run(run())
 
 
-def test_remote_dspark_prefill_request_id_is_separate() -> None:
-    request_id = "request-1"
-
-    prefill_request_id = _remote_dspark_prefill_request_id(request_id)
-
-    assert prefill_request_id != request_id
-    assert prefill_request_id.endswith(".remote-dspark-prefill")
-
-
-def test_remote_dspark_prefill_and_shadow_use_distinct_kv_modes(monkeypatch) -> None:
+def test_remote_dspark_uses_one_long_lived_raiden_request(monkeypatch) -> None:
     async def run() -> list[dict]:
         requests: list[dict] = []
 
@@ -108,22 +99,18 @@ def test_remote_dspark_prefill_and_shadow_use_distinct_kv_modes(monkeypatch) -> 
 
         monkeypatch.setattr(_toy_proxy_server, "_post_with_retries", post)
         body = {"max_tokens": 32, "stream": True}
-        await send_request_to_prefill({}, "/v1/completions", body, "prefill")
-        await send_shadow_request_to_prefill({}, "/v1/completions", body, "shadow")
+        await send_remote_dspark_request_to_prefill(
+            {}, "/v1/completions", body, "request"
+        )
         return requests
 
-    prefill, shadow = asyncio.run(run())
-    assert prefill["max_tokens"] == 1
-    assert prefill["stream"] is False
-    assert prefill["kv_transfer_params"] == {
+    (producer,) = asyncio.run(run())
+    assert producer["max_tokens"] == 33
+    assert producer["stream"] is False
+    assert producer["kv_transfer_params"] == {
         "do_remote_decode": True,
         "do_remote_prefill": False,
-    }
-    assert shadow["max_tokens"] == 32
-    assert shadow["stream"] is False
-    assert shadow["kv_transfer_params"] == {
-        "do_remote_decode": False,
-        "do_remote_prefill": False,
+        "_remote_dspark": True,
     }
 
 
