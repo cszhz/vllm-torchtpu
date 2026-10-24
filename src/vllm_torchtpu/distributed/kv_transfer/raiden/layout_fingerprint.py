@@ -380,7 +380,11 @@ def _measure_packed_row_layouts(
         rows, width = shape[1], shape[-1]
         packing = 1 if word_rows else shape[2]
         if page_tokens is not None:
-            page_rows_tokens = rows if tag == TAG_MLA_NOPE else rows * packing
+            if word_rows and tag != TAG_MLA_NOPE:
+                # GLM SparseCore packed rope rows hold page_tokens / rows tokens.
+                page_rows_tokens = page_tokens if page_tokens % rows == 0 else rows
+            else:
+                page_rows_tokens = rows if tag == TAG_MLA_NOPE else rows * packing
             if page_rows_tokens != page_tokens:
                 raise RuntimeError(
                     f"{pool.tag} page geometry {rows}x{packing} does not "

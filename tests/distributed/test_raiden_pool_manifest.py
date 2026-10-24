@@ -1027,6 +1027,55 @@ def test_glm_manifest_sparse_mla_pairs():
     rpm.verify_storage_binding(manifest, named, raw_tensors=())
 
 
+def _glm_sparsecore_named_kv_caches(*, nope_rows=256, rope_rows=32):
+    # TPU_SPARSE_MLA_{NOPE,ROPE}_LAYOUT=sparsecore with packed rope: uint32
+    # word rows, one 512 B nope row per token, eight 64 B rope tokens per row.
+    named = {
+        f"model.layers.{idx}.self_attn.attn": (
+            FakeTensor((16, nope_rows, 128), 4, dtype="torch.uint32"),
+            FakeTensor((16, rope_rows, 128), 4, dtype="torch.uint32"),
+        )
+        for idx in range(2)
+    }
+    named["model.layers.0.self_attn.indexer"] = FakeTensor(
+        (16, 64, 4, 256), 1, dtype="torch.uint8"
+    )
+    return named
+
+
+def test_glm_manifest_accepts_sparsecore_word_rows():
+    named = _glm_sparsecore_named_kv_caches()
+    manifest = rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=named, raw_tensors=(), block_size_tokens=256
+    )
+
+    geometry = manifest.geometry_by_tag()
+    assert geometry[rpm.TAG_MLA_NOPE]["live_bytes_per_block"] == 256 * 512
+    assert geometry[rpm.TAG_MLA_ROPE]["live_bytes_per_block"] == 32 * 512
+    for pool in manifest.pools:
+        (region,) = pool.regions
+        if pool.tag == rpm.TAG_MLA_NOPE:
+            assert (region.unit_bytes, region.num_units) == (512, 256)
+        elif pool.tag == rpm.TAG_MLA_ROPE:
+            assert (region.unit_bytes, region.num_units) == (512, 32)
+    rpm.verify_storage_binding(manifest, named, raw_tensors=())
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (dict(nope_rows=128), "nope rows 128 do not match"),
+        (dict(rope_rows=24), "word rows 24 do not divide"),
+    ],
+)
+def test_glm_manifest_rejects_bad_sparsecore_geometry(overrides, message):
+    named = _glm_sparsecore_named_kv_caches(**overrides)
+    with pytest.raises(rpm.ManifestError, match=message):
+        rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=named, raw_tensors=(), block_size_tokens=256
+        )
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [

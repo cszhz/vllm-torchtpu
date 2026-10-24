@@ -1301,13 +1301,20 @@ def build_glm_mla_pool_manifest(
     for tag, layer_name, dtype_tag, tensor in flat:
         nbytes = _nbytes(tensor)
         shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
+        itemsize = _element_size(tensor)
+        # The SparseCore MLA layouts (TPU_SPARSE_MLA_*_LAYOUT=sparsecore) are
+        # rank-3 32-bit word rows [blocks, rows, words]: a packing-1 row, as
+        # DSv4's CSA rows. A row holds block_size / rows tokens (one for nope,
+        # several for packed rope), so only the page must split into whole rows.
+        word_rows = len(shape) == 3 and itemsize == 4
+        if word_rows:
+            shape = (shape[0], shape[1], 1, shape[2])
         if len(shape) != 4:
             raise ManifestError(
                 f"cache {layer_name} must be [blocks, rows, packing, width]: "
                 f"got shape {shape}"
             )
         num_blocks, rows, packing, width = shape
-        itemsize = _element_size(tensor)
         if num_blocks <= 0 or nbytes % num_blocks != 0:
             raise ManifestError(
                 f"cache {layer_name} nbytes {nbytes} is not divisible by "
@@ -1319,6 +1326,12 @@ def build_glm_mla_pool_manifest(
             if rows != block_size_tokens:
                 raise ManifestError(
                     f"cache {layer_name} nope rows {rows} do not match the "
+                    f"KV block size {block_size_tokens}"
+                )
+        elif word_rows:
+            if rows <= 0 or block_size_tokens % rows:
+                raise ManifestError(
+                    f"cache {layer_name} word rows {rows} do not divide the "
                     f"KV block size {block_size_tokens}"
                 )
         elif rows * packing != block_size_tokens:
