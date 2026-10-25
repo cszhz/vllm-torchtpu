@@ -338,6 +338,34 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
         )
 
 
+# MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE for DeepSeek-V4's default fused EP
+# MoE; 0 keeps the kernel's own choice.
+DSV4_FUSED_EP_HEIGHT_RUNGS = 0
+
+
+def _default_dsv4_fused_ep_moe(vllm_config: "VllmConfig") -> None:
+    """Serve DeepSeek-V4's expert-parallel MoE through the fused EP kernel.
+
+    Without it each MoE layer is an all-gather, the per-rank routed GMMs and
+    a reduce-scatter of bf16[tokens * dp, hidden] that nothing overlaps. The
+    fused W4A8 kernel dispatches, computes and combines in one program, and
+    every DeepSeek-V4 MoE layer (hash-routed and score-biased) is admitted.
+    Defaults only: an explicit setting of either variable wins. Set here, in
+    the process that spawns the engine cores, so their workers inherit it.
+    """
+    model_config = vllm_config.model_config
+    if model_config is None or not vllm_config.parallel_config.enable_expert_parallel:
+        return
+    if "DeepseekV4ForCausalLM" not in (model_config.architectures or []):
+        return
+    os.environ.setdefault("USE_MOE_FUSED_EP_KERNEL", "1")
+    os.environ.setdefault("MOE_FUSED_EP_ENABLE_W4A8", "1")
+    if DSV4_FUSED_EP_HEIGHT_RUNGS:
+        os.environ.setdefault(
+            "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", str(DSV4_FUSED_EP_HEIGHT_RUNGS)
+        )
+
+
 def _register_tpu_kv_connectors() -> None:
     """Register TPU-specific KV connectors in vLLM's factory name registry.
 
@@ -667,6 +695,7 @@ class TpuPlatform(Platform):
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
         _validate_phased_profiling_config(vllm_config)
+        _default_dsv4_fused_ep_moe(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
