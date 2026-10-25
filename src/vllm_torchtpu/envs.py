@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
     TPU_PIN_OPERANDS_HBM: str = ""
     TPU_FP8_SKINNY_TABLE: str = ""
+    TPU_DSV4_VMEM_LIMIT_MIB: int = 0
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -949,6 +950,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fp8_skinny config table (`fp8_skinny.table`): "" = the original TP8 tables,
     # "v2" = adds the TP4 shards and shared_experts.down_proj (HBM-pinned sites).
     "TPU_FP8_SKINNY_TABLE": env_str("TPU_FP8_SKINNY_TABLE", ""),
+    # Scoped VMEM, in MiB, the DeepSeek-V4 Pallas kernels request
+    # (kernels/vmem_budget.py); 0 keeps their 100 MiB.
+    "TPU_DSV4_VMEM_LIMIT_MIB": env_nonnegative_int("TPU_DSV4_VMEM_LIMIT_MIB", 0),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()

@@ -46,6 +46,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from vllm_torchtpu.kernels import vmem_budget
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
     _dequant_dsv4_fp8,
@@ -54,7 +55,7 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
     prepare_swa_inputs,
 )
 
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+DEFAULT_VMEM_LIMIT_BYTES = vmem_budget.dsv4_limit_bytes()
 LANES = 128
 WORD_BITS = 32
 SUPER_BLOCK = WORD_BITS * LANES  # positions covered by one 128-word column

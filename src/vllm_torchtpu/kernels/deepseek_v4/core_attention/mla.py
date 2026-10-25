@@ -22,7 +22,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+from vllm_torchtpu.kernels import vmem_budget
+
+DEFAULT_VMEM_LIMIT_BYTES = vmem_budget.dsv4_limit_bytes()
 
 
 def cdiv(a, b):

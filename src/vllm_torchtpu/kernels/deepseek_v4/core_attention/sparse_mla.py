@@ -21,9 +21,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import vmem_budget
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
 
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+DEFAULT_VMEM_LIMIT_BYTES = vmem_budget.dsv4_limit_bytes()
 
 
 def cdiv(a, b):
