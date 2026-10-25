@@ -119,7 +119,7 @@ def _symbolic(ag, rs, take, full, partial, slot):
 
         captured = {}
 
-        def capture(gm, example_inputs):
+        def capture(gm, example_inputs, captured=captured):
             captured["gm"], captured["inputs"] = gm, example_inputs
             return gm.forward
 
