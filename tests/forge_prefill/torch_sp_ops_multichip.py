@@ -125,12 +125,17 @@ def _symbolic(ag, rs, take, full, partial, slot):
 
         try:
             torch._dynamo.reset()
-            torch.compile(fn, dynamic=True, backend=capture)(
-                full, partial, positions, slot
-            )
+            # Only the token dim is symbolic, as vLLM marks it.
+            for t in (full, partial, positions):
+                torch._dynamo.mark_dynamic(t, 0)
+            torch.compile(fn, backend=capture)(full, partial, positions, slot)
             tensors = iter((full, partial, positions, slot))
             concrete = [
                 rows if isinstance(e, torch.SymInt) else next(tensors)
+                for e in captured["inputs"]
+            ]
+            out[case + "_placeholders"] = [
+                "sym" if isinstance(e, torch.SymInt) else list(e.shape)
                 for e in captured["inputs"]
             ]
             exe = tpu_compile.TpuBackend()(captured["gm"], concrete)
@@ -141,7 +146,7 @@ def _symbolic(ag, rs, take, full, partial, slot):
                 "shapes": [list(g.shape), list(z.shape), list(y.shape)],
             }
         except Exception as exc:  # noqa: BLE001 - recorded per case
-            out[case] = {"ok": False, "error": repr(exc)[:400]}
+            out[case] = {"ok": False, "error": repr(exc)[:600]}
     return out
 
 
