@@ -98,6 +98,14 @@ class KernelConfig:
     kd_replica_plan: str = dataclasses.field(
         default_factory=lambda: os.environ.get("K3_REPLICA_PLAN", "")
     )
+    # FP8 wires for attention DP's hidden-row gathers (off when empty): "t0"
+    # the attention input, "t10" the MoE input. Rows travel as e4m3 with one
+    # FP32 scale each; every rank uses the dequantized rows.
+    fp8_wires: tuple[str, ...] = dataclasses.field(
+        default_factory=lambda: tuple(
+            filter(None, os.environ.get("K3_FP8_WIRES", "").split(","))
+        )
+    )
     pool_report: bool = False
     vmem_report: bool = False
     vmem_pad_kb: int = 0
@@ -105,6 +113,8 @@ class KernelConfig:
     def __post_init__(self) -> None:
         if self.kd_hot_plan and self.kd_replica_plan:
             raise ValueError("kd_hot_plan and kd_replica_plan are exclusive")
+        if not set(self.fp8_wires) <= {"t0", "t10"}:
+            raise ValueError("fp8_wires holds t0 and/or t10")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
