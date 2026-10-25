@@ -176,6 +176,18 @@ def _dequant_dsv4_fp8(words: jax.Array):
     return (nope_fp8 * nope_scales).astype(jnp.bfloat16)
 
 
+def _e8m0_high_bytes_to_bf16(pairs: jax.Array) -> jax.Array:
+    """BF16 2^(e - 127) for the e8m0 byte e in the high byte of each int16.
+
+    Exact for e in [1, 254], every scale the compressor writes for finite data
+    (amax >= 1e-4); e = 0 gives 0 rather than 2^-127 and e = 255 gives +inf
+    rather than NaN. Costs a shift and a mask per word, against the compare and
+    select fix-ups of an e8m0 -> bf16 convert.
+    """
+    bits = lax.shift_right_logical(pairs, 1) & 0x7F807F80
+    return pltpu.bitcast(bits, jnp.bfloat16)
+
+
 def _dequant_dsv4_fp8_sub_rows(words: jax.Array) -> list[jax.Array]:
     """int32 [rows, 128] NoPE words -> the record's 4 sub-rows as BF16 [rows, 128].
 
@@ -203,7 +215,7 @@ def _dequant_dsv4_fp8_sub_rows(words: jax.Array) -> list[jax.Array]:
     high_halves = lax.shift_right_logical(words, 16).astype(jnp.int16)
     sub_rows = low_and_high_bytes(low_halves) + low_and_high_bytes(high_halves)
     # scales[d] = scales[d % 64]; the 64 scale bytes are lanes 64: of sub-row 3.
-    tail = pltpu.bitcast(sub_rows[-1], jnp.float8_e8m0fnu).astype(jnp.bfloat16)
+    tail = _e8m0_high_bytes_to_bf16(int16_pairs(high_halves))
     lane = lax.broadcasted_iota(jnp.int32, tail.shape, 1)
     tile = jnp.where(
         lane < NOPE_SCALE_PERIOD, pltpu.roll(tail, NOPE_SCALE_PERIOD, 1), tail
