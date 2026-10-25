@@ -53,7 +53,9 @@ logger = init_logger(__name__)
 
 # With the C1 tiles the kernel beats stock through 64 rows (mk/kernel_work/
 # mk-row-slope/report.md vs mk/stock-segment-vs-rows.md); 64 is the margin case.
-DEFAULT_BUCKETS = (4, 8, 16, 32, 64)
+# 24 and 48 are serving token buckets too (TPU_TOKEN_BUCKET_EXTRA); without them
+# 24-/48-row verify steps (6 or 12 requests) run stock.
+DEFAULT_BUCKETS = (4, 8, 16, 24, 32, 48, 64)
 
 
 def _parse_buckets(raw: str) -> tuple[int, ...]:
@@ -84,6 +86,10 @@ def _parse_int(raw: str, key: str) -> int | None:
             return int(part[len(key) + 1 :])
     return None
 
+
+# `VLLM_TPU_MEGAKERNEL=...,nodonate=1`: the GDN pool is not donated to the segment op; it
+# writes a fresh pool that `_run` copies back into the live cache (bisecting a served hang).
+NO_DONATE = False
 
 _UNSET = object()
 
@@ -209,7 +215,7 @@ class _SegmentKind:
                 mesh=self.mesh,
                 input_partition_specs=in_specs,
                 output_partition_specs=outs,
-                donate_argnums=donate,
+                donate_argnums=() if NO_DONATE else donate,
             )
         return self._calls[B]
 
@@ -425,12 +431,14 @@ class Qwen38SegmentDriver:
         drv.sync = _parse_flag(raw, "sync", False)
         drv.warm = _parse_flag(raw, "warm", False)
         drv.noaot = _parse_flag(raw, "noaot", False)
+        global NO_DONATE
+        NO_DONATE = _parse_flag(raw, "nodonate", False)
         logger.info(
             "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d, hier %s, rings %s, head %s",
             drv.buckets,
             drv.check_left,
             qwen38_segment_call.DEFAULT_HIER,
-            f"{qwen38_segment_call.DEFAULT_RINGS or 'per bucket'}, gdnclamp {qwen38_segment_call.CLAMP_BLOCKS}",
+            f"{qwen38_segment_call.DEFAULT_RINGS or 'per bucket'}, gdnclamp {qwen38_segment_call.CLAMP_BLOCKS}, nodonate {NO_DONATE}",
             bool(drv.segments.head_groups),
         )
         return drv
