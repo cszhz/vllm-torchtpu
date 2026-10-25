@@ -178,6 +178,8 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     TPU_DSV4_CSA_GATHER_NO_PAD: bool = True
     TPU_DSV4_CSA_UNION_DENSE: bool = False
+    TPU_DSV4_QNORM_ROPE_FLAT: bool = False
+    TPU_DSV4_ROPE_QUANT_FLAT: bool = False
     TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS: int = 512
     TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
     TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
@@ -1189,6 +1191,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weights rounded to bf16, products accumulated in f32), the numerics the
     # mixed/prefill pass already uses. Halves the VPU work of the reduction.
     "TPU_STREAMIDX_VERIFY_BD": env_bool("TPU_STREAMIDX_VERIFY_BD"),
+    # DSv4 q-RMSNorm + RoPE / indexer rope_quant: read the wq_b projection in its
+    # flat [T, heads * dim] (8, 128) tiles inside the kernel instead of letting
+    # XLA relay it out to [T, heads, dim] first (a TC copy per layer at decode,
+    # a SparseCore data-format call at prefill). Bit-exact. Ported from cuiq
+    # forge/cmp-c90c0ac7 af9afe1f1 / a2c62f3b6.
+    "TPU_DSV4_QNORM_ROPE_FLAT": env_bool("TPU_DSV4_QNORM_ROPE_FLAT"),
+    "TPU_DSV4_ROPE_QUANT_FLAT": env_bool("TPU_DSV4_ROPE_QUANT_FLAT"),
     # DSv4 indexer: hand the SparseCore top-k the scoring kernel's [T, S, 128]
     # buffer as is, without padding rows, instead of reshaping it to [T, S*128]
     # and padding the rows to the top-k's wave size. The bytes are identical, so

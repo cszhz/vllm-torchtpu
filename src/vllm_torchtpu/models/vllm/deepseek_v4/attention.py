@@ -90,6 +90,17 @@ def _qnorm_rope_jax(
     )
 
 
+def _qnorm_rope_3d_jax(
+    x: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    eps: float,
+) -> jax.Array:
+    """Per-head RMSNorm (no weight) fused with RoPE on [tokens, heads, dim] q."""
+    return rope_kernel.qnorm_rope(x, positions, cos_sin_cache, eps=eps)
+
+
 def _rope_jax(
     x: jax.Array,
     positions: jax.Array,
@@ -569,13 +580,46 @@ class VllmDeepseekV4MLAAttention(
         object.__setattr__(self, "_kv_rope_op_instance", op)
         return op
 
+    @property
+    def qnorm_rope_3d_op(self):
+        """The [tokens, heads, dim] q-RMSNorm + RoPE op (TPU_DSV4_QNORM_ROPE_FLAT=0)."""
+        op = self.__dict__.get("_qnorm_rope_3d_op_instance")
+        if op is not None:
+            return op
+
+        eps = float(self.mla_attn.eps)
+        op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(_qnorm_rope_3d_jax, eps=eps),
+                mesh=get_pallas_op_mesh(),
+                input_partition_specs=(
+                    P(None, "model", None),  # q
+                    P(),  # positions
+                    P(),  # cos_sin_cache
+                ),
+            )
+            op.register_fake(_fake_rope)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_qnorm_rope_3d_op_instance", op)
+        return op
+
     def qnorm_rope(
         self,
         q: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """RMSNorm + scaling RoPE on the flat q projection -> [tokens, heads, dim]."""
-        return self.qnorm_rope_op(q, positions, self.mla_attn.rotary_emb.cos_sin_cache)
+        """RMSNorm + scaling RoPE on the flat q projection -> [tokens, heads, dim].
+
+        TPU_DSV4_QNORM_ROPE_FLAT reads the projection's (8, 128) tiles in the
+        kernel; otherwise q is viewed 3-D and XLA relays it out first."""
+        cache = self.mla_attn.rotary_emb.cos_sin_cache
+        if envs.TPU_DSV4_QNORM_ROPE_FLAT:
+            return self.qnorm_rope_op(q, positions, cache)
+        q = q.view(q.shape[0], -1, self.mla_attn.head_dim)
+        return self.qnorm_rope_3d_op(q, positions, cache)
 
     def kv_rope(
         self,
