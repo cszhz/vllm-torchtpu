@@ -3761,6 +3761,18 @@ class TPUModelRunner(GPUModelRunner):
             device="cpu",
         )
 
+    def _clear_finished_remote_dspark_batch(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        request_ids = self.input_batch.req_ids[: self.input_batch.num_reqs]
+        if request_ids and all(
+            req_id in scheduler_output.finished_req_ids for req_id in request_ids
+        ):
+            # The final proposal has no verify feedback. Retire its runner
+            # state before a new prefill can wait on that terminal round.
+            self._remote_dspark_awaiting_feedback = False
+            self._remote_dspark_producer_request_ids = None
+
     def _prepare_remote_dspark_bootstrap(
         self, scheduler_output: "SchedulerOutput"
     ) -> None:
@@ -3791,6 +3803,8 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if self._remote_dspark_role:
+            self._clear_finished_remote_dspark_batch(scheduler_output)
         if self._remote_dspark_role == "consumer":
             self._prepare_remote_dspark_bootstrap(scheduler_output)
         if (

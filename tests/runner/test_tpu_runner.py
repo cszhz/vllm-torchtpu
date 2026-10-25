@@ -3305,3 +3305,23 @@ def test_remote_dspark_bootstrap_preserves_real_proposals():
     assert output.scheduled_spec_decode_tokens == {"request": [42]}
     assert output.num_scheduled_tokens == {"request": 2}
     assert output.total_num_scheduled_tokens == 2
+
+
+@pytest.mark.parametrize("finished", [set(), {"first"}, {"first", "second"}])
+def test_remote_dspark_terminal_batch_does_not_wait_for_feedback(finished):
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["first", "second"], num_reqs=2),
+        _remote_dspark_awaiting_feedback=True,
+        _remote_dspark_producer_request_ids=["producer-first", "producer-second"],
+    )
+    output = SimpleNamespace(finished_req_ids=finished)
+    TPUModelRunner._clear_finished_remote_dspark_batch(runner, output)
+    if finished == {"first", "second"}:
+        assert not runner._remote_dspark_awaiting_feedback
+        assert runner._remote_dspark_producer_request_ids is None
+    else:
+        assert runner._remote_dspark_awaiting_feedback
+        assert runner._remote_dspark_producer_request_ids == [
+            "producer-first",
+            "producer-second",
+        ]
