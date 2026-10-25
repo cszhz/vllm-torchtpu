@@ -151,7 +151,8 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
         union_stats=var.get("ustats") == "1",
     )  # fmt: skip
     if var.get("pipeline") == "1":  # as VLLM_TPU_DSV4_MK_ATTN_PIPELINE=1 (step_impl.kernel_config)
-        scfg = dataclasses.replace(scfg, attn_pipeline=True, attn_split=scfg.attn_tp > 1)
+        split = scfg.attn_tp > 1 and var.get("nosplit") != "1"  # nosplit: attribution only
+        scfg = dataclasses.replace(scfg, attn_pipeline=True, attn_split=split)
     if moe_impl != "real":
         moe_args = []
     elif "moe_distinct" in var:  # per-layer expert arrays reuse k distinct sets
