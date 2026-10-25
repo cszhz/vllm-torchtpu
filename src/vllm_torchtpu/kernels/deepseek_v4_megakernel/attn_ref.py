@@ -295,7 +295,8 @@ def indexer_q_reference(idx_q, idx_w, cos_sin, positions, *, softmax_scale=128 *
                         n_head=64):
     """`rope_quant` + the weight fold of `_indexer_jax`, plain JAX.
 
-    idx_q bf16 [R, T, 64 * 128] (pre-RoPE), idx_w f32 [R, T, 64], positions [R, T].
+    idx_q bf16 [R, T, 64 * 128] (pre-RoPE), idx_w f32 [R, T, 64] (the `weights_proj`
+    accumulator: stock's bf16 linear rounds it to bf16), positions [R, T].
     Returns the e4m3 queries as f32 values [R, T, 64, 128] and the folded weights
     [R, T, 64].
     """
@@ -314,5 +315,5 @@ def indexer_q_reference(idx_q, idx_w, cos_sin, positions, *, softmax_scale=128 *
     scale = amax / 448.0
     inv = jnp.where(amax == 0.0, 0.0, 1.0 / scale)
     q = (y * inv).astype(jnp.float8_e4m3fn).astype(jnp.float32)
-    w = idx_w * softmax_scale * (n_head ** -0.5) * scale[..., 0]
+    w = idx_w.astype(jnp.bfloat16) * softmax_scale * (n_head ** -0.5) * scale[..., 0]
     return q, w

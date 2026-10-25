@@ -20,6 +20,7 @@ indexer scores, top-k), kv_write.compress_store (compressor stores, bit-exact
 vs the stock goldens in test_kv_write) and the SWA row encoding.
 """
 
+import ast
 import dataclasses
 import functools
 import os
@@ -280,14 +281,14 @@ def build_call(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk
         w = refs[n_s + n_v:n_s + n_v + n_w]
         caches = refs[n_s + n_v + n_w + n_c:n_s + n_v + n_w + 2 * n_c]  # aliased outputs
         out = refs[n_s + n_v + n_w + 2 * n_c]
-        scr = refs[n_s + n_v + n_w + 2 * n_c + 1 + 3 * int(debug_topk):]
+        scr = refs[n_s + n_v + n_w + 2 * n_c + 1 + 4 * int(debug_topk):]
         lease = SP.PoolLease(None, 0, 0)
         if leased:
             scr, lease = scr[:-1], SP.PoolLease(scr[-1], 0, lease_bytes // 128)
-        AP.DEBUG_TOPK = AP.DEBUG_SCORES = AP.DEBUG_LENS = None  # set per trace
+        AP.DEBUG_TOPK = AP.DEBUG_SCORES = AP.DEBUG_LENS = AP.DEBUG_WEIGHTS = None  # per trace
         if debug_topk:
-            AP.DEBUG_TOPK, AP.DEBUG_SCORES, AP.DEBUG_LENS = \
-                refs[n_s + n_v + n_w + 2 * n_c + 1:n_s + n_v + n_w + 2 * n_c + 4]
+            AP.DEBUG_TOPK, AP.DEBUG_SCORES, AP.DEBUG_LENS, AP.DEBUG_WEIGHTS = \
+                refs[n_s + n_v + n_w + 2 * n_c + 1:n_s + n_v + n_w + 2 * n_c + 5]
         meta = SP.AttnMeta(
             num_req=s[0], seq_lens=s[1], positions=s[2], bt_flat=s[3],
             bt_off=dict(zip(META_ROLES, s[4:11])), bt_w=dict(zip(META_ROLES, s[11:18])))
@@ -308,7 +309,7 @@ def build_call(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk
             once(0, 0)
         else:
             jax.lax.fori_loop(0, reps, once, 0)
-        AP.DEBUG_TOPK = AP.DEBUG_SCORES = AP.DEBUG_LENS = None
+        AP.DEBUG_TOPK = AP.DEBUG_SCORES = AP.DEBUG_LENS = AP.DEBUG_WEIGHTS = None
 
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
@@ -324,9 +325,10 @@ def build_call(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk
         + [jax.ShapeDtypeStruct((R, geom.RP, 512), inputs["q"].dtype)]  # q's storage
         + ([jax.ShapeDtypeStruct((R, 8, AP.TOPK), jnp.int32),
             jax.ShapeDtypeStruct((R, AP.dims_of(geom).n_cols // 128 * 8, 128), jnp.int32),
-            jax.ShapeDtypeStruct((R, 8, 128), jnp.int32)] if debug_topk else []),
+            jax.ShapeDtypeStruct((R, 8, 128), jnp.int32),
+            jax.ShapeDtypeStruct((R, 8, 128), jnp.float32)] if debug_topk else []),
         in_specs=[smem] * 3 + [hbm] + [smem] * (n_s - 4) + [vmem] * n_v + [hbm] * (n_w + n_c),
-        out_specs=[hbm] * n_c + [vmem] + ([vmem] * 3 if debug_topk else []),
+        out_specs=[hbm] * n_c + [vmem] + ([vmem] * 4 if debug_topk else []),
         scratch_shapes=scratch,
         input_output_aliases={n_s + n_v + n_w + i: i for i in range(n_c)},
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=60 * 1024 * 1024,
@@ -342,9 +344,9 @@ def run_phase(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk=
                          attn_heads=attn_heads, h0=h0, strict_causal=strict_causal)
     n_c = len(ls.arrays)
     res = fn(*ops)
-    AP.DEBUG_TOPK = AP.DEBUG_SCORES = AP.DEBUG_LENS = None
+    AP.DEBUG_TOPK = AP.DEBUG_SCORES = AP.DEBUG_LENS = AP.DEBUG_WEIGHTS = None
     if debug_topk:
-        return list(res[:n_c]), res[n_c], res[n_c + 1:n_c + 4]
+        return list(res[:n_c]), res[n_c], res[n_c + 1:n_c + 5]  # top-k, scores, lens, weights
     return list(res[:n_c]), res[n_c]
 
 
@@ -422,6 +424,35 @@ def reference_with_topk(ls, layer, inputs, exp_caches, topk):
         ls.weights["attn_sink"][layer], sm_scale=AP.SM_SCALE)
 
 
+STOCK_INDEXER = os.path.join(
+    os.path.dirname(os.path.abspath(AP.__file__)), "..", "..", "layers", "adapter", "custom_ops",
+    "deepseek_v4", "deepseek_v4_indexer.py")
+# vLLM `DeepseekV4Indexer`: softmax_scale = index_head_dim ** -0.5, n_head = index_n_heads
+STOCK_SCALARS = dict(softmax_scale=128 ** -0.5, n_head=64)
+
+
+@functools.cache
+def _stock_fold():
+    """The `weights = ...` statement of stock `_indexer_local`, compiled. Its
+    module imports vLLM, so the statement is read from the source instead."""
+    with open(STOCK_INDEXER) as f:
+        tree = ast.parse(f.read())
+    (fn,) = [n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and n.name == "_indexer_local"]
+    (stmt,) = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
+               and [getattr(t, "id", None) for t in n.targets] == ["weights"]]
+    names = {n.id for n in ast.walk(stmt.value) if isinstance(n, ast.Name)}
+    assert names == {"indexer_weights", "q_scales", *STOCK_SCALARS}, names
+    return compile(ast.Expression(stmt.value), STOCK_INDEXER, "eval")
+
+
+def stock_indexer_weights(w_acc, q_scales):
+    """Stock folded weights from an f32 `weights_proj` accumulator: the bf16
+    linear's output (round to nearest even), then stock's fold statement."""
+    env = dict(STOCK_SCALARS, indexer_weights=w_acc.astype(jnp.bfloat16), q_scales=q_scales)
+    return eval(_stock_fold(), {}, env)  # noqa: S307 -- stock source, see _stock_fold
+
+
 def stock_topk_equal(ls, layer, inputs, exp_caches, topk, strict_causal=False):
     """Rows whose kernel top-k equals stock rope_quant + streamindex_topk (device)."""
     from bench_attn_device import stock_indexer
@@ -436,7 +467,7 @@ def stock_topk_equal(ls, layer, inputs, exp_caches, topk, strict_causal=False):
     del ci
     q8, qs = rope_quant(inputs["idx_q"][:, :Q].reshape(R * Q, 64, 128), pos.reshape(-1),
                         ls.weights["idx_cos_sin"], quant_dtype=jnp.float8_e4m3fn)
-    w = inputs["idx_w"][:, :Q, :64].reshape(R * Q, 64) * (128 ** -0.5) * (64 ** -0.5) * qs.reshape(R * Q, 64)
+    w = stock_indexer_weights(inputs["idx_w"][:, :Q, :64].reshape(R * Q, 64), qs.reshape(R * Q, 64))
     stk = np.asarray(stock_indexer(q8, w, u8, seq, jnp.asarray(ls.tables[("indexer_k", layer)]),
                                    strict_causal=strict_causal))
     return int(np.sum(np.all(stk.reshape(R, Q, -1) == np.asarray(topk), axis=-1)))

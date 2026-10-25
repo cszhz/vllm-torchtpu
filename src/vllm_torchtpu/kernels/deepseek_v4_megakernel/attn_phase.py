@@ -73,6 +73,8 @@ ABLATE = frozenset()
 TRANSPOSE_KEYS = False  # explicit key transposes for PV in the HCA / union passes (A/B)
 TABLE_REUSE = True  # tests only: False restages the block tables at every layer
 DEBUG_TOPK = None  # test harness only: a VMEM ref [B, 8, TOPK] receiving the top-k lists
+# test harness only: a VMEM ref [B, 8, 128] f32, folded weights | query scales
+DEBUG_WEIGHTS = None
 # Positive control of the store tests only: "two_runs" writes both boundaries'
 # copies of a shared RoPE row / SAL lane tile, neither merged (lost records).
 STORE_FAULT = ""
@@ -123,6 +125,15 @@ BT_ALIGN = 128  # an HBM int32 vector is tiled by 128: slices start on a tile
 
 
 COS_SIN_FIELDS = ("cos_sin", "comp_cos_sin", "idx_cos_sin")
+
+
+def fold_indexer_weights(w, q_scale):
+    """Indexer score weights from the f32 `weights_proj` accumulator `w` and the
+    per-head query scales, rounded as stock: `weights_proj` is a bf16 linear, and
+    `_indexer_local` (deepseek_v4_indexer.py) folds
+    `indexer_weights * softmax_scale * (n_head**-0.5) * q_scales`, i.e. two bf16
+    multiplies by Python floats, then f32 with the f32 `rope_quant` scales."""
+    return w.astype(jnp.bfloat16) * IDX_SOFTMAX_SCALE * IDX_HEAD_SCALE * q_scale
 
 
 def pack_cos_sin(cs):
@@ -833,7 +844,7 @@ class _Phase:
         ch = lane - 64
         odd = (lane % 2) == 1
         S.qhm[...] = jnp.zeros((512, 128), jnp.float32)
-        wrows = []
+        wrows, srows = [], []
         for t in range(T):
             x = jnp.concatenate([self.inp.idx_q[r, pl.ds(t, 1), pl.ds(h * 128, 128)]
                                  for h in range(64)], axis=0).astype(jnp.float32)  # [64, 128]
@@ -853,10 +864,13 @@ class _Phase:
             inv = jnp.where(amax == 0.0, 0.0, 1.0 / scale)
             q8 = (y * inv).astype(jnp.float8_e4m3fn).astype(jnp.float32)
             S.qhm[pl.ds(t, 64, stride=8), :] = q8
-            srow = jnp.transpose(jnp.broadcast_to(scale, (64, 128)))[0:1, :]  # [1, 64]
-            w = self.inp.idx_w[r, t:t + 1, 0:64]
-            wrows.append(((w * IDX_SOFTMAX_SCALE) * IDX_HEAD_SCALE) * srow)
-        wmat = jnp.concatenate(wrows + [jnp.zeros((8 - T, 64), jnp.float32)], axis=0)  # [8, 64]
+            srows.append(jnp.transpose(jnp.broadcast_to(scale, (64, 128)))[0:1, :])  # [1, 64]
+            wrows.append(self.inp.idx_w[r, t:t + 1, 0:64])
+        pad = [jnp.zeros((8 - T, 64), jnp.float32)]
+        smat = jnp.concatenate(srows + pad, axis=0)
+        wmat = fold_indexer_weights(jnp.concatenate(wrows + pad, axis=0), smat)  # [8, 64]
+        if DEBUG_WEIGHTS is not None:
+            DEBUG_WEIGHTS[r] = jnp.concatenate([wmat, smat], axis=1)
         for h in range(64):
             S.wb[h] = jnp.broadcast_to(wmat[:, h:h + 1], (8, 128))
         # score scan

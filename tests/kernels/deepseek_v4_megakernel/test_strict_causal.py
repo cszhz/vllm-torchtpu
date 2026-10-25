@@ -127,7 +127,7 @@ def csa_layer():
 @pytest.mark.parametrize("strict", [False, True])
 def test_phase_topk_and_attention(csa_layer, strict):
     ls, inp = csa_layer
-    caches, out, (tk, scores, _) = H.run_phase(ls, "csa", 1, inp, debug_topk=True,
+    caches, out, (tk, scores, _, _) = H.run_phase(ls, "csa", 1, inp, debug_topk=True,
                                                strict_causal=strict)
     tk = np.asarray(tk)[:, :Q]
     lens = stock_lens(SEQ, Q, strict)

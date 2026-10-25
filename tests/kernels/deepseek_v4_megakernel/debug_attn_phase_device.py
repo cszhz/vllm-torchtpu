@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench_attn_device import stock_indexer
 qx = inp["idx_q"][0, :7].reshape(7, 64, 128)
 q8, qs = rope_quant(qx, pos[0].astype(jnp.int32), ls.weights["idx_cos_sin"], quant_dtype=jnp.float8_e4m3fn)
-w = inp["idx_w"][0, :7, :64] * (128 ** -0.5) * (64 ** -0.5) * qs.reshape(7, 64)
+w = H.stock_indexer_weights(inp["idx_w"][0, :7, :64], qs.reshape(7, 64))
 u8 = csa_cache_layout.words_to_slabs(jnp.asarray(exp_c[ai]))
 stk = np.asarray(stock_indexer(q8, w, u8, seq, jnp.asarray(ls.tables[("indexer_k", 1)])))
 print("kernel top-k == stock streamindex_topk:", [bool(np.array_equal(tk[t], stk[t])) for t in range(7)],
