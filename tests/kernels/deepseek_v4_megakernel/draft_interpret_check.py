@@ -75,6 +75,8 @@ def main():
     p.add_argument("--moe", choices=("stub", "real"), default="stub")
     p.add_argument("--fault", choices=("none", "ctx_pos"), default="none")
     p.add_argument("--attn", choices=("stub", "real"), default="stub")
+    p.add_argument("--vmem-share", action="store_true", help="vmem_share on")
+    p.add_argument("--dump", default="", help="save the kernel outputs (.npz)")
     a = p.parse_args()
     moe_inter = 1024 if a.moe == "real" else 128 * R
     if a.attn == "real":  # the attention phase is DSv4-shaped: 128 heads of 512
@@ -93,7 +95,8 @@ def main():
     tp_cfg = dataclasses.replace(full, tp=R)
     scfg = SK.StepKernelConfig(dense=tp_cfg, q=K, B=B, moe_impl=a.moe,
                                ctx_q=Q_CTX, num_hash_layers=0, debug_att=True,
-                               attn_impl=a.attn, max_ctx=MAX_CTX)  # fmt: skip
+                               attn_impl=a.attn, max_ctx=MAX_CTX,
+                               vmem_share=a.vmem_share)  # fmt: skip
     w = dw.make_weights(full)
     packs = [dw.pack_weights(SR.rank_weights(w, full, r, R), tp_cfg) for r in range(R)]
     tiles = {n: jnp.concatenate([pk["tiles"][n] for pk in packs])
@@ -202,6 +205,8 @@ def main():
 
     outs = jax.block_until_ready(f(*[put(x) for x in args]))
     outs = [multihost_utils.process_allgather(o, tiled=True) for o in outs]
+    if a.dump:
+        np.savez(a.dump, *[np.asarray(o).view(np.uint8) for o in outs])
     res, ctx_kv = np.asarray(outs[0], np.float32), np.asarray(outs[1], np.float32)
     arr_out = [np.asarray(x) for x in outs[2:]]
     rc = SR.RefConfig(full=full, R=R, T=T, q=K, aux_layers=(), ar_mode="hrsag",
