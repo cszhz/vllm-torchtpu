@@ -156,3 +156,35 @@ def test_plan_matches_numpy(bq):
         )
         np.testing.assert_array_equal(mask[q0 : q0 + qn], ref["mask"][q0 : q0 + qn])
     assert T >= int(c["cu_np"][-1])
+
+
+@pytest.mark.parametrize(
+    "seqs,routed",
+    [
+        ([(7, 9000), (498, 100000)], False),  # chunk past the cap: plan skipped, all sparse
+        ([(7, 100000), (498, 31000)], True),  # deep verify row in front, short chunk routed
+        ([(300, 100000), (200, 9000)], True),  # deep chunk -> sparse prefix of 300 rows
+    ],
+)
+def test_union_max_kv_tp4(seqs, routed):
+    """TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4: sequences whose compressed KV
+    exceeds the cap stay on the sparse path; output matches the sparse kernel."""
+    c = _case(np.random.default_rng(2), seqs, 32, correlated=True)
+    n = int(c["cu_np"][-1])
+    plan = csa_union_dense.prepare(
+        c["topk"], c["kv"], c["pages"], c["cu"], c["dist"], page_size=PAGE_SIZE,
+        bq=32, count_first=False, split=2, max_kv=16384,
+    )  # fmt: skip
+    long_rows = sum(q for q, ctx in seqs if (ctx + q) // 4 + 1 > 16384 and q >= 17)
+    n_sparse = int(plan["n_sparse"])
+    assert (n_sparse < n) == routed  # some sequence routed to union-dense
+    if not routed:
+        assert not bool(plan["use_union"])
+    assert n_sparse >= long_rows
+    ref = np.asarray(_sparse(c), np.float32)[:n]
+    out = csa_union_dense.attention(
+        c["q"], c["nope"], c["rope"], c["topk"], c["kv"], c["pages"], c["cu"],
+        c["dist"], c["sinks"], c["swa_acc"], c["swa_l"], c["swa_m"], sm_scale=0.044,
+        bq=32, plan=plan,
+    )  # fmt: skip
+    np.testing.assert_allclose(np.asarray(out, np.float32)[:n], ref, atol=8e-3, rtol=0)
