@@ -129,9 +129,16 @@ def _symbolic(ag, rs, take, full, partial, slot):
             for t in (full, partial, positions):
                 torch._dynamo.mark_dynamic(t, 0)
             torch.compile(fn, backend=capture)(full, partial, positions, slot)
-            tensors = iter((full, partial, positions, slot))
+            # Dynamo orders the placeholders its own way; the four tensors
+            # differ in rank or trailing dims, which identifies them.
+            by_sig = {
+                (t.dim(), tuple(t.shape[1:])): t
+                for t in (full, partial, positions, slot)
+            }
             concrete = [
-                rows if isinstance(e, torch.SymInt) else next(tensors)
+                rows
+                if isinstance(e, torch.SymInt)
+                else by_sig[(e.dim(), tuple(int(d) for d in e.shape[1:]))]
                 for e in captured["inputs"]
             ]
             out[case + "_placeholders"] = [
