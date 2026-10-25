@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     TPU_DSV4_SWA_KV_BLOCK_TOKENS: int = 256
     TPU_DSV4_SKIP_EMPTY_ATTN_PASSES: bool = False
     TPU_DSV4_HCA_PREFETCH_EARLY: bool = False
+    TPU_DSV4_SWA_SINGLE_PASS: bool = False
     TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS: int = 0
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -1123,10 +1124,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_SWA_KV_BLOCK_TOKENS": env_positive_int(
         "TPU_DSV4_SWA_KV_BLOCK_TOKENS", 256
     ),
-    # DSv4 SWA / HCA attention: skip the decode / verify / mixed kernel passes
-    # that have no sequences this step (each empty launch costs ~1-1.5 us; a
-    # decode step with speculative decoding has empty decode and mixed passes).
+    # DSv4 HCA attention: skip the verify / mixed kernel passes that have no
+    # sequences this step (each empty launch costs ~1 us; a decode step with
+    # speculative decoding has an empty mixed pass).
     "TPU_DSV4_SKIP_EMPTY_ATTN_PASSES": env_bool("TPU_DSV4_SKIP_EMPTY_ATTN_PASSES"),
+    # DSv4 sliding-window attention: run every sequence in one mixed-case kernel
+    # launch instead of three (decode / verify / mixed), two of which are empty
+    # on a speculative-decoding decode step (~1-1.5 us per empty launch).
+    "TPU_DSV4_SWA_SINGLE_PASS": env_bool("TPU_DSV4_SWA_SINGLE_PASS"),
     # DSv4 HCA attention: issue the next KV block's page DMAs before the current
     # block's compute instead of after it, so the copy overlaps the compute.
     "TPU_DSV4_HCA_PREFETCH_EARLY": env_bool("TPU_DSV4_HCA_PREFETCH_EARLY"),

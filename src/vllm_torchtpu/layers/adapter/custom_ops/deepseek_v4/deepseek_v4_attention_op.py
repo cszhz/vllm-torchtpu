@@ -100,7 +100,7 @@ def _run_swa(
         unnormalized_output=not swa_only,
         non_causal_block=non_causal_block,
         chunk_prefill_size=verify_q_len,
-        skip_empty_passes=envs.TPU_DSV4_SKIP_EMPTY_ATTN_PASSES,
+        single_pass=envs.TPU_DSV4_SWA_SINGLE_PASS,
     )
 
 

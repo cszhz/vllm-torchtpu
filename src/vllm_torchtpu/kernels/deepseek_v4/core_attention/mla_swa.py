@@ -1456,7 +1456,7 @@ def run_mla_batched_decode_kernel(
         "unnormalized_output",
         "non_causal_block",
         "q_compute_block_size",
-        "skip_empty_passes",
+        "single_pass",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -1488,7 +1488,7 @@ def mla_sliding_window_ragged_paged_attention(
     # context keys). Requires q_len <= sliding_window.
     non_causal_block: bool = False,
     decode_seq_batch_size: int = 32,
-    skip_empty_passes: bool = False,
+    single_pass: bool = False,
 ) -> tuple[
     jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     jax.Array,  # [total_num_pages, physical_page_size_per_kv_packing, 4, 128] uint8
@@ -1764,14 +1764,15 @@ def mla_sliding_window_ragged_paged_attention(
     in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
 
     def skip_if_empty(start_seq_idx, end_seq_idx, run, operands):
-        # An empty pass still pays its launch (~1-1.5 us per pass); with
-        # speculative decoding the decode and mixed passes of a decode step are
-        # empty. The skip branch returns the aliased operands unchanged.
-        if not skip_empty_passes:
-            return run(*operands)
-        return lax.cond(
-            end_seq_idx > start_seq_idx, lambda ops: run(*ops), lambda ops: ops, operands
-        )
+        # `single_pass`: every sequence (decode, verify window, prefill chunk)
+        # runs in the one mixed-case launch below; the decode and fixed-length
+        # passes are not launched. Each launch costs ~1-1.5 us even when its
+        # sequence range is empty, which with speculative decoding is every
+        # decode step's decode and mixed pass.
+        del start_seq_idx, end_seq_idx
+        if single_pass:
+            return operands
+        return run(*operands)
 
     bkv_sz = num_kv_pages_per_blocks[0] * logical_page_size
     if sliding_window <= bkv_sz:
@@ -1856,29 +1857,24 @@ def mla_sliding_window_ragged_paged_attention(
         )
 
     # Handle mixed case where the query length per sequence is variable.
-    output, updated_kv, out_l, out_m = skip_if_empty(
-        distribution[1],
-        distribution[2],
-        lambda o_in, kv_in, l_in, m_in: run_mla_kernel(
-            q,
-            new_kv,
-            kv_in,
-            kv_lens,
-            page_indices,
-            cu_q_lens,
-            num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-            num_queries_per_block=num_queries_per_blocks[2],
-            start_seq_idx=distribution[1],
-            end_seq_idx=distribution[2],
-            in_output=o_in,
-            in_l=l_in,
-            in_m=m_in,
-            attention_sinks=attention_sinks,
-            static_q_len=None,
-            unnormalized_output=unnormalized_output,
-            case=MlaCase.MIXED,
-        ),
-        (output, updated_kv, out_l, out_m),
+    output, updated_kv, out_l, out_m = run_mla_kernel(
+        q,
+        new_kv,
+        updated_kv,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+        num_queries_per_block=num_queries_per_blocks[2],
+        start_seq_idx=jnp.array(0) if single_pass else distribution[1],
+        end_seq_idx=distribution[2],
+        in_output=output,
+        in_l=out_l,
+        in_m=out_m,
+        attention_sinks=attention_sinks,
+        static_q_len=None,
+        unnormalized_output=unnormalized_output,
+        case=MlaCase.MIXED,
     )
     output = prepare_outputs(
         output, actual_num_q_heads, actual_head_dim
