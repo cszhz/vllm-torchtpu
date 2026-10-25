@@ -62,6 +62,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
+from vllm_torchtpu.utils import release_memory_to_os
 
 logger = init_logger(__name__)
 
@@ -609,6 +610,13 @@ class DeepseekV4Model(nn.Module):
                         continue
         finally:
             staged.flush_all()
+        # The staging is tens of GiB per worker, eight workers a host, and
+        # dropping the last reference does not by itself shrink the process:
+        # the allocator keeps the freed memory for reuse. Held, it is host
+        # DRAM the KV-offload store cannot have, so hand it back now. Not in
+        # the finally: only a successful load needs the memory back, and an
+        # error there would replace the loading error.
+        release_memory_to_os()
 
         return loaded_params
 

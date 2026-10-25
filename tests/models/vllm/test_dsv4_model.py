@@ -53,6 +53,53 @@ def test_deepseek_v4_model_registration():
     assert model_cls is DeepseekV4ForCausalLM
 
 
+def _staging_backbone(monkeypatch) -> model_mod.DeepseekV4Model:
+    """A DeepseekV4Model with one plain parameter and no experts, at TP 1."""
+    model = model_mod.DeepseekV4Model.__new__(model_mod.DeepseekV4Model)
+    nn.Module.__init__(model)
+    model.norm = nn.LayerNorm(3)
+    model.config = SimpleNamespace(num_attention_heads=1)
+    model.get_expert_mapping = list
+    monkeypatch.setattr(model_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(model_mod, "get_tensor_model_parallel_rank", lambda: 0)
+    return model
+
+
+def test_load_weights_releases_staged_host_memory_once_written(monkeypatch):
+    """Staging is tens of GiB per worker; a finished load hands it to the OS.
+
+    The release has to come after every parameter is written, or it would
+    trim memory the remaining host buffers still occupy.
+    """
+    model = _staging_backbone(monkeypatch)
+    released = []
+    monkeypatch.setattr(
+        model_mod,
+        "release_memory_to_os",
+        lambda: released.append(model.norm.weight.detach().clone()),
+    )
+    weight = torch.full((3,), 7.0)
+    assert model.load_weights([("norm.weight", weight)]) == {"norm.weight"}
+    assert len(released) == 1
+    torch.testing.assert_close(released[0], weight)
+
+
+def test_failed_load_writes_staged_params_but_skips_the_release(monkeypatch):
+    """A release in the error path could mask the loading error."""
+    model = _staging_backbone(monkeypatch)
+    released = []
+    monkeypatch.setattr(model_mod, "release_memory_to_os", lambda: released.append(1))
+
+    def weights():
+        yield "norm.weight", torch.full((3,), 7.0)
+        raise RuntimeError("bad shard")
+
+    with pytest.raises(RuntimeError, match="bad shard"):
+        model.load_weights(weights())
+    assert released == []
+    torch.testing.assert_close(model.norm.weight.detach(), torch.full((3,), 7.0))
+
+
 def test_weight_loader_drops_mtp_after_mapping_and_keeps_plain_weights():
     model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
     nn.Module.__init__(model)

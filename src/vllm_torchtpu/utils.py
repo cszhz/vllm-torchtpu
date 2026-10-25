@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ctypes
+import gc
 import importlib
 import os
 import time
@@ -87,6 +89,40 @@ def min_across_ep_dp(parallel_config, value: int) -> int:
         t, op=torch.distributed.ReduceOp.MIN, group=get_dp_group().cpu_group
     )
     return int(t.item())
+
+
+def host_rss_gib() -> float:
+    """This process's resident host memory, in GiB."""
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**30
+
+
+def release_memory_to_os() -> None:
+    """Run the cyclic GC, then hand the C allocator's free memory to the OS.
+
+    Logs the process RSS before and after, so a run records whether the memory
+    came back. Best effort: an allocator with neither release entry point is
+    logged and skipped, since keeping the memory costs host DRAM but is not an
+    error.
+    """
+    rss_before = host_rss_gib()
+    gc.collect()
+    libc = ctypes.CDLL(None)
+    if hasattr(libc, "MallocExtension_ReleaseFreeMemory"):
+        libc.MallocExtension_ReleaseFreeMemory()
+    elif hasattr(libc, "malloc_trim"):
+        libc.malloc_trim(0)
+    else:
+        logger.warning(
+            "Neither tcmalloc nor glibc malloc_trim is available; free host "
+            "memory stays with the allocator."
+        )
+        return
+    logger.info(
+        "Released free host memory to the OS: RSS %.1f GiB -> %.1f GiB.",
+        rss_before,
+        host_rss_gib(),
+    )
 
 
 def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
