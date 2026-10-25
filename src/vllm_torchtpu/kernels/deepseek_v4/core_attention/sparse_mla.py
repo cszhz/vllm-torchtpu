@@ -437,18 +437,17 @@ def _attention_kernel(
 
         # The gathered rope block is [bkv_sz // 2, 2 * rope_dim]: entry i in
         # lanes 0:rope_dim, entry i + bkv_sz // 2 in the upper half (see
-        # csa_gather). Mosaic has no [m, 2n] -> [2m, n] shape cast, but the
-        # lane slice + row concatenate below is one lane rotate per vreg.
+        # csa_gather). The rope dims belong in lanes NOPE_DIM % 128: of the
+        # last nope sub-row, where the upper half already is, so only the
+        # first half's rows take a lane rotate before the select.
         bkv_rope = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx][...]
-        bkv_rope = bkv_rope.reshape(bkv_sz // 2, -1)
         rope_dim = bkv_rope.shape[-1] // 2
+        assert rope_dim == NOPE_DIM % 128
         bkv_rope = jnp.concatenate(
-            [bkv_rope[:, :rope_dim], bkv_rope[:, rope_dim:]], axis=0
+            [pltpu.roll(bkv_rope, rope_dim, 1), bkv_rope], axis=0
         )
-        # Rope dims land in lanes NOPE_DIM % 128: of the last nope sub-row.
-        bkv_rope = jnp.concatenate(
-            [bkv_nope[-1][:, : NOPE_DIM % 128], bkv_rope], axis=-1
-        )
+        lane = lax.broadcasted_iota(jnp.int32, bkv_rope.shape, 1)
+        bkv_rope = jnp.where(lane < rope_dim, bkv_nope[-1], bkv_rope)
         # Rows past kv_len were zeroed in VMEM (zero_rows_past_kv_len).
         return jnp.concatenate([*bkv_nope[:-1], bkv_rope], axis=-1)
 
