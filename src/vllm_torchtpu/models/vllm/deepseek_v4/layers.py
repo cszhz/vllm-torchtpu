@@ -88,7 +88,83 @@ class DeepseekV4MLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
+    def arm_tp_slice(self, tp_rank: int, tp_size: int) -> bool:
+        """Keep this rank's TP shard of a replicated (sequence-parallel) MLP's
+        weights, for the buckets TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS runs on the
+        replicated layout: there the shared expert is the TP-partial one the
+        fused EP op reduces, as without sequence parallelism. Called once after
+        weight processing, outside any trace. False (nothing kept) when the
+        weight layout is not the canonical FP8 (k, n) one this slices."""
+        from vllm_torchtpu.layers.adapter.linear_common import (
+            FP8_PALLAS_ATTR,
+            KEEP_VLLM_LAYOUT_ATTR,
+        )
+        from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
+
+        gu, dn = self.gate_up_proj, self.down_proj
+        if any(getattr(m, KEEP_VLLM_LAYOUT_ATTR, False) for m in (gu, dn)):
+            return False
+        w, ws = gu.weight, getattr(gu, "weight_scale", None)
+        d, ds = dn.weight, getattr(dn, "weight_scale", None)
+        if ws is None or ds is None or w.dim() != 2 or d.dim() != 2:
+            return False
+        n = w.shape[1] // 2
+        if n % tp_size or d.shape[0] != n:
+            return False
+        s = n // tp_size
+
+        def cols(t: torch.Tensor) -> torch.Tensor:
+            dim = t.dim() - 1
+            return torch.cat(
+                [t.narrow(dim, tp_rank * s, s), t.narrow(dim, n + tp_rank * s, s)],
+                dim,
+            )
+
+        if ws.dim() not in (1, 4) or ws.shape[-1] != 2 * n:
+            return False
+        if ds.dim() == 4:
+            blocks = ds.shape[1]
+            if n % blocks or s % (n // blocks):
+                return False
+            blk = n // blocks
+            ds_tp = ds.narrow(1, tp_rank * s // blk, s // blk)
+        elif ds.dim() == 1:
+            ds_tp = ds  # per output channel: the K split leaves it whole
+        else:
+            return False
+        tensors = [
+            fresh_buffer(cols(w)),
+            fresh_buffer(cols(ws)),
+            fresh_buffer(d.narrow(0, tp_rank * s, s)),
+            fresh_buffer(ds_tp),
+        ]
+        synchronize_tensors(tensors)
+        pins = (getattr(gu, FP8_PALLAS_ATTR, None), getattr(dn, FP8_PALLAS_ATTR, None))
+        object.__setattr__(self, "_tp_slice", (tensors, pins))
+        return True
+
+    def _forward_tp_slice(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm_torchtpu.layers.adapter.linear_common import (
+            quantized_matmul,
+            quantized_matmul_pallas,
+        )
+
+        (w, ws, d, ds), (pin_w, pin_d) = self.__dict__["_tp_slice"]
+
+        def mm(a, wq, sc, pin):
+            if pin is None:
+                return quantized_matmul(a, wq, sc)
+            return quantized_matmul_pallas(a, wq, sc, pin)
+
+        h = self.act_fn(mm(x, w, ws, pin_w))
+        return mm(h, d, ds, pin_d)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if "_tp_slice" in self.__dict__:
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import SP_GATE
+
+            if SP_GATE["replicated"]:
+                return self._forward_tp_slice(x)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)

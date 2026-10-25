@@ -171,6 +171,7 @@ if TYPE_CHECKING:
     TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
     TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
     TPU_DSV4_SEQ_PARALLEL: bool = False
+    TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: int = 0
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = True
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = True
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
@@ -1193,6 +1194,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # input and reduce-scatters its output (instead of one all-reduce), and the
     # fused EP needs no restore all-gather or shared reduce-scatter.
     "TPU_DSV4_SEQ_PARALLEL": env_bool("TPU_DSV4_SEQ_PARALLEL"),
+    # Per-bucket gate on TPU_DSV4_SEQ_PARALLEL: steps of T <= this many tokens
+    # (a power of 2) run the replicated layout -- one TP all-reduce after
+    # attention, the TP-sharded shared expert, the fused EP's TP-replica op --
+    # and only T > it run sequence parallel. 0: every bucket sequence parallel.
+    "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS": env_int("TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS", 0),
     # DSpark greedy drafting: shard the Markov head over the vocabulary and
     # exchange per-rank (max, argmax) pairs instead of reading the replicated
     # full-vocabulary weight at every draft position.

@@ -29,6 +29,7 @@ from vllm.distributed import (
     get_tp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -66,6 +67,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op impo
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
+from vllm_torchtpu.layers.adapter.fused_moe_ep import SP_GATE
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import (
     DeepseekV4MoE,
     dsv4_sequence_parallel,
@@ -191,6 +193,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
 
                 object.__setattr__(self, "_sp_ops", build_sp_ops())
+                shared = getattr(self.ffn, "shared_experts", None)
+                if (
+                    envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS > 0
+                    and shared is not None
+                    and not shared.arm_tp_slice(
+                        get_tensor_model_parallel_rank(),
+                        get_tensor_model_parallel_world_size(),
+                    )
+                ):
+                    raise RuntimeError(
+                        "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: the shared expert's "
+                        "weight layout cannot be TP-sliced; unset it"
+                    )
         return ops
 
     def split_hc_fns(self) -> None:
@@ -296,7 +311,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         x = self._norm(self.attn_norm, x)
-        if self.seq_parallel:
+        if self.seq_parallel and SP_GATE["replicated"]:
+            # A bucket TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS keeps replicated: the
+            # whole batch on every TP rank, wo_b's partial summed here.
+            x = tensor_model_parallel_all_reduce(self.attn(positions, x))
+        elif self.seq_parallel:
             # The views pin the row counts to the trace's own symbols (the
             # token count T of `positions`, and the local count of the
             # residual): the collectives' fakes return (T // tp) * tp and
@@ -573,12 +592,21 @@ class DeepseekV4Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        # TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: a shape branch (T <= cap stays
+        # replicated), so each side of it is its own trace (shape_variants);
+        # the layers and the fused EP read the switch while being traced.
+        seq_parallel = self.seq_parallel and not (
+            envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS > 0
+            and positions.shape[0] <= envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS
+        )
+        if self.seq_parallel:
+            SP_GATE["replicated"] = not seq_parallel
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            if self.seq_parallel:
+            if seq_parallel:
                 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (  # noqa: E501
                     tp_rank_as_data,
                 )
@@ -597,7 +625,7 @@ class DeepseekV4Model(nn.Module):
         moe_input_ids = input_ids
         if input_ids is not None and self.start_layer < self.config.num_hash_layers:
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
-            if self.seq_parallel:
+            if seq_parallel:
                 (moe_input_ids,) = self._sp_local_rows([moe_input_ids], sp_rank)
 
         residual, post_mix, res_mix = None, None, None
@@ -650,7 +678,7 @@ class DeepseekV4Model(nn.Module):
                 aux_hidden_states.append(outs[1])
             hidden_states = self.norm(outs[0])
             hidden_states, aux_hidden_states = self._sp_gather(
-                hidden_states, aux_hidden_states, positions.shape[0]
+                hidden_states, aux_hidden_states, positions.shape[0], seq_parallel
             )
             if aux_hidden_states:
                 return hidden_states, aux_hidden_states
@@ -681,16 +709,16 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
         hidden_states, aux_hidden_states = self._sp_gather(
-            hidden_states, aux_hidden_states, positions.shape[0]
+            hidden_states, aux_hidden_states, positions.shape[0], seq_parallel
         )
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def _sp_gather(self, hidden_states, aux_hidden_states, rows):
+    def _sp_gather(self, hidden_states, aux_hidden_states, rows, seq_parallel):
         """Undo the sequence-parallel split on the backbone's outputs. `rows`
         is the step's token count (an input dimension of the trace)."""
-        if not self.seq_parallel:
+        if not seq_parallel:
             return hidden_states, aux_hidden_states
         ag = self.__dict__["_sp_ops"]["ag"]
 

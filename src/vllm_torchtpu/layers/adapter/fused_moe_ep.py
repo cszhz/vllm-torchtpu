@@ -119,6 +119,12 @@ _RANK_BUFFER: Any = None
 # (`Fp8Config.get_quant_method`), so this is per-layer state without a registry
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
+# A sequence-parallel layer's op for the buckets TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS
+# leaves on the replicated layout (TP-replica token groups), and the switch the
+# model flips while tracing such a bucket. A Python value read at trace time:
+# each bucket's trace sees the value its own shape branch set.
+FUSED_MOE_EP_NOSP_OP_ATTR = "_fused_moe_ep_op_nosp"
+SP_GATE = {"replicated": False}
 # Set on a layer whose op returns shared + routed (MOE_FUSED_EP_SHARED_IN_OP).
 SHARED_IN_OP_ATTR = "_tpu_fused_ep_shared_in_op"
 # The runner's routed_scaling_factor, stashed on the routed-experts layer.
@@ -694,6 +700,8 @@ def fused_moe_ep(
     answer.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
+    if SP_GATE["replicated"]:
+        op = getattr(owner, FUSED_MOE_EP_NOSP_OP_ATTR, None) or op
     if w1.dtype == torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N]. Even a single block must
         # retain its axis; the per-channel helper would incorrectly drop it.
