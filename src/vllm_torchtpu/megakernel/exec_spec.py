@@ -200,6 +200,10 @@ class DebugOptions:
             object.__setattr__(self, "modules", DebugModulesMap(self.modules))
 
 
+# Maximum active batch rows (`ExecSpec.B` / padded `ExecSpec.M`) per kernel call.
+MAX_BATCH_ROWS = 128
+
+
 @dataclass(frozen=True)
 class ExecSpec:
     """Execution-time configuration (independent of model architecture)."""
@@ -278,6 +282,7 @@ __all__ = [
     "DebugModulesMap",
     "DebugOptions",
     "ExecSpec",
+    "MAX_BATCH_ROWS",
     "ModuleOptionsMap",
     "NumericsClass",
     "TILE_NUMERICS",

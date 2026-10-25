@@ -26,7 +26,7 @@ from .decls import (
     _resolve_field_spec,
 )
 from .errors import MegakernelConfigError
-from .exec_spec import ExecSpec
+from .exec_spec import MAX_BATCH_ROWS, ExecSpec
 from .modules.gdn import GDNModule
 from .pool.config import cache_exec, resolved_max_pages_per_seq
 from .spec import ModelSpec
@@ -270,7 +270,7 @@ class ModelGeometry:
                 # Routing tables are sized from B and MR; the hard walls are the
                 # 128-lane rows-on-lanes top-k and hits table (TOPK <= 128) and
                 # the paged scatter's `page_size >= MR` (asserted there).
-                self.E % R == 0 and self.TOPK <= 128 and 1 <= B <= M <= 128,
+                self.E % R == 0 and self.TOPK <= 128 and 1 <= B <= M <= MAX_BATCH_ROWS,
                 f"Invalid E={self.E}, R={R}, B={B}, M={M}, TOPK={self.TOPK}",
             ),
             (

@@ -526,22 +526,6 @@ def test_scratch_budget_overflow_is_config_error(field: str, match: str):
     assert not issubclass(mk.MegakernelConfigError, ValueError)
 
 
-def test_load_builtins_sets_flag_only_after_success(monkeypatch: pytest.MonkeyPatch):
-    from vllm_torchtpu.megakernel import profiles
-
-    monkeypatch.setattr(profile_mod, "_BUILTINS_LOADED", False)
-
-    def _boom() -> None:
-        raise ImportError("synthetic")
-
-    monkeypatch.setattr(profiles, "load_builtin_profiles", _boom)
-    with pytest.raises(ImportError, match="synthetic"):
-        profile_mod.list_profiles()
-    assert profile_mod._BUILTINS_LOADED is False
-    monkeypatch.undo()
-    assert "qwen35-candidate30-fused" in profile_mod.list_profiles()
-
-
 def test_builtin_profiles_resolve_in_a_fresh_interpreter():
     """`get_profile` works before any profile module was imported directly."""
     code = (

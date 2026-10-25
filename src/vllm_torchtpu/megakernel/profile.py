@@ -34,8 +34,9 @@ Every tile knob (core `Tiles` fields and each module's `Tunables`) and pool-I/O
 mode declares its class (`exec_spec.tile_numerics()`, `pool.POOL_IO_NUMERICS`).
 `approx_features(profile)` lists the approx features a profile turns on
 relative to its reference; a profile declared `exact` that turns any of them on
-is rejected at construction, and `Profile.with_overrides` re-labels
-(`<name>+overrides`, class derived) instead of silently staying `exact`.
+is rejected at construction and on registration, and `Profile.with_overrides`
+re-labels (`<name>+overrides`, class derived) instead of silently staying
+`exact`.
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .exec_spec import ExecSpec, Tiles, tile_numerics
+from .exec_spec import MAX_BATCH_ROWS, ExecSpec, Tiles, tile_numerics
 
 # Profiles own the pool-I/O mode, so they depend on the pool package's config
 # (its numerics classes and the `CacheExec.pool_gather` a profile resolves).
@@ -56,6 +57,8 @@ from .profiles.default import default_tiles
 DEFAULT_PROFILE_NAME = "default"
 # Tile rule: `(B, *, moe_tp, R) -> Tiles` for a bucket of `B` rows.
 TileRule = Callable[..., Tiles]
+# Fields automatically derived by `Profile.with_overrides`.
+_DERIVED_PROFILE_FIELDS = frozenset({"name", "numerics", "model_default"})
 
 
 @dataclass(frozen=True)
@@ -122,13 +125,7 @@ class Profile:
                 f"profile {self.name!r}: a model default profile needs a model "
                 "and numerics='exact'"
             )
-        if self.numerics == "exact":
-            feats = approx_features(self)
-            if feats:
-                raise ValueError(
-                    f"profile {self.name!r} is declared numerics='exact' but turns on "
-                    f"approx features {list(feats)}; declare numerics='approx'"
-                )
+        _check_exact(self)
 
     def with_overrides(self, **overrides: Any) -> Profile:
         """Return this profile with `overrides` applied, re-labelled if changed.
@@ -139,6 +136,13 @@ class Profile:
         turns on no approx feature relative to the reference profile (it never
         silently stays `exact`). The result is never a model default.
         """
+        bad = _DERIVED_PROFILE_FIELDS & overrides.keys()
+        if bad:
+            names = ", ".join(repr(k) for k in sorted(bad))
+            raise ValueError(
+                f"Profile.with_overrides derives {names} automatically; "
+                "pass tuning fields only"
+            )
         changed = {k: v for k, v in overrides.items() if getattr(self, k) != v}
         if not changed:
             return self
@@ -209,10 +213,9 @@ class Profile:
 _REGISTRY: dict[str, Profile] = {}
 # Model name -> name of the model's default profile.
 _MODEL_DEFAULTS: dict[str, str] = {}
-_BUILTINS_LOADED = False
 
 # Bucket grid on which a profile's tile rule is compared to its reference.
-_NUMERICS_GRID_B = range(1, 65)
+_NUMERICS_GRID_B = range(1, MAX_BATCH_ROWS + 1)
 _NUMERICS_GRID_R = (1, 2, 4, 8, 16)
 
 
@@ -224,14 +227,24 @@ def _knob(t: Tiles, key: str) -> Any:
     return getattr(t.module(module), field)
 
 
+def _check_exact(profile: Profile) -> None:
+    if profile.numerics == "exact":
+        feats = approx_features(profile)
+        if feats:
+            raise ValueError(
+                f"profile {profile.name!r} is declared numerics='exact' but turns on "
+                f"approx features {list(feats)}; declare numerics='approx'"
+            )
+
+
 def approx_features(profile: Profile) -> tuple[str, ...]:
     """Approx-class features `profile` turns on relative to its reference.
 
     The reference is `model_default_profile(profile.model)`; a model default
     profile is its own reference (no features). A tile field counts when the
     two tile rules give it different values on any bucket of the grid (`B` in
-    1..64, `R` in {1, 2, 4, 8, 16}, `moe_tp` in {False, True}) and the knob is
-    `approx` in `exec_spec.tile_numerics()` (module knobs as
+    `1..MAX_BATCH_ROWS`, `R` in `{1, 2, 4, 8, 16}`, `moe_tp` in `{False, True}`)
+    and the knob is `approx` in `exec_spec.tile_numerics()` (module knobs as
     `tiles.<module>.<field>`); a pool-I/O mode the profile turns on and the
     reference does not counts per `POOL_IO_NUMERICS`.
     """
@@ -292,12 +305,15 @@ def register_profile(profile: Profile, *, replace: bool = False) -> Profile:
     """Register `profile` by name (`replace=True` to overwrite an existing one).
 
     A `model_default` profile also becomes its model's default profile (one
-    per model).
+    per model). Re-validates `exact` numerics against the resulting registry
+    state so registration order cannot bypass enforcement.
     """
-    if profile.name in _REGISTRY and not replace:
-        if _REGISTRY[profile.name] == profile:
-            return _REGISTRY[profile.name]  # idempotent (e.g. re-import)
+    old = _REGISTRY.get(profile.name)
+    if old is not None and not replace:
+        if old == profile:
+            return old  # idempotent (e.g. re-import)
         raise ValueError(f"profile {profile.name!r} is already registered")
+    prev: str | None = None
     if profile.model_default:
         assert profile.model is not None  # checked in `Profile.__post_init__`
         prev = _MODEL_DEFAULTS.get(profile.model)
@@ -305,8 +321,44 @@ def register_profile(profile: Profile, *, replace: bool = False) -> Profile:
             raise ValueError(
                 f"model {profile.model!r} already has default profile {prev!r}"
             )
-        _MODEL_DEFAULTS[profile.model] = profile.name
-    _REGISTRY[profile.name] = profile
+
+    snap_reg = _REGISTRY.copy()
+    snap_defaults = _MODEL_DEFAULTS.copy()
+    try:
+        if (
+            old is not None
+            and old.model_default
+            and old.model is not None
+            and _MODEL_DEFAULTS.get(old.model) == old.name
+            and not (profile.model_default and profile.model == old.model)
+        ):
+            del _MODEL_DEFAULTS[old.model]
+        if profile.model_default:
+            assert profile.model is not None
+            if prev is not None and prev != profile.name:
+                _REGISTRY.pop(prev, None)
+            _MODEL_DEFAULTS[profile.model] = profile.name
+        _REGISTRY[profile.name] = profile
+
+        _check_exact(profile)
+        affected_models = {
+            m
+            for m in (
+                profile.model if profile.model_default else None,
+                old.model if (old is not None and old.model_default) else None,
+            )
+            if m is not None
+        }
+        if affected_models:
+            for p in _REGISTRY.values():
+                if p is not profile and p.model in affected_models:
+                    _check_exact(p)
+    except Exception:
+        _REGISTRY.clear()
+        _REGISTRY.update(snap_reg)
+        _MODEL_DEFAULTS.clear()
+        _MODEL_DEFAULTS.update(snap_defaults)
+        raise
     return profile
 
 
@@ -316,27 +368,17 @@ def model_default_profile(model: str | None) -> Profile:
     return _REGISTRY[name] if name is not None else DEFAULT_PROFILE
 
 
-def _load_builtins() -> None:
-    global _BUILTINS_LOADED
-    if not _BUILTINS_LOADED:
-        from . import profiles
-
-        profiles.load_builtin_profiles()  # loads model-agnostic profile hook
-        _BUILTINS_LOADED = True  # only after a successful import
-
-
 def list_profiles() -> tuple[str, ...]:
-    """Return the names of all registered profiles (built-ins included)."""
-    _load_builtins()
+    """Return the names of all registered profiles."""
     return tuple(sorted(_REGISTRY))
 
 
 def get_profile(name: str | Profile | None) -> Profile:
     """Resolve a profile by name (`None` / `""` -> `default`)."""
     if isinstance(name, Profile):
+        _check_exact(name)
         return name
     key = (name or "default").strip()
-    _load_builtins()
     if key not in _REGISTRY:
         raise KeyError(
             f"unknown megakernel profile {key!r}; available: {list(list_profiles())}"
