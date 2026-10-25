@@ -148,6 +148,7 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
         dense=cfg, q=a.q, B=nb, moe_impl=moe_impl, moe_leased=var.get("lease", "1") == "1",
         aux_layers=tuple(x for x in (L - 3, L - 2, L - 1) if x >= 0),
         attn_tp=int(var.get("attn_tp", 1)), vmem_share=var.get("share") == "1",
+        no_bounds_checks=var.get("nobc") == "1",
     )  # fmt: skip
     if moe_impl != "real":
         moe_args = []
@@ -326,6 +327,7 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
         banks=banks, median_ms=statistics.median(ts), p10_ms=ts[len(ts) // 10],
         p90_ms=ts[(9 * len(ts)) // 10], n=a.iters, pipe_ms=pipe_ms, dispatch_ms=disp_ms,
         finite=bool(np.isfinite(res0).all()), share=scfg.vmem_share, res_digest=digest,
+        nobc=scfg.no_bounds_checks,
     )  # fmt: skip
 
 

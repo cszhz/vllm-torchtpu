@@ -121,6 +121,11 @@ class StepKernelConfig:
     # the embedded rows x0 are read from HBM once instead of held in VMEM.
     # Arithmetic is unchanged; it frees VMEM for row buckets above 64.
     vmem_share: bool = False
+    # Mosaic's per-DMA bounds checks (on by default) cost scalar bundles on
+    # every DMA: each MoE item, attention row gather, KV write and weight
+    # tile. Every DMA index here comes from validated tables (the blocks were
+    # measured with the checks off); this turns them off for the whole step.
+    no_bounds_checks: bool = False
 
     @property
     def n_debug_outputs(self) -> int:
@@ -1115,7 +1120,8 @@ def build(scfg: StepKernelConfig, *, axis: str, interpret=False):
             input_output_aliases={n_in - n_arr + i: 2 + i for i in range(n_out_arr)},
             scratch_shapes=[scr[k] for k in names_scr] + list(moe_scr) + list(attn_scr),
             compiler_params=pltpu.CompilerParams(
-                collective_id=AR.COLLECTIVE_ID, vmem_limit_bytes=vmem_limit
+                collective_id=AR.COLLECTIVE_ID, vmem_limit_bytes=vmem_limit,
+                **({"disable_bounds_checks": True} if scfg.no_bounds_checks else {}),
             ),
             interpret=(
                 interpret

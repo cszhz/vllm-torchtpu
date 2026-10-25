@@ -160,6 +160,7 @@ def kernel_config(
     dense = dataclasses.replace(dense or WM.dense_config(spec), rows=bucket.rows)
     kw.setdefault("strict_causal", envs.TPU_STREAMIDX_STRICT_CAUSAL)
     kw.setdefault("vmem_share", envs.VLLM_TPU_DSV4_MK_VMEM_SHARE)
+    kw.setdefault("no_bounds_checks", envs.VLLM_TPU_DSV4_MK_NO_BOUNDS_CHECKS)
     return SK.StepKernelConfig(
         dense=dense,
         q=bucket.q,
