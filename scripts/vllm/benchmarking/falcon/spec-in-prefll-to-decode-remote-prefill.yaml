@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: pd-spec-pipeline-prefill-20261025-r46-live-debug
+name: pd-spec-pipeline-prefill-20261025-r47-target-pools
 exp_type: BENCHMARK
 artifact_type: generic
 cluster_name: gke-tpu-train-us-central1-1-prod
@@ -23,7 +23,7 @@ role_to_task_spec:
         set -euo pipefail
         cd /workspace/vllm-torchtpu
         uv pip install --system --no-deps -e .
-        python -m pytest -q tests/spec_decode/test_remote_dspark.py tests/distributed/test_tpu_connector.py tests/runner/test_tpu_runner.py -k "remote_dspark_handoff or remote_dspark_publishes_long_lived_request_once or stage3_register_ahead_gate or remote_dspark_bootstrap_feedback"
+        python -m pytest -q tests/spec_decode/test_remote_dspark.py tests/distributed/test_tpu_connector.py tests/runner/test_tpu_runner.py -k "remote_dspark_handoff or remote_dspark_publishes_long_lived_request_once or stage3_register_ahead_gate or remote_dspark_bootstrap_feedback or remote_dspark_admission"
         K3_DSPARK_PD_ROLE=prefill \
           bash scripts/vllm/benchmarking/run_k3_dspark_tp8_pd_pair.sh
       '
@@ -73,7 +73,7 @@ role_to_task_spec:
       - name: coord
         type: gcs
         bucket: inference-model-storage-poc-tpu-hns
-        prefix: benchmarks/pd-spec-pipeline/20261025-r46-live-debug
+        prefix: benchmarks/pd-spec-pipeline/20261025-r47-target-pools
         mount_path: /coord
         mount_options: [implicit-dirs, metadata-cache:ttl-secs:0]
     sources:
@@ -81,5 +81,5 @@ role_to_task_spec:
         type: git
         repo: https://github.com/vllm-project/vllm-torchtpu.git
         ref: hafeng/spec_in_prefll_to_decode
-        commit: 943b3ebdf
+        commit: 826d77a3c
         path: /workspace/vllm-torchtpu
