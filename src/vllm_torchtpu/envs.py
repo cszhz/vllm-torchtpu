@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_PALLAS: bool = False
     TPU_FP8_LINEAR_PALLAS_SITES: str = ""
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
+    TPU_FP8_SKINNY_TABLE: str = ""
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -929,6 +930,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # constrained to HBM, so XLA cannot stage it into VMEM ahead of the call.
     # Same arithmetic, bit-identical outputs; placement only.
     "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str("TPU_FP8_SKINNY_HBM_PIN_SITES", ""),
+    # fp8_skinny config table (`fp8_skinny.table`): "" = the original TP8 tables,
+    # "v2" = adds the TP4 shards and shared_experts.down_proj (HBM-pinned sites).
+    "TPU_FP8_SKINNY_TABLE": env_str("TPU_FP8_SKINNY_TABLE", ""),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
