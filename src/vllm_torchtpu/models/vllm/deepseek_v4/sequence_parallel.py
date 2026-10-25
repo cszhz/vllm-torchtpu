@@ -103,15 +103,20 @@ def _group_ops(mesh, groups: tuple[tuple[int, ...], ...]):
     tp = len(groups[0])
     index_groups = [list(g) for g in groups]
 
-    def shard_mapped(body):
-        return lambda x: jax.shard_map(
-            body, mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False
-        )(x)
+    def shard_mapped(body, operands):
+        return lambda *xs: jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(spec,) * operands,
+            out_specs=spec,
+            check_vma=False,
+        )(*xs)
 
     gather = shard_mapped(
-        lambda b: jax.lax.all_gather(
+        lambda b, _like: jax.lax.all_gather(
             b, EP_AXIS_NAME, axis=0, tiled=True, axis_index_groups=index_groups
-        )
+        ),
+        2,
     )
     scatter = shard_mapped(
         lambda b: jax.lax.psum_scatter(
@@ -120,36 +125,40 @@ def _group_ops(mesh, groups: tuple[tuple[int, ...], ...]):
             scatter_dimension=0,
             tiled=True,
             axis_index_groups=index_groups,
-        )
+        ),
+        1,
     )
 
     # Every operand annotated jax.Array: torch_tpu infers static argnums from
-    # the signature and refuses an unannotated one.
-    def ag(x: jax.Array) -> jax.Array:
-        return gather(x)
+    # the signature and refuses an unannotated one. `like` only names the
+    # gathered row count for the fake (it is not read).
+    def ag(x: jax.Array, like: jax.Array) -> jax.Array:
+        return gather(x, like)
 
     def rs(x: jax.Array) -> jax.Array:
         return scatter(x)
 
-    ops = []
-    for name, fn, rows in (
-        ("ag", ag, lambda n: n * tp),
-        ("rs", rs, lambda n: n // tp),
-    ):
-        op = jax_op(
-            f"pallas::dsv4_sp_tp_{name}",
-            fn,
-            mesh=mesh,
-            input_partition_specs=(spec,),
-            output_partition_specs=spec,
-        )
-        # The default fake exports fn at the operand's shape, which would pin
-        # the caller's dynamic token dimension.
-        op.register_fake(
-            lambda x, rows=rows: x.new_empty((rows(x.shape[0]), *x.shape[1:]))
-        )
-        ops.append(op)
-    return ops
+    ag_op = jax_op(
+        "pallas::dsv4_sp_tp_ag",
+        ag,
+        mesh=mesh,
+        input_partition_specs=(spec, spec),
+        output_partition_specs=spec,
+    )
+    rs_op = jax_op(
+        "pallas::dsv4_sp_tp_rs",
+        rs,
+        mesh=mesh,
+        input_partition_specs=(spec,),
+        output_partition_specs=spec,
+    )
+    # The default fakes export fn at the operands' shapes, which would pin the
+    # caller's dynamic token dimension. The gather's row count is taken from
+    # `like` (a [tokens] tensor of the step) so it is the step's own token
+    # symbol, not an expression derived from it.
+    ag_op.register_fake(lambda x, like: x.new_empty((like.shape[0], *x.shape[1:])))
+    rs_op.register_fake(lambda x: x.new_empty((x.shape[0] // tp, *x.shape[1:])))
+    return ag_op, rs_op
 
 
 def prebuild() -> None:
@@ -191,22 +200,15 @@ def shard(x: torch.Tensor, rank: torch.Tensor) -> torch.Tensor:
     return blocks.index_select(0, rank).squeeze(0)
 
 
-def gather(x: torch.Tensor, num_tokens=None) -> torch.Tensor:
+def gather(x: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
     """All ranks' rows of a sharded tensor, in token order.
 
-    With `num_tokens` (the step's token dimension) the result is narrowed to
-    it, so its size is that symbol rather than tp * (num_tokens // tp) and it
-    lines up with the step's other [tokens, ...] tensors.
+    `like` is any [tokens, ...] tensor of the step (e.g. `positions`): the
+    result's row count is its size, so a gathered tensor lines up with the
+    step's other tensors and a returned one has the step's token count rather
+    than a size the runner's static compiled regions see as symbolic.
     """
-    out = _AG(x)
-    return out if num_tokens is None else out.narrow(0, 0, num_tokens)
-
-
-def gather_output(x: torch.Tensor, num_tokens) -> torch.Tensor:
-    """`gather` for a tensor the graph returns: a fresh tensor rather than a
-    view of the all-gather's buffer, the kind of output the replicated graph
-    returns to the runner's compiled (dynamic=False) logits gather."""
-    return gather(x, num_tokens).clone()
+    return _AG(x, like)
 
 
 def reduce_scatter(x: torch.Tensor) -> torch.Tensor:

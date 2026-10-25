@@ -241,9 +241,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self._norm(self.attn_norm, x)
         if sequence_parallel:
             x = sp.reduce_scatter(
-                self.attn(
-                    positions, sp.gather(x, positions.shape[0]), reduce_output=False
-                )
+                self.attn(positions, sp.gather(x, positions), reduce_output=False)
             )
         else:
             x = self.attn(positions, x)
@@ -260,7 +258,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         x = self._norm(self.ffn_norm, x)
         if sequence_parallel:
-            x = self.ffn.forward_sequence_parallel(x, input_ids, padding_mask)
+            x = self.ffn.forward_sequence_parallel(
+                x, input_ids, padding_mask, positions
+            )
         else:
             x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
@@ -658,7 +658,7 @@ class DeepseekV4Model(nn.Module):
                 aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
                 aux_hidden = aux_recon.mean(dim=1)
                 if sequence_parallel:
-                    aux_hidden = sp.gather_output(aux_hidden, num_tokens)
+                    aux_hidden = sp.gather(aux_hidden, positions)
                 aux_hidden_states.append(aux_hidden)
                 final_aux_recon = aux_recon
 
@@ -687,7 +687,7 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
         if sequence_parallel:
-            hidden_states = sp.gather_output(hidden_states, num_tokens)
+            hidden_states = sp.gather(hidden_states, positions)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -823,29 +823,31 @@ class DeepseekV4Model(nn.Module):
         )
 
 
-def _without_dynamic_marks(out):
-    """The SP backbone's outputs, as views where dynamo stamped a tensor dynamic.
-
-    The runner hands these to its dynamic=False compiled regions (the logits
-    gather), and a `_dynamo_dynamic_indices` stamp on a tensor object outranks
-    dynamic=False there (see spec_decode/eagle3._static_shape_args). A view is
-    a distinct object without the stamp and copies nothing.
-    """
-
-    def unmark(t):
-        if isinstance(t, torch.Tensor) and getattr(t, "_dynamo_dynamic_indices", None):
-            logger.warning_once(
-                "DeepSeek-V4 SP backbone returned a tensor marked dynamic %s; "
-                "handing the runner a view instead.",
-                t._dynamo_dynamic_indices,
-            )
-            return t[:]
-        return t
-
-    if isinstance(out, tuple):
-        hidden, aux = out
-        return unmark(hidden), [unmark(t) for t in aux]
-    return unmark(out)
+def _log_sp_outputs(out, positions: torch.Tensor) -> None:
+    """Diagnostic (TPU_DSV4_PREFILL_SP_DEBUG): what the SP backbone hands the
+    runner, once per distinct description."""
+    tensors = [out] if isinstance(out, torch.Tensor) else [out[0], *out[1]]
+    desc = tuple(
+        (
+            type(t).__name__,
+            tuple(type(d).__name__ for d in t.shape),
+            tuple(t.shape),
+            tuple(t.stride()),
+            t.storage_offset(),
+            t._base is not None,
+            getattr(t, "_dynamo_dynamic_indices", None),
+        )
+        for t in tensors
+    )
+    seen = _log_sp_outputs.__dict__.setdefault("seen", set())
+    if desc not in seen:
+        seen.add(desc)
+        logger.warning(
+            "SP backbone outputs %s | positions %s marks %s",
+            desc,
+            tuple(positions.shape),
+            getattr(positions, "_dynamo_dynamic_indices", None),
+        )
 
 
 def _with_full_shared_alias(name: str, params_dict: dict) -> list[str]:
@@ -992,7 +994,9 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
                 out = self.model_sp(
                     input_ids, positions, intermediate_tensors, inputs_embeds
                 )
-            return _without_dynamic_marks(out)
+            if envs.TPU_DSV4_PREFILL_SP_DEBUG:
+                _log_sp_outputs(out, positions)
+            return out
         with bucket_filter.serving(bucket_filter.assigned(self.model)):
             return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 

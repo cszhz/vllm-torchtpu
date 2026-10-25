@@ -63,9 +63,10 @@ class SimulatedTP:
             out = out + v.float()
         return out.to(x.dtype)
 
-    def gather(self, x, num_tokens=None):
+    def gather(self, x, like):
         out = torch.cat(self.exchange(x), dim=0)
-        return out if num_tokens is None else out.narrow(0, 0, num_tokens)
+        assert out.shape[0] == like.shape[0]
+        return out
 
     def reduce_scatter(self, x):
         return self.all_reduce(x).chunk(self.size, dim=0)[self.rank].clone()
@@ -186,7 +187,10 @@ class StubFFN(nn.Module):
         assert x.shape[0] == TOKENS
         return self.sim.all_reduce(self._share(x, input_ids) / self.sim.size)
 
-    def forward_sequence_parallel(self, x, input_ids, padding_mask=None):
+    def forward_sequence_parallel(
+        self, x, input_ids, padding_mask=None, positions=None
+    ):
+        assert positions is not None and positions.shape[0] == TOKENS
         assert padding_mask is None
         assert x.shape[0] == TOKENS // self.sim.size
         return self._share(x, input_ids)
@@ -324,7 +328,7 @@ def test_moe_block_matches_runner_sum(tp, full_shared):
         shared = tp.all_reduce(moe.shared_experts(x))
         want = shared + method.routed(x, x @ weights["gate"], ids) * scale
         got = moe.forward_sequence_parallel(
-            sp.shard(x, _rank(r)), sp.shard(ids, _rank(r))
+            sp.shard(x, _rank(r)), sp.shard(ids, _rank(r)), None, torch.arange(TOKENS)
         )
         return sp.shard(want, _rank(r)), got
 
