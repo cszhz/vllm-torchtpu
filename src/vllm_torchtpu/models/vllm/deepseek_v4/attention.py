@@ -415,6 +415,7 @@ class VllmDeepseekV4MLAAttention(
                 else {
                     "hca_mixed_q_block": envs.TPU_DSV4_HCA_MIXED_Q_BLOCK,
                     "hca_pipelined": envs.TPU_DSV4_HCA_MLA_PIPELINED,
+                    "verify_fused_hca": envs.TPU_DSV4_VERIFY_FUSED_HCA,
                 }
             ),
         )
@@ -429,6 +430,7 @@ class VllmDeepseekV4MLAAttention(
             f"{'_ncb' if non_causal else ''}"
             f"{f'_vq{verify_q_len}' if verify_q_len else ''}"
             f"{'_vfp' if envs.TPU_DSV4_VERIFY_FAST_PATH else ''}"
+            f"{'_vfh' if envs.TPU_DSV4_VERIFY_FUSED_HCA else ''}"
             f"{'' if built_from_real_caches else '_prof'}"
         )
 

@@ -35,6 +35,9 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import (
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
     sparse_ragged_paged_attention,
 )
+from vllm_torchtpu.kernels.deepseek_v4.core_attention.verify_window.attn_swa_hca import (
+    verify_swa_hca,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import align_to
 
@@ -132,6 +135,7 @@ def _attention_hca(
     hca_pipelined: bool = False,
     swa_padded_lm: bool = False,
     verify_fast_path: bool = False,
+    verify_fused_hca: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """SWA-only layers, and HCA layers over a single raw-bf16 latent array.
 
@@ -149,6 +153,9 @@ def _attention_hca(
     the zero-fill and slice/pad copies (same arithmetic on real rows).
     `verify_fast_path`: a batch of verify windows only skips the empty decode
     and mixed passes of both kernels (same arithmetic).
+    `verify_fused_hca` (HCA layers, with `verify_fast_path`): such a batch runs
+    SWA and HCA as one kernel and one online softmax (`verify_swa_hca`; the
+    softmax blocking and the bf16 P of its PV matmul change the rounding).
     """
     if main_cache_kv.shape[0] == 0 or (swa_only and sw_cache.shape[0] == 0):
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
@@ -158,6 +165,67 @@ def _attention_hca(
     swa_page_indices = swa_page_indices.flatten()
     main_page_indices = main_page_indices.flatten()
 
+    def _attention_hca_passes(sw_cache, verify_fast_path):
+        return _hca_passes(
+            q, new_kv, sw_cache, swa_kv_lens, swa_page_indices, swa_cu_q_lens,
+            swa_distribution, main_cache_kv, main_kv_lens, extra, main_page_indices,
+            main_cu_q_lens, main_distribution, attention_sinks,
+            sm_scale=sm_scale, sliding_window=sliding_window,
+            logical_page_size=logical_page_size, swa_only=swa_only,
+            two_caches_same_buffer=two_caches_same_buffer,
+            non_causal_block=non_causal_block, verify_q_len=verify_q_len,
+            hca_mixed_q_block=hca_mixed_q_block, hca_pipelined=hca_pipelined,
+            swa_padded_lm=swa_padded_lm, verify_fast_path=verify_fast_path,
+        )  # fmt: skip
+
+    fused = (
+        verify_fused_hca
+        and verify_fast_path
+        and verify_q_len is not None
+        and not swa_only
+        and not non_causal_block
+        and not two_caches_same_buffer
+        and logical_page_size == sw_cache.shape[1] // 2
+        and q.shape[0] >= verify_q_len
+    )
+    if fused:
+        only_verify = (main_distribution[0] == 0) & (
+            main_distribution[1] == main_distribution[2]
+        )
+
+        def fused_branch(sw_cache):
+            return verify_swa_hca(
+                q,
+                new_kv,
+                sw_cache,
+                swa_kv_lens,
+                swa_page_indices,
+                main_cache_kv,
+                main_page_indices,
+                main_distribution[1],
+                attention_sinks,
+                q_len=verify_q_len,
+                sm_scale=sm_scale,
+                window=sliding_window,
+            )
+
+        def general_branch(sw_cache):
+            return _attention_hca_passes(sw_cache, verify_fast_path=False)
+
+        return jax.lax.cond(only_verify, fused_branch, general_branch, sw_cache)
+
+    return _attention_hca_passes(sw_cache, verify_fast_path)
+
+
+def _hca_passes(
+    q, new_kv, sw_cache, swa_kv_lens, swa_page_indices, swa_cu_q_lens,
+    swa_distribution, main_cache_kv, main_kv_lens, extra, main_page_indices,
+    main_cu_q_lens, main_distribution, attention_sinks, *, sm_scale,
+    sliding_window, logical_page_size, swa_only, two_caches_same_buffer,
+    non_causal_block, verify_q_len, hca_mixed_q_block, hca_pipelined,
+    swa_padded_lm, verify_fast_path,
+):  # fmt: skip
+    """`_attention_hca`'s SWA kernel then compressed-KV kernel."""
     swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
         q=q,
         new_kv=new_kv,

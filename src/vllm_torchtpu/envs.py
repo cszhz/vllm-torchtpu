@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     TPU_DSV4_HCA_MLA_PIPELINED: bool = False
     TPU_DSV4_SWA_PADDED_LM: bool = False
     TPU_DSV4_VERIFY_FAST_PATH: bool = False
+    TPU_DSV4_VERIFY_FUSED_HCA: bool = False
     TPU_DSV4_FUSED_QKV_ROPE: bool = False
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = False
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = False
@@ -1010,6 +1011,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # alone behind one lax.cond per op, without the empty decode/mixed launches.
     # Same passes, bit-identical.
     "TPU_DSV4_VERIFY_FAST_PATH": env_bool("TPU_DSV4_VERIFY_FAST_PATH"),
+    # DSv4 HCA layers, with TPU_DSV4_VERIFY_FAST_PATH: a verify-only batch runs
+    # SWA + HCA attention as one kernel with one online softmax. Changes the
+    # rounding (tolerance tier).
+    "TPU_DSV4_VERIFY_FUSED_HCA": env_bool("TPU_DSV4_VERIFY_FUSED_HCA"),
     # DSv4 attention: q RMSNorm+RoPE and kv RoPE as one kernel (one launch and
     # one cos/sin gather instead of two). Bit-identical.
     "TPU_DSV4_FUSED_QKV_ROPE": env_bool("TPU_DSV4_FUSED_QKV_ROPE"),
