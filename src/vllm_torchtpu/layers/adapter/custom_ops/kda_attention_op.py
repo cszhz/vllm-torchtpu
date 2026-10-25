@@ -546,6 +546,12 @@ def _pooled_kda_core(
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
     dense_offsets = None
+    # Rows of real requests. The metadata pads to the bucket's request
+    # capacity (--max-num-seqs) whatever the batch, and every state row is
+    # 512 KiB at TP8: moving the padded ones dominated a small batch's KDA
+    # cost. Real requests come first and each has a token this step; the
+    # padded tail has zero-length queries.
+    num_valid = jnp.sum(query_start_loc[1:] > query_start_loc[:-1]) * window
     identity = 1 + jnp.arange(num_reqs, dtype=jnp.int32) * window
     if num_spec_tokens:
         if slot_read_offsets is None or ckpt_indices is None:
@@ -617,6 +623,9 @@ def _pooled_kda_core(
 
     # SSM region [0, ssm_tokens): f32 view with one head_dim-wide lane group
     # per typed row, so the leading H * D rows are exactly the state.
+    # Gathered straight into the dense buffer the kernel takes, behind its
+    # scratch slot 0 (`lead_rows`), instead of concatenating a zero row onto
+    # every request's state afterwards.
     ssm_gathered = pool_adapters.gather_region(
         pool,
         state_indices,
@@ -625,11 +634,14 @@ def _pooled_kda_core(
         out_dtype=jnp.float32,
         out_lanes=head_dim,
         split=split,
+        lead_rows=1,
+        num_valid=num_valid,
     )
     ssm_rows = num_heads * head_dim
-    ssm_local = ssm_gathered[:, :ssm_rows, :].reshape(
-        num_reqs, num_heads, head_dim, head_dim
+    ssm_buf = ssm_gathered[:, :ssm_rows, :].reshape(
+        num_reqs + 1, num_heads, head_dim, head_dim
     )
+    ssm_buf = ssm_buf.at[0].set(0.0)
 
     # Stage-3 stores whole, padded prefill-head shards in rank order. Each
     # shard keeps the source's BF16 lane packing, so Raiden can concatenate
@@ -655,6 +667,7 @@ def _pooled_kda_core(
         ntok=layout.conv_tokens,
         out_dtype=conv_dtype,
         split=split,
+        num_valid=num_valid,
     )
     conv_local = conv_gathered.reshape(num_reqs, conv_shards, padded_shard_elems)[
         :, :, :shard_elems
@@ -668,7 +681,6 @@ def _pooled_kda_core(
 
     # Dense slot 0 is scratch for the kernel's idempotent null-block writes.
     conv_buf = jnp.concatenate([jnp.zeros_like(conv_local[:1]), conv_local], axis=0)
-    ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_local[:1]), ssm_local], axis=0)
 
     # The fused conv1d + GDN v3 kernel takes the conv state flat
     # [slots, K - 1, 3*H*D]; the buffers here lay their channels out as
@@ -701,11 +713,21 @@ def _pooled_kda_core(
 
     # Scatter the real slots back; the padding rows/elems of each region are
     # zero-filled so the pool bytes stay deterministic.
+    # Scattered from the dense buffer as is: the kernel skips slot 0
+    # (`lead_rows`) rather than this slicing it off with a copy.
     ssm_region_rows = layout.ssm_tokens * tok_bytes // (4 * head_dim)
-    new_ssm = new_ssm_buf[1:].reshape(num_reqs, ssm_rows, head_dim)
-    new_ssm = jnp.pad(new_ssm, ((0, 0), (0, ssm_region_rows - ssm_rows), (0, 0)))
+    new_ssm = new_ssm_buf.reshape(num_reqs + 1, ssm_rows, head_dim)
+    if ssm_region_rows != ssm_rows:
+        new_ssm = jnp.pad(new_ssm, ((0, 0), (0, ssm_region_rows - ssm_rows), (0, 0)))
     pool = pool_adapters.scatter_region(
-        pool, new_ssm, state_indices, tok0=0, ntok=layout.ssm_tokens, split=split
+        pool,
+        new_ssm,
+        state_indices,
+        tok0=0,
+        ntok=layout.ssm_tokens,
+        split=split,
+        lead_rows=1,
+        num_valid=num_valid,
     )
 
     new_conv = new_conv_buf[1:].reshape(
@@ -725,6 +747,7 @@ def _pooled_kda_core(
         tok0=layout.ssm_tokens,
         ntok=layout.conv_tokens,
         split=split,
+        num_valid=num_valid,
     )
 
     return output, pool
