@@ -519,7 +519,7 @@ def kernel_stream(
     # output
     _,
     # scratch
-    wbuf,  # VMEM [nbuf, t, 2 * state_width]
+    wbuf,  # VMEM [nbuf, 2, t, state_width]
     wsem,  # DMA [nbuf]
     acc_ref,  # VMEM [num_tokens, 2 * state_width] f32
     stage_ref,  # VMEM [num_tokens * rows_per_token, 1, lanes] f32
@@ -551,14 +551,17 @@ def kernel_stream(
     stage_u8 = stage_ref.bitcast(jnp.uint8)
 
     def copies(j):
+        # Each state half lands in its own buffer, so every dot reads a whole
+        # (t, state_width) ref, as `kernel`'s m-tile blocks.
         slot = j % nbuf
         return [
             pltpu.make_async_copy(
-                w_hbm.at[pl.ds(j * t + r * rows, rows), :],
-                wbuf.at[slot, pl.ds(r * rows, rows), :],
+                w_hbm.at[pl.ds(j * t + r * rows, rows), pl.ds(h * state_width, state_width)],
+                wbuf.at[slot, h, pl.ds(r * rows, rows), :],
                 wsem.at[slot],
             )
             for r in range(ndma)
+            for h in range(2)
         ]
 
     for j in range(min(nbuf, n_tiles)):
@@ -573,7 +576,7 @@ def kernel_stream(
         for h in range(2):
             cols = slice(h * state_width, (h + 1) * state_width)
             prod = lax.dot_general(
-                x, wbuf[j % nbuf, :, cols], dn, preferred_element_type=jnp.float32
+                x, wbuf[j % nbuf, h], dn, preferred_element_type=jnp.float32
             )
             if j == 0:
                 acc_ref[:, cols] = jnp.zeros_like(prod) + prod
@@ -698,7 +701,7 @@ def _proj_and_save_state_stream(
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=[
-                pltpu.VMEM((nbuf, t, state_dim), wkv_wgate.dtype),
+                pltpu.VMEM((nbuf, 2, t, state_dim // 2), wkv_wgate.dtype),
                 pltpu.SemaphoreType.DMA((nbuf,)),
                 pltpu.VMEM((num_tokens, state_dim), jnp.float32),
                 pltpu.VMEM((num_tokens * rows_per_token, 1, lanes), jnp.float32),

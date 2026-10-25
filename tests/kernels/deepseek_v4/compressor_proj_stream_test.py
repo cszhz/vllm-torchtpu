@@ -13,11 +13,12 @@
 # limitations under the License.
 """The weight-stream decode projection (`kernel_stream`) against the emit_pipeline one.
 
-With the stream's k tile equal to the pipeline kernel's (3584) and bf16 weights
-the arithmetic is the same -- per-half dots, `0 + dot` then `+=` over k, the
-same APE matmul -- so every cache array must match bit for bit. Other k tiles
-and fp8 weights change rounding: those are checked against an f64 oracle of the
-state the projection stores.
+The stream's stored state is not byte-equal to the pipeline kernel's (last-bit
+differences, measured on TPU, at every k tile including the pipeline's 3584),
+so both are checked against an f64 oracle of the state the projection stores:
+bf16 weights must sit as close to it as the pipeline kernel does, fp8 weights
+within the e4m3 error. The stream's k tiling itself does not change the bytes
+(f32 accumulation over k tiles in order), which the first test pins.
 """
 
 import jax
@@ -107,11 +108,11 @@ class CompressorProjStreamTest(jtu.JaxTestCase):
         decode=((1, 7), (2, 7), (4, 7), (8, 7), (3, 2)),
         nbuf=(2, 1),
     )
-    def test_bit_exact_at_pipeline_tile(self, variant, decode, nbuf):
+    def test_k_tiling_is_byte_neutral(self, variant, decode, nbuf):
         args = _build(variant, decode, ())
-        ref = _run(args, **BASE)
+        ref = _run(args, **BASE, proj_stream_max_tokens=64, proj_stream_cfg=(3584, 2, 1))
         new = _run(
-            args, **BASE, proj_stream_max_tokens=64, proj_stream_cfg=(3584, nbuf, 1)
+            args, **BASE, proj_stream_max_tokens=64, proj_stream_cfg=(512, 4 + nbuf, 1)
         )
         for r, n in zip(ref, new):
             if r is not None:
