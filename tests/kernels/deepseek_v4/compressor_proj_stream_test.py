@@ -75,6 +75,21 @@ def _states(args, **kw):
             x, w, a, p, s, c, compress_ratio=ratio, wkv_scale=ws, **kw
         )
     )(args["hidden_states"], w, ws, args["ape"], args["positions"], slots, tgt)
+    return _extract(args, out, slots)
+
+
+def _slots(args):
+    return compressor_v1._state_slots(
+        **{k: args[k] for k in ("positions", "block_table", "query_start_loc",
+                                "kv_block_table", "cache", "state_cache", "distribution",
+                                "cos_sin_cache", "compress_ratio", "state_block_size",
+                                "head_dim", "overlap", "seq_along_lane")}
+    )
+
+
+def _extract(args, out, slots):
+    """(stored f32 state per real token, its f64 oracle)."""
+    ratio = args["compress_ratio"]
     out = np.asarray(out)
     lanes, page_rows = out.shape[-1], out.shape[1]
     sw = args["wkv_wgate"].shape[1] // 2
@@ -150,9 +165,11 @@ class CompressorProjStreamTest(jtu.JaxTestCase):
 
 
 class CompressorPairProjTest(jtu.JaxTestCase):
-    """`pair_proj` (CSA KV + indexer projections in one stream call) followed
-    by `compressor_forward(skip_proj=True)` writes exactly the bytes of the two
-    separate stream calls: per group, the arithmetic is the same."""
+    """The two-group stream call (CSA KV + indexer projections of the same
+    tokens) against the f64 oracle, and the skip_proj plumbing. Not byte-equal
+    to two single calls at T >= 32 (measured, j-1e33105f: ~1% of state words in
+    2 of a token's 16 rows) -- Mosaic lowers the same dot differently in the two
+    kernels -- so it is held to the oracle tolerance of the single stream."""
 
     def setUp(self):
         super().setUp()
@@ -161,57 +178,58 @@ class CompressorPairProjTest(jtu.JaxTestCase):
 
     @parameterized.product(
         decode=((1, 7), (2, 7), (4, 7), (8, 7), (3, 2)),
-        # k tiles <= 1024 (served: 512). At 3584 the pair's bytes differ from
-        # the single call's in ~0.5% of state words by 1-2 ulp (measured,
-        # j-4c11430a): the Mosaic lowering of the long-k dot is not stable
-        # across kernels; short k tiles leave it nothing to choose.
-        cfg=((512, 6, 1), (1024, 4, 1)),
+        cfg=((512, 6, 1), (3584, 2, 1)),
         fp8=(False, True),
     )
-    def test_pair_equals_separate(self, decode, cfg, fp8):
+    def test_pair(self, decode, cfg, fp8):
         a = _build("csa", decode, ())
         b = _build("indexer", decode, ())
         np.testing.assert_array_equal(a["hidden_states"], b["hidden_states"])
         np.testing.assert_array_equal(a["positions"], b["positions"])
-        kw = dict(BASE, proj_stream_max_tokens=64, proj_stream_cfg=cfg)
+        groups = []
         for args in (a, b):
+            w, ws = _fp8(args["wkv_wgate"]) if fp8 else (args["wkv_wgate"], None)
+            groups.append(dict(
+                wkv_wgate=w, wkv_scale=ws, ape=args["ape"], slot_mapping=_slots(args),
+                cache=args["cache"], compress_ratio=args["compress_ratio"]))
+        hosts = pk._proj_and_save_state_stream_multi(
+            a["hidden_states"], a["positions"], groups,
+            t=cfg[0], nbuf=cfg[1], ndma=cfg[2], interpret=False)
+        for args, host, g in zip((a, b), hosts, groups):
+            got, want = _extract(args, host, g["slot_mapping"])
+            base, _ = _states(args)
+            scale = np.abs(want).max(axis=1, keepdims=True)
+            err = (np.abs(got - want) / scale).max()
+            err_base = (np.abs(base - want) / scale).max()
+            self.assertLess(err, 5e-2 if fp8 else max(4 * err_base, 1e-5))
             if fp8:
-                args["wkv_wgate"], args["wkv_scale"] = _fp8(args["wkv_wgate"])
-            else:
-                args["wkv_scale"] = None
-        ref = [_run(a, **kw), _run(b, **kw)]
+                self.assertGreater(err, 10 * err_base)
+            # Nothing outside the real tokens' state rows changed.
+            n_rows = 2 * (args["wkv_wgate"].shape[1] // 2) // host.shape[-1]
+            own = np.zeros(host.shape[0] * host.shape[1], bool)
+            for s0 in np.asarray(g["slot_mapping"]):
+                if s0 >= 0:
+                    own[s0 : s0 + n_rows] = True
+            h = np.asarray(host).reshape(own.shape[0], -1)
+            i = np.asarray(args["cache"]).reshape(own.shape[0], -1)
+            self.assertFalse(((h != i).any(axis=1) & ~own).any())
 
-        keys = ("wkv_wgate", "wkv_scale", "ape", "block_table", "query_start_loc",
-                "kv_block_table", "cache", "state_cache", "distribution",
-                "cos_sin_cache", "compress_ratio", "state_block_size", "head_dim",
-                "overlap", "seq_along_lane")
-        hosts = jax.jit(
-            lambda x, p, ga, gb: compressor_v1.pair_proj(x, p, [ga, gb], stream_cfg=cfg),
-            static_argnums=(),
-        ) if False else None
-        sa = {k: a[k] for k in keys}
-        sb = {k: b[k] for k in keys}
-        statics = ("compress_ratio", "state_block_size", "head_dim", "overlap",
-                   "seq_along_lane")
-        fn = jax.jit(
-            lambda x, p, da, db: compressor_v1.pair_proj(
-                x, p,
-                [dict(da, **{k: sa[k] for k in statics}),
-                 dict(db, **{k: sb[k] for k in statics})],
-                stream_cfg=cfg,
-            )
-        )
-        da = {k: v for k, v in sa.items() if k not in statics}
-        db = {k: v for k, v in sb.items() if k not in statics}
-        host_a, host_b = fn(a["hidden_states"], a["positions"], da, db)
-        new = [
-            _run(dict(a, cache=host_a), **kw, skip_proj=True),
-            _run(dict(b, cache=host_b), **kw, skip_proj=True),
-        ]
-        for r_grp, n_grp in zip(ref, new):
-            for r, n in zip(r_grp, n_grp):
-                if r is not None:
-                    self.assertArraysEqual(r, n)
+    @parameterized.product(variant=("csa", "indexer"), decode=((1, 7), (4, 7)))
+    def test_skip_proj_reads_the_saved_state(self, variant, decode):
+        """compressor_forward(skip_proj=True) on a state saved by the stream
+        call == compressor_forward that saves it itself."""
+        args = _build(variant, decode, ())
+        kw = dict(BASE, proj_stream_max_tokens=64, proj_stream_cfg=(512, 6, 1))
+        ref = _run(args, **kw)
+        host = pk._proj_and_save_state_stream(
+            args["hidden_states"], args["wkv_wgate"], None, args["ape"],
+            args["positions"], _slots(args), args["cache"],
+            compress_ratio=args["compress_ratio"], t=512, nbuf=6, ndma=1,
+            interpret=False)
+        new = _run(dict(args, cache=host), **kw, skip_proj=True)
+        for r, n in zip(ref, new):
+            if r is not None:
+                self.assertArraysEqual(r, n)
 
 
 if __name__ == "__main__":
