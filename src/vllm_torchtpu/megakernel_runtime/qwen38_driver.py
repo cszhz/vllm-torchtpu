@@ -160,6 +160,27 @@ def _cpu_proxy(m: Any, memo: dict | None = None) -> Any:
     return ns
 
 
+def _param_storages(model: Any) -> set[int]:
+    return {int(p.untyped_storage().data_ptr()) for p in model.parameters()}
+
+
+def _own_operand(t: torch.Tensor, param_storages: set[int]) -> torch.Tensor:
+    """`t` as a kernel operand torch_tpu passes without per-call materialisation.
+
+    A packed operand built by stack / pad / reshape can be a view (offset,
+    strides) of a temporary; torch_tpu then re-materialises it in its own
+    `execute_as_strided` program on every call (q32 j-f243a216: ~1.5 ms/step
+    of copies plus one dispatch each). Such tensors are copied once into a
+    fresh base allocation. Views of model parameters (the routed experts) are
+    zero-copy operands and stay as they are.
+    """
+    if int(t.untyped_storage().data_ptr()) in param_storages:
+        return t
+    if t._base is None and t.storage_offset() == 0 and t.is_contiguous():
+        return t
+    return torch.empty_like(t, memory_format=torch.contiguous_format).copy_(t)
+
+
 # `VLLM_TPU_MEGAKERNEL=...,nodonate=1`: the GDN pool is not donated to the segment op; it
 # writes a fresh pool that `_run` copies back into the live cache (bisecting a served hang).
 NO_DONATE = False
@@ -357,6 +378,7 @@ class Qwen38Segments(nn.Module):
             return
         object.__setattr__(self, "_shared", None)
         R = mesh.size
+        params = _param_storages(model)
         self.n_w: list[int] = []
         for s in range(self.n_seg):
             L = len(segment_layers(g, s))
@@ -364,7 +386,7 @@ class Qwen38Segments(nn.Module):
             ops = pack_segment_operands(model, g, s, qwen38.segment_spec(g, R, L=L), ex)
             self.n_w.append(len(ops))
             for i, t in enumerate(ops):
-                self.register_buffer(f"w{s}_{i}", t, persistent=False)
+                self.register_buffer(f"w{s}_{i}", _own_operand(t, params), persistent=False)
         self.n_hw: list[int] = []
         for h, group in enumerate(self.head_groups):
             L = len(group)
@@ -373,7 +395,7 @@ class Qwen38Segments(nn.Module):
             ops = pack_segment_operands(model, g, -1, spec, ex, layer_ids=group, head=True)
             self.n_hw.append(len(ops))
             for i, t in enumerate(ops):
-                self.register_buffer(f"h{h}_{i}", t, persistent=False)
+                self.register_buffer(f"h{h}_{i}", _own_operand(t, params), persistent=False)
         self.pool = None
         self.layout = None
 
@@ -465,9 +487,10 @@ class MtpTail(nn.Module):
         R = mesh.size
         ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
         ops = pack_segment_operands(draft, g, -1, qwen38.segment_spec(g, R, L=1), ex, layer_ids=[0])
+        params = _param_storages(draft)
         self.n_w = len(ops)
         for i, t in enumerate(ops):
-            self.register_buffer(f"w_{i}", t, persistent=False)
+            self.register_buffer(f"w_{i}", _own_operand(t, params), persistent=False)
 
     def forward(self, hidden: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
         w = [getattr(self, f"w_{i}") for i in range(self.n_w)]
