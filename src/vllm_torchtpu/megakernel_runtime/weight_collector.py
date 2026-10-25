@@ -11,40 +11,59 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3.5 weight collector and packer for vLLM TPU models.
+"""Generic vLLM weight collector (`VLLMWeightSource` and `load_vllm_weights`).
 
-Extracts sharded `torch.Tensor` weights from vLLM Qwen3.5 layers and packs them
-into the layout declared by `planner.plan(qwen35.qwen35_spec(g), ex)`:
+Walks live vLLM `torch.nn.Module` decoder backbones using the `HFParamDecl` and
+`VLLMAlias` declarations on each megakernel `Module` and packs per-rank weights
+via `vllm_torchtpu.megakernel.weights.load_weights`:
 - When `ex.stack_e` is `False` (default for serving), dynamic routed-expert
   weights (`e13`, `e2` — ~45.0 GiB / 48.3 GB per rank at `R=8` for 60 layers)
-  are passed as their original 3D `torch.nn.Parameter` base buffers
+  are passed through as their original 3D `torch.nn.Parameter` base buffers
   (`e13[l].data_ptr() == w13.data_ptr()`), avoiding duplicate expert HBM
   allocations; the 3D -> 4D reshape happens as a zero-copy XLA bitcast inside
   `cache.make_flat_pooled_step`.
-- Non-expert layer weights (`lin_in`, `lin_out`, `att_in`, `att_out`, `router`,
-  `sh13`, `sh2`, `es`, `smalls`, `final_norm` — ~1.5 GB per rank at `R=8` for 60
-  layers) are stacked across layers into contiguous base buffers
-  (`storage_offset() == 0`, `_is_view() is False`) required by the single-call
-  megakernel so `torch_tpu` never emits `tt_jit_execute_as_strided` copies on
-  compiled steps.
+- Non-expert layer weights are stacked across layers into contiguous base
+  buffers (`storage_offset() == 0`, `_is_view() is False`) required by the
+  single-call megakernel so `torch_tpu` never emits `tt_jit_execute_as_strided`
+  copies on compiled steps.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from typing import Any
 
+import jax.numpy as jnp
 import torch
 import torch.nn.functional as F
 
 from vllm_torchtpu.megakernel import planner
+from vllm_torchtpu.megakernel.decls import HFParamDecl, VLLMAlias
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.modules.gdn import GDNModule
-from vllm_torchtpu.megakernel.ops import rup
+from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32
+from vllm_torchtpu.megakernel.weights import (
+    ArrayOps,
+    load_weights,
+    resolve_spec_and_norms,
+    slice_alias_targets,
+    target_axis_widths,
+)
 
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
+
+_TORCH_DTYPE_MAP: dict[Any, torch.dtype] = {
+    jnp.dtype(FP8): torch.float8_e4m3fn,
+    jnp.dtype(BF16): torch.bfloat16,
+    jnp.dtype(F32): torch.float32,
+    jnp.dtype(I32): torch.int32,
+}
+
+
+def _to_torch_dtype(dtype: Any) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    return _TORCH_DTYPE_MAP[jnp.dtype(dtype)]
 
 
 def _need(cond: bool, msg: str) -> None:
@@ -69,6 +88,78 @@ def _try_set(obj: Any, name: str, value: Any) -> None:
     if hasattr(obj, name):
         with suppress(AttributeError):
             setattr(obj, name, value)
+
+
+class TorchArrayOps:
+    """`ArrayOps` implementation backed by `torch.Tensor`."""
+
+    def __init__(self, device: torch.device | None = None) -> None:
+        self._dev = device
+
+    def slice_axis(
+        self, x: torch.Tensor, axis: int, start: int, stop: int
+    ) -> torch.Tensor:
+        ax = axis % x.ndim
+        if start == 0 and stop == int(x.shape[ax]):
+            return x
+        return x.narrow(ax, start, stop - start)
+
+    def concat(self, xs: Sequence[torch.Tensor], axis: int) -> torch.Tensor:
+        return torch.cat(list(xs), dim=axis)
+
+    def reshape(self, x: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+        return x.view(*shape) if x.is_contiguous() else x.reshape(*shape)
+
+    def transpose(self, x: torch.Tensor, perm: tuple[int, ...]) -> torch.Tensor:
+        return x.permute(*perm)
+
+    def pad(
+        self, x: torch.Tensor, pad_widths: Sequence[tuple[int, int]]
+    ) -> torch.Tensor:
+        torch_pad: list[int] = []
+        for before, after in reversed(pad_widths):
+            torch_pad.extend((int(before), int(after)))
+        if not any(torch_pad):
+            return x
+        if x.dtype == torch.float8_e4m3fn:
+            return F.pad(x.view(torch.uint8), tuple(torch_pad), value=0).view(
+                torch.float8_e4m3fn
+            )
+        return F.pad(x, tuple(torch_pad), value=0)
+
+    def cast(self, x: torch.Tensor, dtype: Any) -> torch.Tensor:
+        td = _to_torch_dtype(dtype)
+        return x if x.dtype == td else x.to(td)
+
+    def is_fp8(self, x: torch.Tensor) -> bool:
+        return x.dtype == torch.float8_e4m3fn
+
+    def dequantize(
+        self, x: torch.Tensor, scale: torch.Tensor, dtype: Any
+    ) -> torch.Tensor:
+        return (x.float() * scale.float()).to(_to_torch_dtype(dtype))
+
+    def quantize_fp8(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        w_nk_f32 = x.transpose(0, 1).float()
+        amax = w_nk_f32.abs().amax(dim=-1, keepdim=True)
+        scale = torch.where(amax == 0.0, torch.ones_like(amax), amax * (1.0 / 448.0))
+        w_fp8_kn = (
+            (w_nk_f32 / scale)
+            .clamp(-448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .transpose(0, 1)
+            .contiguous()
+        )
+        return w_fp8_kn, scale.squeeze(-1).float().contiguous()
+
+    def zeros(self, shape: tuple[int, ...], dtype: Any) -> torch.Tensor:
+        return torch.zeros(shape, dtype=_to_torch_dtype(dtype), device=self._dev)
+
+    def stack_layers(self, xs: Sequence[torch.Tensor]) -> torch.Tensor:
+        return _stack(xs)
+
+    def own(self, x: torch.Tensor) -> torch.Tensor:
+        return _own(x)
 
 
 def find_backbone(model: Any) -> Any:
@@ -96,320 +187,43 @@ def get_routed_experts(mlp: Any) -> Any:
     return getattr(experts, "routed_experts", experts)
 
 
-def extract_kn_fp8_weight(
-    proj: Any, hidden_dim: int, out_dim: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return `(w_kn [hidden_dim, out_dim] fp8, s_n [out_dim] f32)` from `proj`."""
-    w = proj.weight.data
-    flipped = getattr(proj, WEIGHT_FLIPPED_ATTR, None)
-    if flipped is True and tuple(w.shape) == (hidden_dim, out_dim):
-        w_kn = w
-    elif flipped is False and tuple(w.shape) == (out_dim, hidden_dim):
-        w_kn = w.transpose(0, 1)
-    elif tuple(w.shape) == (hidden_dim, out_dim) and hidden_dim != out_dim:
-        w_kn = w
-    elif tuple(w.shape) == (out_dim, hidden_dim):
-        w_kn = w.transpose(0, 1)
-    else:
+def _orient_2d_kn(
+    w: torch.Tensor,
+    explicit_flip: bool | None,
+    source_name: str,
+    valid_k: set[int],
+    valid_n: set[int],
+) -> torch.Tensor:
+    """Orient a 2D weight tensor `w` to `[K, N]` layout, raising on ambiguity."""
+    r0, r1 = int(w.shape[0]), int(w.shape[1])
+    if explicit_flip is True and r0 in valid_k and r1 in valid_n:
+        return w
+    if explicit_flip is False and r0 in valid_n and r1 in valid_k:
+        return w.transpose(0, 1)
+    if r0 == r1 and r0 in valid_k and r1 in valid_n:
         raise ValueError(
-            f"Unexpected weight shape {tuple(w.shape)}; expected "
-            f"({hidden_dim}, {out_dim}) or ({out_dim}, {hidden_dim})"
+            f"Ambiguous square weight shape {tuple(w.shape)} for {source_name!r} "
+            f"without explicit {WEIGHT_FLIPPED_ATTR!r} attribute"
         )
-
-    s = getattr(proj, "weight_scale", None)
-    if s is None:
-        s = getattr(proj, "weight_scale_inv", None)
-
-    if w_kn.dtype == torch.float8_e4m3fn:
-        _need(s is not None, "FP8 linear projection is missing weight_scale")
-        assert s is not None
-        s_1d = s.data.float().reshape(-1).contiguous()
-        _need(
-            s_1d.shape == (out_dim,),
-            f"FP8 weight_scale shape {tuple(s_1d.shape)} != ({out_dim},)",
-        )
-        return w_kn.contiguous(), s_1d
-
-    # Fallback: quantize BF16/FP32 weight [hidden_dim, out_dim] per output channel.
-    w_nk_f32 = w_kn.transpose(0, 1).float()
-    amax = w_nk_f32.abs().amax(dim=-1, keepdim=True)
-    scale = torch.where(amax == 0.0, torch.ones_like(amax), amax * (1.0 / 448.0))
-    w_fp8_kn = (
-        (w_nk_f32 / scale)
-        .clamp(-448.0, 448.0)
-        .to(torch.float8_e4m3fn)
-        .transpose(0, 1)
-        .contiguous()
+    if r0 in valid_k and r1 in valid_n:
+        return w
+    if r0 in valid_n and r1 in valid_k:
+        return w.transpose(0, 1)
+    raise ValueError(
+        f"Unexpected weight shape {tuple(w.shape)} for {source_name!r}; "
+        f"expected K in {sorted(valid_k)}, N in {sorted(valid_n)}"
     )
-    return w_fp8_kn, scale.squeeze(-1).float().contiguous()
-
-
-def quantize_ba_weight(
-    in_proj_ba: Any, hidden_dim: int, vh: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize BF16 `in_proj_ba` (`2*vh` channels) per-channel to FP8."""
-    out_dim = 2 * vh
-    w = in_proj_ba.weight.data
-    flipped = getattr(in_proj_ba, WEIGHT_FLIPPED_ATTR, None)
-    if flipped is True and tuple(w.shape) == (hidden_dim, out_dim):
-        w_nk = w.transpose(0, 1)
-    elif tuple(w.shape) == (out_dim, hidden_dim):
-        w_nk = w
-    elif tuple(w.shape) == (hidden_dim, out_dim):
-        w_nk = w.transpose(0, 1)
-    else:
-        raise ValueError(
-            f"Unexpected in_proj_ba.weight shape {tuple(w.shape)}; "
-            f"expected ({out_dim}, {hidden_dim}) or ({hidden_dim}, {out_dim})"
-        )
-
-    if w_nk.dtype == torch.float8_e4m3fn:
-        s = getattr(in_proj_ba, "weight_scale", None)
-        if s is None:
-            s = getattr(in_proj_ba, "weight_scale_inv", None)
-        _need(s is not None, "FP8 in_proj_ba missing weight_scale")
-        assert s is not None
-        return (
-            w_nk.transpose(0, 1).contiguous(),
-            s.data.float().reshape(out_dim).contiguous(),
-        )
-
-    w_f32 = w_nk.float()
-    amax = w_f32.abs().amax(dim=-1, keepdim=True)
-    ba_scale = torch.where(amax == 0.0, torch.ones_like(amax), amax * (1.0 / 448.0))
-    ba_fp8_kn = (
-        (w_f32 / ba_scale)
-        .clamp(-448.0, 448.0)
-        .to(torch.float8_e4m3fn)
-        .transpose(0, 1)
-        .contiguous()
-    )
-    return ba_fp8_kn, ba_scale.squeeze(-1).float().contiguous()
-
-
-def pack_lin_in_layer(
-    gdn_layer: Any,
-    g: qwen35.Qwen35Geometry,
-    ex: ExecSpec,
-    tk_lin_in: int,
-    in_s_width: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack a GDN layer's `in_proj_qkvz` + `in_proj_ba` into `lin_in` and `in_s`."""
-    lay = GDNModule.lin_in_layout(g, ex)
-    nai = g.NAI(ex.R)
-    qkvz_dim = lay.QKV + lay.Z
-    w_qkvz, s_qkvz = extract_kn_fp8_weight(gdn_layer.in_proj_qkvz, g.H, qkvz_dim)
-    ba_fp8, ba_scale = quantize_ba_weight(gdn_layer.in_proj_ba, g.H, lay.vh)
-
-    ba_cols = lay.NLI - lay.BA
-    a_rel = lay.A_OFF - lay.BA
-    ba_pad = torch.zeros(
-        (g.H, ba_cols), dtype=torch.float8_e4m3fn, device=w_qkvz.device
-    )
-    ba_pad[:, 0 : lay.vh] = ba_fp8[:, 0 : lay.vh]
-    ba_pad[:, a_rel : a_rel + lay.vh] = ba_fp8[:, lay.vh : 2 * lay.vh]
-
-    w_cat = torch.cat([w_qkvz, ba_pad], dim=1).contiguous()
-    w_tiled = w_cat.view(g.H // tk_lin_in, tk_lin_in, lay.NLI)
-
-    s_width = in_s_width if in_s_width is not None else max(lay.NLI, nai)
-    in_s = torch.zeros((s_width,), dtype=torch.float32, device=s_qkvz.device)
-    in_s[0:qkvz_dim] = s_qkvz
-    in_s[lay.BA : lay.BA + lay.vh] = ba_scale[0 : lay.vh]
-    in_s[lay.A_OFF : lay.A_OFF + lay.vh] = ba_scale[lay.vh : 2 * lay.vh]
-    return w_tiled, in_s
-
-
-def pack_lin_out_layer(
-    gdn_layer: Any,
-    g: qwen35.Qwen35Geometry,
-    ex: ExecSpec,
-    tk_lin_out: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack a GDN layer's `out_proj` into `[Z // tk_lin_out, tk_lin_out, H]`."""
-    lay = GDNModule.lin_in_layout(g, ex)
-    w_kn, s_n = extract_kn_fp8_weight(gdn_layer.out_proj, lay.Z, g.H)
-    return w_kn.view(lay.Z // tk_lin_out, tk_lin_out, g.H), s_n
-
-
-def pack_att_in_layer(
-    attn_layer: Any,
-    g: qwen35.Qwen35Geometry,
-    ex: ExecSpec,
-    tk_att_in: int,
-    in_s_width: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack a full-attention layer's `qkv_proj` into `att_in` and `in_s`."""
-    nh = g.nh(ex.R)
-    nai = g.NAI(ex.R)
-    gdn_lay = GDNModule.lin_in_layout(g, ex)
-    if hasattr(attn_layer, "qkv_proj"):
-        w_kn, s_n = extract_kn_fp8_weight(attn_layer.qkv_proj, g.H, nai)
-    else:
-        q_dim = 2 * nh * g.HD
-        kv_dim = (nai - q_dim) // 2
-        wq, sq = extract_kn_fp8_weight(attn_layer.q_proj, g.H, q_dim)
-        wk, sk = extract_kn_fp8_weight(attn_layer.k_proj, g.H, kv_dim)
-        wv, sv = extract_kn_fp8_weight(attn_layer.v_proj, g.H, kv_dim)
-        w_kn = torch.cat([wq, wk, wv], dim=1).contiguous()
-        s_n = torch.cat([sq, sk, sv], dim=0).contiguous()
-    s_width = in_s_width if in_s_width is not None else max(gdn_lay.NLI, nai)
-    in_s = torch.zeros((s_width,), dtype=torch.float32, device=s_n.device)
-    in_s[0:nai] = s_n
-    return w_kn.view(g.H // tk_att_in, tk_att_in, nai), in_s
-
-
-def pack_att_out_layer(
-    attn_layer: Any,
-    g: qwen35.Qwen35Geometry,
-    ex: ExecSpec,
-    tk_att_out: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack a full-attention layer's `o_proj` into `att_out` and `out_s`."""
-    k_dim = g.nh(ex.R) * g.HD
-    w_kn, s_n = extract_kn_fp8_weight(attn_layer.o_proj, k_dim, g.H)
-    return w_kn.view(k_dim // tk_att_out, tk_att_out, g.H), s_n
-
-
-def pack_router_and_shared_layer(
-    mlp: Any,
-    g: qwen35.Qwen35Geometry,
-    ex: ExecSpec,
-    *,
-    tp_rank: int = 0,
-    tk_router: int,
-    tk_sh13: int,
-    tk_sh2: int,
-) -> dict[str, torch.Tensor]:
-    """Extract router (`bf16`), shared expert `sh13`/`sh2` (`fp8`), and scales."""
-    isr = g.ISR(ex.R)
-    w_gu = getattr(mlp, "_fused_gate_gu_fp8_weight", None)
-    if w_gu is not None:
-        s_gu = mlp._fused_gate_gu_fp8_scale.data.float().reshape(-1)
-        if hasattr(mlp, "_fused_se_down_fp8_weight"):
-            w_down = mlp._fused_se_down_fp8_weight.data
-            s_down = mlp._fused_se_down_fp8_scale.data.float().reshape(g.H).contiguous()
-        else:
-            down_proj = mlp.shared_expert.down_proj
-            down_rows = int(
-                down_proj.weight.shape[0]
-                if getattr(down_proj, WEIGHT_FLIPPED_ATTR, False)
-                or down_proj.weight.shape[1] == g.H
-                else down_proj.weight.shape[1]
-            )
-            w_down, s_down = extract_kn_fp8_weight(down_proj, down_rows, g.H)
-        if hasattr(mlp, "_fused_se_gate_weight"):
-            sh_gate = mlp._fused_se_gate_weight.data.float().reshape(g.H).contiguous()
-        else:
-            sh_gate = (
-                mlp.shared_expert_gate.weight.data.float().reshape(g.H).contiguous()
-            )
-
-        w_router_fp8 = w_gu.data[:, : g.E]
-        s_router = s_gu[: g.E]
-        w_router_bf16 = (
-            (w_router_fp8.float() * s_router.unsqueeze(0))
-            .to(torch.bfloat16)
-            .contiguous()
-            .view(g.H // tk_router, tk_router, g.E)
-        )
-
-        n_cols = int(w_gu.shape[1])
-        if n_cols == g.E + 2 * g.IS:
-            g0 = g.E + tp_rank * isr
-            u0 = g.E + g.IS + tp_rank * isr
-            w_sh13 = torch.cat(
-                [w_gu.data[:, g0 : g0 + isr], w_gu.data[:, u0 : u0 + isr]], dim=1
-            ).contiguous()
-            s_sh13 = torch.cat(
-                [s_gu[g0 : g0 + isr], s_gu[u0 : u0 + isr]], dim=0
-            ).contiguous()
-        elif n_cols == g.E + 2 * isr:
-            w_sh13 = w_gu.data[:, g.E : g.E + 2 * isr].contiguous()
-            s_sh13 = s_gu[g.E : g.E + 2 * isr].contiguous()
-        else:
-            raise ValueError(
-                f"Unexpected _fused_gate_gu_fp8_weight shape {tuple(w_gu.shape)}"
-            )
-
-        if int(w_down.shape[0]) == g.IS:
-            r0 = tp_rank * isr
-            w_sh2 = w_down[r0 : r0 + isr, :].contiguous()
-        elif int(w_down.shape[0]) == isr:
-            w_sh2 = w_down.contiguous()
-        else:
-            raise ValueError(
-                f"Unexpected _fused_se_down_fp8_weight shape {tuple(w_down.shape)}"
-            )
-    else:
-        gate_w = mlp.gate.weight.data
-        if tuple(gate_w.shape) == (g.E, g.H):
-            gate_w = gate_w.transpose(0, 1)
-        w_router_bf16 = (
-            gate_w.to(torch.bfloat16)
-            .contiguous()
-            .view(g.H // tk_router, tk_router, g.E)
-        )
-
-        gu_proj = mlp.shared_expert.gate_up_proj
-        down_proj = mlp.shared_expert.down_proj
-        gu_cols = int(
-            gu_proj.weight.shape[1]
-            if getattr(gu_proj, WEIGHT_FLIPPED_ATTR, False)
-            or gu_proj.weight.shape[0] == g.H
-            else gu_proj.weight.shape[0]
-        )
-        w_gu_only, s_gu_only = extract_kn_fp8_weight(gu_proj, g.H, gu_cols)
-        if gu_cols == 2 * g.IS:
-            g0 = tp_rank * isr
-            u0 = g.IS + tp_rank * isr
-            w_sh13 = torch.cat(
-                [w_gu_only[:, g0 : g0 + isr], w_gu_only[:, u0 : u0 + isr]], dim=1
-            ).contiguous()
-            s_sh13 = torch.cat(
-                [s_gu_only[g0 : g0 + isr], s_gu_only[u0 : u0 + isr]], dim=0
-            ).contiguous()
-        elif gu_cols == 2 * isr:
-            w_sh13 = w_gu_only.contiguous()
-            s_sh13 = s_gu_only.contiguous()
-        else:
-            raise ValueError(f"Unexpected shared_expert.gate_up_proj cols {gu_cols}")
-
-        down_rows = int(
-            down_proj.weight.shape[0]
-            if getattr(down_proj, WEIGHT_FLIPPED_ATTR, False)
-            or down_proj.weight.shape[1] == g.H
-            else down_proj.weight.shape[1]
-        )
-        w_down_only, s_down = extract_kn_fp8_weight(down_proj, down_rows, g.H)
-        if down_rows == g.IS:
-            r0 = tp_rank * isr
-            w_sh2 = w_down_only[r0 : r0 + isr, :].contiguous()
-        elif down_rows == isr:
-            w_sh2 = w_down_only.contiguous()
-        else:
-            raise ValueError(f"Unexpected shared_expert.down_proj rows {down_rows}")
-
-        sh_gate = mlp.shared_expert_gate.weight.data.float().reshape(g.H).contiguous()
-
-    return {
-        "router": w_router_bf16,
-        "sh13": w_sh13.view(g.H // tk_sh13, tk_sh13, 2 * isr),
-        "sh2": w_sh2.view(isr // tk_sh2, tk_sh2, g.H),
-        "sh13_s": s_sh13,
-        "sh2_s": s_down,
-        "sh_gate": sh_gate,
-    }
 
 
 def extract_ecopy_layer(
     layer_idx: int | None,
     layer: Any,
-    g: qwen35.Qwen35Geometry,
+    g: Any,
     ex: ExecSpec,
     dev: torch.device,
     *,
     expert_placement: Any = None,
+    experts_path: str = "mlp.experts",
 ) -> torch.Tensor | None:
     """Build the `[E]` `float32` `ecopy` descriptor vector for `smalls['ecopy']`.
 
@@ -421,10 +235,12 @@ def extract_ecopy_layer(
     ew = g.EW(ex.R)
     if g.moe_tp or g.e_slots <= er:
         return None
-    mlp = getattr(layer, "mlp", None)
-    routed = (
-        get_routed_experts(mlp) if mlp is not None and hasattr(mlp, "experts") else None
-    )
+    cur: Any = layer
+    for attr in experts_path.split("."):
+        cur = getattr(cur, attr, None)
+        if cur is None:
+            break
+    routed = getattr(cur, "routed_experts", cur) if cur is not None else None
     if routed is not None:
         ec_buf = getattr(routed, "_ecopy", None)
         if ec_buf is not None:
@@ -459,143 +275,240 @@ def extract_ecopy_layer(
     return None
 
 
-def pack_smalls_layer(
-    layer: Any,
-    g: qwen35.Qwen35Geometry,
-    ex: ExecSpec,
-    smalls_layout: dict[str, tuple[int, int]],
-    smalls_stride: int,
-    *,
-    in_s: torch.Tensor,
-    out_s: torch.Tensor,
-    sh13_s: torch.Tensor,
-    sh2_s: torch.Tensor,
-    sh_gate: torch.Tensor,
-    layer_idx: int | None = None,
-    ecopy: torch.Tensor | None = None,
-    expert_placement: Any = None,
-) -> torch.Tensor:
-    """Pack a single layer's small parameters into `[1, S] float32`."""
-    dev = in_s.device
-    isr = g.ISR(ex.R)
-    gdn_lay = GDNModule.lin_in_layout(g, ex)
+def _get_attr_or_scale_variant(obj: Any, leaf: str) -> tuple[str, Any] | None:
+    val = getattr(obj, leaf, None)
+    if val is not None:
+        return leaf, val
+    if leaf.endswith("_scale"):
+        alt = f"{leaf}_inv"
+        val = getattr(obj, alt, None)
+        if val is not None:
+            return alt, val
+    elif leaf.endswith("_scale_inv"):
+        alt = leaf[: -len("_inv")]
+        val = getattr(obj, alt, None)
+        if val is not None:
+            return alt, val
+    return None
 
-    in_norm_w = layer.input_layernorm.weight.data.float().reshape(g.H)
-    post_norm_w = layer.post_attention_layernorm.weight.data.float().reshape(g.H)
 
-    fields: dict[str, torch.Tensor] = {
-        "in_norm": in_norm_w,
-        "post_norm": post_norm_w,
-        "in_s": in_s.float().reshape(-1),
-        "out_s": out_s.float().reshape(g.H),
-        "sh13_s": sh13_s.float().reshape(2 * isr),
-        "sh2_s": sh2_s.float().reshape(g.H),
-        "sh_gate": sh_gate.float().reshape(g.H),
-    }
-    if "ecopy" in smalls_layout:
-        if ecopy is None:
-            ecopy = extract_ecopy_layer(
-                layer_idx, layer, g, ex, dev, expert_placement=expert_placement
-            )
-        if ecopy is not None:
-            fields["ecopy"] = ecopy.float().reshape(g.E)
+def _walk_attr(root: Any, dotted: str) -> tuple[Any, str, Any] | None:
+    """Resolve `dotted` path on `root` into `(parent_obj, leaf_name, leaf_val)`."""
+    parts = dotted.split(".")
+    leaf = parts[-1]
+    cur = root
+    for attr in parts[:-1]:
+        nxt = getattr(cur, attr, None)
+        if nxt is None:
+            return None
+        if attr == "experts" and hasattr(nxt, "routed_experts"):
+            rexp = nxt.routed_experts
+            if rexp is not None and _get_attr_or_scale_variant(rexp, leaf) is not None:
+                nxt = rexp
+        cur = nxt
+    found = _get_attr_or_scale_variant(cur, leaf)
+    if found is None:
+        return None
+    actual_leaf, val = found
+    return cur, actual_leaf, val
 
-    ltype = getattr(layer, "layer_type", None)
-    if ltype is None and layer_idx is not None:
-        ltype = (
-            "full_attention"
-            if (layer_idx % g.att_every == g.att_every - 1)
-            else "linear_attention"
+
+class VLLMWeightSource:
+    """`WeightSource` backed by a live vLLM decoder `backbone` (`layers` + `norm`)."""
+
+    def __init__(self, backbone: Any, g: Any) -> None:
+        _need(
+            len(backbone.layers) == int(g.L),
+            f"expected {g.L} layers, got {len(backbone.layers)}",
         )
-    if ltype == "linear_attention":
-        la = layer.linear_attn
-        conv_w = (
-            la.conv1d.weight.data.float()
-            .reshape(gdn_lay.QKV, 4)
-            .transpose(0, 1)
-            .contiguous()
+        self._backbone = backbone
+        self._dev = backbone.norm.weight.device
+        self._ops = TorchArrayOps(device=self._dev)
+
+    @property
+    def ops(self) -> ArrayOps:
+        return self._ops
+
+    def has_layer_alias(self, lyr: int, ord_idx: int, source_name: str) -> bool:
+        del ord_idx
+        res = _walk_attr(self._backbone.layers[lyr], source_name)
+        if res is None:
+            return False
+        _, _, val = res
+        return isinstance(val, torch.Tensor) or isinstance(
+            getattr(val, "weight", None), torch.Tensor
         )
-        alog_w = la.A_log.data.float().reshape(gdn_lay.vh)
-        dtb_w = la.dt_bias.data.float().reshape(gdn_lay.vh)
-        gnorm_w = la.norm.weight.data.float().reshape(gdn_lay.VD)
 
-        fields["conv"] = conv_w.reshape(4 * gdn_lay.QKV)
-        fields["alog"] = F.pad(alog_w, (0, 128 - gdn_lay.vh))
-        fields["dtb"] = F.pad(dtb_w, (0, 128 - gdn_lay.vh))
-        fields["gnorm"] = gnorm_w
-    else:
-        sa = layer.self_attn
-        fields["qn"] = sa.q_norm.weight.data.float().reshape(g.HD)
-        fields["kn"] = sa.k_norm.weight.data.float().reshape(g.HD)
+    def _read_scale(
+        self, layer: Any, proj_or_parent: Any, alias: VLLMAlias
+    ) -> torch.Tensor | None:
+        if hasattr(proj_or_parent, "weight"):
+            for s_attr in ("weight_scale_inv", "weight_scale"):
+                s = getattr(proj_or_parent, s_attr, None)
+                if isinstance(s, torch.Tensor):
+                    return s.data
+        if alias.scale_source is not None:
+            res = _walk_attr(layer, alias.scale_source)
+            if res is not None and isinstance(res[2], torch.Tensor):
+                return res[2].data
+        return None
 
-    parts = []
-    for name, (_, width) in smalls_layout.items():
-        v = fields.get(name)
-        if v is None:
-            v = torch.zeros((width,), dtype=torch.float32, device=dev)
+    def resolve_alias(
+        self,
+        lyr: int,
+        ord_idx: int,
+        alias: VLLMAlias,
+        target_decls: Sequence[HFParamDecl],
+        scale_decls: Mapping[str, HFParamDecl],
+        *,
+        R: int,
+        tp_rank: int,
+        fuse_groups: Mapping[str, tuple[str, ...]] | None = None,
+    ) -> dict[str, Any]:
+        del ord_idx
+        layer = self._backbone.layers[lyr]
+        res = _walk_attr(layer, alias.source)
+        _need(res is not None, f"Layer {lyr}: missing {alias.source!r}")
+        assert res is not None
+        parent, _, val = res
+        is_direct_tensor = isinstance(val, torch.Tensor)
+        if is_direct_tensor:
+            proj_obj = parent
+            w = val.detach()
         else:
-            v = v.reshape(-1).float()
-        _need(v.numel() == width, f"smalls field {name}: {v.numel()} != {width}")
-        pad_len = rup(width, 128) - width
-        if pad_len > 0:
-            v = F.pad(v, (0, pad_len))
-        parts.append(v)
+            proj_obj = val
+            w = val.weight.detach()
 
-    return torch.cat(parts, dim=0).view(1, smalls_stride).contiguous()
+        d0 = target_decls[0]
+        s_buf: torch.Tensor | None = None
+
+        if w.ndim == 3 and d0.transform.expert_axis == 0:
+            _need(
+                w.is_contiguous(),
+                "expert weights must be contiguous for zero-copy views",
+            )
+            s_raw = self._read_scale(layer, proj_obj, alias)
+            _need(s_raw is not None, f"Expert weight {alias.source!r} missing scale")
+            assert s_raw is not None
+            exp_e, exp_n = int(w.shape[0]), int(w.shape[-1])
+            _need(
+                s_raw.numel() == exp_e * exp_n,
+                f"Expert scale for {alias.source!r} has shape {tuple(s_raw.shape)} "
+                f"({s_raw.numel()} elems), expected ({exp_e}, {exp_n})",
+            )
+            s_buf = s_raw.float().reshape(exp_e, exp_n).contiguous()
+            w_buf = w
+        elif len(target_decls) == 1 and len(d0.shape) == 1:
+            w_buf = w.reshape(-1)
+        elif w.ndim == 2 and not d0.transform.flatten_tail:
+            k_full, k_shard = target_axis_widths(d0, R, 0)
+            valid_k = {k_full, k_shard}
+            n_widths = [target_axis_widths(d, R, -1) for d in target_decls]
+            valid_n = {
+                sum(fw for fw, _ in n_widths),
+                sum(sw for _, sw in n_widths),
+            }
+            if is_direct_tensor:
+                explicit_flip = getattr(
+                    val,
+                    WEIGHT_FLIPPED_ATTR,
+                    getattr(parent, WEIGHT_FLIPPED_ATTR, alias.flipped),
+                )
+            else:
+                explicit_flip = getattr(proj_obj, WEIGHT_FLIPPED_ATTR, None)
+            w_kn = _orient_2d_kn(w, explicit_flip, alias.source, valid_k, valid_n)
+
+            if w_kn.dtype == torch.float8_e4m3fn:
+                s_raw = self._read_scale(layer, proj_obj, alias)
+                _need(
+                    s_raw is not None,
+                    f"FP8 projection {alias.source!r} is missing weight_scale",
+                )
+                assert s_raw is not None
+                exp_n = int(w_kn.shape[1])
+                _need(
+                    s_raw.numel() == exp_n,
+                    f"FP8 weight_scale for {alias.source!r} has shape "
+                    f"{tuple(s_raw.shape)} ({s_raw.numel()} elems), expected {exp_n}",
+                )
+                s_buf = s_raw.float().reshape(exp_n).contiguous()
+            w_buf = w_kn.contiguous()
+        else:
+            w_buf = w
+
+        return slice_alias_targets(
+            self._ops,
+            alias,
+            w_buf,
+            s_buf,
+            target_decls,
+            scale_decls,
+            R=R,
+            tp_rank=tp_rank,
+            fuse_groups=fuse_groups,
+        )
+
+    def read_model_param(self, decl: HFParamDecl, *, R: int, tp_rank: int) -> Any:
+        del R, tp_rank
+        candidates = [al.source for al in decl.vllm_aliases] + [decl.hf_name]
+        for cand in candidates:
+            for path in (cand, cand.removeprefix("model.")):
+                res = _walk_attr(self._backbone, path)
+                if res is not None:
+                    val = res[2]
+                    t = (
+                        val.detach()
+                        if isinstance(val, torch.Tensor)
+                        else val.weight.detach()
+                    )
+                    self._dev = t.device
+                    self._ops._dev = t.device
+                    return t
+        raise ValueError(f"Cannot resolve model parameter {decl.name!r} on backbone")
+
+    def read_layer_ecopy(
+        self,
+        lyr: int,
+        g: Any,
+        ex: ExecSpec,
+        *,
+        expert_placement: Any = None,
+        experts_path: str = "mlp.experts",
+    ) -> torch.Tensor | None:
+        return extract_ecopy_layer(
+            lyr,
+            self._backbone.layers[lyr],
+            g,
+            ex,
+            self._dev,
+            expert_placement=expert_placement,
+            experts_path=experts_path,
+        )
+
+    def supports_passthrough(self) -> bool:
+        return True
 
 
-def pack_expert_views_layer(
-    mlp: Any,
-    g: qwen35.Qwen35Geometry,
+def load_vllm_weights(
+    model_def: Any,
+    backbone: Any,
     ex: ExecSpec,
-    tk_e13: int,
-    tk_e2: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Extract per-layer routed expert weights (`e13`, `e2`) and scales (`es_mk`).
-
-    When `ex.stack_e` is `False`, returns the base 3D `Parameter` tensors
-    `[EW, H, 2*IR]` and `[EW, IR, H]` directly without `.view(...)`, preserving
-    `data_ptr()` and `storage_offset() == 0` with zero duplicate HBM.
-    """
-    experts = get_routed_experts(mlp)
-    w13 = experts.w13_weight
-    w2 = experts.w2_weight
-    ew = g.EW(ex.R)
-    ir = g.IR(ex.R)
-    _need(
-        int(w13.shape[0]) == ew,
-        f"experts.w13_weight.shape[0]={w13.shape[0]} != EW={ew}",
+    *,
+    g: Any = None,
+    tp_rank: int = 0,
+    expert_placement: Any = None,
+) -> dict[str, Any]:
+    """Extract and pack all layers of `backbone` via `load_weights`."""
+    _, geom, _, _, _ = resolve_spec_and_norms(model_def, ex, g=g)
+    source = VLLMWeightSource(backbone, geom)
+    return load_weights(
+        model_def,
+        ex,
+        source,
+        g=geom,
+        tp_rank=tp_rank,
+        expert_placement=expert_placement,
     )
-    _need(
-        w13.is_contiguous() and w2.is_contiguous(),
-        "expert weights must be contiguous for zero-copy views",
-    )
-
-    if not ex.stack_e:
-        e13_view = w13
-        e2_view = w2
-    else:
-        t13 = g.H // tk_e13
-        t2 = ir // tk_e2
-        e13_view = w13.view(ew, t13, tk_e13, 2 * ir)
-        e2_view = w2.view(ew, t2, tk_e2, g.H)
-    _need(
-        e13_view.data_ptr() == w13.data_ptr() and e2_view.data_ptr() == w2.data_ptr(),
-        "expert views must share storage with w13_weight / w2_weight",
-    )
-
-    s13_raw = getattr(experts, "w13_weight_scale_inv", None)
-    if s13_raw is None:
-        s13_raw = experts.w13_weight_scale
-    s2_raw = getattr(experts, "w2_weight_scale_inv", None)
-    if s2_raw is None:
-        s2_raw = experts.w2_weight_scale
-
-    s13 = s13_raw.data.float().reshape(ew, 2 * ir)
-    s2 = s2_raw.data.float().reshape(ew, g.H)
-    es_cat = torch.cat([s13, s2], dim=-1).contiguous()
-    es_mk = es_cat.unsqueeze(1).contiguous()
-    return e13_view, e2_view, es_mk
 
 
 def reshard_experts_ep_to_tp_local(
@@ -604,7 +517,7 @@ def reshard_experts_ep_to_tp_local(
     s13_all: torch.Tensor,
     s2_all: torch.Tensor,
     tp_rank: int,
-    g: qwen35.Qwen35Geometry,
+    g: Any,
     ex: ExecSpec,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Slice global `E`-expert weights/scales into `tp_rank`'s TP-sharded tensors."""
@@ -686,7 +599,7 @@ def apply_tp_moe_flags(experts: Any, *, prebuild_moe_fn: Any = None) -> None:
 def reshard_layer_experts_ep_to_tp(
     mlp: Any,
     tp_rank: int,
-    g: qwen35.Qwen35Geometry,
+    g: Any,
     ex: ExecSpec,
     *,
     all_gather_fn: Any = None,
@@ -753,142 +666,15 @@ def reshard_layer_experts_ep_to_tp(
     apply_tp_moe_flags(mlp.experts, prebuild_moe_fn=prebuild_moe_fn)
 
 
-def pack_weights(
-    backbone: Any,
-    g: qwen35.Qwen35Geometry,
-    ex: ExecSpec,
-    *,
-    tp_rank: int = 0,
-    expert_placement: Any = None,
-) -> dict[str, Any]:
-    """Pack all `g.L` layers of `backbone` into the megakernel's weight dictionary.
-
-    Driven by `planner.plan(qwen35.qwen35_spec(g), ex)`:
-    - Returns all keys in `plan.w_names` (`lin_in`, `lin_out`, `att_in`, `att_out`,
-      `router`, `sh13`, `sh2`, `e13`, `e2`, `es`, `smalls`, `final_norm`).
-    - Returns `"w_flat"`: flat list of `torch.Tensor` leaves in `plan.w_names` order
-      (expanding `tuple`s for unstacked dynamic kinds `plan.dynamic_kinds`).
-    - Returns `"plan"`: the unfitted `Plan` (`planner.plan` is pure and never
-      queries device budgets).
-    """
-    spec = qwen35.qwen35_spec(g)
-    p = planner.plan(spec, ex)
-    tk = p.tk
-    in_s_width = p.smalls_layout["in_s"][1]
-
-    layers = backbone.layers
-    _need(len(layers) == g.L, f"expected {g.L} layers, got {len(layers)}")
-
-    lin_in_list: list[torch.Tensor] = []
-    lin_out_list: list[torch.Tensor] = []
-    att_in_list: list[torch.Tensor] = []
-    att_out_list: list[torch.Tensor] = []
-    router_list: list[torch.Tensor] = []
-    sh13_list: list[torch.Tensor] = []
-    sh2_list: list[torch.Tensor] = []
-    e13_list: list[torch.Tensor] = []
-    e2_list: list[torch.Tensor] = []
-    es_mk_list: list[torch.Tensor] = []
-    smalls_mk_list: list[torch.Tensor] = []
-
-    final_norm_w = _own(backbone.norm.weight.data.float().reshape(1, g.H))
-
-    for l_idx in range(g.L):
-        layer = layers[l_idx]
-        ltype = getattr(layer, "layer_type", None)
-        if ltype is None:
-            ltype = (
-                "full_attention"
-                if (l_idx % g.att_every == g.att_every - 1)
-                else "linear_attention"
-            )
-
-        if ltype == "linear_attention":
-            w_in, in_s = pack_lin_in_layer(
-                layer.linear_attn, g, ex, tk["lin_in"], in_s_width=in_s_width
-            )
-            w_out, out_s = pack_lin_out_layer(layer.linear_attn, g, ex, tk["lin_out"])
-            lin_in_list.append(w_in)
-            lin_out_list.append(w_out)
-        elif ltype == "full_attention":
-            w_in, in_s = pack_att_in_layer(
-                layer.self_attn, g, ex, tk["att_in"], in_s_width=in_s_width
-            )
-            w_out, out_s = pack_att_out_layer(layer.self_attn, g, ex, tk["att_out"])
-            att_in_list.append(w_in)
-            att_out_list.append(w_out)
-        else:
-            raise ValueError(f"Layer {l_idx}: unknown layer_type={ltype!r}")
-
-        rs = pack_router_and_shared_layer(
-            layer.mlp,
-            g=g,
-            ex=ex,
-            tp_rank=tp_rank,
-            tk_router=tk["router"],
-            tk_sh13=tk["sh13"],
-            tk_sh2=tk["sh2"],
-        )
-        router_list.append(rs["router"])
-        sh13_list.append(rs["sh13"])
-        sh2_list.append(rs["sh2"])
-
-        e13_v, e2_v, es_mk = pack_expert_views_layer(
-            layer.mlp, g=g, ex=ex, tk_e13=tk["e13"], tk_e2=tk["e2"]
-        )
-        e13_list.append(e13_v)
-        e2_list.append(e2_v)
-        es_mk_list.append(es_mk)
-
-        sm_mk = pack_smalls_layer(
-            layer,
-            g=g,
-            ex=ex,
-            smalls_layout=p.smalls_layout,
-            smalls_stride=p.smalls_width,
-            in_s=in_s,
-            out_s=out_s,
-            sh13_s=rs["sh13_s"],
-            sh2_s=rs["sh2_s"],
-            sh_gate=rs["sh_gate"],
-            layer_idx=l_idx,
-            expert_placement=expert_placement,
-        )
-        smalls_mk_list.append(sm_mk)
-
-    e13_out: Any = _stack(e13_list) if ex.stack_e else tuple(e13_list)
-    e2_out: Any = _stack(e2_list) if ex.stack_e else tuple(e2_list)
-    w_shapes = planner.weight_shapes(spec, ex, p)
-
-    def _stack_optional(xs: list[torch.Tensor], kind: str) -> torch.Tensor:
-        if xs:
-            return _stack(xs)
-        shape, _ = w_shapes[kind]
-        return torch.zeros(shape, dtype=torch.float8_e4m3fn, device=final_norm_w.device)
-
-    weights: dict[str, Any] = {
-        "lin_in": _stack_optional(lin_in_list, "lin_in"),
-        "lin_out": _stack_optional(lin_out_list, "lin_out"),
-        "att_in": _stack(att_in_list),
-        "att_out": _stack(att_out_list),
-        "router": _stack(router_list),
-        "sh13": _stack(sh13_list),
-        "sh2": _stack(sh2_list),
-        "e13": e13_out,
-        "e2": e2_out,
-        "es": _stack(es_mk_list),
-        "smalls": _stack(smalls_mk_list),
-        "final_norm": final_norm_w,
-        "plan": p,
-    }
-
-    w_flat: list[torch.Tensor] = []
-    for k in p.w_names:
-        val = weights[k]
-        if isinstance(val, (tuple, list)):
-            w_flat.extend(t.detach() for t in val)
-        else:
-            w_flat.append(val.detach())
-
-    weights["w_flat"] = w_flat
-    return weights
+__all__ = [
+    "TorchArrayOps",
+    "VLLMWeightSource",
+    "WEIGHT_FLIPPED_ATTR",
+    "apply_tp_moe_flags",
+    "extract_ecopy_layer",
+    "find_backbone",
+    "get_routed_experts",
+    "load_vllm_weights",
+    "reshard_experts_ep_to_tp_local",
+    "reshard_layer_experts_ep_to_tp",
+]

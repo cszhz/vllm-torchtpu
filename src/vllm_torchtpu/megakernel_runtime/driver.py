@@ -14,8 +14,8 @@
 """vLLM runtime driver (`MegakernelDriver`) for `megakernel`.
 
 Integrates the modular `megakernel` library with `TPUModelRunner`:
-- Extracts/packs model weights via `weight_collector.pack_weights` (preserving
-  3D expert `Parameter` base buffers when `stack_e=False`).
+- Extracts/packs model weights via `weight_collector.load_vllm_weights`
+  (preserving 3D expert `Parameter` base buffers when `stack_e=False`).
 - Binds unified KV+GDN `float8_e4m3fn` raw pools (`bind_caches`) and builds
   per-bucket ops via `exported_bridge.build_pooled_step_op` +
   `execute_pooled_step_inplace`.
@@ -79,7 +79,7 @@ from vllm_torchtpu.megakernel_runtime.exported_bridge import (
 from vllm_torchtpu.megakernel_runtime.weight_collector import (
     find_backbone,
     get_routed_experts,
-    pack_weights,
+    load_vllm_weights,
     reshard_layer_experts_ep_to_tp,
 )
 
@@ -1130,10 +1130,11 @@ class MegakernelDriver:
                 expert_placement = None
 
         t0 = time.perf_counter()
-        weights = pack_weights(
+        weights = load_vllm_weights(
+            self._model_def(),
             self.backbone,
+            self.base_exec,
             g=self.geom,
-            ex=self.base_exec,
             tp_rank=self.tp_rank,
             expert_placement=expert_placement,
         )
