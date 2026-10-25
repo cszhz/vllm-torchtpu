@@ -347,3 +347,29 @@ def test_full_shared_alias_only_when_the_copy_exists():
     assert alias("model.layers.3.attn.wo_b.weight", params) == [
         "model.layers.3.attn.wo_b.weight"
     ]
+
+
+def test_moe_block_masks_this_ranks_padded_rows(tp):
+    torch.manual_seed(2)
+    weights = dict(
+        gate=torch.randn(HIDDEN, 8),
+        routed=torch.randn(HIDDEN, HIDDEN) / HIDDEN**0.5,
+        up=torch.randn(HIDDEN, 32) / HIDDEN**0.5,
+        down=torch.randn(32, HIDDEN) / 32**0.5,
+    )
+    rows = TOKENS // TP
+    x = torch.randn(rows, HIDDEN)
+    mask = torch.zeros(rows, dtype=torch.bool)
+    mask[rows - 3 :] = True
+    moe, method = _moe(None, weights, full_shared=True, routed_scale=1.0)
+    seen = {}
+
+    def record(layer, x, router_logits, input_ids, order_after=None):
+        seen["logits"] = router_logits
+        return torch.zeros_like(x)
+
+    method.forward_sequence_parallel = record
+    moe.forward_sequence_parallel(x, torch.arange(rows), mask)
+    logits = seen["logits"]
+    assert torch.isnan(logits[mask]).all()
+    assert torch.isfinite(logits[~mask]).all()

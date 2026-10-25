@@ -180,7 +180,10 @@ class DeepseekV4MoE(nn.Module):
         return final_hidden_states.view(org_shape)
 
     def forward_sequence_parallel(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The MoE output at this rank's rows of a sequence-parallel step.
 
@@ -188,13 +191,18 @@ class DeepseekV4MoE(nn.Module):
         (TP-reduced shared) + routed_scaling_factor * (routed) -- with the
         routed experts on this rank's rows through the token-sharded fused EP
         op and the shared expert's TP partial reduce-scattered (or computed
-        unsharded on these rows).
+        unsharded on these rows). `padding_mask` marks this rank's padded rows;
+        their router logits become NaN, which the kernel leaves unrouted.
         """
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
         runner = self.experts
         routed_layer = runner.routed_experts
         router_logits, _ = self.gate(hidden_states)
+        if padding_mask is not None:
+            router_logits = torch.where(
+                padding_mask[:, None], float("nan"), router_logits
+            )
         shared = None
         if self.shared_experts_full is not None:
             shared = self.shared_experts_full(hidden_states)

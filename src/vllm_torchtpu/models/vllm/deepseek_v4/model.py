@@ -52,6 +52,7 @@ from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,  # noqa: E501
 )
@@ -205,6 +206,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
         sequence_parallel: bool = False,
+        padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Defer each post into the next pre so the pair is one kernel.
 
@@ -213,8 +215,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         still owes. The chain is opened by the layer-0 attention pre, which
         has no preceding post, and closed by the caller.
 
-        With `sequence_parallel`, every row-wise tensor here (and `input_ids`)
-        holds this rank's rows only; see sequence_parallel.py.
+        With `sequence_parallel`, every row-wise tensor here (and `input_ids`,
+        `padding_mask`) holds this rank's rows only; see sequence_parallel.py.
         """
         if residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
@@ -254,7 +256,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         x = self._norm(self.ffn_norm, x)
         if sequence_parallel:
-            x = self.ffn.forward_sequence_parallel(x, input_ids)
+            x = self.ffn.forward_sequence_parallel(x, input_ids, padding_mask)
         else:
             x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
@@ -555,10 +557,7 @@ class DeepseekV4Model(nn.Module):
         assert get_pcp_group().world_size == 1, (
             "DeepSeek-V4 sequence-parallel prefill does not support PCP"
         )
-        # Both read per-rank state laid out for the replicated rows.
-        assert not envs.TPU_MOE_SKIP_PADDED_TOKENS, (
-            "TPU_DSV4_PREFILL_SP does not support TPU_MOE_SKIP_PADDED_TOKENS"
-        )
+        # Records counts from the replicated rows' layout.
         assert not envs.MOE_EXPERT_COUNT_TAP_DIR, (
             "TPU_DSV4_PREFILL_SP does not support MOE_EXPERT_COUNT_TAP_DIR"
         )
@@ -604,8 +603,13 @@ class DeepseekV4Model(nn.Module):
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
         sequence_parallel = self._sequence_parallel_step(hidden_states)
+        padding_mask = None
         if sequence_parallel:
             rank = sp.rank_as_data(hidden_states.device)
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+                padding_mask = token_padding.local_padding_mask(hidden_states.shape[0])
+                if padding_mask is not None:
+                    padding_mask = sp.shard(padding_mask, rank)
             hidden_states = sp.shard(hidden_states, rank)
             if moe_input_ids is not None:
                 moe_input_ids = sp.shard(moe_input_ids, rank)
@@ -627,6 +631,7 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
                 sequence_parallel=sequence_parallel,
+                padding_mask=padding_mask,
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the full hc-stream state and collapse it the

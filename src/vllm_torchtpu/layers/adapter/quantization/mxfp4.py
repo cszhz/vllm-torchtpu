@@ -838,4 +838,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             expert_placement.expert_slot_table(layer),
             order_after,
             op_attr=FUSED_MOE_EP_SP_OP_ATTR,
+            # The caller masks padded rows: the rank-local mask indexes the
+            # replicated rows, not this rank's shard of them.
+            mask_padding=False,
         )

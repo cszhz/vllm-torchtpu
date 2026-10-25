@@ -436,6 +436,7 @@ def fused_moe_ep(
     expert_slot: torch.Tensor | None = None,
     order_after: torch.Tensor | None = None,
     op_attr: str = FUSED_MOE_EP_OP_ATTR,
+    mask_padding: bool = True,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -455,6 +456,8 @@ def fused_moe_ep(
     op's signature around that.
     Getting it wrong is a torch arity error at the first call, not a wrong
     answer. `op_attr` names the op on `owner`; the default is the layer's own.
+    `mask_padding=False` is for a caller that already masked the padded rows
+    of `router_logits` (the local mask indexes this rank's replicated rows).
     """
     op = getattr(owner, op_attr)
     if w1.dtype == torch.float4_e2m1fn_x2:
@@ -466,7 +469,7 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w1_scale),
             _squeeze_channel_scale_checked(w2_scale),
         )
-    if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+    if envs.TPU_MOE_SKIP_PADDED_TOKENS and mask_padding:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
     extra = tuple(
         t for t in (score_bias, hash_ids, expert_slot, order_after) if t is not None
