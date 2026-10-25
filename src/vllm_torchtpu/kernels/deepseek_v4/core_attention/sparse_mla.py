@@ -46,6 +46,9 @@ DENSE_TILE_GROUP = 4
 # fully unrolled body that the scheduler can overlap end to end; padded tiles
 # are zero rows that no token selects. Divides DENSE_MAX_WINDOW // DENSE_KV_TILE.
 DENSE_TILE_ROUNDING = 4
+# Independent token slices of a step whose MXU passes and softmax the
+# scheduler interleaves; each slice is a multiple of 8 tokens.
+DENSE_ROW_SPLIT = 2
 
 
 def cdiv(a, b):
@@ -676,7 +679,8 @@ def _dense_window_kernel(
     the gather path gives its padding entries, so it attends the same rows.
     """
     tq, num_q_heads, head_dim = q_ref.shape
-    rows = tq * num_q_heads
+    part_tokens = tq // DENSE_ROW_SPLIT
+    part_rows = part_tokens * num_q_heads
     topk, block_tokens = slots_ref.shape
     num_tiles, tile, _ = kv_ref.shape
     quarter = tile // 4
@@ -790,75 +794,99 @@ def _dense_window_kernel(
 
         lax.fori_loop(0, padded_tiles(window), tile_body, 0)
 
-    def per_row(vec_of_token):  # [num_q_heads] per token -> [rows, 1]
-        return jnp.concatenate([vec_of_token(t)[..., None] for t in range(tq)], axis=0)
-
     def lane_folds(x):  # [rows, k * 128] -> its k 128-lane slices
         return [x[:, i : i + 128] for i in range(0, x.shape[1], 128)]
 
     def attend(num_step_tiles):
+        """Attention for the step's tokens over `num_step_tiles` tiles.
+
+        The step's DENSE_ROW_SPLIT token slices ("parts") are independent.
+        Their phases are issued interleaved, so the scheduler runs one part's
+        Q @ K or P @ V on the MXU while another part's softmax runs.
+        """
         groups = [
             list(range(g, min(g + DENSE_TILE_GROUP, num_step_tiles)))
             for g in range(0, num_step_tiles, DENSE_TILE_GROUP)
         ]
-        q = q_ref[...].reshape(rows, head_dim)
-        # Row max and row sum are kept 128 lanes wide across tiles and
-        # reduced across lanes once.
-        m_ref[...] = jnp.full(m_ref.shape, jnp.finfo(jnp.float32).min)
 
-        def qk(tiles):
-            m = m_ref[...]
-            for b in tiles:
-                s = jnp.einsum(
-                    "nd,md->nm", q, kv_ref[b], preferred_element_type=jnp.float32
-                )
-                s *= sm_scale
-                mask = mask_ref[b, pl.ds(step_in_blk * tq, tq), :]
-                mask = jnp.broadcast_to(mask[:, None, :], (tq, num_q_heads, tile))
-                s = jnp.where(mask.reshape(rows, tile) != 0, s, jnp.finfo(s.dtype).min)
-                s_ref[b] = s
-                m = functools.reduce(jnp.maximum, lane_folds(s), m)
-            m_ref[...] = m
+        def tokens(part):
+            return pl.ds(part * part_tokens, part_tokens)
 
-        for tiles in groups:
-            qk(tiles)
+        def rows(part):
+            return pl.ds(part * part_rows, part_rows)
 
-        swa_m = per_row(lambda t: swa_m_ref[t, 0, :num_q_heads])
-        swa_l = per_row(lambda t: swa_l_ref[t, 0, :num_q_heads])
-        m_curr = jnp.maximum(swa_m, jnp.max(m_ref[...], axis=1, keepdims=True))
-        exp_m_diff = jnp.exp(swa_m - m_curr)
-        # m_ref now holds m_curr lane-wide, for the 128-lane folds of each tile.
-        m_ref[...] = jnp.broadcast_to(m_curr, m_ref.shape)
-        l_ref[...] = jnp.zeros(l_ref.shape, jnp.float32)
-        swa_acc = swa_acc_ref[...].reshape(rows, head_dim)
-        acc_ref[...] = exp_m_diff * swa_acc
+        def per_row(part, vec_of_token):  # [num_q_heads] per token -> [part_rows, 1]
+            first = part * part_tokens
+            vecs = [vec_of_token(first + t)[..., None] for t in range(part_tokens)]
+            return jnp.concatenate(vecs, axis=0)
 
-        def pv(tiles):
-            m = m_ref[...]
-            row_sum = l_ref[...]
-            pv_sum = None
-            for b in tiles:
-                s = s_ref[b]
-                p = jnp.concatenate([jnp.exp(x - m) for x in lane_folds(s)], axis=1)
-                row_sum = functools.reduce(jnp.add, lane_folds(p), row_sum)
-                pv = jnp.einsum(
-                    "nm,md->nd", p, kv_ref[b], preferred_element_type=jnp.float32
-                )
-                pv_sum = pv if pv_sum is None else pv_sum + pv
-            l_ref[...] = row_sum
-            acc_ref[...] += pv_sum
+        def score(part):
+            """s_ref <- masked scores; m_ref <- their row max, 128 lanes wide."""
+            r = rows(part)
+            q = q_ref[tokens(part)].reshape(part_rows, head_dim)
+            first = step_in_blk * tq + part * part_tokens
+            m = jnp.full((part_rows, 128), jnp.finfo(jnp.float32).min)
+            for tiles in groups:
+                for b in tiles:
+                    s = jnp.einsum(
+                        "nd,md->nm", q, kv_ref[b], preferred_element_type=jnp.float32
+                    )
+                    s *= sm_scale
+                    mask = mask_ref[b, pl.ds(first, part_tokens), :]
+                    mask = jnp.broadcast_to(
+                        mask[:, None, :], (part_tokens, num_q_heads, tile)
+                    )
+                    s = jnp.where(
+                        mask.reshape(part_rows, tile) != 0, s, jnp.finfo(s.dtype).min
+                    )
+                    s_ref[b, r] = s
+                    m = functools.reduce(jnp.maximum, lane_folds(s), m)
+            m_ref[r] = m
 
-        for tiles in groups:
-            pv(tiles)
+        def accumulate(part):
+            """acc_ref/l_ref <- the SWA state plus P @ V; returns the merge terms."""
+            r = rows(part)
+            swa_m = per_row(part, lambda t: swa_m_ref[t, 0, :num_q_heads])
+            m_curr = jnp.maximum(swa_m, jnp.max(m_ref[r], axis=1, keepdims=True))
+            exp_m_diff = jnp.exp(swa_m - m_curr)
+            m = jnp.broadcast_to(m_curr, (part_rows, 128))
+            swa_acc = swa_acc_ref[tokens(part)].reshape(part_rows, head_dim)
+            acc_ref[r] = exp_m_diff * swa_acc
+            row_sum = jnp.zeros((part_rows, 128), jnp.float32)
+            for tiles in groups:
+                pv_sum = None
+                for b in tiles:
+                    s = s_ref[b, r]
+                    p = jnp.concatenate([jnp.exp(x - m) for x in lane_folds(s)], axis=1)
+                    row_sum = functools.reduce(jnp.add, lane_folds(p), row_sum)
+                    pv = jnp.einsum(
+                        "nm,md->nd", p, kv_ref[b], preferred_element_type=jnp.float32
+                    )
+                    pv_sum = pv if pv_sum is None else pv_sum + pv
+                acc_ref[r] += pv_sum
+            l_ref[r] = row_sum
+            return m_curr, exp_m_diff
 
-        sinks = per_row(lambda t: attention_sinks_ref[...])
-        p_rowsum = jnp.sum(l_ref[...], axis=1, keepdims=True)
-        l_total = exp_m_diff * swa_l + p_rowsum + jnp.exp(sinks - m_curr)
-        out = (acc_ref[...] * pl.reciprocal(l_total, approx=True)).astype(o_ref.dtype)
-        token = step * tq + lax.broadcasted_iota(jnp.int32, o_ref.shape, 0)
-        o_ref[...] = jnp.where(
-            token < num_valid_ref[0], out.reshape(o_ref.shape), q_ref[...]
-        )
+        def finish(part, m_curr, exp_m_diff):
+            r = rows(part)
+            swa_l = per_row(part, lambda t: swa_l_ref[t, 0, :num_q_heads])
+            sinks = per_row(part, lambda t: attention_sinks_ref[...])
+            p_rowsum = jnp.sum(l_ref[r], axis=1, keepdims=True)
+            l_total = exp_m_diff * swa_l + p_rowsum + jnp.exp(sinks - m_curr)
+            out = (acc_ref[r] * pl.reciprocal(l_total, approx=True)).astype(o_ref.dtype)
+            out_shape = (part_tokens, *o_ref.shape[1:])
+            token = step * tq + part * part_tokens
+            token = token + lax.broadcasted_iota(jnp.int32, out_shape, 0)
+            o_ref[tokens(part)] = jnp.where(
+                token < num_valid_ref[0], out.reshape(out_shape), q_ref[tokens(part)]
+            )
+
+        parts = range(DENSE_ROW_SPLIT)
+        for part in parts:
+            score(part)
+        merges = [accumulate(part) for part in parts]
+        for part in parts:
+            finish(part, *merges[part])
 
     @pl.when(eligible & (step_in_blk == 0))
     def _prepare():
@@ -908,7 +936,8 @@ def _dense_window_attention(
     topk = topk_indices.shape[1]
     page_size = cache_kv_nope.shape[1]
     tq = DENSE_TOKENS_PER_STEP
-    assert tq % 8 == 0 and block_tokens % tq == 0, (tq, block_tokens)
+    assert tq % (8 * DENSE_ROW_SPLIT) == 0, (tq, DENSE_ROW_SPLIT)
+    assert block_tokens % tq == 0, (tq, block_tokens)
     assert DENSE_MAX_WINDOW % DENSE_KV_TILE == 0 and DENSE_KV_TILE % 128 == 0
     num_tiles = DENSE_MAX_WINDOW // DENSE_KV_TILE
     assert num_tiles % DENSE_TILE_ROUNDING == 0, (num_tiles, DENSE_TILE_ROUNDING)
