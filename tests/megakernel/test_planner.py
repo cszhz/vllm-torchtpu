@@ -11,32 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for `planner` and `vmem`."""
+"""Unit tests for `planner`."""
 
 from __future__ import annotations
 
 import dataclasses
 
-import jax.numpy as jnp
 import pytest
 from conftest import (
-    TINY_TILES,
     FakeAltMixerModule,
     FakeGeometry,
     FakeMixerModule,
     make_fake_model_spec,
 )
-from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.megakernel import module_options, planner, vmem
+from vllm_torchtpu.megakernel import module_options, planner
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.ops import F32, FP8
+from vllm_torchtpu.megakernel.ops import FP8
 from vllm_torchtpu.megakernel.spec import (
     LayerType,
     ModelSpec,
     Module,
-    ScratchReq,
     SmallField,
     SwitchSlot,
     WeightDecl,
@@ -48,7 +44,7 @@ def test_planner_is_load_bearing_single_branch(fake_ex: ExecSpec):
     ms = make_fake_model_spec(L=4, att_every=1, H=256)
     p = planner.plan(ms, fake_ex)
 
-    # Only FakeMixerModule and FakeFFNModule are in the spec -> no GDN declarations
+    # Only FakeMixerModule and FakeFFNModule are in the spec -> no FakeAltMixerModule declarations
     assert p.static_kinds == ("att_in", "att_out", "router", "sh13", "sh2")
     assert p.dynamic_kinds == ("e13", "e2")
     assert "lin_in" not in p.kinds
@@ -125,9 +121,6 @@ def test_planner_custom_module_extension(fake_ex: ExecSpec):
         def shared_widths(self, g: FakeGeometry, ex: ExecSpec) -> dict[str, int]:
             return {"acc": 512, "xb2": 512}
 
-        def scratch(self, g: FakeGeometry, ex: ExecSpec, plan) -> dict[str, object]:
-            return {"mlp_tmp": pltpu.VMEM((ex.MR, 512), F32)}
-
     g = FakeGeometry(L=2, H=256)
     ms = ModelSpec(
         name="custom_model",
@@ -140,60 +133,7 @@ def test_planner_custom_module_extension(fake_ex: ExecSpec):
     assert p.static_kinds == ("att_in", "att_out", "mlp_up", "mlp_down")
     assert p.dynamic_kinds == ()
     assert "mlp_scale" in p.smalls_layout
-
-    cp, scr = vmem.build_scratch(ms, fake_ex, p)
-    assert "mlp_tmp" in scr
-    assert "epool" not in scr and "esem" not in scr
-    assert cp.NACC >= 512 and cp.KX2 >= 512
-
-
-def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
-    """Verify `ScratchReq.phase` overlays non-persistent buffers and checks budget."""
-    ms_hybrid = make_fake_model_spec(L=4, att_every=4, H=256)
-    cp, scr = vmem.build_scratch(ms_hybrid, fake_ex)
-
-    # `branch_tmp` is declared by FakeAltMixerModule and FakeMixerModule -> overlaid!
-    assert "branch_tmp" in scr
-    assert scr["branch_tmp"].shape == (fake_ex.MR * 2, 128)
-    assert cp.phase_map["branch_tmp"] == "branch:gdn|branch:gqa"
-
-    # Overlaying two SMEM phase buffers preserves SMEM memory space
-    smem_scratch: dict[str, object] = {}
-    smem_phases: dict[str, str] = {}
-    vmem._merge_scratch(
-        smem_scratch,
-        smem_phases,
-        [
-            ScratchReq("smem_tmp", pltpu.SMEM((4,), jnp.int32), phase="branch:a"),
-            ScratchReq("smem_tmp", pltpu.SMEM((8,), jnp.int32), phase="branch:b"),
-        ],
-    )
-    assert smem_scratch["smem_tmp"].shape == (8,)
-    assert smem_scratch["smem_tmp"].memory_space == pltpu.SMEM
-
-    # Persistent name collision must raise MegakernelConfigError
-    class CollidingModule(Module):
-        name = "colliding"
-
-        def scratch(self, g, ex, plan):
-            return [ScratchReq("kbuf", pltpu.VMEM((16, 128), F32), phase="persistent")]
-
-    bad_ms = ModelSpec(
-        name="bad",
-        config=FakeGeometry(L=2, H=256),
-        layer_type=LayerType("bad_layer", slots=(FakeMixerModule(), CollidingModule())),
-    )
-    with pytest.raises(
-        MegakernelConfigError, match="Conflicting scratch buffer 'kbuf'"
-    ):
-        vmem.build_scratch(bad_ms, fake_ex)
-
-    # Exceeding tiles.vmem_mib raises MegakernelConfigError with per-buffer breakdown
-    tiny_budget_ex = dataclasses.replace(
-        fake_ex, tiles=dataclasses.replace(TINY_TILES, vmem_mib=1)
-    )
-    with pytest.raises(MegakernelConfigError, match="exceeds tiles.vmem_mib budget"):
-        vmem.build_scratch(ms_hybrid, tiny_budget_ex)
+    assert p.shared_widths["acc"] >= 512 and p.shared_widths["xb2"] >= 512
 
 
 def test_unsupported_stream_ring_is_config_error(
@@ -216,7 +156,7 @@ def test_unsupported_stream_ring_is_config_error(
 def test_plan_is_pure_and_rejects_inactive_debug_module(
     fake_ex: ExecSpec, monkeypatch: pytest.MonkeyPatch
 ):
-    """`plan` and `*_shapes` never fit VMEM or query device budgets;
+    """`plan` and `*_shapes` never fit tiles or query device budgets;
     `plan` rejects `DebugOptions.modules` targeting a module not in `model_spec`."""
     import jax
 
