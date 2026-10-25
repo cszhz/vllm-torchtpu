@@ -96,7 +96,10 @@ def install_pallas_hbm_pin() -> None:
             call = orig(kernel, out_shape, grid_spec=grid_spec, **kw)
         else:
             call = orig(kernel, out_shape, grid_spec=grid_spec, in_specs=in_specs, **kw)
-        name = kw.get("name") or getattr(kernel, "__name__", "") or ""
+        fn = kernel
+        while isinstance(fn, functools.partial):
+            fn = fn.func
+        name = kw.get("name") or getattr(fn, "__name__", "") or ""
         if skip_re is not None and skip_re.search(name):
             return call
         if only_re is not None and not only_re.search(name):
