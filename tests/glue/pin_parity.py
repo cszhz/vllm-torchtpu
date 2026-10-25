@@ -8,6 +8,7 @@ Each site runs as a chain of calls with distinct per-layer weights, the
 activation produced by a fusion just before each call, as in the decode step.
 """
 
+import os
 import sys
 
 import numpy as np
@@ -199,6 +200,9 @@ def run(out, xprof=None):
     import jax
 
     chains = _chains()
+    only = os.environ.get("PARITY_ONLY")
+    if only:
+        chains = {k: v for k, v in chains.items() if k in only.split(",")}
     res = {}
 
     def call(name):
