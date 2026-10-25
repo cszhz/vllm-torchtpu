@@ -49,6 +49,10 @@ class VllmMoERunner(MoERunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._take_over_moe_quant_config_init()
+        if envs.MOE_FUSED_EP_V2_FOLD_RESTORE == "add":
+            from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+            small_all_reduce_op.request_fold(self.routed_scaling_factor)
 
     def _take_over_moe_quant_config_init(self) -> None:
         routed_experts = self.routed_experts
@@ -147,7 +151,63 @@ class VllmMoERunner(MoERunner):
             return hidden_states
         return super()._maybe_combine(shared_output, hidden_states)
 
+    def _folds_restore(self) -> bool:
+        # The op of an armed layer was built with defer_restore, so its routed
+        # rows MUST be gathered here; see MOE_FUSED_EP_V2_FOLD_RESTORE.
+        return bool(envs.MOE_FUSED_EP_V2_FOLD_RESTORE) and fused_moe_ep_supported(
+            self._quant_method
+        )
+
+    def _maybe_reduce_shared_expert_output(
+        self, shared_output, fused_output_is_reduced=None
+    ):
+        if self._folds_restore():
+            # Summed in _apply_quant_method, and under "add" already in the
+            # routed output, which then stands alone.
+            if envs.MOE_FUSED_EP_V2_FOLD_RESTORE == "add":
+                return None
+            return shared_output
+        return super()._maybe_reduce_shared_expert_output(
+            shared_output, fused_output_is_reduced
+        )
+
+    def _maybe_apply_routed_scale_to_output(self, shared_output, fused_output):
+        if self._folds_restore() and envs.MOE_FUSED_EP_V2_FOLD_RESTORE == "add":
+            return shared_output, fused_output  # scaled in _apply_quant_method
+        return super()._maybe_apply_routed_scale_to_output(shared_output, fused_output)
+
     def _apply_quant_method(
+        self,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids=None,
+        shared_experts_overlapping=False,
+    ):
+        shared, fused = self._apply_quant_method_unfolded(
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+            shared_experts_overlapping,
+        )
+        if not self._folds_restore():
+            return shared, fused
+        if shared is None or self.moe_config.is_sequence_parallel:
+            raise NotImplementedError(
+                "MOE_FUSED_EP_V2_FOLD_RESTORE gathers the routed rows inside the "
+                "shared expert's TP all-reduce; this layer has "
+                + ("no shared expert" if shared is None else "sequence parallel MoE")
+            )
+        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+        folded = small_all_reduce_op.fold(shared, fused, self.routed_scaling_factor)
+        if envs.MOE_FUSED_EP_V2_FOLD_RESTORE == "add":
+            # forward() drops the shared output (see above) and keeps this.
+            return shared, folded
+        return folded
+
+    def _apply_quant_method_unfolded(
         self,
         hidden_states,
         router_logits,

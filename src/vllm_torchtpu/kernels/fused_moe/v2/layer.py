@@ -365,6 +365,7 @@ def fused_ep_moe_v2(
     decode_combine=False,
     pallas_restore=False,
     fused_select=False,
+    defer_restore=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -459,6 +460,11 @@ def fused_ep_moe_v2(
     the score-bias add and the row-routes mask into the top-k selector
     (router_ops.pallas_select_routed). All six apply only at or below
     SMALL_BATCH_LOCAL_TOKENS local tokens and change no value.
+
+    defer_restore skips the token replicas' gather: each member returns its
+    own slice's rows at the top of its [tokens, hidden] block (rows past the
+    slice are zero), and the caller gathers them
+    (TokenReplicaLayout.defer). Every row is unchanged.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -1014,6 +1020,8 @@ def fused_ep_moe_v2(
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        if defer_restore:
+            return token_layout.defer(combined)
         return token_layout.restore(combined, ax, me=me if pallas_restore else None)
 
     # The biases ride the same expert-axis sharding as the weights they
@@ -1096,6 +1104,7 @@ def fused_ep_moe_v2(
         decode_combine,
         pallas_restore,
         fused_select,
+        bool(defer_restore),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_DECODE_COMBINE: bool = False
     MOE_FUSED_EP_V2_PALLAS_RESTORE: bool = False
     MOE_FUSED_EP_V2_FUSED_SELECT: bool = False
+    MOE_FUSED_EP_V2_FOLD_RESTORE: str = ""
     TPU_EXPERT_PLACEMENT: str = ""
     MOE_EXPERT_COUNT_TAP_DIR: str = ""
     MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
@@ -871,6 +872,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_PALLAS_RESTORE": env_bool("MOE_FUSED_EP_V2_PALLAS_RESTORE"),
     # Fold the score-bias add and the row-routes mask into the top-k selector.
     "MOE_FUSED_EP_V2_FUSED_SELECT": env_bool("MOE_FUSED_EP_V2_FUSED_SELECT"),
+    # The fused EP op leaves its routed rows on the core that computed them,
+    # and the shared expert's TP all-reduce gathers them back in the same
+    # kernel (small_all_reduce_op.fold). "pair" returns the sum and the rows
+    # for the runner's usual scale and add; "add" also does those in the
+    # kernel. Needs TPU_SMALL_ALL_REDUCE and a shared expert on every fused EP
+    # layer. Empty: off.
+    "MOE_FUSED_EP_V2_FOLD_RESTORE": env_with_choices(
+        "MOE_FUSED_EP_V2_FOLD_RESTORE", "", ["", "pair", "add"]
+    ),
     # A JSON file naming, per MoE layer, which global experts each EP rank
     # holds and in what slot order (expert_placement.py). Empty: the
     # checkpoint's contiguous blocks.

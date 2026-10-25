@@ -77,6 +77,15 @@ class TokenReplicaLayout:
             rows, slot * self.local_rows, self.local_rows, axis=0
         )
 
+    def defer(self, rows: jax.Array) -> jax.Array:
+        """This member's rows at the top of an input-shaped block, for a
+        caller that gathers them itself (``restore`` without the gather)."""
+        if len(self.groups[0]) == 1:
+            return rows
+        # nextpow2(ceil(n / width)) <= n for width >= 2
+        assert self.local_rows <= self.input_rows
+        return jnp.pad(rows, ((0, self.input_rows - self.local_rows), (0, 0)))
+
     def restore(
         self, rows: jax.Array, axis: str, *, me: jax.Array | None = None
     ) -> jax.Array:
