@@ -92,9 +92,22 @@ def shard(x: torch.Tensor, rank: torch.Tensor) -> torch.Tensor:
     return blocks.index_select(0, rank).squeeze(0)
 
 
-def gather(x: torch.Tensor) -> torch.Tensor:
-    """All ranks' rows of a sharded tensor, in token order."""
-    return tensor_model_parallel_all_gather(x, 0)
+def select_rows(x: torch.Tensor, rank: torch.Tensor, rows) -> torch.Tensor:
+    """Rows [rank * rows, (rank + 1) * rows) of `x`, by index rather than by
+    slicing, so `x` may be longer than the step (a fixed-size buffer)."""
+    index = torch.arange(rows, dtype=torch.int32, device=x.device) + rank * rows
+    return x.index_select(0, index)
+
+
+def gather(x: torch.Tensor, num_tokens=None) -> torch.Tensor:
+    """All ranks' rows of a sharded tensor, in token order.
+
+    With `num_tokens` (the step's token dimension) the result is narrowed to
+    it, so its size is that symbol rather than tp * (num_tokens // tp) and it
+    lines up with the step's other [tokens, ...] tensors.
+    """
+    out = tensor_model_parallel_all_gather(x, 0)
+    return out if num_tokens is None else out.narrow(0, 0, num_tokens)
 
 
 def reduce_scatter(x: torch.Tensor) -> torch.Tensor:

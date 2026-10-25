@@ -239,7 +239,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self._norm(self.attn_norm, x)
         if sequence_parallel:
             x = sp.reduce_scatter(
-                self.attn(positions, sp.gather(x), reduce_output=False)
+                self.attn(
+                    positions, sp.gather(x, positions.shape[0]), reduce_output=False
+                )
             )
         else:
             x = self.attn(positions, x)
@@ -602,15 +604,15 @@ class DeepseekV4Model(nn.Module):
         if input_ids is not None and self.start_layer < self.config.num_hash_layers:
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
+        num_tokens = hidden_states.shape[0]
         sequence_parallel = self._sequence_parallel_step(hidden_states)
         padding_mask = None
         if sequence_parallel:
             rank = sp.rank_as_data(hidden_states.device)
-            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
-                padding_mask = token_padding.local_padding_mask(hidden_states.shape[0])
-                if padding_mask is not None:
-                    padding_mask = sp.shard(padding_mask, rank)
             hidden_states = sp.shard(hidden_states, rank)
+            mask_buffer = token_padding.local_padding_mask_buffer()
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS and mask_buffer is not None:
+                padding_mask = sp.select_rows(mask_buffer, rank, hidden_states.shape[0])
             if moe_input_ids is not None:
                 moe_input_ids = sp.shard(moe_input_ids, rank)
         if get_pp_group().is_first_rank:
@@ -640,7 +642,7 @@ class DeepseekV4Model(nn.Module):
                 aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
                 aux_hidden = aux_recon.mean(dim=1)
                 if sequence_parallel:
-                    aux_hidden = sp.gather(aux_hidden)
+                    aux_hidden = sp.gather(aux_hidden, num_tokens)
                 aux_hidden_states.append(aux_hidden)
                 final_aux_recon = aux_recon
 
@@ -669,7 +671,7 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
         if sequence_parallel:
-            hidden_states = sp.gather(hidden_states)
+            hidden_states = sp.gather(hidden_states, num_tokens)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

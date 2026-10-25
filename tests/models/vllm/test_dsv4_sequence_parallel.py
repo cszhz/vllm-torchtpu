@@ -63,8 +63,9 @@ class SimulatedTP:
             out = out + v.float()
         return out.to(x.dtype)
 
-    def gather(self, x):
-        return torch.cat(self.exchange(x), dim=0)
+    def gather(self, x, num_tokens=None):
+        out = torch.cat(self.exchange(x), dim=0)
+        return out if num_tokens is None else out.narrow(0, 0, num_tokens)
 
     def reduce_scatter(self, x):
         return self.all_reduce(x).chunk(self.size, dim=0)[self.rank].clone()
@@ -373,3 +374,8 @@ def test_moe_block_masks_this_ranks_padded_rows(tp):
     logits = seen["logits"]
     assert torch.isnan(logits[mask]).all()
     assert torch.isfinite(logits[~mask]).all()
+
+
+def test_select_rows_reads_this_ranks_block_of_a_longer_buffer():
+    buffer = torch.arange(100)
+    assert torch.equal(sp.select_rows(buffer, _rank(2), 8), torch.arange(16, 24))
