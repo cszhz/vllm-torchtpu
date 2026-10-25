@@ -783,6 +783,12 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         super().__init__(vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
         self._connector_metadata: TPUConnectorMetadata | None = None
+        # Scheduler side: each admitted remote load's claimed tokens and its
+        # block ids per KV cache group, kept until the load succeeds or the
+        # request finishes. See `_count_load_failures`.
+        self._load_claims: dict[str, tuple[int, tuple[list[int], ...]]] = {}
+        self._finished_load_claims: set[str] = set()
+        self._num_load_failed_tokens = 0
         use_raiden = self.force_raiden_connector or _use_raiden_connector(vllm_config)
         self.use_raiden = use_raiden
         self._stage3_fa_group_index = 0
@@ -859,6 +865,11 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
         assert self.connector_scheduler is not None
+        if num_external_tokens > 0:
+            self._load_claims[request.request_id] = (
+                num_external_tokens,
+                blocks.get_block_ids(),
+            )
         return self.connector_scheduler.update_state_after_alloc(
             request, blocks, num_external_tokens
         )
@@ -876,6 +887,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
+        self._finish_load_claim(request.request_id)
         return self.connector_scheduler.request_finished(request, block_ids)
 
     def request_finished_all_groups(
@@ -884,6 +896,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
+        self._finish_load_claim(request.request_id)
 
         if self.use_raiden and _use_raiden_stage3_transport():
             for transfer_group in self._stage3_transfer_groups:
@@ -991,18 +1004,70 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         gpu_block_pool._tpu_eviction_counter_bound = True
 
     def _take_scheduler_stats(self) -> TpuKVConnectorStats | None:
-        """Drain the HBM block evictions counted since the last step.
+        """Drain the scheduler-side counts recorded since the last step.
 
-        `bind_gpu_block_pool` does the counting; vLLM merges scheduler-side
-        connector stats into the step's stats.
+        `bind_gpu_block_pool` counts HBM block evictions and
+        `_count_load_failures` counts failed-load tokens; vLLM merges
+        scheduler-side connector stats into the step's stats.
         """
         num_evicted_blocks = getattr(self, "_num_evicted_blocks", 0)
-        if not num_evicted_blocks:
+        num_load_failed_tokens = getattr(self, "_num_load_failed_tokens", 0)
+        if not num_evicted_blocks and not num_load_failed_tokens:
             return None
-        self._num_evicted_blocks = 0
         stats = TpuKVConnectorStats()
-        stats.record_evicted_blocks(num_evicted_blocks)
+        if num_evicted_blocks:
+            stats.record_evicted_blocks(num_evicted_blocks)
+            self._num_evicted_blocks = 0
+        if num_load_failed_tokens:
+            stats.record_load_failed_tokens(num_load_failed_tokens)
+            self._num_load_failed_tokens = 0
         return stats
+
+    def _finish_load_claim(self, request_id: str) -> None:
+        # Dropped after the step's connector output is counted: a load that
+        # fails under the `fail` policy finishes its request first.
+        if request_id in self._load_claims:
+            self._finished_load_claims.add(request_id)
+
+    def _count_load_failures(self, connector_output: Any) -> None:
+        """Count the claimed external tokens whose load failed.
+
+        A whole-request failure (`failed_recving`) fails every claimed token.
+        Block-level failures (`invalid_block_ids`, which the Raiden worker
+        reports while also reporting the load as finished) fail the claimed
+        tokens in the request's invalid blocks. The scheduler recomputes or
+        fails them per `kv_load_failure_policy`.
+        """
+        claims = self._load_claims
+        failed_req_ids = connector_output.failed_recving or set()
+        invalid_block_ids = connector_output.invalid_block_ids or set()
+        if claims and (failed_req_ids or invalid_block_ids):
+            group_index = self.get_block_ids_with_load_errors_group_index()
+            groups = self._kv_cache_config.kv_cache_groups
+            for req_id, (num_tokens, block_ids) in list(claims.items()):
+                if req_id in failed_req_ids:
+                    num_failed = num_tokens
+                else:
+                    indices = (
+                        range(len(block_ids)) if group_index is None else (group_index,)
+                    )
+                    num_failed = max(
+                        (
+                            len(invalid_block_ids.intersection(block_ids[i]))
+                            * groups[i].kv_cache_spec.block_size
+                            for i in indices
+                            if i < len(block_ids)
+                        ),
+                        default=0,
+                    )
+                if num_failed:
+                    self._num_load_failed_tokens += min(num_failed, num_tokens)
+                    del claims[req_id]
+        for req_id in connector_output.finished_recving or ():
+            claims.pop(req_id, None)
+        for req_id in self._finished_load_claims:
+            claims.pop(req_id, None)
+        self._finished_load_claims.clear()
 
     @classmethod
     def build_kv_connector_stats(
@@ -1093,7 +1158,9 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         return None
 
     def update_connector_output(self, connector_output: Any) -> None:
-        """Retires scheduler-side Stage-3 dedup state on real completion."""
+        """Counts failed loads, and retires scheduler-side Stage-3 dedup state
+        on real completion."""
+        self._count_load_failures(connector_output)
         scheduler = self.connector_scheduler
         if scheduler is not None and hasattr(scheduler, "update_connector_output"):
             scheduler.update_connector_output(connector_output)
