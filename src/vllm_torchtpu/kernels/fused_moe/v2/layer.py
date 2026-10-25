@@ -879,10 +879,16 @@ def fused_ep_moe_v2(
             scales_gating_biases
         )
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
-        q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, slot_l, row_scale_l, rank_l[0, 0]
         )
+        if ep >= AGQ_MIN_EP:
+            # Quantize the rows before the routing exchange, so the activation
+            # all-gather is in flight while the exchange waits for the slowest
+            # shard. Left free, the scheduler quantizes them just before the
+            # slab scatters, behind the exchange and the routing plan.
+            q_l, packed = lax.optimization_barrier((q_l, packed))
+        q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
         exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
             ep, layout[-1]
         )
