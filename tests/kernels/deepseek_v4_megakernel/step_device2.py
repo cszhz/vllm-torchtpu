@@ -45,6 +45,9 @@ from vllm_torchtpu.kernels.deepseek_v4_megakernel import dense_config as dc  # n
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import step_kernel as SK  # noqa: E402
 
 PID = jax.process_index()
+KS_DEFAULT = __import__(
+    "vllm_torchtpu.kernels.deepseek_v4_megakernel.moe_experts", fromlist=["KS"]
+).KS
 
 
 def result(**kw):
@@ -168,6 +171,7 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     ME.COMPACT_ABLATE = frozenset(
         x for x in var.get("compact_ablate", "").split("+") if x
     )
+    ME.KS = int(var.get("ks", KS_DEFAULT))  # rows a down item adds inside fused()
     skip = tuple(x for x in var.get("skip", "").split("+") if x)
     if skip:
         scfg = dataclasses.replace(scfg, skip=skip)

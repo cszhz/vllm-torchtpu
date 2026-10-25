@@ -55,6 +55,9 @@ PACK4 = 8  # fp4 values per u32 word, consecutive contraction rows
 DN = (((1,), (0,)), ((), ()))
 MODES = ("tp", "ep")
 CT = 32  # compact tile rows (the fp8 sublane tile)
+# compact: rows of a down item added inside fused(), the rest after it; each
+# slot costs every item a tile read-modify-write (step_device2 T=64: 2 best)
+KS = 2
 # Positive control of the compact checks, read at trace time: "row" adds the
 # first gathered row of every item to the next accumulator row.
 COMPACT_FAULT = ""
@@ -345,7 +348,8 @@ class MoEBlock:
                     "w2s_vm": pltpu.VMEM((NB, 8, H), F32),
                 }
             ),
-            "acc": pltpu.VMEM((M, H), F32),
+            # compact: 8 more rows, the target of fused()'s unused scatter slots
+            "acc": pltpu.VMEM((M + 8 * cfg.compact, H), F32),
             "mid": pltpu.VMEM((cfg.item_rows, S), FP8),
             "coef": pltpu.VMEM((cfg.item_rows, 128), F32),
             "msem": pltpu.SemaphoreType.DMA((1,)),
@@ -365,6 +369,9 @@ class MoEBlock:
             "rts": pltpu.SMEM((M // 4 + 8, 128), I32),
             "xsl": pltpu.VMEM((8, 128), F32),  # row 0: x's row scales by lane
             "nsub": pltpu.SMEM((1,), I32),  # (item, chunk) steps of the layer
+            # xq as u32 words of 4 rows (pltpu.bitcast), for row gathers
+            "xq4": pltpu.VMEM((M // 4, H), U32),
+            "xg4": pltpu.VMEM((CT // 4, H), U32),  # one chunk being gathered
             # the current entry's gathered rows, chunk c at rows [c*CT, c*CT+CT)
             "xg": pltpu.VMEM((M, H), FP8),
             "gsc": pltpu.VMEM((M, 128), F32),  # their x row scales
@@ -509,6 +516,7 @@ class MoEBlock:
         )
         cp = pltpu.make_async_copy(s["rtv"], s["rts"], s["msem"].at[0])
         cp.start()
+        s["xq4"][...] = pltpu.bitcast(s["xq"][...], U32)
         xs = s["xs"][:, 0:1]
         diag = lax.broadcasted_iota(I32, (M, 128), 0) == lax.broadcasted_iota(
             I32, (M, 128), 1
@@ -520,6 +528,10 @@ class MoEBlock:
 
     def _count(self, j):
         return self.s["rts"][self.cfg.rows // 4, j]
+
+    def _row(self, p, j):
+        """The p-th row routed to local slot j."""
+        return (self.s["rts"][p >> 2, j] >> ((p & 3) * 8)) & 255
 
     def _n_chunks(self, m):
         return (self._count(self.s["jlist"][m]) + CT - 1) // CT
@@ -541,8 +553,9 @@ class MoEBlock:
         )
 
     def gather(self, m):
-        """Entry m's routed rows of xq into xg (chunk by chunk, an exact one-hot
-        fp8 matmul) with their x scales and routing weights (lane selects)."""
+        """Entry m's routed rows of xq into xg, chunk by chunk (byte copies
+        between the u32 views of 4-row groups; rows past the count are
+        zero), with their x scales and routing weights (lane selects)."""
         cfg, s = self.cfg, self.s
         if "gather" in COMPACT_ABLATE:
             return
@@ -559,7 +572,6 @@ class MoEBlock:
         wl = jnp.sum(jnp.where(diag, wcol, 0.0), axis=0, keepdims=True)
         xl = s["xsl"][0:1, :]
         lane = lax.broadcasted_iota(I32, (CT, 128), 1)
-        lane_m = lax.broadcasted_iota(I32, (CT, M), 1)
         row = lax.broadcasted_iota(I32, (CT, 1), 0)
         for c in range(cfg.n_chunks):
             rs = slice(c * CT, (c + 1) * CT)
@@ -575,46 +587,55 @@ class MoEBlock:
                 s["gw"][rs, :] = jnp.broadcast_to(
                     jnp.sum(jnp.where(sel, wl, 0.0), axis=1, keepdims=True), (CT, 128)
                 )
-                onehot = jnp.where(rows == lane_m, 1.0, 0.0).astype(FP8)
+                s["xg4"][...] = jnp.zeros(s["xg4"].shape, U32)
 
-                w = math.gcd(cfg.hidden, 1024)
-
-                def cols(k, cc):
-                    cs = pl.ds(pl.multiple_of(k * w, w), w)
-                    g = lax.dot_general(
-                        onehot, s["xq"][:, cs], DN, preferred_element_type=F32
-                    )
-                    s["xg"][rs, cs] = g.astype(FP8)
+                def copy(t, cc):
+                    r = self._row(c * CT + t, j)
+                    w = s["xq4"][pl.ds(r >> 2, 1), :]
+                    b = (w >> ((r & 3) * 8).astype(U32)) & jnp.uint32(255)
+                    q = pl.ds(t >> 2, 1)
+                    s["xg4"][q, :] = s["xg4"][q, :] | (b << ((t & 3) * 8).astype(U32))
                     return cc
 
-                lax.fori_loop(0, cfg.hidden // w, cols, 0)
+                lax.fori_loop(0, jnp.minimum(count - c * CT, CT), copy, 0)
+                s["xg"][rs, :] = pltpu.bitcast(s["xg4"][...], FP8)
 
             if c == 0:
                 one()
             else:
                 pl.when(count > c * CT)(one)
 
-    def scatter(self, i, c, valid):
-        """acc[row] += ybuf[t] * coef[t] for the rows of item i's chunk c, in
-        order, with coef still the item's stash; the expression is fused()'s
-        (a compiler that contracts it does so in both)."""
-        cfg, s = self.cfg, self.s
-        j = s["jlist"][self._entry(i)[0]]
+    def scatter_rows(self, i, c, valid):
+        """(row count, acc rows of the first KS) of item i's chunk c; unused
+        slots point at a spare row past M."""
+        cfg = self.cfg
+        j = self.s["jlist"][self._entry(i)[0]]
         n = jnp.where(valid, jnp.clip(self._count(j) - c * CT, 0, CT), 0)
         if "scatter" in COMPACT_ABLATE:
-            n = 0
+            n = jnp.int32(0)
+        rows = []
+        for t in range(KS):
+            r = self._row(c * CT + t, j)
+            if COMPACT_FAULT == "row" and t == 0:
+                r = lax.rem(r + 1, cfg.rows)
+            rows.append(jnp.where(t < n, r, cfg.rows))
+        return n, rows
+
+    def scatter(self, i, c, valid, n):
+        """acc[row] += ybuf[t] * coef[t] for rows KS.. of item i's chunk c (fused()
+        added the first KS), in order, with coef still the item's stash; the
+        expression is fused()'s."""
+        s = self.s
+        j = s["jlist"][self._entry(i)[0]]
 
         def put(t, carry):
-            p = c * CT + t
-            r = (s["rts"][p >> 2, j] >> ((p & 3) * 8)) & 255
-            if COMPACT_FAULT == "row":
-                r = jnp.where(t == 0, lax.rem(r + 1, cfg.rows), r)
+            r = self._row(c * CT + t, j)
             contrib = s["ybuf"][pl.ds(t, 1), :] * s["coef"][pl.ds(t, 1), 0:1]
             contrib = jnp.where(valid, contrib, 0.0)
             s["acc"][pl.ds(r, 1), :] = s["acc"][pl.ds(r, 1), :] + contrib
             return carry
 
-        lax.fori_loop(0, n, put, 0)
+        lax.fori_loop(KS, n, put, 0)
 
     def _copies(self):
         return self.placement is not None and self.placement[1] is not None
@@ -778,6 +799,7 @@ class MoEBlock:
         front_item=None,
         back_item=None,
         chunk_row=None,
+        back_rows=None,
     ):
         """One rolled loop running the gate-up of the slice in `front_slot`
         (returns its f32 [M, 2S] accumulator) and/or the down projection of
@@ -785,8 +807,9 @@ class MoEBlock:
         piece x its block scale) * coef), interleaved group by group so one
         item's MXU drain hides under the other's weight pushes. Per output
         column the f32 summation order is that of the unrolled body.
-        Compact: the gate-up reads xg rows [chunk_row, chunk_row + CT) and the
-        down projection's rows go to ybuf (scatter weights and adds them)."""
+        Compact: the gate-up reads xg rows [chunk_row, chunk_row + CT); the
+        down projection's rows t < KS are added into acc rows back_rows[t]
+        here (as below, per row) and all go to ybuf for scatter()."""
         cfg, s = self.cfg, self.s
         S, qb, M, wc, w2c = cfg.S, cfg.qb, cfg.item_rows, cfg.w1_cols, cfg.w2_cols
         G, bpg, cpg = self._groups()
@@ -825,8 +848,19 @@ class MoEBlock:
                         )
                         t = t * self.w2_scale(back_slot, back_item, j, cs)
                         y = t if y is None else y + t
-                    if cfg.compact:  # scatter() applies coef, as below
+                    if cfg.compact:
                         s["ybuf"][:, cs] = y
+                        # row r through its aligned 8-row tile (a dynamic row
+                        # offset costs more than a sublane select)
+                        sub = lax.broadcasted_iota(I32, (8, w2c), 0)
+                        for t, r in enumerate(back_rows):
+                            add = y[t : t + 1] * coef[t : t + 1]
+                            add = jnp.where(back_valid, add, 0.0)
+                            rt = pl.ds(pl.multiple_of((r >> 3) * 8, 8), 8)
+                            tile = s["acc"][rt, cs]
+                            s["acc"][rt, cs] = jnp.where(
+                                sub == (r & 7), tile + add, tile
+                            )
                         continue
                     contrib = y * coef
                     if back_valid is not None:  # stale-slot operands may be non-finite
@@ -909,7 +943,7 @@ class MoEBlock:
         mid_q, mid_scale = intermediate(cfg, acc, s["xs"][:, 0:1])
         return mid_q, jnp.broadcast_to(mid_scale * wcol, s["coef"].shape)
 
-    def front_compact(self, i, c, slot, back):
+    def front_compact(self, i, c, slot, back, back_rows):
         """front() on chunk c of item i's gathered rows (gather())."""
         cfg, s = self.cfg, self.s
         r0 = pl.multiple_of(c * CT, CT)
@@ -923,6 +957,7 @@ class MoEBlock:
             front_item=i,
             back_item=b_item,
             chunk_row=r0,
+            back_rows=back_rows,
         )
         mid_q, mid_scale = intermediate(cfg, acc, s["gsc"][pl.ds(r0, CT), 0:1])
         wcol = s["gw"][pl.ds(r0, CT), 0:1]
@@ -945,6 +980,8 @@ class MoEBlock:
         NB = cfg.nbuf
         if acc_init is None:
             s["acc"][...] = jnp.zeros(s["acc"].shape, F32)
+        elif callable(acc_init) and cfg.compact:
+            s["acc"][0 : cfg.rows] = acc_init()
         elif callable(acc_init):
             s["acc"][...] = acc_init()
         # else: the caller has written s["acc"] already
@@ -1016,8 +1053,9 @@ class MoEBlock:
 
             mid_q, coef = s["mid"][...], s["coef"][:, 0:1]
             back = (prev, mid_q, coef, k > 0, pi)
-            mid_coef = self.front_compact(cur, c, slot, back)
-            self.scatter(pi, pc, k > 0)
+            n_back, back_rows = self.scatter_rows(pi, pc, k > 0)
+            mid_coef = self.front_compact(cur, c, slot, back, back_rows)
+            self.scatter(pi, pc, k > 0, n_back)
             self.stash(mid_coef)
             more = c + 1 < self._n_chunks(m)
             nxt_i, nxt_c = jnp.where(more, i, i + 1), jnp.where(more, c + 1, 0)
