@@ -18,13 +18,15 @@ from typing import NamedTuple, cast
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu.kernels import vmem_budget
+
 # bf16 tiles are (16, 128); keep token blocks sublane-aligned.
 SUBLANE = 16
 
 # Explicit scoped-VMEM budget, repo convention (mla/v1, deepseek_v4 and
 # fused_moe use the same constant). Never rely on the backend default —
 # it varies by Mosaic version.
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+DEFAULT_VMEM_LIMIT_BYTES = vmem_budget.LEGACY_LIMIT_BYTES
 
 
 def round_up(x: int, multiple: int) -> int:

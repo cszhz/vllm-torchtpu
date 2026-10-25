@@ -20,6 +20,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import vmem_budget
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
@@ -205,7 +206,9 @@ def fused_post_pre_mixes(
 
     compiler_params = pltpu.CompilerParams(
         dimension_semantics=("parallel",),
-        vmem_limit_bytes=vmem_limit_bytes,
+        vmem_limit_bytes=min(
+            vmem_limit_bytes, vmem_budget.dsv4_limit_bytes(padded_tokens)
+        ),
         disable_bounds_checks=True,
     )
 

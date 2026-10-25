@@ -27,6 +27,7 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.kernels import vmem_budget
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
     _pick_partition,
@@ -50,7 +51,7 @@ except ImportError:
 MlaCase = config.MlaCase
 KVLayout = config.KVLayout
 DEFAULT_BUFFER_COUNT = config.DEFAULT_BUFFER_COUNT
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+DEFAULT_VMEM_LIMIT_BYTES = vmem_budget.dsv4_limit_bytes()
 DCP_AXIS_NAME = "dcp"
 
 cp_local_to_global = metadata.cp_local_to_global

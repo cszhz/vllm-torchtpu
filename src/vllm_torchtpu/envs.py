@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_PALLAS_SITES: str = ""
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
     TPU_PIN_OPERANDS_HBM: str = ""
+    TPU_DSV4_VMEM_LIMIT_MIB: int = 0
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -935,6 +936,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of XLA staging them into VMEM with a copy just before the call.
     # Same arithmetic, bit-identical outputs; placement only.
     "TPU_PIN_OPERANDS_HBM": env_str("TPU_PIN_OPERANDS_HBM", ""),
+    # Scoped VMEM, in MiB, the DeepSeek-V4 Pallas kernels request
+    # (kernels/vmem_budget.py); 0 keeps their 100 MiB.
+    "TPU_DSV4_VMEM_LIMIT_MIB": env_nonnegative_int("TPU_DSV4_VMEM_LIMIT_MIB", 0),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()

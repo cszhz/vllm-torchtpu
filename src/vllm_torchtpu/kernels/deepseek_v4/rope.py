@@ -21,13 +21,14 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import vmem_budget
 from vllm_torchtpu.layers.core.quantization import dtype_max
 from vllm_torchtpu.utils import largest_divisor
 
 # Native lane count; the roped channels are the tail of the last lane block.
 LANE = 128
 
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+DEFAULT_VMEM_LIMIT_BYTES = vmem_budget.LEGACY_LIMIT_BYTES
 
 
 @jax.tree_util.register_dataclass
@@ -468,7 +469,7 @@ def _rope_call(
         grid_spec=grid_spec,
         input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=vmem_budget.dsv4_limit_bytes(num_tokens),
             disable_bounds_checks=True,
         ),
         name=name,
@@ -571,7 +572,7 @@ def qnorm_rope(
         grid_spec=grid_spec,
         input_output_aliases={1: 0},  # x (after the scalar prefetch) -> out
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=vmem_budget.dsv4_limit_bytes(num_tokens),
             disable_bounds_checks=True,
         ),
         name=name,
@@ -716,7 +717,7 @@ def qkv_rope(
         ),
         input_output_aliases={1: 0, 2: 1},  # q, kv (after the scalar prefetch)
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=vmem_budget.dsv4_limit_bytes(num_tokens),
             disable_bounds_checks=True,
         ),
         name=name,
