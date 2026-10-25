@@ -751,6 +751,8 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         order_after: torch.Tensor | None = None,
+        *,
+        local_rows: bool = False,
     ) -> torch.Tensor:
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
@@ -779,5 +781,10 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 hash_topk_ids_operand(layer, input_ids),
                 expert_placement.expert_slot_table(layer),
                 order_after,
+                local_rows=local_rows,
+            )
+        if local_rows:
+            raise NotImplementedError(
+                "local_rows output needs the fused EP kernel armed on this layer"
             )
         return super()._forward_monolithic_tpu(layer, x, router_logits, input_ids)

@@ -147,6 +147,7 @@ if TYPE_CHECKING:
     TPU_DSV4_HCA_MLA_PIPELINED: bool = False
     TPU_DSV4_SWA_PADDED_LM: bool = False
     TPU_DSV4_FUSED_QKV_ROPE: bool = False
+    TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: int = 0
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = False
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
@@ -1031,6 +1032,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DSv4 attention: q RMSNorm+RoPE and kv RoPE as one kernel (one launch and
     # one cos/sin gather instead of two). Bit-identical.
     "TPU_DSV4_FUSED_QKV_ROPE": env_bool("TPU_DSV4_FUSED_QKV_ROPE"),
+    # DSv4 sequence parallelism for forwards of at least this many tokens
+    # (0 = off): the mHC residual streams are split over the TP group by
+    # token, so the seams run on 1/TP of the rows; attention and the MoE see
+    # the all-gathered rows and reduce-scatter their outputs instead of
+    # all-reducing them. Needs an EP mesh.
+    "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS", 0
+    ),
     # DSpark greedy drafting: shard the Markov head over the vocabulary and
     # exchange per-rank (max, argmax) pairs instead of reading the replicated
     # full-vocabulary weight at every draft position.

@@ -5234,8 +5234,10 @@ class TPUModelRunner(GPUModelRunner):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
         from vllm_torchtpu.layers.adapter import small_all_reduce_op
+        from vllm_torchtpu.models.vllm.deepseek_v4 import seq_parallel
 
         small_all_reduce_op.prebuild()
+        seq_parallel.prebuild()
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.adapter.linear_common import (

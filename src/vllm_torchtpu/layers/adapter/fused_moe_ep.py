@@ -116,6 +116,9 @@ _RANK_BUFFER: Any = None
 # (`Fp8Config.get_quant_method`), so this is per-layer state without a registry
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
+# Layer op -> its variant that returns only this core's slot of TP-replicated
+# rows (`fused_moe_ep(local_rows=True)`).
+_LOCAL_ROWS_OPS: dict[Any, Any] = {}
 
 
 def _squeeze_channel_scale(
@@ -188,6 +191,7 @@ def _build_op(
     pallas_restore=False,
     fused_select=False,
     defer_restore=False,
+    restore_rows=True,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -215,6 +219,7 @@ def _build_op(
         pallas_restore,
         fused_select,
         defer_restore,
+        restore_rows,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -235,6 +240,7 @@ def _build_op(
         pallas_restore=pallas_restore,
         fused_select=fused_select,
         defer_restore=defer_restore,
+        restore_rows=restore_rows,
     )
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
@@ -378,7 +384,10 @@ def _build_op(
     def _fake(x, *_args, **_kwargs):
         return torch.empty_like(x)
 
-    op.register_fake(_fake)
+    def _fake_local_rows(x, *_args, **_kwargs):
+        return x.new_empty((x.shape[0] // len(token_replica_groups[0]), x.shape[1]))
+
+    op.register_fake(_fake if restore_rows else _fake_local_rows)
     _OPS[key] = op
     return op
 
@@ -435,6 +444,8 @@ def fused_moe_ep(
     hash_ids: torch.Tensor | None = None,
     expert_slot: torch.Tensor | None = None,
     order_after: torch.Tensor | None = None,
+    *,
+    local_rows: bool = False,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -454,6 +465,11 @@ def fused_moe_ep(
     op's signature around that.
     Getting it wrong is a torch arity error at the first call, not a wrong
     answer.
+
+    With `local_rows`, the input rows are TP-replicated and the op returns only
+    this core's slot of them (see `seq_parallel`), skipping the gather that
+    would restore every row; prebuild armed that variant under
+    TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
     if w1.dtype == torch.float4_e2m1fn_x2:
@@ -467,6 +483,8 @@ def fused_moe_ep(
         )
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
+    if local_rows:
+        op = _LOCAL_ROWS_OPS[op]
     extra = tuple(
         t for t in (score_bias, hash_ids, expert_slot, order_after) if t is not None
     )
@@ -764,7 +782,7 @@ def prebuild_fused_moe_ep(
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
     has_expert_slot = placed is not None
-    op = _build_op(
+    build_args = (
         mesh,
         topk,
         renormalize,
@@ -777,6 +795,8 @@ def prebuild_fused_moe_ep(
         has_score_bias,
         routed_scale,
         has_hash_ids,
+    )
+    build_kw = dict(
         token_replica_groups=token_replica_groups,
         scales_expert_second_minor=scales_expert_second_minor,
         has_expert_slot=has_expert_slot,
@@ -789,6 +809,11 @@ def prebuild_fused_moe_ep(
         fused_select=envs.MOE_FUSED_EP_V2_FUSED_SELECT,
         defer_restore=bool(envs.MOE_FUSED_EP_V2_FOLD_RESTORE),
     )
+    op = _build_op(*build_args, **build_kw)
+    if envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS and len(token_replica_groups[0]) > 1:
+        _LOCAL_ROWS_OPS[op] = _build_op(
+            *build_args, **{**build_kw, "defer_restore": False}, restore_rows=False
+        )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "

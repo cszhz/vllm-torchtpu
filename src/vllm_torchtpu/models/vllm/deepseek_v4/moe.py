@@ -26,6 +26,8 @@ from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.models.utils import extract_layer_index
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.models.vllm.deepseek_v4 import seq_parallel
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
 
 
@@ -142,11 +144,20 @@ class DeepseekV4MoE(nn.Module):
         return self.experts.do_naive_dispatch_combine
 
     def forward(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        seq_parallel_rows: bool = False,
     ) -> torch.Tensor:
-        """Forward pass executing router gate and fused expert computation."""
+        """Forward pass executing router gate and fused expert computation.
+
+        With ``seq_parallel_rows``, ``hidden_states`` holds this core's slot of
+        the rows (see ``seq_parallel``) and so does the result.
+        """
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+        if seq_parallel_rows:
+            return self._forward_seq_parallel(hidden_states, input_ids)
 
         org_shape = hidden_states.shape
         # FusedMoEFactory gives the runner our gate, so it computes the logits.
@@ -157,3 +168,27 @@ class DeepseekV4MoE(nn.Module):
         )
 
         return final_hidden_states.view(org_shape)
+
+    def _forward_seq_parallel(
+        self, local_rows: torch.Tensor, input_ids: torch.Tensor | None
+    ) -> torch.Tensor:
+        """The runner's shared + routed sum, on this core's rows only.
+
+        The runner all-reduces the TP-partial shared expert and has the fused
+        op gather every core's routed rows back; here the shared expert is
+        reduce-scattered and the op returns this core's routed rows, which
+        are the same rows in the same slot order.
+        """
+        runner = self.experts
+        assert not envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL
+        assert self.shared_experts is not None
+        rows = seq_parallel.all_gather(local_rows)
+        router_logits, _ = runner.gate(rows)
+        routed_layer = runner.routed_experts
+        routed = routed_layer.quant_method._forward_monolithic_tpu(
+            routed_layer, rows, router_logits, input_ids, local_rows=True
+        )
+        shared = seq_parallel.reduce_scatter(self.shared_experts(rows))
+        if runner.routed_scaling_factor != 1.0:
+            routed = routed * runner.routed_scaling_factor
+        return shared + routed
