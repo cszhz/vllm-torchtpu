@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_MK_AB: bool = False
     VLLM_TPU_DSV4_MK_BUCKETS: str = "16,32,64"
     VLLM_TPU_DSV4_MK_OWN_REQS: int = 4
+    VLLM_TPU_DSV4_MK_MIN_LOCAL_ROWS: str = ""
     VLLM_TPU_DSV4_MK_MAX_CTX: int = 1048576
     VLLM_TPU_DSV4_MK_STATS_PERIOD_S: float = 60.0
     VLLM_TPU_DSV4_MK_TRACE_STEPS: int = 32
@@ -1078,6 +1079,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DSV4_MK_BUCKETS": env_str("VLLM_TPU_DSV4_MK_BUCKETS", "16,32,64"),
     # Megakernel request slots per DP rank; a rank with more goes stock.
     "VLLM_TPU_DSV4_MK_OWN_REQS": env_int("VLLM_TPU_DSV4_MK_OWN_REQS", 4),
+    # Megakernel bucket T runs only when the DP group's busiest rank holds at
+    # least `rows` of its rows: comma-separated T/rows (unlisted T: 0); else
+    # the step is stock under stock_split_rows<total>_l<busiest>.
+    "VLLM_TPU_DSV4_MK_MIN_LOCAL_ROWS": env_str("VLLM_TPU_DSV4_MK_MIN_LOCAL_ROWS", ""),
     # Longest request context (tokens incl. this step's window) a bucket
     # serves unless it names its own: sizes the attention phase's indexer
     # score / top-k scratch. The adapter picks the smallest bucket holding

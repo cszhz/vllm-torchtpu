@@ -42,7 +42,7 @@ import functools
 import json
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import jax
@@ -95,6 +95,25 @@ def parse_row_buckets(
         f"(VLLM_TPU_DSV4_MK_BUCKETS={raw!r})",
     )
     return tuple(KI.Bucket(q=q, rows=r, reqs=reqs, max_ctx=ctx_of[r]) for r in rows)
+
+
+def parse_min_local_rows(raw: str, buckets: Sequence[KI.Bucket]) -> dict[int, int]:
+    """`VLLM_TPU_DSV4_MK_MIN_LOCAL_ROWS`: comma-separated `T/rows`; bucket T
+    runs only when the busiest DP rank holds at least `rows` of its rows."""
+    rule: dict[int, int] = {}
+    for item in (x.strip() for x in raw.split(",")):
+        if not item:
+            continue
+        t, sep, r = item.partition("/")
+        _need(bool(sep), f"{item!r} is not T/rows (VLLM_TPU_DSV4_MK_MIN_LOCAL_ROWS)")
+        _need(
+            int(t) in {b.rows for b in buckets},
+            f"VLLM_TPU_DSV4_MK_MIN_LOCAL_ROWS names {t}, not a bucket of "
+            f"{[b.rows for b in buckets]}",
+        )
+        _need(int(t) not in rule, f"VLLM_TPU_DSV4_MK_MIN_LOCAL_ROWS repeats {t}")
+        rule[int(t)] = int(r)
+    return rule
 
 
 def _serves_ctx(b: KI.Bucket, ctx: int) -> bool:
@@ -273,6 +292,7 @@ class DPReduced:
     any_veto: bool
     total_rows: int  # sum of every rank's active rows
     max_ctx: int = 0  # the group's longest request context
+    max_rank_rows: int = dataclasses.field(kw_only=True)  # the busiest rank's rows
 
 
 @dataclasses.dataclass(frozen=True)
@@ -330,16 +350,24 @@ def classify_local_step(
     return LocalStep(ELIGIBLE, ELIGIBLE, rows, max_seq_len)
 
 
+def busiest_rows(local: LocalStep, reduced: DPReduced | None) -> int:
+    """The busiest DP rank's rows (TP mode: this rank's)."""
+    return local.rows if reduced is None else reduced.max_rank_rows
+
+
 def decide_step(
     local: LocalStep,
     reduced: DPReduced | None,
     buckets: Sequence[KI.Bucket],
+    min_local_rows: Mapping[int, int] | None = None,
 ) -> tuple[str, KI.Bucket | None]:
     """`(key, bucket)`; bucket None means stock. `reduced` is None in TP mode.
 
     In DP mode every input to the bucket choice is DP-reduced, so all ranks
     pick the same bucket: the smallest T holding the group's total rows that
-    serves the group's longest context.
+    serves the group's longest context. `min_local_rows` (T -> rows) sends
+    bucket T to stock unless the busiest rank holds that many rows: the stock
+    step costs what its busiest engine costs, the megakernel what T costs.
     """
     if reduced is None:
         if local.kind != ELIGIBLE:
@@ -362,6 +390,9 @@ def decide_step(
         if select_bucket(rows, buckets) is not None:
             return f"stock_ctx_rows{rows}", None
         return f"stock_total_rows{rows}", None
+    busiest = busiest_rows(local, reduced)
+    if min_local_rows and busiest < min_local_rows.get(bucket.rows, 0):
+        return f"stock_split_rows{rows}_l{busiest}", None
     return bucket.key, bucket
 
 
@@ -1246,13 +1277,17 @@ class DSv4Megakernel:
             len(weights),
             copied_bytes(runner.model, weights) / 2**30,
         )
+        buckets = parse_row_buckets(
+            envs.VLLM_TPU_DSV4_MK_BUCKETS,
+            q,
+            envs.VLLM_TPU_DSV4_MK_OWN_REQS,
+            envs.VLLM_TPU_DSV4_MK_MAX_CTX,
+        )
         mk = cls(
             spec=spec,
-            buckets=parse_row_buckets(
-                envs.VLLM_TPU_DSV4_MK_BUCKETS,
-                q,
-                envs.VLLM_TPU_DSV4_MK_OWN_REQS,
-                envs.VLLM_TPU_DSV4_MK_MAX_CTX,
+            buckets=buckets,
+            min_local_rows=parse_min_local_rows(
+                envs.VLLM_TPU_DSV4_MK_MIN_LOCAL_ROWS, buckets
             ),
             kernel=kernel,
             mesh=mesh,
@@ -1280,6 +1315,7 @@ class DSv4Megakernel:
         *,
         spec: KI.ModelSpec,
         buckets: Sequence[KI.Bucket],
+        min_local_rows: Mapping[int, int] | None = None,
         kernel: KI.KernelImpl,
         mesh: Any,
         rank: int,
@@ -1298,6 +1334,7 @@ class DSv4Megakernel:
     ) -> None:
         self.spec = spec
         self.buckets = tuple(buckets)
+        self.min_local_rows = dict(min_local_rows or {})
         self.kernel = kernel
         self.mesh = mesh
         self.rank = rank
@@ -1351,11 +1388,13 @@ class DSv4Megakernel:
             self._parity = SD.ParityProbe(rank, parity, self._compile)
         logger.info(
             "DeepSeek-V4 megakernel: mode=%s attn_tp=%d q=%d buckets=%s "
-            "aux_layers=%s %d weight operands, mesh index %d of %d, ab=%s",
+            "min_local_rows=%s aux_layers=%s %d weight operands, mesh index %d "
+            "of %d, ab=%s",
             spec.mode,
             spec.attn_tp,
             spec.q,
             [b.rows for b in self.buckets],
+            self.min_local_rows,
             spec.aux_layers,
             len(weights),
             rank,
@@ -1665,7 +1704,10 @@ class DSv4Megakernel:
         if not self.bound:
             key, bucket = "stock_unbound", None
         else:
-            key, bucket = decide_step(local, reduced, self.buckets)
+            key, bucket = decide_step(local, reduced, self.buckets, self.min_local_rows)
+            if bucket is not None and self.ab.enabled:
+                # calibrate each split of the bucket's rows on its own
+                key = f"{key}_l{busiest_rows(local, reduced)}"
         run, mix_key = self.ab.choose(key, bucket is not None)
         self.last_run = None
         parity = run and self._parity is not None and self._parity.select(self.phase)
@@ -1718,6 +1760,7 @@ class DSv4Megakernel:
                 any_veto=bool(entries[0]),
                 total_rows=int(sum(entries[2:])),
                 max_ctx=int(entries[1]),
+                max_rank_rows=int(max(entries[2:])),
             ),
         )
 

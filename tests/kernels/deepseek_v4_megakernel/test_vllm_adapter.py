@@ -151,6 +151,7 @@ def _reduced(entries, max_tokens=None, max_chunks=1, any_prefill=False):
         any_veto=bool(entries[0]),
         total_rows=sum(rows),
         max_ctx=entries[1],
+        max_rank_rows=max(rows),
     )
 
 
@@ -174,6 +175,92 @@ def test_decide_step_tp_and_dp():
     assert VA.decide_step(pre, veto, buckets) == ("stock_prefill", None)
     all_idle = _reduced([0, 0, 0, 0], max_chunks=0)
     assert VA.decide_step(idle, all_idle, buckets) == ("stock_dp_idle", None)
+
+
+# (rows per rank, buckets) -> decision before VLLM_TPU_DSV4_MK_MIN_LOCAL_ROWS
+_DEFAULT_DECISIONS = [
+    ((8, 0), "16,32,64", "mk_q7_t16"),
+    ((8, 8), "16,32,64", "mk_q7_t16"),
+    ((16, 0), "16,32,64", "mk_q7_t16"),
+    ((16, 8), "16,32,64", "mk_q7_t32"),
+    ((24, 8), "16,32,64", "mk_q7_t32"),
+    ((16, 16), "16,32,64", "mk_q7_t32"),
+    ((32, 0), "16,32,64", "mk_q7_t32"),
+    ((32, 8), "16,32,64", "mk_q7_t64"),
+    ((32, 32), "16,32,64", "mk_q7_t64"),
+    ((32, 32, 8), "16,32,64", "stock_total_rows72"),
+    ((16, 8), "16,32", "mk_q7_t32"),
+    ((24, 16), "16,32", "stock_total_rows40"),
+    ((8, 8, 8, 8), "16,32,64", "mk_q7_t32"),
+    ((16, 16, 16, 8), "16,32,64", "mk_q7_t64"),
+]
+
+
+_IDLE = VA.LocalStep(VA.IDLE, VA.IDLE)
+
+
+@pytest.mark.parametrize("zeros", [False, True])
+@pytest.mark.parametrize("rows,raw,want", _DEFAULT_DECISIONS)
+def test_min_local_rows_default_keeps_todays_decisions(rows, raw, want, zeros):
+    """The empty rule (the default) and an all-zero rule decide as before."""
+    buckets = VA.parse_row_buckets(raw, 7, reqs=4)
+    raw_rule = ",".join(f"{b.rows}/0" for b in buckets) if zeros else ""
+    rule = VA.parse_min_local_rows(raw_rule, buckets)
+    red = _reduced([0, 0, *rows])
+    for r in rows:
+        loc = VA.LocalStep(VA.ELIGIBLE, VA.ELIGIBLE, r) if r else _IDLE
+        got = VA.decide_step(loc, red, buckets, rule)
+        assert got[0] == want
+        assert got == VA.decide_step(loc, red, buckets)
+
+
+def test_min_local_rows_parses_and_refuses_bad_rules():
+    buckets = VA.parse_row_buckets("16,32,64", 7, reqs=4)
+    assert VA.parse_min_local_rows("", buckets) == {}
+    assert VA.parse_min_local_rows("16/0,32/24,64/999", buckets) == {
+        16: 0, 32: 24, 64: 999,
+    }  # fmt: skip
+    for bad in ("32", "48/8", "32/8,32/16", "32/x"):
+        with pytest.raises((VA.Unsupported, ValueError)):
+            VA.parse_min_local_rows(bad, buckets)
+
+
+def test_min_local_rows_sends_thin_splits_to_stock():
+    buckets = VA.parse_row_buckets("16,32,64", 7, reqs=4)
+    rule = VA.parse_min_local_rows("16/0,32/24,64/999", buckets)
+    ok16 = VA.LocalStep(VA.ELIGIBLE, VA.ELIGIBLE, 16)
+    ok8 = VA.LocalStep(VA.ELIGIBLE, VA.ELIGIBLE, 8)
+    ok24 = VA.LocalStep(VA.ELIGIBLE, VA.ELIGIBLE, 24)
+    # (16, 8): T=32, busiest 16 < 24 -> stock, on both ranks
+    red = _reduced([0, 0, 16, 8])
+    assert red.max_rank_rows == 16
+    for loc in (ok16, ok8):
+        got = VA.decide_step(loc, red, buckets, rule)
+        assert got == ("stock_split_rows24_l16", None)
+    # (24, 8): busiest 24 -> the megakernel
+    red = _reduced([0, 0, 24, 8])
+    for loc in (ok24, ok8):
+        assert VA.decide_step(loc, red, buckets, rule) == ("mk_q7_t32", buckets[1])
+    # (16, 16) at T=32 too, and (32, 0)
+    assert VA.decide_step(ok16, _reduced([0, 0, 16, 16]), buckets, rule)[0] == (
+        "stock_split_rows32_l16"
+    )
+    ok32 = VA.LocalStep(VA.ELIGIBLE, VA.ELIGIBLE, 32)
+    assert VA.decide_step(ok32, _reduced([0, 0, 32, 0]), buckets, rule)[1] == buckets[1]
+    # T=16 with rule 0 always runs; T=64 with 999 never
+    assert VA.decide_step(ok8, _reduced([0, 0, 8, 8]), buckets, rule)[0] == "mk_q7_t16"
+    assert VA.decide_step(ok16, _reduced([0, 0, 32, 32]), buckets, rule)[0] == (
+        "stock_split_rows64_l32"
+    )
+    # the rule never overrides an earlier stock verdict
+    veto = _reduced([1, 0, 8, 0], max_tokens=900, any_prefill=True)
+    assert VA.decide_step(ok8, veto, buckets, rule) == ("stock_dp_prefill", None)
+    big = _reduced([0, 0, 32, 32, 16])
+    assert VA.decide_step(ok16, big, buckets, rule) == ("stock_total_rows80", None)
+    # TP mode: the local rows are the busiest rank's
+    got = VA.decide_step(ok16, None, buckets, {16: 24})
+    assert got == ("stock_split_rows16_l16", None)
+    assert VA.decide_step(ok24, None, buckets, rule) == ("mk_q7_t32", buckets[1])
 
 
 def test_dp_entries_carry_each_ranks_rows_in_its_slot():
@@ -902,7 +989,7 @@ def test_dp_all_or_nothing_across_ranks(adapter, monkeypatch):
 def test_dp_ab_alternation_stays_in_lockstep(adapter):
     ranks = [adapter(rank=r, mode=VA.MODE_DP, ab=True)[0] for r in range(3)]
     seq = []
-    for tokens in ([6, 0, 3], [9, 9, 0], [6, 6, 6], [12, 3, 0], [3, 0, 0]):
+    for tokens in ([6, 0, 3], [9, 9, 0], [9, 0, 9], [12, 3, 0], [6, 3, 0]):
         locals_ = [
             VA.LocalStep(VA.ELIGIBLE, VA.ELIGIBLE, t) if t else None for t in tokens
         ]
@@ -916,14 +1003,58 @@ def test_dp_ab_alternation_stays_in_lockstep(adapter):
         ]  # fmt: skip
         assert len({(d.run, d.key, d.bucket) for d in ds}) == 1
         seq.append(ds[0].key)
-    # buckets by the group's total rows: 9, 18, 18, 15, 3 -> T 16, 32, 32, 16, 16
+    # buckets by the group's total rows: 9, 18, 18, 15, 9 -> T 16, 32, 32, 16,
+    # 16; each (bucket, busiest rank's rows) key alternates on its own
     assert seq == [
-        "mk_q3_t16",
-        "mk_q3_t32",
-        "ab_stock_q3_t32",
-        "ab_stock_q3_t16",
-        "mk_q3_t16",
+        "mk_q3_t16_l6",
+        "mk_q3_t32_l9",
+        "ab_stock_q3_t32_l9",
+        "mk_q3_t16_l12",
+        "ab_stock_q3_t16_l6",
     ]
+
+
+def test_min_local_rows_and_ab_keys_agree_on_every_rank(adapter):
+    """Four DP ranks, buckets 16/32 (q=3 -> 8 rows per request): the rule and
+    the A/B keys read only DP-reduced inputs, so every rank decides alike."""
+
+    def group(ab, rule):
+        ranks = [adapter(rank=r, mode=VA.MODE_DP, ab=ab)[0] for r in range(4)]
+        for mk in ranks:
+            mk.min_local_rows = rule
+        return ranks
+
+    def step(ranks, rows):
+        locals_ = [VA.LocalStep(VA.ELIGIBLE, VA.ELIGIBLE, r) if r else None
+                   for r in rows]  # fmt: skip
+        mine = [VA.dp_entries(loc, i, 4) for i, loc in enumerate(locals_)]
+        entries = [max(c) for c in zip(*mine)]  # the MAX all-reduce
+        ds = [
+            mk.decide_dp(loc, max_tokens=max(rows), max_chunks=1, any_prefill=False,
+                         entries=entries)
+            for mk, loc in zip(ranks, locals_)
+        ]  # fmt: skip
+        assert len({(d.run, d.key, d.bucket) for d in ds}) == 1
+        return ds[0]
+
+    ranks = group(False, {32: 16})
+    assert step(ranks, [8, 8, 8, 0]).key == "stock_split_rows24_l8"
+    assert step(ranks, [16, 8, 0, 0]).key == "mk_q3_t32"
+    assert step(ranks, [8, 8, 0, 0]).key == "mk_q3_t16"
+    ranks = group(True, {})
+    splits = ([16, 8, 0, 0], [16, 8, 0, 0], [8, 8, 8, 0], [16, 0, 8, 0], [8, 8, 8, 0])
+    keys = [step(ranks, rows).key for rows in splits]
+    assert keys == [
+        "mk_q3_t32_l16",
+        "ab_stock_q3_t32_l16",
+        "mk_q3_t32_l8",
+        "mk_q3_t32_l16",
+        "ab_stock_q3_t32_l8",
+    ]
+    ranks = group(True, {32: 16})
+    splits = ([8, 8, 8, 0], [16, 8, 0, 0], [16, 8, 0, 0])
+    keys = [step(ranks, rows).key for rows in splits]
+    assert keys == ["stock_split_rows24_l8", "mk_q3_t32_l16", "ab_stock_q3_t32_l16"]
 
 
 def test_ab_forward_times_both_paths(adapter, monkeypatch):
@@ -944,7 +1075,7 @@ def test_ab_forward_times_both_paths(adapter, monkeypatch):
         assert aux is None and hidden.shape == (8, HIDDEN)
     assert len(stock_calls) == 2
     assert len(adapter.syncs) == 8  # before and after each timed step
-    summary = mk.ab.summary_dict()["mk_q3_t16"]
+    summary = mk.ab.summary_dict()["mk_q3_t16_l3"]
     assert summary["mk"]["n"] == 2 and summary["stock"]["n"] == 2
 
 
@@ -1123,7 +1254,7 @@ def test_two_engine_vote_sums_engine_rows_and_agrees_on_every_rank():
                 red = VA.DPReduced(
                     max_tokens=6, max_chunks=1, any_prefill=False,
                     any_veto=bool(reduced[0]), total_rows=sum(reduced[2:]),
-                    max_ctx=reduced[1],
+                    max_ctx=reduced[1], max_rank_rows=max(reduced[2:]),
                 )  # fmt: skip
                 loc = per_engine[g] or VA.LocalStep(VA.IDLE, VA.IDLE)
                 decisions.append(VA.decide_step(loc, red, buckets))
