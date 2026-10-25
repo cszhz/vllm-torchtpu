@@ -49,7 +49,17 @@ def report(name, got, want):
     return exact, rel
 
 
-def moe_check(mesh, groups, rows, fmt):
+# The served small-batch options (each applies only at <= 16 local rows).
+SERVED = dict(
+    merge_exchange=True,
+    pallas_plan=True,
+    decode_combine=True,
+    pallas_restore=True,
+    fused_select=True,
+)
+
+
+def moe_check(mesh, groups, rows, fmt, served=False):
     ep = mesh.shape[AXIS]
     rank, inputs = _make_inputs(mesh, groups, rows, fmt)
 
@@ -69,6 +79,7 @@ def moe_check(mesh, groups, rows, fmt):
                 scoring_fn="sqrtsoftplus",
                 routed_scaling_factor=1.0,
                 restore_rows=restore,
+                **(SERVED if served else {}),
             )
 
         return jax.block_until_ready(jax.jit(f)(rank, *inputs))
@@ -84,7 +95,9 @@ def moe_check(mesh, groups, rows, fmt):
             for r in range(ep)
         ]
     )
-    exact, _ = report(f"moe {fmt.name} groups={groups} rows={rows}", local, want)
+    exact, _ = report(
+        f"moe {fmt.name} groups={groups} rows={rows} served={served}", local, want
+    )
     if not exact:
         FAILS.append("moe")
 
@@ -208,4 +221,6 @@ if __name__ == "__main__":
     if "moe" in what:
         for g in (tp8, tp8p, tp4):
             moe_check(mesh, g, 256, WeightFormat.FP4)
+            moe_check(mesh, g, 256, WeightFormat.FP4, served=True)
+            moe_check(mesh, g, 64, WeightFormat.FP4, served=True)
     print("RESULT", "FAIL " + ",".join(FAILS) if FAILS else "moe-local-rows exact")
