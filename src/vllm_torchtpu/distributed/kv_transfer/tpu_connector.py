@@ -2244,13 +2244,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             request.kv_transfer_params
         ):
             self._stage3_early_sends.pop(req_id, None)
+            self._stage3_finished_sends.pop(req_id, None)
             if request.status not in (
                 RequestStatus.FINISHED_LENGTH_CAPPED,
                 RequestStatus.FINISHED_STOPPED,
             ):
-                record = self._stage3_finished_sends.get(req_id)
-                if record is not None and record[0] == early_uuid:
-                    del self._stage3_finished_sends[req_id]
                 self.reqs_to_release[req_id] = early_uuid
             return False, None
         delay_free_blocks, params = self._request_finished_stage3(
@@ -2606,7 +2604,17 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         return True, params
 
     def update_connector_output(self, connector_output: Any) -> None:
-        for req_id in connector_output.finished_sending or ():
+        for req_id in set(connector_output.finished_sending or ()):
+            request = self._stage3_early_requests.get(req_id)
+            if (
+                request is not None
+                and is_remote_dspark_request(request.kv_transfer_params)
+                and not RequestStatus.is_finished(request.status)
+            ):
+                # Upstream frees blocks for every finished_sending ID. A
+                # remote drafter remains live after its Target KV transfer.
+                connector_output.finished_sending.discard(req_id)
+                continue
             self._stage3_finished_sends.pop(req_id, None)
 
     def get_finished_count(self) -> int:

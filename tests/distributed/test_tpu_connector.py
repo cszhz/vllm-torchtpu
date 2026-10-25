@@ -7321,6 +7321,7 @@ class TestPipelineParallelRegisterAhead:
             tp_size=8 if tp_source else 1,
         )
         req = _stage3_request("remote", self.PROMPT, max_tokens=16)
+        req.status = RequestStatus.RUNNING
         req.kv_transfer_params = {
             "do_remote_decode": True,
             "do_remote_prefill": False,
@@ -7337,6 +7338,13 @@ class TestPipelineParallelRegisterAhead:
             patch(f"{_MOD}.publish_remote_dspark_handoff") as publish,
         ):
             meta = self._register_ahead(producer, req)
+            output = SimpleNamespace(finished_sending={"remote", "ordinary"})
+            producer.update_connector_output(output)
+            assert output.finished_sending == {"ordinary"}
+            assert "remote" in producer._stage3_finished_sends
+            repeated = self._register_ahead(producer, req)
+            assert repeated.reqs_to_send == {}
+            req.status = RequestStatus.FINISHED_LENGTH_CAPPED
             finish = producer.request_finished(req, [100, 101])
             after_finish = producer.build_connector_meta(_scheduler_output())
 
@@ -7350,6 +7358,7 @@ class TestPipelineParallelRegisterAhead:
         assert finish == (False, None)
         assert after_finish.reqs_to_send == {}
         assert producer._stage3_early_sends == {}
+        assert producer._stage3_finished_sends == {}
 
     def test_stage3_pp_abort_releases_ahead_registration(self):
         producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
