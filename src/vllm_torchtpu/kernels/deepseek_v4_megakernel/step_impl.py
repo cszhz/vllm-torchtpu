@@ -159,6 +159,7 @@ def kernel_config(
     spec = cfg.model
     dense = dataclasses.replace(dense or WM.dense_config(spec), rows=bucket.rows)
     kw.setdefault("strict_causal", envs.TPU_STREAMIDX_STRICT_CAUSAL)
+    kw.setdefault("moe_compact", envs.VLLM_TPU_DSV4_MK_MOE_COMPACT)
     return SK.StepKernelConfig(
         dense=dense,
         q=bucket.q,

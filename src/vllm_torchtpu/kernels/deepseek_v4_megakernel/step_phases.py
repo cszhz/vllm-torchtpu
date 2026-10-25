@@ -98,6 +98,9 @@ class StepGeometry:
     # CSA indexer rows see (pos + 1) // 4 compressed rows, not pos // 4 + 1
     # (stock TPU_STREAMIDX_STRICT_CAUSAL; attn_csa.visible_rows)
     strict_causal: bool = False
+    # routed experts run only their routed rows (MoEConfig.compact) when the
+    # bucket has more than 32 rows (VLLM_TPU_DSV4_MK_MOE_COMPACT)
+    moe_compact: bool = False
 
     @property
     def heads_per_rank(self) -> int:

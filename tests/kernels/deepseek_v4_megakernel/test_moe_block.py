@@ -301,3 +301,61 @@ def test_ep_stock_layout_with_shared_expert():
     for r in range(R):
         np.testing.assert_array_equal(out[r], out[0])
     assert _rel(out[0][:T], np.asarray(model)[:T]) < MODEL_RTOL
+
+
+def _compact_layer(rows, T, compact, fault=""):
+    """EP stock-layout layer at `rows` compute rows, routing skewed so one
+    expert takes every live row (> 32) while others take 0 or 1."""
+    from vllm_torchtpu.kernels.deepseek_v4_megakernel import moe_experts
+
+    cfg = MoEConfig(R=R, mode="ep", layout="stock", rows=rows, ar_rows=rows,
+                    hidden=1024, inter=3072, n_experts=128, w1_chunks=2,
+                    ar_mode="rsag", compact=compact)  # fmt: skip
+    mesh = _mesh()
+    w1, w1s, w2, w2s = ref.synthetic_weights(jax.random.key(0), cfg)
+    wp = [
+        pack_fp4_rows(w1),
+        pad_scale_rows(w1s),
+        pack_fp4_rows(w2),
+        pad_scale_rows(w2s),
+    ]
+    x = (jax.random.normal(jax.random.key(1), (rows, 1024), F32) * 2).astype(BF16)
+    gate_w = (jax.random.normal(jax.random.key(2), (1024, 128), F32) / 32).astype(BF16)
+    bias = jax.random.normal(jax.random.key(3), (1, 128), F32) * 0.1
+    bias = bias.at[0, 21].set(5.0)  # expert 21 (rank 1) on every live row
+    rep, ep = NamedSharding(mesh, P()), NamedSharding(mesh, P("d"))
+    meta = jnp.stack([jnp.arange(R, dtype=jnp.int32), jnp.full((R,), T, jnp.int32)], 1)
+    old, moe_experts.COMPACT_FAULT = moe_experts.COMPACT_FAULT, fault
+    try:
+        out, ids, _ = moe_layer_call(mesh, cfg, interpret=INTERPRET)(
+            jax.device_put(meta, ep), jax.device_put(x, rep),
+            jax.device_put(gate_w, rep), jax.device_put(bias, rep),
+            *[jax.device_put(a, ep) for a in wp],
+        )  # fmt: skip
+    finally:
+        moe_experts.COMPACT_FAULT = old
+    sids, swts = ref.stock_route(ref.gate_logits(x, gate_w), cfg, T, bias=bias)
+    out = np.asarray(out).reshape(R, rows, -1)
+    return (
+        cfg,
+        out,
+        np.asarray(ids).reshape(R, rows, -1),
+        (x, sids, swts, (w1, w1s, w2, w2s)),
+    )
+
+
+@pytest.mark.parametrize("rows,T", [(64, 61), (128, 120)])
+def test_compact_rows_bit_identical(rows, T):
+    """Flag on vs off: every output bit equal, with an expert over 32 rows and
+    experts at 0 and 1 rows; the reference still holds; a row scattered to
+    the wrong accumulator row is caught (TPU: step_device2 compact_check)."""
+    _, off, ids_off, (x, sids, swts, w) = _compact_layer(rows, T, False)
+    cfg, on, ids_on, _ = _compact_layer(rows, T, True)
+    counts = np.bincount(np.asarray(sids)[:T].reshape(-1), minlength=129)[:128]
+    assert counts.max() > 32 and (counts == 1).any() and (counts == 0).any()
+    np.testing.assert_array_equal(ids_on, ids_off)
+    np.testing.assert_array_equal(on, off)
+    model = ref.model_moe(x, sids, swts, *w, cfg)
+    assert _rel(on[0][:T], np.asarray(model)[:T]) < MODEL_RTOL
+    _, bad, _, _ = _compact_layer(rows, T, True, fault="row")
+    assert not np.array_equal(bad, off)

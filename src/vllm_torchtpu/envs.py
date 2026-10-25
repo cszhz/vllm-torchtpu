@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_MK_TRACE_SYNC: bool = False
     VLLM_TPU_DSV4_MK_DRAFT: bool = False
     VLLM_TPU_DSV4_MK_LOGITS: bool = False
+    VLLM_TPU_DSV4_MK_MOE_COMPACT: bool = False
     VLLM_TPU_DSV4_MK_NONFINITE_STATS: bool = False
     VLLM_TPU_DSV4_MK_PARITY: int = 0
     VLLM_TPU_DSV4_MK_PARITY_EVERY: int = 1
@@ -1102,6 +1103,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # return the logits (target: in place of compute_logits; draft: in place of
     # compute_draft_logits). Sampling stays stock.
     "VLLM_TPU_DSV4_MK_LOGITS": env_bool("VLLM_TPU_DSV4_MK_LOGITS"),
+    # Megakernel routed MoE on buckets above 32 rows: each expert runs only
+    # the rows routed to it, gathered into 32-row tiles (same per-row math).
+    "VLLM_TPU_DSV4_MK_MOE_COMPACT": env_bool("VLLM_TPU_DSV4_MK_MOE_COMPACT"),
     # Megakernel diagnostics, off by default (deepseek_v4_megakernel/diag/).
     # Count the non-finite and dtype-max entries of every megakernel step's
     # hidden rows (real vs padding, warm-up vs served), logged per rank each

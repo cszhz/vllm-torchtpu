@@ -68,6 +68,8 @@ def phase_config(geom, nbuf=4):
         w1_cols=math.gcd(256, 2 * geom.moe_inter // EP_SLICES),
         item_groups=1,  # unrolled: rolled iterations expose MXU drains (+1 us/item)
         w1_chunks=1,  # unused by the stock layout (its own per-piece DMAs)
+        # at 32 rows a gathered tile would be no smaller than the full one
+        compact=geom.moe_compact and geom.T > 32,
     )
 
 
@@ -332,9 +334,12 @@ def moe_phase(
         ws = [s["sel_w"][:, k : k + 1] for k in range(cfg.topk)]
         dense, hit = rt.combine_matrix(ids, ws, E)
         s["dense"][...] = dense
+        if cfg.compact:
+            blk.build_rows(ids)
         n_items = blk.build_worklist(hit)
     for a in ABLATE:  # attribution only: "cap<k>" runs at most k items
         if a.startswith("cap"):
+            assert not cfg.compact, "cap<k> counts items, compact runs chunks"
             n_items = jnp.minimum(n_items, int(a[3:]))
 
     def seed(cs, w):

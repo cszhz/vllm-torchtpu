@@ -23,6 +23,7 @@ the reassociation band between the two.
 """
 
 import argparse
+import hashlib
 import json
 import os
 
@@ -72,6 +73,8 @@ def main():
     p.add_argument("--vocab-shard", action="store_true")
     # MoE: a random static expert permutation per layer (moe_phase placement)
     p.add_argument("--placement", action="store_true")
+    # MoE: routed experts on their routed rows only (needs --T > 32)
+    p.add_argument("--compact", action="store_true")
     a = p.parse_args()
     R, T, q, B = a.R, a.T, a.q, a.B
     perm = (
@@ -87,7 +90,7 @@ def main():
         dense=tp_cfg, q=q, B=B, aux_layers=(1, 2),
         fault="a2a_heads" if a.fault == "a2a_heads" else "", moe_impl=a.moe,
         debug_att=a.debug_att, attn_tp=a.attn_tp,
-        moe_placement="perm" if a.placement else "",
+        moe_placement="perm" if a.placement else "", moe_compact=a.compact,
     )  # fmt: skip
     w = dw.make_weights(full)
     packs = [
@@ -286,6 +289,10 @@ def main():
         "res_max_abs": float(np.max(np.abs(np.asarray(res, np.float32) - rk))),
         "layer0_stub_att_rel": att_cmp,
         **sk,
+        # equal digests across a variant that should not change arithmetic
+        # (e.g. --compact) mean bit-identical outputs
+        "res_sha256": hashlib.sha256(np.asarray(res).tobytes()).hexdigest()[:16],
+        "aux_sha256": hashlib.sha256(np.asarray(aux).tobytes()).hexdigest()[:16],
         "inactive_rows_zero": bool(
             np.all(np.asarray(res, np.float32)[GS : R - GS] == 0)
         ),

@@ -241,3 +241,75 @@ def test_moe_phase_with_expert_placement(copies):
     if not copies:  # positive control: the table must match the slot order
         wrong = call([np.roll(held, 1, axis=2)])
         assert _rel(wrong[0], want) > 100 * 1e-3
+
+
+@pytest.mark.parametrize("T,layer", [(64, 1), (64, 3), (128, 1)])
+def test_moe_phase_compact_bit_identical(T, layer):
+    """MoEConfig.compact on vs off over skewed routing (one expert on more
+    than 32 rows, experts on 0 and 1 rows), hash and noaux_tc layers: every
+    output bit equal; a row scattered to the wrong accumulator row is caught."""
+    import dataclasses
+
+    from vllm_torchtpu.kernels.deepseek_v4_megakernel import moe_experts
+
+    hidden, inter = 512, 512
+    geom = StepGeometry(R=R, T=T, q=7, B=1, layer_kinds=("hca",) * L, hidden=hidden,
+                        n_experts=128, moe_inter=inter)  # fmt: skip
+    cfg = phase_config(geom)
+    mesh = jax.make_mesh((R,), ("d",))
+    keys = jax.random.split(jax.random.key(2), L + 6)
+    weights = [ref.synthetic_weights(keys[i], cfg) for i in range(L)]
+    x = (jax.random.normal(keys[L], (T, hidden), F32) * 2).astype(BF16)
+    logits = jax.random.normal(keys[L + 1], (T, 128), F32)
+    bias = (jax.random.normal(keys[L + 2], (L, 128), F32) * 0.1).at[:, 21].set(5.0)
+    seeds = jax.random.normal(keys[L + 3], (R, T, hidden), F32) * 0.1
+    hids = jax.random.randint(keys[L + 4], (3, T, 8), 0, 128, jnp.int32)
+    hids = hids.at[:, : T // 2 + 8, 0].set(21)  # expert 21 on > 32 rows
+    valid = (np.arange(T) % 8 < 7).astype(np.int32)
+    ep, rep = NamedSharding(mesh, P("d")), NamedSharding(mesh, P())
+    ops = []
+    for w1, w1s, w2, w2s in weights:
+        ops += [pack_fp4_rows(w1), pad_scale_rows(w1s), pack_fp4_rows(w2),
+                pad_scale_rows(w2s)]  # fmt: skip
+    args = (
+        jax.device_put(jnp.arange(R, dtype=jnp.int32).reshape(R, 1), ep),
+        jax.device_put(x, rep), jax.device_put(logits, rep),
+        jax.device_put(seeds.reshape(R * T, hidden), ep),
+        jax.device_put(hids.reshape(3, T * 8), rep),
+        jax.device_put(jnp.asarray(valid), rep), jax.device_put(bias, rep),
+        *[jax.device_put(a, ep) for a in ops],
+    )  # fmt: skip
+
+    def run(compact, fault=""):
+        g = dataclasses.replace(geom, moe_compact=compact)
+        assert phase_config(g).compact == compact
+        old, moe_experts.COMPACT_FAULT = moe_experts.COMPACT_FAULT, fault
+        try:
+            out = phase_harness(mesh, g, layer, layer + 1,
+                                interpret=pltpu.InterpretParams())(*args)  # fmt: skip
+        finally:
+            moe_experts.COMPACT_FAULT = old
+        return np.asarray(out).reshape(R, T, hidden)
+
+    masked = jnp.where(jnp.asarray(valid)[:, None] > 0, logits, -jnp.inf)
+    if layer < 3:
+        sids, swts = ref.stock_route(masked, cfg, T, hash_ids=hids[layer, :, :6])
+    else:
+        sids, swts = ref.stock_route(masked, cfg, T, bias=bias[layer])
+    live = np.asarray(sids)[valid > 0].reshape(-1)
+    counts = np.bincount(live, minlength=128)[:128]
+    assert counts.max() > 32 and (counts == 1).any() and (counts == 0).any()
+    off, on = run(False), run(True)
+    np.testing.assert_array_equal(on, off)
+    rows = cfg.rows
+    x32 = jnp.zeros((rows, hidden), BF16).at[:T].set(x)
+    sids32 = jnp.full((rows, 6), 128, jnp.int32).at[:T].set(sids)
+    swts32 = jnp.zeros((rows, 6), F32).at[:T].set(swts)
+    parts = jnp.stack([
+        ref.model_partial(x32, sids32, swts32, *weights[layer], cfg, r)[:T] + seeds[r]
+        for r in range(R)
+    ])  # fmt: skip
+    want = np.asarray(reference_allreduce(parts, "hrsag", R, 8).astype(BF16))
+    assert _rel(on[0], want.astype(np.float32)) < 1e-3
+    if (T, layer) == (64, 1):
+        assert not np.array_equal(run(True, fault="row"), off)

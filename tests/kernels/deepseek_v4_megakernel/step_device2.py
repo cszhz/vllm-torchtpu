@@ -147,7 +147,7 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     scfg = SK.StepKernelConfig(
         dense=cfg, q=a.q, B=nb, moe_impl=moe_impl, moe_leased=var.get("lease", "1") == "1",
         aux_layers=tuple(x for x in (L - 3, L - 2, L - 1) if x >= 0),
-        attn_tp=int(var.get("attn_tp", 1)),
+        attn_tp=int(var.get("attn_tp", 1)), moe_compact=var.get("compact") == "1",
     )  # fmt: skip
     if moe_impl != "real":
         moe_args = []
@@ -233,8 +233,9 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     if at is not None:
         args += [*at["arrays"], at["bt_flat"], *at["weights"]]
 
-    def make(inplace):
-        step = SK.build(dataclasses.replace(scfg, cache_inplace=inplace), axis="d")
+    def make(inplace, **kw):
+        cfg_kw = dataclasses.replace(scfg, cache_inplace=inplace, **kw)
+        step = SK.build(cfg_kw, axis="d")
         n_out = 0 if inplace else n_arr
         return jax.jit(
             jax.shard_map(functools.partial(per_rank, step), mesh=mesh,
@@ -263,6 +264,27 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
                words_written_aliased=sum(changed), words_written_inplace=sum(changed_b),
                ok=sum(mism) == 0 and sum(changed) > 0 and int(diff(oa[0], ob[0])) == 0)
         del orig, ca, cb, oa, ob, na
+
+    if var.get("compact_check") == "1":
+        # MoE compact on vs off from the same inputs: bitwise, plus the
+        # moe_experts.COMPACT_FAULT positive control (stub attention: no caches)
+        from vllm_torchtpu.kernels.deepseek_v4_megakernel import moe_experts as ME
+
+        on = dataclasses.replace(scfg, moe_compact=True)
+        assert at is None and MP.phase_config(on.geometry()).compact
+        diff = jax.jit(lambda x, y: jnp.sum(x != y))
+        ref = jax.block_until_ready(make(False, moe_compact=False)(*args))
+        got = jax.block_until_ready(make(False, moe_compact=True)(*args))
+        ME.COMPACT_FAULT = "row"
+        bad = jax.block_until_ready(make(False, moe_compact=True)(*args))
+        ME.COMPACT_FAULT = ""
+        mism = [int(diff(x, y)) for x, y in zip(got[:2], ref[:2])]
+        ctrl = [int(diff(x, y)) for x, y in zip(bad[:2], ref[:2])]
+        result(check="compact_vs_off", T=T, owners=owners, res_mismatch=mism[0],
+               aux_mismatch=mism[1], fault_res_mismatch=ctrl[0],
+               finite=bool(jnp.all(jnp.isfinite(got[0].astype(jnp.float32)))),
+               ok=sum(mism) == 0 and ctrl[0] > 0)  # fmt: skip
+        del ref, got, bad
 
     if var.get("hlocheck") == "1":  # large copies XLA inserted around the kernel
         import re
