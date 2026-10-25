@@ -53,9 +53,11 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import 
     merge_kv_split_topk,
     streamindex_topk,
     streamindex_topk_dcp,
+    token_window_metadata,
 )
 
 __all__ = [
+    "token_window_metadata",
     "bref_override",
     "config",
     "kv_cache_append",

@@ -43,6 +43,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     get_kv_cache_shape,
     merge_kv_split_topk,
     streamindex_topk,
+    token_window_metadata,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
@@ -82,6 +83,8 @@ def _indexer_impl(
     verify_q_len: int | None = None,
     split_rank: jax.Array | None = None,
     kv_split: int = 1,
+    row_window: tuple | None = None,
+    row_window_tokens: int = 0,
 ) -> jax.Array:
     out_width = k if kv_split == 1 else 2 * k
     if cache_kv.shape[0] == 0:
@@ -137,6 +140,8 @@ def _indexer_impl(
             sc_topk_coop_max_rows=envs.TPU_DSV4_SC_TOPK_COOP_MAX_ROWS,
             kv_split=kv_split,
             kv_split_rank=0 if split_rank is None else split_rank[0],
+            row_window=row_window,
+            row_window_tokens=row_window_tokens,
         )
         return out if kv_split == 1 else jnp.concatenate(out, axis=1)
 
@@ -216,6 +221,46 @@ def _indexer_split_jax(
     )
 
 
+def _indexer_token_split_jax(
+    q: jax.Array,  # [T / tp, H, D]: this rank's rows
+    positions: jax.Array,  # [T / tp]
+    cos_sin_cache: jax.Array,
+    indexer_weights: jax.Array,  # [T / tp, H]
+    cache_kv: jax.Array,
+    seq_lens: jax.Array,  # whole batch metadata
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    rank: jax.Array,  # i32[1] TP rank
+    *,
+    tp: int,
+    k: int,
+    compression_ratio: int,
+    softmax_scale: float,
+    n_head: int,
+    num_kv_pages_per_block: tuple[int, int, int],
+    num_queries_per_block: tuple[int, int, int],
+    verify_q_len: int | None = None,
+) -> jax.Array:
+    """TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE: the top-k of rows
+    [rank * T/tp, (rank + 1) * T/tp) only, as the whole batch selects them."""
+    window = q.shape[0]
+    offset = (rank[0] * window).astype(jnp.int32)
+    seq_w, pages_w, cu_w, dist_w = token_window_metadata(
+        seq_lens, page_indices.flatten(), cu_q_lens, distribution, offset,
+        window=window, compression_ratio=compression_ratio,
+    )  # fmt: skip
+    return _indexer_impl(
+        q, positions, cos_sin_cache, indexer_weights, cache_kv, seq_w, pages_w,
+        cu_w, dist_w,
+        k=k, compression_ratio=compression_ratio, softmax_scale=softmax_scale,
+        n_head=n_head, num_kv_pages_per_block=num_kv_pages_per_block,
+        num_queries_per_block=num_queries_per_block, verify_q_len=verify_q_len,
+        row_window=(seq_lens, cu_q_lens, distribution, offset),
+        row_window_tokens=window * tp,
+    )  # fmt: skip
+
+
 def _merge_kv_split_a2a_jax(exchanged: jax.Array, *, k: int, kv_split: int) -> jax.Array:
     """i32[T, 2k] after the all-to-all (row block r = rank r's share of this
     rank's token block) -> the unsplit top-k of this rank's block,
@@ -285,6 +330,79 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
                 self, "indexer_split_ops", self._build_indexer_op(self.kv_split)
             )
         object.__setattr__(self.compressor, "k_cache", self.k_cache)
+        tok_above = envs.TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE
+        object.__setattr__(self, "token_split_above", 0)
+        if tok_above > 0 and envs.TPU_DSV4_SEQ_PARALLEL and tp > 1:
+            assert tok_above & (tok_above - 1) == 0, "power of 2"
+            vcfg = get_current_vllm_config()
+            spec = vcfg.speculative_config
+            rows = vcfg.scheduler_config.max_num_seqs * (
+                1 if spec is None else spec.num_speculative_tokens + 1
+            )
+            # The smallest split bucket is 2 x tok_above; its window must hold
+            # every decode/verify row (they lead the batch), or a verify window
+            # would be cut between ranks.
+            assert rows <= 2 * tok_above // tp, (
+                f"TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE={tok_above}: {rows} decode/"
+                f"verify rows do not fit a {2 * tok_above // tp}-row window"
+            )
+            object.__setattr__(self, "token_split_above", tok_above)
+            object.__setattr__(self, "token_split_op", self._build_token_split_op(tp))
+
+    def _build_token_split_op(self, tp: int):
+        mesh = get_pallas_op_mesh()
+        spec = get_current_vllm_config().speculative_config
+        verify_q_len = None if spec is None else spec.num_speculative_tokens + 1
+        op_name = (
+            f"pallas::deepseek_v4_indexer_tok_k{self.topk_tokens}"
+            f"_c{self.compress_ratio}_h{self.n_head}_tp{tp}"
+            f"{'' if verify_q_len is None else f'_vq{verify_q_len}'}"
+        )
+        if op_name in _indexer_op_cache:
+            return _indexer_op_cache[op_name]
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(
+                _indexer_token_split_jax,
+                tp=tp,
+                k=self.topk_tokens,
+                compression_ratio=self.compress_ratio,
+                softmax_scale=self.softmax_scale,
+                n_head=self.n_head,
+                num_kv_pages_per_block=envs.TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK,
+                num_queries_per_block=envs.TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK,
+                verify_q_len=verify_q_len,
+            ),
+            mesh=mesh,
+            input_partition_specs=(
+                P(None, "model", None),  # q
+                P(None),  # positions
+                P(),  # cos_sin_cache
+                P(None, "model"),  # indexer_weights
+                P(),  # cache_kv
+                P(BATCH_AXIS),  # seq_lens
+                P(BATCH_AXIS),  # page_indices
+                P(),  # cu_q_lens
+                P(),  # distribution
+                P(),  # rank
+            ),
+        )
+
+        def _fake(q, *args, **kwargs):
+            return torch.empty(
+                (q.shape[0], self.topk_tokens), dtype=torch.int32, device=q.device
+            )
+
+        op.register_fake(_fake)
+        _indexer_op_cache[op_name] = op
+        return op
+
+    def _token_split_active(self, num_tokens: int) -> bool:
+        if not self.token_split_above or num_tokens <= self.token_split_above:
+            return False
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import SP_GATE
+
+        return not SP_GATE["replicated"] and num_tokens % get_tp_group().world_size == 0
 
     def _build_indexer_op(self, kv_split: int = 1):
         mesh = get_pallas_op_mesh()
@@ -380,6 +498,18 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         rotary_emb: nn.Module,
         slot_mapping: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        num_tokens = query.shape[0]
+        token_split = self._token_split_active(num_tokens)
+        if token_split:
+            # This rank's contiguous 1/tp of the rows (rank as device data, so
+            # every TP rank traces one graph); the projection shrinks with them.
+            group = get_tp_group()
+            tp = group.world_size
+            rank = tp_rank_as_data(group, query.device)
+            query, indexer_weights, q_positions = (
+                t.reshape(tp, -1, *t.shape[1:]).index_select(0, rank)[0]
+                for t in (query, indexer_weights, positions)
+            )
         q, _ = self.wq_b(query)
         q = q.view(-1, self.n_head, self.head_dim)
 
@@ -391,7 +521,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         kv_cache = getattr(self.k_cache, "kv_cache", None)
         if kv_cache is None or kv_cache.numel() == 0:
             return torch.zeros(
-                (q.shape[0], self.topk_tokens), dtype=torch.int32, device=q.device
+                (num_tokens, self.topk_tokens), dtype=torch.int32, device=q.device
             )
 
         # The TPU runner stores its own AttentionMetadata, not the vLLM base class.
@@ -426,6 +556,13 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             idx_q_start_loc,
             idx_req_dist,
         )
+        if token_split:
+            from vllm_torchtpu.models.vllm.deepseek_v4.seq_parallel import (
+                build_sp_ops,
+            )
+
+            local = self.token_split_op(q, q_positions, *args[2:], rank)
+            return build_sp_ops()["ag"](local).view(num_tokens, -1)
         if (
             self.kv_split == 1
             or q.shape[0] < self.kv_split_min_tokens

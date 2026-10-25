@@ -175,8 +175,10 @@ if TYPE_CHECKING:
     TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS: int = 512
     TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
     TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
+    TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4: int = 0
     TPU_DSV4_SEQ_PARALLEL: bool = False
     TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: int = 0
+    TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE: int = 0
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = True
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = True
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
@@ -1214,6 +1216,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS": env_int(
         "TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS", 32
     ),
+    # At more than 16 local heads (TP4): route a sequence to union-dense only
+    # when its compressed KV (seq_len // 4, + 1) is <= this many rows; longer
+    # sequences stay on the sparse path, and a step with none routed skips the
+    # SparseCore plan. At TP4 the dense pass costs ~heads x union, so it pays
+    # only at short contexts (-17% @22.5k, -7% @51k, 0% @100k tokens per call),
+    # and a step that falls back pays the plan for nothing. 0 = no limit.
+    "TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4": env_int(
+        "TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4", 0
+    ),
     # DeepSeek-V4 sequence parallelism over the TP group: the mHC residual
     # stream, the mHC seams and the MoE (router, fused EP, a replicated shared
     # expert) run on this rank's 1/tp of the tokens. Attention all-gathers its
@@ -1225,6 +1236,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # attention, the TP-sharded shared expert, the fused EP's TP-replica op --
     # and only T > it run sequence parallel. 0: every bucket sequence parallel.
     "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS": env_int("TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS", 0),
+    # Under TPU_DSV4_SEQ_PARALLEL (sequence-parallel side of the gate): for
+    # T > this (a power of 2), each TP rank scores and selects the CSA indexer
+    # top-k of its own contiguous T / tp rows only (the whole batch's metadata
+    # and row lengths, so the same selection), and the indices are all-gathered.
+    # Needs max_num_seqs x (spec + 1) <= 2 x this / tp (no verify window cut).
+    # 0 = off.
+    "TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE": env_int(
+        "TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE", 0
+    ),
     # DSpark greedy drafting: shard the Markov head over the vocabulary and
     # exchange per-rank (max, argmax) pairs instead of reading the replicated
     # full-vocabulary weight at every draft position.
