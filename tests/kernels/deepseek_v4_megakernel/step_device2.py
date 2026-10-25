@@ -300,10 +300,18 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
         mism = [int(diff(x, y)) for x, y in zip(ca, cb)]
         written = sum(int(diff(x, y)) for x, y in zip(ca, orig))
         res_m, aux_m = int(diff(oa[0], ob[0])), int(diff(oa[1], ob[1]))
+        rel = jax.jit(lambda x, y: jnp.max(jnp.abs(x.astype(jnp.float32) - y))
+                      / jnp.maximum(jnp.max(jnp.abs(y.astype(jnp.float32))), 1e-30))
+        # ranks of one attention group whose residual differs from the group's first rank
+        # (the split mixes the group's selections: equal to the unsplit one only if equal)
+        div = jax.jit(lambda x: jnp.sum(
+            x.reshape(R // GS, GS, -1) != x.reshape(R // GS, GS, -1)[:, :1]))
         result(
             check="pipeline_off_vs_on", var=var, owners=owners, T=T,
             res_mismatch=res_m, aux_mismatch=aux_m, cache_mismatch=sum(mism),
             cache_arrays_differing=sum(m > 0 for m in mism), words_written=written,
+            res_max_rel=float(rel(ob[0], oa[0])), aux_max_rel=float(rel(ob[1], oa[1])),
+            ref_group_rank_res_diff=int(div(oa[0])), new_group_rank_res_diff=int(div(ob[0])),
             finite=bool(np.isfinite(np.asarray(oa[0].addressable_shards[0].data,
                                                np.float32)).all()),
             bitexact=sum(mism) == 0 and res_m == 0 and aux_m == 0 and written > 0,

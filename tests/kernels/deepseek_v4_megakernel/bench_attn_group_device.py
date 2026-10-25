@@ -55,6 +55,8 @@ def main():
     ap.add_argument("--idx_corr", default="0.0")
     ap.add_argument("--kinds", default="csa")
     ap.add_argument("--ablate", default="", help="comma list of ablation sets joined by +")
+    ap.add_argument("--pipeline", action="store_true", help="StepGeometry.attn_pipeline")
+    ap.add_argument("--check-only", action="store_true", help="no timing")
     a = ap.parse_args()
     print(jax.devices(), flush=True)
     for ctx in map(int, a.ctx.split(",")):
@@ -66,7 +68,8 @@ def main():
                                for c in (a.idx_corr.split(",") if k == "csa" else ["0"])]:
                 layer = 0 if kind == "hca" else 1
                 inp = H.make_inputs(rng, ls, kind, idx_corr=corr)
-                g, ops = H.group_call(ls, kind, layer, inp, interpret=False, served_dtypes=True)
+                g, ops = H.group_call(ls, kind, layer, inp, interpret=False, served_dtypes=True,
+                                      pipeline=a.pipeline)
                 res = g(*ops)
                 n_c = len(ls.arrays)
                 ok = True
@@ -80,6 +83,10 @@ def main():
                     ok &= same_c and same_o
                     if not (same_c and same_o):
                         print(f"MISMATCH rank {jj} caches={same_c} out={same_o}", flush=True)
+                if a.check_only:
+                    print(f"RESULT kind=attn_group_check layer={kind} R={R} ctx={ctx} corr={corr} "
+                          f"pipeline={a.pipeline} bitexact_vs_single={ok}", flush=True)
+                    continue
                 g11, ops11 = H.group_call(ls, kind, layer, inp, interpret=False, served_dtypes=True,
                                           reps=NREP)
                 t1, t11 = np.median(timed(g, ops)), np.median(timed(g11, ops11))
