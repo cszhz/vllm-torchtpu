@@ -39,9 +39,13 @@ DENSE_MAX_WINDOW = 2048
 DENSE_KV_TILE = 256
 # Query tokens per grid step: the MXU sees tokens x heads rows.
 DENSE_TOKENS_PER_STEP = 16
-# Score tiles per rolled loop step: the scheduler overlaps them and the MXU
-# accumulates their P @ V in place.
+# Score tiles whose P @ V the MXU accumulates in place before adding it to
+# the accumulator.
 DENSE_TILE_GROUP = 4
+# A step's tile count is padded to a multiple of this, so each step runs one
+# fully unrolled body that the scheduler can overlap end to end; padded tiles
+# are zero rows that no token selects. Divides DENSE_MAX_WINDOW // DENSE_KV_TILE.
+DENSE_TILE_ROUNDING = 4
 
 
 def cdiv(a, b):
@@ -630,26 +634,6 @@ def _dense_window_position(c: jax.Array) -> jax.Array:
     return jnp.where(c < 0, -1, slot)
 
 
-def _grouped_loop(n, group_body, group):
-    """`group_body(indices)` over [0, n) in groups of `group` (last one shorter).
-
-    One group's indices are a static-length list, so the scheduler overlaps
-    their work and the body keeps its accumulators in registers across them.
-    """
-
-    def rolled(i, carry):
-        group_body([i * group + u for u in range(group)])
-        return carry
-
-    num_full = n // group
-    lax.fori_loop(0, num_full, rolled, 0)
-    for rest in range(1, group):
-
-        @pl.when(n - num_full * group == rest)
-        def _():
-            group_body([num_full * group + u for u in range(rest)])
-
-
 def _dense_window_kernel(
     # Prefetch
     blk_window_ref,  # [num_blocks] window rows of an eligible block, else -1
@@ -708,6 +692,9 @@ def _dense_window_kernel(
     eligible = window >= 0
     nope_win_ref = nope_win_x2_ref.at[blk % 2]
     rope_win_ref = rope_win_x2_ref.at[blk % 2]
+
+    def padded_tiles(rows_used):
+        return align_to(jnp.maximum(cdiv(rows_used, tile), 1), DENSE_TILE_ROUNDING)
 
     def page_copies(b, k):
         page = blk_pages_ref[b * max_pages + k]
@@ -775,7 +762,7 @@ def _dense_window_kernel(
                 kv_ref[b, pl.ds(g * quarter, quarter), :] = kv
             return carry
 
-        lax.fori_loop(0, cdiv(window, tile), tile_body, 0)
+        lax.fori_loop(0, padded_tiles(window), tile_body, 0)
 
     def build_mask():
         """Top-k slots -> mask_ref[b][t, slot] = 1 iff token t selected it."""
@@ -801,7 +788,7 @@ def _dense_window_kernel(
             mask_ref[b] = bits.T
             return carry
 
-        lax.fori_loop(0, cdiv(window, tile), tile_body, 0)
+        lax.fori_loop(0, padded_tiles(window), tile_body, 0)
 
     def per_row(vec_of_token):  # [num_q_heads] per token -> [rows, 1]
         return jnp.concatenate([vec_of_token(t)[..., None] for t in range(tq)], axis=0)
@@ -809,8 +796,11 @@ def _dense_window_kernel(
     def lane_folds(x):  # [rows, k * 128] -> its k 128-lane slices
         return [x[:, i : i + 128] for i in range(0, x.shape[1], 128)]
 
-    def attend():
-        num_step_tiles = cdiv(step_window_ref[step], tile)
+    def attend(num_step_tiles):
+        groups = [
+            list(range(g, min(g + DENSE_TILE_GROUP, num_step_tiles)))
+            for g in range(0, num_step_tiles, DENSE_TILE_GROUP)
+        ]
         q = q_ref[...].reshape(rows, head_dim)
         # Row max and row sum are kept 128 lanes wide across tiles and
         # reduced across lanes once.
@@ -830,7 +820,8 @@ def _dense_window_kernel(
                 m = functools.reduce(jnp.maximum, lane_folds(s), m)
             m_ref[...] = m
 
-        _grouped_loop(num_step_tiles, qk, DENSE_TILE_GROUP)
+        for tiles in groups:
+            qk(tiles)
 
         swa_m = per_row(lambda t: swa_m_ref[t, 0, :num_q_heads])
         swa_l = per_row(lambda t: swa_l_ref[t, 0, :num_q_heads])
@@ -857,7 +848,8 @@ def _dense_window_kernel(
             l_ref[...] = row_sum
             acc_ref[...] += pv_sum
 
-        _grouped_loop(num_step_tiles, pv, DENSE_TILE_GROUP)
+        for tiles in groups:
+            pv(tiles)
 
         sinks = per_row(lambda t: attention_sinks_ref[...])
         p_rowsum = jnp.sum(l_ref[...], axis=1, keepdims=True)
@@ -874,9 +866,12 @@ def _dense_window_kernel(
         dequant_window()
         build_mask()
 
-    @pl.when(eligible)
-    def _attend():
-        attend()
+    step_tiles = padded_tiles(step_window_ref[step])
+    for n in range(DENSE_TILE_ROUNDING, num_tiles + 1, DENSE_TILE_ROUNDING):
+
+        @pl.when(eligible & (step_tiles == n))
+        def _attend():
+            attend(n)
 
     # No block is eligible: every step maps to block 0, so keep it unchanged.
     @pl.when(jnp.logical_not(eligible) & (step_map_ref[step] == step))
@@ -915,6 +910,8 @@ def _dense_window_attention(
     tq = DENSE_TOKENS_PER_STEP
     assert tq % 8 == 0 and block_tokens % tq == 0, (tq, block_tokens)
     assert DENSE_MAX_WINDOW % DENSE_KV_TILE == 0 and DENSE_KV_TILE % 128 == 0
+    num_tiles = DENSE_MAX_WINDOW // DENSE_KV_TILE
+    assert num_tiles % DENSE_TILE_ROUNDING == 0, (num_tiles, DENSE_TILE_ROUNDING)
     num_blocks = num_tokens // block_tokens
     steps_per_block = block_tokens // tq
     num_steps = num_blocks * steps_per_block
@@ -970,7 +967,6 @@ def _dense_window_attention(
         lse_spec,  # swa_l
         lse_spec,  # swa_m
     ]
-    num_tiles = DENSE_MAX_WINDOW // DENSE_KV_TILE
     rows = tq * num_q_heads
     scratch_shapes = [
         pltpu.VMEM((2, max_pages * page_size, 128), jnp.int32),
