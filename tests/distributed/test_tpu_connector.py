@@ -6995,6 +6995,30 @@ def test_kimi_manifest_rejects_the_block_major_pool():
         worker._admit_raiden_hybrid_kv_cache(runner)
 
 
+@pytest.mark.parametrize("role", ["", "producer"])
+def test_remote_dspark_admission_keeps_draft_pools_local(monkeypatch, role):
+    from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+
+    worker, runner = _block_major_admission_worker()
+    target_caches = dict(worker.named_kv_caches)
+    draft_name = "draft_model.layers.0.self_attn.attn"
+    draft_cache = next(iter(target_caches.values()))
+    worker.named_kv_caches[draft_name] = draft_cache
+    runner.drafter = object.__new__(DFlashProposer)
+    runner.drafter._draft_attn_layer_names = {draft_name}
+    monkeypatch.setattr(tpu_envs, "VLLM_TPU_REMOTE_DSPARK_ROLE", role)
+
+    def check_manifest(**kwargs):
+        expected = target_caches if role == "producer" else worker.named_kv_caches
+        assert kwargs["named_kv_caches"] == expected
+        raise _ManifestBuilt
+
+    monkeypatch.setattr(rpm, "build_qwen35_pool_manifest", check_manifest)
+    with pytest.raises(_ManifestBuilt):
+        worker._admit_raiden_hybrid_kv_cache(runner)
+    assert worker.named_kv_caches[draft_name] is draft_cache
+
+
 def test_seq_on_lane_manifest_rejects_the_block_major_pool():
     worker, runner = _block_major_admission_worker()
     with (

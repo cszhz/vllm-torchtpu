@@ -2903,6 +2903,26 @@ class TPURaidenConnectorWorker:
                 "Raiden pool admission requires "
                 "register_kv_caches() before register_runner()"
             )
+        if tpu_envs.VLLM_TPU_REMOTE_DSPARK_ROLE == "producer":
+            from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+
+            drafter = runner.drafter
+            assert isinstance(drafter, DFlashProposer)
+            draft_layers = drafter._draft_attn_layer_names
+            assert draft_layers is not None
+            # The consumer has no draft pools. Keep these caches bound to the
+            # producer's model, but exclude them from Target KV admission.
+            named_kv_caches = {
+                name: cache
+                for name, cache in named_kv_caches.items()
+                if name not in draft_layers
+            }
+            logger.info(
+                "Remote DSpark Target KV admission: target_pools=%d "
+                "local_draft_layers=%s",
+                len(named_kv_caches),
+                sorted(draft_layers),
+            )
         assert runner.kv_cache_config is not None
         kv_cache_groups = tuple(runner.kv_cache_config.kv_cache_groups or ())
         raw_tensors = tuple(runner.kv_cache_raw_tensors or ())
