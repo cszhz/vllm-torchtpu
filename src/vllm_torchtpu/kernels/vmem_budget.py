@@ -24,7 +24,18 @@ DECODE_MAX_TOKENS = 32
 def dsv4_limit_bytes(num_tokens: int | None = None) -> int:
     """The request for a kernel whose blocks are bounded whatever the token count
     (num_tokens=None), or for one at `num_tokens` tokens."""
-    mib = envs.TPU_DSV4_VMEM_LIMIT_MIB
+    return _capped(envs.TPU_DSV4_VMEM_LIMIT_MIB, num_tokens)
+
+
+def dsv4_attn_limit_bytes() -> int:
+    """The request for the attention / indexer kernels (TPU_DSV4_ATTN_VMEM_LIMIT_MIB):
+    at 24 MiB the SWA decode kernel's scoped region no longer fits beside what
+    XLA then keeps in VMEM (compile-time OOM at the T24 bucket), so they have a
+    knob of their own."""
+    return _capped(envs.TPU_DSV4_ATTN_VMEM_LIMIT_MIB, None)
+
+
+def _capped(mib: int, num_tokens: int | None) -> int:
     if not mib or (num_tokens is not None and num_tokens > DECODE_MAX_TOKENS):
         return LEGACY_LIMIT_BYTES
     return mib * 1024 * 1024

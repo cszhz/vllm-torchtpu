@@ -24,7 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import vmem_budget
 
-DEFAULT_VMEM_LIMIT_BYTES = vmem_budget.dsv4_limit_bytes()
+DEFAULT_VMEM_LIMIT_BYTES = vmem_budget.dsv4_attn_limit_bytes()
 
 
 def cdiv(a, b):
