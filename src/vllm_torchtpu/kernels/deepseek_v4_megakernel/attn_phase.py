@@ -334,8 +334,10 @@ def scratch_spec(d: Dims) -> list:
 # Per-call buffers that may live in the skeleton's pool lease (StepGeometry.lease_bytes),
 # largest first, taken greedily while they fit; each validated on device on a lease view
 # (j-c1b81591, j-90c634fa). Excluded: the 40-row indexer page ring (wrong scores on a view)
-# and the rows-mode staging (wrong results).
-LEASE_ORDER = ("scores", "nope_buf", ("tk_scr", 3), "acc", ("un_scr", 4), ("un_scr", 0), "rope_buf")
+# and the rows-mode staging (wrong results). The group split's score copy (same layout as
+# "scores") comes last: it exists only with the split, and the unsplit plan stays as it was.
+LEASE_ORDER = ("scores", "nope_buf", ("tk_scr", 3), "acc", ("un_scr", 4), ("un_scr", 0), "rope_buf",
+               "g_scv")
 
 
 def lease_plan(d: Dims, lease_bytes: int) -> dict:
@@ -343,6 +345,8 @@ def lease_plan(d: Dims, lease_bytes: int) -> dict:
     spec = dict(scratch_spec(d))
     plan, row, cap = {}, 0, lease_bytes // 128
     for key in LEASE_ORDER:
+        if key not in spec:  # a buffer of a mode this geometry does not have
+            continue
         sh = spec[key]
         assert sh.shape[-1] % 128 == 0 and sh.shape[-2] % 8 == 0, key  # whole tiles
         n = vmem_alias.storage_size(sh.shape, sh.dtype) // 128
