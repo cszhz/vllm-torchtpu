@@ -32,6 +32,7 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import (
     mla_sliding_window_ragged_paged_attention,
 )
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
+    PREFILL_ATTENTION_KERNEL_BATCH_SIZE,
     sparse_ragged_paged_attention,
 )
 from vllm_torchtpu.logger import init_logger
@@ -236,7 +237,7 @@ def _attention_csa(
         main_cache_kv = updated_sw_cache
 
     gather_and_attention_chunk_size = 128
-    attention_kernel_batch_size = 16
+    attention_kernel_batch_size = PREFILL_ATTENTION_KERNEL_BATCH_SIZE
     # small chunks override:
     if q.shape[0] <= 128:
         gather_and_attention_chunk_size = 32
