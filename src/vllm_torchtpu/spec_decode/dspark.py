@@ -104,6 +104,8 @@ class DSparkProposer(DFlashProposer):
         # Keyed by padded request count: the all-greedy inputs of dummy
         # forwards.
         self._dummy_sample_inputs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # idle-engine draft sampling operands by (rows, width) (run_dp_dummy_draft)
+        self._mk_idle_rows: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}
         logger.info(
             "DSpark: sample_from_anchor=%s, K=%d (checkpoint block %s), "
             "draft sampling %s.",
@@ -179,6 +181,29 @@ class DSparkProposer(DFlashProposer):
             return
         # a megakernel step is one chunk on every rank (decide_step)
         draft.idle(mk.last_run)
+        if self._draft_replicated:
+            return
+        # The busy engines sample the draft rows with TP collectives (vocab-
+        # parallel logits / Markov argmax); like any TP collective here they
+        # pair across DP engines by emission order, so replay them at the
+        # busy engines' shape (`_prepare_dflash_inputs`' lockstep bucket).
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        rows = self._dp_draft_bucket()
+        width = draft.spec.vocab_size if draft.logits else draft.spec.hidden_size
+        ops = self._mk_idle_rows.get((rows, width))
+        if ops is None:
+            dev = self.runner.device
+            ops = (torch.zeros((rows, width), dtype=torch.bfloat16, device=dev),
+                   torch.zeros(rows, dtype=torch.int32, device=dev))  # fmt: skip
+            self._mk_idle_rows[(rows, width)] = ops
+        hidden, ids = ops
+        synchronize_tensors(
+            self._sample_megakernel_draft(
+                draft, hidden, ids, self._draft_sample_inputs(rows // self.block_size)
+            ),
+            wait=False,
+        )
 
     @torch.no_grad()
     def propose(
@@ -242,20 +267,29 @@ class DSparkProposer(DFlashProposer):
         sample_inputs = self._draft_sample_inputs(
             padded_len // self.block_size, chunk.start_index, chunk.num_reqs
         )
+        draft_tokens = self._sample_megakernel_draft(
+            draft, hidden, input_ids, sample_inputs
+        )
+        if return_device:
+            return draft_tokens[: chunk.num_reqs]
+        return draft_tokens.cpu().tolist()[: chunk.num_reqs]
+
+    def _sample_megakernel_draft(
+        self, draft, hidden: torch.Tensor, input_ids: torch.Tensor, sample_inputs
+    ) -> torch.Tensor:
+        """The draft tokens from the draft megakernel's output (the logits with
+        `draft.logits`, else the pre-norm hidden)."""
         with set_vllm_model_wrapper_context(
             mesh=self.runner.mesh, vllm_config=self.vllm_config
         ):
             if draft.logits:  # the draft step applied norm + lm_head
-                draft_tokens = self._sample_from_draft_logits(
+                return self._sample_from_draft_logits(
                     hidden, input_ids, self.block_size, *sample_inputs
                 )
-            else:
-                draft_tokens, _ = self._sample_from_hidden(
-                    hidden, input_ids, self.block_size, *sample_inputs
-                )
-        if return_device:
-            return draft_tokens[: chunk.num_reqs]
-        return draft_tokens.cpu().tolist()[: chunk.num_reqs]
+            tokens, _ = self._sample_from_hidden(
+                hidden, input_ids, self.block_size, *sample_inputs
+            )
+            return tokens
 
     @torch.no_grad()
     def precompile_megakernel_sampling(self, logits: bool, width: int) -> None:
