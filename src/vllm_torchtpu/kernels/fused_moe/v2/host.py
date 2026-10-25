@@ -952,7 +952,8 @@ def build_routing_tables_sharded(
     row_table = _window_table(
         (off_in_source + run_base[:, None, :]).reshape(n_blocks, g_local), win_hist
     )
-    on_me = (expert_blocks >= first) & (expert_blocks < first + g_local)
+    row_major = lax.optimization_barrier(expert_blocks)
+    on_me = (row_major >= first) & (row_major < first + g_local)
     my_row = _lookup_per_sub_pair(
         row_table, expert_blocks, my_experts, window
     ) + _rank_within_window(expert_blocks, window)
