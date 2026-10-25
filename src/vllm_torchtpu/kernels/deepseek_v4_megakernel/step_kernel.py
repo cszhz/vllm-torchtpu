@@ -436,6 +436,7 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
     assert len(attn_scr) == n_attn_scr
     if scfg.vmem_share:
         s["og"], s["xg"] = s["qs"], s["q"]
+    if scfg.moe_shared():
         shared = {"xq": s["xq"], "acc": s["acc"].at[:, pl.ds(0, cfg.hidden)]}
         it = iter(moe_scr)
         moe_scr = [
