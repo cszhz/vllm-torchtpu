@@ -135,7 +135,8 @@ def step_reference(rc: RefConfig, w, embed, cos_sin_cache, ids, pos, seq_lens,
     live = owner >= 0
     # mesh rank r holds head block hb[r]; per-rank lists stay in mesh order
     hb = [SK.head_block(r, R, rc.attn_tp) for r in range(R)]
-    assert attn is None or rc.attn_tp == 1, "real attention: attn_tp 1 only (todo)"
+    if attn is not None:
+        attn["attn_tp"] = rc.attn_tp  # a group's ranks hold one cache replica
     rw = [rank_weights(w, full, hb[r], R) for r in range(R)]
     cs_f = SK.rope_rows(cos_sin_cache, jnp.asarray(tpos), inverse=False)
     cs_i = SK.rope_rows(cos_sin_cache, jnp.asarray(tpos), inverse=True)
@@ -323,9 +324,11 @@ def _attention(attn, li, lt, full, q, qall, kvr, xp, idxq, owner, lrow, T,
     owner = np.asarray(owner)
     lrow = np.asarray(lrow)
     for gr in range(T // QP):
-        r = int(owner[gr * QP])
-        if r < 0:
+        g = int(owner[gr * QP])
+        if g < 0:
             continue
+        gs = attn.get("attn_tp", 1)
+        r = g * gs  # the group's first rank: its cache set is the replica
         slot = int(lrow[gr * QP]) // q
         assert slot == 0, "the reference handles one request slot per rank"
         rows = slice(gr * QP, gr * QP + QP)
@@ -342,9 +345,10 @@ def _attention(attn, li, lt, full, q, qall, kvr, xp, idxq, owner, lrow, T,
                           idx_comp=xp[rows, full.wp_cols : c0][None])  # fmt: skip
         ls = attn["sets"][r]
         arrays, out, _ = attn["reference"](ls, kind, li, inputs)
-        attn["sets"][r] = dataclasses.replace(
-            ls, arrays=[jnp.asarray(a) for a in arrays]
-        )
+        for jj in range(gs):
+            attn["sets"][r + jj] = dataclasses.replace(
+                ls, arrays=[jnp.asarray(a) for a in arrays]
+            )
         o_r = jnp.asarray(out[0])
         if attn.get("noise"):  # band probe: perturb by the phase's tolerance
             key = jax.random.fold_in(jax.random.key(17), li * 1000 + r)

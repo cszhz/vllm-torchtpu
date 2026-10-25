@@ -115,6 +115,11 @@ class StepKernelConfig:
     # (moe_w["held"]), "replicas" (also moe_w["copy"])
     moe_placement: str = ""
     strict_causal: bool = False  # StepGeometry.strict_causal
+    # attn_tp > 1: split each group request's CSA scan + top-k across the group
+    attn_split: bool = False
+    # also output int32 [L, B]: the CSA union size of each (layer, own slot)
+    union_stats: bool = False
+    attn_pipeline: bool = False  # StepGeometry.attn_pipeline
 
     @property
     def n_debug_outputs(self) -> int:
@@ -190,7 +195,8 @@ class StepKernelConfig:
             n_experts=cfg.n_experts, moe_inter=cfg.moe_inter,
             lease_bytes=cfg.n_banks * cfg.max_tile_bytes, max_ctx=self.max_ctx,
             num_hash_layers=self.num_hash_layers, attn_heads=self.NA,
-            attn_tp=self.attn_tp, strict_causal=self.strict_causal,
+            attn_tp=self.attn_tp, attn_split=self.attn_split,
+            strict_causal=self.strict_causal, attn_pipeline=self.attn_pipeline,
         )  # fmt: skip
 
     def ar_spec(self) -> AR.AllReduceSpec:
@@ -352,6 +358,11 @@ def _scratch(scfg: StepKernelConfig, typed: bool):
         fence=pltpu.SMEM((1,), jnp.int32),
         li_ref=pltpu.SMEM((1,), jnp.int32),
         part_dbg=pltpu.VMEM((T, h) if scfg.debug_att else (8, LANE), F32),
+        **(
+            {"ustats": pltpu.SMEM((cfg.n_layers, scfg.B), jnp.int32)}
+            if scfg.union_stats
+            else {}
+        ),
     )
     for k, v in scfg.ar_spec().scratch().items():
         scr[k] = v
@@ -413,7 +424,9 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
     dbg_out = refs[n_in + 2 + n_arr] if n_dbg else None
     dbg_x = refs[n_in + 3 + n_arr] if n_dbg else None  # f32 [3, T, H] layer 0
     dbg_ctx = refs[n_in + 4 + n_arr] if n_dbg == 3 else None  # f32 [T, d] layer 0
-    scr_refs = refs[n_in + 2 + n_arr + n_dbg :]
+    n_st = int(scfg.union_stats)
+    stats_out = refs[n_in + 2 + n_arr + n_dbg] if n_st else None
+    scr_refs = refs[n_in + 2 + n_arr + n_dbg + n_st :]
     s = dict(zip(names_scr, scr_refs[: len(names_scr)]))
     moe_scr = scr_refs[len(names_scr) : len(names_scr) + n_moe_scr]
     attn_scr = scr_refs[len(names_scr) + n_moe_scr :]
@@ -653,6 +666,7 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
         SP.owner_attention_phase(
             geom, "csa" if csa else "hca", li, csa_ord[li], meta, inputs, caches,
             aweights, s["q_in"], attn_lease, attn_scr, me=me,
+            stats=s["ustats"] if stats_out is not None else None,
         )  # fmt: skip
 
     def attention_swa(li):
@@ -991,7 +1005,15 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
 
         return c
 
+    if stats_out is not None:
+        for li_ in range(L):
+            for r in range(B):
+                s["ustats"][li_, r] = jnp.int32(-1)
     lax.fori_loop(0, L, layer_body, 0)
+    if stats_out is not None:
+        cp = pltpu.make_async_copy(s["ustats"], stats_out, s["osem"].at[0])
+        cp.start()
+        cp.wait()
     if "ar" not in skip:
         ar.wait_sends(0)  # the last AR#1
         if not moe:
@@ -1052,7 +1074,8 @@ def build(scfg: StepKernelConfig, *, axis: str, interpret=False):
                 _kernel, scfg, typed, axis, names_scr, len(moe_scr), alay, len(attn_scr)
             ),  # fmt: skip
             in_specs=in_specs,
-            out_specs=[anyspace] * (2 + n_out_arr + scfg.n_debug_outputs),
+            out_specs=[anyspace]
+            * (2 + n_out_arr + scfg.n_debug_outputs + int(scfg.union_stats)),
             out_shape=[
                 jax.ShapeDtypeStruct((scfg.T, cfg.hc_hidden), BF16),
                 jax.ShapeDtypeStruct((A, scfg.T, cfg.hc_hidden), BF16),
@@ -1066,6 +1089,11 @@ def build(scfg: StepKernelConfig, *, axis: str, interpret=False):
                 + (
                     [jax.ShapeDtypeStruct((scfg.T, cfg.head_dim), F32)]
                     if scfg.n_debug_outputs == 3
+                    else []
+                )
+                + (
+                    [jax.ShapeDtypeStruct((L, scfg.B), jnp.int32)]
+                    if scfg.union_stats
                     else []
                 )
             ),  # fmt: skip
@@ -1106,7 +1134,8 @@ def build(scfg: StepKernelConfig, *, axis: str, interpret=False):
         ctx (ctx_q > 0, the DSpark draft step): dict(main_x=bf16 [T, H] and
         positions=int32 [T] of the context rows in the global row layout of
         the target step, -1 where no row). with_all: also return the final
-        residual of every global row, [T, 4H] (identical on every rank), last.
+        residual of every global row, [T, 4H] (identical on every rank), last
+        but the union_stats output when that is on.
         vocab_start: embed is this rank's vocab-parallel shard starting at this
         (traced) id, the shards of each attention group covering the vocab."""
         me = lax.axis_index(axis) if me is None else me
@@ -1175,6 +1204,8 @@ def build(scfg: StepKernelConfig, *, axis: str, interpret=False):
             sched_j, base_j, ltype, tokm, ownt, counts, x0, cs_f, cs_i, smalls,
             *[tiles[n] for n in names], *extra,
         )  # fmt: skip
+        if scfg.union_stats:  # last output: [L, B] (-1: no CSA union)
+            outs, ustats = outs[:-1], outs[-1]
         res_all, aux_all = outs[:2]
         own = ownt >= 0
         sel = jnp.maximum(ownt, 0)
@@ -1184,7 +1215,9 @@ def build(scfg: StepKernelConfig, *, axis: str, interpret=False):
         aux = jnp.stack(
             [jnp.where(own[:, None], aux_all[k][sel], 0) for k in range(A)]
         ).astype(BF16)
-        tail = (res_all,) if with_all else ()
+        tail = ((res_all,) if with_all else ()) + (
+            (ustats,) if scfg.union_stats else ()
+        )
         if scfg.debug_att:
             nd = scfg.n_debug_outputs
             dbg = outs[len(outs) - nd :]

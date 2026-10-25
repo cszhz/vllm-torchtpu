@@ -124,3 +124,15 @@ def test_group_tp_heads(kind, layer, h0):
     _check(ls, kind, layer, inp, caches, out, heads=16, h0=h0)
     with pytest.raises(AssertionError):  # positive control: the neighbouring slice
         _check(ls, kind, layer, inp, caches, out, heads=16, h0=(h0 + 16) % 128)
+
+
+def test_union_size_stats():
+    """stats[layer, r] = the union size; with every visible row selected it is
+    the request's compressed length."""
+    rng = np.random.default_rng(17)
+    ls = H.build(rng, KINDS, [1030, 3000], 4096)
+    inp = H.make_inputs(rng, ls, "csa")
+    fn, ops = H.build_call(ls, "csa", 1, inp, stats=True)
+    res = fn(*ops)
+    st = np.asarray(res[-1])
+    assert st[1].tolist() == [1030 // 4, 3000 // 4], st[1]

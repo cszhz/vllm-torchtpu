@@ -244,17 +244,19 @@ def group_heads(inputs, weights, attn_heads, h0):
 
 def build_call(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk=False,
                served_dtypes=False, reps=1, lease_bytes=0, attn_heads=128, h0=0,
-               strict_causal=False):
+               strict_causal=False, attn_tp=1, stats=False, pipeline=False, races=False):
     """(function, operands) of the phase's standalone pallas_call. With
     `served_dtypes` the uint8-served arrays are passed as uint8 slabs (device
     only: the phase bitcasts them in-kernel). `lease_bytes` (device only): the
     phase gets a PoolLease over a u8 scratch of that size, as the step lends it
-    the idle weight pool."""
+    the idle weight pool. `pipeline`: StepGeometry.attn_pipeline. `races`
+    (interpret): DMAs executed at their start, with the race detector."""
     R = len(ls.seq_lens)
     num_req = R if num_req is None else num_req
     geom = SP.StepGeometry(R=16, T=16, q=Q, B=R, layer_kinds=ls.kinds, max_ctx=ls.max_ctx,
                            lease_bytes=lease_bytes, attn_heads=attn_heads,
-                           strict_causal=strict_causal)
+                           strict_causal=strict_causal, attn_tp=attn_tp,
+                           attn_split=attn_tp > 1, attn_pipeline=pipeline)
     weights = ls.weights
     if attn_heads != 128:
         inputs, weights = group_heads(inputs, weights, attn_heads, h0)
@@ -280,7 +282,7 @@ def build_call(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk
         w = refs[n_s + n_v:n_s + n_v + n_w]
         caches = refs[n_s + n_v + n_w + n_c:n_s + n_v + n_w + 2 * n_c]  # aliased outputs
         out = refs[n_s + n_v + n_w + 2 * n_c]
-        scr = refs[n_s + n_v + n_w + 2 * n_c + 1 + 3 * int(debug_topk):]
+        scr = refs[n_s + n_v + n_w + 2 * n_c + 1 + 3 * int(debug_topk) + int(stats):]
         lease = SP.PoolLease(None, 0, 0)
         if leased:
             scr, lease = scr[:-1], SP.PoolLease(scr[-1], 0, lease_bytes // 128)
@@ -300,7 +302,9 @@ def build_call(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk
 
         def once(i, c):  # repeated calls are idempotent (timing only)
             SP.owner_attention_phase(geom, kind, s[18][0], s[18][1], meta, inp, cs,
-                                     SP.AttnWeights(*w), out, lease, scr)
+                                     SP.AttnWeights(*w), out, lease, scr,
+                                     me=jax.lax.axis_index("d") if attn_tp > 1 else None,
+                                     stats=refs[-len(scratch) - 1] if stats else None)
             return c
 
         AP.reset_table_stage(geom, scr, leased)
@@ -324,22 +328,61 @@ def build_call(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk
         + [jax.ShapeDtypeStruct((R, geom.RP, 512), inputs["q"].dtype)]  # q's storage
         + ([jax.ShapeDtypeStruct((R, 8, AP.TOPK), jnp.int32),
             jax.ShapeDtypeStruct((R, AP.dims_of(geom).n_cols // 128 * 8, 128), jnp.int32),
-            jax.ShapeDtypeStruct((R, 8, 128), jnp.int32)] if debug_topk else []),
+            jax.ShapeDtypeStruct((R, 8, 128), jnp.int32)] if debug_topk else [])
+        + ([jax.ShapeDtypeStruct((len(ls.kinds), R), jnp.int32)] if stats else []),
         in_specs=[smem] * 3 + [hbm] + [smem] * (n_s - 4) + [vmem] * n_v + [hbm] * (n_w + n_c),
-        out_specs=[hbm] * n_c + [vmem] + ([vmem] * 3 if debug_topk else []),
+        out_specs=[hbm] * n_c + [vmem] + ([vmem] * 3 if debug_topk else [])
+        + ([smem] if stats else []),
         scratch_shapes=scratch,
         input_output_aliases={n_s + n_v + n_w + i: i for i in range(n_c)},
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=60 * 1024 * 1024,
                                              disable_bounds_checks=True),
-        interpret=pltpu.InterpretParams() if interpret else False,
+        interpret=(pltpu.InterpretParams(detect_races=True, dma_execution_mode="eager") if races
+                   else pltpu.InterpretParams()) if interpret else False,
     )
     return fn, [jnp.asarray(x) for x in smem_ops] + list(vmem_ops) + list(w_ops) + arrays
 
 
+def group_call(ls, kind, layer, inputs, attn_tp=8, attn_heads=16, num_req=None, interpret=True,
+               served_dtypes=False, reps=1, ndev=None, pipeline=False, races=False):
+    """(jitted fn, stacked operands) of the phase on attn_tp devices (run_group);
+    ndev > attn_tp = 1: ndev independent single-rank phases side by side."""
+    from jax.sharding import Mesh
+    from jax.sharding import PartitionSpec as Ps
+    ndev = ndev or attn_tp
+    devs = jax.devices()[:ndev]
+    assert len(devs) == ndev
+    per_dev = [build_call(ls, kind, layer, inputs, num_req, interpret, attn_heads=attn_heads,
+                          h0=jj * attn_heads, attn_tp=attn_tp, served_dtypes=served_dtypes,
+                          reps=reps, pipeline=pipeline, races=races)
+               for jj in range(ndev)]
+    fn = per_dev[0][0]
+    ops = [jnp.stack([jnp.asarray(o[i]) for _, o in per_dev]) for i in range(len(per_dev[0][1]))]
+    mesh = Mesh(np.array(devs), ("d",))
+    g = jax.jit(jax.shard_map(lambda *a: [x[None] for x in fn(*[y[0] for y in a])], mesh=mesh,
+                              in_specs=(Ps("d"),) * len(ops), out_specs=Ps("d"), check_vma=False))
+    return g, ops
+
+
+def run_group(ls, kind, layer, inputs, attn_tp=8, attn_heads=16, num_req=None, interpret=True,
+              served_dtypes=False, pipeline=False, races=False):
+    """The phase on attn_tp devices of a 1-D mesh "d" (group TP): every device
+    holds the same caches and attends heads [16 jj, 16 jj + 16) of all the
+    requests; device jj scores 1 / attn_tp of each request's columns. Returns
+    per device (caches, out)."""
+    g, ops = group_call(ls, kind, layer, inputs, attn_tp, attn_heads, num_req, interpret,
+                        served_dtypes, pipeline=pipeline, races=races)
+    res = g(*ops)
+    n_c = len(ls.arrays)
+    return [([np.asarray(c[j]) for c in res[:n_c]], np.asarray(res[n_c][j], np.float32))
+            for j in range(attn_tp)]
+
+
 def run_phase(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk=False,
-              attn_heads=128, h0=0, strict_causal=False):
+              attn_heads=128, h0=0, strict_causal=False, pipeline=False, races=False):
     fn, ops = build_call(ls, kind, layer, inputs, num_req, interpret, debug_topk,
-                         attn_heads=attn_heads, h0=h0, strict_causal=strict_causal)
+                         attn_heads=attn_heads, h0=h0, strict_causal=strict_causal,
+                         pipeline=pipeline, races=races)
     n_c = len(ls.arrays)
     res = fn(*ops)
     AP.DEBUG_TOPK = AP.DEBUG_SCORES = AP.DEBUG_LENS = None

@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_MK_PARITY_WARMUP: int = 0
     VLLM_TPU_DSV4_MK_PARITY_TOL: float = 0.1
     VLLM_TPU_DSV4_MK_PARITY_PAIR: str = "stock,mk"
+    VLLM_TPU_DSV4_MK_ATTN_PIPELINE: bool = False
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -1119,6 +1120,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # check), or "mk,mk" / "stock,stock" / "mk,stock" (controls); several
     # pairs separated by ";" take turns over the parity calls.
     "VLLM_TPU_DSV4_MK_PARITY_PAIR": env_str("VLLM_TPU_DSV4_MK_PARITY_PAIR", "stock,mk"),
+    # Megakernel attention: fetch request r + 1's first SWA / HCA / indexer
+    # pages while request r computes, and split each group request's CSA
+    # indexer scan + top-k across its attention-TP ranks (exact).
+    "VLLM_TPU_DSV4_MK_ATTN_PIPELINE": env_bool("VLLM_TPU_DSV4_MK_ATTN_PIPELINE"),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),

@@ -147,8 +147,11 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     scfg = SK.StepKernelConfig(
         dense=cfg, q=a.q, B=nb, moe_impl=moe_impl, moe_leased=var.get("lease", "1") == "1",
         aux_layers=tuple(x for x in (L - 3, L - 2, L - 1) if x >= 0),
-        attn_tp=int(var.get("attn_tp", 1)),
+        attn_tp=int(var.get("attn_tp", 1)), attn_split=var.get("split") == "1",
+        union_stats=var.get("ustats") == "1",
     )  # fmt: skip
+    if var.get("pipeline") == "1":  # as VLLM_TPU_DSV4_MK_ATTN_PIPELINE=1 (step_impl.kernel_config)
+        scfg = dataclasses.replace(scfg, attn_pipeline=True, attn_split=scfg.attn_tp > 1)
     if moe_impl != "real":
         moe_args = []
     elif "moe_distinct" in var:  # per-layer expert arrays reuse k distinct sets
@@ -187,8 +190,9 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     names = cfg.stream_names
     inplace = var.get("inplace") == "1"
     at = (
-        attn_operands(mesh, EP, R, L, nb, owners, a.q, seq,
-                      int(var.get("synth_ctx", max_ctx)))  # cache arrays sized for this
+        attn_operands(
+            mesh, EP, R, L, nb, owners, a.q, seq, int(var.get("synth_ctx", max_ctx))
+        )  # cache arrays sized for this
         if attn_impl == "real"
         else None
     )
@@ -217,7 +221,8 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
                     eblk=jax.lax.axis_index("d"))  # fmt: skip
         res, aux = outs[0], outs[1]
         arrs_out = list(outs[5]) if at is not None else []  # [] when in place
-        return (res[None], aux[None], *arrs_out)
+        st = (outs[-1][None],) if scfg.union_stats else ()
+        return (res[None], aux[None], *arrs_out, *st)
 
     args = [
         ids_d,
@@ -239,7 +244,8 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
         return jax.jit(
             jax.shard_map(functools.partial(per_rank, step), mesh=mesh,
                           in_specs=(P("d"),) * len(args),
-                          out_specs=(P("d"),) * (2 + n_out), check_vma=False),
+                          out_specs=(P("d"),) * (2 + n_out + scfg.union_stats),
+                          check_vma=False),
             donate_argnums=() if inplace else tuple(range(c0, c0 + n_out)),
         )  # fmt: skip
 
@@ -258,10 +264,15 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
         mism = [int(diff(x, y)) for x, y in zip(na, cb)]
         changed = [int(diff(x, y)) for x, y in zip(na, orig)]
         changed_b = [int(diff(x, y)) for x, y in zip(cb, orig)]
-        result(check="inplace_vs_aliased", res_mismatch=int(diff(oa[0], ob[0])),
-               aux_mismatch=int(diff(oa[1], ob[1])), cache_mismatch=sum(mism),
-               words_written_aliased=sum(changed), words_written_inplace=sum(changed_b),
-               ok=sum(mism) == 0 and sum(changed) > 0 and int(diff(oa[0], ob[0])) == 0)
+        result(
+            check="inplace_vs_aliased",
+            res_mismatch=int(diff(oa[0], ob[0])),
+            aux_mismatch=int(diff(oa[1], ob[1])),
+            cache_mismatch=sum(mism),
+            words_written_aliased=sum(changed),
+            words_written_inplace=sum(changed_b),
+            ok=sum(mism) == 0 and sum(changed) > 0 and int(diff(oa[0], ob[0])) == 0,
+        )
         del orig, ca, cb, oa, ob, na
 
     if var.get("hlocheck") == "1":  # large copies XLA inserted around the kernel
@@ -270,19 +281,29 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
         txt = f.lower(*args).compile().as_text()
         big = []
         for line in txt.splitlines():
-            m = re.search(r"= (\w+)\[([0-9,]+)\][^ ]* (copy|copy-start|transpose|bitcast-convert|fusion)\(", line)
+            m = re.search(
+                r"= (\w+)\[([0-9,]+)\][^ ]* (copy|copy-start|transpose|bitcast-convert|fusion)\(",
+                line,
+            )
             if m:
                 n = int(np.prod([int(x) for x in m.group(2).split(",")]))
-                nbytes = n * {"s32": 4, "f32": 4, "u8": 1, "bf16": 2, "s8": 1}.get(m.group(1), 4)
+                nbytes = n * {"s32": 4, "f32": 4, "u8": 1, "bf16": 2, "s8": 1}.get(
+                    m.group(1), 4
+                )
                 if nbytes > (8 << 20):
                     big.append((m.group(3), m.group(1), m.group(2), nbytes))
-        result(check="hlo_big_ops", attn=attn_impl, n=len(big),
-               total_mb=sum(b[3] for b in big) / 2**20, top=big[:12])
+        result(
+            check="hlo_big_ops",
+            attn=attn_impl,
+            n=len(big),
+            total_mb=sum(b[3] for b in big) / 2**20,
+            top=big[:12],
+        )
 
     def run():
         out = f(*args)
         if not inplace:
-            args[c0 : c0 + n_arr] = out[2:]
+            args[c0 : c0 + n_arr] = out[2 : 2 + n_arr]
         return out
 
     t0 = time.time()
@@ -312,6 +333,17 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     if var.get("profile") == "1":
         result(check="scopes", var=var, planes=profile_scopes(run))
     res0 = np.asarray(out[0].addressable_shards[0].data, np.float32)
+    if scfg.union_stats:  # [R, L, B] CSA union sizes (-1: none); process 0's ranks
+        us = np.concatenate([np.asarray(x.data) for x in out[-1].addressable_shards])
+        live = us[us >= 0]
+        result(
+            check="union_stats",
+            var=var,
+            n=int(live.size),
+            mean=float(live.mean()) if live.size else -1,
+            max=int(live.max()) if live.size else -1,
+            min=int(live.min()) if live.size else -1,
+        )
     result(
         check="step_time", var=var, T=T, B=nb, lease=var.get("lease", "1"), owners=owners,
         layers=L, moe=moe_impl, attn=attn_impl, inplace=inplace, max_ctx=max_ctx,
@@ -321,7 +353,6 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
         p90_ms=ts[(9 * len(ts)) // 10], n=a.iters, pipe_ms=pipe_ms, dispatch_ms=disp_ms,
         finite=bool(np.isfinite(res0).all()),
     )  # fmt: skip
-
 
 
 def profile_scopes(run, n_steps=3, devices=("TPU:0", "TPU:3")):
@@ -374,6 +405,7 @@ def profile_scopes(run, n_steps=3, devices=("TPU:0", "TPU:3")):
         tot["_line_names"] = sorted({ln.name for ln in plane.lines})
         res[plane.name] = tot
     return res
+
 
 def attn_operands(mesh, EP, R, L, nb, owners, q, seq, max_ctx):
     """Per-rank synthetic served caches (attn_phase_synth), stacked on a

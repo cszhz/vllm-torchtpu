@@ -64,6 +64,9 @@ def main():
     # seq_len (incl. the 7 new rows) of the two requests
     p.add_argument("--seqs", default="1030,3000")
     p.add_argument("--strict", action="store_true", help="StepKernelConfig.strict_causal")
+    # attention groups (TP8 x DP2: 8): one request per group (groups 0 and last)
+    p.add_argument("--attn-tp", type=int, default=1)
+    p.add_argument("--split", action="store_true", help="StepKernelConfig.attn_split")
     a = p.parse_args()
     R, T, q, B = 16, 16, 7, 1
     M = B * q
@@ -79,9 +82,15 @@ def main():
         dense=tp_cfg, q=q, B=B, aux_layers=aux_layers, attn_impl="real",
         max_ctx=a.max_ctx, fault="" if a.fault == "none" else a.fault, debug_att=True,
         strict_causal=a.strict,
+        attn_tp=a.attn_tp, attn_split=a.split,
     )  # fmt: skip
     w = dw.make_weights(full)
-    packs = [dw.pack_weights(SR.rank_weights(w, full, r, R), tp_cfg) for r in range(R)]
+    GS = a.attn_tp
+    NA = 128 // GS
+    packs = [
+        dw.pack_weights(SR.rank_weights(w, full, SK.head_block(r, R, GS), R), tp_cfg)
+        for r in range(R)
+    ]
     names = tp_cfg.stream_names
     tiles = {n: jnp.concatenate([pk["tiles"][n] for pk in packs]) for n in names}
     smalls = jnp.concatenate([pk["smalls"] for pk in packs])
@@ -89,12 +98,21 @@ def main():
     embed = jax.random.normal(jax.random.key(7), (V, full.hidden)).astype(jnp.bfloat16)
 
     s0, s1 = (int(x) for x in a.seqs.split(","))
-    owners = {0: s0, 9: s1}  # rank -> seq_len (incl. the 7 new rows)
+    # rank -> seq_len (incl. the 7 new rows); a group's ranks share its batch
+    owners = {0: s0, 9: s1} if GS == 1 else {0: s0, R - GS: s1}
     sets = []
     for r in range(R):
-        rng = np.random.default_rng(100 + r)
-        sets.append(H.build(rng, kinds, [owners.get(r, 1030)], a.max_ctx,
-                            share_tables=a.share_tables))
+        lead = r - r % GS  # one replica per attention group
+        rng = np.random.default_rng(100 + lead)
+        sets.append(
+            H.build(
+                rng,
+                kinds,
+                [owners.get(lead, 1030)],
+                a.max_ctx,
+                share_tables=a.share_tables,
+            )
+        )
     wts = sets[0].weights  # one model: every rank holds the same weights
     sets = [dataclasses.replace(s_, weights=wts) for s_ in sets]
     cos_sin_cache = wts["cos_sin"]
@@ -103,10 +121,17 @@ def main():
     seq = np.zeros((R, B), np.int32)
     rng = np.random.default_rng(0)
     for r, sl in owners.items():
-        ids[r] = rng.integers(0, V, q)
-        pos[r] = np.arange(sl - q, sl)
-        seq[r, 0] = sl
-    metas = [H.meta_arrays(s_, 1 if r in owners else 0) for r, s_ in enumerate(sets)]
+        ids[r : r + GS] = rng.integers(0, V, q)
+        pos[r : r + GS] = np.arange(sl - q, sl)
+        seq[r : r + GS, 0] = sl
+    metas = [
+        H.meta_arrays(s_, 1 if r - r % GS in owners else 0) for r, s_ in enumerate(sets)
+    ]
+    # each rank's attended heads [j NA, (j + 1) NA) first in its attn_sink
+    sink = np.asarray(wts["attn_sink"])
+    sinks = jnp.concatenate([
+        jnp.asarray(np.roll(sink, -(r % GS) * NA, axis=-1)) for r in range(R)
+    ])  # fmt: skip
     n_arr = len(sets[0].arrays)
     arrays = [jnp.concatenate([s_.arrays[i] for s_ in sets]) for i in range(n_arr)]
     bt_flat = jnp.concatenate([jnp.asarray(m["bt_flat"]) for m in metas])
@@ -116,7 +141,7 @@ def main():
     step = SK.build(scfg, axis="d", interpret=True)
     wnames = list(SK.SP.AttnWeights._fields)
 
-    def per_rank(ids, pos, seq, smalls, bt, *rest):
+    def per_rank(ids, pos, seq, smalls, bt, sk_, *rest):
         tl = rest[: len(names)]
         arrs = rest[len(names) :]
         attn = dict(
@@ -125,7 +150,7 @@ def main():
             bt_off={r: jnp.asarray(metas[0]["bt_off"][r]) for r in roles},
             bt_w={r: jnp.asarray(metas[0]["bt_w"][r]) for r in roles},
             weights={k: AP.pack_cos_sin(wts[k]) if k in AP.COS_SIN_FIELDS else wts[k]
-                     for k in wnames},
+                     for k in wnames} | {"attn_sink": sk_},
         )  # fmt: skip
         res, aux, _, _, _, arr_out, att0, _ = step(
             ids[0], pos[0], seq[0], embed, AP.pack_cos_sin(cos_sin_cache), smalls,
@@ -136,17 +161,17 @@ def main():
 
     nl = len(names)
     f = jax.jit(jax.shard_map(
-        per_rank, mesh=mesh, in_specs=(P("d"),) * (5 + nl + n_arr),
+        per_rank, mesh=mesh, in_specs=(P("d"),) * (6 + nl + n_arr),
         out_specs=(P("d"),) * (3 + n_arr), check_vma=False,
     ))  # fmt: skip
     shard = jax.sharding.NamedSharding(mesh, P("d"))
     args = [jnp.asarray(ids), jnp.asarray(pos), jnp.asarray(seq), smalls, bt_flat,
-            *[tiles[n] for n in names], *arrays]  # fmt: skip
+            sinks, *[tiles[n] for n in names], *arrays]  # fmt: skip
     outs = jax.block_until_ready(f(*[jax.device_put(x, shard) for x in args]))
     res, aux, att0 = outs[0], outs[1], np.asarray(outs[2])
     outs = outs[:2] + outs[3:]
     rc = SR.RefConfig(full=full, R=R, T=T, q=q, aux_layers=aux_layers, ar_mode="hrsag",
-                      ar_group=8)  # fmt: skip
+                      ar_group=8, attn_tp=GS)  # fmt: skip
     ref, adict = {}, {}
     for order in ("kernel", "stock", "noise"):
         sets_o = [dataclasses.replace(s_) for s_ in sets]
@@ -158,9 +183,11 @@ def main():
             "kernel" if order == "noise" else order, attn=adict[order],
         )  # fmt: skip
     att_err = {}
-    for r in owners:
-        o_k = att0.reshape(R, B, -1, 512)[r, 0, : q * 128].reshape(q, 128, 512)
-        o_r = adict["kernel"]["o_ref"][(0, r)]
+    group_ranks = [r + jj for r in owners for jj in range(GS)]
+    for r in group_ranks:
+        j = r % GS
+        o_k = att0.reshape(R, B, -1, 512)[r, 0, : q * NA].reshape(q, NA, 512)
+        o_r = adict["kernel"]["o_ref"][(0, r - j)][:, j * NA : (j + 1) * NA]
         err = np.abs(o_k - o_r)
         att_err[r] = (float(err.max() / np.abs(o_r).max()), float(err.mean()))
     rk, ak, sk = ref["kernel"]
@@ -168,7 +195,7 @@ def main():
     cache_rel = {
         f"{i}@{r}": _rel(np.asarray(outs[2 + i]).reshape(R, *sets[0].arrays[i].shape)[r],
                          np.asarray(sk[r].arrays[i]))
-        for i in range(n_arr) for r in owners
+        for i in range(n_arr) for r in group_ranks
     }  # fmt: skip
     cache_rel_max = max(cache_rel.values())
     out = {
@@ -179,7 +206,8 @@ def main():
         "band_res_att_noise": _rel(ref["noise"][0], rk),
         "band_aux": _rel(as_, ak), "cache_rel_max": cache_rel_max,
         "cache_rel": cache_rel, "layer0_att_maxrel_meanabs": att_err,
-        "idle_rows_zero": bool(np.all(np.asarray(res, np.float32)[1:9] == 0)),
+        "idle_rows_zero": bool(np.all(np.asarray(res, np.float32)[
+            [r for r in range(R) if r not in group_ranks]] == 0)),
     }  # fmt: skip
     print("RESULT " + json.dumps(out), flush=True)
 

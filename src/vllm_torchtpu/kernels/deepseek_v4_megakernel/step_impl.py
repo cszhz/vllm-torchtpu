@@ -159,6 +159,9 @@ def kernel_config(
     spec = cfg.model
     dense = dataclasses.replace(dense or WM.dense_config(spec), rows=bucket.rows)
     kw.setdefault("strict_causal", envs.TPU_STREAMIDX_STRICT_CAUSAL)
+    if envs.VLLM_TPU_DSV4_MK_ATTN_PIPELINE:  # also splits each group's scan + top-k
+        kw.setdefault("attn_pipeline", True)
+        kw.setdefault("attn_split", spec.attn_tp > 1)
     return SK.StepKernelConfig(
         dense=dense,
         q=bucket.q,

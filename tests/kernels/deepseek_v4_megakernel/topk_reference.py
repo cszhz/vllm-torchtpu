@@ -73,6 +73,12 @@ def make_case(kind: str, r: int, n: int, rng: np.random.Generator):
         v = rng.standard_normal((r, n)).astype(np.float32)
         v[:, ::128] += 100.0
         x = f32_bits(v)
+    elif kind == "straddle":  # a tie run at the k-boundary across column n // 8 (a slice edge)
+        v = -np.abs(rng.standard_normal((r, n))).astype(np.float32) - 1.0
+        for i in range(r):
+            v[i, rng.choice(n, 900, replace=False)] = 2.0 + rng.random(900).astype(np.float32)
+        v[:, n // 8 - 200:n // 8 + 200] = 0.5
+        x = f32_bits(v)
     elif kind == "garbage_tail":  # past each row's length: -inf / NaN / -1 / +inf bits
         x = f32_bits(rng.standard_normal((r, n), dtype=np.float32))
         lens = rng.choice(np.array([750, 1024, 1500, 5000, n // 2 + 3], np.int32), size=r)
@@ -85,7 +91,7 @@ def make_case(kind: str, r: int, n: int, rng: np.random.Generator):
 
 
 KINDS = ("random", "verify", "short", "ties", "all_equal", "zeros_signed", "neg_inf",
-         "desc", "asc", "nan", "strided", "garbage_tail")
+         "desc", "asc", "nan", "strided", "garbage_tail", "straddle")
 
 
 def reference_union(lists: np.ndarray) -> np.ndarray:
@@ -95,3 +101,27 @@ def reference_union(lists: np.ndarray) -> np.ndarray:
         for c in row[row >= 0]:
             bits[int(c)] = bits.get(int(c), 0) | (1 << r)
     return np.array([(c << 8) | b for c, b in sorted(bits.items())], np.int64).astype(np.int32)
+
+
+def split_cuts(bits: np.ndarray, k: int, row_lengths: np.ndarray, n_loc: int, ranks: int):
+    """Per-row global cut for columns split contiguously over `ranks` slices of n_loc:
+    G (i32[R], monotone key of the k-th largest eligible key, INT_MIN if fewer than k) and
+    allow (i32[ranks, R]): ties at G each slice takes in column order (-1 = all of them),
+    lower slices first, which reproduces the single-slice tie rule."""
+    r = bits.shape[0]
+    g = np.full((r,), np.iinfo(np.int32).min, np.int32)
+    allow = np.full((ranks, r), -1, np.int32)
+    for i in range(r):
+        ln = int(np.clip(row_lengths[i], 0, bits.shape[1]))
+        key = monotone_key(bits[i, :ln])
+        key = np.where(key > KEY_NEG_INF, key, np.iinfo(np.int32).min)
+        valid = np.sort(key[key > np.iinfo(np.int32).min])[::-1]
+        if valid.size < k:
+            continue
+        g[i] = valid[k - 1]
+        left = k - int((valid > g[i]).sum())
+        for q in range(ranks):
+            ties = int((key[q * n_loc:(q + 1) * n_loc] == g[i]).sum())
+            allow[q, i] = -1 if ties <= left else left
+            left = max(left - ties, 0)
+    return g, allow

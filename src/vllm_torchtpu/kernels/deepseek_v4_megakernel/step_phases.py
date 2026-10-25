@@ -98,6 +98,12 @@ class StepGeometry:
     # CSA indexer rows see (pos + 1) // 4 compressed rows, not pos // 4 + 1
     # (stock TPU_STREAMIDX_STRICT_CAUSAL; attn_csa.visible_rows)
     strict_causal: bool = False
+    # split each group request's CSA indexer scan + top-k across its attn_tp
+    # ranks (exact; attn_group); False: every group rank selects alone
+    attn_split: bool = False
+    # pipeline each layer's requests: request r + 1's first SWA / HCA / indexer
+    # pages are fetched while request r computes (attn_phase._Phase.prefetch)
+    attn_pipeline: bool = False
 
     @property
     def heads_per_rank(self) -> int:
@@ -276,7 +282,8 @@ def owner_attention_phase(
     out: Ref,  # VMEM f32 [B, RP, 512]: attention output (bf16-rounded), row t*128 + h
     lease: PoolLease,
     scratch: Sequence[Ref],  # attention_scratch_shapes(geom, leased) order
-    me=None,  # traced int32 mesh index (needed when geom.attn_tp > 1)
+    me=None,  # traced int32 mesh index (needed when geom.attn_split)
+    stats=None,  # SMEM int32 [L, B] or None: CSA union size of (layer, own slot)
 ) -> None:
     """One layer of attention for this rank's requests.
 
@@ -309,6 +316,7 @@ def owner_attention_phase(
         lease,
         scratch,
         me=me,
+        stats=stats,
     )
 
 

@@ -29,6 +29,12 @@ Per active request (sequentially; an owner holds one or two at C <= 8):
 
 Per-layer caches are `LayerRefs`; every DMA start site on them dispatches on
 the traced layer with a balanced tree over the layers of the static kind.
+
+StepGeometry.attn_pipeline (HCA / CSA layers): request r + 1's SWA window, its
+first HCA block and its first indexer scan block are fetched while request r
+computes (`_Phase.prefetch`), into buffer slots and onto DMA semaphores of
+r + 1's parity; request r + 1 re-reads the pages of that prefetch that its own
+compressed-row writes changed (`_Phase.refetch`).
 """
 
 import dataclasses
@@ -42,6 +48,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import attn_core as core
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import attn_csa
+from vllm_torchtpu.kernels.deepseek_v4_megakernel import attn_group
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import attn_layout as L
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import kv_write as kw
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import tc_topk
@@ -76,6 +83,10 @@ DEBUG_TOPK = None  # test harness only: a VMEM ref [B, 8, TOPK] receiving the to
 # Positive control of the store tests only: "two_runs" writes both boundaries'
 # copies of a shared RoPE row / SAL lane tile, neither merged (lost records).
 STORE_FAULT = ""
+# Positive controls of the pipeline tests only: "same_slot" prefetches request
+# r + 1 into the slots (and onto the semaphores) of request r's parity;
+# "no_refetch" keeps the prefetched pages a request's own stores changed.
+PF_FAULT = ""
 
 
 def round_up(a, b):
@@ -91,6 +102,12 @@ class Dims:
     kinds: tuple[str, ...] = ("csa", "hca")  # layer kinds present
     heads: int = 128  # attended query heads per query row (StepGeometry.attn_heads)
     strict_causal: bool = False  # StepGeometry.strict_causal
+    tp: int = 1  # ranks splitting each request's scan + top-k (attn_tp when attn_split)
+    pipeline: bool = False  # StepGeometry.attn_pipeline
+
+    @property
+    def pf(self):  # prefetch of the next request (HCA / CSA layers)
+        return self.pipeline and self.compressed
 
     @property
     def compressed(self):  # any HCA / CSA layer: their buffers are needed
@@ -101,11 +118,19 @@ class Dims:
         return -(-self.max_ctx // CSA_RATIO // (CSA_BLK * CSA_PAGE))
 
     @property
-    def n_cols(self):  # indexer score columns (tc_topk needs multiples of 16384)
-        return round_up(self.max_ctx // CSA_RATIO, tc_topk.N_ALIGN)
+    def n_cols(self):  # this rank's indexer score columns (tc_topk needs multiples of 16384)
+        if self.tp == 1:
+            return round_up(self.max_ctx // CSA_RATIO, tc_topk.N_ALIGN)
+        blocks = -(-(-(-self.max_ctx // CSA_RATIO) // CSA_PAGE) // IDX_BLK)
+        return round_up(-(-blocks // self.tp) * IDX_BLK * CSA_PAGE, tc_topk.N_ALIGN)
 
 
 assert 2 * HCA_BLK <= CSA_BLK * CSA_PAGE  # HCA blocks reuse the NoPE ring
+# Pipeline, HCA layers: nope_buf[p, PF_HCA_ROW:] (unused by the HCA ring) holds
+# the first HCA block of the next request of parity p.
+PF_HCA_ROW = 2 * HCA_BLK
+assert PF_HCA_ROW + 2 * HCA_BLK <= CSA_BLK * CSA_PAGE
+PF_IBUF = 2  # pipeline: ibuf slots 2 + p hold the first scan block of parity p
 
 
 def compress_config(d: Dims, mode: str) -> kw.CompressConfig:
@@ -168,7 +193,8 @@ def table_layout(d: Dims):
 def dims_of(geom) -> Dims:
     return Dims(q=geom.q, B=geom.B, RP=geom.RP, max_ctx=geom.max_ctx,
                 kinds=tuple(sorted(set(geom.layer_kinds))), heads=geom.attn_heads,
-                strict_causal=geom.strict_causal)
+                strict_causal=geom.strict_causal,
+                tp=geom.attn_tp if geom.attn_split else 1, pipeline=geom.attn_pipeline)
 
 
 def window_config(d: Dims, kind: str = "") -> core.WindowConfig:
@@ -227,6 +253,16 @@ class Scratch(NamedTuple):
     bts: Any  # SMEM i32 [table words]: the staged block tables (table_layout)
     bt_start: Any  # SMEM i32 [regions * B]: bt_flat index of each staged table's word 0
     bt_tag: Any  # SMEM i32 [regions]: bt_off of the staged tables (-1: none)
+    # group split (attn_tp > 1; one vreg each otherwise), see attn_group
+    g_scv: Any  # i32 [n_cols / 128 * 8, 128]: this rank's scores, kept for the second top-k
+    g_vals: Any  # i32 [8, TOPK]: monotone keys of this rank's local top-k lists
+    g_rv: Any  # i32 [tp, 8, TOPK]: every rank's g_vals
+    g_vscr: tuple  # tc_topk.values_scratch_shapes(n_cols) (empty unless group split)
+    g_ru: Any  # i32 [tp, U_MAX / 128 + 8, 128]: every rank's local union, then its size
+    g_ru_s: Any  # SMEM i32 [tp, 8, 128]: the sizes of the tp local unions
+    g_sem: Any  # REGULAR [2]: receive buffers free, per all_gather (keys, unions)
+    g_dma: Any  # DMA [4]: sends, receives, per all_gather
+    pf_sems: tuple  # (DMA [PF_NSEM],) with the pipeline, else ()
     sems: Any  # DMA [S_RING + CSA_SLOTS]
 
 
@@ -244,7 +280,7 @@ def scratch_shapes(d: Dims) -> list:
         v((8, 512), f32), v((1024, 128), i32), v((32, 256), i32), v((8, 128), f32),
         v((8, 128), i32), v((8, 128), i32), v((2, 40, 128), i32),
         v((512, 128), f32), v((8, 128), f32), v((64, 8, 128), f32),
-        v((2, IDX_BLK, 40, 256), i32), v((d.n_cols // 128 * 8, 128), i32),
+        v((PF_IBUF + 2 if d.pf else 2, IDX_BLK, 40, 256), i32), v((d.n_cols // 128 * 8, 128), i32),
         v((8, TOPK), i32), pltpu.SMEM((8, TOPK), i32), tuple(tk),
         v((CSA_SLOTS, CSA_BLK * 256, 128), i32), v((CSA_SLOTS, CSA_BLK * 64, 128), i32),
         stage, stage, v((TOPK + GRAN, 128), i32) if rows else v((8, 128), i32),
@@ -255,6 +291,8 @@ def scratch_shapes(d: Dims) -> list:
         pltpu.SMEM((48,), i32),
         pltpu.SMEM((table_layout(d)[1],), i32), pltpu.SMEM((len(table_layout(d)[0]) * d.B,), i32),
         pltpu.SMEM((len(table_layout(d)[0]),), i32),
+        *group_scratch_shapes(d),
+        (pltpu.SemaphoreType.DMA((PF_NSEM,)),) if d.pf else (),
         pltpu.SemaphoreType.DMA((S_RING + CSA_SLOTS,)),
     ]
     if d.compressed:
@@ -268,9 +306,21 @@ def scratch_shapes(d: Dims) -> list:
             for f, sh in zip(Scratch._fields, shapes, strict=True)]
 
 
+def group_scratch_shapes(d: Dims) -> list:
+    """The group split's buffers; empty tuples without it."""
+    if d.tp == 1:
+        return [()] * 8
+    v, i32 = pltpu.VMEM, jnp.int32
+    ur = U_MAX // 128 + 8
+    return [v((d.n_cols // 128 * 8, 128), i32), v((8, TOPK), i32), v((d.tp, 8, TOPK), i32),
+            tuple(tc_topk.values_scratch_shapes(d.n_cols)), v((d.tp, ur, 128), i32),
+            pltpu.SMEM((d.tp, 8, 128), i32),
+            pltpu.SemaphoreType.REGULAR((2,)), pltpu.SemaphoreType.DMA((4,))]
+
+
 # Scratch an SWA-only geometry (the DSpark draft) uses.
 SWA_FIELDS = ("swa_buf", "m", "l", "acc", "wsems", "wbuf", "sink_raw", "sink_row", "cnt", "bts",
-              "bt_start", "bt_tag", "sems")
+              "bt_start", "bt_tag", "pf_sems", "sems")
 
 
 def scratch_spec(d: Dims) -> list:
@@ -337,6 +387,8 @@ def unflatten_scratch(refs, d: Dims, lease=None, lease_bytes: int = 0) -> Scratc
 # sems
 (S_KVW, S_WIN, S_REC, S_RMW, S_APE, S_SINK, S_IDX0, S_IDX1, S_CSA0, S_CSA1, S_HCA0, S_HCA1,
  S_BT, S_RING) = range(14)  # S_RING + slot: the union stream ring
+# pf_sems: the HCA and indexer prefetches of parity p, the refetches
+PF_HCA0, PF_IDX0, PF_FIX, PF_NSEM = 0, 2, 4, 5
 
 
 def words(ref):
@@ -427,9 +479,9 @@ def reset_table_stage(geom, scratch, leased: bool):
 
 
 def owner_attention_phase(geom, kind, layer, csa_ordinal, meta, inputs, caches, weights, out,
-                          lease, scratch, me=None):
-    del me  # the group split of each request's selection: todo (attn_tp > 1)
+                          lease, scratch, me=None, stats=None):
     d = dims_of(geom)
+    assert d.tp == 1 or me is not None, "attn_split needs the mesh index"
     S = unflatten_scratch(scratch, d, lease, geom.lease_bytes)
     kinds = geom.layer_kinds
     roles = {"swa": ("swa",), "hca": ("swa", "kv", "state"),
@@ -441,10 +493,13 @@ def owner_attention_phase(geom, kind, layer, csa_ordinal, meta, inputs, caches, 
                   scr=core.WindowScratch(S.swa_buf, S.m, S.l, S.acc, S.wsems, S.wbuf),
                   swa_dispatch=disp["swa"])
     ph = _Phase(geom, d, kind, layer, csa_ordinal, meta, inputs, weights, disp, win, S)
+    ph.group = attn_group.Group(me, d.tp) if d.tp > 1 else None
+    ph.stats = stats
     pages.phase = ph
 
     if "all" in ABLATE:  # attribution only: the phase does nothing
         return
+    assert not (d.pf and ABLATE), "the pipeline waits every prefetch: no ablations"
 
     @pl.when(meta.num_req[0] > 0)
     def _():
@@ -518,6 +573,8 @@ class _Phase:
     def prologue(self):
         S, w, lay = self.S, self.w, self.layer
         self.stage_tables()
+        if self.d.pf and self.kind != "swa":
+            self.prefetch(0, 0)
         self.copy_in(w.attn_sink.at[pl.ds(lay, 1)], S.sink_raw.at[pl.ds(0, 1)], S_SINK)
         if self.kind != "swa":
             self.copy_in(w.comp_norm.at[pl.ds(lay, 1)], S.norm.at[pl.ds(0, 1)], S_SINK)
@@ -543,6 +600,9 @@ class _Phase:
         if self.kind == "swa":
             self.draft_request(r)
             return
+        if self.d.pf:
+            self.pipelined_request(r)
+            return
         if "kvw" not in ABLATE:
             self.kv_writes(r)
         if self.kind == "csa":
@@ -556,9 +616,128 @@ class _Phase:
                 self.hca(r)
             win.finalize(r)  # waits the SWA row writes
             return
+        if self.stats is not None and CSA_MODE == "union":  # the union size, for serving logs
+            self.stats[self.layer, r] = self.S.un_len_s[0, 0]
         if "rows" not in ABLATE:
             self.csa_union(r) if CSA_MODE == "union" else self.csa(r)
         win.finalize(r)
+
+    def pipelined_request(self, r):
+        """request() with request r + 1's first pages in flight during r."""
+        par = self.par(r)
+
+        @pl.when(r + 1 < self.meta.num_req[0])
+        def _():
+            self.prefetch(r + 1, self.par(r + 1))
+
+        self.kv_writes(r)
+        if self.kind == "csa":
+            self.indexer(r)
+        win = self.win
+        win.swa_dma(r, par, wait=True)
+        win.swa_step(r, par)  # also starts the SWA row writes
+        if self.kind == "hca":
+            self.hca(r)
+        else:
+            self.csa_union(r) if CSA_MODE == "union" else self.csa(r)
+        win.finalize(r)  # waits the SWA row writes
+
+    # ------------------------------------------------------------------ pipeline
+    @staticmethod
+    def par(r):
+        """The slots and semaphores of request r's prefetch."""
+        return 0 if PF_FAULT == "same_slot" else r % 2
+
+    def prefetch(self, r, par, wait=False):
+        """Request r's SWA window, first HCA block / first indexer scan block
+        (this rank's share), into the slots of parity `par`."""
+        self.win.swa_dma(r, par, wait=wait)
+        if self.kind == "hca":
+            self._hca_block_copies(r, 0, PF_IBUF + par, self.S.pf_sems[0].at[PF_HCA0 + par], wait)
+        else:
+            _, _, nblk, b_lo = self._idx_share(r)
+            n_pg = jnp.where(nblk > 0, self._idx_pages(r, b_lo), 0)
+            self._idx_block_copies(r, b_lo, n_pg, PF_IBUF + par,
+                                   self.S.pf_sems[0].at[PF_IDX0 + par], wait)
+
+    def refetch(self, r, mode, first_page, n_pg, dst):
+        """Re-read the logical `mode` pages in [first_page, first_page + n_pg)
+        that request r's compressed-row stores of this step wrote (waited by
+        kv_writes) after the prefetch read them: dst(page, i) -> DMA (ref, i =
+        page - first_page) on the PF_FIX semaphore, started and waited."""
+        if PF_FAULT == "no_refetch":
+            return
+        cfg = self._kcfg(mode)
+        per_page = HCA_PAGE if mode == "hca" else CSA_PAGE
+        bl = self._boundaries(r, cfg)
+        pages = [self.pos(r, jnp.minimum(t, self.d.q - 1)) // cfg.ratio // per_page
+                 for t, _, _ in bl]
+        role = "kv" if mode == "hca" else "indexer_k"
+        dsp = self.disp[role]
+        sem = self.S.pf_sems[0].at[PF_FIX]
+        for j, (_, _, live) in enumerate(bl):
+            i = pages[j] - first_page
+            hit = live & (i >= 0) & (i < n_pg)
+            if j == 1:  # both boundaries in one page: one re-read
+                hit = hit & jnp.logical_not(bl[0][2] & (pages[0] == pages[1]))
+
+            @pl.when(hit)
+            def _(i=i, lp=pages[j]):
+                page = self.bt(role, r, lp)
+                dsp.run(lambda ref: dst(ref, page, i, sem).start())
+                dst(dsp.first, page, i, sem).wait()
+
+    def _idx_share(self, r):
+        """(compressed rows, pages, this rank's scan blocks, its first block)."""
+        n = self.meta.seq_lens[r] // CSA_RATIO
+        npages = core.cdiv(n, CSA_PAGE)
+        nblk = jnp.maximum(core.cdiv(npages, IDX_BLK), 1)
+        b_lo = 0
+        if self.group is not None:
+            per = core.cdiv(nblk, self.d.tp)
+            b_lo = jnp.minimum(self.group.jj * per, nblk)
+            nblk = jnp.minimum(b_lo + per, nblk) - b_lo
+        return n, npages, nblk, b_lo
+
+    def _idx_pages(self, r, b):
+        """Pages of scan block b of request r."""
+        npages = core.cdiv(self.meta.seq_lens[r] // CSA_RATIO, CSA_PAGE)
+        return jnp.clip(npages - b * IDX_BLK, 0, IDX_BLK)
+
+    def _idx_block_copies(self, r, b, n_pg, slot, sem, wait):
+        """The n_pg pages of scan block b -> ibuf[slot] (started, or waited)."""
+        S = self.S
+        if wait:
+            lax.fori_loop(0, n_pg, lambda p, c: (wait_bytes(S.ibuf.at[slot, 0], sem), c)[1], 0)
+            return
+
+        def pg(ref, p):
+            page = self.bt("indexer_k", r, b * IDX_BLK + p)
+            pltpu.make_async_copy(ref.at[page, pl.ds(0, 40)], S.ibuf.at[slot, p], sem).start()
+        self.disp["indexer_k"].loop(n_pg, pg)
+
+    def _hca_view(self, v):
+        """HCA block buffer v: the ring slots 0, 1 or the prefetch areas PF_IBUF + p."""
+        row = pl.multiple_of((v // PF_IBUF) * PF_HCA_ROW, PF_HCA_ROW)
+        return self.S.nope_buf.at[v % 2, pl.ds(row, 2 * HCA_BLK)]
+
+    def _hca_block_copies(self, r, b, v, sem, wait):
+        """The pages of HCA block b of request r -> buffer v (started, or waited)."""
+        per_blk = HCA_BLK // HCA_PAGE
+        npages = core.cdiv(self.meta.seq_lens[r] // HCA_RATIO, HCA_PAGE)
+        n_pg = jnp.clip(npages - b * per_blk, 0, per_blk)
+        buf = self._hca_view(v)
+        if wait:
+            lax.fori_loop(0, n_pg, lambda p, c: (wait_bytes(buf.at[pl.ds(0, 2 * HCA_PAGE)], sem),
+                                                 c)[1], 0)
+            return
+
+        def pg(ref, p):
+            page = self.bt("kv", r, b * per_blk + p)
+            pltpu.make_async_copy(
+                ref.at[page], buf.at[pl.ds(pl.multiple_of(p * 2 * HCA_PAGE, 16), 2 * HCA_PAGE)],
+                sem).start()
+        self.disp["kv"].loop(n_pg, pg)
 
     def draft_request(self, r):
         """Kind "swa" (DSpark draft): the context rows into the SWA pages, then
@@ -858,36 +1037,68 @@ class _Phase:
         wmat = jnp.concatenate(wrows + [jnp.zeros((8 - T, 64), jnp.float32)], axis=0)  # [8, 64]
         for h in range(64):
             S.wb[h] = jnp.broadcast_to(wmat[:, h:h + 1], (8, 128))
-        # score scan
+        # score scan: this rank's scan blocks [b_lo, b_lo + nblk) (all, unless group split)
         npages = core.cdiv(n, CSA_PAGE)
         nblk = jnp.maximum(core.cdiv(npages, IDX_BLK), 1)
+        b_lo = 0
+        if self.group is not None:
+            per = core.cdiv(nblk, self.d.tp)
+            b_lo = jnp.minimum(self.group.jj * per, nblk)
+            nblk = jnp.minimum(b_lo + per, nblk) - b_lo
         dsp = self.disp["indexer_k"]
         t8 = lax.broadcasted_iota(jnp.int32, (8, 1), 0)
         row_len = jnp.where(t8 < T, attn_csa.visible_rows(n, self.pos(r, 0) + t8, d.strict_causal,
                                                           CSA_RATIO), 0)
 
-        def start(b, slot):
+        def start(i, slot):
+            b = i if self.group is None else b_lo + i
+
             def pg(ref, p):
                 page = self.bt("indexer_k", r, b * IDX_BLK + p)
                 pltpu.make_async_copy(ref.at[page, pl.ds(0, 40)], S.ibuf.at[slot, p],
                                       S.sems.at[S_IDX0 + slot]).start()
             dsp.loop(jnp.clip(npages - b * IDX_BLK, 0, IDX_BLK), pg)
 
-        def wait(b, slot):
+        def wait(i, slot):
+            b = i if self.group is None else b_lo + i
+
             def pg(p, c):
                 wait_bytes(S.ibuf.at[slot, 0], S.sems.at[S_IDX0 + slot])
                 return c
             lax.fori_loop(0, jnp.clip(npages - b * IDX_BLK, 0, IDX_BLK), pg, 0)
 
-        start(0, 0)
-
-        def blk(b, c):
-            slot = b % 2
-            wait(b, slot)
-
-            @pl.when(b + 1 < nblk)
+        pf = self.d.pf
+        if pf:  # block 0 was prefetched into slot PF_IBUF + par during request r - 1
+            par = self.par(r)
+            n_pg0 = jnp.where(nblk > 0, self._idx_pages(r, b_lo), 0)
+            self._idx_block_copies(r, b_lo, n_pg0, PF_IBUF + par, S.pf_sems[0].at[PF_IDX0 + par],
+                                   wait=True)
+            self.refetch(r, "idx", b_lo * IDX_BLK, n_pg0,
+                         lambda ref, page, i, sem: pltpu.make_async_copy(
+                             ref.at[page, pl.ds(0, 40)], S.ibuf.at[PF_IBUF + par, i], sem))
+        elif self.group is None:
+            start(0, 0)
+        else:
+            @pl.when(nblk > 0)
             def _():
-                start(b + 1, 1 - slot)
+                start(0, 0)
+
+        def blk(i, c):
+            b = i if self.group is None else b_lo + i
+            if pf:
+                slot = jnp.where(i == 0, PF_IBUF + par, i % 2)
+                pl.when(i > 0)(lambda: wait(i, i % 2))
+
+                @pl.when(i + 1 < nblk)
+                def _():
+                    start(i + 1, (i + 1) % 2)
+            else:
+                slot = i % 2
+                wait(i, slot)
+
+                @pl.when(i + 1 < nblk)
+                def _():
+                    start(i + 1, 1 - slot)
 
             ws = [S.ibuf[slot, p] for p in range(IDX_BLK)]
             k_t = jnp.concatenate([pltpu.bitcast(x[0:32], jnp.float8_e4m3fn) for x in ws], axis=1)
@@ -908,19 +1119,33 @@ class _Phase:
             acc = jnp.where(colv < row_len, acc, 0.0)  # see the fill below
             bits = lax.bitcast_convert_type(acc, jnp.int32)
             for j in range(IDX_BLK * 2):
-                v = pl.multiple_of((b * IDX_BLK * 2 + j) * 8, 8)
+                v = pl.multiple_of((i * IDX_BLK * 2 + j) * 8, 8)  # this rank's column order
                 S.scores[pl.ds(v, 8), :] = bits[:, j * 128:(j + 1) * 128]
             return c
 
         if "scan" not in ABLATE:
             lax.fori_loop(0, nblk, blk, 0)
-        else:
+        elif self.group is None:
             wait(0, 0)
+        else:
+            @pl.when(nblk > 0)
+            def _():
+                wait(0, 0)
         # top-k
         lens = jnp.broadcast_to(row_len, (8, 128))
         # row lengths grow with t
         max_len = attn_csa.visible_rows(n, self.pos(r, T - 1), d.strict_causal, CSA_RATIO)
+        if self.group is not None:  # this rank's columns [c_lo, c_lo + nblk * blk_cols)
+            c_lo, c_n = b_lo * IDX_BLK * CSA_PAGE, nblk * IDX_BLK * CSA_PAGE
+            row_len = jnp.clip(row_len - c_lo, 0, c_n)
+            max_len = jnp.clip(max_len - c_lo, 0, c_n)
+            lens = jnp.broadcast_to(row_len, (8, 128))
         nscan = jnp.maximum((max_len + tc_topk.SCAN_ALIGN - 1) // tc_topk.SCAN_ALIGN, 1)
+        if self.group is not None:
+            assert DEBUG_TOPK is None and DEBUG_SCORES is None and CSA_MODE == "union"
+            if "topk" not in ABLATE:
+                self.group_topk(lens, nscan, c_lo)
+            return
         # columns past the row lengths (stale VMEM included) are never read by topk_group
         if DEBUG_SCORES is not None:
             DEBUG_SCORES[r] = S.scores[...]
@@ -947,6 +1172,64 @@ class _Phase:
             cp.start()
             cp.wait()
 
+    def group_topk(self, lens, nscan, c_lo):
+        """The union of the request's top-k rows, this rank scoring columns
+        [c_lo, ...) (attn_group)."""
+        S, g, P = self.S, self.group, self.d.tp
+        sync = lambda src, dst: (lambda c: (c.start(), c.wait()))(  # noqa: E731
+            pltpu.make_async_copy(src, dst, S.sems.at[S_APE]))
+        sync(S.scores, S.g_scv)  # the top-k consumes its buffer
+        # 1. local top-k keys, all-gathered
+        tc_topk.topk_group(S.scores, lens, nscan, S.tk_v, *S.tk_scr, k=TOPK,
+                           values=(S.g_vals, *S.g_vscr))
+        if "g_ag1" not in ABLATE:
+            attn_group.all_gather(g, S.g_vals, S.g_rv, S.g_sem.at[0], S.g_dma.at[0],
+                                  S.g_dma.at[1])  # semaphores of its own: waits count bytes
+        # 2. the global cut; keys [8, P * TOPK], rank-major
+        keys = jnp.concatenate([S.g_rv[p] for p in range(P)], axis=1)
+        cut, n_gt, take_all = attn_group.global_cut(keys, TOPK)
+        eq = [jnp.sum((keys[:, p * TOPK:(p + 1) * TOPK] == cut).astype(jnp.int32), axis=1,
+                      keepdims=True) for p in range(P)]
+        before = sum(jnp.where(p < g.jj, eq[p], 0) for p in range(P))
+        mine = sum(jnp.where(p == g.jj, eq[p], 0) for p in range(P))
+        allow = jnp.clip(TOPK - n_gt - before, 0, mine)  # ties this rank keeps, column order
+        cut = jnp.where(take_all == 1, attn_group.INT_MIN, cut)
+        # 3. this rank's members of the global top-k, as a union
+        sync(S.g_scv, S.scores)
+        tc_topk.topk_group(S.scores, lens, nscan, S.tk_v, *S.tk_scr, k=TOPK,
+                           union=(S.un_v, S.un_len_v, *S.un_scr), lists=False,
+                           thresh=(jnp.broadcast_to(cut, (8, 128)),
+                                   jnp.broadcast_to(allow, (8, 128))))
+        # 4. all-gather the local unions (global columns), concatenate in rank order
+        uv = S.un_v[...]
+        mine_ru = S.g_ru.at[g.jj]
+        mine_ru[pl.ds(0, U_MAX // 128), :] = jnp.where(uv >= 0, uv + (c_lo << attn_csa.UNION_BITS),
+                                                       -1)
+        mine_ru[pl.ds(U_MAX // 128, 8), :] = S.un_len_v[...]
+        if "g_ag2" not in ABLATE:
+            attn_group.all_gather(g, mine_ru, S.g_ru, S.g_sem.at[1], S.g_dma.at[2],
+                                  S.g_dma.at[3], local=False)
+        UR = U_MAX // 128
+        sync(S.g_ru.at[:, pl.ds(UR, 8)], S.g_ru_s.at[:, pl.ds(0, 8)])  # the P sizes
+        lane = lax.broadcasted_iota(jnp.int32, (1, 128), 1)
+        off = jnp.int32(0)
+        for p in range(P):  # segment p -> union entries [off, off + n_p): rows rotated by off % 128
+            n_p = S.g_ru_s[p, 0, 0]
+            rot, row0 = off % 128, off // 128
+
+            def cat(kk, c, p=p, n_p=n_p, rot=rot, row0=row0):
+                x = pltpu.roll(S.g_ru[p, pl.ds(kk, 1), :], rot, 1)
+                src = kk * 128 + (lane - rot) % 128  # entry of segment p in each lane of x
+                keep = src < n_p
+                a_, b_ = pl.ds(row0 + kk, 1), pl.ds(row0 + kk + 1, 1)
+                S.un_v[a_, :] = jnp.where(keep & (lane >= rot), x, S.un_v[a_, :])
+                S.un_v[b_, :] = jnp.where(keep & (lane < rot), x, S.un_v[b_, :])
+                return c
+            lax.fori_loop(0, 0 if "g_cat" in ABLATE else (n_p + 127) // 128, cat, 0)
+            off = off + n_p
+        S.un_len_s[0, 0] = off
+        sync(S.un_v, S.un_s)
+
     # ------------------------------------------------------------------ HCA
     def hca(self, r):
         S, win = self.S, self.win
@@ -970,19 +1253,39 @@ class _Phase:
                 return c
             lax.fori_loop(0, jnp.clip(npages - b * per_blk, 0, per_blk), pg, 0)
 
-        @pl.when(nblk > 0)
-        def _():
-            start(0, 0)
+        pf = self.d.pf
+        if pf:  # block 0 was prefetched into buffer PF_IBUF + par during request r - 1
+            par = self.par(r)
+            v0 = PF_IBUF + par
+            self._hca_block_copies(r, 0, v0, S.pf_sems[0].at[PF_HCA0 + par], wait=True)
+            self.refetch(r, "hca", 0, jnp.clip(npages, 0, per_blk),
+                         lambda ref, page, i, sem: pltpu.make_async_copy(
+                             ref.at[page], self._hca_view(v0).at[
+                                 pl.ds(pl.multiple_of(i * 2 * HCA_PAGE, 16), 2 * HCA_PAGE)], sem))
+        else:
+            @pl.when(nblk > 0)
+            def _():
+                start(0, 0)
 
         def blk(b, c):
-            slot = b % 2
-            wait(b, slot)
+            if pf:
+                pl.when(b > 0)(lambda: wait(b, b % 2))
 
-            @pl.when(b + 1 < nblk)
-            def _():
-                start(b + 1, 1 - slot)
+                @pl.when(b + 1 < nblk)
+                def _():
+                    start(b + 1, (b + 1) % 2)
 
-            kv, kv_t = core.decode_bf16_tokens(S.nope_buf.at[slot], HCA_BLK, TRANSPOSE_KEYS)
+                buf = self._hca_view(jnp.where(b == 0, PF_IBUF + par, b % 2))
+            else:
+                slot = b % 2
+                wait(b, slot)
+
+                @pl.when(b + 1 < nblk)
+                def _():
+                    start(b + 1, 1 - slot)
+
+                buf = S.nope_buf.at[slot]
+            kv, kv_t = core.decode_bf16_tokens(buf, HCA_BLK, TRANSPOSE_KEYS)
             jg = b * HCA_BLK + lax.broadcasted_iota(jnp.int32, (HCA_BLK, 1), 0)
             live = jg < n_c
             kv = jnp.where(live, kv, 0)

@@ -26,10 +26,18 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from topk_reference import KINDS, make_case, reference_topk, reference_union  # noqa: E402
+from topk_reference import (  # noqa: E402
+    KINDS,
+    make_case,
+    monotone_key,
+    reference_topk,
+    reference_union,
+    split_cuts,
+)
 
 from vllm_torchtpu.kernels.deepseek_v4_megakernel.tc_topk import (  # noqa: E402
     tc_topk,
+    tc_topk_ext,
     tc_topk_union_grouped,
     to_group_layout,
 )
@@ -100,3 +108,51 @@ def test_union_without_lists(kind):
     x, lens = make_case(kind, 7, N, np.random.default_rng(7))
     lens[3] = 0
     _check_union(x, lens, lists_too=False)
+
+
+@pytest.mark.parametrize("kind", ["random", "ties", "short", "nan", "garbage_tail"])
+def test_values_aligned_with_lists(kind):
+    x, lens = make_case(kind, 7, N, np.random.default_rng(21))
+    res = tc_topk_ext(to_group_layout(jnp.asarray(x)), jnp.asarray(lens), k=K, values=True,
+                      interpret=True)
+    ref = reference_topk(x, K, lens)
+    keys = np.take_along_axis(monotone_key(x), np.maximum(ref, 0), axis=1)
+    np.testing.assert_array_equal(np.asarray(res["lists"])[:7], ref)
+    np.testing.assert_array_equal(np.asarray(res["values"])[:7],
+                                  np.where(ref >= 0, keys, np.iinfo(np.int32).min))
+
+
+SLICES = 8
+
+
+def _sliced_union(x, lens, g, allow):
+    """Union over SLICES contiguous column slices, each cut externally, in slice order."""
+    n_loc = x.shape[1] // SLICES
+    ents = []
+    for q in range(SLICES):
+        res = tc_topk_ext(
+            to_group_layout(jnp.asarray(x[:, q * n_loc:(q + 1) * n_loc])),
+            jnp.asarray(np.clip(lens - q * n_loc, 0, n_loc).astype(np.int32)),
+            jnp.asarray(g), jnp.asarray(allow[q]), k=K, lists=False, union=True, interpret=True)
+        u = np.asarray(res["union"])[0].reshape(-1)[: int(res["union_len"][0])].astype(np.int64)
+        ents.append(((u >> 8) + q * n_loc) * 256 + (u & 255))
+    return np.concatenate(ents)
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_sliced_union_with_external_cut(kind):
+    """8 slices of N columns, each cut by the global threshold and tie quota, reproduce the
+    single-slice union exactly, including tie runs across slice edges."""
+    x, lens = make_case(kind, 7, SLICES * N, np.random.default_rng(31))
+    g, allow = split_cuts(x, K, lens, N, SLICES)
+    want = reference_union(reference_topk(x, K, lens)).astype(np.int64)
+    np.testing.assert_array_equal(_sliced_union(x, lens, g, allow), want)
+
+
+def test_sliced_union_check_bites():
+    """Positive control: taking every tie in every slice (ignoring the quota) is rejected."""
+    x, lens = make_case("straddle", 7, SLICES * N, np.random.default_rng(31))
+    g, allow = split_cuts(x, K, lens, N, SLICES)
+    want = reference_union(reference_topk(x, K, lens)).astype(np.int64)
+    got = _sliced_union(x, lens, g, np.full_like(allow, -1))
+    assert got.size != want.size or (got != want).any()

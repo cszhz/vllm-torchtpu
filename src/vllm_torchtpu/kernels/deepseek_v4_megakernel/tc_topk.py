@@ -107,7 +107,8 @@ def _lane_sum(x):
 
 
 def topk_group(buf, lens, nblk, out, ce_ref, ci_ref, mbuf, acc_ref, inf_ref, aux, tab_v, tab_s, sem,
-               *, k, kc=256, threshold="stack", stages=9, union=None, lists=True):
+               *, k, kc=256, threshold="stack", stages=9, union=None, lists=True, values=None,
+               thresh=None):
     """Top-k of one 8-row group.
 
     buf   (S * 8, 128) i32 VMEM: score bits, rows on sublanes (consumed).
@@ -118,6 +119,12 @@ def topk_group(buf, lens, nblk, out, ce_ref, ci_ref, mbuf, acc_ref, inf_ref, aux
     union  None, or the refs from ``union_scratch_shapes`` preceded by out_union
            ((8k / 128, 128) i32) and out_len ((8, 128) i32): see ``_union``.
     lists  False skips the per-row lists (out is not written); needs ``union``.
+    values None, or (out_vals (8, k) i32, *values_scratch_shapes(n, kc)): the monotone key
+           of each listed entry, aligned with out, INT_MIN padding. Needs lists.
+    thresh None, or (G, allow) (8, 128) i32 lane-broadcast values replacing the group's own
+           threshold: select keys > G (monotone-key order) and the first allow keys == G
+           in column order (all of them if allow < 0); G = INT_MIN selects every eligible
+           key. Union output only (lists=False).
     """
     s_tot = buf.shape[0] // SUB
     assert s_tot % SEGS == 0 and k % kc == 0 and kc % LANES == 0
@@ -218,6 +225,8 @@ def topk_group(buf, lens, nblk, out, ce_ref, ci_ref, mbuf, acc_ref, inf_ref, aux
             ok = (v * LANES + lane < lens) & (key > KEY_NEG_INF)
             key = jnp.where(ok, key, INT_MIN)
             r[...] = key
+            if values is not None:
+                values[1][pl.ds(pl.multiple_of(v * SUB, SUB), SUB), :] = key
             a_ = aux.at[pl.ds(pl.multiple_of((base + u) * SUB, SUB), SUB), :]
             a_[...] = jnp.maximum(a_[...], key)
         return c
@@ -230,85 +239,95 @@ def topk_group(buf, lens, nblk, out, ce_ref, ci_ref, mbuf, acc_ref, inf_ref, aux
     if stages == 1:
         return stage_out(lo + hi)
 
-    def radix_threshold():
-        """Exact threshold by radix over all keys (offset by lo so it spans fewer bits)."""
-        lom1 = lo - 1
+    if thresh is None:
+        def radix_threshold():
+            """Exact threshold by radix over all keys (offset by lo so it spans fewer bits)."""
+            lom1 = lo - 1
 
-        def off_it(j, acc):
-            acc = list(acc)
-            for u in range(8):
-                r = vreg_ref(j * 8 + u)
-                key = r[...]
-                ok = key >= lo
-                r[...] = jnp.where(ok, (key - lom1) ^ INT_MIN, INT_MIN)
-                acc[u % NCHAINS] = acc[u % NCHAINS] + _cnt(ok)
-            return tuple(acc)
+            def off_it(j, acc):
+                acc = list(acc)
+                for u in range(8):
+                    r = vreg_ref(j * 8 + u)
+                    key = r[...]
+                    ok = key >= lo
+                    r[...] = jnp.where(ok, (key - lom1) ^ INT_MIN, INT_MIN)
+                    acc[u % NCHAINS] = acc[u % NCHAINS] + _cnt(ok)
+                return tuple(acc)
 
-        n_ok = _lane_sum(sum(lax.fori_loop(0, nit8, off_it, (jnp.zeros((SUB, LANES), I32),) * NCHAINS)))
-        span = jnp.where(hi >= lo, hi - lom1, 0) ^ INT_MIN  # biased unsigned max kb per row
-        t = radix_select(load_buf, nit8, npass_for(span), _cnt(n_ok < k))
-        n_gt, n_ge = count_pass([lambda x: x > t, lambda x: x >= t], load_buf, nit8)
-        return t, n_gt, n_ge
+            n_ok = _lane_sum(sum(lax.fori_loop(0, nit8, off_it, (jnp.zeros((SUB, LANES), I32),) * NCHAINS)))
+            span = jnp.where(hi >= lo, hi - lom1, 0) ^ INT_MIN  # biased unsigned max kb per row
+            t = radix_select(load_buf, nit8, npass_for(span), _cnt(n_ok < k))
+            n_gt, n_ge = count_pass([lambda x: x > t, lambda x: x >= t], load_buf, nit8)
+            return t, n_gt, n_ge
 
-    if threshold == "radix":
-        t, n_gt, n_ge = radix_threshold()
+        if threshold == "radix":
+            t, n_gt, n_ge = radix_threshold()
+        else:
+            # L = k-th largest chunk maximum: >= k keys are >= L, and few more than k for
+            # unstructured rows. Keys > L are pushed onto per-(row, lane) stacks of depth
+            # STACK_D; the k-th largest stacked key is the threshold unless some stack
+            # overflowed, in which case the radix above runs instead.
+            big_l = aux_select(CM_VREGS, lo, hi)
+            if stages == 2:
+                return stage_out(big_l)
+
+            def stack_it(j, c):
+                st, cnt, ceq = list(c[:STACK_D]), c[STACK_D], list(c[STACK_D + 1:])
+                for u in range(8):
+                    x = vreg_ref(j * 8 + u)[...]
+                    push = x > big_l
+                    for d in range(STACK_D - 1, 0, -1):
+                        st[d] = jnp.where(push, st[d - 1], st[d])
+                    st[0] = jnp.where(push, x, st[0])
+                    cnt = cnt + _cnt(push)
+                    ceq[u % NCHAINS] = ceq[u % NCHAINS] + _cnt(x == big_l)
+                return (*st, cnt, *ceq)
+
+            zi = jnp.zeros((SUB, LANES), I32)
+            res = lax.fori_loop(0, nit8, stack_it,
+                                (jnp.full((SUB, LANES), INT_MIN, I32),) * STACK_D + (zi,) * (1 + NCHAINS))
+            cnt = res[STACK_D]
+            c_gt = _lane_sum(cnt)
+            c_eq = _lane_sum(sum(res[STACK_D + 1:]))
+            overflow = jnp.max(cnt) > STACK_D
+
+            def stack_threshold():
+                for d in range(STACK_D):
+                    aux[d * SUB:(d + 1) * SUB, :] = res[d]
+                base = jnp.maximum(jnp.where(big_l == INT_MAX, big_l, big_l + 1), KEY_NEG_INF + 1)
+                ts = aux_select(STACK_D, base, hi)
+                # unstacked keys are <= L, so the full-row threshold is max(ts, L)
+                ts = jnp.maximum(ts, big_l)
+                s_gt = _lane_sum(sum(_cnt(res[d] > ts) for d in range(STACK_D)))
+                s_ge = _lane_sum(sum(_cnt(res[d] >= ts) for d in range(STACK_D)))
+                s_ge = jnp.where(ts == big_l, s_gt + c_eq, s_ge)
+                at_l = c_gt < k  # then the threshold is L itself
+                return (jnp.where(at_l, big_l, ts), jnp.where(at_l, c_gt, s_gt),
+                        jnp.where(at_l, c_gt + c_eq, s_ge))
+
+            t, n_gt, n_ge = lax.cond(overflow, radix_threshold, stack_threshold)
+        if stages == 3:
+            return stage_out(t)
+        real_t = t != INT_MIN
+        n_sel = jnp.where(real_t, k, n_gt)
+        need = jnp.where(real_t, k - n_gt, 0)
+        n_eq = n_ge - n_gt
+        take_all = real_t & (need >= n_eq)
     else:
-        # L = k-th largest chunk maximum: >= k keys are >= L, and few more than k for
-        # unstructured rows. Keys > L are pushed onto per-(row, lane) stacks of depth
-        # STACK_D; the k-th largest stacked key is the threshold unless some stack
-        # overflowed, in which case the radix above runs instead.
-        big_l = aux_select(CM_VREGS, lo, hi)
-        if stages == 2:
-            return stage_out(big_l)
-
-        def stack_it(j, c):
-            st, cnt, ceq = list(c[:STACK_D]), c[STACK_D], list(c[STACK_D + 1:])
-            for u in range(8):
-                x = vreg_ref(j * 8 + u)[...]
-                push = x > big_l
-                for d in range(STACK_D - 1, 0, -1):
-                    st[d] = jnp.where(push, st[d - 1], st[d])
-                st[0] = jnp.where(push, x, st[0])
-                cnt = cnt + _cnt(push)
-                ceq[u % NCHAINS] = ceq[u % NCHAINS] + _cnt(x == big_l)
-            return (*st, cnt, *ceq)
-
-        zi = jnp.zeros((SUB, LANES), I32)
-        res = lax.fori_loop(0, nit8, stack_it,
-                            (jnp.full((SUB, LANES), INT_MIN, I32),) * STACK_D + (zi,) * (1 + NCHAINS))
-        cnt = res[STACK_D]
-        c_gt = _lane_sum(cnt)
-        c_eq = _lane_sum(sum(res[STACK_D + 1:]))
-        overflow = jnp.max(cnt) > STACK_D
-
-        def stack_threshold():
-            for d in range(STACK_D):
-                aux[d * SUB:(d + 1) * SUB, :] = res[d]
-            base = jnp.maximum(jnp.where(big_l == INT_MAX, big_l, big_l + 1), KEY_NEG_INF + 1)
-            ts = aux_select(STACK_D, base, hi)
-            # unstacked keys are <= L, so the full-row threshold is max(ts, L)
-            ts = jnp.maximum(ts, big_l)
-            s_gt = _lane_sum(sum(_cnt(res[d] > ts) for d in range(STACK_D)))
-            s_ge = _lane_sum(sum(_cnt(res[d] >= ts) for d in range(STACK_D)))
-            s_ge = jnp.where(ts == big_l, s_gt + c_eq, s_ge)
-            at_l = c_gt < k  # then the threshold is L itself
-            return (jnp.where(at_l, big_l, ts), jnp.where(at_l, c_gt, s_gt),
-                    jnp.where(at_l, c_gt + c_eq, s_ge))
-
-        t, n_gt, n_ge = lax.cond(overflow, radix_threshold, stack_threshold)
-    if stages == 3:
-        return stage_out(t)
-    real_t = t != INT_MIN
-    n_sel = jnp.where(real_t, k, n_gt)
-    need = jnp.where(real_t, k - n_gt, 0)
-    n_eq = n_ge - n_gt
-    take_all = real_t & (need >= n_eq)
+        # external cut: keys > G, plus the first `allow` keys == G in column order (all if < 0)
+        assert not lists, "lists need the group's own threshold"
+        t, allow = thresh
+        real_t = t != INT_MIN
+        need = allow
+        take_all = real_t & (allow < 0)
+        rank_ties = jnp.max(_cnt(real_t & (allow >= 0))) > 0
 
     # 4. ranks: global inclusive rank of the selection (f32, in place) and per-segment CE / CI.
     ri = lax.broadcasted_iota(I32, (LANES, LANES), 0)
     li = lax.broadcasted_iota(I32, (LANES, LANES), 1)
     upper = (ri <= li).astype(BF16)
-    rank_ties = jnp.max(_cnt(real_t & (need > 0) & (need < n_eq))) > 0
+    if thresh is None:
+        rank_ties = jnp.max(_cnt(real_t & (need > 0) & (need < n_eq))) > 0
 
     def init_tab(i, c):
         o = pl.multiple_of(i * LANES, LANES)
@@ -355,7 +374,10 @@ def topk_group(buf, lens, nblk, out, ce_ref, ci_ref, mbuf, acc_ref, inf_ref, aux
         mbuf[slot] = lax.dot_general(sel_plain(blk(b)[...]).astype(BF16), upper, NN,
                                      preferred_element_type=F32)
 
-    def finish(b, m, scar):
+    def finish(b, m, scar, sel=None):
+        if values is not None:
+            vb = values[1].at[pl.ds(pl.multiple_of(b * rows_per_rblk, rows_per_rblk), rows_per_rblk), :]
+            vb[...] = jnp.where(sel_plain(blk(b)[...]) if sel is None else sel, vb[...], 0)
         cnt = jnp.broadcast_to(m[:, LANES - 1:], m.shape)
         ce, scar2 = excl_prefix(cnt, scar)
         blk(b)[...] = pltpu.bitcast(ce + m, I32)  # global inclusive rank
@@ -392,7 +414,7 @@ def topk_group(buf, lens, nblk, out, ce_ref, ci_ref, mbuf, acc_ref, inf_ref, aux
             e_off, tcar2 = excl_prefix(jnp.broadcast_to(e[:, LANES - 1:], e.shape), tcar)
             sel = gt | (eq & ((e_off + e <= need_b) | take_b))
             m = lax.dot_general(sel.astype(BF16), upper, NN, preferred_element_type=F32)
-            return tcar2, finish(b, m, scar)
+            return tcar2, finish(b, m, scar, sel)
 
         zf = jnp.zeros((SUB, LANES), F32)
         lax.fori_loop(0, nblk, body, (zf, zf))
@@ -472,6 +494,16 @@ def topk_group(buf, lens, nblk, out, ce_ref, ci_ref, mbuf, acc_ref, inf_ref, aux
                 else:
                     acc_ref[r] += g
                     inf_ref[r] += gi
+                if values is not None:  # selected keys (0 elsewhere) as 4 exact byte planes
+                    kv = values[1][pl.ds(b * (SEGS * SUB) + r, SEGS, stride=SUB), :]
+                    planes = jnp.concatenate(
+                        [lax.shift_right_logical(kv, 8 * j) & 255 for j in range(4)], axis=1)
+                    gv = lax.dot_general(oht, planes.astype(F32).astype(BF16), NN,
+                                         preferred_element_type=F32)
+                    if first:
+                        values[2][r] = gv
+                    else:
+                        values[2][r] += gv
 
         gather(b_lo, True)
 
@@ -480,7 +512,7 @@ def topk_group(buf, lens, nblk, out, ce_ref, ci_ref, mbuf, acc_ref, inf_ref, aux
             return c1
 
         lax.fori_loop(b_lo + 1, b_hi, blk_body, 0)
-        rows = []
+        rows, vrows = [], []
         for r in range(SUB):
             a = acc_ref[r]
             rank_g = LANES * a[:, :LANES] + a[:, LANES:]
@@ -488,14 +520,33 @@ def topk_group(buf, lens, nblk, out, ce_ref, ci_ref, mbuf, acc_ref, inf_ref, aux
             gi = inf_ref[r]
             pos = LANES * (SEGS * gi[1:2] + gi[0:1]) + ln
             nsel_r = tab_s[r, LANES - 1].astype(F32)
-            rows.append(jnp.where(t_row + (c * kc).astype(F32) < nsel_r, pos, -1.0).astype(I32))
+            live = t_row + (c * kc).astype(F32) < nsel_r
+            rows.append(jnp.where(live, pos, -1.0).astype(I32))
+            if values is not None:
+                # the selected lane is the only one with rank t + 1 and a nonzero plane entry
+                at = rank_g == tc + 1
+                vg = values[2][r]
+                key = functools.reduce(jnp.bitwise_or, [lax.shift_left(lax.dot_general(
+                    ones8, jnp.where(at, vg[:, j * LANES:(j + 1) * LANES], 0.0).astype(BF16), NT,
+                    preferred_element_type=F32)[0:1].astype(I32), 8 * j) for j in range(4)])
+                vrows.append(jnp.where(live, key, INT_MIN))
         out[:, pl.ds(pl.multiple_of(c * kc, kc), kc)] = jnp.concatenate(rows, axis=0)
+        if values is not None:
+            values[0][:, pl.ds(pl.multiple_of(c * kc, kc), kc)] = jnp.concatenate(vrows, axis=0)
         return c0
 
     lax.fori_loop(0, nch, chunk_body, 0)
 
 
 U_KC = 1024  # union slots per extraction chunk (8 output rows of 128)
+
+
+def values_scratch_shapes(n: int, kc: int = 256):
+    """Scratch for ``topk_group(values=(out_vals, *this))``."""
+    return [
+        pltpu.VMEM((n // LANES * SUB, LANES), I32),  # keys, then selected keys (0 elsewhere)
+        pltpu.VMEM((SUB, kc, 4 * LANES), F32),  # per-row gathered key byte planes
+    ]
 
 
 def union_scratch_shapes(n: int, k: int = 1024):
@@ -755,6 +806,78 @@ def tc_topk_union_grouped(groups, row_lengths, *, k=1024, interpret=False, lists
         interpret=pltpu.InterpretParams() if interpret else False,
     )(lens, groups)
     return (lists_o.reshape(g * SUB, k) if lists else None), union, ulen[:, 0, 0]
+
+
+@functools.partial(jax.jit, static_argnames=("k", "interpret", "lists", "union", "values"))
+def tc_topk_ext(groups, row_lengths, thresh_key=None, thresh_allow=None, *, k=1024,
+                interpret=False, lists=True, union=False, values=False):
+    """Standalone wrapper for every topk_group output. thresh_key / thresh_allow: optional
+    i32[G * 8] external cut (see topk_group). Returns a dict with "lists" i32[G * 8, k],
+    "values" i32[G * 8, k], "union" i32[G, 8 k / 128, 128], "union_len" i32[G] as requested."""
+    g, rows, _ = groups.shape
+    n = rows // SUB * LANES
+    assert n % N_ALIGN == 0, n
+    lens = jnp.clip(jnp.pad(row_lengths.astype(I32), (0, g * SUB - row_lengths.shape[0])), 0, n)
+    ext = thresh_key is not None
+    u_rows = 8 * k // LANES
+    scr = scratch_shapes(n)
+    n_main = len(scr)
+    n_val = len(values_scratch_shapes(n)) if values else 0
+    if values:
+        scr = scr + values_scratch_shapes(n)
+    if union:
+        scr = scr + union_scratch_shapes(n, k)
+
+    def bcast(x):
+        x = jnp.pad(x.astype(I32), (0, g * SUB - x.shape[0])).reshape(g, SUB, 1)
+        return jnp.broadcast_to(x, (g, SUB, LANES))
+
+    def kernel(lens_s, x_ref, *refs):
+        if ext:
+            tk_ref, ta_ref, *refs = refs
+        o_ref, v_ref, u_ref, ul_ref, *sc = refs
+        gi = pl.program_id(0)
+        sub = lax.broadcasted_iota(I32, (SUB, LANES), 0)
+        lv = jnp.zeros((SUB, LANES), I32)
+        mx = I32(0)
+        for i in range(SUB):
+            li = lens_s[gi * SUB + i]
+            lv = jnp.where(sub == i, li, lv)
+            mx = jnp.maximum(mx, li)
+        nblk = lax.shift_right_logical(mx + SCAN_ALIGN - 1, 13)
+        topk_group(
+            x_ref.at[0], lv, nblk, o_ref.at[0], *sc[:n_main], k=k, lists=lists,
+            values=(v_ref.at[0], *sc[n_main:n_main + n_val]) if values else None,
+            union=(u_ref.at[0], ul_ref.at[0], *sc[n_main + n_val:]) if union else None,
+            thresh=(tk_ref[0], ta_ref[0]) if ext else None)
+
+    blk3 = lambda shape: pl.BlockSpec((1, *shape), lambda i, l: (i, 0, 0))  # noqa: E731
+    in_specs = [blk3((rows, LANES))] + ([blk3((SUB, LANES))] * 2 if ext else [])
+    outs = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(g,),
+            in_specs=in_specs,
+            out_specs=[blk3((SUB, k)), blk3((SUB, k)), blk3((u_rows, LANES)), blk3((SUB, LANES))],
+            scratch_shapes=scr,
+        ),
+        out_shape=[jax.ShapeDtypeStruct((g, SUB, k), I32), jax.ShapeDtypeStruct((g, SUB, k), I32),
+                   jax.ShapeDtypeStruct((g, u_rows, LANES), I32),
+                   jax.ShapeDtypeStruct((g, SUB, LANES), I32)],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",), vmem_limit_bytes=56 * 1024 * 1024
+        ),
+        interpret=pltpu.InterpretParams() if interpret else False,
+    )(lens, groups, *((bcast(thresh_key), bcast(thresh_allow)) if ext else ()))
+    res = {}
+    if lists:
+        res["lists"] = outs[0].reshape(g * SUB, k)
+    if values:
+        res["values"] = outs[1].reshape(g * SUB, k)
+    if union:
+        res["union"], res["union_len"] = outs[2], outs[3][:, 0, 0]
+    return res
 
 
 def tc_topk(scores, k, row_lengths, *, interpret=False, threshold="stack"):
