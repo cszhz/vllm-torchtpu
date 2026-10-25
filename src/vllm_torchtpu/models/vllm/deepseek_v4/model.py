@@ -627,6 +627,11 @@ class DeepseekV4Model(nn.Module):
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
+        layer_kwargs = (
+            dict(sequence_parallel=True, padding_mask=padding_mask)
+            if sequence_parallel
+            else {}
+        )
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None
@@ -641,8 +646,7 @@ class DeepseekV4Model(nn.Module):
                 post_mix,
                 res_mix,
                 residual,
-                sequence_parallel=sequence_parallel,
-                padding_mask=padding_mask,
+                **layer_kwargs,
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the full hc-stream state and collapse it the

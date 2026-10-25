@@ -186,7 +186,8 @@ class StubFFN(nn.Module):
         assert x.shape[0] == TOKENS
         return self.sim.all_reduce(self._share(x, input_ids) / self.sim.size)
 
-    def forward_sequence_parallel(self, x, input_ids):
+    def forward_sequence_parallel(self, x, input_ids, padding_mask=None):
+        assert padding_mask is None
         assert x.shape[0] == TOKENS // self.sim.size
         return self._share(x, input_ids)
 
