@@ -92,7 +92,57 @@ def _measure(rank):
             "rs_vs_f32sum_rel_l2": float((r.float() - want_rs).norm() / want_rs.norm()),
             "rs_vs_f32sum_max_abs": float((r.float() - want_rs).abs().max()),
         }
+    res["symbolic"] = _symbolic(ag, rs, take, full, partial, slot)
     return res
+
+
+def _symbolic(ag, rs, take, full, partial, slot):
+    """vLLM's route: one Dynamo trace with the token dim symbolic, then the
+    TPU backend compiles that graph for concrete inputs. Case "derived"
+    allocates by cores * (tokens // cores), the shape a gather sized off its
+    input carries; case "like" by the gather sized off positions."""
+    import torch
+    from torch_tpu._internal import compile as tpu_compile
+
+    rows = full.shape[0]
+    positions = torch.arange(rows, dtype=torch.int64).to("tpu")
+    out = {}
+    for case in ("like", "derived"):
+
+        def fn(full, partial, positions, slot, case=case):
+            local = take(full, slot)
+            g = ag(local[:, 0].contiguous(), positions)
+            n = g.shape[0] if case == "like" else local.shape[0] * WORLD
+            z = torch.zeros((n, 1024), dtype=torch.int32, device=full.device)
+            y = (rs(partial) + local[:, 1]) * 2.5
+            return g, z, y
+
+        captured = {}
+
+        def capture(gm, example_inputs):
+            captured["gm"], captured["inputs"] = gm, example_inputs
+            return gm.forward
+
+        try:
+            torch._dynamo.reset()
+            torch.compile(fn, dynamic=True, backend=capture)(
+                full, partial, positions, slot
+            )
+            tensors = iter((full, partial, positions, slot))
+            concrete = [
+                rows if isinstance(e, torch.SymInt) else next(tensors)
+                for e in captured["inputs"]
+            ]
+            exe = tpu_compile.TpuBackend()(captured["gm"], concrete)
+            g, z, y = (t.cpu() for t in exe(*concrete))
+            out[case] = {
+                "ok": True,
+                "gather_exact": bool(torch.equal(g, full.cpu()[:, 0])),
+                "shapes": [list(g.shape), list(z.shape), list(y.shape)],
+            }
+        except Exception as exc:  # noqa: BLE001 - recorded per case
+            out[case] = {"ok": False, "error": repr(exc)[:400]}
+    return out
 
 
 def _worker(out):
