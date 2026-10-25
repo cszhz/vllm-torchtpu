@@ -25,6 +25,7 @@ from jax.sharding import PartitionSpec as P
 from .. import kernel, planner
 from ..exec_spec import ExecSpec
 from ..modules.gdn import GDNModule
+from ..modules.moe.reference import random_nvfp4_weight
 from ..ops import BF16, F32, FP8, I32, rup
 from ..pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
 from . import qwen35_pool
@@ -53,15 +54,13 @@ def random_logical_inputs(
     isr, ir, er, ew = g.ISR(R), g.IR(R), g.ER(R), g.EW(R)
     natt, ngdn = g.NATT, g.NGDN
 
-    keys = jax.random.split(key, 36)
-    it = iter(keys)
-
+    it = iter(jax.random.split(key, 50))
     base_pos = jnp.arange(1, NS + 1, dtype=I32) * min(16, ctx // 4)
-    if T == 1:
-        pos = base_pos
-    else:
-        pos = (base_pos[:, None] + jnp.arange(T, dtype=I32)[None, :]).reshape(B)
-
+    pos = (
+        base_pos
+        if T == 1
+        else (base_pos[:, None] + jnp.arange(T, dtype=I32)[None, :]).reshape(B)
+    )
     hidden = jax.random.normal(next(it), (B, H), dtype=BF16) * 0.1
 
     def rfp8(shape):
@@ -86,10 +85,13 @@ def random_logical_inputs(
         (R, L, H),
     )
 
-    e13 = rfp8((R, L, ew, H, 2 * ir))
-    e13_s = rscale((R, L, ew, 2 * ir))
-    e2 = rfp8((R, L, ew, ir, H))
-    e2_s = rscale((R, L, ew, H))
+    def rexp(k_dim: int, n_dim: int) -> jax.Array:
+        if g.expert_quant == "nvfp4":
+            return random_nvfp4_weight(next(it), (R, L, ew), k_dim, n_dim)
+        return rfp8((R, L, ew, k_dim, n_dim))
+
+    e13, e13_s = rexp(H, 2 * ir), rscale((R, L, ew, 2 * ir))
+    e2, e2_s = rexp(ir, H), rscale((R, L, ew, H))
 
     logical_weights: dict[str, Any] = {
         "in_norm": jax.random.normal(next(it), (L, H), dtype=F32) * 0.05,
@@ -293,8 +295,7 @@ def pack_inputs(
 
     states_mk: dict[str, Any] = {}
     if ngdn > 0 and "conv" in logical_states and "rec" in logical_states:
-        conv_l = logical_states["conv"]
-        rec_l = logical_states["rec"]
+        conv_l, rec_l = logical_states["conv"], logical_states["rec"]
         qkv, vh = g.QKV(R), g.vh(R)
         if conv_l.ndim == 5 and conv_l.shape[3] == 3:
             if T == 1:

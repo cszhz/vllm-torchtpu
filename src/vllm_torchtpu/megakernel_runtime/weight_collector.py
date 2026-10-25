@@ -39,6 +39,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_torchtpu.megakernel import planner
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.modules.gdn import GDNModule
@@ -572,28 +573,158 @@ def pack_expert_views_layer(
         "expert weights must be contiguous for zero-copy views",
     )
 
-    if not ex.stack_e:
-        e13_view = w13
-        e2_view = w2
-    else:
-        t13 = g.H // tk_e13
-        t2 = ir // tk_e2
-        e13_view = w13.view(ew, t13, tk_e13, 2 * ir)
-        e2_view = w2.view(ew, t2, tk_e2, g.H)
-    _need(
-        e13_view.data_ptr() == w13.data_ptr() and e2_view.data_ptr() == w2.data_ptr(),
-        "expert views must share storage with w13_weight / w2_weight",
+    is_nvfp4 = (
+        str(g.expert_quant) == "nvfp4"
+        or getattr(experts, "w13_weight_scale_2", None) is not None
     )
+    if is_nvfp4:
+        _stock_msg = (
+            "(stock process_weights_after_loading already requantized; see unit B)"
+        )
 
-    s13_raw = getattr(experts, "w13_weight_scale_inv", None)
-    if s13_raw is None:
-        s13_raw = experts.w13_weight_scale
-    s2_raw = getattr(experts, "w2_weight_scale_inv", None)
-    if s2_raw is None:
-        s2_raw = experts.w2_weight_scale
+        def _pack_nvfp4_w(
+            w_raw: torch.Tensor,
+            bscale_raw: torch.Tensor | None,
+            k_dim: int,
+            n_dim: int,
+            tk_raw: int,
+            *,
+            name: str,
+        ) -> tuple[torch.Tensor, bool]:
+            k_half = k_dim // 2
+            n_raw = n_dim + rup(n_dim // 8, 128)
+            if w_raw is None or w_raw.dtype != torch.uint8:
+                got_w = None if w_raw is None else (tuple(w_raw.shape), w_raw.dtype)
+                raise MegakernelConfigError(
+                    f"{name}: expected raw torch.uint8 weight tensor, "
+                    f"got {got_w} {_stock_msg}"
+                )
+            w_u8 = w_raw.data
+            if tuple(w_u8.shape) == (ew, k_half, n_raw):
+                fused = w_u8.contiguous()
+                pre_fused = True
+            else:
+                pre_fused = False
+                if tuple(w_u8.shape) == (ew, n_dim, k_half):
+                    w_kn = w_u8.transpose(1, 2).contiguous()
+                elif tuple(w_u8.shape) == (ew, k_half, n_dim):
+                    w_kn = w_u8.contiguous()
+                else:
+                    raise MegakernelConfigError(
+                        f"{name}: expected raw uint8 shape {(ew, n_dim, k_half)} or "
+                        f"{(ew, k_half, n_dim)}, got {tuple(w_u8.shape)} {_stock_msg}"
+                    )
+                if bscale_raw is None or bscale_raw.dtype not in (
+                    torch.uint8,
+                    torch.float8_e4m3fn,
+                ):
+                    got_bs = (
+                        None
+                        if bscale_raw is None
+                        else (tuple(bscale_raw.shape), bscale_raw.dtype)
+                    )
+                    raise MegakernelConfigError(
+                        f"{name}_scale: expected raw uint8 or float8_e4m3fn "
+                        f"block scale, got {got_bs} {_stock_msg}"
+                    )
+                bs_u8 = bscale_raw.data.view(torch.uint8)
+                if tuple(bs_u8.shape) == (ew, n_dim, k_dim // 16):
+                    bs_kn = bs_u8.transpose(1, 2).contiguous()
+                elif tuple(bs_u8.shape) == (ew, k_dim // 16, n_dim):
+                    bs_kn = bs_u8.contiguous()
+                else:
+                    raise MegakernelConfigError(
+                        f"{name}_scale: expected raw block scale shape "
+                        f"{(ew, n_dim, k_dim // 16)} or {(ew, k_dim // 16, n_dim)}, "
+                        f"got {tuple(bs_u8.shape)} {_stock_msg}"
+                    )
+                bs_cols = bs_kn.reshape(ew, k_half, n_dim // 8)
+                pad_cols = n_raw - n_dim - (n_dim // 8)
+                parts = [w_kn, bs_cols]
+                if pad_cols > 0:
+                    parts.append(
+                        torch.zeros(
+                            (ew, k_half, pad_cols),
+                            dtype=torch.uint8,
+                            device=w_u8.device,
+                        )
+                    )
+                fused = _own(torch.cat(parts, dim=-1))
+            if not ex.stack_e:
+                return fused, pre_fused
+            return fused.view(ew, k_half // tk_raw, tk_raw, n_raw), pre_fused
 
-    s13 = s13_raw.data.float().reshape(ew, 2 * ir)
-    s2 = s2_raw.data.float().reshape(ew, g.H)
+        e13_view, pre13 = _pack_nvfp4_w(
+            w13,
+            getattr(experts, "w13_weight_scale", None),
+            g.H,
+            2 * ir,
+            tk_e13,
+            name="w13_weight",
+        )
+        e2_view, pre2 = _pack_nvfp4_w(
+            w2,
+            getattr(experts, "w2_weight_scale", None),
+            ir,
+            g.H,
+            tk_e2,
+            name="w2_weight",
+        )
+        g13 = getattr(experts, "w13_weight_scale_2", None)
+        g2 = getattr(experts, "w2_weight_scale_2", None)
+        if not (pre13 and pre2) and (g13 is None or g2 is None):
+            raise MegakernelConfigError(
+                "w13_weight_scale_2 and w2_weight_scale_2 must be present for raw "
+                f"NVFP4 packing {_stock_msg}"
+            )
+        if g13 is not None and (
+            not g13.is_floating_point() or g13.numel() not in (ew, ew * 2 * ir)
+        ):
+            raise MegakernelConfigError(
+                f"w13_weight_scale_2: expected float tensor of {ew} elements, "
+                f"got shape {tuple(g13.shape)} and dtype {g13.dtype} {_stock_msg}"
+            )
+        if g2 is not None and (
+            not g2.is_floating_point() or g2.numel() not in (ew, ew * g.H)
+        ):
+            raise MegakernelConfigError(
+                f"w2_weight_scale_2: expected float tensor of {ew} elements, "
+                f"got shape {tuple(g2.shape)} and dtype {g2.dtype} {_stock_msg}"
+            )
+        s13 = (
+            g13.data.float().reshape(ew, -1).expand(ew, 2 * ir).contiguous()
+            if g13 is not None
+            else experts.w13_weight_scale.data.float().reshape(ew, 2 * ir)
+        )
+        s2 = (
+            g2.data.float().reshape(ew, -1).expand(ew, g.H).contiguous()
+            if g2 is not None
+            else experts.w2_weight_scale.data.float().reshape(ew, g.H)
+        )
+    else:
+        if not ex.stack_e:
+            e13_view = w13
+            e2_view = w2
+        else:
+            t13 = g.H // tk_e13
+            t2 = ir // tk_e2
+            e13_view = w13.view(ew, t13, tk_e13, 2 * ir)
+            e2_view = w2.view(ew, t2, tk_e2, g.H)
+        _need(
+            e13_view.data_ptr() == w13.data_ptr()
+            and e2_view.data_ptr() == w2.data_ptr(),
+            "expert views must share storage with w13_weight / w2_weight",
+        )
+
+        s13_raw = getattr(experts, "w13_weight_scale_inv", None)
+        if s13_raw is None:
+            s13_raw = experts.w13_weight_scale
+        s2_raw = getattr(experts, "w2_weight_scale_inv", None)
+        if s2_raw is None:
+            s2_raw = experts.w2_weight_scale
+
+        s13 = s13_raw.data.float().reshape(ew, 2 * ir)
+        s2 = s2_raw.data.float().reshape(ew, g.H)
     es_cat = torch.cat([s13, s2], dim=-1).contiguous()
     es_mk = es_cat.unsqueeze(1).contiguous()
     return e13_view, e2_view, es_mk

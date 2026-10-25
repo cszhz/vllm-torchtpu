@@ -150,6 +150,7 @@ _GEOM_FIELD_NAMES = (
     "IS",
     "moe_tp",
     "e_slots",
+    "expert_quant",
     "eps",
     "gdn_l2_eps",
     "theta",
@@ -178,6 +179,7 @@ class ModelGeometry:
     IS: int
     moe_tp: bool = True
     e_slots: int = 0
+    expert_quant: str = "fp8"
     eps: float = 1e-6
     gdn_l2_eps: float = 1e-6
     theta: float = 10_000.0
