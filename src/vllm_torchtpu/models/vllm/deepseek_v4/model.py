@@ -658,7 +658,7 @@ class DeepseekV4Model(nn.Module):
                 aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
                 aux_hidden = aux_recon.mean(dim=1)
                 if sequence_parallel:
-                    aux_hidden = sp.gather(aux_hidden, num_tokens)
+                    aux_hidden = sp.gather_output(aux_hidden, num_tokens)
                 aux_hidden_states.append(aux_hidden)
                 final_aux_recon = aux_recon
 
@@ -687,7 +687,7 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
         if sequence_parallel:
-            hidden_states = sp.gather(hidden_states, num_tokens)
+            hidden_states = sp.gather_output(hidden_states, num_tokens)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

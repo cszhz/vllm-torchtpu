@@ -202,6 +202,13 @@ def gather(x: torch.Tensor, num_tokens=None) -> torch.Tensor:
     return out if num_tokens is None else out.narrow(0, 0, num_tokens)
 
 
+def gather_output(x: torch.Tensor, num_tokens) -> torch.Tensor:
+    """`gather` for a tensor the graph returns: a fresh tensor rather than a
+    view of the all-gather's buffer, the kind of output the replicated graph
+    returns to the runner's compiled (dynamic=False) logits gather."""
+    return gather(x, num_tokens).clone()
+
+
 def reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     """Sum TP partial outputs over the group; keep this rank's rows."""
     return _RS(x)
