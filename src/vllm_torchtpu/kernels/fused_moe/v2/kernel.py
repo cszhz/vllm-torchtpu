@@ -65,6 +65,15 @@ FP4_OUTPUT_CHUNK = 256
 # top rung is always tile_m, so a full tile is unchanged. Overridable per
 # process by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time.
 HEIGHT_RUNGS = 4
+# Tiles one FFN pass computes in a build that commits through the
+# contribution slab, where an expert's rows span several tiles. Each
+# widened four-bit weight block and each matrix-unit weight load then
+# serves this many tiles' rows; commits and the scale mirror stay per tile.
+PASS_TILES = 2
+# Row blocks the token-gather issue loop handles per iteration. The loop is
+# a serial chain of scalar-memory loads and DMA starts; unrolling it lets the
+# scheduler overlap one row's index load with the previous row's start.
+GATHER_ISSUE_UNROLL = 8
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -166,6 +175,29 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     ):
         return (tile_m,)
     return tuple(range(step, tile_m + 1, step))
+
+
+def _pass_tiles(push_from_vmem, rows_alloc, capacity):
+    """Tiles one FFN pass of this build computes.
+
+    A build that ships each tile from `out_vm` expects an expert inside one
+    tile, so its passes are one tile. A slab build's pass reads its index
+    and act-scale windows a whole pass past its first row; the tail margin
+    rows_alloc keeps past the shard's rows, and the one-window pad the layer
+    gives the index table, cover PASS_TILES tiles only where both checks
+    below hold, and a build where they do not keeps one-tile passes.
+    """
+    if push_from_vmem:
+        return 1
+    pass_m = PASS_TILES * capacity
+    last_base = rows_alloc - capacity - ROWBLK
+    scales_fit = last_base // HIDDEN_LANE_BLOCK + host.act_scale_window_rows(
+        pass_m
+    ) <= host.act_scale_slab_rows(rows_alloc)
+    index_fits = last_base + host.token_gather_window_rows(
+        pass_m
+    ) <= rows_alloc + host.token_gather_window_rows(capacity)
+    return PASS_TILES if scales_fit and index_fits else 1
 
 
 def _row_scale(amax):
@@ -629,6 +661,36 @@ def _build_fused_ep_moe_kernel(
     lane_blocks = host.row_lane_blocks(hidden)
     has_scales = form.has_scales
     has_act_scale = form.quantized_activations
+    # ragged_rows_alloc must cover every tile READ as well as every commit
+    # -- the shard's total rows plus tile_m, aligned to tile_m -- because a
+    # tail tile reads a full window.
+    if (
+        ragged_rows_alloc is None
+        or ragged_rows_alloc % ROWBLK
+        or ragged_rows_alloc % capacity
+    ):
+        raise ValueError(
+            f"ragged_rows_alloc {ragged_rows_alloc} must be a whole number "
+            f"of both {ROWBLK}-row blocks and {capacity}-row tiles, because "
+            "a tail tile reads a full window past the shard's last row"
+        )
+    # The contribution slab exists for one reason: to give the push an HBM
+    # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
+    # read straight back out of it by the push that ships it -- two local
+    # passes and, at the small buckets, about a quarter of the visit's DMA
+    # enqueues, for a buffer nothing else reads. Where a build's experts are
+    # expected to fit inside one tile -- the same bound the height ladder
+    # below is emitted on -- the tile can be shipped from `out_vm` itself,
+    # deleting the commits, the drain that gates them and the slab's traffic.
+    # It costs a staging buffer that stays live until the wire has read it,
+    # which is why a build whose visits carry several tiles keeps the slab:
+    # there the wire is the busy resource and the round trip is what keeps
+    # the tile loop off it.
+    #
+    # This subsumes the deferred commit drain the same bound used to select:
+    # deferring a wait one visit is worth nothing once the wait is gone.
+    push_from_vmem = ragged_rows_alloc <= ep * g_local * capacity
+    pass_tiles = _pass_tiles(push_from_vmem, ragged_rows_alloc, capacity)
     # The prefetch schedule this build can afford: the deepest runway whose
     # nbuf copies of one expert still leave the rest of the buffers inside
     # the budget, walked down from the ceiling one slot at a time. Every
@@ -643,6 +705,7 @@ def _build_fused_ep_moe_kernel(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        pass_tiles=pass_tiles,
     )
     prefetch_distance = slots.distance
     nbuf = slots.nbuf
@@ -714,19 +777,6 @@ def _build_fused_ep_moe_kernel(
             slots.limit / 2**20,
             host.MAX_WEIGHT_PREFETCH_DISTANCE,
         )
-    # ragged_rows_alloc must cover every tile READ as well as every commit
-    # -- the shard's total rows plus tile_m, aligned to tile_m -- because a
-    # tail tile reads a full window.
-    if (
-        ragged_rows_alloc is None
-        or ragged_rows_alloc % ROWBLK
-        or ragged_rows_alloc % capacity
-    ):
-        raise ValueError(
-            f"ragged_rows_alloc {ragged_rows_alloc} must be a whole number "
-            f"of both {ROWBLK}-row blocks and {capacity}-row tiles, because "
-            "a tail tile reads a full window past the shard's last row"
-        )
     tile_m = capacity  # the tile height IS the capacity
     tile_blocks = tile_m // ROWBLK
     # The mirror's unit is a tile, the run tables' unit is a block, and the
@@ -734,26 +784,18 @@ def _build_fused_ep_moe_kernel(
     tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
     tile_shift = host.pow2_shift(tile_m, "tile_m")
     height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
-    # The contribution slab exists for one reason: to give the push an HBM
-    # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
-    # read straight back out of it by the push that ships it -- two local
-    # passes and, at the small buckets, about a quarter of the visit's DMA
-    # enqueues, for a buffer nothing else reads. Where a build's experts are
-    # expected to fit inside one tile -- the same bound the height ladder
-    # above is emitted on -- the tile can be shipped from `out_vm` itself,
-    # deleting the commits, the drain that gates them and the slab's traffic.
-    # It costs a staging buffer that stays live until the wire has read it,
-    # which is why a build whose visits carry several tiles keeps the slab:
-    # there the wire is the busy resource and the round trip is what keeps
-    # the tile loop off it.
-    #
-    # This subsumes the deferred commit drain the same bound used to select:
-    # deferring a wait one visit is worth nothing once the wait is gone.
-    push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
-    ls_window_rows = host.act_scale_window_rows(tile_m)
+    # Each step of the tile loop below computes one pass of pass_tiles tiles;
+    # commits and the scale mirror stay in tile units.
+    pass_m = pass_tiles * tile_m
+    pass_blocks = pass_m // ROWBLK
+    if pass_tiles > 1:
+        # A pass runs at the whole tiles its live rows cover, so an expert
+        # computes exactly the tiles it did at one tile per pass.
+        height_rungs = tuple(range(tile_m, pass_m + 1, tile_m))
+    ls_window_rows = host.act_scale_window_rows(pass_m)
     gather_tiles = host.TOKEN_GATHER_TILES_PER_WINDOW
-    gather_payload_rows = gather_tiles * tile_m
-    gather_window_rows = host.token_gather_window_rows(tile_m)
+    gather_payload_rows = gather_tiles * pass_m
+    gather_window_rows = host.token_gather_window_rows(pass_m)
 
     def kernel(*refs):
         it = iter(refs)
@@ -1145,7 +1187,18 @@ def _build_fused_ep_moe_kernel(
                         ).start()
                     return _
 
-                lax.fori_loop(0, live_blocks, issue_block, jnp.int32(0))
+                def issue_group(g, carry):
+                    for u in range(GATHER_ISSUE_UNROLL):
+                        issue_block(g * GATHER_ISSUE_UNROLL + u, carry)
+                    return carry
+
+                # Whole groups unrolled, then the remainder block by block;
+                # the rows issue in the same order either way.
+                whole = live_blocks // GATHER_ISSUE_UNROLL
+                lax.fori_loop(0, whole, issue_group, jnp.int32(0))
+                lax.fori_loop(
+                    whole * GATHER_ISSUE_UNROLL, live_blocks, issue_block, jnp.int32(0)
+                )
 
             @pl.when(gather_slot == 0)
             def _():
@@ -1209,11 +1262,15 @@ def _build_fused_ep_moe_kernel(
             return _mirror_base(e) + lo, dst, hi - lo + 1
 
         def wait_commits(parity, live_blocks):
-            """Wait one tile's commits on `parity`: data rows, then scales."""
+            """Wait one pass's commits on `parity`: data rows, then scales."""
             assert commit_sems is not None and commit_scl_sems is not None
             _rows_wait(commit_sems.at[parity], contrib_hbm, live_blocks * ROWBLK)
-            # One tile committed one mirror sublane, whatever its row count.
-            _rows_wait(commit_scl_sems.at[parity], cscl_hbm, 1)
+            # Each live tile committed one mirror sublane, whatever its row
+            # count.
+            live_tiles = jnp.right_shift(
+                live_blocks + tile_blocks - 1, tile_block_shift
+            )
+            _rows_wait(commit_scl_sems.at[parity], cscl_hbm, live_tiles)
 
         def wait_shipped(parity, rows, subs):
             """Wait until the wire has read `parity`'s staging slot.
@@ -1254,7 +1311,7 @@ def _build_fused_ep_moe_kernel(
             wait_gather_window(slab_base, wslot)
             _, shift = gather_dma_coords(slab_base)
             lhs_issue_tile(
-                slab_base, jnp.minimum(rows, tile_m) // ROWBLK, lhs_slot, wslot, shift
+                slab_base, jnp.minimum(rows, pass_m) // ROWBLK, lhs_slot, wslot, shift
             )
 
             # Keep group one in flight while tile zero computes. Later group
@@ -1267,7 +1324,7 @@ def _build_fused_ep_moe_kernel(
                 )
 
         def expert_tiles(e, visit_i, carry):
-            """One expert step: a fori_loop over its [tile_m, H] tiles."""
+            """One expert step: a fori_loop over its [pass_m, H] passes."""
             # carry = (tile_count, <per-parity outstanding counts>, wslot):
             # the global tile counter, what each out_vm parity still owes --
             # committed blocks, or shipped rows and mirror sublanes where the
@@ -1311,7 +1368,7 @@ def _build_fused_ep_moe_kernel(
 
             rows = expert_rows_sm[e]
             slab_base = expert_base_sm[e]
-            n_tiles = -(-rows // tile_m)
+            n_tiles = -(-rows // pass_m)  # passes, in pass_tiles > 1 builds
             wslot = carry[-1]
             # Index windows alternate slots across the WHOLE visit list, so
             # the slot after this expert's last group is the one its
@@ -1357,13 +1414,18 @@ def _build_fused_ep_moe_kernel(
                             commit_sems.at[parity],
                         ).start()
 
-                # The tile's scales are one sublane wherever its rows
-                # went, so they commit once, outside the per-dest loop.
-                pltpu.make_async_copy(
-                    oscl_vm.at[parity],
-                    cscl_hbm.at[pl.ds(_mirror_base(e) + t, 1)],
-                    commit_scl_sems.at[parity],
-                ).start()
+                # Each tile's scales are one sublane wherever its rows
+                # went, so they commit once per live tile, outside the
+                # per-dest loop.
+                for j in range(pass_tiles):
+
+                    @pl.when(live_blocks > j * tile_blocks)
+                    def _(j=j):
+                        pltpu.make_async_copy(
+                            oscl_vm.at[parity * pass_tiles + j],
+                            cscl_hbm.at[pl.ds(_mirror_base(e) + t * pass_tiles + j, 1)],
+                            commit_scl_sems.at[parity],
+                        ).start()
 
             def ship_tile(parity, t, tile_block_base, live_blocks):
                 """Ship the tile straight out of `out_vm`, no slab in between.
@@ -1465,10 +1527,10 @@ def _build_fused_ep_moe_kernel(
             def tile_body(t, carried):
                 """Compute tile t, stage it for the wire and ship it."""
                 tile_count = carried[0]
-                row_base = slab_base + t * tile_m
-                live_rows = jnp.minimum(rows - t * tile_m, tile_m)
+                row_base = slab_base + t * pass_m
+                live_rows = jnp.minimum(rows - t * pass_m, pass_m)
                 live_blocks = live_rows // ROWBLK
-                tile_block_base = t * tile_blocks  # expert-local block base
+                tile_block_base = t * pass_blocks  # expert-local block base
                 parity = lax.rem(tile_count, jnp.int32(OUT_PARITIES))
 
                 # out_vm[parity] reuse guard. Predicated on the outstanding
@@ -1517,13 +1579,13 @@ def _build_fused_ep_moe_kernel(
                             )
 
                     _, next_shift = gather_dma_coords(next_group_base)
-                    next_rows = jnp.minimum(rows - next_t * tile_m, tile_m)
+                    next_rows = jnp.minimum(rows - next_t * pass_m, pass_m)
                     lhs_issue_tile(
-                        slab_base + next_t * tile_m,
+                        slab_base + next_t * pass_m,
                         next_rows // ROWBLK,
                         other_parity,
                         next_group_slot,
-                        next_shift + next_within * tile_m,
+                        next_shift + next_within * pass_m,
                     )
 
                 # The next expert's index window, a tile early. This is the
@@ -1542,7 +1604,7 @@ def _build_fused_ep_moe_kernel(
                     height above them is pure waste; `height` is the smallest
                     rung that still covers them.
                     """
-                    full = height == tile_m
+                    full = height == pass_m
                     act_rows = (
                         lhs_vm[parity] if full else lhs_vm[parity, pl.ds(0, height)]
                     ).reshape(height, hidden)
@@ -1646,19 +1708,28 @@ def _build_fused_ep_moe_kernel(
                     wire_rows_staged = wire_rows.reshape(
                         height, lane_blocks, HIDDEN_LANE_BLOCK
                     )
-                    wire_scales_staged = wire_scales.reshape(1, height)
+                    # One mirror row per tile of the pass, each the tile's
+                    # scales; a rung shorter than a tile fills its row's head.
+                    wire_scales_staged = [
+                        wire_scales[j * tile_m : min(height, (j + 1) * tile_m)].reshape(
+                            1, -1
+                        )
+                        for j in range(-(-height // tile_m))
+                    ]
 
                     def store_parity(static_parity):
-                        """Stage the tile's rows and scales in one out_vm
+                        """Stage the pass's rows and scales in one out_vm
                         slot."""
                         if full:
                             out_vm[static_parity] = wire_rows_staged
-                            oscl_vm[static_parity] = wire_scales_staged
                         else:
                             out_vm[static_parity, pl.ds(0, height)] = wire_rows_staged
-                            oscl_vm[static_parity, :, pl.ds(0, height)] = (
-                                wire_scales_staged
-                            )
+                        for j, scales in enumerate(wire_scales_staged):
+                            slot_j = static_parity * pass_tiles + j
+                            if scales.shape[1] == tile_m:
+                                oscl_vm[slot_j] = scales
+                            else:
+                                oscl_vm[slot_j, :, pl.ds(0, scales.shape[1])] = scales
 
                     # Store slots must be static, so these branches stay
                     # static.
@@ -1671,9 +1742,9 @@ def _build_fused_ep_moe_kernel(
                         store_parity(1)
 
                 # Exactly one rung runs: live_rows is a whole number of
-                # ROWBLK in [ROWBLK, tile_m], and the rungs partition that.
+                # ROWBLK in [ROWBLK, pass_m], and the rungs partition that.
                 if len(height_rungs) == 1:
-                    compute_tile(tile_m)
+                    compute_tile(pass_m)
                 else:
                     for rung_i, rung in enumerate(height_rungs):
                         below = height_rungs[rung_i - 1] if rung_i else 0
@@ -1901,6 +1972,7 @@ def _build_fused_ep_moe_kernel(
                 rhs_qb=rhs_qb,
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
+                pass_tiles=pass_tiles,
             )
         ]
         + [

@@ -1362,6 +1362,7 @@ def vmem_scratch_arrays(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    pass_tiles=1,
 ):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
@@ -1381,11 +1382,16 @@ def vmem_scratch_arrays(
     leaves the row axis untiled, which is what makes an 8-row transport
     offset legal. It does that for every element type, which is why a
     sixteen-bit wire takes the same geometry at twice the bytes.
+
+    `pass_tiles` is how many capacity tiles one FFN pass computes: the row
+    staging and the wire buffer hold a pass, the scale mirror a sublane per
+    tile of it.
     """
     form = weight_form(weight_format)
     lane_blocks = row_lane_blocks(hidden)
-    # The tile height IS the capacity, and the out pair is in tile units.
+    # The tile height IS the capacity, and the out pair is in pass units.
     tile_m = capacity
+    pass_m = pass_tiles * tile_m
     # A scale table rides the weight slots, not the expert list: it is read
     # only alongside the slab it scales, so it is staged with that slab and
     # is nbuf deep.
@@ -1428,7 +1434,7 @@ def vmem_scratch_arrays(
         [
             (
                 "ls_vm",
-                (OUT_PARITIES, act_scale_window_rows(capacity), HIDDEN_LANE_BLOCK),
+                (OUT_PARITIES, act_scale_window_rows(pass_m), HIDDEN_LANE_BLOCK),
                 jnp.float32,
             )
         ]
@@ -1440,7 +1446,7 @@ def vmem_scratch_arrays(
         # Parity-deep for the same reason ls_vm is.
         (
             "lhs_vm",
-            (OUT_PARITIES, capacity, lane_blocks, HIDDEN_LANE_BLOCK),
+            (OUT_PARITIES, pass_m, lane_blocks, HIDDEN_LANE_BLOCK),
             form.act_dtype,
         ),
         *weights,
@@ -1448,10 +1454,10 @@ def vmem_scratch_arrays(
         *act_scale,
         (
             "out_vm",
-            (OUT_PARITIES, tile_m, lane_blocks, HIDDEN_LANE_BLOCK),
+            (OUT_PARITIES, pass_m, lane_blocks, HIDDEN_LANE_BLOCK),
             form.wire_dtype,
         ),
-        ("oscl_vm", (OUT_PARITIES, 1, capacity), jnp.float32),
+        ("oscl_vm", (OUT_PARITIES * pass_tiles, 1, capacity), jnp.float32),
     ]
 
 
@@ -1532,6 +1538,7 @@ def vmem_estimate_bytes(
     has_w1_bias=False,
     has_w2_bias=False,
     info=None,
+    pass_tiles=1,
 ):
     """VMEM one built kernel occupies, from the arrays it declares.
 
@@ -1557,9 +1564,15 @@ def vmem_estimate_bytes(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        pass_tiles=pass_tiles,
     )
+    # The body's values are one pass tall.
     arrays += vmem_tile_body_arrays(
-        capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb
+        pass_tiles * capacity,
+        hidden,
+        inter,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
     )
     return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
 
@@ -1596,6 +1609,7 @@ def fit_weight_slots(
     has_w2_bias=False,
     info=None,
     limit=None,
+    pass_tiles=1,
 ):
     """The deepest prefetch schedule this shape's VMEM leaves room for.
 
@@ -1638,6 +1652,7 @@ def fit_weight_slots(
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
                 info=info,
+                pass_tiles=pass_tiles,
             ),
             limit,
         )
