@@ -841,6 +841,7 @@ def proj_and_save_state(
             tile_n_cap=runs_tile_n,
             tile_k_cap=tile_k_cap,
             wkv_scale=wkv_scale,
+            hbm_pin=True,
             interpret=interpret,
         )
     if 0 < num_tokens <= stream_max_tokens:
@@ -861,6 +862,9 @@ def proj_and_save_state(
             compress_ratio=compress_ratio,
             tile_n_cap=runs_tile_n,
             tile_k_cap=tile_k_cap,
+            # The stream knob opts the whole projection family into HBM-pinned
+            # weights; off, the runs path is byte- and placement-identical.
+            hbm_pin=stream_max_tokens > 0,
             interpret=interpret,
         )
 
@@ -943,6 +947,7 @@ def _proj_and_save_state_runs(
     interpret: bool,
     tile_k_cap: int = 3584,
     wkv_scale: jax.Array | None = None,
+    hbm_pin: bool = False,
 ) -> jax.Array:
     num_tokens, hidden_size = hidden_states.shape
     _, state_dim = wkv_wgate.shape
@@ -1000,6 +1005,9 @@ def _proj_and_save_state_runs(
         if scaled
         else jnp.ones((1, state_dim), jnp.float32)
     )
+    if hbm_pin:
+        # No XLA VMEM staging copy of the weight before the call (see the stream).
+        wkv_wgate = pltpu.with_memory_space_constraint(wkv_wgate, pltpu.HBM)
     return pl.pallas_call(
         functools.partial(kernel_runs, cfgs=cfgs, scaled=scaled),
         out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
