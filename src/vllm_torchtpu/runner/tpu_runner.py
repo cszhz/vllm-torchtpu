@@ -5573,9 +5573,7 @@ class TPUModelRunner(GPUModelRunner):
         else:
             input_ids = torch.zeros((num_tokens), dtype=torch.int32).to(self.device)
             # An idle DP rank's lockstep forward only pairs collectives and its
-            # output is discarded. One request keeps its attention passes as
-            # short as a busy rank's; `num_reqs` 1-token decodes made the idle
-            # rank the slowest in the lockstep. Values only: same program.
+            # output is discarded: one request (see `distribution` below).
             actual_num_reqs = 1 if dp_lockstep else min(num_tokens, num_reqs)
         inputs_embeds = None
         if self.uses_mrope:
@@ -5600,8 +5598,15 @@ class TPUModelRunner(GPUModelRunner):
         # V3: request_distribution = [decode_end, prefill_end, mixed_end].
         # Dummy runs use one scheduled token per active request, so model
         # them as pure decode to match the real single-chip path; a profile
-        # run holds mixed requests, as a real prefill chunk does.
-        distribution = [0, 0, actual_num_reqs] if profiling else [actual_num_reqs] * 3
+        # run holds mixed requests, as a real prefill chunk does. So does an
+        # idle lockstep rank's request: busy ranks' verify windows leave the
+        # decode passes empty, so they are skipped, while a non-empty one made
+        # the idle rank the slowest in the lockstep. Values only: same program.
+        distribution = (
+            [0, 0, actual_num_reqs]
+            if profiling or dp_lockstep
+            else [actual_num_reqs] * 3
+        )
         request_distribution = torch.tensor(distribution, dtype=torch.int32).to(
             self.device
         )
