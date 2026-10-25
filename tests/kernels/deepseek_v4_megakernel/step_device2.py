@@ -282,8 +282,11 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
         # VLLM_TPU_DSV4_MK_ATTN_PIPELINE off vs on (pf_fault: the prefetch control)
         diff = jax.jit(lambda x, y: jnp.sum(x != y))
         cp = jax.jit(lambda x: x + jnp.zeros((), x.dtype))
-        off = dataclasses.replace(scfg, attn_pipeline=False, attn_split=False)
-        on = dataclasses.replace(scfg, attn_pipeline=True, attn_split=scfg.attn_tp > 1)
+        grp = scfg.attn_tp > 1
+        modes = {"off": (False, False), "pipe": (True, grp), "pipe_nosplit": (True, False),
+                 "split": (False, grp)}  # (attn_pipeline, attn_split); controls: pc_ref / pc_new
+        off, on = (dataclasses.replace(scfg, attn_pipeline=modes[m][0], attn_split=modes[m][1])
+                   for m in (var.get("pc_ref", "off"), var.get("pc_new", "pipe")))
         orig = [cp(x) for x in args[c0 : c0 + n_arr]]
         ca, cb = [cp(x) for x in orig], [cp(x) for x in orig]
         oa = make(True, off)(*args[:c0], *ca, *args[c0 + n_arr :])
