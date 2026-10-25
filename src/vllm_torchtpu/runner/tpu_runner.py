@@ -6720,7 +6720,7 @@ class TPUModelRunner(GPUModelRunner):
             for num_tokens in self.num_tokens_paddings:
                 logger.info("  -- num_tokens: %d", num_tokens)
                 if buckets.needs_retrace(num_tokens):
-                    shape_variants.retrace(self.model, self.vllm_config)
+                    shape_variants.retrace(self.model, self.vllm_config, num_tokens)
                 self._dummy_run(
                     num_tokens,
                     self.num_reqs_max_model_len,
