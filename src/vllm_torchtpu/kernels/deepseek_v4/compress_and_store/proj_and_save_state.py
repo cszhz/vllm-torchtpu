@@ -694,7 +694,10 @@ def _proj_and_save_state_stream_multi(
             + 2 * num_tokens * state_dim * 4 * 2
             + 3 * num_tokens * state_dim * 4
         )
-    vmem_limit = min(max(vmem_need + (8 << 20), 32 << 20), 60 << 20)
+    # Tight scoped VMEM: a large limit stops XLA keeping its own VMEM prefetches
+    # (e.g. the next MoE operands) live across this call (measured: +4 us per
+    # decode MoE call at a 32 MiB floor, c8 twin j-2ae4b46e vs j-52b5ae5a).
+    vmem_limit = min(max(vmem_need + (4 << 20), 12 << 20), 60 << 20)
     n_in = 1 + 3 * G + 1  # x, groups, positions (after the G scalar prefetches)
     outs = pl.pallas_call(
         functools.partial(
