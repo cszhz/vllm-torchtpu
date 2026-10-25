@@ -39,7 +39,10 @@ MAX_M = 32
 LANE = 128
 FP8_SUBLANE_TILE = 32  # rows per fp8 (32, 128) HBM tile
 
-Config = tuple[str, int, int, int]  # (split, tile, nbuf, ndma)
+# (split, tile, nbuf, ndma[, "f8dot"]). "f8dot": x_q stays fp8 and the dot is fp8 x
+# fp8 with f32 accumulation, as in `xla_quantized_matmul`; with K tiles a multiple of
+# 256 (or the 'n' split) the output is bit-identical to that XLA path on tpu7x.
+Config = tuple
 
 # Fastest config per DeepSeek-V4 TP8 decode shape on tpu7x at M=16, all 8 cores
 # streaming at once, 16 distinct weights per chain. `TUNED`: the weight operand is
@@ -66,17 +69,45 @@ assert TUNED.keys() == TUNED_HBM.keys()
 PIN_WS: frozenset[tuple[int, int]] = frozenset({(7168, 2048), (2048, 7168)})
 PIN_X: frozenset[tuple[int, int]] = frozenset({(2048, 7168)})
 
+# Table "v2" (weight pinned to HBM): TUNED_HBM's TP8 shapes unchanged, plus the TP4
+# shards and the shared-expert down projections as "f8dot" configs, i.e. bit-identical
+# to the XLA path those shapes otherwise take. Fastest such config per shape on tpu7x,
+# all 8 cores streaming, 16 distinct weights per chain, M=16 and 32 (us/call, XLA ->
+# here): wq_b 11.8 -> 9.5, wo_b 13.8 -> 10.5, gate_up 5.4 -> 5.0, down 3.9 -> 3.5.
+TUNED_V2_HBM: dict[tuple[int, int], Config] = {
+    **TUNED_HBM,
+    (384, 7168): ("n", 1792, 4, 1, "f8dot"),  # TP8 shared_experts.down_proj
+    (1536, 16384): ("k", 256, 4, 4, "f8dot"),  # TP4 attn.wq_b
+    (4096, 7168): ("k", 256, 4, 4, "f8dot"),  # TP4 attn.wo_b
+    (7168, 1536): ("k", 512, 8, 4, "f8dot"),  # TP4 shared_experts.gate_up_proj
+    (768, 7168): ("n", 1792, 4, 1, "f8dot"),  # TP4 shared_experts.down_proj
+}
 
-def supports(m: int, w_q: jax.Array, w_s: jax.Array) -> bool:
+
+def table(hbm_pin: bool, version: str = "") -> dict[tuple[int, int], Config]:
+    """The measured configs a layer is served from: `version` "" is the original
+    TUNED / TUNED_HBM pair, "v2" is TUNED_V2_HBM (HBM-pinned layers only)."""
+    if version == "":
+        return TUNED_HBM if hbm_pin else TUNED
+    if version == "v2":
+        if not hbm_pin:
+            raise ValueError("fp8_skinny table v2 is measured with hbm_pin only")
+        return TUNED_V2_HBM
+    raise ValueError(f"unknown fp8_skinny table {version!r}")
+
+
+def supports(
+    m: int, w_q: jax.Array, w_s: jax.Array, configs: dict | None = None
+) -> bool:
     """True when this kernel serves the call: M <= MAX_M, per-channel fp8, and a
-    (K, N) with a measured config. Other shapes stay on XLA: nothing says an
-    unmeasured shape would win."""
+    (K, N) with a measured config in `configs` (default TUNED). Other shapes stay
+    on XLA: nothing says an unmeasured shape would win."""
     return (
         m <= MAX_M
         and w_q.ndim == 2
         and w_s.ndim == 1
         and w_q.dtype == jnp.float8_e4m3fn
-        and tuple(w_q.shape) in TUNED
+        and tuple(w_q.shape) in (TUNED if configs is None else configs)
         and w_s.shape[0] == w_q.shape[1]
     )
 
@@ -190,7 +221,11 @@ def _vmem_limit(m, k, n, tile, nbuf, split):
 
 
 @functools.cache
-def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma, x_hbm=False, ws_hbm=False):
+def _build(
+    m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma, options=(), x_hbm=False, ws_hbm=False
+):
+    if set(options) - {"f8dot"}:
+        raise ValueError(f"unknown fp8_skinny options {options}")
     full = k if split == "k" else n
     if full % t or t % LANE:
         raise ValueError(
@@ -203,7 +238,7 @@ def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma, x_hbm=False, ws_hb
     nbuf = max(1, min(nbuf, n_tiles))
     tile = (k, t) if split == "n" else (t, n)
     scratch = [
-        pltpu.VMEM((m, k), jnp.bfloat16),
+        pltpu.VMEM((m, k), w_dtype if "f8dot" in options else jnp.bfloat16),
         pltpu.VMEM((m, 1), jnp.float32),
         pltpu.VMEM((nbuf, *tile), w_dtype),
         pltpu.SemaphoreType.DMA((nbuf,)),
@@ -243,7 +278,8 @@ def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma, x_hbm=False, ws_hb
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=_vmem_limit(m, k, n, tile, nbuf, split),
         ),
-        name=f"fp8_skinny_{split}{t}_b{nbuf}_d{ndma}_m{m}_k{k}_n{n}"
+        name=f"fp8_skinny_{split}{t}_b{nbuf}_d{ndma}{''.join('_' + o for o in options)}"
+        f"_m{m}_k{k}_n{n}"
         + ("_xh" if x_hbm else "")
         + ("_sh" if ws_hbm else ""),
     )
@@ -281,12 +317,15 @@ def fp8_skinny_matmul(
     n = w_q.shape[1]
     if config is None:
         config = (TUNED_HBM if hbm_pin else TUNED)[(k, n)]
-    split, t, nbuf, ndma = config
+    split, t, nbuf, ndma, *options = config
     # Only with the weight pinned: an unpinned weight would be staged anyway.
     pin = hbm_pin and operand_pin.enabled("skinny")
     ws_hbm = pin and (k, n) in PIN_WS
     x_hbm = pin and (k, n) in PIN_X
-    call = _build(m, k, n, w_q.dtype, x.dtype, split, t, nbuf, ndma, x_hbm, ws_hbm)
+    call = _build(
+        m, k, n, w_q.dtype, x.dtype, split, t, nbuf, ndma, tuple(sorted(options)),
+        x_hbm, ws_hbm,
+    )
     w_s2 = w_s.reshape(1, n).astype(jnp.float32)
     if hbm_pin:
         return _call_hbm_pinned(call, x, w_s2, w_q, x_hbm, ws_hbm)

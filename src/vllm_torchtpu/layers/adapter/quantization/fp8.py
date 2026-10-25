@@ -1341,16 +1341,17 @@ def _arm_fp8_linear_pallas(layer: torch.nn.Module, prefix: str) -> None:
     """Mark a selected per-channel FP8 layer with a measured (K, N) for the
     `fp8_skinny` path and build its op (load time, outside Dynamo)."""
     weight, scale = layer.weight, layer.weight_scale
+    hbm_pin = _site_listed(prefix, envs.TPU_FP8_SKINNY_HBM_PIN_SITES)
     if not (
         fp8_linear_pallas_selected(prefix)
         and not getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
         and weight.dtype == torch.float8_e4m3fn
         and scale.ndim == 1
-        and tuple(weight.shape) in fp8_skinny.TUNED
     ):
         return
-    hbm_pin = _site_listed(prefix, envs.TPU_FP8_SKINNY_HBM_PIN_SITES)
-    table = fp8_skinny.TUNED_HBM if hbm_pin else fp8_skinny.TUNED
+    table = fp8_skinny.table(hbm_pin, envs.TPU_FP8_SKINNY_TABLE)
+    if tuple(weight.shape) not in table:
+        return
     setattr(layer, FP8_PALLAS_ATTR, hbm_pin)
     get_fp8_linear_pallas_op(hbm_pin)
     logger.info_once(
