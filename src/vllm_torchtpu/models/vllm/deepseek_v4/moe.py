@@ -107,7 +107,8 @@ class DeepseekV4MoE(nn.Module):
                     hidden_act=config.hidden_act,
                     swiglu_limit=self.swiglu_limit,
                     quant_config=quant_config,
-                    reduce_results=False,
+                    # Unsharded, so there is no TP sum to skip; reduce_results
+                    # stays at its default (a no-op without TP).
                     is_sequence_parallel=True,
                     prefix=f"{prefix}.shared_experts_full",
                 )
