@@ -369,9 +369,12 @@ FAULTS = {
 
 # ----------------------------------------------------------------------------- stock (incumbent) region
 def stock_env():
-    """Fin env for the attention path (must be set before vllm_torchtpu.envs is read)."""
-    os.environ.setdefault("TPU_DSV4_SWA_SINGLE_PASS", "1")
-    os.environ.setdefault("TPU_DSV4_CSA_UNION_DENSE", "1")
+    """Served fin env for this path (E2E#3 fin recipes, dsv4-trial2/e2e3/recipes/*-fin-*.yaml); set before vllm_torchtpu.envs is read."""
+    for k, v in (("TPU_DSV4_SWA_SINGLE_PASS", "1"), ("TPU_DSV4_CSA_UNION_DENSE", "1"),
+                 ("TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK", "8,64,64"), ("TPU_ROPE_CACHE_ROW_MAJOR", "1"),
+                 ("TPU_KV_DROP_HCA_STATE_CHECKPOINT", "1"), ("TPU_DSV4_PAIR_SWAP", "1"),
+                 ("TPU_DSV4_ATTN_INTRA_CHIP_TP", "0"), ("TPU_STREAMIDX_VERIFY_BD", "1")):
+        os.environ.setdefault(k, v)
 
 
 def device_inputs(inp: Inputs):
