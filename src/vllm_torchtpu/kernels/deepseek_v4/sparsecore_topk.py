@@ -1264,6 +1264,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "return_scores",
         "one_launch",
         "coop_max_rows",
+        "max_row_length",
     ),
 )
 def sparsecore_topk(
@@ -1276,6 +1277,7 @@ def sparsecore_topk(
     return_scores: bool = False,
     one_launch: bool = False,
     coop_max_rows: int = 0,
+    max_row_length: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
@@ -1295,6 +1297,10 @@ def sparsecore_topk(
     cooperative path, split over ``p`` subcores by its own length, instead of
     one subcore per row. A decode batch has only a handful of long rows, which
     otherwise leave most subcores idle.
+
+    ``max_row_length``: a static bound on ``row_lengths``. When every row fits
+    one subcore's by-length buffer, the cooperative pass (which would own no
+    row) is not launched.
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -1361,7 +1367,9 @@ def sparsecore_topk(
         return_scores=return_scores,
         scheduling_group_id=scheduling_group_id,
     )
-    if n <= BY_LENGTH_SLOT_WORDS:
+    if n <= BY_LENGTH_SLOT_WORDS or (
+        max_row_length is not None and max_row_length <= BY_LENGTH_SLOT_WORDS
+    ):
         return by_length
     is_long = lengths > BY_LENGTH_SLOT_WORDS
     # Rows it does not own are never read, so it need not write them either.

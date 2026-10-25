@@ -288,6 +288,14 @@ def _merge_kv_split_jax(
     return merge_kv_split_topk(shares, k)
 
 
+def _merge_kv_split_all_jax(gathered: jax.Array, *, k: int, kv_split: int) -> jax.Array:
+    """i32[kv_split * T, 2k] rank-major shares -> the unsplit top-k of every
+    token, i32[T, k] (no second collective)."""
+    return merge_kv_split_topk(
+        gathered.reshape(kv_split, -1, 2 * k), k, payload_merge=True
+    )
+
+
 def _merge_kv_split_a2a_jax(
     exchanged: jax.Array, *, k: int, kv_split: int
 ) -> jax.Array:
@@ -361,8 +369,13 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         # top-k candidates (same indices, same order).
         tp = get_tensor_model_parallel_world_size()
         split_min = envs.TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS
-        object.__setattr__(self, "kv_split", tp if (split_min > 0 and tp > 1) else 1)
-        object.__setattr__(self, "kv_split_min_tokens", split_min)
+        decode_buckets = frozenset(envs.TPU_DSV4_INDEXER_KV_SPLIT_DECODE_BUCKETS)
+        split_on = split_min > 0 or bool(decode_buckets)
+        object.__setattr__(self, "kv_split", tp if (split_on and tp > 1) else 1)
+        object.__setattr__(
+            self, "kv_split_min_tokens", split_min if split_min > 0 else 1 << 30
+        )
+        object.__setattr__(self, "kv_split_decode_buckets", decode_buckets)
         if self.kv_split > 1:
             object.__setattr__(
                 self, "indexer_split_ops", self._build_indexer_op(self.kv_split)
@@ -471,7 +484,24 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
                 )
 
             a2a_merge_op.register_fake(_fake_merge_a2a)
-            indexer_jax_op = (indexer_jax_op, merge_op, a2a_merge_op)
+            all_merge_op = pallas.jax_op(
+                f"pallas::deepseek_v4_indexer_merge_all_k{self.topk_tokens}_s{kv_split}",
+                functools.partial(
+                    _merge_kv_split_all_jax, k=self.topk_tokens, kv_split=kv_split
+                ),
+                mesh=mesh,
+                input_partition_specs=(P(),),
+            )
+
+            def _fake_merge_all(gathered):
+                return torch.empty(
+                    (gathered.shape[0] // kv_split, self.topk_tokens),
+                    dtype=torch.int32,
+                    device=gathered.device,
+                )
+
+            all_merge_op.register_fake(_fake_merge_all)
+            indexer_jax_op = (indexer_jax_op, merge_op, a2a_merge_op, all_merge_op)
 
         _indexer_op_cache[op_name] = indexer_jax_op
         return indexer_jax_op
@@ -531,10 +561,17 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             idx_q_start_loc,
             idx_req_dist,
         )
-        if self.kv_split == 1 or q.shape[0] < self.kv_split_min_tokens:
+        decode_split = q.shape[0] in self.kv_split_decode_buckets
+        if self.kv_split == 1 or (
+            q.shape[0] < self.kv_split_min_tokens and not decode_split
+        ):
             return self.indexer_op(*args)
-        share_op, merge_op, a2a_merge_op = self.indexer_split_ops
+        share_op, merge_op, a2a_merge_op, all_merge_op = self.indexer_split_ops
         rank = tp_rank_as_data(get_tp_group(), q.device)
+        if decode_split:
+            return all_merge_op(
+                tensor_model_parallel_all_gather(share_op(*args, rank), 0)
+            )
         return merge_kv_split_shares(
             share_op(*args, rank),
             merge_op,

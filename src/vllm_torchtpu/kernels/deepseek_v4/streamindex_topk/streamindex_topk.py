@@ -1202,6 +1202,7 @@ def kv_split_window(
 def merge_kv_split_topk(
     local: jax.Array,  # i32[kv_split, T, 2 * k]: (indices, score bits) per rank
     k: int,
+    payload_merge: bool = False,
 ) -> jax.Array:  # i32[T, k]
     """Global top-k from every rank's `kv_split` top-k, in column order.
 
@@ -1210,12 +1211,16 @@ def merge_kv_split_topk(
     each lists its winners in column order, so the rank-major candidate list
     is in column order and the merge breaks ties toward the lowest column,
     as the unsplit top-k does.
+
+    `payload_merge`: always select with one subcore per row and let it emit
+    the winners' indices, instead of a cooperative selection followed by an
+    XLA gather of the indices (faster for a decode batch's few rows).
     """
     num_ranks, num_tokens, _ = local.shape
     cand = local.reshape(num_ranks, num_tokens, 2, k).transpose(2, 1, 0, 3)
     cand = cand.reshape(2, num_tokens, num_ranks * k)
     n = num_ranks * k
-    if _pick_partition(num_tokens, n, k) == 1:
+    if payload_merge or _pick_partition(num_tokens, n, k) == 1:
         # The SparseCore emits the winners' indices itself: an XLA gather of
         # them costs more than the selection.
         return _sc_topk_direct(
@@ -1517,6 +1522,7 @@ def streamindex_topk(
     pages_per_seq = page_indices.shape[0] // max_num_seqs
 
     kv_window = None
+    max_row_length = None
     global_seq_lens = seq_lens
     if kv_split > 1:
         if cp_size > 1 or enable_early_exit:
@@ -1539,6 +1545,8 @@ def streamindex_topk(
             axis=1,
         ).reshape(-1)
         seq_lens = kv_window[1] * compression_ratio
+        # A share is at most this many compressed rows (`kv_split_window`).
+        max_row_length = cdiv(pages_per_seq, kv_split) * page_size
 
     for bkv_p in num_kv_pages_per_blocks:
         bkv_sz = page_size * bkv_p
@@ -1945,6 +1953,7 @@ def streamindex_topk(
                     return_scores=True,
                     one_launch=sc_topk_one_launch,
                     coop_max_rows=sc_topk_coop_max_rows,
+                    max_row_length=max_row_length,
                 )
                 topk_scores_list.append(chunk_topk_scores)
             else:

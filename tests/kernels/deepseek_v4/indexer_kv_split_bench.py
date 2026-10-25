@@ -87,13 +87,18 @@ def indexer(variant, x, w, tp):
     """Per-rank body (inside shard_map): i32[T, TOPK]."""
     if variant == "unsplit":
         return topk(x, w)
-    rank = jax.lax.axis_index("tp")
+    if variant == "split_fast":
+        # The served path passes the rank as data from an all-to-all of iota.
+        ids = jnp.arange(tp, dtype=jnp.int32)
+        rank = jax.lax.all_to_all(ids, "tp", 0, 0, tiled=True)[0]
+    else:
+        rank = jax.lax.axis_index("tp")
     idx, sc = topk(x, w, kv_split=tp, rank=rank)
     share = jnp.concatenate([idx, sc], axis=1)  # [T, 2k]
     shares = jax.lax.all_gather(share, "tp")  # [tp, T, 2k]
     T = share.shape[0]
-    if variant == "split_all" or T % tp:
-        return merge_kv_split_topk(shares, TOPK)
+    if variant in ("split_all", "split_fast") or T % tp:
+        return merge_kv_split_topk(shares, TOPK, payload_merge=variant == "split_fast")
     rows = T // tp
     mine = jax.lax.dynamic_slice_in_dim(shares, rank * rows, rows, axis=1)
     merged = merge_kv_split_topk(mine, TOPK)  # [T/tp, k]
@@ -175,16 +180,16 @@ def run_case(tp, T, ctx, check, top_ops=0):
     wo = jnp.ones((7168, max(OTHER_N, 1)), jnp.bfloat16) * 1e-4
     if check:
         outs = {}
-        for v in ("unsplit", "split_own", "split_all"):
+        for v in ("unsplit", "split_all", "split_fast"):
             print(f"... check tp{tp} T{T} {ctx // 1000}k {v}", flush=True)
             f = jax.jit(make_step(v, x, tp, mesh, layers=1))
             outs[v] = np.asarray(f(x["w"], h, wo)[2])
         n_rows = n_req * VQ
-        for v in ("split_own", "split_all"):
+        for v in ("split_all", "split_fast"):
             same = np.array_equal(outs[v][:n_rows], outs["unsplit"][:n_rows])
             print(f"EXACT tp{tp} T{T} {ctx // 1000}k {v}: {'PASS' if same else 'FAIL'}")
     res = {}
-    for v in ("none", "unsplit", "split_all", "split_own"):
+    for v in ("none", "unsplit", "split_all", "split_fast"):
         print(f"... timing tp{tp} T{T} {ctx // 1000}k {v}", flush=True)
         res[v] = per_step_us(
             make_step(v, x, tp, mesh), (x["w"], h, wo), v, top_ops=top_ops
@@ -192,7 +197,7 @@ def run_case(tp, T, ctx, check, top_ops=0):
     base = res["none"]
     print(
         f"TIME tp{tp} T{T} {n_req}x{ctx // 1000}k per layer: other-only {base:.2f}  "
-        + "  ".join(f"{v} +{res[v] - base:.2f}" for v in ("unsplit", "split_own", "split_all"))
+        + "  ".join(f"{v} +{res[v] - base:.2f}" for v in ("unsplit", "split_all", "split_fast"))
         + " us"
     )
 
@@ -201,11 +206,15 @@ def main():
     if os.environ.get("BREAKDOWN"):
         run_case(8, 8, 480_000, False, top_ops=40)
         return
-    run_case(8, 8, 250_000, True)
-    for tp, Ts in ((8, (8, 16, 32)), (4, (16, 32))):
-        for T in Ts:
-            for ctx in (80_000, 250_000, 480_000):
-                run_case(tp, T, ctx, ctx == 250_000 and (tp, T) != (8, 8))
+    run_case(4, 32, 120_000, True, top_ops=40)
+    for tp, T, ctxs in (
+        (4, 32, (80_000, 120_000, 250_000, 480_000)),
+        (4, 64, (80_000, 120_000, 250_000)),
+        (8, 32, (80_000, 120_000, 250_000)),
+        (8, 8, (80_000, 480_000)),
+    ):
+        for ctx in ctxs:
+            run_case(tp, T, ctx, ctx == 80_000)
 
 
 if __name__ == "__main__":
