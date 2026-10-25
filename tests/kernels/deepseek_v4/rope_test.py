@@ -90,7 +90,8 @@ def qnorm_rope_ref_impl(x, positions, cos_sin_cache, eps, inverse=False):
 def assert_bits_equal(actual, expected):
     """Byte-for-byte equality, for dtypes NumPy will not compare directly."""
     np.testing.assert_array_equal(
-        np.asarray(actual).view(np.uint8), np.asarray(expected).view(np.uint8)
+        np.ascontiguousarray(actual).view(np.uint8),
+        np.ascontiguousarray(expected).view(np.uint8),
     )
 
 
