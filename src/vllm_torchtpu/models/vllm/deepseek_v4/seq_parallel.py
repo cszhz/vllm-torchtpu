@@ -66,13 +66,13 @@ def _build_ops(mesh, groups: tuple[tuple[int, ...], ...]):
 
     # Every operand annotated jax.Array: torch_tpu infers static argnums from
     # the signature and refuses an unannotated one.
-    def all_gather(x: jax.Array) -> jax.Array:
+    def all_gather(x: jax.Array, like: jax.Array) -> jax.Array:
         return smap(
-            lambda b: lax.all_gather(
+            lambda b, _: lax.all_gather(
                 b, EP_AXIS_NAME, axis=0, tiled=True, axis_index_groups=index_groups
             ),
-            1,
-        )(x)
+            2,
+        )(x, like)
 
     def reduce_scatter(x: jax.Array) -> jax.Array:
         return smap(
@@ -103,13 +103,16 @@ def _build_ops(mesh, groups: tuple[tuple[int, ...], ...]):
         )
         # The default fake exports fn at the operands' shapes; the row count
         # is known without that.
-        o.register_fake(lambda x, *_: x.new_empty((rows(x.shape[0]), *x.shape[1:])))
+        o.register_fake(lambda x, *a: x.new_empty((rows(x, *a), *x.shape[1:])))
         return o
 
     return (
-        op("all_gather", all_gather, 1, lambda n: n * cores),
-        op("reduce_scatter", reduce_scatter, 1, lambda n: n // cores),
-        op("take", take, 2, lambda n: n // cores),
+        # Sized off `like` so the gathered rows carry the forward's own token
+        # symbol: torch_tpu refuses allocations sized by a derived expression
+        # such as cores * (tokens // cores).
+        op("all_gather", all_gather, 2, lambda x, like: like.shape[0]),
+        op("reduce_scatter", reduce_scatter, 1, lambda x: x.shape[0] // cores),
+        op("take", take, 2, lambda x, slot: x.shape[0] // cores),
     )
 
 
@@ -172,10 +175,12 @@ def take_local(x: torch.Tensor) -> torch.Tensor:
     return _TAKE(x, small_all_reduce_op._RANK)
 
 
-def all_gather(x: torch.Tensor) -> torch.Tensor:
-    """Every core's rows of the token-sharded ``x``, in slot order."""
+def all_gather(x: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """Every core's rows of the token-sharded ``x``, in slot order. ``like``
+    is any tensor whose leading dim is the forward's token count (positions):
+    the result takes that dim from it."""
     assert _AG is not None
-    return _AG(x)
+    return _AG(x, like)
 
 
 def reduce_scatter(x: torch.Tensor) -> torch.Tensor:
