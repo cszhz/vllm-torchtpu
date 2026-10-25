@@ -392,6 +392,12 @@ class VllmDeepseekV4MLAAttention(
                 ),
                 "union_dense_max_heads": envs.TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS,
                 "union_dense_max_kv_tp4": envs.TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4,
+                # The TP4 plan outside its lax.cond pays only with the indexer
+                # token split (short SparseCore top-k ahead of it).
+                "union_dense_plan_unconditional": (
+                    envs.TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE > 0
+                    and bool(envs.TPU_DSV4_SEQ_PARALLEL)
+                ),
             }
             if is_csa
             else {

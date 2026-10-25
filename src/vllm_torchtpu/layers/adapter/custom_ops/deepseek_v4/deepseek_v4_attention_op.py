@@ -220,6 +220,7 @@ def _attention_csa(
     union_dense_rows_per_token: int = 160,
     union_dense_max_heads: int = 32,
     union_dense_max_kv_tp4: int = 0,
+    union_dense_plan_unconditional: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -290,6 +291,7 @@ def _attention_csa(
                 if q.shape[1] > 16 and union_dense_max_kv_tp4 > 0
                 else {}
             ),
+            unconditional=union_dense_plan_unconditional and q.shape[1] > 16,
         )
     extra, swa_output, union_plan = jax.lax.optimization_barrier(
         (extra, swa_output, union_plan)

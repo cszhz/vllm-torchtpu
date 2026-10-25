@@ -786,6 +786,7 @@ def prepare(
     count_first: bool = True,
     split: int = 1,
     max_kv: int | None = None,
+    unconditional: bool = False,
 ) -> dict:
     """The union plan of a step (SparseCore), independent of q and the SWA
     pass: a caller can issue it ahead so it runs behind TensorCore work.
@@ -858,12 +859,18 @@ def prepare(
         use_union = use_union & jnp.all(u_full == usize)
     else:
         # One pass (where fallbacks are rare and the plan's fixed cost matters).
-        # Unconditional: inside a lax.cond the SparseCore call starts and
+        # `unconditional`: inside a lax.cond the SparseCore call starts and
         # completes within the branch, so it cannot run behind the TensorCore
-        # work before the attention (SWA, compressor) and its whole latency was
-        # exposed. With no routed sequence every block has qn == 0 and the
-        # kernel skips it; use_union is then False and the outputs are unused.
-        idx, mask, usize = full(None)
+        # work before the attention (SWA, compressor) and its whole latency is
+        # exposed. Outside it, XLA issues it right after the indexer top-k --
+        # a win only when the SparseCore top-k is short (indexer token split:
+        # c16 twin -52 us/CSA layer), a loss when the top-k it then waits on
+        # is long (+40 us without the split). With no routed sequence every
+        # block has qn == 0 and the kernel skips it; use_union is then False.
+        if unconditional:
+            idx, mask, usize = full(None)
+        else:
+            idx, mask, usize = lax.cond(has_routed, full, none, None)
         use_union = has_routed & fits(usize)
     return dict(
         idx=idx, mask=mask, usize=usize, q0=q0, qn=qn, seq_b=seq_b,
