@@ -745,6 +745,35 @@ def _pair_proj_jax(
     )
 
 
+def _get_pair_op(statics):
+    key = tuple(tuple(sorted(st.items())) for st in statics)
+    op = _pair_op_cache.get(key)
+    if op is None:
+        name = "pallas::deepseek_v4_compressor_pair_proj_" + "_".join(
+            f"{st['head_dim']}x{st['compress_ratio']}x{st['state_block_size']}"
+            for st in statics
+        )
+        grp_specs = (P(), P(), P(), P(BATCH_AXIS), P(), P(BATCH_AXIS), P(), P())
+        op = pallas.jax_op(
+            name,
+            functools.partial(
+                _pair_proj_jax, statics_a=statics[0], statics_b=statics[1]
+            ),
+            mesh=get_pallas_op_mesh(),
+            donate_argnums=(11, 19),
+            input_partition_specs=(P(None, None), P(None), P(), P())
+            + grp_specs
+            + grp_specs,
+        )
+
+        def _fake(*a, **k):
+            return torch.empty_like(a[11]), torch.empty_like(a[19])
+
+        op.register_fake(_fake)
+        _pair_op_cache[key] = op
+    return op
+
+
 def pair_proj_forward(
     comp_a: "VllmDeepseekCompressor",
     comp_b: "VllmDeepseekCompressor",
@@ -758,9 +787,6 @@ def pair_proj_forward(
     so their next `forward` skips the projection. Returns False (nothing
     marked) when this step does not qualify -- the callers then run as usual.
     """
-    n = hidden_states.shape[0]
-    if not (0 < n <= envs.TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS):
-        return False
     preps = []
     for comp, rot in ((comp_a, rotary_a), (comp_b, rotary_b)):
         if comp._separate_state:
@@ -769,44 +795,33 @@ def pair_proj_forward(
         if prep is None:
             return False
         preps.append((comp, prep))
-    statics = []
-    args = [hidden_states, positions]
-    cos = []
-    for comp, (operands, cache, _, _, _, _) in preps:
-        (_, w, ws, ape, _, cos_sin, _, st, qsl, kvt, dist, _) = operands
-        cos.append(cos_sin)
-        args += [w, ws, ape, st, qsl, kvt, dist, cache]
-        statics.append(dict(
+    # Build every op this path needs on the same call that first builds the
+    # compressors' own ops (the first forward with live caches), whatever its
+    # token count: building a jax_op is not traceable, so it must not first
+    # happen inside a compiled decode graph.
+    statics = [
+        dict(
             compress_ratio=comp.compress_ratio,
             state_block_size=comp.state_cache.block_size,
             head_dim=comp.head_dim,
             overlap=comp.overlap,
             seq_along_lane=comp.head_dim == 128,
             separate_state=False,
-        ))
+        )
+        for comp in (comp_a, comp_b)
+    ]
+    op = _get_pair_op(statics)
+    _ = comp_a.compressor_op_skip_proj, comp_b.compressor_op_skip_proj
+    n = hidden_states.shape[0]
+    if not (0 < n <= envs.TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS):
+        return False
+    args = [hidden_states, positions]
+    cos = []
+    for comp, (operands, cache, _, _, _, _) in preps:
+        (_, w, ws, ape, _, cos_sin, _, st, qsl, kvt, dist, _) = operands
+        cos.append(cos_sin)
+        args += [w, ws, ape, st, qsl, kvt, dist, cache]
     args = args[:2] + cos + args[2:]
-    key = tuple(tuple(sorted(st.items())) for st in statics)
-    op = _pair_op_cache.get(key)
-    if op is None:
-        name = "pallas::deepseek_v4_compressor_pair_proj_" + "_".join(
-            f"{st['head_dim']}x{st['compress_ratio']}x{st['state_block_size']}"
-            for st in statics
-        )
-        grp_specs = (P(), P(), P(), P(BATCH_AXIS), P(), P(BATCH_AXIS), P(), P())
-        op = pallas.jax_op(
-            name,
-            functools.partial(_pair_proj_jax, statics_a=statics[0], statics_b=statics[1]),
-            mesh=get_pallas_op_mesh(),
-            donate_argnums=(11, 19),
-            input_partition_specs=(P(None, None), P(None), P(), P())
-            + grp_specs + grp_specs,
-        )
-
-        def _fake(*a, **k):
-            return torch.empty_like(a[11]), torch.empty_like(a[19])
-
-        op.register_fake(_fake)
-        _pair_op_cache[key] = op
     new_a, new_b = op(*args)
     preps[0][1][1].copy_(new_a)
     preps[1][1][1].copy_(new_b)
