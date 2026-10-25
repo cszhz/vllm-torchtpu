@@ -139,6 +139,9 @@ if TYPE_CHECKING:
     TPU_DSV4_COMPRESSOR_PROJ_RUNS_INDEXER: bool = False
     TPU_DSV4_COMPRESSOR_PREFILL_BLOCK: int = 128
     TPU_DSV4_COMPRESSOR_PREFILL_BLOCK_MIN_TOKENS: int = 256
+    TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS: int = 0
+    TPU_DSV4_COMPRESSOR_PROJ_STREAM_CFG: tuple[int, int, int] = (3584, 2, 1)
+    TPU_DSV4_COMPRESSOR_FP8: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_SMALL_ALL_REDUCE: bool = True
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
@@ -1080,6 +1083,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_COMPRESSOR_PREFILL_BLOCK_MIN_TOKENS": env_nonnegative_int(
         "TPU_DSV4_COMPRESSOR_PREFILL_BLOCK_MIN_TOKENS", 256
     ),
+    # DSv4 compressor projection: calls of at most this many tokens stream the
+    # weight from HBM through a VMEM ring (proj_and_save_state.kernel_stream)
+    # instead of the 4-step emit_pipeline kernel. 0 disables.
+    "TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS": env_nonnegative_int(
+        "TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS", 0
+    ),
+    # ...its ring as "k_tile,slots,dmas_per_tile". k_tile 3584 keeps the bf16
+    # stored bytes identical to the emit_pipeline kernel.
+    "TPU_DSV4_COMPRESSOR_PROJ_STREAM_CFG": env_positive_int_triple(
+        "TPU_DSV4_COMPRESSOR_PROJ_STREAM_CFG", (3584, 2, 1)
+    ),
+    # Store the compressor projections (fused_wkv_wgate; bf16 in the
+    # checkpoint) as per-output-channel e4m3 with an f32 scale, and run every
+    # projection through the stream kernel (bf16 x fp8 dot, f32 accumulation).
+    # Numerics change: needs accuracy evidence.
+    "TPU_DSV4_COMPRESSOR_FP8": env_bool("TPU_DSV4_COMPRESSOR_FP8"),
     # CSA: query tokens per gather + attention chunk of the sparse attention
     # (sparse_ragged_paged_attention). Steps of at most 128 tokens keep 32.
     "TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE": env_positive_int(

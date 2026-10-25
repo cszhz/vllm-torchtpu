@@ -17,6 +17,7 @@ import functools
 from typing import TYPE_CHECKING, cast
 
 import jax
+import jax.numpy as jnp
 import torch
 import torch.nn as nn
 from jax.sharding import PartitionSpec as P
@@ -56,6 +57,7 @@ BATCH_AXIS = None
 def _run_compressor(
     hidden_states: jax.Array,
     wkv_wgate: jax.Array,
+    wkv_scale: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
     cos_sin_cache: jax.Array,
@@ -104,6 +106,10 @@ def _run_compressor(
         proj_runs_indexer=envs.TPU_DSV4_COMPRESSOR_PROJ_RUNS_INDEXER,
         prefill_block=envs.TPU_DSV4_COMPRESSOR_PREFILL_BLOCK,
         prefill_block_min_tokens=envs.TPU_DSV4_COMPRESSOR_PREFILL_BLOCK_MIN_TOKENS,
+        proj_stream_max_tokens=envs.TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS,
+        proj_stream_cfg=envs.TPU_DSV4_COMPRESSOR_PROJ_STREAM_CFG,
+        # bf16 weights carry a placeholder scale that is never read.
+        wkv_scale=wkv_scale if wkv_wgate.dtype == jnp.float8_e4m3fn else None,
     )
 
 
@@ -112,6 +118,7 @@ def _run_compressor(
 def _compressor_jax_csa(
     hidden_states: jax.Array,
     wkv_wgate: jax.Array,
+    wkv_scale: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
     cos_sin_cache: jax.Array,
@@ -136,6 +143,7 @@ def _compressor_jax_csa(
     new_cache, new_rope_cache, _ = _run_compressor(
         hidden_states=hidden_states,
         wkv_wgate=wkv_wgate,
+        wkv_scale=wkv_scale,
         ape=ape,
         norm_weight=norm_weight,
         cos_sin_cache=cos_sin_cache,
@@ -162,6 +170,7 @@ def _compressor_jax_csa(
 def _compressor_jax_hca(
     hidden_states: jax.Array,
     wkv_wgate: jax.Array,
+    wkv_scale: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
     cos_sin_cache: jax.Array,
@@ -186,6 +195,7 @@ def _compressor_jax_hca(
     new_cache, _, new_state_cache = _run_compressor(
         hidden_states=hidden_states,
         wkv_wgate=wkv_wgate,
+        wkv_scale=wkv_scale,
         ape=ape,
         norm_weight=norm_weight,
         cos_sin_cache=cos_sin_cache,
@@ -212,6 +222,7 @@ def _compressor_jax_hca(
 def _compressor_jax_indexer(
     hidden_states: jax.Array,
     wkv_wgate: jax.Array,
+    wkv_scale: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
     cos_sin_cache: jax.Array,
@@ -235,6 +246,7 @@ def _compressor_jax_indexer(
     new_cache, _, _ = _run_compressor(
         hidden_states=hidden_states,
         wkv_wgate=wkv_wgate,
+        wkv_scale=wkv_scale,
         ape=ape,
         norm_weight=norm_weight,
         cos_sin_cache=cos_sin_cache,
@@ -395,11 +407,22 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         # re-materialize it at the `pallas.jax_op` boundary every step
         # (`tt_jit_as_strided`). A fresh buffer + copy_ breaks the chain; same
         # pattern as `_fresh()` in mla_attention_op.py and the flip in fp8.py.
+        n = w_t.shape[1]
+        if envs.TPU_DSV4_COMPRESSOR_FP8:
+            # Per-output-channel e4m3: scale = amax_k |w| / 448 (0 -> 1).
+            w_f = w_t.float()
+            scale = w_f.abs().amax(dim=0) / 448.0
+            scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+            w_t = (w_f / scale[None, :]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        else:
+            scale = torch.ones((n,), dtype=torch.float32, device=w_t.device)
         weight = torch.empty(w_t.shape, dtype=w_t.dtype, device=w_t.device).copy_(w_t)
+        scale = torch.empty((n,), dtype=torch.float32, device=w_t.device).copy_(scale)
         self.fused_wkv_wgate.weight = torch.nn.Parameter(weight, requires_grad=False)
+        self.register_buffer("_wkv_scale", scale, persistent=False)
         self._wkv_wgate_transposed = True
         if weight.device.type == "tpu":
-            synchronize_tensors([weight])
+            synchronize_tensors([weight, scale])
 
     # head_dim == 512 with overlap: CSA, which splits NoPE and RoPE.
     # head_dim == 512 without:      HCA, whose state lives on a CSA array.
@@ -462,6 +485,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         input_partition_specs = (
             P(attn_data_axis, None),  # hidden_states
             P(),  # wkv_wgate
+            P(),  # wkv_scale
             P(),  # ape
             P(),  # norm_weight
             P(),  # cos_sin_cache
@@ -490,6 +514,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             def _fake_compressor(
                 hidden_states,
                 wkv_wgate,
+                wkv_scale,
                 ape,
                 norm_weight,
                 cos_sin_cache,
@@ -508,6 +533,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             def _fake_compressor(
                 hidden_states,
                 wkv_wgate,
+                wkv_scale,
                 ape,
                 norm_weight,
                 cos_sin_cache,
@@ -623,6 +649,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         operands = (
             hidden_states,
             self.fused_wkv_wgate.weight,
+            self._wkv_scale,
             self.ape,
             self.norm.weight,
             rotary_emb.cos_sin_cache,

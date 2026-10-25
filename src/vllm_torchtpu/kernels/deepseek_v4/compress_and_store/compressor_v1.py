@@ -252,6 +252,10 @@ def compressor_forward(
     proj_runs_min_tokens: int = 0,  # see `proj_and_save_state`
     proj_runs_tile_n: int = 512,
     proj_runs_indexer: bool = False,  # runs path for the 128-dim indexer too
+    proj_tile_k: int = 3584,  # k tile cap of the projection (3584 = 2 k steps)
+    proj_stream_max_tokens: int = 0,  # weight-stream kernel for calls <= this
+    proj_stream_cfg: tuple[int, int, int] = (3584, 2, 1),
+    wkv_scale: jax.Array | None = None,  # per-column scale of fp8 wkv_wgate
     prefill_block: int = 0,  # see `prefill_block`; 0 disables
     prefill_block_min_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array | None, jax.Array]:
@@ -293,6 +297,10 @@ def compressor_forward(
             proj_runs_min_tokens if head_dim != 128 or proj_runs_indexer else 0
         ),
         runs_tile_n=proj_runs_tile_n,
+        tile_k_cap=proj_tile_k,
+        wkv_scale=wkv_scale,
+        stream_max_tokens=proj_stream_max_tokens,
+        stream_cfg=tuple(proj_stream_cfg),
     )
     if shares_buffer:
         cache = updated_state
