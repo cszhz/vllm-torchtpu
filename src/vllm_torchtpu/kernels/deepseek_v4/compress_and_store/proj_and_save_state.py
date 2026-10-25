@@ -506,128 +506,224 @@ def kernel_runs(
 LANES = 128
 
 
-def kernel_stream(
-    # scalar prefetch
-    slot_mapping,  # [num_tokens] state row of each token, -1 = no write
-    # input
-    x_ref,  # VMEM [num_tokens, hidden_size] bf16
-    w_hbm,  # HBM [hidden_size, 2 * state_width] bf16 or fp8
-    ws_ref,  # VMEM [1, 2 * state_width] f32 per-column scale (fp8 only)
-    ape,  # VMEM [compress_ratio, state_width]
-    pos_ref,  # VMEM [num_tokens]
-    cache,  # HBM, aliased
-    # output
-    _,
-    # scratch
-    wbuf,  # VMEM [nbuf, 2, t, state_width]
-    wsem,  # DMA [nbuf]
-    acc_ref,  # VMEM [num_tokens, 2 * state_width] f32
-    stage_ref,  # VMEM [num_tokens * rows_per_token, 1, lanes] f32
-    osem,  # DMA [1]
-    *,
-    t: int,
-    nbuf: int,
-    ndma: int,
-    compress_ratio: int,
-    token_page_size: int,
-    scaled: bool,
-):
-    """Decode projection as a weight stream: the weight stays in HBM and walks
-    through a VMEM ring of `nbuf` k-tiles with all their DMAs in flight; each
-    tile's two half dots (one per state half, as `kernel`'s m tiles) accumulate
-    into an f32 sum (0 + dot first, then +=, as `kernel`). The epilogue applies
-    the per-column fp8 scale (fp8 weights only), adds APE to the score half,
-    stages the states token-major and writes one DMA per page-contiguous run.
-    With t = `kernel`'s tile_k and bf16 weights, the stored bytes are `kernel`'s.
+def kernel_stream(*refs, groups, t, nbuf, ndma):
+    """Decode projection as a weight stream, for one or more projections of the
+    same tokens (`groups`: one dict of static facts per projection).
+
+    Every weight stays in HBM and walks through one VMEM ring of `nbuf` k-tiles
+    (group after group) with their DMAs in flight; each tile's two half dots
+    (one per state half, as `kernel`'s m tiles) accumulate into the group's f32
+    sum (0 + dot first, then +=). Each group's epilogue applies its per-column
+    fp8 scale (fp8 weights only), adds APE to the score half, stages the states
+    token-major and writes one DMA per token into the group's state cache.
+    The k tiling does not change the stored bytes.
+
+    refs: G slot mappings (SMEM) | x, (w, ws, ape) x G, positions | G caches
+    (aliased) | G outputs | G weight rings, ring semaphores, G accumulators,
+    G staging buffers, output semaphore.
     """
+    G = len(groups)
+    slots = refs[:G]
+    x_ref = refs[G]
+    wsa = [refs[G + 1 + 3 * g : G + 4 + 3 * g] for g in range(G)]
+    pos_ref = refs[4 * G + 1]
+    caches = refs[4 * G + 2 : 5 * G + 2]
+    scratch = refs[6 * G + 2 :]
+    wbufs = scratch[:G]
+    wsem = scratch[G]
+    accs = scratch[G + 1 : 2 * G + 1]
+    stages = scratch[2 * G + 1 : 3 * G + 1]
+    osem = scratch[3 * G + 1]
+
     num_tokens, size_k = x_ref.shape
-    size_m = w_hbm.shape[1]
-    state_width = size_m // 2
     n_tiles = size_k // t
     rows = t // ndma
-    lanes = stage_ref.shape[-1]
-    rows_per_token = size_m // lanes
-    cache = csa_cache_layout.as_u8_slabs(cache)
-    stage_u8 = stage_ref.bitcast(jnp.uint8)
+    tiles = [(g, j) for g in range(G) for j in range(n_tiles)]
 
-    def copies(j):
-        # Each state half lands in its own buffer, so every dot reads a whole
-        # (t, state_width) ref, as `kernel`'s m-tile blocks.
-        slot = j % nbuf
+    def copies(q):
+        g, j = tiles[q]
+        w_hbm = wsa[g][0]
+        sw = groups[g]["state_width"]
         return [
             pltpu.make_async_copy(
-                w_hbm.at[pl.ds(j * t + r * rows, rows), pl.ds(h * state_width, state_width)],
-                wbuf.at[slot, h, pl.ds(r * rows, rows), :],
-                wsem.at[slot],
+                w_hbm.at[pl.ds(j * t + r * rows, rows), pl.ds(h * sw, sw)],
+                wbufs[g].at[q % nbuf, h, pl.ds(r * rows, rows), :],
+                wsem.at[q % nbuf],
             )
             for r in range(ndma)
             for h in range(2)
         ]
 
-    for j in range(min(nbuf, n_tiles)):
-        for c in copies(j):
+    for q in range(min(nbuf, len(tiles))):
+        for c in copies(q):
             c.start()
 
     dn = (((1,), (0,)), ((), ()))
-    for j in range(n_tiles):
-        for c in copies(j):
+    for q, (g, j) in enumerate(tiles):
+        for c in copies(q):
             c.wait()
         x = x_ref[:, j * t : (j + 1) * t]
+        sw = groups[g]["state_width"]
         for h in range(2):
-            cols = slice(h * state_width, (h + 1) * state_width)
+            cols = slice(h * sw, (h + 1) * sw)
             prod = lax.dot_general(
-                x, wbuf[j % nbuf, h], dn, preferred_element_type=jnp.float32
+                x, wbufs[g][q % nbuf, h], dn, preferred_element_type=jnp.float32
             )
             if j == 0:
-                acc_ref[:, cols] = jnp.zeros_like(prod) + prod
+                accs[g][:, cols] = jnp.zeros_like(prod) + prod
             else:
-                acc_ref[:, cols] = acc_ref[:, cols] + prod
-        if j + nbuf < n_tiles:
-            for c in copies(j + nbuf):
+                accs[g][:, cols] = accs[g][:, cols] + prod
+        if q + nbuf < len(tiles):
+            for c in copies(q + nbuf):
                 c.start()
 
-    flat = stage_ref.reshape(-1, LANES)
-    num_chunks = size_m // LANES
-    half_chunks = state_width // LANES
-    for h in range(2):
-        cols = slice(h * state_width, (h + 1) * state_width)
-        val = acc_ref[:, cols]
-        if scaled:
-            val = val * ws_ref[:, cols]
-        if h == 1:
-            ape_rows = pos_ref[...] % compress_ratio
-            one_hot = (
-                ape_rows[:, None] == jnp.arange(compress_ratio)[None, :]
-            ).astype(jnp.float32)
-            val = val + jnp.matmul(
-                one_hot, ape[...].astype(jnp.float32), precision=lax.Precision.HIGHEST
+    all_copies = []
+    for g in range(G):
+        info = groups[g]
+        sw = info["state_width"]
+        size_m = 2 * sw
+        _, ws_ref, ape = wsa[g]
+        stage_ref = stages[g]
+        lanes = stage_ref.shape[-1]
+        rpt = size_m // lanes
+        flat = stage_ref.reshape(-1, LANES)
+        num_chunks = size_m // LANES
+        half_chunks = sw // LANES
+        for h in range(2):
+            cols = slice(h * sw, (h + 1) * sw)
+            val = accs[g][:, cols]
+            if info["scaled"]:
+                val = val * ws_ref[:, cols]
+            if h == 1:
+                ratio = info["compress_ratio"]
+                ape_rows = pos_ref[...] % ratio
+                one_hot = (ape_rows[:, None] == jnp.arange(ratio)[None, :]).astype(
+                    jnp.float32
+                )
+                val = val + jnp.matmul(
+                    one_hot,
+                    ape[...].astype(jnp.float32),
+                    precision=lax.Precision.HIGHEST,
+                )
+            for c in range(half_chunks):
+                flat[pl.ds(h * half_chunks + c, num_tokens, num_chunks)] = val[
+                    :, c * LANES : (c + 1) * LANES
+                ]
+        cache = csa_cache_layout.as_u8_slabs(caches[g])
+        stage_u8 = stage_ref.bitcast(jnp.uint8)
+        page = info["token_page_size"]
+        # One DMA per token (decode tokens rarely share a page run), as `kernel`.
+        for i in range(num_tokens):
+            slot = slots[g][i]
+            safe = jnp.maximum(slot, 0)
+            cp = pltpu.make_async_copy(
+                stage_u8.at[pl.ds(i * rpt, rpt), :, :],
+                cache.at[safe // page, pl.ds(safe % page, rpt), :, :],
+                osem.at[0],
             )
-        for c in range(half_chunks):
-            flat[pl.ds(h * half_chunks + c, num_tokens, num_chunks)] = val[
-                :, c * LANES : (c + 1) * LANES
-            ]
-
-    # One DMA per token (decode tokens rarely share a page run), as `kernel`.
-    def _tok_copy(i):
-        slot = slot_mapping[i]
-        safe = jnp.maximum(slot, 0)
-        return slot >= 0, pltpu.make_async_copy(
-            stage_u8.at[pl.ds(i * rows_per_token, rows_per_token), :, :],
-            cache.at[
-                safe // token_page_size,
-                pl.ds(safe % token_page_size, rows_per_token),
-                :,
-                :,
-            ],
-            osem.at[0],
-        )
-
-    for i in range(num_tokens):
-        valid, cp = _tok_copy(i)
-        pl.when(valid)(cp.start)
-    for i in range(num_tokens):
-        valid, cp = _tok_copy(i)
+            pl.when(slot >= 0)(cp.start)
+            all_copies.append((slot >= 0, cp))
+    for valid, cp in all_copies:
         pl.when(valid)(cp.wait)
+
+
+def _proj_and_save_state_stream_multi(
+    hidden_states: jax.Array,
+    positions: jax.Array,
+    groups: list,  # dicts: wkv_wgate, wkv_scale, ape, slot_mapping, cache, compress_ratio
+    *,
+    t: int,
+    nbuf: int,
+    ndma: int,
+    interpret: bool,
+    name: str = "proj_and_save_state_stream",
+) -> tuple[jax.Array, ...]:
+    num_tokens, hidden_size = hidden_states.shape
+    assert hidden_size % t == 0 and (t // ndma) % 32 == 0, (hidden_size, t, ndma)
+    padded = pl.cdiv(num_tokens, 8) * 8
+    pad = padded - num_tokens
+    if pad:
+        hidden_states = jnp.pad(hidden_states, ((0, pad), (0, 0)))
+        positions = jnp.pad(positions, (0, pad))
+    num_tokens = padded
+    G = len(groups)
+    infos, slots, ins, in_specs, caches = [], [], [], [], []
+    scratch_w, scratch_acc, scratch_stage = [], [], []
+    n_tiles = hidden_size // t
+    nbuf = max(1, min(nbuf, G * n_tiles))
+    vmem_need = 2 * num_tokens * hidden_size * 2
+    for gr in groups:
+        w, cache = gr["wkv_wgate"], gr["cache"]
+        state_dim = w.shape[1]
+        lanes = cache.shape[-1]
+        assert state_dim % lanes == 0 and lanes % LANES == 0, (state_dim, lanes)
+        sm = gr["slot_mapping"]
+        if pad:
+            sm = jnp.pad(sm, (0, pad), constant_values=-1)
+        slots.append(sm)
+        scaled = gr["wkv_scale"] is not None
+        ws = (
+            gr["wkv_scale"].reshape(1, state_dim).astype(jnp.float32)
+            if scaled
+            else jnp.ones((1, state_dim), jnp.float32)
+        )
+        # Keep the weight in HBM: otherwise XLA's memory-space assignment may
+        # stage a weight that fits in VMEM with a separate copy before the call.
+        ins += [pltpu.with_memory_space_constraint(w, pltpu.HBM), ws, gr["ape"]]
+        in_specs += [
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+        ]
+        caches.append(cache)
+        infos.append(
+            dict(
+                state_width=state_dim // 2,
+                compress_ratio=gr["compress_ratio"],
+                token_page_size=cache.shape[1],
+                scaled=scaled,
+            )
+        )
+        scratch_w.append(pltpu.VMEM((nbuf, 2, t, state_dim // 2), w.dtype))
+        scratch_acc.append(pltpu.VMEM((num_tokens, state_dim), jnp.float32))
+        scratch_stage.append(
+            pltpu.VMEM((num_tokens * (state_dim // lanes), 1, lanes), jnp.float32)
+        )
+        vmem_need += (
+            nbuf * t * state_dim * jnp.dtype(w.dtype).itemsize
+            + 2 * num_tokens * state_dim * 4 * 2
+            + 3 * num_tokens * state_dim * 4
+        )
+    vmem_limit = min(max(vmem_need + (8 << 20), 32 << 20), 60 << 20)
+    n_in = 1 + 3 * G + 1  # x, groups, positions (after the G scalar prefetches)
+    outs = pl.pallas_call(
+        functools.partial(
+            kernel_stream, groups=tuple(infos), t=t, nbuf=nbuf, ndma=ndma
+        ),
+        out_shape=tuple(jax.ShapeDtypeStruct(c.shape, c.dtype) for c in caches),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=G,
+            grid=(),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)]  # hidden_states
+            + in_specs
+            + [pl.BlockSpec(memory_space=pltpu.VMEM)]  # positions
+            + [pl.BlockSpec(memory_space=pltpu.HBM)] * G,  # caches
+            out_specs=tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in range(G)),
+            scratch_shapes=scratch_w
+            + [pltpu.SemaphoreType.DMA((nbuf,))]
+            + scratch_acc
+            + scratch_stage
+            + [pltpu.SemaphoreType.DMA((1,))],
+        ),
+        input_output_aliases={G + n_in + g: g for g in range(G)},
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True,
+            vmem_limit_bytes=vmem_limit,
+        ),
+        interpret=interpret,
+        name=name,
+    )(*slots, hidden_states, *ins, positions, *caches)
+    return tuple(outs)
 
 
 def _proj_and_save_state_stream(
@@ -645,85 +741,25 @@ def _proj_and_save_state_stream(
     ndma: int,
     interpret: bool,
 ) -> jax.Array:
-    num_tokens, hidden_size = hidden_states.shape
-    _, state_dim = wkv_wgate.shape
-    lanes = cache.shape[-1]
-    assert state_dim % lanes == 0 and lanes % LANES == 0, (state_dim, lanes)
-    assert hidden_size % t == 0 and (t // ndma) % 32 == 0, (hidden_size, t, ndma)
-    rows_per_token = state_dim // lanes
-    padded = pl.cdiv(num_tokens, 8) * 8
-    if padded != num_tokens:
-        pad = padded - num_tokens
-        hidden_states = jnp.pad(hidden_states, ((0, pad), (0, 0)))
-        positions = jnp.pad(positions, (0, pad))
-        slot_mapping = jnp.pad(slot_mapping, (0, pad), constant_values=-1)
-        num_tokens = padded
-    scaled = wkv_scale is not None
-    ws = (
-        wkv_scale.reshape(1, state_dim).astype(jnp.float32)
-        if scaled
-        else jnp.ones((1, state_dim), jnp.float32)
-    )
-    n_tiles = hidden_size // t
-    nbuf = max(1, min(nbuf, n_tiles))
-    w_bytes = jnp.dtype(wkv_wgate.dtype).itemsize
-    vmem_need = (
-        nbuf * t * state_dim * w_bytes
-        + 2 * num_tokens * hidden_size * 2
-        + 2 * num_tokens * state_dim * 4 * 2
-        + 3 * num_tokens * state_dim * 4
-    )
-    vmem_limit = min(max(vmem_need + (8 << 20), 32 << 20), 60 << 20)
-    # Keep the weight in HBM: otherwise XLA's memory-space assignment may stage
-    # a weight that fits in VMEM with a separate copy before the call.
-    w = pltpu.with_memory_space_constraint(wkv_wgate, pltpu.HBM)
-    return pl.pallas_call(
-        functools.partial(
-            kernel_stream,
-            t=t,
-            nbuf=nbuf,
-            ndma=ndma,
-            compress_ratio=compress_ratio,
-            token_page_size=cache.shape[1],
-            scaled=scaled,
-        ),
-        out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            grid=(),
-            in_specs=[
-                pl.BlockSpec(memory_space=pltpu.VMEM),  # hidden_states
-                pl.BlockSpec(memory_space=pltpu.HBM),  # wkv_wgate
-                pl.BlockSpec(memory_space=pltpu.VMEM),  # ws
-                pl.BlockSpec(memory_space=pltpu.VMEM),  # ape
-                pl.BlockSpec(memory_space=pltpu.VMEM),  # positions
-                pl.BlockSpec(memory_space=pltpu.HBM),  # cache
-            ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-            scratch_shapes=[
-                pltpu.VMEM((nbuf, 2, t, state_dim // 2), wkv_wgate.dtype),
-                pltpu.SemaphoreType.DMA((nbuf,)),
-                pltpu.VMEM((num_tokens, state_dim), jnp.float32),
-                pltpu.VMEM((num_tokens * rows_per_token, 1, lanes), jnp.float32),
-                pltpu.SemaphoreType.DMA((1,)),
-            ],
-        ),
-        input_output_aliases={6: 0},  # cache
-        compiler_params=pltpu.CompilerParams(
-            disable_bounds_checks=True,
-            vmem_limit_bytes=vmem_limit,
-        ),
-        interpret=interpret,
-        name="proj_and_save_state_stream",
-    )(
-        slot_mapping,
+    (out,) = _proj_and_save_state_stream_multi(
         hidden_states,
-        w,
-        ws,
-        ape,
         positions,
-        cache,
+        [
+            dict(
+                wkv_wgate=wkv_wgate,
+                wkv_scale=wkv_scale,
+                ape=ape,
+                slot_mapping=slot_mapping,
+                cache=cache,
+                compress_ratio=compress_ratio,
+            )
+        ],
+        t=t,
+        nbuf=nbuf,
+        ndma=ndma,
+        interpret=interpret,
     )
+    return out
 
 
 def _write_runs(slot_mapping, tile_n, rows_per_token, page_rows):

@@ -54,6 +54,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_o
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
+    pair_proj_forward,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     VllmDeepseekV4Indexer,
@@ -690,6 +691,17 @@ class VllmDeepseekV4MLAAttention(
                 "indexer_rotary_emb",
                 getattr(self.mla_attn, "rotary_emb", None),
             )
+            if envs.TPU_DSV4_COMPRESSOR_PAIR and compressor is not None:
+                # One weight stream for both projections of these tokens; the
+                # two compressor calls below then skip theirs.
+                pair_proj_forward(
+                    compressor,
+                    self.indexer.compressor,
+                    hidden_states,
+                    positions,
+                    self.mla_attn.rotary_emb,
+                    indexer_emb,
+                )
             if envs.TPU_DSV4_CSA_TOPK_FENCE_Q and self.indexer._token_split_active(
                 positions.shape[0]
             ):

@@ -149,5 +149,66 @@ class CompressorProjStreamTest(jtu.JaxTestCase):
             self.assertGreater(err.max(), 10 * err_base.max())
 
 
+class CompressorPairProjTest(jtu.JaxTestCase):
+    """`pair_proj` (CSA KV + indexer projections in one stream call) followed
+    by `compressor_forward(skip_proj=True)` writes exactly the bytes of the two
+    separate stream calls: per group, the arithmetic is the same."""
+
+    def setUp(self):
+        super().setUp()
+        if not jtu.test_device_matches(["tpu"]):
+            self.skipTest("TPU only")
+
+    @parameterized.product(
+        decode=((1, 7), (2, 7), (4, 7), (8, 7), (3, 2)),
+        cfg=((512, 6, 1), (3584, 2, 1)),
+        fp8=(False, True),
+    )
+    def test_pair_equals_separate(self, decode, cfg, fp8):
+        a = _build("csa", decode, ())
+        b = _build("indexer", decode, ())
+        np.testing.assert_array_equal(a["hidden_states"], b["hidden_states"])
+        np.testing.assert_array_equal(a["positions"], b["positions"])
+        kw = dict(BASE, proj_stream_max_tokens=64, proj_stream_cfg=cfg)
+        for args in (a, b):
+            if fp8:
+                args["wkv_wgate"], args["wkv_scale"] = _fp8(args["wkv_wgate"])
+            else:
+                args["wkv_scale"] = None
+        ref = [_run(a, **kw), _run(b, **kw)]
+
+        keys = ("wkv_wgate", "wkv_scale", "ape", "block_table", "query_start_loc",
+                "kv_block_table", "cache", "state_cache", "distribution",
+                "cos_sin_cache", "compress_ratio", "state_block_size", "head_dim",
+                "overlap", "seq_along_lane")
+        hosts = jax.jit(
+            lambda x, p, ga, gb: compressor_v1.pair_proj(x, p, [ga, gb], stream_cfg=cfg),
+            static_argnums=(),
+        ) if False else None
+        sa = {k: a[k] for k in keys}
+        sb = {k: b[k] for k in keys}
+        statics = ("compress_ratio", "state_block_size", "head_dim", "overlap",
+                   "seq_along_lane")
+        fn = jax.jit(
+            lambda x, p, da, db: compressor_v1.pair_proj(
+                x, p,
+                [dict(da, **{k: sa[k] for k in statics}),
+                 dict(db, **{k: sb[k] for k in statics})],
+                stream_cfg=cfg,
+            )
+        )
+        da = {k: v for k, v in sa.items() if k not in statics}
+        db = {k: v for k, v in sb.items() if k not in statics}
+        host_a, host_b = fn(a["hidden_states"], a["positions"], da, db)
+        new = [
+            _run(dict(a, cache=host_a), **kw, skip_proj=True),
+            _run(dict(b, cache=host_b), **kw, skip_proj=True),
+        ]
+        for r_grp, n_grp in zip(ref, new):
+            for r, n in zip(r_grp, n_grp):
+                if r is not None:
+                    self.assertArraysEqual(r, n)
+
+
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())

@@ -36,6 +36,9 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import (
     compressor_forward,
 )
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import (
+    pair_proj as compressor_v1_pair_proj,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
@@ -77,6 +80,7 @@ def _run_compressor(
     rms_eps: float,
     quant_block: int,
     seq_along_lane: bool = False,
+    skip_proj: bool = False,
 ) -> tuple[jax.Array, jax.Array | None, jax.Array | None]:
     """Shared body of the three op variants, for CSA compressor, HCA compressor,
     and CSA indexer compressor respectively."""
@@ -101,6 +105,7 @@ def _run_compressor(
         rms_eps=rms_eps,
         quant_block=quant_block,
         seq_along_lane=seq_along_lane,
+        skip_proj=skip_proj,
         proj_runs_min_tokens=envs.TPU_DSV4_COMPRESSOR_PROJ_RUNS_MIN_TOKENS,
         proj_runs_tile_n=envs.TPU_DSV4_COMPRESSOR_PROJ_RUNS_TILE_N,
         proj_runs_indexer=envs.TPU_DSV4_COMPRESSOR_PROJ_RUNS_INDEXER,
@@ -136,6 +141,7 @@ def _compressor_jax_csa(
     overlap: bool,
     rms_eps: float,
     quant_block: int,
+    skip_proj: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: NoPE and RoPE in two arrays, state shares the NoPE buffer."""
     if cache.shape[0] == 0:
@@ -161,6 +167,7 @@ def _compressor_jax_csa(
         overlap=overlap,
         rms_eps=rms_eps,
         quant_block=quant_block,
+        skip_proj=skip_proj,
     )
     # The CSA kernel always returns a rope cache.
     assert new_rope_cache is not None
@@ -188,6 +195,7 @@ def _compressor_jax_hca(
     overlap: bool,
     rms_eps: float,
     quant_block: int,
+    skip_proj: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """HCA: no RoPE array, and the state lives on a CSA NoPE array."""
     if cache.shape[0] == 0 or state_cache.shape[0] == 0:
@@ -213,6 +221,7 @@ def _compressor_jax_hca(
         overlap=overlap,
         rms_eps=rms_eps,
         quant_block=quant_block,
+        skip_proj=skip_proj,
     )
     # The HCA kernel always returns a state cache.
     assert new_state_cache is not None
@@ -239,6 +248,7 @@ def _compressor_jax_indexer(
     overlap: bool,
     rms_eps: float,
     quant_block: int,
+    skip_proj: bool = False,
 ) -> jax.Array:
     """Lightning indexer: one array holds the SEQ_ALONG_LANE records and state."""
     if cache.shape[0] == 0:
@@ -265,6 +275,7 @@ def _compressor_jax_indexer(
         rms_eps=rms_eps,
         quant_block=quant_block,
         seq_along_lane=True,
+        skip_proj=skip_proj,
     )
     return new_cache
 
@@ -449,7 +460,17 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             object.__setattr__(self, "_compressor_op_instance", op)
         return op
 
-    def _build_compressor_op(self):
+    @property
+    def compressor_op_skip_proj(self):
+        """`compressor_op` without the projection (its state saved by
+        `pair_proj_forward`)."""
+        op = self.__dict__.get("_compressor_op_skip_instance")
+        if op is None:
+            op = self._build_compressor_op(skip_proj=True)
+            object.__setattr__(self, "_compressor_op_skip_instance", op)
+        return op
+
+    def _build_compressor_op(self, skip_proj: bool = False):
         mesh = get_pallas_op_mesh()
 
         assert self.head_dim in (512, 128), self.head_dim
@@ -468,12 +489,14 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             overlap=self.overlap,
             rms_eps=self.rms_norm_eps,
             quant_block=self._quant_block,
+            skip_proj=skip_proj,
         )
 
         op_name = (
             f"pallas::deepseek_v4_compressor_{variant}"
             f"_{self.head_dim}_{self.compress_ratio}"
             f"_{self.state_cache.block_size}"
+            f"{'_noproj' if skip_proj else ''}"
         )
 
         global _compressor_op_cache
@@ -569,12 +592,13 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             return cache
         return cache.view(torch.uint8)
 
-    def forward(
+    def _prepare(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
-    ) -> None:
+    ):
+        """The op operands, or None when there is nothing to compress."""
         attn_ctx = get_forward_context().attn_metadata
         if not isinstance(attn_ctx, dict):
             # As in the base class: without per-layer metadata there is
@@ -660,13 +684,132 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             state_metadata.request_distribution,
             cache,
         )
+        return operands, cache, rope_cache, state_cache, state_metadata, k_block_tables
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
+    ) -> None:
+        # Set by `pair_proj_forward` for exactly the next call of this step.
+        skip = self.__dict__.pop("_skip_proj_next", False)
+        prep = self._prepare(hidden_states, positions, rotary_emb)
+        if prep is None:
+            return
+        operands, cache, rope_cache, state_cache, _, _ = prep
+        op = self.compressor_op_skip_proj if skip else self.compressor_op
         if rope_cache is not None:
-            new_cache, new_rope_cache = self.compressor_op(*operands, rope_cache)
+            new_cache, new_rope_cache = op(*operands, rope_cache)
             cache.copy_(new_cache)
             rope_cache.copy_(new_rope_cache)
         elif state_cache is not None:
-            new_cache, new_state_cache = self.compressor_op(*operands, state_cache)
+            new_cache, new_state_cache = op(*operands, state_cache)
             cache.copy_(new_cache)
             state_cache.copy_(new_state_cache)
         else:
-            cache.copy_(self.compressor_op(*operands))
+            cache.copy_(op(*operands))
+
+
+_pair_op_cache: dict = {}
+
+
+def _pair_proj_jax(
+    hidden_states, positions, cos_sin_a, cos_sin_b,
+    w_a, ws_a, ape_a, st_a, qsl_a, kvt_a, dist_a, host_a,
+    w_b, ws_b, ape_b, st_b, qsl_b, kvt_b, dist_b, host_b,
+    *, statics_a, statics_b,
+):
+    def grp(w, ws, ape, st, qsl, kvt, dist, host, cos_sin, statics):
+        separate = statics["separate_state"]
+        return dict(
+            wkv_wgate=w,
+            wkv_scale=ws if w.dtype == jnp.float8_e4m3fn else None,
+            ape=ape,
+            block_table=st,
+            query_start_loc=qsl,
+            kv_block_table=kvt,
+            # derive_metadata reads only the host's geometry; the KV array is
+            # not needed when the state is separate (HCA, not paired).
+            cache=host,
+            state_cache=host if separate else None,
+            distribution=dist,
+            cos_sin_cache=cos_sin,
+            **{k: v for k, v in statics.items() if k != "separate_state"},
+        )
+    return compressor_v1_pair_proj(
+        hidden_states, positions,
+        [grp(w_a, ws_a, ape_a, st_a, qsl_a, kvt_a, dist_a, host_a, cos_sin_a, statics_a),
+         grp(w_b, ws_b, ape_b, st_b, qsl_b, kvt_b, dist_b, host_b, cos_sin_b, statics_b)],
+        stream_cfg=envs.TPU_DSV4_COMPRESSOR_PROJ_STREAM_CFG,
+    )
+
+
+def pair_proj_forward(
+    comp_a: "VllmDeepseekCompressor",
+    comp_b: "VllmDeepseekCompressor",
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    rotary_a: nn.Module,
+    rotary_b: nn.Module,
+) -> bool:
+    """Saves the state of two compressors of the same tokens (a CSA layer's KV
+    compressor and its indexer's) with one weight-stream call, and marks both
+    so their next `forward` skips the projection. Returns False (nothing
+    marked) when this step does not qualify -- the callers then run as usual.
+    """
+    n = hidden_states.shape[0]
+    if not (0 < n <= envs.TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS):
+        return False
+    preps = []
+    for comp, rot in ((comp_a, rotary_a), (comp_b, rotary_b)):
+        if comp._separate_state:
+            return False
+        prep = comp._prepare(hidden_states, positions, rot)
+        if prep is None:
+            return False
+        preps.append((comp, prep))
+    statics = []
+    args = [hidden_states, positions]
+    cos = []
+    for comp, (operands, cache, _, _, _, _) in preps:
+        (_, w, ws, ape, _, cos_sin, _, st, qsl, kvt, dist, _) = operands
+        cos.append(cos_sin)
+        args += [w, ws, ape, st, qsl, kvt, dist, cache]
+        statics.append(dict(
+            compress_ratio=comp.compress_ratio,
+            state_block_size=comp.state_cache.block_size,
+            head_dim=comp.head_dim,
+            overlap=comp.overlap,
+            seq_along_lane=comp.head_dim == 128,
+            separate_state=False,
+        ))
+    args = args[:2] + cos + args[2:]
+    key = tuple(tuple(sorted(st.items())) for st in statics)
+    op = _pair_op_cache.get(key)
+    if op is None:
+        name = "pallas::deepseek_v4_compressor_pair_proj_" + "_".join(
+            f"{st['head_dim']}x{st['compress_ratio']}x{st['state_block_size']}"
+            for st in statics
+        )
+        grp_specs = (P(), P(), P(), P(BATCH_AXIS), P(), P(BATCH_AXIS), P(), P())
+        op = pallas.jax_op(
+            name,
+            functools.partial(_pair_proj_jax, statics_a=statics[0], statics_b=statics[1]),
+            mesh=get_pallas_op_mesh(),
+            donate_argnums=(11, 19),
+            input_partition_specs=(P(None, None), P(None), P(), P())
+            + grp_specs + grp_specs,
+        )
+
+        def _fake(*a, **k):
+            return torch.empty_like(a[11]), torch.empty_like(a[19])
+
+        op.register_fake(_fake)
+        _pair_op_cache[key] = op
+    new_a, new_b = op(*args)
+    preps[0][1][1].copy_(new_a)
+    preps[1][1][1].copy_(new_b)
+    object.__setattr__(comp_a, "_skip_proj_next", True)
+    object.__setattr__(comp_b, "_skip_proj_next", True)
+    return True
