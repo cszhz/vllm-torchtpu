@@ -425,4 +425,12 @@ def proj_and_save_state(
         ),
         interpret=interpret,
         name="proj_and_save_state",
-    )(slot_mapping, positions, hidden_states, wkv_wgate, ape, cache)
+    )(
+        slot_mapping,
+        positions,
+        # Left to XLA, a VMEM placement turns the kernel's DMAs into vector copies.
+        pltpu.with_memory_space_constraint(hidden_states, pltpu.HBM),
+        pltpu.with_memory_space_constraint(wkv_wgate, pltpu.HBM),
+        ape,
+        cache,
+    )
