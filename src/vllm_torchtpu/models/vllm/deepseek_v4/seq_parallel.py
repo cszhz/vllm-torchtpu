@@ -116,12 +116,21 @@ def _build_ops(mesh, groups: tuple[tuple[int, ...], ...]):
     )
 
 
-def prebuild() -> None:
-    """Build the ops and this core's slot outside any traced region (the
-    groups come from a collective). A no-op unless the flag is set."""
+def prebuild(max_num_tokens: int) -> None:
+    """Build the ops outside any traced region (the groups come from a
+    collective). A no-op unless the flag is set."""
     global _AG, _RS, _TAKE, _CORES
-    if envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS == 0 or _AG is not None:
+    min_tokens = envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS
+    if min_tokens == 0 or _AG is not None:
         return
+    if min_tokens >= max_num_tokens:
+        # The token-sharded trace would then hold only the largest bucket:
+        # its guards pin the dynamic token dim to one value, which Dynamo
+        # refuses for a dim vLLM marked dynamic.
+        raise ValueError(
+            f"TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS={min_tokens} must be below the "
+            f"largest token bucket ({max_num_tokens})"
+        )
     mesh = build_ep_mesh()
     if mesh is None:
         raise NotImplementedError(
