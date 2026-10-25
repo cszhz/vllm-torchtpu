@@ -41,6 +41,9 @@ from vllm_torchtpu.kernels.deepseek_v4_megakernel import kernel_interface as KI
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import step_kernel as SK
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import step_phases as SP
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import weight_map as WM
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 ROLES = SK.ROLES
 ATTN_WEIGHTS = SP.AttnWeights._fields  # manifest names match the fields
@@ -200,6 +203,12 @@ def build_step(
     scfg = kernel_config(cfg, bucket, dense, attn_impl=attn_impl, moe_impl=moe_impl,
                          cache_inplace=cache_inplace, **ctx)  # fmt: skip
     step = SK.build(scfg, axis=spec.axis_name, interpret=interpret)
+    if scfg.attn_pipeline:  # the flag's runtime evidence in the server log
+        logger.info(
+            "DeepSeek-V4 megakernel step T=%d: attn_pipeline=True attn_split=%s",
+            bucket.rows,
+            scfg.attn_split,
+        )
     names = [e.name for e in KI.weight_manifest(spec, logits=logits)]
     streams = scfg.dense.stream_names
     plan = CachePlan.of(cfg)
