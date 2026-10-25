@@ -108,6 +108,8 @@ def _mla_ragged_paged_attention_kernel(
     bkv_p,
     bq_sz,
     batch_size: int = 1,
+    prefetch_early: bool = False,
+    probe: int = 0,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
@@ -191,6 +193,8 @@ def _mla_ragged_paged_attention_kernel(
     def _fetch_bkv(
         batch_start_seq_idx, bkv_idx, bkv_sem_idx, *, wait=False, enabled=True
     ):
+        if probe == 3:  # timing probe: no KV DMA
+            return
         for b in range(batch_size):
             sem = sems.at[0, b, bkv_sem_idx]
             # bkv_x2_ref shape:
@@ -519,33 +523,50 @@ def _mla_ragged_paged_attention_kernel(
                 # Wait for cur bkv
                 wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
 
+                if prefetch_early:
+                    # Issue the next block into the other slot before this
+                    # block's compute, so its DMA overlaps the compute instead
+                    # of being waited on, exposed, at the next iteration.
+                    sem_ids_ref[1] = next_bkv_sem_idx
+                    start_fetch_bkv(
+                        next_seq_idx,
+                        next_bkv_idx,
+                        next_bkv_sem_idx,
+                        enabled=next_seq_idx < end_seq_idx,
+                    )
+
                 # Load bkv into vreg. There is no need to mask out invalid k/v entries,
                 # because the score of invalid Q.K^T pairs are masked (to be zero) in
                 # flash attention, so that the invalid kv entries
                 # (as long as they are not NaN or inf) won't affect to the output.
-                bkv = load_bkv(bkv_sem_idx, bkv_idx)
+                if probe == 2:  # timing probe: no VMEM->vreg KV load / relayout
+                    bkv = jnp.zeros((batch_size, bkv_sz, head_dim), q_dtype)
+                else:
+                    bkv = load_bkv(bkv_sem_idx, bkv_idx)
 
                 bq = load_bq(bq_sem_idx)
 
-                flash_attention(
-                    bq,
-                    bkv,
-                    bq_idx=bq_idx,
-                    bkv_idx=bkv_idx,
-                    kv_lens_to_attend_segment=kv_lens_to_attend_segment,
-                )
+                if probe != 1:  # probe 1: no compute
+                    flash_attention(
+                        bq,
+                        bkv,
+                        bq_idx=bq_idx,
+                        bkv_idx=bkv_idx,
+                        kv_lens_to_attend_segment=kv_lens_to_attend_segment,
+                    )
 
                 # Prefetch next bkv. Issued after the compute and without a branch, so
                 # the scalar work of the per-page copies is scheduled alongside the
                 # vector work instead of in a region of its own; past the last block
                 # the copies are empty.
-                sem_ids_ref[1] = next_bkv_sem_idx
-                start_fetch_bkv(
-                    next_seq_idx,
-                    next_bkv_idx,
-                    next_bkv_sem_idx,
-                    enabled=next_seq_idx < end_seq_idx,
-                )
+                if not prefetch_early:
+                    sem_ids_ref[1] = next_bkv_sem_idx
+                    start_fetch_bkv(
+                        next_seq_idx,
+                        next_bkv_idx,
+                        next_bkv_sem_idx,
+                        enabled=next_seq_idx < end_seq_idx,
+                    )
                 return (kv_lens_to_attend_segment,)
 
             # Wait for cur bq if not ready yet
@@ -728,6 +749,8 @@ def prepare_outputs(
         "vmem_limit_bytes",
         "decode_batch_size",
         "skip_empty_passes",
+        "prefetch_early",
+        "probe",
     ),
 )
 def mla_ragged_paged_attention(
@@ -753,6 +776,8 @@ def mla_ragged_paged_attention(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_batch_size: int = 8,
     skip_empty_passes: bool = False,
+    prefetch_early: bool = False,
+    probe: int = 0,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -942,6 +967,8 @@ def mla_ragged_paged_attention(
                     bq_sz=bq_sz,
                     bkv_p=bkv_p,
                     batch_size=batch_size,
+                    prefetch_early=prefetch_early,
+                    probe=probe,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
