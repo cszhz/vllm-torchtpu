@@ -188,3 +188,30 @@ def test_union_max_kv_tp4(seqs, routed):
         bq=32, plan=plan,
     )  # fmt: skip
     np.testing.assert_allclose(np.asarray(out, np.float32)[:n], ref, atol=8e-3, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "seqs",
+    [
+        [(7, 30000), (7, 9000), (498, 31000)],  # TP4 shape, routed
+        [(7, 30000), (7, 9000), (7, 8000)],  # verify rows only: nothing routed
+        [(7, 9000), (498, 300000)],  # chunk past s_cap: nothing routed
+    ],
+)
+def test_union_plan_unconditional(seqs):
+    """prepare(unconditional=True) (the TP4 plan outside lax.cond, with the
+    indexer token split): with nothing routed the plan's buffers are left
+    unwritten and must never be read; output matches the sparse kernel."""
+    c = _case(np.random.default_rng(3), seqs, 32, correlated=True)
+    n = int(c["cu_np"][-1])
+    plan = csa_union_dense.prepare(
+        c["topk"], c["kv"], c["pages"], c["cu"], c["dist"], page_size=PAGE_SIZE,
+        bq=32, count_first=False, split=2, unconditional=True,
+    )  # fmt: skip
+    ref = np.asarray(_sparse(c), np.float32)[:n]
+    out = csa_union_dense.attention(
+        c["q"], c["nope"], c["rope"], c["topk"], c["kv"], c["pages"], c["cu"],
+        c["dist"], c["sinks"], c["swa_acc"], c["swa_l"], c["swa_m"], sm_scale=0.044,
+        bq=32, plan=plan,
+    )  # fmt: skip
+    np.testing.assert_allclose(np.asarray(out, np.float32)[:n], ref, atol=8e-3, rtol=0)
