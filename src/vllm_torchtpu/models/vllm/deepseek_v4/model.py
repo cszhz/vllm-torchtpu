@@ -22,10 +22,12 @@ from itertools import islice
 
 import torch
 import torch.nn as nn
+from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_dp_group,
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -51,6 +53,8 @@ from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import bucket_filter
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,  # noqa: E501
 )
@@ -61,6 +65,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op impo
     get_mhc_split_fn_op,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.deepseek_v4 import sequence_parallel as sp
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
@@ -202,6 +207,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
+        sequence_parallel: bool = False,
+        padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Defer each post into the next pre so the pair is one kernel.
 
@@ -209,6 +216,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         carries `(residual, post_mix, res_mix)` -- the recombine that output
         still owes. The chain is opened by the layer-0 attention pre, which
         has no preceding post, and closed by the caller.
+
+        With `sequence_parallel`, every row-wise tensor here (and `input_ids`,
+        `padding_mask`) holds this rank's rows only; see sequence_parallel.py.
         """
         if residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
@@ -229,7 +239,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         x = self._norm(self.attn_norm, x)
-        x = self.attn(positions, x)
+        if sequence_parallel:
+            x = sp.reduce_scatter(
+                self.attn(positions, sp.gather(x, positions), reduce_output=False)
+            )
+        else:
+            x = self.attn(positions, x)
 
         residual, post_mix, res_mix, x = self.mhc_ops.fused(
             x,
@@ -242,7 +257,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             *self._norm_arg(self.ffn_norm),
         )
         x = self._norm(self.ffn_norm, x)
-        x = self.ffn(x, input_ids)
+        if sequence_parallel:
+            x = self.ffn.forward_sequence_parallel(
+                x, input_ids, padding_mask, positions
+            )
+        else:
+            x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
 
@@ -524,6 +544,23 @@ class DeepseekV4Model(nn.Module):
             return input_ids
         return dp_group.all_gather(input_ids, dim=0)
 
+    @staticmethod
+    def check_sequence_parallel_supported() -> None:
+        """Refuse configurations the sequence-parallel graph does not handle."""
+        assert get_pp_group().world_size == 1, (
+            "DeepSeek-V4 sequence-parallel prefill does not support PP"
+        )
+        assert not envs.TPU_DSV4_ATTN_INTRA_CHIP_TP, (
+            "TPU_DSV4_PREFILL_SP and TPU_DSV4_ATTN_INTRA_CHIP_TP are exclusive"
+        )
+        assert get_pcp_group().world_size == 1, (
+            "DeepSeek-V4 sequence-parallel prefill does not support PCP"
+        )
+        # Records counts from the replicated rows' layout.
+        assert not envs.MOE_EXPERT_COUNT_TAP_DIR, (
+            "TPU_DSV4_PREFILL_SP does not support MOE_EXPERT_COUNT_TAP_DIR"
+        )
+
     def make_empty_intermediate_tensors(
         self,
         batch_size: int,
@@ -546,12 +583,25 @@ class DeepseekV4Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        """The replicated-TP backbone; sequence-parallel steps go to
+        DeepseekV4ModelSP, a separate compiled graph over the same layers."""
+        return self.forward_impl(
+            input_ids, positions, intermediate_tensors, inputs_embeds, False
+        )
+
+    def forward_impl(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None,
+        sequence_parallel: bool,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = typing.cast(
@@ -564,6 +614,27 @@ class DeepseekV4Model(nn.Module):
         if input_ids is not None and self.start_layer < self.config.num_hash_layers:
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
+        num_tokens = hidden_states.shape[0]
+        padding_mask = None
+        if sequence_parallel:
+            rank = sp.rank_as_data()
+            hidden_states = sp.shard(hidden_states, rank)
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+                # Sliced to the step's rows as the stock MoE path does; this
+                # graph has no lower bound on the token count to pin it.
+                padding_mask = token_padding.local_padding_mask(num_tokens)
+                if padding_mask is not None:
+                    padding_mask = sp.shard(padding_mask, rank)
+            if moe_input_ids is not None:
+                moe_input_ids = sp.shard(moe_input_ids, rank)
+        if get_pp_group().is_first_rank:
+            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+
+        layer_kwargs = (
+            dict(sequence_parallel=True, padding_mask=padding_mask)
+            if sequence_parallel
+            else {}
+        )
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None
@@ -578,13 +649,17 @@ class DeepseekV4Model(nn.Module):
                 post_mix,
                 res_mix,
                 residual,
+                **layer_kwargs,
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the full hc-stream state and collapse it the
                 # way the drafts were trained on: settle the deferred post,
                 # then mean over the hc streams (upstream numerics).
                 aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
-                aux_hidden_states.append(aux_recon.mean(dim=1))
+                aux_hidden = aux_recon.mean(dim=1)
+                if sequence_parallel:
+                    aux_hidden = sp.gather(aux_hidden, positions)
+                aux_hidden_states.append(aux_hidden)
                 final_aux_recon = aux_recon
 
         if post_mix is not None:
@@ -611,6 +686,8 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        if sequence_parallel:
+            hidden_states = sp.gather(hidden_states, positions)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -659,10 +736,11 @@ class DeepseekV4Model(nn.Module):
                         break
                     if name not in params_dict:
                         continue
-                    param = staged.stage(name, params_dict[name])
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    loaded_params.add(name)
+                    for target in _with_full_shared_alias(name, params_dict):
+                        param = staged.stage(target, params_dict[target])
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                        loaded_params.add(target)
                     break
                 else:
                     if ".experts." in name:
@@ -718,12 +796,13 @@ class DeepseekV4Model(nn.Module):
                             continue
                         if name not in params_dict:
                             continue
-                        param = staged.stage(name, params_dict[name])
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                        loaded_params.add(name)
+                        for target in _with_full_shared_alias(name, params_dict):
+                            param = staged.stage(target, params_dict[target])
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param, loaded_weight)
+                            loaded_params.add(target)
                         continue
         finally:
             staged.flush_all()
@@ -742,6 +821,44 @@ class DeepseekV4Model(nn.Module):
             ckpt_up_proj_name="w3",
             num_experts=self.config.n_routed_experts,
         )
+
+
+def _log_sp_outputs(out, positions: torch.Tensor) -> None:
+    """Diagnostic (TPU_DSV4_PREFILL_SP_DEBUG): what the SP backbone hands the
+    runner, once per distinct description."""
+    tensors = [out] if isinstance(out, torch.Tensor) else [out[0], *out[1]]
+    desc = tuple(
+        (
+            type(t).__name__,
+            tuple(type(d).__name__ for d in t.shape),
+            tuple(t.shape),
+            tuple(t.stride()),
+            t.storage_offset(),
+            t._base is not None,
+            getattr(t, "_dynamo_dynamic_indices", None),
+        )
+        for t in tensors
+    )
+    seen = _log_sp_outputs.__dict__.setdefault("seen", set())
+    if desc not in seen:
+        seen.add(desc)
+        logger.warning(
+            "SP backbone outputs %s | positions %s marks %s",
+            desc,
+            tuple(positions.shape),
+            getattr(positions, "_dynamo_dynamic_indices", None),
+        )
+
+
+def _with_full_shared_alias(name: str, params_dict: dict) -> list[str]:
+    """`name`, plus the unsharded shared-expert copy's parameter it also feeds.
+
+    DeepseekV4MoE.shared_experts_full exists only under
+    TPU_DSV4_PREFILL_SP_REPLICATED_SHARED and has no checkpoint tensors of its
+    own: it is loaded from the shared expert's, without the TP split.
+    """
+    alias = name.replace(".shared_experts.", ".shared_experts_full.")
+    return [name, alias] if alias != name and alias in params_dict else [name]
 
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
@@ -775,6 +892,39 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     )
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+    }
+)
+class DeepseekV4ModelSP(nn.Module):
+    """The backbone's sequence-parallel graph (TPU_DSV4_PREFILL_SP).
+
+    A compiled module of its own over the backbone's layers and parameters: it
+    holds the backbone without registering it, so parameters, loading and
+    state dicts see one copy. DeepseekV4ForCausalLM routes it only the
+    sequence-parallel buckets and each module compiles only its own buckets
+    (compilation/bucket_filter), so neither graph branches on the token count.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, backbone: DeepseekV4Model):
+        super().__init__()
+        object.__setattr__(self, "_backbone", backbone)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        return self._backbone.forward_impl(
+            input_ids, positions, intermediate_tensors, inputs_embeds, True
+        )
+
+
 class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
     """DeepSeek-V4 causal language model registered for TPU inference."""
 
@@ -795,6 +945,14 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.model_sp = None
+        if sp.enabled():
+            self.model.check_sequence_parallel_supported()
+            self.model_sp = DeepseekV4ModelSP(
+                vllm_config=vllm_config, backbone=self.model
+            )
+            bucket_filter.assign(self.model_sp, sp.eligible)
+            bucket_filter.assign(self.model, lambda n: not sp.eligible(n))
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -824,7 +982,23 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        if self.model_sp is None:
+            return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        # Routed on the padded bucket size, outside both compiled graphs.
+        if sp.eligible(positions.shape[0]):
+            sp.prebuild()  # once; it needs the EP mesh, which no trace may see
+            with (
+                bucket_filter.serving(sp.eligible),
+                set_model_tag("backbone_sp"),
+            ):
+                out = self.model_sp(
+                    input_ids, positions, intermediate_tensors, inputs_embeds
+                )
+            if envs.TPU_DSV4_PREFILL_SP_DEBUG:
+                _log_sp_outputs(out, positions)
+            return out
+        with bucket_filter.serving(bucket_filter.assigned(self.model)):
+            return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return getattr(self.model, "_mtp_hidden_buffer", None)

@@ -116,6 +116,9 @@ _RANK_BUFFER: Any = None
 # (`Fp8Config.get_quant_method`), so this is per-layer state without a registry
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
+# The token-sharded variant, built for sequence-parallel prefill
+# (deepseek_v4/sequence_parallel.py) next to the layer's own op.
+FUSED_MOE_EP_SP_OP_ATTR = "_fused_moe_ep_op_sp"
 
 
 def _squeeze_channel_scale(
@@ -432,6 +435,8 @@ def fused_moe_ep(
     hash_ids: torch.Tensor | None = None,
     expert_slot: torch.Tensor | None = None,
     order_after: torch.Tensor | None = None,
+    op_attr: str = FUSED_MOE_EP_OP_ATTR,
+    mask_padding: bool = True,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -450,9 +455,11 @@ def fused_moe_ep(
     prebuild saw the corresponding thing on the layer -- prebuild built the
     op's signature around that.
     Getting it wrong is a torch arity error at the first call, not a wrong
-    answer.
+    answer. `op_attr` names the op on `owner`; the default is the layer's own.
+    `mask_padding=False` is for a caller that already masked the padded rows
+    of `router_logits` (the local mask indexes this rank's replicated rows).
     """
-    op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
+    op = getattr(owner, op_attr)
     if w1.dtype == torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N]. Even a single block must
         # retain its axis; the per-channel helper would incorrectly drop it.
@@ -462,7 +469,7 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w1_scale),
             _squeeze_channel_scale_checked(w2_scale),
         )
-    if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+    if envs.TPU_MOE_SKIP_PADDED_TOKENS and mask_padding:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
     extra = tuple(
         t for t in (score_bias, hash_ids, expert_slot, order_after) if t is not None
@@ -596,6 +603,7 @@ def prebuild_fused_moe_ep(
     weights=None,
     supplies_hash_ids=False,
     scales_expert_second_minor=False,
+    sequence_parallel: bool | None = None,
 ) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
@@ -623,6 +631,10 @@ def prebuild_fused_moe_ep(
     requantized layout so admission precedes any lossy weight conversion.
     The caller must validate the actual prepared tensors before installing
     them; the built op closes over configuration, never these tensors.
+
+    `sequence_parallel` overrides the layer's MoE sequence parallelism: True
+    builds the variant whose input rows are each rank's own tokens (singleton
+    token groups: no replica split and no restore all-gather).
     """
     if not envs.USE_MOE_FUSED_EP_KERNEL:
         return None
@@ -757,6 +769,8 @@ def prebuild_fused_moe_ep(
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
     token_replica_groups = ep_token_replica_groups(
         is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
+        if sequence_parallel is None
+        else sequence_parallel
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None

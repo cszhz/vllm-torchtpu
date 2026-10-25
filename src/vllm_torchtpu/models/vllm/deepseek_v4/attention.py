@@ -912,8 +912,14 @@ class VllmDeepseekV4MLAAttention(
             f"{self.prefix}.wo_a: rotary_dim {rotary_dim} must be even and at most 128."
         )
 
-    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Apply inverse RoPE and low-rank output projections wo_a and wo_b."""
+    def _o_proj(
+        self, o: torch.Tensor, positions: torch.Tensor, reduce_output: bool = True
+    ) -> torch.Tensor:
+        """Apply inverse RoPE and low-rank output projections wo_a and wo_b.
+
+        With ``reduce_output=False`` wo_b's TP partial sum is returned as is,
+        for a caller that reduces it itself (sequence-parallel prefill).
+        """
         # The kernel folds the inverse RoPE, the activation quantization and
         # the per-group `wo_a` matmul into one pass.
         assert o.dtype == torch.bfloat16, (
@@ -933,6 +939,9 @@ class VllmDeepseekV4MLAAttention(
             self.wo_a.weight_scale,
         )
 
+        if not reduce_output:
+            # RowParallelLinear.forward minus its all-reduce; wo_b has no bias.
+            return self.wo_b.quant_method.apply(self.wo_b, z, None)
         out = self.wo_b(z)
         if isinstance(out, tuple):
             out = out[0]
@@ -942,6 +951,7 @@ class VllmDeepseekV4MLAAttention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        reduce_output: bool = True,
     ) -> torch.Tensor:
         """Forward pass for DeepSeek-V4 attention layer."""
         if positions.ndim > 1:
@@ -964,5 +974,6 @@ class VllmDeepseekV4MLAAttention(
             None,
         )
 
-        out = self._o_proj(attn_output, positions)
-        return out
+        if reduce_output:
+            return self._o_proj(attn_output, positions)
+        return self._o_proj(attn_output, positions, reduce_output=False)
