@@ -537,17 +537,22 @@ def read_served(
 
 
 def read_draft_served(
-    draft_model: Any, g: WM.Geometry, n_aux: int
+    draft_model: Any, g: WM.Geometry, n_aux: int, vocab_parallel: bool = False
 ) -> tuple[
     dict[str, torch.Tensor], list[dict[str, torch.Tensor]], list[dict[str, bool]]
 ]:
     """The DSpark draft's served tensors (`WM.served_draft_spec`), validated:
     model-level, per draft layer, and the per-layer [n, k] flags. `draft_model`
-    is the proposer's `draft_model` (`DSparkDeepseekV4ForCausalLM`)."""
+    is the proposer's `draft_model` (`DSparkDeepseekV4ForCausalLM`); `g` the
+    target geometry (`WM.tp_local` under vLLM TP, then `vocab_parallel`)."""
     model = draft_model.model
     layers = list(model.layers)
-    local_experts = int(layers[0].ffn.experts.routed_experts.w13_weight.shape[0])
-    glob_spec, layer_specs = WM.served_draft_spec(g, len(layers), n_aux, local_experts)
+    local_experts = [
+        int(lyr.ffn.experts.routed_experts.w13_weight.shape[0]) for lyr in layers
+    ]
+    glob_spec, layer_specs = WM.served_draft_spec(
+        g, len(layers), n_aux, local_experts, vocab_parallel
+    )
     glob, _ = read_served(model, glob_spec, "draft")
     served, flags = [], []
     for i, (layer, spec) in enumerate(zip(layers, layer_specs)):
@@ -613,12 +618,17 @@ def build_draft_weight_operands(
     """This rank's DSpark draft-step weight operands, in
     `KI.draft_weight_manifest(spec, logits=)` (= `step_impl.draft_weight_names`)
     order. `spec` is the draft's ModelSpec, `g` the target's geometry;
-    `shared` operands are taken as given (the target's lm_head shard)."""
-    glob, served, flags = read_draft_served(draft_model, g, n_aux)
+    `shared` operands are taken as given (the target's lm_head shard, the
+    placement rows). `rank` is the mesh index; under vLLM TP the served
+    tensors are its TP shard (`WM.tp_local`), as for the target."""
+    if spec.attn_tp > 1:
+        _need(not logits, "logits mode under vLLM TP (the lm_head is a TP shard)")
+        g = WM.tp_local(g, spec.attn_tp)
+    glob, served, flags = read_draft_served(draft_model, g, n_aux, spec.attn_tp > 1)
     gd = WM.draft_geometry(g, len(served))
     manifest = functools.partial(KI.draft_weight_manifest, logits=logits)
-    builds = WM.plan_operands(spec, flags, gd, WM.Shard(rank, spec.num_ranks), dense,
-                              manifest=manifest)  # fmt: skip
+    shard = WM.head_shard(rank, spec.num_ranks, spec.attn_tp)
+    builds = WM.plan_operands(spec, flags, gd, shard, dense, manifest=manifest)
     return _materialize(builds, glob, served, run_jax, shared or {})
 
 
@@ -955,6 +965,15 @@ def inplace_call(flat: Any, n_head: int, direct: bool) -> Callable:
     return call
 
 
+def _submitted(outs: Any) -> Any:
+    """`outs` after enqueueing the computation producing them, without
+    waiting (DirectStepCall)."""
+    from vllm_torchtpu.utils import synchronize_tensors
+
+    synchronize_tensors(list(outs), wait=False)
+    return outs
+
+
 class DirectStepCall:
     """The in-place step's exported kernel, called without the JaxCallable
     front end after the first call.
@@ -966,7 +985,14 @@ class DirectStepCall:
     lists are bound once), so the first call goes through `flat` -- export,
     registration, the output placeholders -- and later calls dispatch the
     registered kernel directly, checking only what can change: the head
-    operands' shapes and that the weight / cache lists are the bound ones."""
+    operands' shapes and that the weight / cache lists are the bound ones.
+
+    Every call is submitted at once (`synchronize_tensors(wait=False)`):
+    torch_tpu defers an op until its outputs are needed, and the kernel's
+    effects are in-place cache writes and its pairing with the other ranks'
+    calls, which torch cannot see -- an idle rank that drops the outputs
+    (DraftMegakernel.idle) would otherwise never launch it, and the busy
+    ranks' kernel would wait for it forever."""
 
     def __init__(self, flat: Any, n_head: int) -> None:
         self.flat, self.n_head = flat, n_head
@@ -977,7 +1003,7 @@ class DirectStepCall:
         if self._entry is None:
             outs = self.flat(*args)
             self._bind(head, weights, caches, args)
-            return outs
+            return _submitted(outs)
         fp, out_shapes, out_tree, devices, sig, w_ref, c_ref = self._entry
         _need(
             weights is w_ref and caches is c_ref,
@@ -997,7 +1023,7 @@ class DirectStepCall:
             donate_argnums=self.flat.donate_argnums,
             device_assignment=devices,
         )
-        return out_tree.unflatten(results)
+        return _submitted(out_tree.unflatten(results))
 
     def _bind(self, head, weights, caches, args) -> None:
         from torch_tpu._internal.pallas import pallas as pallas_impl
@@ -1020,18 +1046,32 @@ class DirectStepCall:
 
 
 def placement_operands(
-    spec: KI.ModelSpec, ep_rank: int, device: Any, placement: Any = None
+    spec: KI.ModelSpec,
+    ep_rank: int,
+    device: Any,
+    placement: Any = None,
+    first_layer: int = 0,
 ) -> tuple[KI.ModelSpec, dict[str, torch.Tensor]]:
     """The static expert placement (`expert_placement.current()` unless
     given): `spec` with its moe_placement / expert_slots, and this rank's
     rows of `moe_phase.placement_tables` (EP rank `ep_rank`) as the
-    "placement" weight operands. No placement: `spec` as is, no operands."""
+    "placement" weight operands; `spec`'s layers are the model's layers
+    `first_layer`.. (the DSpark draft's sit past the target's). No placement:
+    `spec` as is, no operands."""
+    import dataclasses as dc_
+
     from vllm_torchtpu import expert_placement
     from vllm_torchtpu.kernels.deepseek_v4_megakernel import moe_phase
 
     placement = placement or expert_placement.current()
     if placement is None:
         return spec, {}
+    if first_layer:
+        layers = range(first_layer, first_layer + spec.num_layers)
+        placement = dc_.replace(placement, layers={
+            li - first_layer: placement.layers[li]
+            for li in layers if li in placement.layers
+        })  # fmt: skip
     E, R = spec.n_routed_experts, spec.num_ranks
     _need(
         (placement.experts, placement.shards) == (E, R),
@@ -1048,26 +1088,83 @@ def placement_operands(
     return spec, {k: torch.from_numpy(v[ep_rank]).to(device) for k, v in rows.items()}
 
 
+def check_expert_slots(
+    layers: Sequence[Any], held: Any, ep_rank: int, n_experts: int, n_ranks: int
+) -> None:
+    """Refuse unless each layer's served routed experts sit where the kernel
+    reads them: local slot j holds global expert `held[layer, j]` (this rank's
+    placement_tables row; None: the contiguous block ep_rank * E/R + j), per
+    the layer's served expert map (global id -> local slot, -1 elsewhere)."""
+    import numpy as np
+
+    el = n_experts // n_ranks
+    for li, layer in enumerate(layers):
+        re_ = layer.ffn.experts.routed_experts
+        emap = _attr(re_, "_expert_map", f"layers.{li}.ffn.experts.routed_experts")
+        emap = emap.detach().cpu().numpy().astype(np.int64)
+        if held is None:
+            row = np.arange(ep_rank * el, (ep_rank + 1) * el)
+        else:
+            row = np.asarray(held[li].cpu() if hasattr(held, "cpu") else held[li])
+        want = np.full(n_experts, -1, np.int64)
+        live = row >= 0
+        want[row[live]] = np.nonzero(live)[0]
+        bad = np.nonzero(emap != want)[0]
+        _need(
+            not bad.size,
+            f"layer {li}: served expert slots differ from the kernel's "
+            f"(EP rank {ep_rank}) at global experts {bad[:8].tolist()}: served "
+            f"{emap[bad[:8]].tolist()}, kernel {want[bad[:8]].tolist()}",
+        )
+
+
 class RunTrace:
     """stderr trace of the first `budget` megakernel executions of this rank
     (target and draft, busy and idle), tagged with the DP step count. With
     `sync`, each is followed by a device sync and its end is traced: a rank
-    whose last line is a begin is stuck in that kernel."""
+    whose last line is a begin is stuck in that kernel; the device is synced
+    first and a "ready" line written, so a rank with "ready" but no begin
+    hung before the kernel (prep / operand copies); the `audit` operands not
+    in the default device layout (the layout the step was compiled for,
+    bind()) are named on the begin line, with the step's kernel fingerprint
+    (`fp`, the same on every rank or the ranks run different programs)."""
 
     def __init__(self, rank: int, budget: int, sync: bool) -> None:
         self.rank, self.left, self.sync = rank, budget, sync
         self.step = 0  # DP decisions so far
         self.n = 0
 
+    def note(self, msg: str) -> None:
+        """A free-form trace line, tagged like the run lines."""
+        sys.stderr.write(f"[dsv4-megakernel rank {self.rank}] step {self.step} {msg}\n")
+        sys.stderr.flush()
+
     @contextlib.contextmanager
-    def __call__(self, what: str):
+    def __call__(
+        self,
+        what: str,
+        audit: dict[str, Sequence[torch.Tensor]] | None = None,
+        call: Any = None,
+    ):
         if self.left <= 0:
             yield
             return
         self.left -= 1
         self.n += 1
         tag = f"[dsv4-megakernel rank {self.rank}] run {self.n} step {self.step} {what}"
-        sys.stderr.write(f"{tag} begin\n")
+        moved = ""
+        if self.sync:
+            t0 = time.perf_counter()
+            _sync(None)
+            sys.stderr.write(f"{tag} ready {(time.perf_counter() - t0) * 1e3:.1f} ms\n")
+            entry = getattr(call, "_entry", None)
+            moved = f" fp={entry[0]}" if entry else " fp=unbound"
+        if self.sync and audit:
+            got = {(k, i): default_layout(t) for k, ts in audit.items()
+                   for i, t in enumerate(ts)}  # fmt: skip
+            off = [f"{k}[{i}]={v}" for (k, i), v in got.items() if v is not True]
+            moved += f" non-default layout: {off}" if off else ""
+        sys.stderr.write(f"{tag} begin{moved}\n")
         sys.stderr.flush()
         t0 = time.perf_counter()
         yield
@@ -1224,6 +1321,8 @@ class DSv4Megakernel:
             attn_tp=attn_tp,
         )
         spec, placed = placement_operands(spec, expert_block, runner.device)
+        check_expert_slots(backbone.layers, placed.get("moe_held"), expert_block,
+                           spec.n_routed_experts, spec.num_ranks)  # fmt: skip
         if kernel is None:
             # the kernel sizes its attention for the context classify() admits
             kernel = ServingKernel(
@@ -1317,6 +1416,7 @@ class DSv4Megakernel:
         self.cfg: KI.StepConfig | None = None
         self.caches: BoundCaches | None = None
         self._steps: dict[KI.Bucket, Callable] = {}
+        self._calls: dict[KI.Bucket, Any] = {}  # in place: the DirectStepCall
         self._preps: dict[KI.Bucket, Callable] = {}
         self._fits: dict[tuple[KI.Bucket, int], Callable] = {}
         self._idle_operands: dict[KI.Bucket, list[torch.Tensor]] = {}
@@ -1477,6 +1577,7 @@ class DSv4Megakernel:
         )
         if inplace:
             call = inplace_call(flat, _HEAD_OPERANDS + n_bt, self.direct_dispatch)
+            self._calls[bucket] = call
 
             def inplace_step(meta, input_ids, positions, seq_lens, block_tables,
                              weights, caches):  # fmt: skip
@@ -1837,7 +1938,11 @@ class DSv4Megakernel:
                 first.request_distribution,
                 *(md[n].block_tables for n in names),
             )
-        with self.trace(f"target {bucket.key} {'idle' if decision.idle else 'busy'}"):
+        with self.trace(
+            f"target {bucket.key} {'idle' if decision.idle else 'busy'}",
+            dict(ops=ops, cache=self.caches.arrays),
+            self._calls.get(bucket),
+        ):
             hidden, aux = self._steps[bucket](
                 self.meta,
                 ops[0],

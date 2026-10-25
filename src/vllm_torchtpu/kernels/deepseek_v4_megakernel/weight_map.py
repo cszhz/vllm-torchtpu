@@ -278,7 +278,11 @@ def draft_geometry(g: Geometry, n_draft: int) -> Geometry:
 
 
 def served_draft_spec(
-    g: Geometry, n_draft: int, n_aux: int, local_experts: int
+    g: Geometry,
+    n_draft: int,
+    n_aux: int,
+    local_experts: int | Sequence[int],
+    vocab_parallel: bool = False,
 ) -> tuple[dict[str, Served], list[dict[str, Served]]]:
     """What the DSpark draft serves: model-level tensors (paths from its
     `DSparkDeepseekV4Model`) and one `served_layer_spec` per draft layer.
@@ -289,9 +293,13 @@ def served_draft_spec(
     may differ from the target's, whose layers all compress). main_proj
     takes the concatenated aux states of the `n_aux` target layers."""
     h, gd = g.hidden, draft_geometry(g, n_draft)
-    layers = [served_layer_spec(gd, i, local_experts) for i in range(n_draft)]
+    if isinstance(local_experts, int):  # per layer (a placement may differ)
+        local_experts = [local_experts] * n_draft
+    layers = [served_layer_spec(gd, i, e) for i, e in enumerate(local_experts)]
     glob = {
-        "embed": Served("embed_tokens.weight", (g.vocab, h), BF16),
+        "embed": Served(
+            "embed_tokens.weight", (-1 if vocab_parallel else g.vocab, h), BF16
+        ),
         "main_proj": Served("main_proj.weight", (n_aux * h, h), FP8),
         "main_proj_scale": Served("main_proj.weight_scale", (h,), F32),
         "main_norm": Served("main_norm.weight", (h,), BF16),
@@ -313,13 +321,22 @@ def served_draft_spec(
 class Shard:
     rank: int
     ranks: int
+    # the mesh index, when `rank` is a TP shard's half (head_shard); the
+    # "proj_cols" columns follow the mesh order
+    mesh_rank: int | None = None
+
+    @property
+    def col_rank(self) -> int:
+        return self.rank if self.mesh_rank is None else self.mesh_rank
 
 
 def head_shard(rank: int, ranks: int, attn_tp: int = 1) -> Shard:
     """Mesh rank `rank`'s share of its served (TP-local, `tp_local`)
     tensors: half g = rank // attn_tp of them, over G = ranks // attn_tp."""
     _need(ranks % attn_tp == 0, f"attn_tp {attn_tp} does not divide {ranks} ranks")
-    return Shard(rank // attn_tp, ranks // attn_tp)
+    if attn_tp == 1:
+        return Shard(rank, ranks)
+    return Shard(rank // attn_tp, ranks // attn_tp, mesh_rank=rank)
 
 
 def _cols(x, start, size):
@@ -618,7 +635,7 @@ def _plan(e, served, g, s, cfg) -> Build:
         key, n = e.source.split(":")[0], e.shape[-1]
 
         def proj_cols(x):
-            x = _cols(x, s.rank * n, n)
+            x = _cols(x, s.col_rank * n, n)
             return x.astype(jnp.bfloat16) if e.dtype == BF16 else x
 
         return Build(e, (LayerSource(None, key, False),), proj_cols)

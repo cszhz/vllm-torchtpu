@@ -1181,6 +1181,8 @@ def test_from_runner_tp8_dp2(monkeypatch):
     monkeypatch.setattr(
         VA, "_mesh_and_rank", lambda mode: pytest.fail("DP16 mesh under TP")
     )
+    # the stand-in layers carry no served expert maps (test_check_expert_slots)
+    monkeypatch.setattr(VA, "check_expert_slots", lambda *a: None)
     for k in (
         "VLLM_TPU_DSV4_MK_LOGITS",
         "VLLM_TPU_DSV4_MK_DRAFT",
@@ -1202,6 +1204,20 @@ def test_from_runner_tp8_dp2(monkeypatch):
     monkeypatch.setenv("TPU_EXPERT_PLACEMENT", "dsv4_pro_agentx_ep16")
     VA.DSv4Megakernel.from_runner(_tp_runner(), kernel)
     assert (kernel.spec.moe_placement, kernel.spec.expert_slots) == ("perm", 24)
+
+
+def test_check_expert_slots():
+    def layer(emap):
+        re_ = NS(_expert_map=torch.tensor(emap))
+        return NS(ffn=NS(experts=NS(routed_experts=re_)))
+
+    # 8 experts over 4 ranks: rank 1 holds global experts 2, 3 in slots 0, 1
+    block = [-1, -1, 0, 1, -1, -1, -1, -1]
+    VA.check_expert_slots([layer(block)], None, 1, 8, 4)
+    VA.check_expert_slots([layer([-1, 1, -1, -1, -1, 0, -1, -1])],
+                          torch.tensor([[5, 1]]), 1, 8, 4)  # fmt: skip
+    with pytest.raises(VA.Unsupported, match="at global experts \\[2, 3\\]"):
+        VA.check_expert_slots([layer([-1, -1, 1, 0, -1, -1, -1, -1])], None, 1, 8, 4)
 
 
 def test_placement_operands_are_this_ep_ranks_table_rows():

@@ -212,3 +212,41 @@ def test_no_forced_embedding_sharing():
     # has_own_embed_tokens / has_own_lm_head instead of force-sharing.
     p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
     assert p._force_share_target_embeddings is False
+
+
+def test_megakernel_idle_draft_replays_the_busy_sampling_collectives():
+    """An idle DP engine runs the draft megakernel idle, then the draft
+    sampling graph at the busy engines' lockstep bucket: under a TP-sharded
+    draft the sampling issues TP collectives, which pair across DP engines."""
+    p = _make_proposer(
+        {"dspark_noise_token_id": 7, "dspark_block_size": 4, **_LAYER_IDS}
+    )
+    calls = []
+    draft = SimpleNamespace(
+        logits=False,
+        spec=SimpleNamespace(hidden_size=16, vocab_size=32),
+        idle=lambda bucket: calls.append(("idle", bucket)),
+    )
+    p.runner._dsv4_mk = SimpleNamespace(draft=draft, last_run="t16")
+    p.runner._dp_step_max_reqs = 2
+    p.runner.num_tokens_paddings = [8, 16, 32]
+
+    def sample(hidden, ids, block_size, *rest):
+        calls.append(("sample", tuple(hidden.shape), ids.dtype, block_size, rest))
+        return torch.zeros(1), hidden
+
+    p._sample_from_hidden = sample
+    rows = p._dp_draft_bucket()
+    assert rows == p._get_padded_len(2 * p.block_size)
+    with mock.patch("vllm_torchtpu.utils.synchronize_tensors"):
+        p._draft_replicated = False
+        p.run_dp_dummy_draft(1)
+        assert calls == [
+            ("idle", "t16"),
+            ("sample", (rows, 16), torch.int32, p.block_size, ()),
+        ]
+        # a replicated draft samples rank-locally: nothing to pair
+        calls.clear()
+        p._draft_replicated = True
+        p.run_dp_dummy_draft(1)
+        assert calls == [("idle", "t16")]

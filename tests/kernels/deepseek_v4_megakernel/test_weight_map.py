@@ -607,7 +607,8 @@ def test_tp_geometry_and_shard(tree):
         384,
         3072,
     )
-    assert WM.head_shard(13, R, TP) == WM.Shard(1, 2)
+    assert WM.head_shard(13, R, TP) == WM.Shard(1, 2, mesh_rank=13)
+    assert WM.head_shard(13, R, TP).col_rank == 13
     assert WM.head_shard(13, R) == WM.Shard(13, R)
     with pytest.raises(WM.Unsupported, match="does not divide"):
         WM.tp_local(G, 3)
