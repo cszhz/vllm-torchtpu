@@ -21,6 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import operand_pin
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
 
@@ -116,10 +117,16 @@ def kernel(
     acc_ref,  # (2, tile_n, slots_per_m_tile, 1, 128)
     sem_ref,
     write_counts_ref,  # [2]
-    *,
+    *ape_fetch,  # (VMEM copy of ape, DMA semaphore) when ape is an HBM ref
     cfgs: Configs,
 ):
     """Inner kernel executing matmul, APE addition, and paged writes."""
+    ape_copy = None
+    if ape_fetch:
+        ape_vmem, ape_sem = ape_fetch
+        ape_copy = pltpu.make_async_copy(ape, ape_vmem, ape_sem.at[0])
+        ape_copy.start()  # waited in the first pipeline step, behind its weight DMA
+        ape = ape_vmem
     tile_m = cfgs.tile_sizes.tile_m
     tile_n = cfgs.tile_sizes.tile_n
     last_dim = acc_ref.shape[-1]
@@ -210,6 +217,12 @@ def kernel(
             )
             new_acc = existing_acc + ape_selected  # (tile_n, state_width)
             store_to_acc_ref(acc_ref.at[buf_idx], new_acc)
+
+        if ape_copy is not None:
+
+            @pl.when((n_idx == 0) & (m_idx == 0) & (k_idx == 0))
+            def _wait_ape():
+                ape_copy.wait()
 
         def process(copy_dma: bool, add_ape: bool):
             # 1. Semaphore wait (only on first step)
@@ -323,6 +336,9 @@ def kernel(
             pl.semaphore_wait(sem_ref.at[b], count)
 
 
+_PIN_MIN_STATE_DIM = 1024
+
+
 def _select_tile_k(size_k: int, cap: int = 3584, align: int = 128) -> int:
     """Largest 128-aligned k tile that *divides* ``size_k``."""
     cap = max(align, (min(cap, size_k) // align) * align)
@@ -406,6 +422,19 @@ def proj_and_save_state(
         pltpu.SemaphoreType.REGULAR((2,)),
         pltpu.SMEM((2,), jnp.int32),
     ]
+    # XLA prefetches the indexer's 7 MB weight in slices behind earlier ops, but
+    # stages the 14.7 / 29 MB ones (and the small operands with them) unoverlapped
+    # right before the call, so only those are pinned.
+    pin = operand_pin.enabled("proj") and state_dim >= _PIN_MIN_STATE_DIM
+    if pin:
+        scratch_shapes += [
+            pltpu.VMEM(ape.shape, ape.dtype),
+            pltpu.SemaphoreType.DMA((1,)),
+        ]
+        slot_mapping, positions, hidden_states, wkv_wgate, ape = (
+            operand_pin.hbm(a)
+            for a in (slot_mapping, positions, hidden_states, wkv_wgate, ape)
+        )
 
     out_shape = jax.ShapeDtypeStruct(cache.shape, cache.dtype)
 
@@ -419,7 +448,8 @@ def proj_and_save_state(
                 pl.BlockSpec(memory_space=pltpu.HBM),  # positions
                 pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states
                 pl.BlockSpec(memory_space=pltpu.HBM),  # wkv_wgate
-                pl.BlockSpec(memory_space=pltpu.VMEM),  # ape (prefetch to VMEM)
+                # ape: with `pin`, fetched by the kernel (see `ape_fetch`)
+                pl.BlockSpec(memory_space=pltpu.HBM if pin else pltpu.VMEM),
                 pl.BlockSpec(memory_space=pltpu.HBM),  # cache
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
