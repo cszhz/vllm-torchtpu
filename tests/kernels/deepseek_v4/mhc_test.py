@@ -630,6 +630,39 @@ class MhcGatesInKernelTpuTest(parameterized.TestCase):
         np.testing.assert_array_equal(_to_np(got_layer), _to_np(want_layer))
         self._check_gates(got_post, got_comb, want_post, want_comb)
 
+    @parameterized.product(
+        num_tokens=[1, 3, 4, 8], sinkhorn_repeat=[1, 20], norm=[False, True],
+        stacked=[False, True],
+    )
+    def test_fused_small_block(self, num_tokens, sinkhorn_repeat, norm, stacked):
+        """small_block=8 (one block of exactly the T<=8 rows) vs the 16-row
+        block: streams bit-identical; the squared-sum reduction runs over a
+        different tile layout, so the gates move by f32 ulps (gate
+        tolerance) and a rare layer-input element by one bf16 ulp."""
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel, utils
+
+        rng = np.random.default_rng(15)
+        args = _fused_args(rng, num_tokens, 7168, sinkhorn_repeat)
+        if stacked:
+            args = args[:4] + (utils.cat_fn3(jnp.asarray(args[4])),) + args[5:]
+        kw = dict(gates_in_kernel=True, gates_max_tokens=0)
+        if norm:
+            kw.update(
+                norm_weight=jnp.asarray(rng.uniform(0.5, 1.5, (7168,)), jnp.bfloat16),
+                norm_eps=RMS_EPS,
+            )
+        fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
+        want = fused_fn(*args, small_block=16, **kw)
+        got = fused_fn(*args, small_block=8, **kw)
+        for g, w in zip(got, want):
+            self.assertEqual(g.shape, w.shape)
+            self.assertTrue(np.isfinite(_to_np(g)).all())
+        np.testing.assert_array_equal(_to_np(got[0]), _to_np(want[0]))
+        got_l, want_l = _to_np(got[3]), _to_np(want[3])
+        np.testing.assert_allclose(got_l, want_l, rtol=8e-3, atol=1e-6)
+        self.assertLessEqual(np.mean(got_l != want_l), 1e-3)
+        self._check_gates(got[1], got[2], want[1], want[2])
+
     @parameterized.product(num_tokens=[8, 16, 17], sinkhorn_repeat=[1, 20])
     def test_pre(self, num_tokens, sinkhorn_repeat):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import pre_kernel

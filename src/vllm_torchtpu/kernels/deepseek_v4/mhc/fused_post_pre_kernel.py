@@ -20,6 +20,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
@@ -112,6 +113,7 @@ def _fused_kernel(
         "vmem_limit_bytes",
         "gates",
         "norm_eps",
+        "small_block",
     ),
 )
 def fused_post_pre_mixes(
@@ -131,6 +133,7 @@ def fused_post_pre_mixes(
     gates: utils.GateConsts | None = None,
     norm_weight: jax.Array | None = None,
     norm_eps: float | None = None,
+    small_block: int = utils.SUBLANE,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """The Pallas seam kernel: post recombine fused with pre's mix GEMM
     and in-block collapse.
@@ -158,6 +161,9 @@ def fused_post_pre_mixes(
             in-block and returned in place of (mixes, sqrsum).
         norm_weight, norm_eps: when set, layer2d is returned RMS-normalized
             with this (hidden_size,) weight (see utils.finish_layer_input).
+        small_block: with in-kernel gates, a batch of at most this many
+            tokens (8) runs as one block of exactly its rows instead of the
+            16-row bf16 tile (see the call site).
 
     Returns:
         new_res2d: (num_tokens, hc_mult * hidden_size), bfloat16.
@@ -186,6 +192,12 @@ def fused_post_pre_mixes(
     tb, padded_tokens = utils.select_token_block(
         num_tokens, token_block_size, whole_small_batch=gates is not None
     )
+    if gates is not None and num_tokens <= small_block < tb:
+        # Decode batches of <= 8 rows: one block of exactly the array's rows
+        # (legal as it equals the full dims). The body's f32 VPU work is per
+        # 8-row vreg, so the 16-row overhang block doubled it for nothing:
+        # T=8 seam 6.42 -> 5.78 us (tpu7x, served shapes).
+        tb, padded_tokens = num_tokens, num_tokens
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
 
     fn_ops = utils.fn_operands(fn)
@@ -269,6 +281,7 @@ def mhc_fused_post_pre(
     gates_max_tokens: int | None = None,
     norm_weight: jax.Array | None = None,
     norm_eps: float | None = None,
+    small_block: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Fused seam op: Pallas post+GEMM+collapse kernel, gates in an XLA
     epilogue or (``gates_in_kernel``, up to ``gates_max_tokens`` tokens --
@@ -286,6 +299,8 @@ def mhc_fused_post_pre(
     post2d = post_layer_mix.reshape(-1, hc_mult)
     comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
 
+    if small_block is None:
+        small_block = envs.VLLM_TPU_DSV4_MHC_SMALL_BLOCK
     gates = utils.gate_consts(
         x2d.shape[0],
         gates_in_kernel,
@@ -310,6 +325,7 @@ def mhc_fused_post_pre(
         gates=gates,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        small_block=small_block,
     )
     if gates is not None:
         post_mix_cur, comb_mix_cur = gate_a, gate_b

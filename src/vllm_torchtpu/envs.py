@@ -196,6 +196,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_MHC_STACKED_FN: bool = True
     VLLM_TPU_DSV4_MHC_TOKEN_BLOCK: int = 128
     VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS: int = 0
+    VLLM_TPU_DSV4_MHC_SMALL_BLOCK: int = 16
     VLLM_TPU_DSV4_MHC_POST_HEAD: bool = True
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
@@ -1350,6 +1351,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS": env_int(
         "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS", 0
     ),
+    # DeepSeek-V4 mHC: fused seam batches of at most this many tokens (with
+    # in-kernel gates) run as one block of exactly their rows. 16 = off (the
+    # bf16 sublane tile); 8 halves the f32 VPU work of a T<=8 decode seam
+    # (6.42 -> 5.78 us at T=8; post/comb mixes move by f32 ulps).
+    "VLLM_TPU_DSV4_MHC_SMALL_BLOCK": env_int("VLLM_TPU_DSV4_MHC_SMALL_BLOCK", 16),
     # DeepSeek-V4 mHC: fuse the posts that only feed the hc head collapse or
     # DSpark's aux stream mean into one kernel each, so the (T, 4, H) streams
     # are never written (one to three posts per forward).
