@@ -273,6 +273,7 @@ def score_pipeline(
     cp_size: int = 1,
     interleave_c: int = 1,
     chunk_idx: int = 0,
+    verify_bd: bool = False,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     scores_hbm_ref = score_refs[-1]
@@ -493,6 +494,28 @@ def score_pipeline(
     # The zero pad rows are scored and dropped.
     hm_tok = align_to(bq_sz, 8)
 
+    # Block-diagonal verify scoring (`verify_bd`, TPU_STREAMIDX_VERIFY_BD). The
+    # contraction is head_dim = 128 deep, but the MXU pads it to 256 anyway, so
+    # stacking two lane tiles' keys on the contraction ([keys_a; keys_b]) against
+    # a block-diagonal q -- row (h, half, t) holds q[t, h] in contraction half
+    # `half`, zeros in the other -- scores both tiles in the passes one took.
+    # Each head then owns 2 * hm_tok = 16 rows: one packed (16, 128) bf16 tile
+    # per lane tile, so the head reduction runs in packed bf16 (relu(q.k) and
+    # the weights rounded to bf16, products accumulated in f32; the numerics of
+    # `reduce_token_block`'s bf16 reduce), one multiply-accumulate per packed
+    # register instead of a max, a multiply and an add per f32 register.
+    use_verify_bd = (
+        verify_bd
+        and seq_along_lane
+        and not prefill_cfg.enabled
+        and seq_batch_size == 1
+        and bq_sz > 1
+        and get_dtype_bitwidth(q_hbm_ref.dtype) == 8
+        and 2 * hm_tok == 8 * get_dtype_packing(jnp.bfloat16)
+        and 2 * head_dim <= 256
+        and (num_lane_tiles_bkv // 2) % 2 == 0
+    )
+
     def pad_tokens(bq_rows, n_tok):
         """[n_tok, H, D] -> [hm_tok, H, D], zero rows appended."""
         if n_tok == hm_tok:
@@ -575,10 +598,50 @@ def score_pipeline(
             ret.append(s_summed.reshape(-1, num_sublanes, 128))
         return jnp.concatenate(ret, axis=0)
 
-    def step_body(q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None):
+    def build_verify_bd_caches(q_vmem, weights_vmem, q_bd_ref, wb_ref):
+        """Caches the block-diagonal q and lane-broadcast bf16 weights of a q block.
+
+        Args:
+          q_vmem: [bq, H, D] query block.
+          weights_vmem: [bq, H] indexer weights.
+          q_bd_ref: [H * 2 * hm_tok, 2 * D] block-diagonal q, rows (head, half,
+            token); the token axis is padded to hm_tok with zero rows.
+          wb_ref: [H, 2 * hm_tok, 128] bf16 weights of each (head, half, token)
+            row, broadcast along lanes; zero on the padding rows.
+        """
+        # Built in f32 (exact for FP8 values), cast back to the q dtype.
+        qf = pad_tokens(q_vmem[...], bq_sz).astype(jnp.float32)
+        qhm = qf.transpose(1, 0, 2)  # [H, hm_tok, D]
+        z = jnp.zeros_like(qhm)
+        q_bd = jnp.concatenate(
+            [
+                jnp.concatenate([qhm, z], axis=-1),
+                jnp.concatenate([z, qhm], axis=-1),
+            ],
+            axis=1,
+        )
+        q_bd_ref[...] = q_bd.reshape(q_bd_ref.shape).astype(q_bd_ref.dtype)
+        w = weights_vmem[...].astype(jnp.float32)
+        w = jnp.pad(w, ((0, hm_tok - w.shape[0]), (0, 0)))  # [hm_tok, H]
+        for h in range(num_q_heads):
+            col = w[:, h : h + 1]
+            wb_ref[h] = jnp.broadcast_to(
+                jnp.concatenate([col, col], axis=0), (2 * hm_tok, 128)
+            ).astype(wb_ref.dtype)
+
+    def step_body(
+        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None, wb_ref=None
+    ):
         bkv_idx = bkv_block(pl.program_id(0))
 
-        if q_hm_ref is not None:
+        if wb_ref is not None:
+            # Verify-bd: the caches depend only on the q block (see below).
+            @pl.when(bkv_idx == 0)
+            def _():
+                build_verify_bd_caches(q_vmem, weights_vmem, q_hm_ref, wb_ref)
+
+            bq_vec = None
+        elif q_hm_ref is not None:
             # The head-major reordering depends only on the q block, but the grid
             # iterates kv innermost (`bkv_idx = step % num_bkv`), so bq_idx is held
             # fixed for a whole run of steps. Reordering once per q block instead of
@@ -597,8 +660,70 @@ def score_pipeline(
         w_data = weights_vmem[...].reshape(seq_batch_size, -1, num_q_heads)
         bq_weights_vec = [w_data[batch_idx] for batch_idx in range(seq_batch_size)]
 
+        def score_verify_bd(num_tiles):
+            """Verify-bd scoring of the block's first `num_tiles` lane tiles."""
+            rows = seq_along_lane_block_rows(bkv_vmem)
+            half_n = num_tiles // 2
+            # Two lane tiles per contraction half per matmul (N = 256 lanes), the
+            # heads reduced inside each chunk and the weight tile reloaded from
+            # VMEM per chunk, as in `blocked_prefill_step`: in that shape the
+            # compiler fuses each packed bf16 term into one multiply-accumulate.
+            # One matmul over the whole block, with a single weight register
+            # reused across every lane tile, does not fuse: the relu is packed,
+            # unpacked and multiplied and added in f32, 2.5x the VALU work.
+            chunk = math.gcd(half_n, 2)
+            halves = ([], [])
+            for c in range(half_n // chunk):
+                tiles = (
+                    range(c * chunk, (c + 1) * chunk),
+                    range(half_n + c * chunk, half_n + (c + 1) * chunk),
+                )
+                # Contraction half 0 scores lane tiles [0, n/2), half 1 [n/2, n).
+                rhs = jnp.concatenate(
+                    [
+                        jnp.concatenate(
+                            [seq_along_lane_key_tile(rows, 0, j) for j in t], axis=1
+                        )
+                        for t in tiles
+                    ],
+                    axis=0,
+                )
+                st = jnp.einsum(
+                    "nd,dm->nm",
+                    q_hm_ref[...],
+                    rhs,
+                    preferred_element_type=jnp.float32,
+                ).reshape(num_q_heads, 2 * hm_tok, chunk * 128)
+                acc = None
+                for h in range(num_q_heads):
+                    w_h = wb_ref[h]
+                    if chunk > 1:
+                        w_h = jnp.concatenate([w_h] * chunk, axis=1)
+                    # As in `reduce_token_block`: rounding before the relu equals
+                    # rounding after it, and the chain starts from a product and
+                    # adds one unpacked bf16 x bf16 product per head.
+                    r = jnp.maximum(st[h].astype(jnp.bfloat16), 0)
+                    term = r.astype(jnp.float32) * w_h.astype(jnp.float32)
+                    acc = term if acc is None else acc + term
+                assert acc is not None
+                # Rows [0, bq) of the head slice score half 0's tiles, rows
+                # [hm_tok, hm_tok + bq) half 1's.
+                for half, t in enumerate(tiles):
+                    scale = jnp.concatenate(
+                        [seq_along_lane_scale_tile(rows, 0, j) for j in t], axis=1
+                    )
+                    r0 = half * hm_tok
+                    halves[half].append(acc[r0 : r0 + bq_sz] * scale)
+            s = jnp.concatenate(halves[0] + halves[1], axis=1)
+            scores_vmem[:, :num_tiles] = pltpu.bitcast(
+                s.reshape(bq_sz, num_tiles, 128), jnp.int32
+            )
+
         def score(num_tiles):
             """Scores the block's first `num_tiles` lane tiles."""
+            if wb_ref is not None:
+                score_verify_bd(num_tiles)
+                return
             bkvs = []
             bkv_scales = []
             for batch_idx in range(seq_batch_size):
@@ -887,7 +1012,7 @@ def score_pipeline(
                 q_half_ref=q_half_ref,
             )
         else:
-            body = functools.partial(step_body, q_hm_ref=q_hm_ref)
+            body = functools.partial(step_body, q_hm_ref=q_hm_ref, wb_ref=wb_ref)
 
         @pl.with_scoped(final_allocs=(q_alloc, weights_alloc, kv_alloc, o_alloc))
         def _run_pipeline(final_allocs):
@@ -937,6 +1062,12 @@ def score_pipeline(
                 if half_block_cache
                 else ()
             ),
+        )
+    elif use_verify_bd:
+        pl.run_scoped(
+            lambda q_bd_ref, wb_ref: _run_all(q_hm_ref=q_bd_ref, wb_ref=wb_ref),
+            pltpu.VMEM((num_q_heads * 2 * hm_tok, 2 * head_dim), q_hbm_ref.dtype),
+            pltpu.VMEM((num_q_heads, 2 * hm_tok, 128), jnp.bfloat16),
         )
     elif seq_batch_size == 1 and bq_sz > 1:
         pl.run_scoped(
@@ -1359,6 +1490,7 @@ def _effective_row_lengths(
         "sc_topk_coop_max_rows",
         "kv_split",
         "row_window_tokens",
+        "verify_bd",
     ),
 )
 def streamindex_topk(
@@ -1394,6 +1526,7 @@ def streamindex_topk(
     kv_split_rank: jax.Array | int = 0,
     row_window: tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None = None,
     row_window_tokens: int = 0,
+    verify_bd: bool | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1476,6 +1609,10 @@ def streamindex_topk(
         SparseCore data-format conversion of the whole (padded) buffer. Same
         selection either way.
       sc_topk_coop_max_rows: `sparsecore_topk`'s `coop_max_rows`.
+      verify_bd: score the `uniform_q_len` pass (windows of <= 8 tokens) with a
+        block-diagonal q and a packed bf16 head reduction (see `score_pipeline`).
+        Not bit-exact: relu(q.k) and the weights are rounded to bf16, as in the
+        mixed pass. None reads TPU_STREAMIDX_VERIFY_BD.
       return_scores: also return the score of each selected position, which is
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
@@ -1490,6 +1627,10 @@ def streamindex_topk(
     # `cache_kv`, keeping HBM transactions fused.
 
     kv_layout = KVLayout.parse(kv_layout)
+    if verify_bd is None:
+        from vllm_torchtpu import envs
+
+        verify_bd = envs.TPU_STREAMIDX_VERIFY_BD
 
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
@@ -1715,6 +1856,7 @@ def streamindex_topk(
                     cp_size=cp_size,
                     interleave_c=interleave_c,
                     chunk_idx=chunk_idx,
+                    verify_bd=verify_bd and case == MlaCase.PREFILL,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,

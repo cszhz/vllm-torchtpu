@@ -155,6 +155,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_STREAMIDX_VERIFY_BD: bool = False
     TPU_DSV4_SC_TOPK_FLAT_SCORES: bool = True
     TPU_DSV4_SC_TOPK_COOP_MAX_ROWS: int = 16
     TPU_DSV4_SWA_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
@@ -1152,6 +1153,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
+    # StreamIndex verify pass (speculative-decoding windows of <= 8 tokens):
+    # score two lane tiles per 256-deep MXU pass with a block-diagonal q
+    # (16 rows per head) and reduce the heads in packed bf16 (relu(q.k) and the
+    # weights rounded to bf16, products accumulated in f32), the numerics the
+    # mixed/prefill pass already uses. Halves the VPU work of the reduction.
+    "TPU_STREAMIDX_VERIFY_BD": env_bool("TPU_STREAMIDX_VERIFY_BD"),
     # DSv4 indexer: hand the SparseCore top-k the scoring kernel's [T, S, 128]
     # buffer as is, without padding rows, instead of reshaping it to [T, S*128]
     # and padding the rows to the top-k's wave size. The bytes are identical, so
