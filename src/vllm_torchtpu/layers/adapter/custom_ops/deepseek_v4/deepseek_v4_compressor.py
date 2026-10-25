@@ -14,6 +14,7 @@
 """TPU DeepSeek-V4 KV/score compressor, on the compress-and-store kernels."""
 
 import functools
+import re
 from typing import TYPE_CHECKING, cast
 
 import jax
@@ -51,6 +52,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _compressor_op_cache = {}
+# Every compressor built in this process, so the op prebuild can pair a CSA
+# layer's KV compressor with its indexer's (TPU_DSV4_COMPRESSOR_PAIR).
+_COMPRESSORS: list = []
 
 # The mesh has no batch axis today, so every batch-axis spec resolves to None.
 # TODO(patemotter): name it here once the DP-attention PR adds the axis.
@@ -401,6 +405,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         self.num_layers = (
             get_current_vllm_config().model_config.hf_config.num_hidden_layers
         )
+        _COMPRESSORS.append(self)
 
     def transpose_wkv_wgate(self) -> None:
         """Stores ``fused_wkv_wgate.weight`` transposed, once, at load time.
@@ -458,6 +463,15 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         if op is None:
             op = self._build_compressor_op()
             object.__setattr__(self, "_compressor_op_instance", op)
+            if envs.TPU_DSV4_COMPRESSOR_PAIR and not self._separate_state:
+                # The runner's op prebuild reaches this before compile: build
+                # the TPU_DSV4_COMPRESSOR_PAIR ops now, since building a
+                # jax_op inside the compiled graph is not traceable.
+                _ = self.compressor_op_skip_proj
+                partner = _pair_partner(self)
+                if partner is not None:
+                    a, b = (self, partner) if self.head_dim == 512 else (partner, self)
+                    _get_pair_op([_pair_statics(a), _pair_statics(b)])
         return op
 
     @property
@@ -745,8 +759,40 @@ def _pair_proj_jax(
     )
 
 
+def _layer_of(comp) -> tuple[str, bool] | None:
+    m = re.search(r"layers\.(\d+)\.", comp.state_cache.prefix or "")
+    if m is None:
+        return None
+    return m.group(1), "indexer" in comp.state_cache.prefix
+
+
+def _pair_partner(comp):
+    """The other compressor of the same CSA layer (KV <-> indexer), if any."""
+    me = _layer_of(comp)
+    if me is None:
+        return None
+    for other in _COMPRESSORS:
+        if other is comp or other._separate_state:
+            continue
+        them = _layer_of(other)
+        if them is not None and them[0] == me[0] and them[1] != me[1]:
+            return other
+    return None
+
+
+def _pair_statics(comp) -> dict:
+    return dict(
+        compress_ratio=comp.compress_ratio,
+        state_block_size=comp.state_cache.block_size,
+        head_dim=comp.head_dim,
+        overlap=comp.overlap,
+        seq_along_lane=comp.head_dim == 128,
+        separate_state=False,
+    )
+
+
 def _get_pair_op(statics):
-    key = tuple(tuple(sorted(st.items())) for st in statics)
+    key = tuple(tuple(sorted(st.items())) for st in statics)  # == pair_proj_forward's
     op = _pair_op_cache.get(key)
     if op is None:
         name = "pallas::deepseek_v4_compressor_pair_proj_" + "_".join(
@@ -795,23 +841,16 @@ def pair_proj_forward(
         if prep is None:
             return False
         preps.append((comp, prep))
-    # Build every op this path needs on the same call that first builds the
-    # compressors' own ops (the first forward with live caches), whatever its
-    # token count: building a jax_op is not traceable, so it must not first
-    # happen inside a compiled decode graph.
-    statics = [
-        dict(
-            compress_ratio=comp.compress_ratio,
-            state_block_size=comp.state_cache.block_size,
-            head_dim=comp.head_dim,
-            overlap=comp.overlap,
-            seq_along_lane=comp.head_dim == 128,
-            separate_state=False,
-        )
-        for comp in (comp_a, comp_b)
-    ]
-    op = _get_pair_op(statics)
-    _ = comp_a.compressor_op_skip_proj, comp_b.compressor_op_skip_proj
+    # Look up only: the ops are prebuilt with the compressors' own (see
+    # `compressor_op`); building one here would happen inside the compiled graph.
+    key = tuple(
+        tuple(sorted(_pair_statics(c).items())) for c in (comp_a, comp_b)
+    )
+    op = _pair_op_cache.get(key)
+    if op is None or any(
+        c.__dict__.get("_compressor_op_skip_instance") is None for c in (comp_a, comp_b)
+    ):
+        return False
     n = hidden_states.shape[0]
     if not (0 < n <= envs.TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS):
         return False
