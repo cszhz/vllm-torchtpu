@@ -80,6 +80,7 @@ fi
 
 server_pid=""
 proxy_pid=""
+server_log_pid=""
 # shellcheck disable=SC2317  # Invoked through the EXIT trap.
 cleanup() {
     status=$?
@@ -112,10 +113,16 @@ cleanup() {
     [[ -z "$proxy_pid" ]] || kill "$proxy_pid" 2>/dev/null || true
     [[ -z "$server_pid" ]] || kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
+    [[ -z "$server_log_pid" ]] || kill "$server_log_pid" 2>/dev/null || true
     printf '%s\n' "$status" >"$coord/$role.exit"
     exit "$status"
 }
 trap cleanup EXIT
+
+# Keep the full server trace available through Falcon logs after pod teardown.
+touch "$server_out/server.log"
+tail -n +1 -F "$server_out/server.log" &
+server_log_pid=$!
 
 RESULTS_DIR="$server_out" \
 CAPTURE_PROFILE=1 \
