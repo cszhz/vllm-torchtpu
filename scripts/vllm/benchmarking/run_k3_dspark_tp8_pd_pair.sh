@@ -85,9 +85,27 @@ cleanup() {
     status=$?
     trap - EXIT
     if [[ "$status" -ne 0 ]]; then
+        if [[ -f "$out/proxy.log" ]]; then
+            echo "========== Proxy request failure ==========" >&2
+            tail -200 "$out/proxy.log" >&2 || true
+        fi
+        echo "========== $role server exceptions ==========" >&2
+        grep -n -B 8 -A 40 -E 'Traceback|ERROR|RuntimeError|ValueError|KeyError|Exception' \
+            "$server_out/server.log" >&2 || true
         echo "========== Last 200 lines of $role server.log ==========" >&2
         tail -200 "$server_out/server.log" >&2 || true
         echo "========================================================" >&2
+    fi
+    debug_hold_s="${K3_DSPARK_PD_DEBUG_HOLD_S:-0}"
+    if ((debug_hold_s > 0)); then
+        echo "Preserving $role debug session for ${debug_hold_s}s (exit=$status)."
+        # Keep the proxy, model, page cache and compiled artifacts available
+        # for Falcon exec/cp diagnostics before the experiment terminates.
+        hold_until=$((SECONDS + debug_hold_s))
+        while ((SECONDS < hold_until)); do
+            [[ ! -f "$coord/debug.release" ]] || break
+            sleep 5
+        done
     fi
     [[ -z "$proxy_pid" ]] || kill "$proxy_pid" 2>/dev/null || true
     [[ -z "$server_pid" ]] || kill "$server_pid" 2>/dev/null || true
