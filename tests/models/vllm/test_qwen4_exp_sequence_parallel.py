@@ -293,8 +293,9 @@ def test_ple_gate_sequence_parallel_matches_tp(tp2):
         (True, 1024, 512, 8, False),
         (True, 1024, 1056, 8, False),  # shard would not be 8-row aligned
         (True, 1024, 8192, 1, False),
-        (True, 0, 64, 8, True),
-        (True, 0, 32, 8, False),
+        (True, 0, 64, 8, False),  # decode buckets stay under the 1024 floor
+        (True, 0, 1088, 8, True),
+        (True, 2048, 1088, 8, False),
     ],
 )
 def test_sequence_parallel_eligibility(
@@ -305,3 +306,18 @@ def test_sequence_parallel_eligibility(
         sp.envs, "QWEN4_EXP_PREFILL_SP_MIN_TOKENS", minimum, raising=False
     )
     assert sp.sequence_parallel_eligible(tokens, tp) is expected
+
+
+def test_shard_rows_keep_every_hc_kernel_on_its_pallas_path():
+    # Full mix tile 128 runs on 256-row multiples, up and norm on 128.
+    assert sp.shard_rows([256, 128, 128]) == 256
+    assert sp.shard_rows([0, 0, 0]) == sp.ROW_ALIGNMENT
+
+
+@pytest.mark.parametrize(
+    "tokens,expected", [(1024, False), (2048, True), (3072, False), (8192, True)]
+)
+def test_eligibility_with_hc_shard_rows(monkeypatch, tokens, expected):
+    monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP", True, raising=False)
+    monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_MIN_TOKENS", 1024, raising=False)
+    assert sp.sequence_parallel_eligible(tokens, 8, rows=256) is expected

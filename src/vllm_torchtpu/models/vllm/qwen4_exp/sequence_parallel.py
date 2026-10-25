@@ -16,11 +16,15 @@ Rank r owns rows [r * T / tp, (r + 1) * T / tp), the order the reduce-scatter
 produces and the all-gather consumes. Slicing goes through vLLM's
 ``sequence_parallel_chunk`` custom op so every rank traces the same graph.
 
-The decision reads the token count while tracing, so it leaves a shape guard
-and the backbone is re-traced per bucket group (compilation/shape_variants).
-Only the backbone may take this path: the MTP draft is traced once for every
-bucket.
+The sequence-parallel backbone is a compiled graph of its own
+(``Qwen4ExpBackboneSP``): ``Qwen4ExpForCausalLM.forward`` routes each step on
+its padded bucket size, outside both graphs, and each graph compiles only its
+own buckets (compilation/bucket_filter). Neither branches on the token count.
+Only the backbone takes this path; the MTP draft keeps the replicated one.
 """
+
+import math
+from collections.abc import Iterable
 
 import torch
 from vllm.distributed import (
@@ -36,19 +40,42 @@ from vllm_torchtpu import envs
 
 # Each rank's shard stays a multiple of a sublane tile.
 ROW_ALIGNMENT = 8
+# Decode buckets (the megakernel's, <= 64 rows) must never take this path.
+MIN_TOKENS_FLOOR = 1024
 
 
-def sequence_parallel_eligible(num_tokens, tp_size: int) -> bool:
-    """Whether a step of ``num_tokens`` tokens takes the sequence-parallel path.
+def enabled(tp_size: int) -> bool:
+    """Whether sequence-parallel prefill is on for this TP size."""
+    return bool(envs.QWEN4_EXP_PREFILL_SP) and tp_size > 1
 
-    ``num_tokens`` is a (possibly symbolic) tensor dimension, never a Python
-    value computed elsewhere: a shape comparison is what leaves the guard the
-    per-bucket re-trace partitions on.
+
+def shard_rows(hc_tiles: Iterable[int]) -> int:
+    """Row multiple of a shard at which every HC prefill kernel takes its
+    Pallas path.
+
+    ``GatedResidual`` picks a kernel or its XLA fallback by whether the row
+    count divides the kernel's tile (twice the tile for the full mix). Only
+    shards that divide all of them keep the sequence-parallel graph one
+    structure across its buckets, so it traces once.
     """
-    if not envs.QWEN4_EXP_PREFILL_SP or tp_size <= 1:
+    return math.lcm(ROW_ALIGNMENT, *(tile for tile in hc_tiles if tile))
+
+
+def sequence_parallel_eligible(
+    num_tokens: int, tp_size: int, rows: int = ROW_ALIGNMENT
+) -> bool:
+    """Whether a bucket of ``num_tokens`` tokens takes the sequence-parallel
+    graph, each rank's shard a multiple of ``rows``. The router, both graphs'
+    bucket filters and the warmup retraces use this one rule, so every bucket
+    is compiled by exactly one graph."""
+    if not enabled(tp_size):
         return False
-    minimum = max(int(envs.QWEN4_EXP_PREFILL_SP_MIN_TOKENS), tp_size * ROW_ALIGNMENT)
-    return bool(num_tokens >= minimum and num_tokens % (tp_size * ROW_ALIGNMENT) == 0)
+    minimum = max(
+        int(envs.QWEN4_EXP_PREFILL_SP_MIN_TOKENS),
+        MIN_TOKENS_FLOOR,
+        tp_size * rows,
+    )
+    return num_tokens >= minimum and num_tokens % (tp_size * rows) == 0
 
 
 def tp_world_size() -> int:

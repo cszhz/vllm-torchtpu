@@ -14,11 +14,13 @@
 """Checkpoint-native text backbone with explicit TPU state/input ownership."""
 
 from collections.abc import Iterable, Sequence
+from functools import partial
 from pathlib import Path
 from typing import cast
 
 import torch
 from torch import nn
+from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.forward_context import get_forward_context
@@ -39,6 +41,7 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import bucket_filter
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from . import sequence_parallel as sp
@@ -519,6 +522,37 @@ class Qwen4ExpBackbone(nn.Module):
         main_block_table,
         compressed_block_table,
     ):
+        """The replicated-TP backbone; sequence-parallel steps go to
+        ``Qwen4ExpBackboneSP``, a separate compiled graph over the same layers."""
+        return self._forward_impl(
+            input_ids,
+            positions,
+            inputs_embeds,
+            sequence_parallel=False,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+        )
+
+    def _forward_impl(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds,
+        *,
+        sequence_parallel: bool,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
         # Resolve host lookup before any decoder work so shape arithmetic
         # stays in the main graph and model preparation precedes the D2H wait.
         ple_raw_embeddings = None
@@ -533,9 +567,6 @@ class Qwen4ExpBackbone(nn.Module):
             self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         )
         num_tokens = input_ids.shape[0]
-        sequence_parallel = sp.sequence_parallel_eligible(
-            num_tokens, sp.tp_world_size()
-        )
         if sequence_parallel:
             sp.check_divisible(num_tokens)
             hidden = sp.shard(hidden)
@@ -715,6 +746,57 @@ class Qwen4ExpSegmentModel(nn.Module):
         )
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
+class Qwen4ExpBackboneSP(nn.Module):
+    """The backbone's sequence-parallel graph (QWEN4_EXP_PREFILL_SP).
+
+    A compiled module of its own over the backbone's layers and parameters:
+    it holds the backbone without registering it, so parameters, loading and
+    state dicts see one copy. The runner-side router sends it only the
+    sequence-parallel buckets, and each module compiles only its own buckets
+    (compilation/bucket_filter), so neither graph branches on the token count.
+    """
+
+    def __init__(self, *, backbone):
+        super().__init__()
+        object.__setattr__(self, "_backbone", backbone)
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        return self._backbone._forward_impl(
+            input_ids,
+            positions,
+            inputs_embeds,
+            sequence_parallel=True,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+        )
+
+
 class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
     requires_raw_input_tokens = True
     hf_to_vllm_mapper = WeightsMapper(
@@ -735,13 +817,43 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.pd_gdn_qk_pair_layout = envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
         self.config = vllm_config.model_config.hf_text_config
         self.model = Qwen4ExpBackbone(vllm_config)
+        self.model_sp = None
+        tp_size = sp.tp_world_size()
+        if sp.enabled(tp_size):
+            self.model_sp = Qwen4ExpBackboneSP(
+                vllm_config=vllm_config, backbone=self.model
+            )
+            rows = sp.shard_rows(
+                tile
+                for hc in self.model.modules()
+                if isinstance(hc, GatedResidual)
+                for tile in (
+                    2 * hc.prefill_full_tile,
+                    hc.prefill_up_tile,
+                    hc.prefill_norm_tile,
+                )
+            )
+            eligible = partial(
+                sp.sequence_parallel_eligible, tp_size=tp_size, rows=rows
+            )
+            # One rule for the router, both bucket filters and retraces.
+            bucket_filter.assign(self.model_sp, eligible)
+            bucket_filter.assign(self.model, lambda n: not eligible(n))
         self.lm_head = ParallelLMHead(
             self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
-        return self.model(input_ids, positions, inputs_embeds, **kwargs)
+        # The route reads the padded bucket size outside both compiled graphs.
+        if self.model_sp is None:
+            return self.model(input_ids, positions, inputs_embeds, **kwargs)
+        serves_sp = bucket_filter.assigned(self.model_sp)
+        if serves_sp(input_ids.shape[0]):
+            with bucket_filter.serving(serves_sp), set_model_tag("backbone_sp"):
+                return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
+        with bucket_filter.serving(bucket_filter.assigned(self.model)):
+            return self.model(input_ids, positions, inputs_embeds, **kwargs)
 
     def embed_input_ids(self, input_ids):
         return self.model.embed_tokens(input_ids)
