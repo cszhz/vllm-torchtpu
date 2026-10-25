@@ -167,7 +167,9 @@ class StubMHC:
 
     def fused(self, x, residual, post_mix, res_mix, fn_hi, fn_mid, fn_lo, *rest):
         residual = res_mix @ residual + post_mix * x.unsqueeze(1)
-        post_mix, res_mix, layer_input = self.pre(residual, None, None, None, None, None)
+        post_mix, res_mix, layer_input = self.pre(
+            residual, None, None, None, None, None
+        )
         return residual, post_mix, res_mix, layer_input
 
 
@@ -227,7 +229,12 @@ def test_decoder_layers_match_replicated_path(tp):
             state = (x, None, None, None)
             for _ in range(3):
                 x, residual, post_mix, res_mix = layer(
-                    state[0], positions, i, state[2], state[3], state[1],
+                    state[0],
+                    positions,
+                    i,
+                    state[2],
+                    state[3],
+                    state[1],
                     sequence_parallel=sequence_parallel,
                 )
                 state = (x, residual, post_mix, res_mix)
@@ -249,7 +256,9 @@ class RowRoutedMethod:
     def __init__(self, weight):
         self.weight = weight
 
-    def forward_sequence_parallel(self, layer, x, router_logits, input_ids, order_after=None):
+    def forward_sequence_parallel(
+        self, layer, x, router_logits, input_ids, order_after=None
+    ):
         return self.routed(x, router_logits, input_ids)
 
     def routed(self, x, router_logits, input_ids):
@@ -278,10 +287,14 @@ def _moe(sim, weights, *, full_shared, routed_scale):
     moe = object.__new__(moe_mod.DeepseekV4MoE)
     nn.Module.__init__(moe)
     gate_weight = weights["gate"]
-    moe.gate = type("Gate", (), {"tid2eid": None, "__call__": lambda s, x: (x @ gate_weight, None)})()
+    moe.gate = type(
+        "Gate", (), {"tid2eid": None, "__call__": lambda s, x: (x @ gate_weight, None)}
+    )()
     method = RowRoutedMethod(weights["routed"])
     routed_layer = SimpleNamespace(quant_method=method)
-    moe.experts = SimpleNamespace(routed_experts=routed_layer, routed_scaling_factor=routed_scale)
+    moe.experts = SimpleNamespace(
+        routed_experts=routed_layer, routed_scaling_factor=routed_scale
+    )
     moe.shared_experts = SlicedMLP(sim, weights["up"], weights["down"])
     moe.shared_experts_full = (
         SlicedMLP(None, weights["up"], weights["down"]) if full_shared else None
@@ -308,7 +321,9 @@ def test_moe_block_matches_runner_sum(tp, full_shared):
         # expert plus the scaled routed output, at every row.
         shared = tp.all_reduce(moe.shared_experts(x))
         want = shared + method.routed(x, x @ weights["gate"], ids) * scale
-        got = moe.forward_sequence_parallel(sp.shard(x, _rank(r)), sp.shard(ids, _rank(r)))
+        got = moe.forward_sequence_parallel(
+            sp.shard(x, _rank(r)), sp.shard(ids, _rank(r))
+        )
         return sp.shard(want, _rank(r)), got
 
     for want, got in tp.run(per_rank):
