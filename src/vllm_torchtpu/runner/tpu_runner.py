@@ -246,6 +246,20 @@ _SAMPLER_LIGHT_DEFAULT_RADIX_BITS = 1
 # length it trims (the variants _precompile_spec_sample_verify_fused warms).
 _VERIFY_TRIM_ROWS = 8
 _VERIFY_TRIM_MAX_LEN = 32
+# Above _VERIFY_TRIM_MAX_LEN the chain keeps the real slots rounded up to this
+# many rows (MTP decode pads e.g. 63 real slots to a 96-row bucket); one
+# warmed variant per step below the padded length.
+_VERIFY_TRIM_LARGE_STEP = 16
+
+
+def _verify_trim_large_rows(padded_logits_length: int) -> list[int]:
+    """The trimmed row counts warmed for a padded verify length above
+    _VERIFY_TRIM_MAX_LEN: every multiple of _VERIFY_TRIM_LARGE_STEP below it."""
+    if padded_logits_length <= _VERIFY_TRIM_MAX_LEN:
+        return []
+    return list(
+        range(_VERIFY_TRIM_LARGE_STEP, padded_logits_length, _VERIFY_TRIM_LARGE_STEP)
+    )
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
@@ -6355,6 +6369,10 @@ class TPUModelRunner(GPUModelRunner):
             _VERIFY_TRIM_ROWS < num_tokens <= _VERIFY_TRIM_MAX_LEN
         ):
             trim_variants.append({"verify_rows": _VERIFY_TRIM_ROWS})
+        if self._sampler_verify_trim:
+            trim_variants.extend(
+                {"verify_rows": rows} for rows in _verify_trim_large_rows(num_tokens)
+            )
         rng_kwargs: dict[str, Any] = {}
         default_gen = default_gen_state = None
         if self._sampler_graph_rng:
@@ -7936,9 +7954,14 @@ class TPUModelRunner(GPUModelRunner):
         """
         if not self._sampler_verify_trim:
             return 0
+        real_slots = int(np.sum(draft_lengths_cpu))
+        if padded_logits_length > _VERIFY_TRIM_MAX_LEN:
+            step = _VERIFY_TRIM_LARGE_STEP
+            rows = max(step, -(-real_slots // step) * step)
+            return rows if rows < padded_logits_length else 0
         if not (_VERIFY_TRIM_ROWS < padded_logits_length <= _VERIFY_TRIM_MAX_LEN):
             return 0
-        if int(np.sum(draft_lengths_cpu)) > _VERIFY_TRIM_ROWS:
+        if real_slots > _VERIFY_TRIM_ROWS:
             return 0
         return _VERIFY_TRIM_ROWS
 

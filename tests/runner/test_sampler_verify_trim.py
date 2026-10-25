@@ -238,7 +238,12 @@ def test_positive_control_trimmed_draw_shape_is_caught(dev):
         (16, [3, 3, 3], True, 0),  # 9 real slots
         (8, [1], True, 0),  # nothing to trim
         (32, [2, 2], True, 8),
-        (64, [1], True, 0),  # above _VERIFY_TRIM_MAX_LEN: not precompiled
+        # Above _VERIFY_TRIM_MAX_LEN: real slots rounded up to 16 rows.
+        (64, [1], True, 16),
+        (96, [3] * 21, True, 64),  # MTP 3 x 21 requests in the 96-row bucket
+        (128, [3] * 30, True, 96),
+        (96, [3] * 32, True, 0),  # 96 real slots: nothing to trim
+        (96, [3] * 21, False, 0),
         (16, [3], False, 0),
     ],
 )
@@ -247,3 +252,16 @@ def test_verify_trim_rows_gate(padded, drafts, flag, expect):
     got = TPUModelRunner._verify_trim_rows(r, padded, np.asarray(drafts))
     assert got == expect
     assert tpu_runner._VERIFY_TRIM_ROWS == 8
+
+
+@pytest.mark.parametrize(
+    "padded,warmed",
+    [(32, []), (48, [16, 32]), (96, [16, 32, 48, 64, 80]), (128, list(range(16, 128, 16)))],
+)
+def test_large_trim_rows_are_warmed(padded, warmed):
+    assert tpu_runner._verify_trim_large_rows(padded) == warmed
+    # Every row count the gate can return for this bucket is warmed.
+    r = SimpleNamespace(_sampler_verify_trim=True)
+    for real in range(1, padded + 1):
+        rows = TPUModelRunner._verify_trim_rows(r, padded, np.asarray([real]))
+        assert rows == 0 or padded <= tpu_runner._VERIFY_TRIM_MAX_LEN or rows in warmed
