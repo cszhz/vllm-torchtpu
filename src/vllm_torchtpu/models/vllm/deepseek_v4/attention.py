@@ -529,7 +529,11 @@ class VllmDeepseekV4MLAAttention(
 
     @property
     def qnorm_rope_op(self):
-        """The fused q-RMSNorm + RoPE op, built lazily on first forward."""
+        """The fused q-RMSNorm + RoPE op, built before compile (tpu_runner's
+        prebuild list): the flat-input op under TPU_DSV4_QNORM_ROPE_FLAT, else
+        the [tokens, heads, dim] one."""
+        if not envs.TPU_DSV4_QNORM_ROPE_FLAT:
+            return self.qnorm_rope_3d_op
         op = self.__dict__.get("_qnorm_rope_op_instance")
         if op is not None:
             return op
@@ -615,11 +619,9 @@ class VllmDeepseekV4MLAAttention(
 
         TPU_DSV4_QNORM_ROPE_FLAT reads the projection's (8, 128) tiles in the
         kernel; otherwise q is viewed 3-D and XLA relays it out first."""
-        cache = self.mla_attn.rotary_emb.cos_sin_cache
-        if envs.TPU_DSV4_QNORM_ROPE_FLAT:
-            return self.qnorm_rope_op(q, positions, cache)
-        q = q.view(q.shape[0], -1, self.mla_attn.head_dim)
-        return self.qnorm_rope_3d_op(q, positions, cache)
+        if not envs.TPU_DSV4_QNORM_ROPE_FLAT:
+            q = q.view(q.shape[0], -1, self.mla_attn.head_dim)
+        return self.qnorm_rope_op(q, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
     def kv_rope(
         self,
