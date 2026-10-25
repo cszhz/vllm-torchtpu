@@ -167,6 +167,7 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     from vllm_torchtpu.kernels.deepseek_v4_megakernel import moe_experts as ME
 
     ME.SCOPES = var.get("fine") == "1"  # MoE sub-step named scopes (profile=1)
+    AP.SCOPES = var.get("fine") == "1"  # attention stage named scopes (profile=1)
     MP.EP_SLICES = int(var.get("slices", 8))  # MoE work item = 1/slices of an expert
     skip = tuple(x for x in var.get("skip", "").split("+") if x)
     if skip:
@@ -362,7 +363,7 @@ def profile_scopes(run, n_steps=3, devices=("TPU:0", "TPU:3")):
                     ops[ev.name] = ops.get(ev.name, 0.0) + ev.duration_ns
             for ev in line.events:
                 nm = ev.name
-                if nm.startswith(("mk_", "moe_")) or "dsv4_step" in nm:
+                if nm.startswith(("mk_", "moe_", "at_")) or "dsv4_step" in nm:
                     key = nm if "dsv4_step" not in nm else "step_op"
                     spans.setdefault(key, []).append((ev.start_ns, ev.end_ns))
         tot = {}

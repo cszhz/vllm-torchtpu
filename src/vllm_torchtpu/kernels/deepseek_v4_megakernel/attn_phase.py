@@ -31,6 +31,7 @@ Per-layer caches are `LayerRefs`; every DMA start site on them dispatches on
 the traced layer with a balanced tree over the layers of the static kind.
 """
 
+import contextlib
 import dataclasses
 from typing import Any, NamedTuple
 
@@ -70,6 +71,13 @@ ROUND_MODE = "rows"  # "rows": 7 per-row updates a round; "blockdiag": one full-
 # Benchmark attribution only: stages to skip ("all", "kvw", "scan", "topk", "rows", "hca",
 # "attend", "copy", "stream").
 ABLATE = frozenset()
+# Profiling only, read at trace time: named scopes around the phase's stages
+# (location metadata only; the arithmetic is unchanged).
+SCOPES = False
+
+
+def _scope(name):
+    return jax.named_scope(name) if SCOPES else contextlib.nullcontext()
 TRANSPOSE_KEYS = False  # explicit key transposes for PV in the HCA / union passes (A/B)
 TABLE_REUSE = True  # tests only: False restages the block tables at every layer
 DEBUG_TOPK = None  # test harness only: a VMEM ref [B, 8, TOPK] receiving the top-k lists
@@ -544,21 +552,27 @@ class _Phase:
             self.draft_request(r)
             return
         if "kvw" not in ABLATE:
-            self.kv_writes(r)
+            with _scope("at_kvw"):
+                self.kv_writes(r)
         if self.kind == "csa":
             self.indexer(r)
         win = self.win
-        win.swa_dma(r, 0, wait=False)
-        win.swa_dma(r, 0, wait=True)
-        win.swa_step(r, 0)  # also starts the SWA row writes
+        with _scope("at_swa"):
+            win.swa_dma(r, 0, wait=False)
+            win.swa_dma(r, 0, wait=True)
+            win.swa_step(r, 0)  # also starts the SWA row writes
         if self.kind == "hca":
             if "hca" not in ABLATE:
-                self.hca(r)
-            win.finalize(r)  # waits the SWA row writes
+                with _scope("at_hca"):
+                    self.hca(r)
+            with _scope("at_fin"):
+                win.finalize(r)  # waits the SWA row writes
             return
         if "rows" not in ABLATE:
-            self.csa_union(r) if CSA_MODE == "union" else self.csa(r)
-        win.finalize(r)
+            with _scope("at_rows"):
+                self.csa_union(r) if CSA_MODE == "union" else self.csa(r)
+        with _scope("at_fin"):
+            win.finalize(r)
 
     def draft_request(self, r):
         """Kind "swa" (DSpark draft): the context rows into the SWA pages, then
@@ -913,7 +927,8 @@ class _Phase:
             return c
 
         if "scan" not in ABLATE:
-            lax.fori_loop(0, nblk, blk, 0)
+            with _scope("at_scan"):
+                lax.fori_loop(0, nblk, blk, 0)
         else:
             wait(0, 0)
         # top-k
@@ -927,9 +942,10 @@ class _Phase:
             DEBUG_LENS[r] = jnp.broadcast_to(nscan, (8, 128))
         if "topk" not in ABLATE and CSA_MODE == "union":
             # per-row lists only for the test hooks (they cost ~7 us)
-            tc_topk.topk_group(S.scores, lens, nscan, S.tk_v, *S.tk_scr, k=TOPK,
-                               union=(S.un_v, S.un_len_v, *S.un_scr),
-                               lists=DEBUG_TOPK is not None)
+            with _scope("at_topk"):
+                tc_topk.topk_group(S.scores, lens, nscan, S.tk_v, *S.tk_scr, k=TOPK,
+                                   union=(S.un_v, S.un_len_v, *S.un_scr),
+                                   lists=DEBUG_TOPK is not None)
             for src, dst in ((S.un_v, S.un_s), (S.un_len_v, S.un_len_s)):
                 cp = pltpu.make_async_copy(src, dst, S.sems.at[S_APE])
                 cp.start()
