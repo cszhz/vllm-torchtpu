@@ -158,7 +158,8 @@ def mix_gemm(x_bf: jax.Array, fn_refs, hc_mult3: int, gemm_precision: str):
         acc = out[:, :hc_mult3]
         if gemm_precision == "highest":
             acc = acc + out[:, hc_mult3 : 2 * hc_mult3]
-            acc = acc + out[:, 2 * hc_mult3 :]
+            if out.shape[1] > 2 * hc_mult3:  # absent with a 2-chunk read
+                acc = acc + out[:, 2 * hc_mult3 :]
         return acc
     fn_hi_ref, fn_mid_ref, fn_lo_ref = fn_refs
     acc = jax.lax.dot_general(

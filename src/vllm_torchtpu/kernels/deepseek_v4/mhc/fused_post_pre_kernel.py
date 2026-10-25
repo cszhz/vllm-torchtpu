@@ -114,6 +114,7 @@ def _fused_kernel(
         "gates",
         "norm_eps",
         "small_block",
+        "fn_chunks",
     ),
 )
 def fused_post_pre_mixes(
@@ -134,6 +135,7 @@ def fused_post_pre_mixes(
     norm_weight: jax.Array | None = None,
     norm_eps: float | None = None,
     small_block: int = utils.SUBLANE,
+    fn_chunks: int = 3,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """The Pallas seam kernel: post recombine fused with pre's mix GEMM
     and in-block collapse.
@@ -164,6 +166,9 @@ def fused_post_pre_mixes(
         small_block: with in-kernel gates, a batch of at most this many
             tokens (8) runs as one block of exactly its rows instead of the
             16-row bf16 tile (see the call site).
+        fn_chunks: with a stacked fn (``utils.CatFn``), how many of its bf16
+            chunks the kernel reads: 3 (exact f32 product) or 2 (hi + mid,
+            16 mantissa bits: the lo rows are never DMA'd or pushed).
 
     Returns:
         new_res2d: (num_tokens, hc_mult * hidden_size), bfloat16.
@@ -201,6 +206,11 @@ def fused_post_pre_mixes(
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
 
     fn_ops = utils.fn_operands(fn)
+    assert fn_chunks in (2, 3), fn_chunks
+    # Stacked fn with fn_chunks=2: the BlockSpec covers only the hi and mid
+    # chunk rows of the (3 * M3, K) array, so the lo chunk (a third of the
+    # kernel's dominant bytes and MXU weight pushes) is never read.
+    fn_rows = fn_chunks * hc_mult3 if len(fn_ops) == 1 else None
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
@@ -233,7 +243,10 @@ def fused_post_pre_mixes(
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
-            *(pl.BlockSpec(f.shape, lambda i: (0, 0)) for f in fn_ops),
+            *(
+                pl.BlockSpec((fn_rows or f.shape[0], f.shape[1]), lambda i: (0, 0))
+                for f in fn_ops
+            ),
             pl.BlockSpec((1, 3), lambda i: (0, 0)),
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
             *norm_specs,
@@ -282,6 +295,7 @@ def mhc_fused_post_pre(
     norm_weight: jax.Array | None = None,
     norm_eps: float | None = None,
     small_block: int | None = None,
+    fn_chunks: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Fused seam op: Pallas post+GEMM+collapse kernel, gates in an XLA
     epilogue or (``gates_in_kernel``, up to ``gates_max_tokens`` tokens --
@@ -301,6 +315,8 @@ def mhc_fused_post_pre(
 
     if small_block is None:
         small_block = envs.VLLM_TPU_DSV4_MHC_SMALL_BLOCK
+    if fn_chunks is None:
+        fn_chunks = envs.VLLM_TPU_DSV4_MHC_FN_CHUNKS
     gates = utils.gate_consts(
         x2d.shape[0],
         gates_in_kernel,
@@ -326,6 +342,7 @@ def mhc_fused_post_pre(
         norm_weight=norm_weight,
         norm_eps=norm_eps,
         small_block=small_block,
+        fn_chunks=fn_chunks,
     )
     if gates is not None:
         post_mix_cur, comb_mix_cur = gate_a, gate_b

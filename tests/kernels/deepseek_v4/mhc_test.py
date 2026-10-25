@@ -663,6 +663,36 @@ class MhcGatesInKernelTpuTest(parameterized.TestCase):
         self.assertLessEqual(np.mean(got_l != want_l), 1e-3)
         self._check_gates(got[1], got[2], want[1], want[2])
 
+    @parameterized.product(num_tokens=[1, 8, 16, 32, 128, 300])
+    def test_fused_two_fn_chunks(self, num_tokens):
+        """fn_chunks=2 (hi + mid of the stacked fn) vs a float64 oracle of
+        the mix logits: within 1e-5 of the logit scale (3-chunk ~2e-7);
+        new_res unchanged."""
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel, utils
+
+        rng = np.random.default_rng(16)
+        x, res, plm, crm, fn, sc, hb = _make_fused_inputs(rng, num_tokens, 7168)
+        cat = utils.cat_fn3(jnp.asarray(fn))
+        ops = (
+            jnp.asarray(x).astype(jnp.bfloat16).reshape(num_tokens, -1),
+            jnp.asarray(res).astype(jnp.bfloat16).reshape(num_tokens, -1),
+            jnp.asarray(plm, jnp.float32).reshape(num_tokens, -1),
+            jnp.asarray(crm, jnp.float32).reshape(num_tokens, -1),
+            cat,
+            jnp.asarray(sc),
+            jnp.asarray(hb),
+            RMS_EPS,
+            HC_PRE_EPS,
+        )
+        res3, mix3, _, _ = fused_post_pre_kernel.fused_post_pre_mixes(*ops, fn_chunks=3)
+        res2, mix2, _, _ = fused_post_pre_kernel.fused_post_pre_mixes(*ops, fn_chunks=2)
+        np.testing.assert_array_equal(_to_np(res2), _to_np(res3))
+        g = _to_np(res3).astype(np.float64)
+        ref = g @ np.asarray(fn, np.float64).T
+        scale = np.abs(ref).max()
+        self.assertLess(np.abs(_to_np(mix3) - ref).max() / scale, 1e-6)
+        self.assertLess(np.abs(_to_np(mix2) - ref).max() / scale, 1e-5)
+
     @parameterized.product(num_tokens=[8, 16, 17], sinkhorn_repeat=[1, 20])
     def test_pre(self, num_tokens, sinkhorn_repeat):
         from vllm_torchtpu.kernels.deepseek_v4.mhc import pre_kernel
