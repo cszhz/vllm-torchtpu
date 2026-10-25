@@ -167,6 +167,7 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     from vllm_torchtpu.kernels.deepseek_v4_megakernel import moe_experts as ME
 
     ME.SCOPES = var.get("fine") == "1"  # MoE sub-step named scopes (profile=1)
+    MP.EP_SLICES = int(var.get("slices", 8))  # MoE work item = 1/slices of an expert
     skip = tuple(x for x in var.get("skip", "").split("+") if x)
     if skip:
         scfg = dataclasses.replace(scfg, skip=skip)
