@@ -7289,8 +7289,13 @@ class TestPipelineParallelRegisterAhead:
         assert delay
         assert params["uuid"] == 777
 
-    def test_stage3_remote_dspark_publishes_long_lived_request_once(self):
-        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+    @pytest.mark.parametrize("tp_source", [False, True])
+    def test_stage3_remote_dspark_publishes_long_lived_request_once(self, tp_source):
+        producer = _make_raiden_scheduler(
+            is_producer=True,
+            pp_size=1 if tp_source else 8,
+            tp_size=8 if tp_source else 1,
+        )
         req = _stage3_request("remote", self.PROMPT, max_tokens=16)
         req.kv_transfer_params = {
             "do_remote_decode": True,
@@ -7299,6 +7304,12 @@ class TestPipelineParallelRegisterAhead:
         }
         with (
             _stage3_producer_env(777),
+            patch(f"{_MOD}._uses_tp_stage3_source", return_value=tp_source),
+            patch(f"{_MOD}.tpu_envs.VLLM_TPU_REMOTE_DSPARK_ROLE", "producer"),
+            patch(
+                f"{_MOD}.dist_utils.get_stage3_register_ahead_enabled",
+                return_value=False,
+            ),
             patch(f"{_MOD}.publish_remote_dspark_handoff") as publish,
         ):
             meta = self._register_ahead(producer, req)

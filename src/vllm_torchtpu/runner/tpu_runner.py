@@ -49,7 +49,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
-from vllm.distributed import get_pcp_group
+from vllm.distributed import get_pcp_group, get_tp_group
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -183,6 +183,7 @@ from vllm_torchtpu.spec_decode.remote_dspark import (
     RemoteDeviceTensorRows,
     RemoteDSparkTransport,
     RemoteTensorTransfer,
+    complete_remote_dspark_handoff,
     is_remote_draft_proposal_rank,
 )
 from vllm_torchtpu.spec_decode.utils import (
@@ -5276,6 +5277,19 @@ class TPUModelRunner(GPUModelRunner):
                 len(request_seq_lens),
             )
         self.maybe_wait_for_kv_save()
+        if (
+            self._is_dspark_pd_producer
+            and self._remote_dspark_role == "producer"
+            and request_seq_lens
+            and not state.remote_next_tokens_per_chunk
+        ):
+            # Pointer registration precedes forward; D must not pull those
+            # pointers until every TP rank has finished writing the prefix.
+            torch.distributed.barrier(group=get_tp_group().cpu_group)
+            if self._remote_dspark_proposal_rank:
+                for _, _, _, req_id in request_seq_lens:
+                    complete_remote_dspark_handoff(req_id)
+                    logger.info("Remote DSpark Raiden handoff ready: req_id=%s", req_id)
         if self._remote_dspark_role == "producer" and request_seq_lens:
             logger.info(
                 "Remote DSpark Raiden save wait complete: rank=%d",

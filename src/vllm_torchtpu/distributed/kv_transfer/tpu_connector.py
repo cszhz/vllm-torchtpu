@@ -1569,15 +1569,19 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         step first waits for the next batch's forward (and, with a drafter,
         for every KV write) before it registers, so the consumer's load
         parks on the deferred-submit path for a whole prefill step. GLM,
-        DSv4 and Kimi-K3 producers keep finish-time registration."""
+        DSv4 and ordinary Kimi-K3 producers keep finish-time registration.
+        Remote DSpark must publish before waiting for decode feedback, so
+        its TP producer registers in the prompt-completing step as well."""
+        remote_draft = tpu_envs.VLLM_TPU_REMOTE_DSPARK_ROLE == "producer"
         return (
             self.is_producer
             and _use_raiden_stage3_transport()
             and not _use_raiden_glm_admission()
             and not _use_raiden_dsv4_admission()
-            and not _uses_tp_stage3_source(self.vllm_config)
+            and (not _uses_tp_stage3_source(self.vllm_config) or remote_draft)
             and (
-                _engine_is_pipeline(self.vllm_config)
+                remote_draft
+                or _engine_is_pipeline(self.vllm_config)
                 or dist_utils.get_stage3_register_ahead_enabled()
             )
         )
@@ -2174,6 +2178,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if request is None or req_id in self._stage3_finished_sends:
                 continue
             remote_dspark = is_remote_dspark_request(request.kv_transfer_params)
+            # TP Kimi keeps its existing finish-time path for ordinary requests.
+            if _uses_tp_stage3_source(self.vllm_config) and not remote_dspark:
+                continue
             if request.resumable or (
                 int(request.max_tokens) != 1 and not remote_dspark
             ):
@@ -2204,9 +2211,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if delay_free_blocks:
                 self._stage3_early_sends[req_id] = int(params["uuid"])
                 if remote_dspark:
-                    publish_remote_dspark_handoff(req_id, params)
+                    # Register pointers ahead, but expose them to the proxy
+                    # only after every producer rank has materialized its KV.
+                    publish_remote_dspark_handoff(req_id, params, ready=False)
                     logger.info(
-                        "Published remote DSpark Raiden handoff: req_id=%s uuid=%s",
+                        "Staged remote DSpark Raiden handoff: req_id=%s uuid=%s",
                         req_id,
                         params["uuid"],
                     )

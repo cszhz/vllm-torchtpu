@@ -28,6 +28,7 @@ from vllm_torchtpu.spec_decode.remote_dspark import (
     RemoteDSparkTransport,
     RequestPhase,
     VerifyFeedback,
+    complete_remote_dspark_handoff,
     is_remote_draft_proposal_rank,
     is_remote_dspark_request,
     mark_remote_dspark_request,
@@ -55,6 +56,15 @@ def test_remote_dspark_handoff_is_atomic_and_consumed_once(tmp_path) -> None:
     assert "/" not in path.name
     assert take_remote_dspark_handoff(request_id, tmp_path) == params
     assert take_remote_dspark_handoff(request_id, tmp_path) is None
+
+
+def test_remote_dspark_handoff_waits_for_prefill_completion(tmp_path) -> None:
+    params = {"uuid": 7, "num_tokens": 31}
+    publish_remote_dspark_handoff("request", params, tmp_path, ready=False)
+    assert take_remote_dspark_handoff("request", tmp_path) is None
+
+    complete_remote_dspark_handoff("request", tmp_path)
+    assert take_remote_dspark_handoff("request", tmp_path) == params
 
 
 def test_transport_proposal_feedback_round_trip():
