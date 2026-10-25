@@ -335,8 +335,9 @@ def draft_weight_manifest(
     def g(name, shape, dtype, rule, source):
         return WeightEntry(name, shape, dtype, rule, source)
 
+    vocab_rows = spec.vocab_size if spec.attn_tp == 1 else -1  # a TP vocab shard
     out = [
-        g("embed", (spec.vocab_size, H), "bfloat16", "served", "embed_tokens.weight"),
+        g("embed", (vocab_rows, H), "bfloat16", "served", "embed_tokens.weight"),
         g("cos_sin", (-1, 128), "float32", "rope", "cos_sin: layers.0.attn.rotary_emb"),
         # this rank's output columns: bf16 (exact for fp8 values) + their scales
         g(
@@ -392,6 +393,12 @@ def draft_weight_manifest(
         g("comp_cos_sin", (8, 128), "float32", "zeros", "unread by swa"),
         g("idx_cos_sin", (8, 128), "float32", "zeros", "unread by swa"),
     ]
+    if spec.moe_placement:
+        src = "the adapter's: this rank's EP row of the draft layers' placement"
+        slots = (L, spec.expert_slots)
+        out.append(g("moe_held", slots, "int32", "placement", src))
+        if spec.moe_placement == "replicas":
+            out.append(g("moe_copy", slots, "int32", "placement", src))
     return out
 
 

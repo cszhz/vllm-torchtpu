@@ -316,6 +316,8 @@ def draft_weight_names(
     for li in range(spec.num_layers):
         names += [f"{k}_{li}" for k in ("w13", "w13_scale", "w2", "w2_scale")]
     names += list(ATTN_WEIGHTS)
+    if spec.moe_placement:  # the draft layers' placement_tables rows
+        names += ["moe_held"] + (["moe_copy"] if spec.moe_placement == "replicas" else [])
     return names
 
 
@@ -348,8 +350,6 @@ def build_draft_step(
     at rows r*ctx_q ..): main_x = main_norm(main_proj(ctx_aux)) as the stock
     combine_hidden_states, then gathered into the target step's global row
     layout, where every SWA layer projects their kv for its attention."""
-    from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
-
     spec = cfg.model
     assert spec.mode == "dp" and spec.num_hash_layers == 0 and not spec.aux_layers
     ctx = {} if max_ctx is None else {"max_ctx": max_ctx}
@@ -370,25 +370,16 @@ def build_draft_step(
         w = dict(zip(names, rest[G : G + W]))
         caches = list(rest[G + W :])
         me = meta[KI.META_RANK]
-        # xla_quantized_matmul's arithmetic on this rank's column slice (the
-        # fp8 x fp8 products are exact in bf16), then the slices gathered
-        x_q, x_s = quantize_tensor(ctx_aux, jnp.float8_e4m3fn)
-        part = jax.lax.dot_general(
-            x_q.astype(jnp.bfloat16), w["main_proj"], (((1,), (0,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        )  # fmt: skip
-        part = (part * x_s * w["main_proj_scale"][None, :]).astype(ctx_aux.dtype)
-        main_x = jax.lax.all_gather(part, spec.axis_name, axis=1, tiled=True)
-        main_x = _rms_norm(main_x, w["main_norm"], spec.rms_eps)
+        main_x = ctx_main_x(ctx_aux, w["main_proj"], w["main_proj_scale"],
+                            w["main_norm"], spec)  # fmt: skip
         tokm, *_ = SK.step_metadata(
             ctx_layout, me, jnp.zeros_like(ctx_positions), ctx_positions,
             ctx_seq_lens, spec.axis_name,
         )  # fmt: skip
         T = scfg.T
         owner, lrow = tokm[2 * T : 3 * T], tokm[3 * T : 4 * T]
-        allx = jax.lax.all_gather(main_x, spec.axis_name)  # [R, Mc, H]
         live = owner >= 0
-        gx = allx[jnp.maximum(owner, 0), jnp.maximum(lrow, 0)]
+        gx = main_x[jnp.maximum(owner, 0), jnp.maximum(lrow, 0)]
         ctx = dict(
             main_x=jnp.where(live[:, None], gx, 0).astype(jnp.bfloat16),
             positions=jnp.where(live, tokm[T : 2 * T], -1),
@@ -400,6 +391,7 @@ def build_draft_step(
                 k: [w[f"{k}_{li}"] for li in range(L)]
                 for k in ("w13", "w13_scale", "w2", "w2_scale")
             },
+            **{k: w["moe_" + k] for k in ("held", "copy") if "moe_" + k in w},
         )
         kw = {}
         if attn_impl != "stub":
@@ -414,7 +406,8 @@ def build_draft_step(
             input_ids, positions, seq_lens, w["embed"], w["cos_sin"],
             w["dense_smalls"], {n: w["dense_" + n] for n in streams},
             moe_w if moe_impl == "real" else None,
-            me=me, eblk=meta[KI.META_EBLK], ctx=ctx, with_all=logits, **kw,
+            me=me, eblk=meta[KI.META_EBLK], ctx=ctx, with_all=logits,
+            vocab_start=vocab_start(spec, meta), **kw,
         )  # fmt: skip
 
         def head(r):
@@ -442,6 +435,31 @@ def _own_logits(x_all, lm_head_shard, ownt, meta, spec):
     full = jax.lax.all_gather(lg, spec.axis_name, axis=1, tiled=True)[:, :V]
     own = ownt >= 0
     return jnp.where(own[:, None], full[jnp.maximum(ownt, 0)], 0).astype(jnp.bfloat16)
+
+
+def ctx_main_x(ctx_aux, w_cols, w_cols_scale, norm_w, spec: KI.ModelSpec):
+    """The DSpark context rows of every attention group, [G, Mc, H]:
+    main_norm(main_proj(ctx_aux)) with xla_quantized_matmul's arithmetic
+    (per-row fp8 activation quantization, f32 accumulation, scales; the fp8
+    products are exact in bf16). Each rank holds output columns [r*H/R,
+    (r+1)*H/R) (mesh index r) and its group's rows, so the quantized rows are
+    gathered first (one copy per group), every rank projects all of them onto
+    its columns, and the column slices are gathered."""
+    from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
+
+    ax, G = spec.axis_name, spec.dp_groups
+    mc = ctx_aux.shape[0]
+    # per-row quantization is row-local: gather the fp8 rows (half the bytes)
+    x_q, x_s = quantize_tensor(ctx_aux, jnp.float8_e4m3fn)
+    x_q = jax.lax.all_gather(x_q, ax)[:: spec.attn_tp].reshape(G * mc, -1)
+    x_s = jax.lax.all_gather(x_s, ax)[:: spec.attn_tp].reshape(G * mc, -1)
+    part = jax.lax.dot_general(
+        x_q.astype(jnp.bfloat16), w_cols, (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )  # fmt: skip
+    part = (part * x_s * w_cols_scale[None, :]).astype(ctx_aux.dtype)
+    x = jax.lax.all_gather(part, ax, axis=1, tiled=True)  # [G * Mc, H]
+    return _rms_norm(x, norm_w, spec.rms_eps).reshape(G, mc, -1)
 
 
 def _rms_norm(x, w, eps):

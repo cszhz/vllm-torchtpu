@@ -66,6 +66,7 @@ class DraftMegakernel:
         expert_block: int,
         weights: list[torch.Tensor],
         draft_layers: list[Any],
+        vocab_start: int = 0,
         device: torch.device | str,
         compile_fn: Callable[[Callable], Callable] | None = None,
         op_namespace: str = "dsv4_megakernel_draft",
@@ -84,12 +85,14 @@ class DraftMegakernel:
         meta[KI.META_RANK] = rank
         meta[KI.META_Q] = spec.q
         meta[KI.META_EBLK] = expert_block
+        meta[KI.META_VSTART] = vocab_start
         self.meta = meta.to(self.device)
         self.cfg: KI.StepConfig | None = None
         self.caches: VA.BoundCaches | None = None
         self._steps: dict[KI.Bucket, Callable] = {}
         self._preps: dict[KI.Bucket, Callable] = {}
         self._idle: dict[KI.Bucket, list[torch.Tensor]] = {}
+        self._calls: dict[KI.Bucket, Any] = {}  # by draft bucket
         # the target's VA.RunTrace (maybe_create)
         self.trace: Any = VA.RunTrace(rank, 0, False)
 
@@ -103,16 +106,6 @@ class DraftMegakernel:
             hasattr(drafter, "_sample_from_hidden"),
             f"draft megakernel: the drafter {type(drafter).__name__} is not DSpark",
         )
-        VA._need(
-            not target.spec.moe_placement,
-            "draft megakernel with a static expert placement (its layers' "
-            "placement rows are not passed yet)",
-        )
-        VA._need(
-            target.spec.attn_tp == 1,
-            "draft megakernel under vLLM TP (its weights are not mapped from TP "
-            "shards yet)",
-        )
         draft_model = drafter.draft_model
         layers = list(draft_model.model.layers)
         dcfg = draft_model.config
@@ -124,7 +117,19 @@ class DraftMegakernel:
             q=int(drafter.block_size),
             aux_layers=(),
             num_hash_layers=0,
+            moe_placement="",
+            expert_slots=0,
         )
+        # the draft layers are the model's layers L.. (a placement lists them)
+        spec, placed = VA.placement_operands(
+            spec,
+            int(target.meta[KI.META_EBLK].item()),
+            target.device,
+            first_layer=tspec.num_layers,
+        )
+        VA.check_expert_slots(layers, placed.get("moe_held"),
+                              int(target.meta[KI.META_EBLK].item()),
+                              spec.n_routed_experts, spec.num_ranks)  # fmt: skip
         n_aux = len(tuple(dcfg.dspark_target_layer_ids))
         VA._need(
             n_aux == len(tspec.aux_layers),
@@ -132,7 +137,7 @@ class DraftMegakernel:
             f"{len(tspec.aux_layers)}",
         )
         g = WM.Geometry.from_hf(runner.model_config.hf_config, tspec.compress_ratios)
-        shared = {}
+        shared = dict(placed)
         VA._need(
             not (target.logits and getattr(draft_model, "has_own_lm_head", False)),
             "logits mode: the draft has its own lm_head (the megakernel applies "
@@ -160,6 +165,7 @@ class DraftMegakernel:
             mesh=target.mesh,
             rank=target.rank,
             expert_block=int(target.meta[KI.META_EBLK].item()),
+            vocab_start=int(target.meta[KI.META_VSTART].item()),
             weights=weights,
             draft_layers=layers,
             device=target.device,
@@ -233,6 +239,7 @@ class DraftMegakernel:
         flat = VA.export_step(fn, self.mesh, n_in, 1, f"dsv4_draft_{tag}",
                               f"{self.op_namespace}::step_{tag}")  # fmt: skip
         call = VA.inplace_call(flat, _HEAD_OPERANDS + n_bt, self.direct_dispatch)
+        self._calls[bucket] = call
 
         def step(head, block_tables, weights, caches):
             return call((*head, *block_tables), weights, caches)[0]
@@ -304,14 +311,20 @@ class DraftMegakernel:
         ops = self._preps[target](input_ids, positions, seq_lens, ctx_aux,
                                   ctx_positions, ctx_seq_lens, num_reqs,
                                   *block_tables)  # fmt: skip
-        with self.trace(f"draft {target.key} busy"):
+        with self.trace(f"draft {target.key} busy", *self._audit(target, ops)):
             hidden = self._run(target, ops)
         return VA._fit_rows(hidden, int(input_ids.shape[0]))
 
     def idle(self, target: KI.Bucket) -> None:
         """An idle DP rank's draft step (every request inactive)."""
-        with self.trace(f"draft {target.key} idle"):
-            self._run(target, self._idle[target])
+        ops = self._idle[target]
+        with self.trace(f"draft {target.key} idle", *self._audit(target, ops)):
+            self._run(target, ops)
+
+    def _audit(self, target: KI.Bucket, ops: Sequence[torch.Tensor]):
+        assert self.caches is not None
+        call = self._calls.get(draft_bucket(target, self.spec.q))
+        return dict(ops=ops, cache=self.caches.arrays), call
 
     def _run(self, target: KI.Bucket, ops: Sequence[torch.Tensor]) -> torch.Tensor:
         assert self.caches is not None
