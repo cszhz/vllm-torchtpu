@@ -368,6 +368,7 @@ def _attention_csa(
     union_dense_max_kv_tp4: int = 0,
     union_dense_plan_unconditional: bool = False,
     topk_after_q_above: int = 0,
+    topk_after_kv: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -390,7 +391,13 @@ def _attention_csa(
         # plan's start behind them and lets the gather complete under them;
         # the plan still has the SWA pass and the compressor to run behind.
         # Scheduling only: same values.
-        extra, q = jax.lax.optimization_barrier((extra, q))
+        if topk_after_kv:
+            # TPU_DSV4_CSA_TOPK_AFTER_KV: also behind the roped kv, so the
+            # top-k all-gather (issued once the q projection is fenced with
+            # the top-k, TPU_DSV4_CSA_TOPK_FENCE_Q) completes under kv_rope.
+            extra, q, new_kv = jax.lax.optimization_barrier((extra, q, new_kv))
+        else:
+            extra, q = jax.lax.optimization_barrier((extra, q))
 
     swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
         q=q,
