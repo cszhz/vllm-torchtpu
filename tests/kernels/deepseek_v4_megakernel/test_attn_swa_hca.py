@@ -75,9 +75,9 @@ def test_matches_reference(heads, seq_lens, blk_pages):
     assert _close(out, ref), (np.abs(out - ref).max(), np.abs(ref).max())
 
 
-def test_f32_pv_matches_reference():
+def test_bf16_pv_matches_reference():
     case = C.swa_hca_case(np.random.default_rng(7), [1030, 3000], 8)
-    out, ref = _run(case, blk_pages=4, pv_dtype=jnp.float32), _ref(case)
+    out, ref = _run(case, blk_pages=4, pv_dtype=jnp.bfloat16), _ref(case)
     assert _close(out, ref)
 
 

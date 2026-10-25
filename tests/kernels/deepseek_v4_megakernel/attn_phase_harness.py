@@ -348,7 +348,7 @@ def run_phase(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk=
     return list(res[:n_c]), res[n_c]
 
 
-def reference(ls, kind, layer, inputs, strict_causal=False):
+def reference(ls, kind, layer, inputs, strict_causal=False, stock=False):
     """Expected (caches, out rows [R, Q, 128, 512] f32)."""
     R = len(ls.seq_lens)
     arrays = [np.asarray(a).copy() for a in ls.arrays]
@@ -395,7 +395,8 @@ def reference(ls, kind, layer, inputs, strict_causal=False):
     if kind == "hca":
         out = attn_ref.swa_hca_reference(
             q, inputs["kv"][:, :Q], swa_words, jnp.asarray(ls.swa_table[layer]),
-            jnp.asarray(arrays[ai("kv")]), tb("kv"), seq, sinks, sm_scale=AP.SM_SCALE)
+            jnp.asarray(arrays[ai("kv")]), tb("kv"), seq, sinks, sm_scale=AP.SM_SCALE,
+            stock=stock)
         return arrays, out, None
     qi, wi = attn_ref.indexer_q_reference(inputs["idx_q"][:, :Q], inputs["idx_w"][:, :Q, :64],
                                           w["idx_cos_sin"], pos)
@@ -405,7 +406,7 @@ def reference(ls, kind, layer, inputs, strict_causal=False):
     out = attn_ref.csa_reference(
         q, inputs["kv"][:, :Q], swa_words, jnp.asarray(ls.swa_table[layer]),
         jnp.asarray(arrays[ai("kv")]), jnp.asarray(arrays[ai("kv_rope")]), tb("kv"), topk, seq,
-        sinks, sm_scale=AP.SM_SCALE)
+        sinks, sm_scale=AP.SM_SCALE, stock=stock)
     return arrays, out, topk
 
 

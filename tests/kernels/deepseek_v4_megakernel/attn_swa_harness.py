@@ -28,6 +28,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import attn_core as core
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import attn_layout as L
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import attn_phase as AP
+from vllm_torchtpu.kernels.deepseek_v4_megakernel import attn_ref
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import step_phases as SP
 
 META_ROLES = ("swa", "kv", "state", "kv_rope", "indexer_k", "indexer_state", "swa_pages")
@@ -186,8 +187,10 @@ def _tokens(words):  # int32 [..., 2, 128] -> f32 [..., 512]
     return np.concatenate([p.astype(np.uint32).view(np.float32) for p in parts], axis=-1)
 
 
-def reference(ss, layer, inputs, num_req=None):
-    """(caches after the phase, out [B, K, 128, 512] f32 for the active requests)."""
+def reference(ss, layer, inputs, num_req=None, stock=False):
+    """(caches after the phase, out [B, K, 128, 512] f32 for the active requests).
+
+    `stock`: the SWA-only stock kernel's arithmetic (`attn_ref._attend_stock`)."""
     B, K = len(ss.bases), ss.K
     num_req = B if num_req is None else num_req
     caches = [a.copy() for a in ss.arrays]
@@ -212,6 +215,11 @@ def reference(ss, layer, inputs, num_req=None):
         for t in range(K):
             qp = base + t
             vis = ((qp - pos >= 0) & (qp - pos < W)) | ((pos >= base) & (pos < base + K))
+            if stock:
+                out[r, t] = attn_ref._attend_stock(q[r, t], keys, jnp.asarray(vis), len(pos),
+                                                   jnp.asarray(ss.sinks[layer]), AP.SM_SCALE,
+                                                   False)
+                continue
             s = (q[r, t] @ keys.T) * AP.SM_SCALE  # [128, n]
             s = np.where(vis[None, :], s, -np.inf)
             m = s.max(axis=1, keepdims=True)

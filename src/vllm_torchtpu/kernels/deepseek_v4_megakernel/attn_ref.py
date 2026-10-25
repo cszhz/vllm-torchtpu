@@ -25,6 +25,9 @@ serving path computes for R requests of ``q_len`` consecutive query rows:
   All   one softmax over the union of the SWA and compressed keys plus the
         per-head attention sink, as the kernels' partial merge computes.
 
+With ``stock=True`` the references instead follow the served kernels'
+arithmetic step by step (`_attend_stock`), bf16-rounded output included.
+
 Positions: ``seq_lens`` count the new rows, so the first query row of
 request r sits at ``seq_lens[r] - q_len``.
 """
@@ -32,6 +35,7 @@ request r sits at ``seq_lens[r] - q_len``.
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import attn_layout as L
 
@@ -70,6 +74,45 @@ def _attend(q_t, keys, visible, sinks, sm_scale):
     return jnp.einsum("hn,nd->hd", p, keys, precision="highest") / denom
 
 
+# The kernels' `pl.reciprocal(approx=True)`, jitted (the primitive has no eager
+# rule). Off TPU it lowers to 1 / bf16(x), as in interpret mode.
+_approx_reciprocal = jax.jit(lambda x: pltpu.reciprocal(x, approx=True))
+
+
+def _attend_stock(q_t, keys, visible, n_window, sinks, sm_scale, compressed):
+    """`_attend` in the served kernels' arithmetic: bf16 ``[H, 512]`` as f32.
+
+    Keys ``[:n_window]`` are the SWA pass (`mla_swa`), the rest the compressed
+    pass (`mla` for HCA, `sparse_mla` for CSA) continuing its softmax state.
+    Both: ``s = (q @ k) * sm_scale``, masked to the f32 minimum, ``p = exp(s -
+    m)`` kept f32 for the row sum and P.V, and ``out = acc * reciprocal(l +
+    exp(sink - m), approx=True)`` cast to bf16. With a compressed pass
+    (`compressed`, even when it sees no rows) the SWA kernel hands its
+    accumulator over as bf16.
+    """
+    neg = jnp.finfo(jnp.float32).min
+    s = jnp.einsum("hd,nd->hn", q_t, keys, precision="highest") * sm_scale
+    s = jnp.where(visible[None, :], s, neg)
+    sw, kw = s[:, :n_window], keys[:n_window]
+    m = jnp.max(sw, axis=1, keepdims=True)
+    p = jnp.exp(sw - m)
+    l = jnp.sum(p, axis=1, keepdims=True)  # noqa: E741
+    acc = jnp.einsum("hn,nd->hd", p, kw, precision="highest")
+    if compressed:
+        acc = acc.astype(jnp.bfloat16).astype(jnp.float32)
+        sc, kc = s[:, n_window:], keys[n_window:]
+        if kc.shape[0]:
+            m_new = jnp.maximum(m, jnp.max(sc, axis=1, keepdims=True))
+            p = jnp.exp(sc - m_new)
+            alpha = jnp.exp(m - m_new)
+            l = alpha * l + jnp.sum(p, axis=1, keepdims=True)  # noqa: E741
+            acc = alpha * acc + jnp.einsum("hn,nd->hd", p, kc, precision="highest")
+            m = m_new
+    l_total = l + jnp.exp(sinks[:, None] - m)
+    out = acc * _approx_reciprocal(l_total)
+    return out.astype(jnp.bfloat16).astype(jnp.float32)
+
+
 def swa_hca_reference(
     q,  # bf16 [R, q_len, H, 512]
     new_kv,  # bf16 [R, q_len, 512]
@@ -85,6 +128,7 @@ def swa_hca_reference(
     swa_page=128,
     ratio=128,
     hca_page=8,
+    stock=False,
 ):
     """f32 ``[R, q_len, H, 512]``."""
     q = np.asarray(q, np.float32)
@@ -110,7 +154,11 @@ def swa_hca_reference(
             vis = (kpos >= 0) & (kpos <= qpos) & (kpos > qpos - window)
             if n_c:
                 vis = np.concatenate([vis, np.arange(n_c) < (qpos + 1) // ratio])
-            rows_t.append(_attend(q[r, t], keys, jnp.asarray(vis), sinks, sm_scale))
+            if stock:
+                rows_t.append(_attend_stock(q[r, t], keys, jnp.asarray(vis), len(kpos),
+                                            sinks, sm_scale, hca_words is not None))
+            else:
+                rows_t.append(_attend(q[r, t], keys, jnp.asarray(vis), sinks, sm_scale))
         out.append(jnp.stack(rows_t))
     return jnp.stack(out)
 
@@ -210,6 +258,7 @@ def csa_reference(
     window=128,
     swa_page=128,
     page_size=256,
+    stock=False,
 ):
     """f32 ``[R, q_len, H, 512]``: SWA + sparse attention over the top-k rows."""
     q = np.asarray(q, np.float32)
@@ -233,7 +282,11 @@ def csa_reference(
             vis = (kpos >= 0) & (kpos <= qpos) & (kpos > qpos - window)
             vis = np.concatenate([vis, np.ones(len(sel), bool)])
             allk = jnp.concatenate([keys, ckeys], axis=0)
-            rows_t.append(_attend(q[r, t], allk, jnp.asarray(vis), sinks, sm_scale))
+            if stock:
+                rows_t.append(_attend_stock(q[r, t], allk, jnp.asarray(vis), len(kpos),
+                                            sinks, sm_scale, True))
+            else:
+                rows_t.append(_attend(q[r, t], allk, jnp.asarray(vis), sinks, sm_scale))
         out.append(jnp.stack(rows_t))
     return jnp.stack(out)
 

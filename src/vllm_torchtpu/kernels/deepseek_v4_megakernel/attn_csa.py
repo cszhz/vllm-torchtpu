@@ -757,14 +757,15 @@ def csa_attention(
     blk_pages: int = 8,
     granule: int = 256,
     k_dense: int = 4,  # hybrid: union rows a page needs to be streamed whole
-    pv_dtype=jnp.bfloat16,
+    pv_dtype=jnp.float32,
     interpret=False,
     vmem_limit_bytes: int = 60 * 1024 * 1024,
 ):
     """Standalone wrapper: SWA + sparse attention, bf16 ``[R, q_len, H, 512]``."""
     R, T, H, D = q.shape
     wcfg = core.WindowConfig(heads=H, sm_scale=sm_scale, q_len=T,
-                             swa_page=swa_words.shape[1] // 2, pv_dtype=pv_dtype)
+                             swa_page=swa_words.shape[1] // 2, pv_dtype=pv_dtype,
+                             round_window_acc=True)
     G = granule
     u_max = core.cdiv(union.shape[1], G) * G
     union = jnp.pad(union, ((0, 0), (0, u_max - union.shape[1])))

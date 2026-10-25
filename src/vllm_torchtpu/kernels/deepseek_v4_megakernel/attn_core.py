@@ -41,7 +41,6 @@ NEG = float(jnp.finfo(jnp.float32).min)
 NT = (((1,), (1,)), ((), ()))
 NN = (((1,), (0,)), ((), ()))
 TN = (((0,), (0,)), ((), ()))
-LOG2E = 1.4426950408889634
 
 
 def cdiv(a, b):
@@ -55,7 +54,11 @@ class WindowConfig:
     q_len: int = 7
     window: int = 128
     swa_page: int = 128  # SWA tokens per page
-    pv_dtype: object = jnp.bfloat16
+    # probabilities in the row sum and P.V (the stock kernels keep them f32)
+    pv_dtype: object = jnp.float32
+    # a compressed-KV pass follows: round the window pass's accumulator to bf16
+    # as stock does handing it from the SWA kernel to the HCA / CSA kernel
+    round_window_acc: bool = False
     write_swa: bool = False  # also store the new rows into the SWA pages
     # the new rows are one block that sees itself bidirectionally (stock
     # non_causal_block, the DSpark draft); else causal
@@ -87,7 +90,7 @@ class WindowConfig:
 
 class WindowScratch(NamedTuple):
     swa_buf: object  # int32 [2, 2 * window, 128]
-    m: object  # f32 [1, rows_pad] (transposed) or [rows8, 1]; unscaled scores
+    m: object  # f32 [1, rows_pad] (transposed) or [rows8, 1]; scaled scores
     l: object  # f32, as m
     acc: object  # f32 [512, rows_pad] (transposed) or [rows8, 512]
     sems: object  # DMA [3]: SWA reads (2 slots), SWA row writes
@@ -247,14 +250,13 @@ class VerifyWindow:
             cols = pl.ds(pl.multiple_of(l0, 128), w)
             q = self.q_ref[r, cols, :].astype(jnp.bfloat16)
             s = lax.dot_general(kv, q, NT, preferred_element_type=jnp.float32)
-            s = jnp.where(vis, s, NEG)
+            s = jnp.where(vis, s * cfg.sm_scale, NEG)
             m_prev = scr.m[:, cols]
             m_cur = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
-            c = cfg.sm_scale * LOG2E
-            p = jnp.exp2((s - m_cur) * c).astype(cfg.pv_dtype)
+            p = jnp.exp(s - m_cur).astype(cfg.pv_dtype)
             pv = lax.dot_general(kv_t.astype(cfg.pv_dtype), p, NN,
                                  preferred_element_type=jnp.float32)
-            alpha = jnp.exp2((m_prev - m_cur) * c)
+            alpha = jnp.exp(m_prev - m_cur)
             scr.l[:, cols] = alpha * scr.l[:, cols] + jnp.sum(p.astype(jnp.float32), 0, keepdims=True)
             scr.acc[:, cols] = alpha * scr.acc[:, cols] + pv
             scr.m[:, cols] = m_cur
@@ -265,13 +267,12 @@ class VerifyWindow:
         else:
             q = self.q_ref[r, : cfg.rows8, :].astype(jnp.bfloat16)
             s = lax.dot_general(q, kv, NT, preferred_element_type=jnp.float32)
-        s = jnp.where(vis, s, NEG)  # unscaled
+        # The stock kernels' order: scale, mask, then exp(s - m) on scaled scores.
+        s = jnp.where(vis, s * cfg.sm_scale, NEG)
         m_blk = jnp.max(s, axis=axis, keepdims=True)
         m_prev = None if first else scr.m[...]
         m_cur = m_blk if first else jnp.maximum(m_prev, m_blk)
-        # exp(scale * (s - m)) with the scale folded into the base-2 exponent.
-        c = cfg.sm_scale * LOG2E
-        p = jnp.exp2((s - m_cur) * c).astype(cfg.pv_dtype)
+        p = jnp.exp(s - m_cur).astype(cfg.pv_dtype)
         l_blk = jnp.sum(p.astype(jnp.float32), axis=axis, keepdims=True)
         if cfg.transposed and kv_t is None:  # contract the keys of kv itself: no transpose
             pv = lax.dot_general(kv.astype(cfg.pv_dtype), p, TN,
@@ -282,11 +283,13 @@ class VerifyWindow:
         else:
             pv = lax.dot_general(p, kv.astype(cfg.pv_dtype), NN,
                                  preferred_element_type=jnp.float32)  # [rows8, 512]
-        if first:
+        if first:  # the window pass (`swa_step`)
             scr.l[...] = l_blk
+            if cfg.round_window_acc:
+                pv = pv.astype(jnp.bfloat16).astype(jnp.float32)
             scr.acc[...] = pv
         else:
-            alpha = jnp.exp2((m_prev - m_cur) * c)
+            alpha = jnp.exp(m_prev - m_cur)
             scr.l[...] = alpha * scr.l[...] + l_blk
             scr.acc[...] = alpha * scr.acc[...] + pv
         scr.m[...] = m_cur
@@ -321,8 +324,8 @@ class VerifyWindow:
         sink = self.sink_ref[...]
         if not cfg.transposed:
             sink = sink.T[: cfg.rows8]
-        inv = 1.0 / (scr.l[...] + jnp.exp(sink - scr.m[...] * cfg.sm_scale))
-        out = scr.acc[...] * inv
+        l_total = scr.l[...] + jnp.exp(sink - scr.m[...])
+        out = scr.acc[...] * pltpu.reciprocal(l_total, approx=True)
         if cfg.transposed:
             self.out_ref[r] = out.T.astype(jnp.bfloat16).astype(self.out_ref.dtype)
         else:

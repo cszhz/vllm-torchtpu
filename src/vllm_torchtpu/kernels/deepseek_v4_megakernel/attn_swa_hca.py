@@ -149,7 +149,7 @@ def swa_hca_attention(
     blk_pages: int | None = None,
     with_hca: bool = True,
     write_swa: bool = False,
-    pv_dtype=jnp.bfloat16,
+    pv_dtype=jnp.float32,
     interpret=False,
     vmem_limit_bytes: int = 60 * 1024 * 1024,
 ):
@@ -159,7 +159,7 @@ def swa_hca_attention(
     assert D == L.HEAD_DIM
     wcfg = core.WindowConfig(heads=H, sm_scale=sm_scale, q_len=T,
                              swa_page=swa_words.shape[1] // 2, pv_dtype=pv_dtype,
-                             write_swa=write_swa)
+                             write_swa=write_swa, round_window_acc=with_hca)
     hca_page = hca_words.shape[1] // 2
     if blk_pages is None:  # one block per request up to 1024 compressed rows
         blk_pages = min(128, hca_table.shape[1])

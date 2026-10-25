@@ -173,7 +173,8 @@ def dims_of(geom) -> Dims:
 
 def window_config(d: Dims, kind: str = "") -> core.WindowConfig:
     return core.WindowConfig(heads=d.heads, sm_scale=SM_SCALE, q_len=d.q, write_swa=True,
-                             block_bidir=kind == "swa", force_transposed=True)
+                             block_bidir=kind == "swa", force_transposed=True,
+                             round_window_acc=kind != "swa")
 
 
 class Scratch(NamedTuple):
