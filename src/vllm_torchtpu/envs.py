@@ -166,6 +166,8 @@ if TYPE_CHECKING:
     TPU_DSV4_SWA_Q_COMPUTE_BLOCK_SIZE: int = 16
     TPU_DSV4_SWA_KV_BLOCK_TOKENS: int = 256
     TPU_DSV4_HCA_PREFETCH_EARLY: bool = False
+    TPU_DSV4_FUSED_HCA_DECODE: bool = False
+    TPU_DSV4_FUSED_HCA_BLK_PAGES: int = 64
     TPU_DSV4_SWA_SINGLE_PASS: bool = False
     TPU_DSV4_SWA_SINGLE_PASS_MAX_TOKENS: int = 32
     TPU_DSV4_SWA_SINGLE_PASS_BQ: int = 8
@@ -1176,6 +1178,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DSv4 HCA attention: issue the next KV block's page DMAs before the current
     # block's compute instead of after it, so the copy overlaps the compute.
     "TPU_DSV4_HCA_PREFETCH_EARLY": env_bool("TPU_DSV4_HCA_PREFETCH_EARLY"),
+    # DSv4 HCA layers, steps of T <= 32 tokens: one fused kernel for the SWA window
+    # + compressed rows (one online softmax + sink, new rows stored in-kernel)
+    # instead of the SWA kernel, the HCA MLA kernels and their hand-off glue.
+    "TPU_DSV4_FUSED_HCA_DECODE": env_bool("TPU_DSV4_FUSED_HCA_DECODE"),
+    # ... HCA pages (8 compressed rows each) per KV block of that kernel.
+    "TPU_DSV4_FUSED_HCA_BLK_PAGES": env_positive_int("TPU_DSV4_FUSED_HCA_BLK_PAGES", 64),
     # DSv4 indexer: from this many tokens per bucket on, each TP rank scores
     # only its contiguous 1/TP of every sequence's compressed positions; the
     # ranks exchange their top-k candidates (all-to-all) and merge them (same
