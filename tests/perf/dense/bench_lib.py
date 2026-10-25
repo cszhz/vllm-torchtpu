@@ -9,6 +9,7 @@ all cores streaming concurrently (as in serving). Per-call time = (loop - empty 
 
 from __future__ import annotations
 
+import re
 import time
 
 import jax
@@ -43,28 +44,32 @@ def _smap(f, n_in):
 _EMPTY: dict = {}
 
 
+def _chain(kernel, per_w_args, reps, call_kernel):
+    n_w = len(per_w_args)
+    k = len(per_w_args[0])
+    n_flat = n_w * k
+
+    def dev(x, *flat_args):
+        def body(_, x):
+            acc = jnp.zeros((), jnp.float32)
+            for i in range(n_w):
+                if call_kernel:
+                    y = jax.tree.leaves(kernel(x, *flat_args[i * k : (i + 1) * k]))[0]
+                else:
+                    y = x
+                acc = acc + y[(0,) * y.ndim].astype(jnp.float32)
+            return x + (acc * 1e-30).astype(x.dtype)
+
+        return jax.lax.fori_loop(0, reps, body, x)
+
+    return jax.jit(_smap(dev, 1 + n_flat))
+
+
 def time_chain(kernel, x0, per_w_args, reps=40, trials=3, empty=True):
     """kernel(x, *args_i) -> y (any shape); per_w_args: list over weights of tuples of
     global sharded arrays. Returns microseconds per kernel call."""
     n_w = len(per_w_args)
     flat = [a for t in per_w_args for a in t]
-    k = len(per_w_args[0])
-
-    def make(call_kernel):
-        def dev(x, *flat_args):
-            def body(_, x):
-                acc = jnp.zeros((), jnp.float32)
-                for i in range(n_w):
-                    if call_kernel:
-                        y = jax.tree.leaves(kernel(x, *flat_args[i * k : (i + 1) * k]))[0]
-                    else:
-                        y = x
-                    acc = acc + y[(0,) * y.ndim].astype(jnp.float32)
-                return x + (acc * 1e-30).astype(x.dtype)
-
-            return jax.lax.fori_loop(0, reps, body, x)
-
-        return jax.jit(_smap(dev, 1 + len(flat)))
 
     def run(f):
         jax.block_until_ready(f(x0, *flat))
@@ -75,12 +80,20 @@ def time_chain(kernel, x0, per_w_args, reps=40, trials=3, empty=True):
             best = min(best, time.perf_counter() - t)
         return best
 
-    t_full = run(make(True))
+    t_full = run(_chain(kernel, per_w_args, reps, True))
     ekey = (x0.shape, x0.dtype, tuple((a.shape, a.dtype) for a in flat), reps)
     if empty and ekey not in _EMPTY:
-        _EMPTY[ekey] = run(make(False))
+        _EMPTY[ekey] = run(_chain(kernel, per_w_args, reps, False))
     t_empty = _EMPTY[ekey] if empty else 0.0
     return (t_full - t_empty) / (reps * n_w) * 1e6
+
+
+def profile_chain(kernel, x0, per_w_args, reps=8, top=6):
+    """Device-0 XLA-op times of the chain: [(op, calls per kernel call, us per kernel call)]."""
+    calls = reps * len(per_w_args)
+    flat = [a for t in per_w_args for a in t]
+    rows = device_op_times(_chain(kernel, per_w_args, reps, True), x0, *flat, top=top)
+    return [(name, c / calls, t / calls) for name, c, t in rows]
 
 
 def first_device(a):
@@ -91,3 +104,35 @@ def first_device(a):
 def run_on_devices(f, *args):
     """Run f per device (shard_map) once; returns the global output."""
     return jax.jit(_smap(f, len(args)))(*args)
+
+
+def device_op_times(f, *args, trace_dir="/tmp/dense_prof", top=12):
+    """Run f(*args) under the profiler; return [(op name, count, total us)] for device 0's
+    XLA-op events, largest first. Exploratory: prints the plane/line names it walked."""
+    import glob
+    import shutil
+
+    from jax.profiler import ProfileData
+
+    shutil.rmtree(trace_dir, ignore_errors=True)
+    jax.block_until_ready(f(*args))
+    with jax.profiler.trace(trace_dir):
+        jax.block_until_ready(f(*args))
+    path = sorted(glob.glob(f"{trace_dir}/**/*.xplane.pb", recursive=True))[-1]
+    pd = ProfileData.from_file(path)
+    agg: dict = {}
+    for plane in pd.planes:
+        if plane.name != "/device:TPU:0":
+            continue
+        for line in plane.lines:
+            if line.name != "XLA Ops":
+                continue
+            for ev in line.events:
+                # "%fp8_skinny_x.12 = bf16[...] ..." -> "fp8_skinny_x": one row per kernel
+                name = re.sub(r"\.\d+$", "", ev.name.split(" = ")[0].lstrip("%"))
+                c, t = agg.get(name, (0, 0.0))
+                agg[name] = (c + 1, t + ev.duration_ns / 1e3)
+    if not agg:
+        print("device_op_times: no events; planes:", [
+            (p.name, [l.name for l in p.lines]) for p in pd.planes][:6])
+    return sorted(((k, c, t) for k, (c, t) in agg.items()), key=lambda r: -r[2])[:top]
