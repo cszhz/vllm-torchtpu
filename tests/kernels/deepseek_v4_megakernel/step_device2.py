@@ -163,6 +163,11 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     from vllm_torchtpu.kernels.deepseek_v4_megakernel import moe_phase as MP
 
     MP.ABLATE = frozenset(x for x in var.get("moe_ablate", "").split("+") if x)
+    from vllm_torchtpu.kernels.deepseek_v4_megakernel import moe_experts as ME
+
+    ME.COMPACT_ABLATE = frozenset(
+        x for x in var.get("compact_ablate", "").split("+") if x
+    )
     skip = tuple(x for x in var.get("skip", "").split("+") if x)
     if skip:
         scfg = dataclasses.replace(scfg, skip=skip)
@@ -268,8 +273,6 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     if var.get("compact_check") == "1":
         # MoE compact on vs off from the same inputs: bitwise, plus the
         # moe_experts.COMPACT_FAULT positive control (stub attention: no caches)
-        from vllm_torchtpu.kernels.deepseek_v4_megakernel import moe_experts as ME
-
         on = dataclasses.replace(scfg, moe_compact=True)
         assert at is None and MP.phase_config(on.geometry()).compact
         diff = jax.jit(lambda x, y: jnp.sum(x != y))

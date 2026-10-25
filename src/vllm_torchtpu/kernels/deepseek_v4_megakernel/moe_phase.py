@@ -334,8 +334,6 @@ def moe_phase(
         ws = [s["sel_w"][:, k : k + 1] for k in range(cfg.topk)]
         dense, hit = rt.combine_matrix(ids, ws, E)
         s["dense"][...] = dense
-        if cfg.compact:
-            blk.build_rows(ids)
         n_items = blk.build_worklist(hit)
     for a in ABLATE:  # attribution only: "cap<k>" runs at most k items
         if a.startswith("cap"):
@@ -349,7 +347,7 @@ def moe_phase(
 
     with jax.named_scope("moe_items"):
         _over_cols(geom.hidden, seed)
-        blk.run(n_items, acc_init=False)
+        blk.run(n_items, acc_init=False, ids=ids if cfg.compact else None)
     if before_ar is not None:  # every item DMA has landed: the lease is free
         before_ar()
     if ar is None:

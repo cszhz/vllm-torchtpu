@@ -58,6 +58,9 @@ CT = 32  # compact tile rows (the fp8 sublane tile)
 # Positive control of the compact checks, read at trace time: "row" adds the
 # first gathered row of every item to the next accumulator row.
 COMPACT_FAULT = ""
+# Time attribution only (wrong numerics), read at trace time: "gather" skips
+# the row gathers, "scatter" the accumulator adds.
+COMPACT_ABLATE: frozenset[str] = frozenset()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -422,8 +425,7 @@ class MoEBlock:
             return n + jnp.where(e >= 0, s["hits"][ec >> 7, ec & 127], 0)
 
         n_hit = lax.fori_loop(0, n_slots, add, jnp.int32(0), unroll=8)
-        if cfg.compact:
-            self._count_steps(n_hit)
+        self._n_hit = n_hit  # compact: run() counts the (item, chunk) steps
         if not self._copies():
             return n_hit * cfg.SL
         _, copy, layer = self.placement
@@ -451,8 +453,8 @@ class MoEBlock:
 
     # -- compact rows ------------------------------------------------------------
     def build_rows(self, ids):
-        """Compact mode, after routing (`ids`: topk [M, 1] id columns) and
-        quantize_rows: per local slot j the rows routed to it in ascending
+        """Compact mode (run() calls it, after build_worklist; `ids`: topk
+        [M, 1] id columns): per local slot j the rows routed to it in ascending
         order (rtab[p, j] for p < count) and the counts, packed into SMEM
         `rts` for the scatter; x's row scales as a lane vector. Vector work:
         a row's position in its expert's list is a prefix count over rows."""
@@ -542,6 +544,8 @@ class MoEBlock:
         """Entry m's routed rows of xq into xg (chunk by chunk, an exact one-hot
         fp8 matmul) with their x scales and routing weights (lane selects)."""
         cfg, s = self.cfg, self.s
+        if "gather" in COMPACT_ABLATE:
+            return
         M, E = cfg.rows, cfg.n_experts
         j, e = s["jlist"][m], s["elist"][m]
         count = self._count(j)
@@ -597,6 +601,8 @@ class MoEBlock:
         cfg, s = self.cfg, self.s
         j = s["jlist"][self._entry(i)[0]]
         n = jnp.where(valid, jnp.clip(self._count(j) - c * CT, 0, CT), 0)
+        if "scatter" in COMPACT_ABLATE:
+            n = 0
 
         def put(t, carry):
             p = c * CT + t
@@ -928,7 +934,7 @@ class MoEBlock:
     def back(self, slot, mid_q, coef):
         self.down(slot, mid_q, coef)
 
-    def run(self, n_items, acc_init=None):
+    def run(self, n_items, acc_init=None, ids=None):
         """Software-pipelined over items with ONE copy of each code site (the
         weight-DMA issue is replicated per layer where weights are
         layer-indexed, and code size is time inside the step kernel): step i
@@ -945,7 +951,7 @@ class MoEBlock:
         s["mid"][...] = jnp.zeros(s["mid"].shape, s["mid"].dtype)
         s["coef"][...] = jnp.zeros(s["coef"].shape, F32)
         if cfg.compact:
-            self._run_compact(n_items)
+            self._run_compact(n_items, ids)
             return
 
         def step(i, issued):
@@ -973,22 +979,27 @@ class MoEBlock:
         def _():
             lax.fori_loop(0, n_items + 1, step, jnp.int32(0))
 
-    def _run_compact(self, n_items):
+    def _run_compact(self, n_items, ids):
         """run() over (item, chunk) steps: an item's chunks run back to back on
         its slot (one weight load), the first waits its DMAs and, on an
         entry's first item, gathers the entry's rows; step k's down
-        projection is step k-1's, scattered into acc after the loop body."""
+        projection is step k-1's, scattered into acc after the loop body.
+        The first items' weights stream in while the row lists are built."""
         cfg, s = self.cfg, self.s
         NB = cfg.nbuf
+        pre = jnp.minimum(n_items, NB - 1)
+
+        def issue(q, cc):
+            self.start_item(q, lax.rem(q, NB))
+            return cc
+
+        lax.fori_loop(0, pre, issue, 0)
+        self.build_rows(ids)
+        self._count_steps(self._n_hit)
 
         def step(k, carry):
             issued, i, c, pi, pc = carry
             target = jnp.minimum(n_items, i + NB - 1)
-
-            def issue(q, cc):
-                self.start_item(q, lax.rem(q, NB))
-                return cc
-
             lax.fori_loop(issued, target, issue, 0)
             cur = jnp.minimum(i, n_items - 1)
             slot, prev = lax.rem(i, NB), lax.rem(pi, NB)
@@ -1016,7 +1027,7 @@ class MoEBlock:
 
         @pl.when(n_items > 0)
         def _():
-            lax.fori_loop(0, s["nsub"][0] + 1, step, (zero,) * 5)
+            lax.fori_loop(0, s["nsub"][0] + 1, step, (pre,) + (zero,) * 4)
 
 
 def intermediate(cfg, acc, xs):
@@ -1141,9 +1152,7 @@ def build_moe_layer(cfg: MoEConfig, *, interpret=None):
             w_out = jnp.where(lane == k, ws[k], w_out)
         ids_ref[...] = ids_out
         wts_ref[...] = w_out
-        if cfg.compact:
-            blk.build_rows(ids)
-        blk.run(blk.build_worklist(hit), acc_init)
+        blk.run(blk.build_worklist(hit), acc_init, ids=ids if cfg.compact else None)
         ar = AllReduce(cfg.ar, s, me)
         tot = ar(s["acc"][0 : cfg.ar_rows], 0)
         out_ref[0 : cfg.ar_rows] = tot.astype(BF16)
