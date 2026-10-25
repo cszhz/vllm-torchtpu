@@ -727,6 +727,7 @@ def prepare_outputs(
         "num_queries_per_block",
         "vmem_limit_bytes",
         "decode_batch_size",
+        "skip_empty_passes",
     ),
 )
 def mla_ragged_paged_attention(
@@ -751,6 +752,7 @@ def mla_ragged_paged_attention(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_batch_size: int = 8,
+    skip_empty_passes: bool = False,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1027,9 +1029,16 @@ def mla_ragged_paged_attention(
         ),
     )
 
+    def maybe_skip(start_seq_idx, end_seq_idx, run):
+        # The prefill and mixed passes were always launched; an empty one costs
+        # ~1 us (a decode step's mixed pass is empty).
+        if not skip_empty_passes:
+            return run(q)
+        return skip_if_empty(start_seq_idx, end_seq_idx, run)
+
     if chunk_prefill_size is not None:
         # Handle prefill where the query length is fixed per sequence.
-        q = run_mla_kernel(
+        q = maybe_skip(distribution[0], distribution[1], lambda q: run_mla_kernel(
             q,
             cache_kv,
             kv_lens,
@@ -1047,10 +1056,10 @@ def mla_ragged_paged_attention(
             static_q_len=chunk_prefill_size,
             batch_size=1,
             case=MlaCase.PREFILL,
-        )
+        ))
 
     # Handle mixed case where the query length per sequence is variable.
-    q = run_mla_kernel(
+    q = maybe_skip(distribution[1], distribution[2], lambda q: run_mla_kernel(
         q,
         cache_kv,
         kv_lens,
@@ -1068,7 +1077,7 @@ def mla_ragged_paged_attention(
         static_q_len=None,
         batch_size=1,
         case=MlaCase.MIXED,
-    )
+    ))
     output = prepare_outputs(
         q, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
