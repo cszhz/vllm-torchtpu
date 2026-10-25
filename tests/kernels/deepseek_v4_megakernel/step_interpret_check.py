@@ -19,7 +19,9 @@
 Reduced widths (dense_config.small_config), 3 layers (HCA, HCA, CSA), stub
 phases. Prints one RESULT JSON line: relative errors of the kernel's own-row
 outputs vs the plain-JAX composition (kernel and stock summation orders) and
-the reassociation band between the two.
+the reassociation band between the two. --detect-races runs the interpreter's
+cross-core race detector (eager DMAs; each race prints a RACE DETECTED
+report) and adds "races" (whether any was found) to the line.
 """
 
 import argparse
@@ -37,6 +39,8 @@ import dataclasses  # noqa: E402
 
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
+from jax._src.pallas.mosaic.interpret import interpret_pallas_call  # noqa: E402
+from jax.experimental.pallas import tpu as pltpu  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import dense_config as dc  # noqa: E402
@@ -72,6 +76,7 @@ def main():
     p.add_argument("--vocab-shard", action="store_true")
     # MoE: a random static expert permutation per layer (moe_phase placement)
     p.add_argument("--placement", action="store_true")
+    p.add_argument("--detect-races", action="store_true")
     a = p.parse_args()
     R, T, q, B = a.R, a.T, a.q, a.B
     perm = (
@@ -126,7 +131,13 @@ def main():
     mesh = jax.make_mesh(
         (R,), ("d",), devices=sorted(jax.devices(), key=lambda d: d.id)[:R]
     )
-    step = SK.build(scfg, axis="d", interpret=not ON_DEVICE)
+    interpret = not ON_DEVICE
+    if a.detect_races:
+        assert interpret, "the race detector is an interpret-mode tool"
+        interpret = pltpu.InterpretParams(
+            dma_execution_mode="eager", detect_races=True
+        )
+    step = SK.build(scfg, axis="d", interpret=interpret)
     L = full.n_layers
     names = tp_cfg.stream_names
     moe = None
@@ -290,6 +301,9 @@ def main():
             np.all(np.asarray(res, np.float32)[GS : R - GS] == 0)
         ),
     }
+    if a.detect_races:
+        races = interpret_pallas_call.races
+        out["races"] = bool(races is not None and races.races_found)
     print("RESULT " + json.dumps(out), flush=True)
 
 

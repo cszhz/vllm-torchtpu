@@ -159,12 +159,6 @@ class StepKernelConfig:
         return -(-self.q // 8) * 8
 
     @property
-    def og_in_rx(self) -> bool:
-        """A2A#2 lands in a2a_rx[1] (free once A2A#1 is unpacked) when it has
-        a block per global request."""
-        return self.B >= 2 and self.G >= self.T // self.QP
-
-    @property
     def hpr(self) -> int:  # heads per rank (= heads of one o-group)
         return self.dense.heads
 
@@ -340,11 +334,10 @@ def _scratch(scfg: StepKernelConfig, typed: bool):
         # (row, rank) -- half the bytes, 1/q the DMAs.
         qs_b=pltpu.VMEM((T * scfg.hpr, d), BF16),  # A2A#1 send
         a2a_rx=pltpu.VMEM((scfg.B, scfg.G, scfg.QP * scfg.hpr, d), BF16),
-        **(
-            {}
-            if scfg.og_in_rx
-            else {"og_b": pltpu.VMEM((T // scfg.QP, scfg.QP * scfg.hpr, d), BF16)}
-        ),  # A2A#2 receive, one [QP * hpr, d] block per global request
+        # A2A#2 receive, one [QP * hpr, d] block per global request. Never
+        # a2a_rx: a peer may still be unpacking its A2A#1 heads from there
+        # when an owner's A2A#2 lands.
+        og_b=pltpu.VMEM((T // scfg.QP, scfg.QP * scfg.hpr, d), BF16),
         part=pltpu.VMEM((T, h), F32),  # wo_b / shared-expert partials
         post_st=pltpu.VMEM((16, cfg.hc_hidden), BF16),
         a2a_sem=pltpu.SemaphoreType.DMA((2, 2)),  # [A2A#1, #2] x [send, recv]
@@ -558,9 +551,9 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
         g's (rank g * GS + tj) og[global row, :], packed per (request, source)
         as bf16 rows t*hpr + j of a2a2_stg[g] and landed in og_b, then widened
         into og."""
-        # A2A#1 has been unpacked by now: its slots 0 (and 1) are free
+        # this rank has unpacked its own A2A#1 heads: its slot 0 is free
         stg = s["a2a_rx"].at[0]
-        ogb = s["a2a_rx"].at[1] if scfg.og_in_rx else s["og_b"]
+        ogb = s["og_b"]
         dummy = a2a2_desc(stg.at[0], ogb.at[0], me)
         for r in range(B):
             gk0 = ownt[r * q]  # global row of the request's first row
@@ -949,6 +942,13 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
         dbg_x_store(2, s["xin"])
 
     # ---- prologue ----------------------------------------------------------------
+    # Zero the remote-landing buffers before the barrier: past it, a fast peer
+    # may already be sending its layer-0 A2A#1 heads here.
+    s["q_in"][...] = jnp.zeros(s["q_in"].shape, BF16)
+    s["og"][...] = jnp.zeros(s["og"].shape, F32)
+    s["og_b"][...] = jnp.zeros(s["og_b"].shape, BF16)
+    # every block og may read is finite (inactive requests' blocks are stale)
+    s["a2a_rx"][...] = jnp.zeros(s["a2a_rx"].shape, BF16)
     AR.barrier(R, me)
 
     def smalls_copy(li, slot):
@@ -967,12 +967,6 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
         mixst[:, DR.COMB0 + j * hcm + j : DR.COMB0 + j * hcm + j + 1] = jnp.ones(
             (T, 1), F32
         )
-    s["q_in"][...] = jnp.zeros(s["q_in"].shape, BF16)
-    s["og"][...] = jnp.zeros(s["og"].shape, F32)
-    if not scfg.og_in_rx:
-        s["og_b"][...] = jnp.zeros(s["og_b"].shape, BF16)
-    # every block og may read is finite (inactive requests' blocks are stale)
-    s["a2a_rx"][...] = jnp.zeros(s["a2a_rx"].shape, BF16)
 
     def layer_body(li, c):
         slot = lax.rem(li, 2)
