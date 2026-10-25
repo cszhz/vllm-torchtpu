@@ -5445,6 +5445,10 @@ class TPURaidenConnectorWorker:
         tp_group = None
         if self._stage3_sharded_consumer():
             tp_group = get_tp_group() if self._stage3_kimi else self._stage3_tp_group()
+        # Sharded consumer: every rank stages each load first, then one
+        # all_gather_object agrees on all of this step's loads at once (one
+        # CPU-group round trip per step, not two gloo all_gathers per request).
+        staged: list[tuple[_Stage3PendingSubmit, Any, list[int]]] = []
 
         for destination_req_id, req_meta in metadata.reqs_to_load.items():
             if not isinstance(req_meta, _Stage3LoadMeta):
@@ -5633,25 +5637,44 @@ class TPURaidenConnectorWorker:
             )
             if tp_group is not None:
                 pending.task = self._stage_stage3_submit_task(pending, synchronous)
-                ready: list[bool | None] = [None] * int(tp_group.world_size)
-                torch.distributed.all_gather_object(
-                    ready, pending.task is not None, group=tp_group.cpu_group
-                )
-                if not all(ready):
+                staged.append((pending, destination_req_id, local_blocks))
+                continue
+            self._submit_staged_stage3_load(pending, synchronous)
+
+        if staged:
+            local_ready = [entry[0].task is not None for entry in staged]
+            ready: list[list[bool] | None] = [None] * int(tp_group.world_size)
+            torch.distributed.all_gather_object(
+                ready, local_ready, group=tp_group.cpu_group
+            )
+            for rank_ready in ready:
+                if rank_ready is None or len(rank_ready) != len(staged):
+                    raise RuntimeError(
+                        "Stage-3 sharded consumer ranks staged different load "
+                        f"sets: {len(staged)} here vs {rank_ready!r}"
+                    )
+            for i, (pending, destination_req_id, local_blocks) in enumerate(staged):
+                if not all(rank_ready[i] for rank_ready in ready):
                     self._record_stage3_load_failure(destination_req_id, local_blocks)
                     continue
-            with TraceAnnotation(
-                "KV_Cache_Decode_Submit_Load",
-                uuid=uuid,
-                request_id=str(destination_req_id),
-                source_req_id=str(source_req_id),
-                num_tokens=num_tokens,
-                num_blocks=len(local_blocks),
-            ):
-                self._dispatch_stage3_load_submit(pending, synchronous)
+                self._submit_staged_stage3_load(pending, synchronous)
 
         if tp_group is not None and synchronous:
             self._drain_stage3_submit_outcomes()
+
+    def _submit_staged_stage3_load(
+        self, pending: _Stage3PendingSubmit, synchronous: bool
+    ) -> None:
+        """Dispatches one load whose staging every rank agreed on."""
+        with TraceAnnotation(
+            "KV_Cache_Decode_Submit_Load",
+            uuid=pending.uuid,
+            request_id=str(pending.destination_req_id),
+            source_req_id=str(pending.source_req_id),
+            num_tokens=pending.num_tokens,
+            num_blocks=len(pending.local_blocks),
+        ):
+            self._dispatch_stage3_load_submit(pending, synchronous)
 
     def _stage3_fa_skip_bytes(self, skip_tokens: int) -> int:
         """Use the same destination byte space for inline and queued submits."""

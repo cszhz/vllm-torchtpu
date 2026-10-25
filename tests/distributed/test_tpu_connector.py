@@ -3768,6 +3768,68 @@ class TestTPURaidenConnectorWorker:
         )
         return meta
 
+    @pytest.mark.parametrize("peer_ready", [[True, True], [True, False]])
+    def test_sharded_consumer_agrees_on_all_loads_in_one_gather(self, peer_ready):
+        worker = _make_raiden_worker(
+            is_producer=False, tp_rank=0, tp_size=2, block_size=1024
+        )
+        worker._raiden_work_unit = MagicMock()
+        worker._raiden_transfer_engine = engine = _FakeRaidenEngine()
+        engine.poll_results = []
+        meta = self._make_stage3_load_meta("dst-a", "src-a", 2001, [7, 8])
+        meta.reqs_to_load.update(
+            self._make_stage3_load_meta("dst-b", "src-b", 2002, [9, 10]).reqs_to_load
+        )
+        group = SimpleNamespace(
+            world_size=2, cpu_group=object(), broadcast_object=lambda obj, src: obj
+        )
+        gathers = []
+
+        def gather(outputs, value, group):
+            gathers.append(list(value))
+            outputs[:] = [value, peer_ready]
+
+        dispatched = []
+        failed = []
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"),
+            patch(f"{_MOD}.get_tp_group", return_value=group),
+            patch.object(worker, "_stage3_tp_group", return_value=group),
+            patch(f"{_MOD}.torch.distributed.all_gather_object", side_effect=gather),
+            patch.object(
+                worker,
+                "_require_stage3_controller",
+                return_value=(MagicMock(), "10.0.0.2:28000"),
+            ),
+            patch.object(
+                worker, "_stage_stage3_submit_task", return_value=MagicMock()
+            ),
+            patch.object(
+                worker,
+                "_raiden_destination_work_units",
+                return_value=[MagicMock(), MagicMock()],
+            ),
+            patch.object(
+                worker,
+                "_dispatch_stage3_load_submit",
+                side_effect=lambda pending, sync: dispatched.append(
+                    pending.destination_req_id
+                ),
+            ),
+            patch.object(
+                worker,
+                "_record_stage3_load_failure",
+                side_effect=lambda req_id, blocks: failed.append(req_id),
+            ),
+        ):
+            worker._submit_stage3_loads(meta, engine)
+        # One CPU-group exchange for both loads, in request order.
+        assert gathers == [[True, True]]
+        if all(peer_ready):
+            assert dispatched == ["dst-a", "dst-b"] and failed == []
+        else:
+            assert dispatched == ["dst-a"] and failed == ["dst-b"]
+
     @pytest.mark.parametrize("prearm_failure", [False, True])
     def test_qwen_tp_submits_are_serial_without_blocking_model_step(
         self, prearm_failure
