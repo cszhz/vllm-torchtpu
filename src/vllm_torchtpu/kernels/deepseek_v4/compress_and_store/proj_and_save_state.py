@@ -109,6 +109,8 @@ def kernel(
     acc_ref,  # (2, tile_n * slots_per_token, 1, lanes) f32
     sem_ref,  # [2]
     write_rows_ref,  # [2] rows in flight from each acc buffer
+    run_starts_ref,  # [tile_n + 1] first token of each run of one tile
+    run_ends_ref,  # [tile_n + 1] one past the last token of each run
     *,
     cfgs: Configs,
 ):
@@ -146,20 +148,48 @@ def kernel(
             pltpu.make_async_copy(buf, buf, sem_ref.at[buf_idx]).wait()
 
     def _dma_copy_out(n_idx, buf_idx):
-        """Writes every valid token's state from one acc buffer to the cache."""
+        """Writes the tile's valid tokens from one acc buffer to the cache,
+        one DMA per run of tokens whose states are consecutive in one page.
+
+        A branch-free scan records where runs start and end; DMAs are issued
+        only for runs, so a prefill tile costs a few DMAs instead of tile_n.
+        """
+        page_rows = cfgs.token_page_size
+        base = n_idx * tile_n
         rows = 0
+        num_starts = num_ends = jnp.int32(0)
+        prev_slot = None
         for i in range(tile_n):
-            global_slot_idx = slot_mapping[n_idx * tile_n + i]
-            valid = global_slot_idx >= 0
-            safe_slot_idx = lax.select(valid, global_slot_idx, 0)
-            p = safe_slot_idx // cfgs.token_page_size
-            start_slot = safe_slot_idx % cfgs.token_page_size
-            size = lax.select(valid, slots_per_token, 0)
-            rows = rows + size
-            dest = cache.at[p, pl.ds(start_slot, size), :, :]
-            src = acc_ref_u8.at[buf_idx, pl.ds(i * slots_per_token, size), :, :]
-            pltpu.make_async_copy(src, dest, sem_ref.at[buf_idx]).start()
+            slot = slot_mapping[base + i]
+            valid = slot >= 0
+            rows = rows + lax.select(valid, slots_per_token, 0)
+            if prev_slot is None:
+                starts = valid
+            else:
+                prev_valid = prev_slot >= 0
+                extends = prev_valid & (slot == prev_slot + slots_per_token)
+                if page_rows % slots_per_token == 0:
+                    # Slots are page * page_rows + j * slots_per_token, so a
+                    # run reaches the next page only when the page is full.
+                    extends = extends & (slot % page_rows != 0)
+                starts = valid & jnp.logical_not(extends)
+                # Unconditional store: an index past the last end is scratch.
+                run_ends_ref[num_ends] = i
+                num_ends = num_ends + (prev_valid & jnp.logical_not(extends))
+            run_starts_ref[num_starts] = i
+            num_starts = num_starts + starts
+            prev_slot = slot
+        run_ends_ref[num_ends] = tile_n
         write_rows_ref[buf_idx] = rows
+
+        @pl.loop(0, num_starts)
+        def _(r):
+            start = run_starts_ref[r]
+            slot = slot_mapping[base + start]
+            run_rows = (run_ends_ref[r] - start) * slots_per_token
+            dest = cache.at[slot // page_rows, pl.ds(slot % page_rows, run_rows)]
+            src = acc_ref_u8.at[buf_idx, pl.ds(start * slots_per_token, run_rows)]
+            pltpu.make_async_copy(src, dest, sem_ref.at[buf_idx]).start()
 
     def inner_kernel(
         tiled_hidden_states_ref,  # (tile_n, hidden_size)
@@ -328,6 +358,8 @@ def proj_and_save_state(
         pltpu.VMEM((2, tile_n * slots_per_token, 1, last_dim), jnp.float32),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SMEM((2,), jnp.int32),
+        pltpu.SMEM((tile_n + 1,), jnp.int32),
+        pltpu.SMEM((tile_n + 1,), jnp.int32),
     ]
 
     out_shape = jax.ShapeDtypeStruct(cache.shape, cache.dtype)
