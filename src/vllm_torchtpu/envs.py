@@ -170,6 +170,7 @@ if TYPE_CHECKING:
     TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS: int = 512
     TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
     TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
+    TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4: int = 0
     TPU_DSV4_SEQ_PARALLEL: bool = False
     TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: int = 0
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = True
@@ -1187,6 +1188,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # buckets) the plan runs as one pass on two subcores per block.
     "TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS": env_int(
         "TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS", 32
+    ),
+    # At more than 16 local heads (TP4): route a sequence to union-dense only
+    # when its compressed KV (seq_len // 4, + 1) is <= this many rows; longer
+    # sequences stay on the sparse path, and a step with none routed skips the
+    # SparseCore plan. At TP4 the dense pass costs ~heads x union, so it pays
+    # only at short contexts (-17% @22.5k, -7% @51k, 0% @100k tokens per call),
+    # and a step that falls back pays the plan for nothing. 0 = no limit.
+    "TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4": env_int(
+        "TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4", 0
     ),
     # DeepSeek-V4 sequence parallelism over the TP group: the mHC residual
     # stream, the mHC seams and the MoE (router, fused EP, a replicated shared

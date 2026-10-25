@@ -391,6 +391,7 @@ class VllmDeepseekV4MLAAttention(
                     envs.TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN
                 ),
                 "union_dense_max_heads": envs.TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS,
+                "union_dense_max_kv_tp4": envs.TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4,
             }
             if is_csa
             else {

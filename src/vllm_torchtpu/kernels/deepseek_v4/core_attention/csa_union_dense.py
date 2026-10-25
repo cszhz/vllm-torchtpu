@@ -785,6 +785,7 @@ def prepare(
     rows_per_token: int = 160,
     count_first: bool = True,
     split: int = 1,
+    max_kv: int | None = None,
 ) -> dict:
     """The union plan of a step (SparseCore), independent of q and the SWA
     pass: a caller can issue it ahead so it runs behind TensorCore work.
@@ -800,6 +801,9 @@ def prepare(
     # index == kv_lens (= seq_len // ratio): the selectable range is kv + 1.
     sel_len = kv_lens + 1
     ud_ok = (qlen >= min_q_len) & (sel_len <= s_cap) & (kv_lens > 0)
+    if max_kv is not None:
+        # Longer sequences stay on the sparse path (where union-dense does not pay).
+        ud_ok = ud_ok & (sel_len <= max_kv)
     split_seq = jnp.max(jnp.where(live & ~ud_ok, seq_ids + 1, 0)).astype(jnp.int32)
     routed = live & (seq_ids >= split_seq)
     nblk = jnp.where(routed, (qlen + bq - 1) // bq, 0)
