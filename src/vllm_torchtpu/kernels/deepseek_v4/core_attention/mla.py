@@ -757,7 +757,7 @@ def prepare_outputs(
         "decode_batch_size",
         "bkv_prefetch",
         "fast_dma",
-        "verify_fast_path",
+        "static_pass",
     ),
 )
 def mla_ragged_paged_attention(
@@ -784,7 +784,7 @@ def mla_ragged_paged_attention(
     decode_batch_size: int = 8,
     bkv_prefetch: str = "after_compute",
     fast_dma: bool = False,
-    verify_fast_path: bool = False,
+    static_pass: bool = True,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -814,10 +814,8 @@ def mla_ragged_paged_attention(
         current block has landed, so the copies overlap its compute).
       fast_dma: whole kv blocks issue static-size page copies; empty fetches
         issue none.
-      verify_fast_path: with `chunk_prefill_size`, a batch holding only
-        verify windows runs the static-length pass alone, behind one
-        `lax.cond`, instead of also launching the empty decode and mixed
-        passes. Same pass, same arithmetic.
+      static_pass: False leaves the `chunk_prefill_size` sequences to the
+        caller: their output rows keep the values of `q`.
 
     Returns:
       The output of attention.
@@ -1016,13 +1014,65 @@ def mla_ragged_paged_attention(
             swa_m,
         )
 
-    def skip_if_empty(q, start_seq_idx, end_seq_idx, run):
+    def skip_if_empty(start_seq_idx, end_seq_idx, run):
         # An empty pass still pays its launch and the page-table copy into
         # SMEM; with speculative decoding the decode passes are usually empty.
         return lax.cond(end_seq_idx > start_seq_idx, run, lambda q: q, q)
 
-    def verify_pass(q):
-        return run_mla_kernel(
+    batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
+    # Batched decode
+    q = skip_if_empty(
+        jnp.array(0),
+        batch_distribution,
+        lambda q: run_mla_kernel(
+            q,
+            cache_kv,
+            kv_lens,
+            kv_lens_to_attend,
+            page_indices,
+            cu_q_lens,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=jnp.array(0),
+            end_seq_idx=batch_distribution,
+            static_q_len=1,
+            batch_size=decode_batch_size,
+            case=MlaCase.BATCHED_DECODE,
+        ),
+    )
+
+    # Decode-only
+    q = skip_if_empty(
+        batch_distribution,
+        distribution[0],
+        lambda q: run_mla_kernel(
+            q,
+            cache_kv,
+            kv_lens,
+            kv_lens_to_attend,
+            page_indices,
+            cu_q_lens,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=batch_distribution,
+            end_seq_idx=distribution[0],
+            static_q_len=1,
+            batch_size=1,
+            case=MlaCase.DECODE,
+        ),
+    )
+
+    if chunk_prefill_size is not None and static_pass:
+        # Handle prefill where the query length is fixed per sequence.
+        q = run_mla_kernel(
             q,
             cache_kv,
             kv_lens,
@@ -1042,91 +1092,26 @@ def mla_ragged_paged_attention(
             case=MlaCase.PREFILL,
         )
 
-    def all_passes(q):
-        batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
-        # Batched decode
-        q = skip_if_empty(
-            q,
-            jnp.array(0),
-            batch_distribution,
-            lambda q: run_mla_kernel(
-                q,
-                cache_kv,
-                kv_lens,
-                kv_lens_to_attend,
-                page_indices,
-                cu_q_lens,
-                attention_sinks,
-                swa_accumution,
-                swa_l,
-                swa_m,
-                num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-                num_queries_per_block=num_queries_per_blocks[0],
-                start_seq_idx=jnp.array(0),
-                end_seq_idx=batch_distribution,
-                static_q_len=1,
-                batch_size=decode_batch_size,
-                case=MlaCase.BATCHED_DECODE,
-            ),
-        )
-
-        # Decode-only
-        q = skip_if_empty(
-            q,
-            batch_distribution,
-            distribution[0],
-            lambda q: run_mla_kernel(
-                q,
-                cache_kv,
-                kv_lens,
-                kv_lens_to_attend,
-                page_indices,
-                cu_q_lens,
-                attention_sinks,
-                swa_accumution,
-                swa_l,
-                swa_m,
-                num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-                num_queries_per_block=num_queries_per_blocks[0],
-                start_seq_idx=batch_distribution,
-                end_seq_idx=distribution[0],
-                static_q_len=1,
-                batch_size=1,
-                case=MlaCase.DECODE,
-            ),
-        )
-
-        if chunk_prefill_size is not None:
-            # Handle prefill where the query length is fixed per sequence.
-            q = verify_pass(q)
-
-        # Handle mixed case where the query length per sequence is variable.
-        q = run_mla_kernel(
-            q,
-            cache_kv,
-            kv_lens,
-            kv_lens_to_attend,
-            page_indices,
-            cu_q_lens,
-            attention_sinks,
-            swa_accumution,
-            swa_l,
-            swa_m,
-            num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-            num_queries_per_block=num_queries_per_blocks[2],
-            start_seq_idx=distribution[1],
-            end_seq_idx=distribution[2],
-            static_q_len=None,
-            batch_size=1,
-            case=MlaCase.MIXED,
-        )
-        return q
-
-    if verify_fast_path and chunk_prefill_size is not None:
-        only_verify = (distribution[0] == 0) & (distribution[1] == distribution[2])
-        q = lax.cond(only_verify, verify_pass, all_passes, q)
-    else:
-        q = all_passes(q)
+    # Handle mixed case where the query length per sequence is variable.
+    q = run_mla_kernel(
+        q,
+        cache_kv,
+        kv_lens,
+        kv_lens_to_attend,
+        page_indices,
+        cu_q_lens,
+        attention_sinks,
+        swa_accumution,
+        swa_l,
+        swa_m,
+        num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+        num_queries_per_block=num_queries_per_blocks[2],
+        start_seq_idx=distribution[1],
+        end_seq_idx=distribution[2],
+        static_q_len=None,
+        batch_size=1,
+        case=MlaCase.MIXED,
+    )
     output = prepare_outputs(
         q, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]

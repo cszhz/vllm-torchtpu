@@ -244,38 +244,53 @@ def swa_hca_attention(
 
 
 def verify_swa_hca(
-    q,  # [T, H, 512]: the verify windows back to back from token 0
+    q,  # [T, H, 512]
     new_kv,  # bf16 [T, 512]
     sw_cache,  # served SWA cache (int32 words or uint8 slabs), 2 slots per token
     swa_kv_lens,  # i32[max_seqs], incl. the new rows
     swa_page_indices,  # i32[max_seqs * P_swa]
     hca_cache,  # served HCA cache (uint8 slabs or int32 words)
     hca_page_indices,  # i32[max_seqs * P_hca]
-    num_req,  # traced: verify windows in the batch (<= T // q_len)
+    first_req,  # traced: first verify window's sequence index
+    num_req,  # traced: verify windows, back to back from token first_token
+    first_token,  # traced
     sinks,  # f32 [H]
+    base,  # [T, H, 512]: the other rows of the result
     *,
     q_len: int,
     sm_scale: float,
     window: int,
     blk_pages: int | None = None,
 ):
-    """SWA + HCA attention of a batch of verify windows only, in one kernel,
-    stock-path shapes: ([T, H, 512] normalized output, updated SWA cache).
-    Rows past the windows are zero."""
+    """SWA + HCA attention of the verify windows of a batch, in one kernel.
+
+    Sequences [first_req, first_req + num_req) are windows of exactly q_len
+    tokens, laid out back to back from token first_token. Returns ([T, H, 512]:
+    their normalized attention on their rows, `base` on every other row; the
+    SWA cache with their new rows written).
+    """
     if window != core.WindowConfig.window:
         raise ValueError(f"window {window} != {core.WindowConfig.window}")
     T, H, D = q.shape
-    R = T // q_len
-    max_seqs = swa_kv_lens.shape[0]
+    R = T // q_len  # static bound on num_req
     rows = R * q_len
+    max_seqs = swa_kv_lens.shape[0]
+    req = jnp.clip(first_req + jnp.arange(R, dtype=jnp.int32), 0, max_seqs - 1)
+    # Padded so a window block starting anywhere in the batch stays in bounds.
+    q_v = lax.dynamic_slice_in_dim(
+        jnp.pad(q, ((0, rows), (0, 0), (0, 0))), first_token, rows
+    )
+    kv_v = lax.dynamic_slice_in_dim(
+        jnp.pad(new_kv, ((0, rows), (0, 0))), first_token, rows
+    )
     att, cache = swa_hca_attention(
-        q[:rows].reshape(R, q_len, H, D),
-        new_kv[:rows].reshape(R, q_len, D),
+        q_v.reshape(R, q_len, H, D),
+        kv_v.reshape(R, q_len, D),
         sw_cache,
-        swa_page_indices.reshape(max_seqs, -1)[:R],
+        swa_page_indices.reshape(max_seqs, -1)[req],
         hca_cache,
-        hca_page_indices.reshape(max_seqs, -1)[:R],
-        swa_kv_lens[:R],
+        hca_page_indices.reshape(max_seqs, -1)[req],
+        swa_kv_lens[req],
         sinks,
         sm_scale=sm_scale,
         blk_pages=blk_pages,
@@ -283,7 +298,9 @@ def verify_swa_hca(
         num_req=num_req,
         live_pages_only=True,
     )
-    att = att.reshape(rows, H, D)
-    if rows < T:
-        att = jnp.concatenate([att, jnp.zeros((T - rows, H, D), att.dtype)])
-    return att, cache
+    placed = lax.dynamic_update_slice_in_dim(
+        jnp.zeros((T + rows, H, D), att.dtype), att.reshape(rows, H, D), first_token, 0
+    )[:T]
+    tok = lax.broadcasted_iota(jnp.int32, (T, 1, 1), 0)
+    mine = (tok >= first_token) & (tok < first_token + num_req * q_len)
+    return jnp.where(mine, placed, base), cache

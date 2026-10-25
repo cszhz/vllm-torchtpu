@@ -1457,7 +1457,7 @@ def run_mla_batched_decode_kernel(
         "non_causal_block",
         "q_compute_block_size",
         "padded_lm_out",
-        "verify_fast_path",
+        "static_pass",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -1490,7 +1490,7 @@ def mla_sliding_window_ragged_paged_attention(
     non_causal_block: bool = False,
     decode_seq_batch_size: int = 32,
     padded_lm_out: bool = False,
-    verify_fast_path: bool = False,
+    static_pass: bool = True,
 ) -> tuple[
     jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     jax.Array,  # [total_num_pages, physical_page_size_per_kv_packing, 4, 128] uint8
@@ -1532,10 +1532,9 @@ def mla_sliding_window_ragged_paged_attention(
         lane-padded width (only the first actual_num_q_heads lanes are
         meaningful) and leave padding rows uninitialized, for a consumer that
         reads only the real rows' heads (the HCA / CSA kernels).
-      verify_fast_path: with `chunk_prefill_size`, a batch holding only
-        verify windows (no decode-only and no mixed sequences) runs the
-        static-length pass alone, behind one `lax.cond`, instead of also
-        launching the two empty passes. Same pass, same arithmetic.
+      static_pass: False leaves the `chunk_prefill_size` sequences
+        [distribution[0], distribution[1]) to the caller: their rows and cache
+        writes are not done here.
 
     Returns:
       The output of attention and the updated kv cache.
@@ -1780,80 +1779,53 @@ def mla_sliding_window_ragged_paged_attention(
     # data won't be used downstream at all, so un-initialized buffer is fine.
     in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
 
-    def verify_pass(in_output, cache_kv, l, m):  # noqa: E741
-        return run_mla_kernel(
+    bkv_sz = num_kv_pages_per_blocks[0] * logical_page_size
+    if sliding_window <= bkv_sz:
+        output, updated_kv, out_l, out_m = run_mla_batched_decode_kernel(
             q,
             new_kv,
             cache_kv,
             kv_lens,
             page_indices,
             cu_q_lens,
-            num_kv_pages_per_block=num_kv_pages_per_blocks[1],
-            num_queries_per_block=num_queries_per_blocks[1],
-            start_seq_idx=distribution[0],
-            end_seq_idx=distribution[1],
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=jnp.array(0),
+            end_seq_idx=distribution[0],
             in_output=in_output,
             in_l=l,
             in_m=m,
             attention_sinks=attention_sinks,
-            static_q_len=chunk_prefill_size,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            logical_page_size=logical_page_size,
+            vmem_limit_bytes=vmem_limit_bytes,
             unnormalized_output=unnormalized_output,
-            case=MlaCase.PREFILL,
+            seq_batch_sz=decode_seq_batch_size,
+        )
+    else:
+        output, updated_kv, out_l, out_m = run_mla_kernel(
+            q,
+            new_kv,
+            cache_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            start_seq_idx=jnp.array(0),
+            end_seq_idx=distribution[0],
+            in_output=in_output,
+            in_l=l,
+            in_m=m,
+            attention_sinks=attention_sinks,
+            static_q_len=1,
+            unnormalized_output=unnormalized_output,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            case=MlaCase.DECODE,
         )
 
-    def all_passes(in_output, cache_kv, l, m):  # noqa: E741
-        bkv_sz = num_kv_pages_per_blocks[0] * logical_page_size
-        if sliding_window <= bkv_sz:
-            output, updated_kv, out_l, out_m = run_mla_batched_decode_kernel(
-                q,
-                new_kv,
-                cache_kv,
-                kv_lens,
-                page_indices,
-                cu_q_lens,
-                num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-                num_queries_per_block=num_queries_per_blocks[0],
-                start_seq_idx=jnp.array(0),
-                end_seq_idx=distribution[0],
-                in_output=in_output,
-                in_l=l,
-                in_m=m,
-                attention_sinks=attention_sinks,
-                sm_scale=sm_scale,
-                sliding_window=sliding_window,
-                logical_page_size=logical_page_size,
-                vmem_limit_bytes=vmem_limit_bytes,
-                unnormalized_output=unnormalized_output,
-                seq_batch_sz=decode_seq_batch_size,
-            )
-        else:
-            output, updated_kv, out_l, out_m = run_mla_kernel(
-                q,
-                new_kv,
-                cache_kv,
-                kv_lens,
-                page_indices,
-                cu_q_lens,
-                start_seq_idx=jnp.array(0),
-                end_seq_idx=distribution[0],
-                in_output=in_output,
-                in_l=l,
-                in_m=m,
-                attention_sinks=attention_sinks,
-                static_q_len=1,
-                unnormalized_output=unnormalized_output,
-                num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-                num_queries_per_block=num_queries_per_blocks[0],
-                case=MlaCase.DECODE,
-            )
-
-        if chunk_prefill_size is not None:
-            # Handle prefill where the query length is fixed per sequence.
-            output, updated_kv, out_l, out_m = verify_pass(
-                output, updated_kv, out_l, out_m
-            )
-
-        # Handle mixed case where the query length per sequence is variable.
+    if chunk_prefill_size is not None and static_pass:
+        # Handle prefill where the query length is fixed per sequence.
         output, updated_kv, out_l, out_m = run_mla_kernel(
             q,
             new_kv,
@@ -1861,27 +1833,39 @@ def mla_sliding_window_ragged_paged_attention(
             kv_lens,
             page_indices,
             cu_q_lens,
-            num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-            num_queries_per_block=num_queries_per_blocks[2],
-            start_seq_idx=distribution[1],
-            end_seq_idx=distribution[2],
+            num_kv_pages_per_block=num_kv_pages_per_blocks[1],
+            num_queries_per_block=num_queries_per_blocks[1],
+            start_seq_idx=distribution[0],
+            end_seq_idx=distribution[1],
             in_output=output,
             in_l=out_l,
             in_m=out_m,
             attention_sinks=attention_sinks,
-            static_q_len=None,
+            static_q_len=chunk_prefill_size,
             unnormalized_output=unnormalized_output,
-            case=MlaCase.MIXED,
+            case=MlaCase.PREFILL,
         )
-        return output, updated_kv, out_l, out_m
 
-    if verify_fast_path and chunk_prefill_size is not None:
-        only_verify = (distribution[0] == 0) & (distribution[1] == distribution[2])
-        output, updated_kv, out_l, out_m = lax.cond(
-            only_verify, verify_pass, all_passes, in_output, cache_kv, l, m
-        )
-    else:
-        output, updated_kv, out_l, out_m = all_passes(in_output, cache_kv, l, m)
+    # Handle mixed case where the query length per sequence is variable.
+    output, updated_kv, out_l, out_m = run_mla_kernel(
+        q,
+        new_kv,
+        updated_kv,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+        num_queries_per_block=num_queries_per_blocks[2],
+        start_seq_idx=distribution[1],
+        end_seq_idx=distribution[2],
+        in_output=output,
+        in_l=out_l,
+        in_m=out_m,
+        attention_sinks=attention_sinks,
+        static_q_len=None,
+        unnormalized_output=unnormalized_output,
+        case=MlaCase.MIXED,
+    )
     output = prepare_outputs(
         output, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]

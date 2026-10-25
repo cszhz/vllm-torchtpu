@@ -402,7 +402,6 @@ class VllmDeepseekV4MLAAttention(
             non_causal_block=non_causal,
             verify_q_len=verify_q_len,
             swa_padded_lm=envs.TPU_DSV4_SWA_PADDED_LM,
-            verify_fast_path=envs.TPU_DSV4_VERIFY_FAST_PATH,
             **(
                 {
                     "csa_gather_no_pad": envs.TPU_DSV4_CSA_GATHER_NO_PAD,
@@ -429,7 +428,6 @@ class VllmDeepseekV4MLAAttention(
             f"{'_aliased' if two_caches_same_buffer else ''}"
             f"{'_ncb' if non_causal else ''}"
             f"{f'_vq{verify_q_len}' if verify_q_len else ''}"
-            f"{'_vfp' if envs.TPU_DSV4_VERIFY_FAST_PATH else ''}"
             f"{'_vfh' if envs.TPU_DSV4_VERIFY_FUSED_HCA else ''}"
             f"{'' if built_from_real_caches else '_prof'}"
         )
