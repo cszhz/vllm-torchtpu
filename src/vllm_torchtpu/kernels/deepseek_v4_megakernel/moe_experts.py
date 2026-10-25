@@ -35,6 +35,7 @@ finer rounding: the intermediate's fp8 row scale is the max over this slice
 stock's fp8 wire rounding, and partial sums cross ranks as bf16.
 """
 
+import contextlib
 import dataclasses
 import math
 
@@ -54,6 +55,15 @@ FP4, FP8 = jnp.float4_e2m1fn, jnp.float8_e4m3fn
 PACK4 = 8  # fp4 values per u32 word, consecutive contraction rows
 DN = (((1,), (0,)), ((), ()))
 MODES = ("tp", "ep")
+
+
+# Profiling only, read at trace time: named scopes around the MoE phase's
+# sub-steps (they change the kernel's location metadata, not its arithmetic).
+SCOPES = False
+
+
+def scope(name):
+    return jax.named_scope(name) if SCOPES else contextlib.nullcontext()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -705,8 +715,9 @@ class MoEBlock:
         elif callable(acc_init):
             s["acc"][...] = acc_init()
         # else: the caller has written s["acc"] already
-        s["mid"][...] = jnp.zeros(s["mid"].shape, s["mid"].dtype)
-        s["coef"][...] = jnp.zeros(s["coef"].shape, F32)
+        with scope("moe_zero"):
+            s["mid"][...] = jnp.zeros(s["mid"].shape, s["mid"].dtype)
+            s["coef"][...] = jnp.zeros(s["coef"].shape, F32)
 
         def step(i, issued):
             # slots of items i-1 (down) and i (gate-up) are busy: issue up to i+NB-2
@@ -716,13 +727,15 @@ class MoEBlock:
                 self.start_item(k, lax.rem(k, NB))
                 return c
 
-            lax.fori_loop(issued, target, issue, 0)
+            with scope("moe_issue"):
+                lax.fori_loop(issued, target, issue, 0)
             cur = jnp.minimum(i, n_items - 1)
             slot, prev = lax.rem(i, NB), lax.rem(i + NB - 1, NB)
 
             @pl.when(i < n_items)
             def _():
-                self.wait_item(i, slot)
+                with scope("moe_wait"):
+                    self.wait_item(i, slot)
 
             mid_q, coef = s["mid"][...], s["coef"][:, 0:1]
             back = (prev, mid_q, coef, i > 0, jnp.maximum(i - 1, 0))

@@ -163,6 +163,9 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     from vllm_torchtpu.kernels.deepseek_v4_megakernel import moe_phase as MP
 
     MP.ABLATE = frozenset(x for x in var.get("moe_ablate", "").split("+") if x)
+    from vllm_torchtpu.kernels.deepseek_v4_megakernel import moe_experts as ME
+
+    ME.SCOPES = var.get("fine") == "1"  # MoE sub-step named scopes (profile=1)
     skip = tuple(x for x in var.get("skip", "").split("+") if x)
     if skip:
         scfg = dataclasses.replace(scfg, skip=skip)

@@ -32,7 +32,7 @@ from jax.experimental.pallas import tpu as pltpu
 from . import moe_router as rt
 from . import vmem_alias
 from .allreduce import AllReduce
-from .moe_experts import F32, FP4, I32, U32, MoEBlock, MoEConfig
+from .moe_experts import F32, FP4, I32, U32, MoEBlock, MoEConfig, scope
 
 RING = (
     "w1_vm",
@@ -296,7 +296,8 @@ def moe_phase(
         )
 
     with jax.named_scope("moe_route"):
-        _quantize_rows(s, inputs.x, T, M)
+        with scope("moe_quant"):
+            _quantize_rows(s, inputs.x, T, M)
         live = _smem_columns(lambda t, k: inputs.row_valid[t], 1, T, M)[0] > 0
         logits = pad(inputs.logits[...])
         # attribution only: every layer routes by the hash tables (random
@@ -335,16 +336,18 @@ def moe_phase(
             s["sel_ids"][...] = sid
             s["sel_w"][...] = sw
 
-        if spread:
-            select(True)
-        else:
-            pl.when(is_hash)(lambda: select(True))
-            pl.when(jnp.logical_not(is_hash))(lambda: select(False))
-        ids = [s["sel_ids"][:, k : k + 1] for k in range(cfg.topk)]
-        ws = [s["sel_w"][:, k : k + 1] for k in range(cfg.topk)]
-        dense, hit = rt.combine_matrix(ids, ws, E)
-        s["dense"][...] = dense
-        n_items = blk.build_worklist(hit)
+        with scope("moe_select"):
+            if spread:
+                select(True)
+            else:
+                pl.when(is_hash)(lambda: select(True))
+                pl.when(jnp.logical_not(is_hash))(lambda: select(False))
+        with scope("moe_worklist"):
+            ids = [s["sel_ids"][:, k : k + 1] for k in range(cfg.topk)]
+            ws = [s["sel_w"][:, k : k + 1] for k in range(cfg.topk)]
+            dense, hit = rt.combine_matrix(ids, ws, E)
+            s["dense"][...] = dense
+            n_items = blk.build_worklist(hit)
     for a in ABLATE:  # attribution only: "cap<k>" runs at most k items
         if a.startswith("cap"):
             n_items = jnp.minimum(n_items, int(a[3:]))
@@ -355,7 +358,8 @@ def moe_phase(
             s["acc"][T:M, cs] = jnp.zeros((M - T, w), F32)
 
     with jax.named_scope("moe_items"):
-        _over_cols(geom.hidden, seed)
+        with scope("moe_seed"):
+            _over_cols(geom.hidden, seed)
         blk.run(n_items, acc_init=False)
     if before_ar is not None:  # every item DMA has landed: the lease is free
         before_ar()
