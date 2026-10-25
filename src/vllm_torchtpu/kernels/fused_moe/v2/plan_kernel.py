@@ -257,9 +257,35 @@ def _plan_kernel(
         jnp.sum(gather, axis=0, keepdims=True), 0, jnp.int32(gather_hi)
     )
     if scale_lanes:
-        ss_ref[...] = lax.bitcast_convert_type(
-            jnp.sum(scale, axis=0, keepdims=True), jnp.float32
-        )
+        ss = lax.bitcast_convert_type(jnp.sum(scale, axis=0, keepdims=True), jnp.float32)
+        if ss_ref.shape[0] > 1:  # written as the [rows, 128] slab the kernel reads
+            lanes = ss_ref.shape[1]
+            ss = jnp.concatenate(
+                [ss[:, r * lanes : (r + 1) * lanes] for r in range(ss_ref.shape[0])]
+            )
+        ss_ref[...] = ss
+
+
+def _hbm_outputs_kernel(me_ref, *refs, n_in, to_hbm, plan):
+    """`plan` on VMEM refs, then each output flagged in `to_hbm` DMA'd from its
+    VMEM scratch to its HBM ref: the fused MoE kernel takes those tables as
+    scalar-prefetch operands, which XLA would otherwise copy out of VMEM one
+    by one ahead of it."""
+    ins, refs = refs[:n_in], refs[n_in:]
+    n_out = len(to_hbm)
+    outs, scratch, sem = refs[:n_out], refs[n_out:-1], refs[-1]
+    it = iter(scratch)
+    targets = [next(it) if h else o for o, h in zip(outs, to_hbm)]
+    plan(me_ref, *ins, *targets)
+    copies = [
+        pltpu.make_async_copy(t, o, sem.at[i])
+        for i, (t, o, h) in enumerate(zip(targets, outs, to_hbm))
+        if h
+    ]
+    for c in copies:
+        c.start()
+    for c in copies:
+        c.wait()
 
 
 def decode_plan_supported(*, e_total, ep, t_local, topk, shard_stride):
@@ -331,10 +357,15 @@ def build_decode_plan(
         gather_hi=gather_hi,
     )
     i32 = jnp.int32
+    # With `plan` pinning, every table the fused kernel reads leaves this
+    # kernel in HBM (and the scale slab already in its [rows, 128] shape);
+    # pos / mirror_pos feed XLA ops and stay in VMEM.
+    hbm_tables = operand_pin.enabled("plan")
     out_shape = [jax.ShapeDtypeStruct((G, ep), i32) for _ in range(5)]
     out_shape.append(jax.ShapeDtypeStruct((1, gather_rows), i32))
     if quantized:
-        out_shape.append(jax.ShapeDtypeStruct((1, scale_lanes), jnp.float32))
+        ss_shape = (scale_rows, HIDDEN_LANE_BLOCK) if hbm_tables else (1, scale_lanes)
+        out_shape.append(jax.ShapeDtypeStruct(ss_shape, jnp.float32))
     out_shape += [jax.ShapeDtypeStruct((1, G), i32) for _ in range(3)]
     out_shape.append(jax.ShapeDtypeStruct((8, ep), i32))
     out_shape += [jax.ShapeDtypeStruct((1, P), i32) for _ in range(2)]
@@ -342,13 +373,31 @@ def build_decode_plan(
     if quantized:
         inputs.append(scale_bits_g.astype(i32).reshape(ep, t_local))
     vmem = pltpu.MemorySpace.VMEM
+    to_hbm = [hbm_tables] * (len(out_shape) - 2) + [False, False]
+    scratch = []
+    if hbm_tables:
+        kernel = functools.partial(
+            _hbm_outputs_kernel, n_in=len(inputs), to_hbm=to_hbm, plan=kernel
+        )
+        scratch = [pltpu.VMEM(o.shape, o.dtype) for o, h in zip(out_shape, to_hbm) if h]
+        scratch.append(pltpu.SemaphoreType.DMA((len(out_shape),)))
+        # The out_spec only types the kernel's ref; the output's own memory
+        # space is what makes XLA allocate it in HBM.
+        out_shape = [
+            pltpu.MemorySpace.HBM(o.shape, o.dtype) if h else o
+            for o, h in zip(out_shape, to_hbm)
+        ]
     outs = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             grid=(),
             in_specs=[pl.BlockSpec(memory_space=vmem) for _ in inputs],
-            out_specs=[pl.BlockSpec(memory_space=vmem) for _ in out_shape],
+            out_specs=[
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM if h else vmem)
+                for h in to_hbm
+            ],
+            scratch_shapes=scratch,
         ),
         out_shape=out_shape,
         interpret=interpret,

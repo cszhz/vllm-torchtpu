@@ -930,7 +930,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # constrained to HBM, so XLA cannot stage it into VMEM ahead of the call.
     # Same arithmetic, bit-identical outputs; placement only.
     "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str("TPU_FP8_SKINNY_HBM_PIN_SITES", ""),
-    # Comma-separated Pallas call sites (kernels/operand_pin.py SITES, or "all")
+    # Comma- or colon-separated Pallas call sites (kernels/operand_pin.py SITES, or "all")
     # whose operands are constrained to HBM and moved by the kernel's own DMAs,
     # instead of XLA staging them into VMEM with a copy just before the call.
     # Same arithmetic, bit-identical outputs; placement only.

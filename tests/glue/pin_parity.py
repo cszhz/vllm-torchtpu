@@ -131,6 +131,27 @@ def _chains():
         return outs
 
     chains["pages"] = (jax.jit(pg), (spi0, tables))
+
+    ep, E, stride = 16, 384, 768
+    P = t_local * topk
+    pairs0 = jax.random.randint(next(key), (ep, P), 0, E + 1)
+    bits0 = jax.lax.bitcast_convert_type(
+        jax.random.uniform(next(key), (ep * t_local,), minval=0.01, maxval=2.0), jnp.int32
+    )
+
+    def plan(pairs, bits):
+        outs = []
+        for r in range(L):
+            p = plan_kernel.build_decode_plan(
+                pairs, bits, jnp.int32(r % ep), e_total=E, ep=ep, t_local=t_local,
+                topk=topk, block=4, tile_m=128, shard_stride=stride, row_stride=3,
+            )
+            leaves = jax.tree_util.tree_leaves(p)
+            outs += [jax.lax.bitcast_convert_type(x, jnp.int32) if x.dtype == jnp.float32 else x for x in leaves]
+            pairs = (pairs + (leaves[0][0, 0] & 1) + 7) % (E + 1)
+        return outs
+
+    chains["plan"] = (jax.jit(plan), (pairs0, bits0))
     return chains
 
 
@@ -149,7 +170,7 @@ def run(out, xprof=None):
     for name in chains:
         o = call(name)
         leaves = jax.tree_util.tree_leaves(o)
-        res[name] = np.concatenate([np.asarray(x).view(np.uint8).reshape(-1) for x in leaves])
+        res[name] = np.concatenate([np.ascontiguousarray(np.asarray(x)).reshape(-1).view(np.uint8) for x in leaves])
         print(name, "ok", res[name].size, flush=True)
     if xprof:
         for name in chains:

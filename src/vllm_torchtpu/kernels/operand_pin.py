@@ -23,13 +23,17 @@ SITES = (
     "combine",  # fused EP MoE decode combine: arrivals and their scales
     "select",  # fused EP MoE routed top-k select: score bias and slot labels
     "pages",  # sparse MLA gather_page_ids: per-token page-table windows
+    "plan",  # fused EP MoE decode plan: writes the fused kernel's tables to HBM
 )
 
 
 def enabled(site: str) -> bool:
     if site not in SITES:
         raise ValueError(f"unknown operand-pin site {site!r}; known: {SITES}")
-    listed = {s.strip() for s in envs.TPU_PIN_OPERANDS_HBM.split(",") if s.strip()}
+    # ":" also separates, so the list fits in a comma-separated env list.
+    listed = {
+        s.strip() for s in envs.TPU_PIN_OPERANDS_HBM.replace(":", ",").split(",")
+    } - {""}
     unknown = listed - set(SITES) - {"all"}
     if unknown:
         raise ValueError(f"TPU_PIN_OPERANDS_HBM names unknown sites {sorted(unknown)}")

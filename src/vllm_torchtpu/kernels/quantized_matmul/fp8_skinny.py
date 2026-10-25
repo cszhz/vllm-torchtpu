@@ -57,10 +57,13 @@ TUNED_HBM: dict[tuple[int, int], Config] = {
     (7168, 768): ("k", 1792, 4, 1),
 }
 assert TUNED.keys() == TUNED_HBM.keys()
-# Under TPU_PIN_OPERANDS_HBM=skinny the per-channel scale is always HBM-pinned; x
-# only where its producer leaves it in HBM (attn.wo_b: the wo_a kernel's output).
-# Pinning a fusion-produced x makes the fusion write HBM, which costs more than
-# the staging copy it saves.
+# Under TPU_PIN_OPERANDS_HBM=skinny, the (K, N) whose per-channel scale (PIN_WS)
+# and x (PIN_X) XLA stages unoverlapped right before the call in the DSv4 TP8
+# decode step; an HBM-pinned operand costs ~0.1-0.2 us of in-kernel fetch, a
+# staging copy ~0.6-0.9 us. Elsewhere the copy is already overlapped (wq_b's
+# scale), or the scale needs a relayout op that would then write HBM (n=768), or
+# x is a fusion's output that would then be written to HBM (wq_a, gate_up).
+PIN_WS: frozenset[tuple[int, int]] = frozenset({(7168, 2048), (2048, 7168)})
 PIN_X: frozenset[tuple[int, int]] = frozenset({(2048, 7168)})
 
 
@@ -280,8 +283,9 @@ def fp8_skinny_matmul(
         config = (TUNED_HBM if hbm_pin else TUNED)[(k, n)]
     split, t, nbuf, ndma = config
     # Only with the weight pinned: an unpinned weight would be staged anyway.
-    ws_hbm = hbm_pin and operand_pin.enabled("skinny")
-    x_hbm = ws_hbm and (k, n) in PIN_X
+    pin = hbm_pin and operand_pin.enabled("skinny")
+    ws_hbm = pin and (k, n) in PIN_WS
+    x_hbm = pin and (k, n) in PIN_X
     call = _build(m, k, n, w_q.dtype, x.dtype, split, t, nbuf, ndma, x_hbm, ws_hbm)
     w_s2 = w_s.reshape(1, n).astype(jnp.float32)
     if hbm_pin:
