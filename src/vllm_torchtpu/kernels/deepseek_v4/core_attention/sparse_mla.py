@@ -21,6 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
@@ -28,6 +29,19 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 # epilogue (the first QK and the last PV, which nothing overlaps) are paid
 # once per step, so wider steps amortize them over more tokens.
 PREFILL_ATTENTION_KERNEL_BATCH_SIZE = 32
+# Dense-window prefill path (`_dense_window_kernel`). A gather chunk of at
+# least DENSE_MIN_CHUNK tokens from one sequence whose selected rows all lie
+# below DENSE_MAX_WINDOW is answered from its copied window instead of a
+# per-token gather; decode-sized chunks always take the gather path.
+DENSE_MIN_CHUNK = 128
+DENSE_MAX_WINDOW = 2048
+# Window rows per score tile; a multiple of 128 (lanes) that divides the window.
+DENSE_KV_TILE = 256
+# Query tokens per grid step: the MXU sees tokens x heads rows.
+DENSE_TOKENS_PER_STEP = 16
+# Score tiles per rolled loop step: the scheduler overlaps them and the MXU
+# accumulates their P @ V in place.
+DENSE_TILE_GROUP = 4
 
 
 def cdiv(a, b):
@@ -602,6 +616,405 @@ def _attention_kernel(
     ### ------- Kernel end ------- ###
 
 
+def _dense_window_position(c: jax.Array) -> jax.Array:
+    """Window slot of compressed row ``c`` (``-1`` stays ``-1``).
+
+    A RoPE cache row packs 4 consecutive rows in 32-word lane groups, so each
+    `DENSE_KV_TILE`-row tile is stored group-major: row ``c`` goes to quarter
+    ``c % 4`` of its tile, at offset ``(c % tile) // 4``. A quarter's RoPE is
+    then one lane group of consecutive cache rows, with no relayout.
+    """
+    quarter = DENSE_KV_TILE // 4
+    slot = (c // DENSE_KV_TILE) * DENSE_KV_TILE + (c % 4) * quarter
+    slot = slot + (c % DENSE_KV_TILE) // 4
+    return jnp.where(c < 0, -1, slot)
+
+
+def _grouped_loop(n, group_body, group):
+    """`group_body(indices)` over [0, n) in groups of `group` (last one shorter).
+
+    One group's indices are a static-length list, so the scheduler overlaps
+    their work and the body keeps its accumulators in registers across them.
+    """
+
+    def rolled(i, carry):
+        group_body([i * group + u for u in range(group)])
+        return carry
+
+    num_full = n // group
+    lax.fori_loop(0, num_full, rolled, 0)
+    for rest in range(1, group):
+
+        @pl.when(n - num_full * group == rest)
+        def _():
+            group_body([num_full * group + u for u in range(rest)])
+
+
+def _dense_window_kernel(
+    # Prefetch
+    blk_window_ref,  # [num_blocks] window rows of an eligible block, else -1
+    step_window_ref,  # [num_steps] window rows the step's tokens select from
+    step_map_ref,  # [num_steps] token block the step's q/swa/o BlockSpecs use
+    blk_pages_ref,  # [num_blocks * max_pages] physical pages of the window
+    num_valid_ref,  # [1] tokens past this keep q, as in the gather path
+    # Input
+    attention_sinks_ref,  # float32[num_q_heads]
+    q_ref,  # [tq, num_q_heads, head_dim]
+    slots_ref,  # i32[topk, block_tokens] window slot of each selected row
+    cache_kv_nope_hbm_ref,  # int32[total_num_pages, page_size, 128]
+    cache_kv_rope_hbm_ref,  # int32[total_num_pages, page_size // 4, 128]
+    swa_acc_ref,  # [tq, num_q_heads, head_dim]
+    swa_l_ref,  # [tq, 1, num_l_heads]
+    swa_m_ref,  # [tq, 1, num_l_heads]
+    # Output
+    o_ref,  # [tq, num_q_heads, head_dim]
+    # Scratch
+    nope_win_ref,  # int32[max_pages * page_size, 128]
+    rope_win_ref,  # int32[max_pages * page_size // 4, 128]
+    kv_ref,  # bf16[num_tiles, tile, head_dim] dequantized window, slot order
+    bitmap_ref,  # int32[window_cap // 32, block_tokens] selection bit words
+    mask_ref,  # int32[num_tiles, block_tokens, tile] 0/1 selection
+    s_ref,  # f32[num_tiles, tq * num_q_heads, tile]
+    acc_ref,  # f32[tq * num_q_heads, head_dim]
+    m_ref,  # f32[tq * num_q_heads, 128] lane-wide running row max
+    l_ref,  # f32[tq * num_q_heads, 128] lane-wide running row sum
+    sems,  # DMA [2]
+    *,
+    sm_scale: float,
+):
+    """Attention for a block of one sequence's tokens over its whole window.
+
+    Every query token of the block attends over the same ``W`` compressed
+    rows: the block's highest selected row plus one. Instead of gathering
+    each token's top-k rows, the window is copied in page-sized DMAs and
+    dequantized once per block, and each token's top-k set becomes a 0/1
+    score mask: the rows a token did not select get the same minimum score
+    the gather path gives its padding entries, so it attends the same rows.
+    """
+    tq, num_q_heads, head_dim = q_ref.shape
+    rows = tq * num_q_heads
+    topk, block_tokens = slots_ref.shape
+    num_tiles, tile, _ = kv_ref.shape
+    quarter = tile // 4
+    page_size = cache_kv_nope_hbm_ref.shape[1]
+    max_pages = nope_win_ref.shape[0] // page_size
+    steps_per_block = pl.num_programs(1)
+
+    blk = pl.program_id(0)
+    step_in_blk = pl.program_id(1)
+    step = blk * steps_per_block + step_in_blk
+    window = blk_window_ref[blk]
+    eligible = window >= 0
+
+    def page_copies(k):
+        page = blk_pages_ref[blk * max_pages + k]
+        nope = pltpu.make_async_copy(
+            cache_kv_nope_hbm_ref.at[page],
+            nope_win_ref.at[pl.ds(k * page_size, page_size)],
+            sems.at[0],
+        )
+        rope = pltpu.make_async_copy(
+            cache_kv_rope_hbm_ref.at[page],
+            rope_win_ref.at[pl.ds(k * (page_size // 4), page_size // 4)],
+            sems.at[1],
+        )
+        return nope, rope
+
+    def fetch_window():
+        num_pages = cdiv(window, page_size)
+
+        def start(k, carry):
+            for cp in page_copies(k):
+                cp.start()
+            return carry
+
+        def wait(k, carry):
+            for cp in page_copies(k):
+                cp.wait()
+            return carry
+
+        lax.fori_loop(0, num_pages, start, 0)
+        lax.fori_loop(0, num_pages, wait, 0)
+
+    def dequant_window():
+        """Window rows -> kv_ref tiles in slot order; rows >= window are 0."""
+        lane = lax.broadcasted_iota(jnp.int32, (quarter, 128), 1)
+        row = lax.broadcasted_iota(jnp.int32, (quarter, head_dim), 0)
+        rope_dim = NOPE_DIM % 128
+        words_per_token = csa_cache_layout.ROPE_WORDS
+
+        def tile_body(b, carry):
+            rope_words = rope_win_ref[pl.ds(b * quarter, quarter), :]
+            for g in range(4):
+                words = nope_win_ref[pl.ds(b * tile + g, quarter, stride=4), :]
+                nope = _dequant_dsv4_fp8(words)
+                # The last sub-row's lanes rope_dim + k hold rope value k, as in
+                # the gather path. Word k of quarter g's token (lane 32 g + k)
+                # holds value k in its low half and k + 32 in its high half.
+                low_lanes = rope_dim - words_per_token * g
+                low = pltpu.roll(rope_words, low_lanes % 128, 1)
+                high = pltpu.roll(rope_words, (low_lanes + words_per_token) % 128, 1)
+                low = pltpu.bitcast(lax.shift_left(low, 16), jnp.float32)
+                high = pltpu.bitcast(high & jnp.int32(-65536), jnp.float32)
+                rope = jnp.where(lane < rope_dim + words_per_token, low, high)
+                last = jnp.where(lane < rope_dim, nope[-1], rope.astype(jnp.bfloat16))
+                kv = jnp.concatenate([*nope[:-1], last], axis=-1)
+                # NaN bytes can sit past the written rows; P @ V must not see them.
+                kv = jnp.where(b * tile + 4 * row + g < window, kv, 0)
+                kv_ref[b, pl.ds(g * quarter, quarter), :] = kv
+            return carry
+
+        lax.fori_loop(0, cdiv(window, tile), tile_body, 0)
+
+    def build_mask():
+        """Top-k slots -> mask_ref[b][t, slot] = 1 iff token t selected it."""
+        words = bitmap_ref.shape[0]
+        word = lax.broadcasted_iota(jnp.int32, (words, block_tokens), 0)
+
+        def select(k, bitmap):
+            slot = slots_ref[pl.ds(k, 1), :]
+            bit = lax.shift_left(jnp.int32(1), slot & 31)
+            hit = word == lax.shift_right_arithmetic(slot, 5)  # -1 matches no word
+            return bitmap | jnp.where(hit, bit, 0)
+
+        bitmap_ref[...] = lax.fori_loop(
+            0, topk, select, jnp.zeros((words, block_tokens), jnp.int32), unroll=8
+        )
+        tile_words = tile // 32
+        shift = lax.broadcasted_iota(jnp.int32, (tile, block_tokens), 0) & 31
+
+        def tile_body(b, carry):
+            w = bitmap_ref[pl.ds(b * tile_words, tile_words), :]
+            w = jnp.broadcast_to(w[:, None, :], (tile_words, 32, block_tokens))
+            bits = lax.shift_right_logical(w.reshape(tile, block_tokens), shift) & 1
+            mask_ref[b] = bits.T
+            return carry
+
+        lax.fori_loop(0, cdiv(window, tile), tile_body, 0)
+
+    def per_row(vec_of_token):  # [num_q_heads] per token -> [rows, 1]
+        return jnp.concatenate([vec_of_token(t)[..., None] for t in range(tq)], axis=0)
+
+    def lane_folds(x):  # [rows, k * 128] -> its k 128-lane slices
+        return [x[:, i : i + 128] for i in range(0, x.shape[1], 128)]
+
+    def attend():
+        num_step_tiles = cdiv(step_window_ref[step], tile)
+        q = q_ref[...].reshape(rows, head_dim)
+        # Row max and row sum are kept 128 lanes wide across tiles and
+        # reduced across lanes once.
+        m_ref[...] = jnp.full(m_ref.shape, jnp.finfo(jnp.float32).min)
+
+        def qk(tiles):
+            m = m_ref[...]
+            for b in tiles:
+                s = jnp.einsum(
+                    "nd,md->nm", q, kv_ref[b], preferred_element_type=jnp.float32
+                )
+                s *= sm_scale
+                mask = mask_ref[b, pl.ds(step_in_blk * tq, tq), :]
+                mask = jnp.broadcast_to(mask[:, None, :], (tq, num_q_heads, tile))
+                s = jnp.where(mask.reshape(rows, tile) != 0, s, jnp.finfo(s.dtype).min)
+                s_ref[b] = s
+                m = functools.reduce(jnp.maximum, lane_folds(s), m)
+            m_ref[...] = m
+
+        _grouped_loop(num_step_tiles, qk, DENSE_TILE_GROUP)
+
+        swa_m = per_row(lambda t: swa_m_ref[t, 0, :num_q_heads])
+        swa_l = per_row(lambda t: swa_l_ref[t, 0, :num_q_heads])
+        m_curr = jnp.maximum(swa_m, jnp.max(m_ref[...], axis=1, keepdims=True))
+        exp_m_diff = jnp.exp(swa_m - m_curr)
+        # m_ref now holds m_curr lane-wide, for the 128-lane folds of each tile.
+        m_ref[...] = jnp.broadcast_to(m_curr, m_ref.shape)
+        l_ref[...] = jnp.zeros(l_ref.shape, jnp.float32)
+        swa_acc = swa_acc_ref[...].reshape(rows, head_dim)
+        acc_ref[...] = exp_m_diff * swa_acc
+
+        def pv(tiles):
+            m = m_ref[...]
+            row_sum = l_ref[...]
+            pv_sum = None
+            for b in tiles:
+                s = s_ref[b]
+                p = jnp.concatenate([jnp.exp(x - m) for x in lane_folds(s)], axis=1)
+                row_sum = functools.reduce(jnp.add, lane_folds(p), row_sum)
+                pv = jnp.einsum(
+                    "nm,md->nd", p, kv_ref[b], preferred_element_type=jnp.float32
+                )
+                pv_sum = pv if pv_sum is None else pv_sum + pv
+            l_ref[...] = row_sum
+            acc_ref[...] += pv_sum
+
+        _grouped_loop(num_step_tiles, pv, DENSE_TILE_GROUP)
+
+        sinks = per_row(lambda t: attention_sinks_ref[...])
+        p_rowsum = jnp.sum(l_ref[...], axis=1, keepdims=True)
+        l_total = exp_m_diff * swa_l + p_rowsum + jnp.exp(sinks - m_curr)
+        out = (acc_ref[...] * pl.reciprocal(l_total, approx=True)).astype(o_ref.dtype)
+        token = step * tq + lax.broadcasted_iota(jnp.int32, o_ref.shape, 0)
+        o_ref[...] = jnp.where(
+            token < num_valid_ref[0], out.reshape(o_ref.shape), q_ref[...]
+        )
+
+    @pl.when(eligible & (step_in_blk == 0))
+    def _prepare():
+        fetch_window()
+        dequant_window()
+        build_mask()
+
+    @pl.when(eligible)
+    def _attend():
+        attend()
+
+    # No block is eligible: every step maps to block 0, so keep it unchanged.
+    @pl.when(jnp.logical_not(eligible) & (step_map_ref[step] == step))
+    def _keep():
+        o_ref[...] = q_ref[...]
+
+
+def _dense_window_attention(
+    q: jax.Array,  # [num_tokens, num_q_heads, head_dim]
+    cache_kv_nope: jax.Array,  # int32[total_num_pages, page_size, 128]
+    cache_kv_rope: jax.Array,  # int32[total_num_pages, page_size // 4, 128]
+    topk_indices: jax.Array,  # i32[num_tokens, topk], -1 past the valid tokens
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    seq_ids: jax.Array,  # i32[num_tokens], -1 past the valid tokens
+    attention_sinks: jax.Array,  # float32[num_q_heads]
+    swa_accumution: jax.Array,  # [num_tokens, num_q_heads, head_dim]
+    swa_l: jax.Array,  # float32[num_tokens, num_l_heads]
+    swa_m: jax.Array,  # float32[num_tokens, num_l_heads]
+    num_valid_tokens: jax.Array,  # i32
+    *,
+    max_num_seqs: int,
+    block_tokens: int,
+    sm_scale: float,
+    vmem_limit_bytes: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Runs the dense-window kernel on every eligible `block_tokens` block.
+
+    A block is eligible when its valid tokens all belong to one sequence and
+    select only rows below `DENSE_MAX_WINDOW`. Returns q with those blocks'
+    outputs written in place, and the per-block eligibility, so the caller
+    sends only the other blocks through the gather path.
+    """
+    num_tokens, num_q_heads, head_dim = q.shape
+    topk = topk_indices.shape[1]
+    page_size = cache_kv_nope.shape[1]
+    tq = DENSE_TOKENS_PER_STEP
+    assert tq % 8 == 0 and block_tokens % tq == 0, (tq, block_tokens)
+    assert DENSE_MAX_WINDOW % DENSE_KV_TILE == 0 and DENSE_KV_TILE % 128 == 0
+    num_blocks = num_tokens // block_tokens
+    steps_per_block = block_tokens // tq
+    num_steps = num_blocks * steps_per_block
+    max_pages = cdiv(DENSE_MAX_WINDOW, page_size)
+
+    token_window = jnp.max(topk_indices, axis=1) + 1  # 0 for no selection
+    blk_window = jnp.max(token_window.reshape(num_blocks, -1), axis=1)
+    blk_seqs = seq_ids.reshape(num_blocks, block_tokens)
+    seq_hi = jnp.max(blk_seqs, axis=1)
+    seq_lo = jnp.min(
+        jnp.where(blk_seqs < 0, jnp.iinfo(jnp.int32).max, blk_seqs), axis=1
+    )
+    eligible = (seq_hi >= 0) & (seq_lo == seq_hi) & (blk_window <= DENSE_MAX_WINDOW)
+
+    step_window = jnp.max(token_window.reshape(num_steps, tq), axis=1)
+    step_ids = jnp.arange(num_steps, dtype=jnp.int32)
+    step_eligible = jnp.repeat(eligible, steps_per_block)
+    # An ineligible step points its blocks at a neighbouring eligible step's,
+    # so the pipeline neither fetches nor writes back its tokens.
+    before = lax.cummax(jnp.where(step_eligible, step_ids, -1))
+    after = lax.cummin(jnp.where(step_eligible, step_ids, num_steps), reverse=True)
+    step_map = jnp.where(
+        step_eligible,
+        step_ids,
+        jnp.where(before >= 0, before, jnp.where(after < num_steps, after, 0)),
+    )
+
+    page_table = page_indices.reshape(max_num_seqs, -1)
+    if page_table.shape[1] < max_pages:
+        page_table = jnp.pad(page_table, ((0, 0), (0, max_pages - page_table.shape[1])))
+    blk_pages = page_table[jnp.clip(seq_hi, 0, max_num_seqs - 1), :max_pages]
+
+    slots = _dense_window_position(topk_indices).T  # [topk, num_tokens]
+    num_l_heads = swa_l.shape[1]
+    swa_l = swa_l.reshape(num_tokens, 1, num_l_heads)
+    swa_m = swa_m.reshape(num_tokens, 1, num_l_heads)
+
+    def token_block(blk, step_in_blk, blk_window, step_window, step_map, *_):
+        return (step_map[blk * steps_per_block + step_in_blk], 0, 0)
+
+    def slots_block(blk, step_in_blk, blk_window, step_window, step_map, *_):
+        return (0, step_map[blk * steps_per_block + step_in_blk] // steps_per_block)
+
+    tokens_spec = pl.BlockSpec((tq, num_q_heads, head_dim), token_block)
+    lse_spec = pl.BlockSpec((tq, 1, num_l_heads), token_block)
+    in_specs = [
+        pl.BlockSpec(memory_space=pltpu.VMEM),  # attention_sinks
+        tokens_spec,  # q
+        pl.BlockSpec((topk, block_tokens), slots_block),
+        pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_nope
+        pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_rope
+        tokens_spec,  # swa_accumution
+        lse_spec,  # swa_l
+        lse_spec,  # swa_m
+    ]
+    num_tiles = DENSE_MAX_WINDOW // DENSE_KV_TILE
+    rows = tq * num_q_heads
+    scratch_shapes = [
+        pltpu.VMEM((max_pages * page_size, 128), jnp.int32),
+        pltpu.VMEM((max_pages * page_size // 4, 128), jnp.int32),
+        pltpu.VMEM((num_tiles, DENSE_KV_TILE, head_dim), jnp.bfloat16),
+        pltpu.VMEM((DENSE_MAX_WINDOW // 32, block_tokens), jnp.int32),
+        pltpu.VMEM((num_tiles, block_tokens, DENSE_KV_TILE), jnp.int32),
+        pltpu.VMEM((num_tiles, rows, DENSE_KV_TILE), jnp.float32),
+        pltpu.VMEM((rows, head_dim), jnp.float32),
+        pltpu.VMEM((rows, 128), jnp.float32),
+        pltpu.VMEM((rows, 128), jnp.float32),
+        pltpu.SemaphoreType.DMA((2,)),
+    ]
+    scalar_prefetches = (
+        jnp.where(eligible, blk_window, -1).astype(jnp.int32),
+        step_window.astype(jnp.int32),
+        step_map,
+        blk_pages.reshape(-1),
+        jnp.reshape(num_valid_tokens, (1,)).astype(jnp.int32),
+    )
+    scope_name = f"SparseMLA-dense-w_{DENSE_MAX_WINDOW}-bt_{block_tokens}-tq_{tq}"
+    kernel = jax.named_scope(scope_name)(
+        pl.pallas_call(
+            functools.partial(_dense_window_kernel, sm_scale=sm_scale),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=len(scalar_prefetches),
+                in_specs=in_specs,
+                out_specs=tokens_spec,
+                grid=(num_blocks, steps_per_block),
+                scratch_shapes=scratch_shapes,
+            ),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary", "arbitrary"),
+                vmem_limit_bytes=vmem_limit_bytes,
+                disable_bounds_checks=True,
+            ),
+            out_shape=jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+            input_output_aliases={len(scalar_prefetches) + 1: 0},
+            name=scope_name,
+        )
+    )
+    q = kernel(
+        *scalar_prefetches,
+        attention_sinks,
+        q,
+        slots,
+        cache_kv_nope,
+        cache_kv_rope,
+        swa_accumution,
+        swa_l,
+        swa_m,
+    )
+    return q, eligible
+
+
 def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):
@@ -904,6 +1317,31 @@ def sparse_ragged_paged_attention(
     gather_indices = (page_ids * page_size + token_offset).reshape(-1)
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
 
+    dense_chunks = None
+    if (
+        gather_and_attention_chunk_size >= DENSE_MIN_CHUNK
+        and q.shape[0] % gather_and_attention_chunk_size == 0
+    ):
+        num_valid_tokens = cu_q_lens[distribution[2]]
+        valid = jnp.arange(q.shape[0]) < num_valid_tokens
+        q, dense_chunks = _dense_window_attention(
+            q,
+            cache_kv_nope,
+            cache_kv_rope,
+            jnp.where(valid[:, None], topk_indices, -1),
+            page_indices,
+            jnp.where(valid, seq_ids_segment, -1),
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            num_valid_tokens,
+            max_num_seqs=max_num_seqs,
+            block_tokens=gather_and_attention_chunk_size,
+            sm_scale=sm_scale,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
@@ -930,6 +1368,9 @@ def sparse_ragged_paged_attention(
             )
             * kernel_batch_size
         )
+        if dense_chunks is not None:
+            # The dense-window kernel already answered this chunk: gather nothing.
+            batch_end = jnp.where(dense_chunks[i], start_pos, batch_end)
         num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
 
         # For prefilling of short sequences (or early in the sequence), there are
