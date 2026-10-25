@@ -469,7 +469,37 @@ def _pack_single_module_step_inputs(
 
     hid_pad = jnp.pad(hidden[:B], ((0, M - B), (0, 0)))
     hid_mk = jnp.tile(hid_pad[None, :, :], (R, 1, 1)).reshape(R * M, g.H)
-    weights_mk = mk.pack_logical_weights(spec, ex, logical_weights, g=g)
+
+    class _SingleModuleDef(mk.ModelDef):
+        schedule = mk.Schedule(
+            mixer=GQAModule.bind("self_attn"),
+            ffn=MoEModule.bind("mlp"),
+            pre_norm=(
+                Norm.bind(
+                    "input_layernorm",
+                    zero_centered=g.zero_centered_norm,
+                    small_field="in_norm",
+                )
+                if "in_norm" in p.smalls_layout
+                else None
+            ),
+            post_norm=(
+                Norm.bind(
+                    "post_attention_layernorm",
+                    zero_centered=g.zero_centered_norm,
+                    small_field="post_norm",
+                )
+                if "post_norm" in p.smalls_layout
+                else None
+            ),
+        )
+        final_norm = Norm.bind("model.norm", zero_centered=g.zero_centered_norm)
+
+        @classmethod
+        def to_model_spec(cls, hf_config_or_geom: Any = None, **kw: Any) -> ModelSpec:
+            return spec
+
+    weights_mk = mk.pack_logical_weights(_SingleModuleDef, ex, logical_weights, g=g)
 
     states_mk: dict[str, Any] = {}
     for s_name in p.s_names:

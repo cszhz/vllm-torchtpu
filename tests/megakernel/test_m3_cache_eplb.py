@@ -1248,8 +1248,8 @@ def test_unstacked_expert_weights_equivalence(T: int, B: int):
     # T=2 re-checks the T=1 EPLB path (EPLB is also pinned by the golden harness).
     [(1, 2), pytest.param(2, 4, marks=pytest.mark.slow)],
 )
-def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
-    """Verify `split_hf_weights` (R=1 vs R=2), `encode_ecopy`, EPLB, and TP MoE."""
+def test_eplb_ecopy_stack_e_and_load_logical_weights(T: int, B: int):
+    """Verify `load_logical_weights` (R=1 vs R=2), `encode_ecopy`, EPLB, and TP MoE."""
     # Verify encode_ecopy warns when an expert has > 1 secondary replicas
     with pytest.warns(UserWarning, match="multiple secondary replicas"):
         mk.encode_ecopy(
@@ -1328,13 +1328,13 @@ def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
         "e13_s",
     )
     hf_unfused = {k: v for k, v in hf_w.items() if k not in fused_keys}
-    w_ep_l = qwen35.split_hf_weights(hf_unfused, g_ep, ex_base)
-    w_eplb_l = qwen35.split_hf_weights(hf_unfused, g_eplb, ex_base)
-    w_tp_l = qwen35.split_hf_weights(hf_unfused, g_tp, ex_base)
+    w_ep_l = mk.load_logical_weights(qwen35.Qwen35, ex_base, hf_unfused, g=g_ep)
+    w_eplb_l = mk.load_logical_weights(qwen35.Qwen35, ex_base, hf_unfused, g=g_eplb)
+    w_tp_l = mk.load_logical_weights(qwen35.Qwen35, ex_base, hf_unfused, g=g_tp)
     assert "ecopy" in w_eplb_l
     assert jnp.any(w_eplb_l["ecopy"] > 0)
 
-    # Unsharded R=1 forward pass comparison for split_hf_weights
+    # Unsharded R=1 forward pass comparison for load_logical_weights
     g_r1 = replace(g_ep, NKV=1)
     ex_r1 = replace(ex_base, R=1)
     hf_r1 = dict(
@@ -1345,7 +1345,7 @@ def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
         v_proj_s=hf_unfused["v_proj_s"][:, :1],
         kn=hf_unfused["kn"][:, :1],
     )
-    w_r1_l = qwen35.split_hf_weights(hf_r1, g_r1, ex_r1)
+    w_r1_l = mk.load_logical_weights(qwen35.Qwen35, ex_r1, hf_r1, g=g_r1)
     qk = (g_ep.KH // ex_base.R) * g_ep.KD
     st_r1 = {
         "kc": st_l["kc"][:1],
@@ -1454,7 +1454,9 @@ def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
         # route_vec=True vs route_vec=False (ecopy_opt=0 and ecopy_opt=1)
         hf_rand = qwen35.random_hf_weights(jax.random.key(299), g_ep)
         hf_rand_unfused = {k: v for k, v in hf_rand.items() if k not in fused_keys}
-        w_eplb_rand = qwen35.split_hf_weights(hf_rand_unfused, g_eplb, ex_base)
+        w_eplb_rand = mk.load_logical_weights(
+            qwen35.Qwen35, ex_base, hf_rand_unfused, g=g_eplb
+        )
         out_rand_opt0 = run_cfg(g_eplb, ex_opt0, w_eplb_rand)
         out_rand_opt1 = run_cfg(g_eplb, ex_po2c, w_eplb_rand)
         out_rand_vec = run_cfg(g_eplb, ex_vec, w_eplb_rand)

@@ -22,13 +22,13 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from .. import kernel, planner
+from .. import kernel
 from ..exec_spec import ExecSpec
 from ..modules.gdn import GDNModule
 from ..ops import BF16, F32, FP8, I32, rup
 from ..pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
+from ..weights import default_eplb_cores, encode_eplb_ecopy, pack_logical_weights
 from . import qwen35_pool
-from .qwen35_weights import default_eplb_cores, encode_eplb_ecopy
 
 
 def accept_states(g: Any, ex: ExecSpec, st: dict[str, Any], acc: Any) -> dict[str, Any]:
@@ -174,120 +174,12 @@ def pack_inputs(
     build_default_pool: bool = False,
 ) -> tuple[jax.Array, jax.Array, dict[str, Any], dict[str, Any]]:
     """Pack logical model weights and states into the tiled/folded megakernel layout."""
-    ms = g.to_model_spec()
-    p = planner.plan(ms, ex)
     R, B, T, NS, M = ex.R, ex.B, ex.T, ex.NS, ex.M
-    L, ngdn = g.L, g.NGDN
+    ngdn = g.NGDN
 
     hid_pad = jnp.pad(hidden[:B], ((0, M - B), (0, 0)))
     hid_mk = jnp.tile(hid_pad[None, :, :], (R, 1, 1)).reshape(R * M, g.H)
-
-    def tile_w(arr: jax.Array, kind: str) -> jax.Array:
-        *lead, k_in, n_in = arr.shape
-        nt_, tk_ = p.nt[kind], p.tk[kind]
-        exp_n = p.kinds[kind][1]
-        assert nt_ * tk_ == k_in, (kind, k_in, nt_, tk_)
-        assert n_in == exp_n, (kind, n_in, exp_n)
-        return arr.reshape((*lead, nt_, tk_, n_in))
-
-    # Pack smalls [R, L, 1, S]
-    lay = p.smalls_layout
-    S = p.smalls_width
-    sm = jnp.zeros((R, L, 1, S), dtype=F32)
-
-    def set_sm_all(name: str, val: jax.Array):
-        nonlocal sm
-        if name not in lay:
-            return
-        o, w = lay[name]
-        if val.ndim == 2:
-            val = jnp.broadcast_to(val[None, :, :], (R, L, val.shape[-1]))
-        assert val.shape[-1] <= w, (name, val.shape[-1], w)
-        vw = min(w, val.shape[-1])
-        sm = sm.at[:, :, 0, o : o + vw].set(val[:, :, :vw].astype(F32))
-
-    def set_sm_layer(lyr: int, name: str, val_l: jax.Array):
-        nonlocal sm
-        if name not in lay:
-            return
-        o, w = lay[name]
-        if val_l.ndim == 1:
-            val_l = jnp.broadcast_to(val_l[None, :], (R, val_l.shape[-1]))
-        assert val_l.shape[-1] <= w, (name, val_l.shape[-1], w)
-        vw = min(w, val_l.shape[-1])
-        sm = sm.at[:, lyr, 0, o : o + vw].set(val_l[:, :vw].astype(F32))
-
-    def branch_slice(arr: jax.Array, lyr: int, ord_idx: int) -> jax.Array:
-        return arr[:, lyr] if arr.shape[1] == L else arr[:, ord_idx]
-
-    for k in ("in_norm", "post_norm", "sh_gate", "sh13_s", "sh2_s"):
-        set_sm_all(k, logical_weights[k])
-    if "ecopy" in logical_weights:
-        set_sm_all("ecopy", logical_weights["ecopy"])
-    elif "e_cores" in logical_weights:
-        set_sm_all("ecopy", encode_eplb_ecopy(g, R, logical_weights["e_cores"]))
-
-    for lyr in range(L):
-        if (lyr + 1) % g.att_every == 0:
-            a = lyr // g.att_every
-            set_sm_layer(lyr, "in_s", branch_slice(logical_weights["att_in_s"], lyr, a))
-            set_sm_layer(
-                lyr, "out_s", branch_slice(logical_weights["att_out_s"], lyr, a)
-            )
-            set_sm_layer(lyr, "qn", branch_slice(logical_weights["qn"], lyr, a))
-            set_sm_layer(lyr, "kn", branch_slice(logical_weights["kn"], lyr, a))
-        else:
-            o_gdn = lyr - (lyr + 1) // g.att_every
-            set_sm_layer(
-                lyr, "in_s", branch_slice(logical_weights["lin_in_s"], lyr, o_gdn)
-            )
-            set_sm_layer(
-                lyr, "out_s", branch_slice(logical_weights["lin_out_s"], lyr, o_gdn)
-            )
-            for k in ("conv", "alog", "dtb", "gnorm"):
-                set_sm_layer(lyr, k, branch_slice(logical_weights[k], lyr, o_gdn))
-
-    router_rep = jnp.broadcast_to(
-        logical_weights["router"][None, ...], (R, L, g.H, g.E)
-    )
-
-    def _pack_expert(raw_e: Any, kind: str) -> Any:
-        if ex.stack_e:
-            if isinstance(raw_e, (tuple, list)):
-                raw_e = jnp.stack(raw_e, axis=1)
-            return tile_w(raw_e, kind)
-        if isinstance(raw_e, (tuple, list)):
-            return tuple(tile_w(raw_e[lyr], kind) for lyr in range(L))
-        return tuple(tile_w(raw_e[:, lyr], kind) for lyr in range(L))
-
-    e13_mk = _pack_expert(logical_weights["e13"], "e13")
-    e2_mk = _pack_expert(logical_weights["e2"], "e2")
-
-    es_mk = jnp.concatenate(
-        [logical_weights["e13_s"], logical_weights["e2_s"]], axis=-1
-    )[:, :, :, None, :].astype(F32)
-    fn_mk = jnp.broadcast_to(
-        logical_weights["final_norm"][None, None, :], (R, 1, g.H)
-    ).astype(F32)
-
-    weights_mk: dict[str, Any] = {}
-    if ngdn > 0:
-        weights_mk["lin_in"] = tile_w(logical_weights["lin_in"], "lin_in")
-        weights_mk["lin_out"] = tile_w(logical_weights["lin_out"], "lin_out")
-    weights_mk.update(
-        {
-            "att_in": tile_w(logical_weights["att_in"], "att_in"),
-            "att_out": tile_w(logical_weights["att_out"], "att_out"),
-            "router": tile_w(router_rep, "router"),
-            "sh13": tile_w(logical_weights["sh13"], "sh13"),
-            "sh2": tile_w(logical_weights["sh2"], "sh2"),
-            "e13": e13_mk,
-            "e2": e2_mk,
-            "es": es_mk,
-            "smalls": sm,
-            "final_norm": fn_mk,
-        }
-    )
+    weights_mk = pack_logical_weights(g._model_def, ex, logical_weights, g=g)
 
     states_mk: dict[str, Any] = {}
     if ngdn > 0 and "conv" in logical_states and "rec" in logical_states:

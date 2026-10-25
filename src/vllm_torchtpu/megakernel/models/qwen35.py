@@ -34,12 +34,7 @@ from .qwen35_pack import (
     random_logical_inputs,
 )
 from .qwen35_profile import DEFAULT_HF_CONFIG, PROFILE, QWEN35_MODEL_NAME
-from .qwen35_weights import (
-    default_eplb_cores,
-    encode_eplb_ecopy,
-    random_hf_weights,
-    split_hf_weights,
-)
+from .qwen35_weights import random_hf_weights
 
 _REEXPORTS = (
     GDNModule,
@@ -50,10 +45,7 @@ _REEXPORTS = (
     pack_inputs,
     random_inputs,
     random_logical_inputs,
-    default_eplb_cores,
-    encode_eplb_ecopy,
     random_hf_weights,
-    split_hf_weights,
 )
 
 
@@ -137,6 +129,7 @@ class Qwen35(ModelDef):
     }
 
 
+Qwen35Geometry._model_def = Qwen35
 MKConfig = Qwen35Geometry
 FULL = Qwen35.derive_geometry(DEFAULT_HF_CONFIG, moe_tp=True)
 FULL_EP = dataclasses.replace(FULL, moe_tp=False)

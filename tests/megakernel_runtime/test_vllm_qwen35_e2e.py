@@ -35,6 +35,7 @@ import torch  # noqa: E402
 from jax.sharding import Mesh, NamedSharding  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
+import vllm_torchtpu.megakernel as mk  # noqa: E402
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod  # noqa: E402
 from tests.megakernel_runtime.test_weight_collector import (  # noqa: E402
     _jax_to_torch,
@@ -200,10 +201,16 @@ def _make_backbone_from_logical_weights(
             s_qkvz = s_lin_full[:qkvz_dim].contiguous()
             w_b = w_lin_full[:, gdn_lay.BA : gdn_lay.BA + gdn_lay.vh]
             w_a = w_lin_full[:, gdn_lay.A_OFF : gdn_lay.A_OFF + gdn_lay.vh]
-            w_ba = torch.cat([w_b, w_a], dim=1).contiguous()
             s_b = s_lin_full[gdn_lay.BA : gdn_lay.BA + gdn_lay.vh]
             s_a = s_lin_full[gdn_lay.A_OFF : gdn_lay.A_OFF + gdn_lay.vh]
-            s_ba = torch.cat([s_b, s_a], dim=0).contiguous()
+            if "_ba_bf16" in w_logical:
+                w_ba = _jax_to_torch(w_logical["_ba_bf16"][tp_rank, o_gdn]).contiguous()
+            else:
+                w_ba_kn = torch.cat(
+                    [w_b.float() * s_b.unsqueeze(0), w_a.float() * s_a.unsqueeze(0)],
+                    dim=1,
+                ).to(torch.bfloat16)
+                w_ba = w_ba_kn.transpose(0, 1).contiguous()
 
             in_proj_qkvz = SimpleNamespace(
                 weight=torch.nn.Parameter(w_qkvz, requires_grad=False),
@@ -212,9 +219,7 @@ def _make_backbone_from_logical_weights(
             setattr(in_proj_qkvz, WEIGHT_FLIPPED_ATTR, True)
             in_proj_ba = SimpleNamespace(
                 weight=torch.nn.Parameter(w_ba, requires_grad=False),
-                weight_scale=torch.nn.Parameter(s_ba, requires_grad=False),
             )
-            setattr(in_proj_ba, WEIGHT_FLIPPED_ATTR, True)
             out_proj = SimpleNamespace(
                 weight=torch.nn.Parameter(
                     _jax_to_torch(w_logical["lin_out"][tp_rank, o_gdn]),
@@ -1325,8 +1330,22 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     # Generate independent logical weights and packed MK reference weights via pure-JAX
     # `qwen35` helpers, then construct the PyTorch backbone from `w_logical`.
     torch.manual_seed(42)
-    hf = qwen35.random_hf_weights(jax.random.key(42), g)
-    w_logical = qwen35.split_hf_weights(hf, g, ex_base)
+    hf = dict(qwen35.random_hf_weights(jax.random.key(42), g))
+    jax_ops = mk.JaxArrayOps()
+    b_bf16 = (
+        jax.random.normal(jax.random.key(43), (g.NGDN, g.H, g.VH), dtype=jnp.bfloat16)
+        * 0.05
+    )
+    a_bf16 = (
+        jax.random.normal(jax.random.key(44), (g.NGDN, g.H, g.VH), dtype=jnp.bfloat16)
+        * 0.05
+    )
+    hf["lin_b"], hf["lin_b_s"] = jax.vmap(jax_ops.quantize_fp8)(b_bf16)
+    hf["lin_a"], hf["lin_a_s"] = jax.vmap(jax_ops.quantize_fp8)(a_bf16)
+    w_logical = mk.load_logical_weights(qwen35.Qwen35, ex_base, hf, g=g)
+    w_logical["_ba_bf16"] = jnp.swapaxes(
+        jnp.concatenate([b_bf16, a_bf16], axis=-1), -1, -2
+    )[None, ...]
     pos_init, hid_l_init, _, st_l = qwen35.random_logical_inputs(
         jax.random.key(77), g, ex_base
     )

@@ -1792,7 +1792,7 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
     # Part 3: EPLB (e_slots=72, ecopy_opt=0 & ecopy_opt=1 Po2C) at (1, 16), (4, 16)
     # -----------------------------------------------------------------------
     g_eplb = dataclasses.replace(g, e_slots=72)
-    ecopy_host = qwen35.encode_eplb_ecopy(g_eplb, 8)
+    ecopy_host = mk.encode_eplb_ecopy(g_eplb, 8)
     p_base = planner.plan(qwen35.qwen35_spec(g), ExecSpec(B=16, T=1, R=8, ctx=4096))
     p_eplb = planner.plan(
         qwen35.qwen35_spec(g_eplb), ExecSpec(B=16, T=1, R=8, ctx=4096)
