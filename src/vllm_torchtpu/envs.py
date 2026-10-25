@@ -177,6 +177,7 @@ if TYPE_CHECKING:
     TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
     TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4: int = 0
     TPU_DSV4_SEQ_PARALLEL: bool = False
+    TPU_NUM_GPU_BLOCKS_OVERRIDE: int = 0
     TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: int = 0
     TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE: int = 0
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = True
@@ -1231,6 +1232,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # input and reduce-scatters its output (instead of one all-reduce), and the
     # fused EP needs no restore all-gather or shared reduce-scatter.
     "TPU_DSV4_SEQ_PARALLEL": env_bool("TPU_DSV4_SEQ_PARALLEL"),
+    # Pin the KV pool to exactly this many blocks per engine, as
+    # --num-gpu-blocks-override does, for launchers whose server command fixes
+    # --gpu-memory-utilization (a served-config invariant: resident-weight
+    # changes must not resize the pool). Ignored when the CLI flag is set.
+    # 0 = off (pool sized from --gpu-memory-utilization).
+    "TPU_NUM_GPU_BLOCKS_OVERRIDE": env_int("TPU_NUM_GPU_BLOCKS_OVERRIDE", 0),
     # Per-bucket gate on TPU_DSV4_SEQ_PARALLEL: steps of T <= this many tokens
     # (a power of 2) run the replicated layout -- one TP all-reduce after
     # attention, the TP-sharded shared expert, the fused EP's TP-replica op --
