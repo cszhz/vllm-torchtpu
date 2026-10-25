@@ -254,6 +254,14 @@ _ARCH_REGISTRY: dict[str, type[ModelDef]] = {}
 _MODEL_TYPE_REGISTRY: dict[str, type[ModelDef]] = {}
 
 
+def _hf_geom_sig(cfg: Any) -> tuple[Any, Any] | None:
+    root = _sub_cfg(cfg, "text_config") or cfg
+    if root is None:
+        return None
+    sig = (_sub_cfg(root, "num_hidden_layers"), _sub_cfg(root, "hidden_size"))
+    return sig if sig != (None, None) else None
+
+
 def register_model(
     *,
     name: str,
@@ -284,11 +292,18 @@ def register_model(
         ):
             for k in keys:
                 prev = reg.get(k)
+                sig_new = _hf_geom_sig(getattr(cls, "default_hf_config", None))
+                sig_prev = (
+                    _hf_geom_sig(getattr(prev, "default_hf_config", None))
+                    if prev
+                    else None
+                )
                 if (
                     prev is not None
                     and prev is not cls
                     and prev.name != name
                     and not replace
+                    and (sig_new is None or sig_prev is None or sig_new == sig_prev)
                 ):
                     raise MegakernelConfigError(
                         f"{kind} {k!r} is already registered to {prev.name!r}"
@@ -307,9 +322,9 @@ def register_model(
             register_profile(prof, replace=replace)
         _MODEL_REGISTRY[name] = cls
         for a in archs:
-            _ARCH_REGISTRY[a] = cls
+            _ARCH_REGISTRY.setdefault(a, cls)
         for mt in mtypes:
-            _MODEL_TYPE_REGISTRY[mt] = cls
+            _MODEL_TYPE_REGISTRY.setdefault(mt, cls)
         return cls
 
     return _decorator
@@ -339,6 +354,14 @@ def find_model(target: Any) -> type[ModelDef] | None:
         for root in (target, _sub_cfg(target, "text_config")):
             if root is not None and (mt := _sub_cfg(root, "model_type")):
                 cands.append(str(mt))
+        if (sig := _hf_geom_sig(target)) is not None and cands:
+            for m in _MODEL_REGISTRY.values():
+                keys = (*m.hf_architectures, *m.hf_model_type)
+                if (
+                    any(c in keys for c in cands)
+                    and _hf_geom_sig(m.default_hf_config) == sig
+                ):
+                    return m
         for cand in cands:
             if (found := find_model(cand)) is not None:
                 return found

@@ -1,0 +1,485 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Qwen3.8-shaped (`KH=16 < R=32`, `IS=2048 < 128*R`) hybrid composition at 32 ranks."""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+import subprocess
+import sys
+import time
+
+import jax
+import jax.numpy as jnp
+import pytest
+import torch
+from jax.sharding import Mesh
+
+from vllm_torchtpu.megakernel import kernel, planner
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.model_def import find_model, get_model
+from vllm_torchtpu.megakernel.models import (
+    qwen35,
+    qwen35_profile,
+    qwen38,
+    qwen38_profile,
+)
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
+from vllm_torchtpu.megakernel.ops import F32, I32
+from vllm_torchtpu.megakernel_runtime import weight_collector
+
+R = 32
+TOL = 3e-2
+CTX = 2048
+POS0 = 1800
+_DEVICE_COUNT_FLAG = "--xla_force_host_platform_device_count"
+_CHILD_TIMEOUT_S = 540
+
+QWEN38_FULL_HF_CONFIG = {
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "model_type": "qwen3_5_moe",
+    "text_config": {
+        "model_type": "qwen3_5_moe_text",
+        "hidden_size": 8192,
+        "num_hidden_layers": 92,
+        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 23,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "partial_rotary_factor": 0.25,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 128,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 512,
+        "num_experts_per_tok": 10,
+        "moe_intermediate_size": 2048,
+        "shared_expert_intermediate_size": 2048,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 248320,
+        "rope_parameters": {
+            "rope_theta": 10_000_000.0,
+            "partial_rotary_factor": 0.25,
+        },
+    },
+}
+
+
+def _tiny_qwen38_geometry() -> qwen35.Qwen35Geometry:
+    """Tiny Qwen3.8-shaped geometry (`KH=16 < R=32`, `IS=2048 < 128*R`) at R=32."""
+    return qwen35.Qwen35Geometry(
+        L=4,
+        att_every=4,
+        H=1024,
+        NH=32,
+        NKV=4,
+        HD=128,
+        ROT=32,
+        KH=16,
+        VH=32,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=128,
+        IS=2048,
+        moe_tp=False,
+    )
+
+
+def _tiny_qwen38_r8_geometry() -> qwen35.Qwen35Geometry:
+    """8-rank geometry with identical replication factors (`kh_rep=2`, `sh_rep=2`)."""
+    return qwen35.Qwen35Geometry(
+        L=4,
+        att_every=4,
+        H=1024,
+        NH=8,
+        NKV=2,
+        HD=128,
+        ROT=32,
+        KH=4,
+        VH=8,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=128,
+        IS=512,
+        moe_tp=False,
+    )
+
+
+def _rms(x) -> float:
+    return float(jnp.sqrt(jnp.mean(jnp.square(x.astype(F32)))))
+
+
+def _report(name: str, got, exp) -> None:
+    err = jnp.abs(got.astype(F32) - exp.astype(F32))
+    print(
+        f"{name}: max_err={float(err.max()):.3e} rms_err={_rms(err):.3e} "
+        f"rms_ref={_rms(exp):.3e}"
+    )
+
+
+def _check(name: str, got, exp, controls) -> None:
+    _report(name, got, exp)
+    assert jnp.allclose(got, exp, atol=TOL, rtol=TOL), name
+    for label, bad in controls:
+        _report(f"{name} vs {label}", bad, exp)
+        assert not jnp.allclose(bad, exp, atol=TOL, rtol=TOL), f"{name}: {label}"
+
+
+def _swap(x, a: int, b: int):
+    return x.at[a].set(x[b]).at[b].set(x[a])
+
+
+def test_qwen38_full_geometry_and_shared_expert_replication_at_r32():
+    """Verify full Qwen3.8 geometry (`L=92, H=8192, KH=16, IS=2048`) plans at `R=32`."""
+    assert find_model(QWEN38_FULL_HF_CONFIG) is qwen38.Qwen38
+    assert find_model(qwen38_profile.DEFAULT_HF_CONFIG) is qwen38.Qwen38
+    assert find_model(qwen35_profile.DEFAULT_HF_CONFIG) is qwen35.Qwen35
+    assert get_model("qwen3_8") is qwen38.Qwen38
+    assert qwen38.Qwen38.default_profile().name == "qwen38-baseline"
+    assert qwen38.Qwen38.get_profile("tp32-dcp8").name == "qwen38-tp32-dcp8"
+
+    g = qwen38.Qwen38.geometry(QWEN38_FULL_HF_CONFIG, moe_tp=False)
+    ex = ExecSpec(B=4, T=1, R=R, ctx=CTX)
+    g.check(ex)
+    assert g.kh_rep(R) == 2
+    assert g.kh(R) == 1
+    assert g.vh(R) == 4
+    assert g.sh_rep(R) == 2
+    assert g.ISR(R) == 128
+    assert g.ER(R) == 16
+
+    ms = g.to_model_spec(R=R)
+    assert ms.name == "qwen3_8"
+    assert ms.layer_type.name == "qwen38_layer"
+    p = planner.plan(ms, ex, fit_vmem=False)
+    assert p.module_params["gdn"].kh == 1
+    assert p.module_params["gdn"].vh == 4
+    assert p.module_params["moe"].ISR == 128
+    assert p.module_params["moe"].sh_rep == 2
+    assert ms.cache_backend is not None
+    play = ms.cache_backend.layout
+    assert play.kh_per_rank(R) == 1
+    assert play.vh_per_rank(R) == 4
+    assert play.qkv_per_rank(R) == 768
+    assert play.rec_pages_per_slot == 4
+    play.validate(ex)
+
+    # Verify pack_router_and_shared_layer slices by sh_rank = tp_rank // 2.
+    class _FakeMLP:
+        pass
+
+    mlp = _FakeMLP()
+    g_tiny = _tiny_qwen38_geometry()
+    ex_tiny = ExecSpec(B=2, T=1, R=R, ctx=CTX)
+    p_tiny = planner.plan(g_tiny.to_model_spec(), ex_tiny, fit_vmem=False)
+    torch.manual_seed(0)
+    mlp._fused_gate_gu_fp8_weight = torch.nn.Parameter(
+        torch.randn(g_tiny.H, g_tiny.E + 2 * g_tiny.IS).to(torch.float8_e4m3fn),
+        requires_grad=False,
+    )
+    mlp._fused_gate_gu_fp8_scale = torch.nn.Parameter(
+        torch.rand(g_tiny.E + 2 * g_tiny.IS, dtype=torch.float32) * 0.02 + 0.01,
+        requires_grad=False,
+    )
+    mlp._fused_se_down_fp8_weight = torch.nn.Parameter(
+        torch.randn(g_tiny.IS, g_tiny.H).to(torch.float8_e4m3fn),
+        requires_grad=False,
+    )
+    mlp._fused_se_down_fp8_scale = torch.nn.Parameter(
+        torch.rand(g_tiny.H, dtype=torch.float32) * 0.02 + 0.01,
+        requires_grad=False,
+    )
+    mlp._fused_se_gate_weight = torch.nn.Parameter(
+        torch.randn(g_tiny.H, dtype=torch.float32),
+        requires_grad=False,
+    )
+    rs0 = weight_collector.pack_router_and_shared_layer(
+        mlp,
+        g_tiny,
+        ex_tiny,
+        tp_rank=0,
+        tk_router=p_tiny.tk["router"],
+        tk_sh13=p_tiny.tk["sh13"],
+        tk_sh2=p_tiny.tk["sh2"],
+    )
+    rs1 = weight_collector.pack_router_and_shared_layer(
+        mlp,
+        g_tiny,
+        ex_tiny,
+        tp_rank=1,
+        tk_router=p_tiny.tk["router"],
+        tk_sh13=p_tiny.tk["sh13"],
+        tk_sh2=p_tiny.tk["sh2"],
+    )
+    rs2 = weight_collector.pack_router_and_shared_layer(
+        mlp,
+        g_tiny,
+        ex_tiny,
+        tp_rank=2,
+        tk_router=p_tiny.tk["router"],
+        tk_sh13=p_tiny.tk["sh13"],
+        tk_sh2=p_tiny.tk["sh2"],
+    )
+    assert torch.equal(rs0["sh13"].view(torch.uint8), rs1["sh13"].view(torch.uint8))
+    assert torch.equal(rs0["sh2"].view(torch.uint8), rs1["sh2"].view(torch.uint8))
+    assert not torch.equal(rs0["sh13"].view(torch.uint8), rs2["sh13"].view(torch.uint8))
+
+    # Also verify 32-rank weight splitting, packing, and reference step on tiny Qwen3.8.
+    k_in, k_w = jax.random.split(jax.random.PRNGKey(3800))
+    _, hid_l, _, st_l = qwen35.random_logical_inputs(k_in, g_tiny, ex_tiny)
+    w_l = qwen35.split_hf_weights(
+        qwen35.random_hf_weights(k_w, g_tiny), g_tiny, ex_tiny
+    )
+    pos = POS0 + jnp.arange(ex_tiny.NS, dtype=I32)
+    qk_cols = 2 * g_tiny.kh(R) * g_tiny.KD
+    assert jnp.array_equal(
+        w_l["lin_in"][0, :, :, :qk_cols], w_l["lin_in"][1, :, :, :qk_cols]
+    )
+    assert not jnp.array_equal(
+        w_l["lin_in"][0, :, :, :qk_cols], w_l["lin_in"][2, :, :, :qk_cols]
+    )
+    assert jnp.array_equal(w_l["sh13"][0], w_l["sh13"][1])
+    assert not jnp.array_equal(w_l["sh13"][0], w_l["sh13"][2])
+    ref_hid, ref_st = qwen35.reference_step(g_tiny, ex_tiny, pos, hid_l, w_l, st_l)
+    _, _, w_mk, _ = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g_tiny, ex_tiny, mesh=None
+    )
+    assert jnp.array_equal(w_mk["sh13"][0], w_mk["sh13"][1])
+    assert not jnp.array_equal(w_mk["sh13"][0], w_mk["sh13"][2])
+    conv_swap_01_qk = (
+        ref_st["conv"]
+        .at[:, :, :, :qk_cols]
+        .set(_swap(ref_st["conv"][:, :, :, :qk_cols], 0, 1))
+    )
+    assert jnp.array_equal(
+        conv_swap_01_qk[:, :, : 3 * ex_tiny.B, :qk_cols],
+        ref_st["conv"][:, :, : 3 * ex_tiny.B, :qk_cols],
+    )
+    assert not jnp.allclose(
+        _swap(ref_st["conv"], 0, 2), ref_st["conv"], atol=TOL, rtol=TOL
+    )
+    assert not jnp.allclose(hid_l, ref_hid, atol=TOL, rtol=TOL)
+
+
+def test_qwen38_sub_rank_replication_step_in_process():
+    """Run `make_step` on 8 CPU devices with `kh_rep=2` and `sh_rep=2`."""
+    r8 = 8
+    devs = jax.devices("cpu")
+    assert len(devs) >= r8, f"Requires {r8} CPU devices, found {len(devs)}"
+    g = _tiny_qwen38_r8_geometry()
+    assert g.kh_rep(r8) == 2 and g.sh_rep(r8) == 2
+    tiles = dataclasses.replace(
+        TINY_TILES, bank=256 << 10, hier=3, mb8=2, inplace=False
+    ).with_modules({"gqa": {"split": True}})
+    ex = ExecSpec(B=2, T=1, R=r8, ctx=1024, tiles=tiles, interpret=True)
+
+    k_in, k_w = jax.random.split(jax.random.PRNGKey(3808))
+    _, hid_l, _, st_l = qwen35.random_logical_inputs(k_in, g, ex)
+    w_l = qwen35.split_hf_weights(qwen35.random_hf_weights(k_w, g), g, ex)
+    pos = 900 + jnp.arange(ex.NS, dtype=I32)
+    ref_hid, ref_st = qwen35.reference_step(g, ex, pos, hid_l, w_l, st_l)
+
+    mesh = Mesh(devs[:r8], ("tp",))
+    pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh
+    )
+    step, _ = qwen35.make_step(mesh, g, ex, donate_states=True)
+    st_in = {
+        k: jax.device_get(kernel.unfold(st_mk[k], r8))
+        for k in ("conv", "rec", "kc", "vc")
+    }
+    out_hid, out_st = step(pos_mk, hid_mk, w_mk, st_mk)
+
+    hid_r = kernel.unfold(out_hid, r8)[:, : ex.B]
+    for r in range(1, r8):
+        assert jnp.array_equal(hid_r[r], hid_r[0]), f"hidden differs on rank {r}"
+    _check("hidden", hid_r[0], ref_hid, [("input hidden", hid_l)])
+
+    qk_cols = 2 * g.kh(r8) * g.KD
+    conv_got = kernel.unfold(out_st["conv"], r8)
+    conv_swap_01_qk = conv_got.at[:, :, :, :qk_cols].set(
+        _swap(conv_got[:, :, :, :qk_cols], 0, 1)
+    )
+    assert jnp.array_equal(
+        conv_swap_01_qk[:, :, : 3 * ex.B, :qk_cols],
+        conv_got[:, :, : 3 * ex.B, :qk_cols],
+    )
+    _check(
+        "conv",
+        conv_got,
+        ref_st["conv"],
+        [
+            ("ranks 0 and 2 swapped", _swap(conv_got, 0, 2)),
+            ("input state", st_in["conv"]),
+        ],
+    )
+    for k, a, b in (("rec", 0, 1), ("kc", 0, 4), ("vc", 0, 4)):
+        got = kernel.unfold(out_st[k], r8)
+        _check(
+            k,
+            got,
+            ref_st[k],
+            [
+                (f"ranks {a} and {b} swapped", _swap(got, a, b)),
+                ("input state", st_in[k]),
+            ],
+        )
+
+
+def _step_qwen38_32_ranks_in_process() -> None:
+    devs = jax.devices("cpu")
+    assert len(devs) >= R, f"Requires {R} CPU devices, found {len(devs)}"
+    g = _tiny_qwen38_geometry()
+    tiles = dataclasses.replace(
+        TINY_TILES, bank=256 << 10, hier=3, mb8=2, inplace=False
+    ).with_modules({"gqa": {"split": True}})
+    ex = ExecSpec(B=2, T=1, R=R, ctx=256, tiles=tiles, interpret=True)
+
+    k_in, k_w = jax.random.split(jax.random.PRNGKey(3801))
+    _, hid_l, _, st_l = qwen35.random_logical_inputs(k_in, g, ex)
+    w_l = qwen35.split_hf_weights(qwen35.random_hf_weights(k_w, g), g, ex)
+    pos = 100 + jnp.arange(ex.NS, dtype=I32)
+
+    # Ranks 0 and 1 share key/query head 0 and shared-expert slice 0; rank 2 does not.
+    qk_cols = 2 * g.kh(R) * g.KD
+    assert jnp.array_equal(
+        w_l["lin_in"][0, :, :, :qk_cols], w_l["lin_in"][1, :, :, :qk_cols]
+    )
+    assert not jnp.array_equal(
+        w_l["lin_in"][0, :, :, :qk_cols], w_l["lin_in"][2, :, :, :qk_cols]
+    )
+    assert jnp.array_equal(w_l["sh13"][0], w_l["sh13"][1])
+    assert not jnp.array_equal(w_l["sh13"][0], w_l["sh13"][2])
+
+    ref_hid, ref_st = qwen35.reference_step(g, ex, pos, hid_l, w_l, st_l)
+
+    mesh = Mesh(devs[:R], ("tp",))
+    pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh
+    )
+    step, _ = qwen35.make_step(mesh, g, ex, donate_states=True)
+    st_in = {
+        k: jax.device_get(kernel.unfold(st_mk[k], R))
+        for k in ("conv", "rec", "kc", "vc")
+    }
+    out_hid, out_st = step(pos_mk, hid_mk, w_mk, st_mk)
+
+    hid_r = kernel.unfold(out_hid, R)[:, : ex.B]
+    for r in range(1, R):
+        assert jnp.array_equal(hid_r[r], hid_r[0]), f"hidden differs on rank {r}"
+    _check("hidden", hid_r[0], ref_hid, [("input hidden", hid_l)])
+
+    conv_got = kernel.unfold(out_st["conv"], R)
+    # Positive control: swapping Q/K conv state between replica ranks 0 and 1 is exact.
+    conv_swap_01_qk = conv_got.at[:, :, :, :qk_cols].set(
+        _swap(conv_got[:, :, :, :qk_cols], 0, 1)
+    )
+    assert jnp.array_equal(
+        conv_swap_01_qk[:, :, : 3 * ex.B, :qk_cols],
+        conv_got[:, :, : 3 * ex.B, :qk_cols],
+    )
+    # Negative control: swapping Q/K conv state between ranks 0 and 2 fails.
+    conv_swap_02 = _swap(conv_got, 0, 2)
+    _check(
+        "conv",
+        conv_got,
+        ref_st["conv"],
+        [("ranks 0 and 2 swapped", conv_swap_02), ("input state", st_in["conv"])],
+    )
+
+    for k, a, b in (("rec", 0, 1), ("kc", 0, 8), ("vc", 0, 8)):
+        got = kernel.unfold(out_st[k], R)
+        _check(
+            k,
+            got,
+            ref_st[k],
+            [
+                (f"ranks {a} and {b} swapped", _swap(got, a, b)),
+                ("input state", st_in[k]),
+            ],
+        )
+    print("32-rank step completed successfully with L=4, att_every=4, CTX=256")
+
+
+@pytest.mark.slow
+def test_qwen38_decode_with_32_ranks():
+    flags = [
+        f
+        for f in os.environ.get("XLA_FLAGS", "").split()
+        if not f.startswith(_DEVICE_COUNT_FLAG)
+    ]
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        MALLOC_ARENA_MAX="2",
+        XLA_FLAGS=" ".join([*flags, f"{_DEVICE_COUNT_FLAG}={R}"]),
+    )
+    t0 = time.perf_counter()
+    out = subprocess.run(
+        [sys.executable or "python3", __file__, "qwen38_r32"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=_CHILD_TIMEOUT_S,
+    )
+    child_time = time.perf_counter() - t0
+    print(f"test_qwen38_decode_with_32_ranks child wall time: {child_time:.2f}s")
+    print(out.stdout)
+    assert out.returncode == 0, out.stdout[-2000:] + out.stderr[-4000:]
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "qwen38_r32":
+        _step_qwen38_32_ranks_in_process()
+
+
+def test_replicated_reference_matches_unreplicated_reference():
+    """kh_rep = sh_rep = 2 at R=8 keeps the R=4 (unreplicated) layer output."""
+    g = _tiny_qwen38_r8_geometry()
+    assert (g.kh_rep(8), g.sh_rep(8)) == (2, 2)
+    assert (g.kh_rep(4), g.sh_rep(4)) == (1, 1)
+    hf = qwen35.random_hf_weights(jax.random.PRNGKey(3808), g)
+    tiles = dataclasses.replace(
+        TINY_TILES, bank=256 << 10, hier=0, mb8=2, inplace=False
+    )
+    delta, w_by_r, args_by_r = {}, {}, {}
+    for r in (4, 8):
+        ex = ExecSpec(B=2, T=1, R=r, ctx=1024, tiles=tiles, interpret=True)
+        _, hid, _, st = qwen35.random_logical_inputs(jax.random.PRNGKey(7), g, ex)
+        st0 = jax.tree.map(jnp.zeros_like, st)
+        w = qwen35.split_hf_weights(hf, g, ex)
+        pos = 900 + jnp.arange(ex.NS, dtype=I32)
+        out, _ = qwen35.reference_step(g, ex, pos, hid, w, st0)
+        delta[r] = out.astype(F32) - hid.astype(F32)
+        w_by_r[r], args_by_r[r] = w, (g, ex, pos, hid)
+    # Two arms x 2 all-reduces per layer x L layers of bf16 partial rounding.
+    n_ar = 2 * g.L
+    tol = 2 * n_ar * 2.0**-8 * float(jnp.max(jnp.abs(delta[4])))
+    _report("replicated R=8 vs unreplicated R=4", delta[8], delta[4])
+    assert float(jnp.max(jnp.abs(delta[8] - delta[4]))) <= tol
+    # Negative control: drop the 1/sh_rep compensation (shared expert counted twice).
+    g8, ex8, pos8, hid8 = args_by_r[8]
+    w_bad = dict(w_by_r[8], sh2_s=w_by_r[8]["sh2_s"] * 2.0)
+    st8 = jax.tree.map(
+        jnp.zeros_like, qwen35.random_logical_inputs(jax.random.PRNGKey(7), g8, ex8)[3]
+    )
+    out_bad, _ = qwen35.reference_step(g8, ex8, pos8, hid8, w_bad, st8)
+    d_bad = out_bad.astype(F32) - hid8.astype(F32)
+    assert float(jnp.max(jnp.abs(d_bad - delta[4]))) > tol

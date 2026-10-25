@@ -29,6 +29,7 @@ from ..ops import BF16, F32, FP8, I32, rup
 from ..pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
 from . import qwen35_pool
 from .qwen35_weights import default_eplb_cores, encode_eplb_ecopy
+from .replication import replicate_logical_inputs
 
 
 def accept_states(g: Any, ex: ExecSpec, st: dict[str, Any], acc: Any) -> dict[str, Any]:
@@ -159,6 +160,7 @@ def random_logical_inputs(
         logical_states["rec"] = (
             jax.random.normal(next(it), (R, ngdn, NS, vh, KD, VD), dtype=BF16) * 0.05
         )
+    replicate_logical_inputs(g, ex, logical_weights, logical_states)
     return pos, hidden, logical_weights, logical_states
 
 
