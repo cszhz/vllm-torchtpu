@@ -205,6 +205,7 @@ if TYPE_CHECKING:
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
+    TPU_SRPT_DP_BALANCE_QUANTILE: float = 0.0
 
 
 def env_with_choices(
@@ -1247,6 +1248,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_WORK_CAP": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_WORK_CAP", 0
     ),
+    # SrptPrefillScheduler (and the model runner, which reports per-rank costs):
+    # instead of a fixed cap, keep each rank's predicted attention time under the
+    # DP group's max decode-only time or this quantile of the ranks' step times,
+    # whichever is larger, from the previous step (0 disables it).
+    "TPU_SRPT_DP_BALANCE_QUANTILE": env_float("TPU_SRPT_DP_BALANCE_QUANTILE", 0.0),
 }
 
 

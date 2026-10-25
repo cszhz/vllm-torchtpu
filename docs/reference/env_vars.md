@@ -25,6 +25,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `DP_SCHED_ENABLED` | `False` | Enables TPU data-parallel request scheduling optimizations. |
 | `VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS` | `8` | Consecutive `schedule()` steps a running prefill chunk may go without getting at least one KV block of tokens in `SrptPrefillScheduler` (held back or crowded out by shorter prefills) before it moves ahead of the other prefill chunks and is no longer held until it gets a block (`0` disables hold-back). |
 | `VLLM_TPU_SRPT_ATTN_WORK_CAP` | `0` | `SrptPrefillScheduler`: cap on a step's attention work (sum over its scheduled tokens of the context each attends to), enforced by clipping prefill chunks to end on the 16-token grid while some DP rank decodes; decodes are never clipped (`0` disables). |
+| `TPU_SRPT_DP_BALANCE_QUANTILE` | `0` | `SrptPrefillScheduler`: instead of a fixed cap, clip prefill chunks so each rank's predicted attention time stays under the larger of the DP group's highest decode-only time and this quantile of the ranks' step times, both from the previous step (exclusive with `VLLM_TPU_SRPT_ATTN_WORK_CAP`; `0` disables). |
 | `TPU_STEP_TIMING_LOG_STEPS` | `0` | Steps between per-rank "step timing" log lines: the runner's step period grouped by DP token bucket, plus the DP sync wait (`0` disables). |
 | `TPU_PP_DYNAMIC_CHUNKS` | `True` | Dynamically sizes microbatch chunks in Pipeline Parallelism (`--pipeline-parallel-size`). |
 | `TPU_PP_CHUNK_SLACK` | `0.1` | Slack ratio for dynamic pipeline-parallel chunk sizing. |

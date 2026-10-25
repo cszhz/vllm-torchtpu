@@ -54,6 +54,15 @@ rank's running requests for the step being scheduled, the other ranks' as the
 runner reports them for the previous step. A prefill running alone is not
 clipped.
 
+With ``TPU_SRPT_DP_BALANCE_QUANTILE=q`` the budget is relative instead of fixed:
+chunks are charged their predicted attention time (``step_cost``), and each
+rank's step is kept under the larger of the DP group's highest decode-only time
+and the ``q`` quantile of the busy ranks' unclipped step times (their demand),
+both from a previous step as the runner reports them. A rank whose decodes and
+deep prompts would make it the slowest stops extending every rank's step, while
+the others fill as before; a rank busy alone is never clipped. Exclusive with the
+fixed cap.
+
 Under KV pressure upstream preempts ``running[-1]``, which is the longest
 non-stalled prefill chunk, so a long prompt can be preempted repeatedly.
 
@@ -71,6 +80,7 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.core.experimental import step_cost
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -101,6 +111,14 @@ class SrptPrefillScheduler(AsyncScheduler):
         # Target request id -> (failed holds, first step a hold may retry).
         self._hold_backoff: dict[str, tuple[int, int]] = {}
         self.attn_work_cap = envs.VLLM_TPU_SRPT_ATTN_WORK_CAP
+        self.dp_balance_quantile = envs.TPU_SRPT_DP_BALANCE_QUANTILE
+        if self.attn_work_cap and self.dp_balance_quantile:
+            raise ValueError(
+                "VLLM_TPU_SRPT_ATTN_WORK_CAP and TPU_SRPT_DP_BALANCE_QUANTILE are "
+                "two budgets for the same clipping; set one"
+            )
+        # Microseconds of attention per step, from the runner's last report.
+        self._dp_budget_us: float | None = None
         # Whether another DP rank decoded in the last step the runner reported.
         self._other_rank_decoding = False
         self._attn_cap_active = False
@@ -108,10 +126,16 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._attn_work = 0.0
         self._attn_prefill_scheduled = False
         self._attn_clipped_chunks = 0
+        # TPU_SRPT_DP_BALANCE_QUANTILE: this step's unclipped and decode-only
+        # predicted attention time (us), handed to the runner with the output.
+        self._attn_demand_us = 0.0
+        self._attn_decode_us = 0.0
         logger.info(
-            "SrptPrefillScheduler active (max_consecutive_holds=%d, attn_work_cap=%d)",
+            "SrptPrefillScheduler active (max_consecutive_holds=%d, attn_work_cap=%d, "
+            "dp_balance_quantile=%g)",
             self.max_consecutive_holds,
             self.attn_work_cap,
+            self.dp_balance_quantile,
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -158,11 +182,18 @@ class SrptPrefillScheduler(AsyncScheduler):
                 )
         if target is not None:
             self._record_hold_outcome(target)
-        if self.attn_work_cap and self.current_step % _LOG_EVERY_STEPS == 0:
+        if self.dp_balance_quantile:
+            # Read by the model runner's DP step sync.
+            output.attn_step_us = (
+                int(self._attn_demand_us),
+                int(self._attn_decode_us),
+            )
+        if self._budget() is not None and self.current_step % _LOG_EVERY_STEPS == 0:
             logger.info(
-                "SRPT step %d: attn_clipped_chunks=%d",
+                "SRPT step %d: attn_clipped_chunks=%d budget=%.0f",
                 self.current_step,
                 self._attn_clipped_chunks,
+                self._budget(),
             )
         return output
 
@@ -171,10 +202,26 @@ class SrptPrefillScheduler(AsyncScheduler):
         decoding = getattr(model_runner_output, "other_rank_decoding", None)
         if decoding is not None:
             self._other_rank_decoding = decoding
+        budget = getattr(model_runner_output, "dp_balance_budget_us", None)
+        if budget is not None:
+            self._dp_budget_us = budget
         return super().update_from_output(scheduler_output, model_runner_output)
+
+    def _budget(self) -> float | None:
+        """The step's attention budget in the active unit, or None (no clipping)."""
+        if self.dp_balance_quantile:
+            return self._dp_budget_us
+        return self.attn_work_cap or None
+
+    def _cost(self, num_tokens: int, context: int, decode: bool) -> float:
+        if self.dp_balance_quantile:
+            return step_cost.chunk_cost_us(num_tokens, context, decode)
+        return num_tokens * (context + num_tokens / 2)
 
     def _reset_attn_work(self) -> None:
         self._attn_work = 0.0
+        self._attn_demand_us = 0.0
+        self._attn_decode_us = 0.0
         self._attn_prefill_scheduled = False
 
     def _reserve_prefill_lookahead(
@@ -184,8 +231,14 @@ class SrptPrefillScheduler(AsyncScheduler):
         _plan_running pass through once a request's tokens are budgeted; with
         an attention-work cap, clip prefill chunks to the step's work left."""
         prefill = num_computed_tokens < request.num_prompt_tokens
+        if self.dp_balance_quantile and num_new_tokens > 0:
+            cost = step_cost.chunk_cost_us(
+                num_new_tokens, num_computed_tokens, decode=not prefill
+            )
+            self._attn_demand_us += cost
+            self._attn_decode_us += 0.0 if prefill else cost
         if (
-            self.attn_work_cap
+            self._budget() is not None
             and self._attn_cap_active
             and prefill
             and num_new_tokens > 0
@@ -210,20 +263,27 @@ class SrptPrefillScheduler(AsyncScheduler):
         num_new_tokens = super()._reserve_prefill_lookahead(
             request, num_computed_tokens, num_new_tokens
         )
-        if self.attn_work_cap:
+        if self._budget() is not None:
             self._attn_prefill_scheduled |= prefill and num_new_tokens > 0
-            self._attn_work += num_new_tokens * (
-                num_computed_tokens + num_new_tokens / 2
+            self._attn_work += self._cost(
+                num_new_tokens, num_computed_tokens, decode=not prefill
             )
         return num_new_tokens
 
     def _attn_fit(self, context: int) -> int:
-        """Most tokens n of a chunk starting at ``context`` with
-        n * (context + n / 2) within the step's remaining attention work."""
-        room = self.attn_work_cap - self._attn_work
+        """Most tokens n of a prefill chunk starting at ``context`` whose cost,
+        a * n^2 + b * n, fits in the step's remaining budget."""
+        budget = self._budget()
+        assert budget is not None
+        room = budget - self._attn_work
         if room <= 0:
             return 0
-        return int(math.sqrt(context * context + 2 * room) - context)
+        if self.dp_balance_quantile:
+            per_tc = step_cost.US_PER_M_PREFILL_TOKEN_CONTEXT * 1e-6
+            a, b = per_tc / 2, step_cost.US_PER_TOKEN + per_tc * context
+        else:
+            a, b = 0.5, float(context)
+        return int((math.sqrt(b * b + 4 * a * room) - b) / (2 * a))
 
     @staticmethod
     def _remaining(request: Request) -> int:

@@ -41,6 +41,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_torchtpu.compilation import tpu_compiler
+from vllm_torchtpu.core.experimental import step_cost
 from vllm_torchtpu.core.experimental.srpt_prefill_scheduler import SrptPrefillScheduler
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 
@@ -642,3 +643,80 @@ def test_attn_cap_applies_while_this_rank_decodes(shared_model_config, monkeypat
     assert scheduler.schedule().num_scheduled_tokens == {"dec": 16}
     # Uncapped, `long` would take the 63 tokens the decode leaves.
     assert scheduler.schedule().num_scheduled_tokens == {"dec": 1, "long": 48}
+
+
+def _balanced(model_config, monkeypatch, budget_us, **kwargs):
+    monkeypatch.setenv("TPU_SRPT_DP_BALANCE_QUANTILE", "0.75")
+    scheduler, hasher = _build_real_scheduler(model_config, **kwargs)
+    scheduler._dp_budget_us = budget_us
+    scheduler._attn_cap_active = True  # as in a step with a decode
+    return scheduler, hasher
+
+
+def test_dp_balance_budget_is_the_quantile_or_the_slowest_decodes():
+    demand = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000]
+    assert step_cost.dp_balance_budget_us(demand, [0] * 8, 0.75) == 7000
+    assert step_cost.dp_balance_budget_us(demand, [0] * 7 + [7500], 0.75) == 7500
+    # Idle ranks do not pull the quantile down; a rank busy alone is not clipped.
+    assert step_cost.dp_balance_budget_us([0] * 7 + [9000], [0] * 8, 0.75) == 9000
+    assert step_cost.dp_balance_budget_us([0] * 8, [0] * 8, 0.75) is None
+
+
+def test_dp_balance_charges_predicted_time_and_clips_to_the_grid(
+    shared_model_config, monkeypatch
+):
+    scheduler, _ = _balanced(shared_model_config, monkeypatch, 10_000)
+    decode = _chunk(200_000, num_tokens=200_010)
+    assert scheduler._reserve_prefill_lookahead(decode, 200_010, 7) == 7
+    used = step_cost.chunk_cost_us(7, 200_010, decode=True)
+    assert scheduler._attn_work == pytest.approx(used)
+    n = scheduler._reserve_prefill_lookahead(_chunk(400_000), 100_000, 128)
+    assert 0 < n < 128 and (100_000 + n) % 16 == 0
+    assert used + step_cost.chunk_cost_us(n, 100_000, decode=False) <= 10_000
+    assert used + step_cost.chunk_cost_us(n + 16, 100_000, decode=False) > 10_000
+    assert scheduler._attn_clipped_chunks == 1
+
+
+def test_dp_balance_without_a_report_does_not_clip(shared_model_config, monkeypatch):
+    scheduler, _ = _balanced(shared_model_config, monkeypatch, None)
+    assert scheduler._reserve_prefill_lookahead(_chunk(400_000), 300_000, 128) == 128
+    assert scheduler._attn_work == 0.0
+
+
+def test_dp_balance_takes_the_budget_from_the_runner(shared_model_config, monkeypatch):
+    scheduler, _ = _balanced(shared_model_config, monkeypatch, None)
+    monkeypatch.setattr(AsyncScheduler, "update_from_output", lambda *a: {})
+    scheduler.update_from_output(None, SimpleNamespace(dp_balance_budget_us=12_345))
+    assert scheduler._budget() == 12_345
+    scheduler.update_from_output(None, SimpleNamespace())  # empty output: holds
+    assert scheduler._budget() == 12_345
+    assert "TPU_SRPT_DP_BALANCE_QUANTILE" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+
+
+def test_dp_balance_and_fixed_cap_are_exclusive(shared_model_config, monkeypatch):
+    monkeypatch.setenv("TPU_SRPT_DP_BALANCE_QUANTILE", "0.75")
+    monkeypatch.setenv("VLLM_TPU_SRPT_ATTN_WORK_CAP", "25000000")
+    with pytest.raises(ValueError):
+        _build_real_scheduler(shared_model_config)
+
+
+def test_dp_balance_reports_unclipped_demand_with_the_output(
+    shared_model_config, monkeypatch
+):
+    scheduler, hasher = _balanced(
+        shared_model_config,
+        monkeypatch,
+        None,
+        num_blocks=128,
+        max_num_batched_tokens=64,
+    )
+    scheduler.add_request(_make_real_request("long", 1024, hasher, seed=1))
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {"long": 64}
+    assert out.attn_step_us == (int(step_cost.chunk_cost_us(64, 0, decode=False)), 0)
+    # A budget below the next chunk's cost clips it; the demand stays unclipped.
+    scheduler._dp_budget_us = 1.0
+    scheduler._other_rank_decoding = True
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {"long": 16}
+    assert out.attn_step_us[0] == int(step_cost.chunk_cost_us(64, 64, decode=False))

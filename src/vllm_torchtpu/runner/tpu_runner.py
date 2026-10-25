@@ -96,6 +96,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.core.experimental import step_cost
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
@@ -822,6 +823,9 @@ class TPUModelRunner(GPUModelRunner):
         # Whether another DP rank ran a decode this step; SrptPrefillScheduler
         # applies VLLM_TPU_SRPT_ATTN_WORK_CAP only while some rank decodes.
         self._dp_step_other_decode = False
+        # TPU_SRPT_DP_BALANCE_QUANTILE: the next step's attention budget (us)
+        # from this step's per-rank predicted attention times.
+        self._dp_balance_budget_us: int | None = None
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -3623,6 +3627,7 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         local_any_decode: bool = False,
+        local_attn_us: tuple[int, int] = (0, 0),
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._dp_step_other_decode = False
@@ -3646,10 +3651,16 @@ class TPUModelRunner(GPUModelRunner):
                 # tell whether another one decodes under a MAX reduction.
                 int(local_any_decode) * (dp_rank + 1),
                 int(local_any_decode) * (dp_size - dp_rank),
-            ],
+            ]
+            # Each rank's (demand, decode-only) predicted attention time in its
+            # own slot, so the MAX reduction hands every rank all of them.
+            + ([0] * (2 * dp_size) if envs.TPU_SRPT_DP_BALANCE_QUANTILE else []),
             dtype=torch.int64,
             device="cpu",
         )
+        if envs.TPU_SRPT_DP_BALANCE_QUANTILE:
+            t[6 + dp_rank] = int(local_attn_us[0])
+            t[6 + dp_size + dp_rank] = int(local_attn_us[1])
         sync_start = time.perf_counter()
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=dp_group.cpu_group
@@ -3667,12 +3678,18 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_other_decode = highest >= 0 and (
             highest != lowest or highest != dp_rank
         )
+        if envs.TPU_SRPT_DP_BALANCE_QUANTILE:
+            step_us = t[6 : 6 + dp_size].numpy()
+            decode_us = t[6 + dp_size : 6 + 2 * dp_size].numpy()
+            self._dp_balance_budget_us = step_cost.dp_balance_budget_us(
+                step_us, decode_us, envs.TPU_SRPT_DP_BALANCE_QUANTILE
+            )
         return bucket, int(t[1].item())
 
     def _any_decode(self, scheduler_output: "SchedulerOutput") -> bool:
         """Whether this step schedules a request past its prompt; computed
-        only for the SRPT attention-work cap, which reads it."""
-        if not envs.VLLM_TPU_SRPT_ATTN_WORK_CAP:
+        only for the SRPT attention budget, which reads it."""
+        if not (envs.VLLM_TPU_SRPT_ATTN_WORK_CAP or envs.TPU_SRPT_DP_BALANCE_QUANTILE):
             return False
         batch = self.input_batch
         indices = [
@@ -3831,6 +3848,8 @@ class TPUModelRunner(GPUModelRunner):
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             local_any_decode=self._any_decode(scheduler_output),
+            # Set by SrptPrefillScheduler under TPU_SRPT_DP_BALANCE_QUANTILE.
+            local_attn_us=getattr(scheduler_output, "attn_step_us", (0, 0)),
         )
         self._dp_step_num_chunks = target_num_chunks
 
@@ -5216,6 +5235,7 @@ class TPUModelRunner(GPUModelRunner):
             )
             # Read by SrptPrefillScheduler.update_from_output.
             model_runner_output.other_rank_decoding = self._dp_step_other_decode
+            model_runner_output.dp_balance_budget_us = self._dp_balance_budget_us
 
             async_output = AsyncTPUModelRunnerOutput(
                 model_runner_output=model_runner_output,

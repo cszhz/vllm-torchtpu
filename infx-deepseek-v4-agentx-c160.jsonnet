@@ -342,7 +342,12 @@ local pairSwap = cdk.var('TPU_DSV4_PAIR_SWAP', '1');
 // setting every rank's step. Empty = off.
 // c=160: full stack + 25M, n=3 vs n=4: intvty p90 46.4-47.8 vs 45.1-45.8, TTFT mean 19.8-20.3 vs
 // 21.4-23.5 s, tok/s/chip +2% (in noise).
-local srptAttnWorkCap = cdk.var('VLLM_TPU_SRPT_ATTN_WORK_CAP', '25000000');
+local srptAttnWorkCap = cdk.var('VLLM_TPU_SRPT_ATTN_WORK_CAP', '');
+// Relative budget instead of the fixed cap (exclusive with it): each rank's predicted attention time is kept
+// under the DP group's max decode-only time or this quantile of the ranks' step times, from the last step.
+// RC13a c=160 xprof (j-26904041): attention is the only rank-dependent work, predicted to R^2 0.988 from the
+// batch; p75 trims ~1.7 ms/step of skew while deferring ~2.6% of prefill tokens. Empty = off.
+local srptDpBalanceQuantile = cdk.var('TPU_SRPT_DP_BALANCE_QUANTILE', '0.75');
 // Each TensorCore keeps half of wq_b/wo_a/wo_b and the chip pair exchanges activations; the freed HBM goes
 // to KV (1.875M -> 3.14M tokens/rank in j-02810869, 361,390 vs ~310k total tok/s). Tolerance tier:
 // mmlu_pro 0.8386 vs 0.845 off (McNemar p=0.40). Empty = off.
@@ -789,6 +794,7 @@ local serverJob = cdk.job(
           'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK',
           'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK',
           'TPU_DSV4_ATTN_INTRA_CHIP_TP',
+          'TPU_SRPT_DP_BALANCE_QUANTILE',
           'TPU_PJRT_EVENT_TRACE_ENABLE',
           'USE_PHASED_PROFILER',
           'VLLM_TPU_MOST_MODEL_LEN',
@@ -822,6 +828,8 @@ local serverJob = cdk.job(
         [if expertPlacement != '' then 'TPU_EXPERT_PLACEMENT']: expertPlacement,
         [if pairSwap != '' then 'TPU_DSV4_PAIR_SWAP']: pairSwap,
         [if srptAttnWorkCap != '' then 'VLLM_TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
+        // Read by the scheduler (EngineCore) and the model runner (Ray workers).
+        [if srptDpBalanceQuantile != '' then 'TPU_SRPT_DP_BALANCE_QUANTILE']: srptDpBalanceQuantile,
         [if hcaKvPagesPerBlock != '' then 'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK']: hcaKvPagesPerBlock,
         [if indexerKvPagesPerBlock != '' then 'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK']: indexerKvPagesPerBlock,
         [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
