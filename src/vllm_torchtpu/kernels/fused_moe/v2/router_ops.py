@@ -30,6 +30,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
+from vllm_torchtpu.kernels import operand_pin
+
 NEG = -3.0e38  # below any real softmax score (>=0); avoids inf
 
 
@@ -138,11 +140,14 @@ def pallas_select_routed(
     row_spec = pl.BlockSpec((block_rows, N), lambda i: (i, 0))
     vec_spec = pl.BlockSpec((1, N), lambda i: (0, 0))
     operands, specs = [scores, gate.astype(jnp.float32)], [row_spec, row_spec]
+    # The per-layer tables are fetched with the rows in the kernel prologue
+    # rather than staged one by one by XLA ahead of it.
+    pin = operand_pin.hbm if operand_pin.enabled("select") else (lambda v: v)
     if score_bias is not None:
-        operands.append(score_bias.astype(jnp.float32).reshape(1, N))
+        operands.append(pin(score_bias.astype(jnp.float32).reshape(1, N)))
         specs.append(vec_spec)
     if labels is not None:
-        operands.append(labels.astype(jnp.int32).reshape(1, N))
+        operands.append(pin(labels.astype(jnp.int32).reshape(1, N)))
         specs.append(vec_spec)
     kernel = functools.partial(
         _select_routed_kernel,

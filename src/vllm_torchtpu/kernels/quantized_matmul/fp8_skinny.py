@@ -33,6 +33,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import operand_pin
+
 MAX_M = 32
 LANE = 128
 FP8_SUBLANE_TILE = 32  # rows per fp8 (32, 128) HBM tile
@@ -55,6 +57,11 @@ TUNED_HBM: dict[tuple[int, int], Config] = {
     (7168, 768): ("k", 1792, 4, 1),
 }
 assert TUNED.keys() == TUNED_HBM.keys()
+# Under TPU_PIN_OPERANDS_HBM=skinny the per-channel scale is always HBM-pinned; x
+# only where its producer leaves it in HBM (attn.wo_b: the wo_a kernel's output).
+# Pinning a fusion-produced x makes the fusion write HBM, which costs more than
+# the staging copy it saves.
+PIN_X: frozenset[tuple[int, int]] = frozenset({(2048, 7168)})
 
 
 def supports(m: int, w_q: jax.Array, w_s: jax.Array) -> bool:
@@ -80,14 +87,31 @@ def _kernel(
     xs_ref,
     wbuf,
     sem,
-    *acc,
+    *rest,
     split,
     t,
     n_tiles,
     nbuf,
     ndma,
     q_dtype,
+    x_hbm,
+    ws_hbm,
 ):
+    rest = list(rest)
+    acc = [rest.pop(0)] if split == "k" else []
+    # An HBM-pinned x / scale is fetched here, ahead of the weight ring, rather
+    # than in a pipeline prologue that the first weight DMA would wait behind.
+    x_copy = ws_copy = None
+    if x_hbm:
+        x_vmem, x_sem = rest.pop(0), rest.pop(0)
+        x_copy = pltpu.make_async_copy(x_ref, x_vmem, x_sem)
+        x_copy.start()
+        x_ref = x_vmem
+    if ws_hbm:
+        ws_vmem, ws_sem = rest.pop(0), rest.pop(0)
+        ws_copy = pltpu.make_async_copy(ws_ref, ws_vmem, ws_sem)
+        ws_copy.start()
+        ws_ref = ws_vmem
     rows = wbuf.shape[1] // ndma  # each tile moves as `ndma` row-band DMAs
 
     def copies(j):
@@ -105,6 +129,8 @@ def _kernel(
     for j in range(min(nbuf, n_tiles)):
         for c in copies(j):
             c.start()
+    if x_copy is not None:
+        x_copy.wait()
 
     q_max = float(jnp.finfo(q_dtype).max)
     x = x_ref[...]
@@ -119,6 +145,8 @@ def _kernel(
     xs_ref[...] = scale
 
     dn = (((1,), (0,)), ((), ()))
+    if ws_copy is not None and split == "n":
+        ws_copy.wait()
     for j in range(n_tiles):
         for c in copies(j):
             c.wait()
@@ -144,6 +172,8 @@ def _kernel(
             for c in copies(j + nbuf):
                 c.start()
     if split == "k":
+        if ws_copy is not None:
+            ws_copy.wait()
         o_ref[...] = (acc[0][...] * xs_ref[...] * ws_ref[...]).astype(o_ref.dtype)
 
 
@@ -157,7 +187,7 @@ def _vmem_limit(m, k, n, tile, nbuf, split):
 
 
 @functools.cache
-def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma):
+def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma, x_hbm=False, ws_hbm=False):
     full = k if split == "k" else n
     if full % t or t % LANE:
         raise ValueError(
@@ -177,6 +207,12 @@ def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma):
     ]
     if split == "k":
         scratch.append(pltpu.VMEM((m, n), jnp.float32))
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    act_specs = []
+    for pinned, shape, dtype in ((x_hbm, (m, k), out_dtype), (ws_hbm, (1, n), jnp.float32)):
+        if pinned:
+            scratch += [pltpu.VMEM(shape, dtype), pltpu.SemaphoreType.DMA]
+        act_specs.append(hbm_spec if pinned else pl.BlockSpec(shape, lambda g: (0, 0)))
     kern = functools.partial(
         _kernel,
         split=split,
@@ -185,14 +221,15 @@ def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma):
         nbuf=nbuf,
         ndma=ndma,
         q_dtype=w_dtype,
+        x_hbm=x_hbm,
+        ws_hbm=ws_hbm,
     )
     return pl.pallas_call(
         kern,
         out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
         grid=(1,),
         in_specs=[
-            pl.BlockSpec((m, k), lambda g: (0, 0)),
-            pl.BlockSpec((1, n), lambda g: (0, 0)),
+            *act_specs,
             # The weight is an HBM ref inside the kernel. This alone does not stop
             # XLA staging the operand in VMEM first; see `hbm_pin`.
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -203,16 +240,22 @@ def _build(m, k, n, w_dtype, out_dtype, split, t, nbuf, ndma):
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=_vmem_limit(m, k, n, tile, nbuf, split),
         ),
-        name=f"fp8_skinny_{split}{t}_b{nbuf}_d{ndma}_m{m}_k{k}_n{n}",
+        name=f"fp8_skinny_{split}{t}_b{nbuf}_d{ndma}_m{m}_k{k}_n{n}"
+        + ("_xh" if x_hbm else "")
+        + ("_sh" if ws_hbm else ""),
     )
 
 
-@functools.partial(jax.jit, static_argnums=(0,))
-def _call_hbm_pinned(call, x, w_s, w_q):
+@functools.partial(jax.jit, static_argnums=(0, 4, 5))
+def _call_hbm_pinned(call, x, w_s, w_q, x_hbm=False, ws_hbm=False):
     # The constraint sets the operand aval's memory space, which pallas_call lowers
     # to the custom call's input memory space. It only binds a pallas_call input
     # and cannot run eagerly, hence the jit around both.
-    return call(x, w_s, pltpu.with_memory_space_constraint(w_q, pltpu.HBM))
+    if x_hbm:
+        x = operand_pin.hbm(x)
+    if ws_hbm:
+        w_s = operand_pin.hbm(w_s)
+    return call(x, w_s, operand_pin.hbm(w_q))
 
 
 def fp8_skinny_matmul(
@@ -236,8 +279,11 @@ def fp8_skinny_matmul(
     if config is None:
         config = (TUNED_HBM if hbm_pin else TUNED)[(k, n)]
     split, t, nbuf, ndma = config
-    call = _build(m, k, n, w_q.dtype, x.dtype, split, t, nbuf, ndma)
+    # Only with the weight pinned: an unpinned weight would be staged anyway.
+    ws_hbm = hbm_pin and operand_pin.enabled("skinny")
+    x_hbm = ws_hbm and (k, n) in PIN_X
+    call = _build(m, k, n, w_q.dtype, x.dtype, split, t, nbuf, ndma, x_hbm, ws_hbm)
     w_s2 = w_s.reshape(1, n).astype(jnp.float32)
     if hbm_pin:
-        return _call_hbm_pinned(call, x, w_s2, w_q)
+        return _call_hbm_pinned(call, x, w_s2, w_q, x_hbm, ws_hbm)
     return call(x, w_s2, w_q)

@@ -21,6 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import operand_pin
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather, native_sc_gather
 
@@ -121,7 +122,7 @@ def gather_page_ids(
             disable_bounds_checks=True,
         ),
         name="gather_page_ids",
-    )(windows, logical)
+    )(operand_pin.hbm(windows) if operand_pin.enabled("pages") else windows, logical)
     return out[:num_tokens]
 
 

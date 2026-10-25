@@ -21,6 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import operand_pin
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     ROWBLK,
@@ -452,6 +453,11 @@ def build_decode_combine(arrivals, arrival_scales, pos, mirror_pos, weights, out
     kernel = functools.partial(
         _combine_kernel, t_local=t_local, topk=topk, tile_m=tile_m, out_dtype=out_dtype
     )
+    if operand_pin.enabled("combine"):
+        # The kernel reads n rows of each buffer, which the MoE kernel left in
+        # HBM; do not let XLA stage them whole. `tables` is a fusion's output
+        # and stays where XLA puts it.
+        arrivals, arrival_scales = map(operand_pin.hbm, (arrivals, arrival_scales))
     return pl.pallas_call(
         kernel,
         in_specs=[pl.BlockSpec(memory_space=hbm)] * 3,
