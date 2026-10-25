@@ -189,7 +189,12 @@ def test_old_bound_leaks_the_draft(name, variant):
     inp = _case(seqs, T)
     pos = _positions(inp, seqs)
     idx = VARIANTS[variant](inp, False)
-    leaking = int(np.sum((pos + 1) % RATIO != 0))
+    # A row leaks when its own group is incomplete at its position but a later
+    # token of the same forward completes it (it is inside seq_len // 4).
+    seq_end = np.concatenate(
+        [np.full(q_len, seq_len) for q_len, seq_len, _ in seqs]
+    )
+    leaking = int(np.sum(((pos + 1) % RATIO != 0) & (pos // RATIO < seq_end // RATIO)))
     assert _violations(idx, pos).size == leaking > 0
 
 
