@@ -45,7 +45,7 @@ DENSE_TILE_GROUP = 4
 # A step's tile count is padded to a multiple of this, so each step runs one
 # fully unrolled body that the scheduler can overlap end to end; padded tiles
 # are zero rows that no token selects. Divides DENSE_MAX_WINDOW // DENSE_KV_TILE.
-DENSE_TILE_ROUNDING = 4
+DENSE_TILE_ROUNDING = 2
 # Independent token slices of a step whose MXU passes and softmax the
 # scheduler interleaves; each slice is a multiple of 8 tokens.
 DENSE_ROW_SPLIT = 2
