@@ -25,6 +25,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
+from vllm_torchtpu.layers.adapter import fused_moe_ep as fused_moe_ep_mod
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 
 # Taken once at import, outside any trace: the MoE forward is traced by
@@ -158,9 +159,20 @@ class VllmMoERunner(MoERunner):
             self._quant_method
         )
 
+    def _reduces_shared_in_op(self, num_tokens) -> bool:
+        # See TPU_MOE_SHARED_REDUCE_OVERLAP_MIN_TOKENS; the shared output and the
+        # routed rows share the token count, so both call sites agree.
+        if self._shared_experts is None:
+            return False
+        return fused_moe_ep_mod.shared_reduce_overlap(self._quant_method, num_tokens)
+
     def _maybe_reduce_shared_expert_output(
         self, shared_output, fused_output_is_reduced=None
     ):
+        if shared_output is not None and self._reduces_shared_in_op(
+            shared_output.shape[0]
+        ):
+            return shared_output  # summed inside the fused EP op
         if self._folds_restore():
             # Summed in _apply_quant_method, and under "add" already in the
             # routed output, which then stands alone.
@@ -240,6 +252,16 @@ class VllmMoERunner(MoERunner):
         shared = (
             self._shared_experts.output if self._shared_experts is not None else None
         )
+        if shared is not None and self._reduces_shared_in_op(hidden_states.shape[0]):
+            fused, shared = self._quant_method.apply_monolithic(
+                layer=self.routed_experts,
+                x=hidden_states,
+                router_logits=router_logits,
+                input_ids=input_ids,
+                order_after=shared,
+                reduce_shared=True,
+            )
+            return shared, fused
         fused = self._quant_method.apply_monolithic(
             layer=self.routed_experts,
             x=hidden_states,

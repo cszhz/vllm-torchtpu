@@ -111,6 +111,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_PALLAS_RESTORE: bool = False
     MOE_FUSED_EP_V2_FUSED_SELECT: bool = False
     MOE_FUSED_EP_V2_FOLD_RESTORE: str = ""
+    TPU_MOE_SHARED_REDUCE_OVERLAP_MIN_TOKENS: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
     MOE_EXPERT_COUNT_TAP_DIR: str = ""
     MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
@@ -876,6 +877,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_PALLAS_RESTORE": env_bool("MOE_FUSED_EP_V2_PALLAS_RESTORE"),
     # Fold the score-bias add and the row-routes mask into the top-k selector.
     "MOE_FUSED_EP_V2_FUSED_SELECT": env_bool("MOE_FUSED_EP_V2_FUSED_SELECT"),
+    # From this many tokens (prefill buckets), the shared expert's TP sum is a
+    # Pallas reduce-scatter issued inside the fused EP op, its transfers in
+    # flight under the MoE kernel, instead of an XLA all-reduce (or, with
+    # TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS, reduce-scatter) after it: XLA does not
+    # overlap its collectives with Pallas kernels. 0: off.
+    "TPU_MOE_SHARED_REDUCE_OVERLAP_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_SHARED_REDUCE_OVERLAP_MIN_TOKENS", 0
+    ),
     # The fused EP op leaves its routed rows on the core that computed them,
     # and the shared expert's TP all-reduce gathers them back in the same
     # kernel (small_all_reduce_op.fold). "pair" returns the sum and the rows

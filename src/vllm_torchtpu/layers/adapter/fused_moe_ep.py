@@ -119,6 +119,9 @@ FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
 # Layer op -> its variant that returns only this core's slot of TP-replicated
 # rows (`fused_moe_ep(local_rows=True)`).
 _LOCAL_ROWS_OPS: dict[Any, Any] = {}
+# (layer op, local_rows) -> its variant that also reduces the shared expert's
+# output around the kernel (`fused_moe_ep(reduce_shared=True)`).
+_REDUCE_SHARED_OPS: dict[tuple[Any, bool], Any] = {}
 
 
 def _squeeze_channel_scale(
@@ -192,6 +195,7 @@ def _build_op(
     fused_select=False,
     defer_restore=False,
     restore_rows=True,
+    reduce_order_after=False,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -220,6 +224,7 @@ def _build_op(
         fused_select,
         defer_restore,
         restore_rows,
+        reduce_order_after,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -241,6 +246,7 @@ def _build_op(
         fused_select=fused_select,
         defer_restore=defer_restore,
         restore_rows=restore_rows,
+        reduce_order_after=reduce_order_after,
     )
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
@@ -360,6 +366,7 @@ def _build_op(
                 + ("expert_slot",) * has_expert_slot
                 + ("order_after",) * has_order_after
             ),
+            n_out=2 if reduce_order_after else 1,
         )
     elif has_score_bias:
         fn = moe_with_score_bias
@@ -375,7 +382,7 @@ def _build_op(
         # [, expert_slot] [, order_after]
         # -- and the single output is sharded on axis 0 like x.
         input_partition_specs=input_specs,
-        output_partition_specs=spec,
+        output_partition_specs=(spec, spec) if reduce_order_after else spec,
     )
 
     # Replaces the fake jax_op installs, which resolves the output aval by
@@ -387,7 +394,12 @@ def _build_op(
     def _fake_local_rows(x, *_args, **_kwargs):
         return x.new_empty((x.shape[0] // len(token_replica_groups[0]), x.shape[1]))
 
-    op.register_fake(_fake if restore_rows else _fake_local_rows)
+    fake = _fake if restore_rows else _fake_local_rows
+    if reduce_order_after:
+        # (routed rows, reduced shared rows), sized alike.
+        op.register_fake(lambda *a, **k: (fake(*a, **k), fake(*a, **k)))
+    else:
+        op.register_fake(fake)
     _OPS[key] = op
     return op
 
@@ -401,7 +413,7 @@ _OPERAND_DTYPES = {
 }
 
 
-def _operand_fn(call, names):
+def _operand_fn(call, names, n_out=1):
     """`call` behind the signature (x, w1, w2, w1_scale, w2_scale, gating,
     rank, *names), every operand annotated jax.Array as torch_tpu requires.
 
@@ -425,9 +437,11 @@ def _operand_fn(call, names):
     param = inspect.Parameter.POSITIONAL_OR_KEYWORD
     fn.__signature__ = inspect.Signature(
         [inspect.Parameter(n, param, annotation=jax.Array) for n in fixed + names],
-        return_annotation=jax.Array,
+        return_annotation=jax.Array if n_out == 1 else tuple[(jax.Array,) * n_out],
     )
-    fn.__annotations__ = {n: jax.Array for n in fixed + names} | {"return": jax.Array}
+    fn.__annotations__ = {n: jax.Array for n in fixed + names} | {
+        "return": fn.__signature__.return_annotation
+    }
     fn.__name__ = "moe_with_" + "_".join(names)
     return fn
 
@@ -446,7 +460,8 @@ def fused_moe_ep(
     order_after: torch.Tensor | None = None,
     *,
     local_rows: bool = False,
-) -> torch.Tensor:
+    reduce_shared: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run one MoE layer through the fused EP kernel.
 
     Takes this rank's own tokens and returns this rank's own tokens: the
@@ -470,6 +485,11 @@ def fused_moe_ep(
     this core's slot of them (see `seq_parallel`), skipping the gather that
     would restore every row; prebuild armed that variant under
     TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS.
+
+    With `reduce_shared`, `order_after` is the shared expert's TP-partial
+    output and the op returns (routed, its TP sum) -- the sum's transfers
+    overlap the kernel (TPU_MOE_SHARED_REDUCE_OVERLAP_MIN_TOKENS). The sum
+    holds this core's slot rows with `local_rows`, else every row.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
     if w1.dtype == torch.float4_e2m1fn_x2:
@@ -483,12 +503,26 @@ def fused_moe_ep(
         )
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
-    if local_rows:
+    if reduce_shared:
+        if order_after is None:
+            raise ValueError("reduce_shared reduces order_after; none was passed")
+        op = _REDUCE_SHARED_OPS[(op, local_rows)]
+    elif local_rows:
         op = _LOCAL_ROWS_OPS[op]
     extra = tuple(
         t for t in (score_bias, hash_ids, expert_slot, order_after) if t is not None
     )
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+
+
+def shared_reduce_overlap(owner, num_tokens) -> bool:
+    """Whether this layer's forward of ``num_tokens`` rows reduces the shared
+    expert inside the fused EP op (``fused_moe_ep(reduce_shared=True)``).
+    Graphs are traced per token bucket, so this is a trace-time constant."""
+    min_tokens = envs.TPU_MOE_SHARED_REDUCE_OVERLAP_MIN_TOKENS
+    if not min_tokens or num_tokens < min_tokens or not fused_moe_ep_supported(owner):
+        return False
+    return (getattr(owner, FUSED_MOE_EP_OP_ATTR), False) in _REDUCE_SHARED_OPS
 
 
 def register_fused_scale_buffers(layer) -> None:
@@ -814,6 +848,21 @@ def prebuild_fused_moe_ep(
         _LOCAL_ROWS_OPS[op] = _build_op(
             *build_args, **{**build_kw, "defer_restore": False}, restore_rows=False
         )
+    overlap = envs.TPU_MOE_SHARED_REDUCE_OVERLAP_MIN_TOKENS
+    if overlap and len(token_replica_groups[0]) > 1:
+        if not envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL:
+            raise ValueError(
+                "TPU_MOE_SHARED_REDUCE_OVERLAP_MIN_TOKENS reduces the shared expert's "
+                "output inside the fused EP op, which takes it as its order_after "
+                "operand: set MOE_FUSED_EP_SHARED_BEFORE_KERNEL=1"
+            )
+        for local in (False, True):
+            _REDUCE_SHARED_OPS[(op, local)] = _build_op(
+                *build_args,
+                **{**build_kw, "defer_restore": False},
+                restore_rows=not local,
+                reduce_order_after=True,
+            )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "

@@ -27,6 +27,7 @@ from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter import fused_moe_ep
 from vllm_torchtpu.models.vllm.deepseek_v4 import seq_parallel
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
 
@@ -195,16 +196,34 @@ class DeepseekV4MoE(nn.Module):
         with runner._sequence_parallel_context():
             shared = self.shared_experts(rows)
             routed_layer = runner.routed_experts
-            routed = routed_layer.quant_method._forward_monolithic_tpu(
-                routed_layer,
-                rows,
-                router_logits,
-                input_ids,
-                # As VllmMoERunner._apply_quant_method hands it over.
-                order_after=shared if envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL else None,
-                local_rows=True,
-            )
-        shared = seq_parallel.reduce_scatter(shared)
+            quant_method = routed_layer.quant_method
+            if fused_moe_ep.shared_reduce_overlap(quant_method, rows.shape[0]):
+                # The op reduce-scatters the shared output under its kernel.
+                routed, shared = quant_method._forward_monolithic_tpu(
+                    routed_layer,
+                    rows,
+                    router_logits,
+                    input_ids,
+                    order_after=shared,
+                    local_rows=True,
+                    reduce_shared=True,
+                )
+                reduced = True
+            else:
+                routed = quant_method._forward_monolithic_tpu(
+                    routed_layer,
+                    rows,
+                    router_logits,
+                    input_ids,
+                    # As VllmMoERunner._apply_quant_method hands it over.
+                    order_after=shared
+                    if envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL
+                    else None,
+                    local_rows=True,
+                )
+                reduced = False
+        if not reduced:
+            shared = seq_parallel.reduce_scatter(shared)
         if runner.routed_scaling_factor != 1.0:
             routed = routed * runner.routed_scaling_factor
         return shared + routed

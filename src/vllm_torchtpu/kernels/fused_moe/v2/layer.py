@@ -329,6 +329,40 @@ _LAYER_SM_CACHE = {}
 _LAYER_SM_CACHE_LOCK = threading.Lock()
 
 
+def _group_tables(token_layout, me):
+    """This core's slot in its token replica group and the group's mesh
+    indices, as data (``me`` is the mesh index as data)."""
+    group_of = [0] * len(token_layout.slots)
+    for g, group in enumerate(token_layout.groups):
+        for rank in group:
+            group_of[rank] = g
+    peers = jnp.asarray(token_layout.groups, jnp.int32)[
+        jnp.asarray(group_of, jnp.int32)[me]
+    ]
+    slot = jnp.asarray(token_layout.slots, jnp.int32)[me].reshape(1)
+    return slot, peers
+
+
+def _shared_reduce_start(partial, token_layout, me, ax):
+    from vllm_torchtpu.kernels.experimental.small_collectives import large
+
+    slot, peers = _group_tables(token_layout, me)
+    return large.reduce_scatter_start(
+        partial, num_cores=len(token_layout.groups[0]), axis=ax, rank=slot, peers=peers
+    )
+
+
+def _shared_reduce_done(handle, token_layout, ax, after, restore_rows):
+    from vllm_torchtpu.kernels.experimental.small_collectives import large
+
+    part = large.reduce_scatter_done(handle, after=after)
+    if not restore_rows:
+        return part
+    return lax.all_gather(
+        part, ax, axis=0, tiled=True, axis_index_groups=token_layout.groups
+    )
+
+
 def fused_ep_moe_v2(
     x,
     w1,
@@ -367,6 +401,7 @@ def fused_ep_moe_v2(
     fused_select=False,
     defer_restore=False,
     restore_rows=True,
+    reduce_order_after=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -464,6 +499,14 @@ def fused_ep_moe_v2(
     the score-bias add and the row-routes mask into the top-k selector
     (router_ops.pallas_select_routed). All six apply only at or below
     SMALL_BATCH_LOCAL_TOKENS local tokens and change no value.
+
+    reduce_order_after says ``order_after`` is a TP-partial block shaped like
+    x (the shared expert's output): it is also summed over each token replica
+    group by a Pallas reduce-scatter whose transfers are in flight while the
+    fused kernel runs (small_collectives.large.reduce_scatter_start/_done,
+    float32 in group order), and the call returns (rows, sum). The sum is
+    this member's slot rows with ``restore_rows=False``, else every row
+    (all-gathered after the kernel).
 
     defer_restore skips the token replicas' gather: each member returns its
     own slice's rows at the top of its [tokens, hidden] block (rows past the
@@ -579,6 +622,11 @@ def fused_ep_moe_v2(
     has_hash_ids = hash_topk_ids is not None
     has_expert_slot = expert_slot is not None
     has_order_after = order_after is not None
+    if reduce_order_after and (not has_order_after or len(token_layout.groups[0]) < 2):
+        raise ValueError(
+            "reduce_order_after needs order_after and token replica groups wider "
+            "than one core"
+        )
     if scoring_fn not in SCORING_FNS:
         raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got {scoring_fn!r}")
     if has_score_bias and score_bias.shape != (e_router,):
@@ -674,6 +722,12 @@ def fused_ep_moe_v2(
         # lowers to `partition-id`, which the SPMD partitioner rejects when
         # torch_tpu recompiles this module through its jax.export bridge.
         me = rank_l[0, 0]
+        shared_rs = None
+        if reduce_order_after:
+            shared_rs = _shared_reduce_start(order_after_l, token_layout, me, ax)
+            # Issued before the exchange so the slices travel under it and
+            # under the kernel; the barrier keeps XLA from sinking the start.
+            x_l, _ = lax.optimization_barrier((x_l, shared_rs[2]))
         x_l = token_layout.split(x_l, me)
         gate_l = token_layout.split(gate_l, me, fill_value=-jnp.inf)
         if hash_l is not None:
@@ -1032,8 +1086,15 @@ def fused_ep_moe_v2(
         if defer_restore:
             return token_layout.defer(combined)
         if not restore_rows:
-            return combined
-        return token_layout.restore(combined, ax, me=me if pallas_restore else None)
+            out = combined
+        else:
+            out = token_layout.restore(combined, ax, me=me if pallas_restore else None)
+        if shared_rs is None:
+            return out
+        shared_sum = _shared_reduce_done(
+            shared_rs, token_layout, ax, combined, restore_rows
+        )
+        return out, shared_sum
 
     # The biases ride the same expert-axis sharding as the weights they
     # belong to, so no shard ever holds a bias for an expert it does not own.
@@ -1117,6 +1178,7 @@ def fused_ep_moe_v2(
         fused_select,
         bool(defer_restore),
         restore_rows,
+        bool(reduce_order_after),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
@@ -1127,7 +1189,7 @@ def fused_ep_moe_v2(
                     local_fn,
                     mesh=mesh,
                     in_specs=in_specs,
-                    out_specs=P(ax),
+                    out_specs=(P(ax), P(ax)) if reduce_order_after else P(ax),
                     check_vma=False,
                 )
                 _LAYER_SM_CACHE[key] = sm
