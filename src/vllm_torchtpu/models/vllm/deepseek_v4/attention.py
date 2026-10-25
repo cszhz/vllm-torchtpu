@@ -57,6 +57,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer imp
     VllmDeepseekV4Indexer,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.deepseek_v4 import seq_parallel
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
     get_vllm_model_wrapper_context,
@@ -912,8 +913,17 @@ class VllmDeepseekV4MLAAttention(
             f"{self.prefix}.wo_a: rotary_dim {rotary_dim} must be even and at most 128."
         )
 
-    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Apply inverse RoPE and low-rank output projections wo_a and wo_b."""
+    def _o_proj(
+        self,
+        o: torch.Tensor,
+        positions: torch.Tensor,
+        seq_parallel_rows: bool = False,
+    ) -> torch.Tensor:
+        """Apply inverse RoPE and low-rank output projections wo_a and wo_b.
+
+        With ``seq_parallel_rows`` the TP-partial wo_b output is
+        reduce-scattered to this core's rows instead of all-reduced.
+        """
         # The kernel folds the inverse RoPE, the activation quantization and
         # the per-group `wo_a` matmul into one pass.
         assert o.dtype == torch.bfloat16, (
@@ -933,6 +943,10 @@ class VllmDeepseekV4MLAAttention(
             self.wo_a.weight_scale,
         )
 
+        if seq_parallel_rows:
+            assert self.wo_b.bias is None
+            partial = self.wo_b.quant_method.apply(self.wo_b, z, None)
+            return seq_parallel.reduce_scatter(partial)
         out = self.wo_b(z)
         if isinstance(out, tuple):
             out = out[0]
@@ -942,8 +956,13 @@ class VllmDeepseekV4MLAAttention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        seq_parallel_rows: bool = False,
     ) -> torch.Tensor:
-        """Forward pass for DeepSeek-V4 attention layer."""
+        """Forward pass for DeepSeek-V4 attention layer.
+
+        ``hidden_states`` holds every row; with ``seq_parallel_rows`` the
+        result holds this core's slot of them (see ``seq_parallel``).
+        """
         if positions.ndim > 1:
             positions = positions.flatten()
 
@@ -964,5 +983,6 @@ class VllmDeepseekV4MLAAttention(
             None,
         )
 
-        out = self._o_proj(attn_output, positions)
-        return out
+        if seq_parallel_rows:
+            return self._o_proj(attn_output, positions, seq_parallel_rows=True)
+        return self._o_proj(attn_output, positions)

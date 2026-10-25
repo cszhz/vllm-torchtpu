@@ -61,6 +61,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op impo
     get_mhc_split_fn_op,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.deepseek_v4 import seq_parallel
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
@@ -90,6 +91,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
         attn_cls = VllmDeepseekV4MLAAttention
         if envs.TPU_DSV4_ATTN_INTRA_CHIP_TP:
+            if envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS:
+                raise NotImplementedError(
+                    "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS does not cover "
+                    "TPU_DSV4_ATTN_INTRA_CHIP_TP's attention"
+                )
             from vllm_torchtpu.models.vllm.deepseek_v4.attn_intra_chip import (
                 VllmDeepseekV4MLAAttentionIntraChip as attn_cls,
             )
@@ -202,6 +208,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
+        seq_parallel_rows: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Defer each post into the next pre so the pair is one kernel.
 
@@ -209,6 +216,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         carries `(residual, post_mix, res_mix)` -- the recombine that output
         still owes. The chain is opened by the layer-0 attention pre, which
         has no preceding post, and closed by the caller.
+
+        With `seq_parallel_rows`, everything passed and returned holds this
+        core's slot of the rows (see `seq_parallel`); the sublayers gather
+        the rows they need.
         """
         if residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
@@ -229,7 +240,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         x = self._norm(self.attn_norm, x)
-        x = self.attn(positions, x)
+        if seq_parallel_rows:
+            x = self.attn(positions, seq_parallel.all_gather(x), seq_parallel_rows=True)
+        else:
+            x = self.attn(positions, x)
 
         residual, post_mix, res_mix, x = self.mhc_ops.fused(
             x,
@@ -242,7 +256,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             *self._norm_arg(self.ffn_norm),
         )
         x = self._norm(self.ffn_norm, x)
-        x = self.ffn(x, input_ids)
+        x = self.ffn(x, input_ids, seq_parallel_rows=seq_parallel_rows)
         return x, residual, post_mix, res_mix
 
 
@@ -564,6 +578,13 @@ class DeepseekV4Model(nn.Module):
         if input_ids is not None and self.start_layer < self.config.num_hash_layers:
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
+        # Graphs are traced per token bucket, so this is fixed per graph.
+        sp = get_pp_group().world_size == 1 and seq_parallel.active(
+            hidden_states.shape[0]
+        )
+        if sp:
+            hidden_states = seq_parallel.take_local(hidden_states)
+
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None
@@ -578,13 +599,15 @@ class DeepseekV4Model(nn.Module):
                 post_mix,
                 res_mix,
                 residual,
+                seq_parallel_rows=sp,
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the full hc-stream state and collapse it the
                 # way the drafts were trained on: settle the deferred post,
                 # then mean over the hc streams (upstream numerics).
                 aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
-                aux_hidden_states.append(aux_recon.mean(dim=1))
+                aux = aux_recon.mean(dim=1)
+                aux_hidden_states.append(seq_parallel.all_gather(aux) if sp else aux)
                 final_aux_recon = aux_recon
 
         if post_mix is not None:
@@ -611,6 +634,8 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        if sp:
+            hidden_states = seq_parallel.all_gather(hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

@@ -365,6 +365,7 @@ def fused_ep_moe_v2(
     decode_combine=False,
     pallas_restore=False,
     fused_select=False,
+    restore_rows=True,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -408,6 +409,9 @@ def fused_ep_moe_v2(
     routes and computes a disjoint slice, then gathers the combined outputs
     within its group to restore the input row order. Expert sharding stays
     unchanged. None means singleton groups with no token replication.
+    With restore_rows=False the gather is skipped: each member returns only
+    the rows it computed (its slot's contiguous 1/width of the input rows),
+    which needs the input rows to split evenly over a group.
 
     mesh_ep_ranks names the EP rank at every device-mesh index. A non-identity
     order relabels only the selected expert ids after top-k, keeping the full
@@ -540,6 +544,11 @@ def fused_ep_moe_v2(
         row_alignment=U32_SUBLANE_TILE,
     )
     t_local = token_layout.local_rows
+    if not restore_rows and t_local * len(token_layout.groups[0]) != T // ep:
+        raise ValueError(
+            f"restore_rows=False needs {T // ep} rows per shard to split evenly "
+            f"over token replica groups of {len(token_layout.groups[0])}"
+        )
     T = ep * t_local
     P = jax.sharding.PartitionSpec
     stride_bound = ragged_stride_bound(T, topk, e_total, capacity)
@@ -1014,6 +1023,8 @@ def fused_ep_moe_v2(
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        if not restore_rows:
+            return combined
         return token_layout.restore(combined, ax, me=me if pallas_restore else None)
 
     # The biases ride the same expert-axis sharding as the weights they
@@ -1096,6 +1107,7 @@ def fused_ep_moe_v2(
         decode_combine,
         pallas_restore,
         fused_select,
+        restore_rows,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
