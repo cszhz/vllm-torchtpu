@@ -31,9 +31,11 @@ sets the custom call's operand memory space, which stops the staging (see
 ``TPU_PALLAS_HBM_PIN=2``: also blocked operands with no explicit memory space
 (the Pallas pipeline DMAs their blocks from HBM itself).
 ``TPU_PALLAS_HBM_PIN_SKIP=<regex>``: kernel names (pallas_call ``name=``) to leave alone;
-default ``^proj_and_save_state_runs$`` (the prefill compressor: pinning its
-hidden states makes XLA add a [512, 7168] relayout copy, +43 us per twin
-mixed step, measured). Set it to an empty string to pin everything.
+default ``_DEFAULT_SKIP``: the prefill compressor (pinning its hidden states
+makes XLA add a [T, 7168] relayout copy, +27..43 us per twin mixed step) and
+the fused EP MoE family + small collectives (the expert kernel ran +4.6%
+slower pinned at TP8 T16, 3 boots per arm, measured). Set it to an empty
+string to pin everything.
 ``TPU_PALLAS_HBM_PIN_ONLY=<regex>``: only kernels whose name matches.
 
 Same kernels, same arithmetic: bit-identical outputs. Only traced operands are
@@ -50,6 +52,10 @@ import re
 logger = logging.getLogger(__name__)
 
 _MARK = "_torchtpu_hbm_pin_patch"
+_DEFAULT_SKIP = (
+    r"^(proj_and_save_state_runs$|fused_ep_moe_v2_|moe_v2_|oneshot_all_gather"
+    r"|small_all_)"
+)
 
 
 def _level() -> int:
@@ -70,7 +76,7 @@ def install_pallas_hbm_pin() -> None:
     orig = pl.pallas_call
     if getattr(orig, _MARK, False):
         return
-    skip = os.environ.get("TPU_PALLAS_HBM_PIN_SKIP", "^proj_and_save_state_runs$")
+    skip = os.environ.get("TPU_PALLAS_HBM_PIN_SKIP", _DEFAULT_SKIP)
     only = os.environ.get("TPU_PALLAS_HBM_PIN_ONLY", "")
     skip_re = re.compile(skip) if skip else None
     only_re = re.compile(only) if only else None
