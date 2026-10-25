@@ -367,6 +367,7 @@ def _attention_csa(
     union_dense_max_heads: int = 32,
     union_dense_max_kv_tp4: int = 0,
     union_dense_plan_unconditional: bool = False,
+    topk_after_q_above: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -378,6 +379,18 @@ def _attention_csa(
 
     swa_page_indices = swa_page_indices.flatten()
     main_page_indices = main_page_indices.flatten()
+
+    if topk_after_q_above and q.shape[0] > topk_after_q_above:
+        # TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE: the top-k (under the indexer token
+        # split, an all-gather of every TP rank's rows) is first needed by the
+        # union plan issued below, which XLA starts as early as it can -- so
+        # the gather's done sat right behind its start, ~21 us exposed per
+        # CSA layer at c16 T512, while the q projection and its norm/rope,
+        # which do not need it, waited. Fencing the top-k with q moves the
+        # plan's start behind them and lets the gather complete under them;
+        # the plan still has the SWA pass and the compressor to run behind.
+        # Scheduling only: same values.
+        extra, q = jax.lax.optimization_barrier((extra, q))
 
     swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
         q=q,

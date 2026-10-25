@@ -187,6 +187,7 @@ if TYPE_CHECKING:
     TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
     TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
     TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4: int = 0
+    TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE: int = 0
     TPU_DSV4_SEQ_PARALLEL: bool = False
     TPU_NUM_GPU_BLOCKS_OVERRIDE: int = 0
     TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: int = 0
@@ -1291,6 +1292,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4": env_int(
         "TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4", 0
     ),
+    # CSA buckets above this many tokens fence the top-k with the projected
+    # q before the attention op uses it, so the indexer's top-k all-gather
+    # (token split) completes under the q projection instead of right behind
+    # its start. Scheduling only. 0 = off.
+    "TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE": env_int("TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE", 0),
     # DeepSeek-V4 sequence parallelism over the TP group: the mHC residual
     # stream, the mHC seams and the MoE (router, fused EP, a replicated shared
     # expert) run on this rank's 1/tp of the tokens. Attention all-gathers its

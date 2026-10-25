@@ -422,6 +422,7 @@ class VllmDeepseekV4MLAAttention(
                     envs.TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE > 0
                     and bool(envs.TPU_DSV4_SEQ_PARALLEL)
                 ),
+                "topk_after_q_above": envs.TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE,
             }
             if is_csa
             else {
