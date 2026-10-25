@@ -669,8 +669,8 @@ def _dense_window_kernel(
     # Output
     o_ref,  # [tq, num_q_heads, head_dim]
     # Scratch
-    nope_win_ref,  # int32[max_pages * page_size, 128]
-    rope_win_ref,  # int32[max_pages * page_size // 4, 128]
+    nope_win_x2_ref,  # int32[2, max_pages * page_size, 128] window per block parity
+    rope_win_x2_ref,  # int32[2, max_pages * page_size // 4, 128]
     kv_ref,  # bf16[num_tiles, tile, head_dim] dequantized window, slot order
     bitmap_ref,  # int32[window_cap // 32, block_tokens] selection bit words
     mask_ref,  # int32[num_tiles, block_tokens, tile] 0/1 selection
@@ -678,7 +678,7 @@ def _dense_window_kernel(
     acc_ref,  # f32[tq * num_q_heads, head_dim]
     m_ref,  # f32[tq * num_q_heads, 128] lane-wide running row max
     l_ref,  # f32[tq * num_q_heads, 128] lane-wide running row sum
-    sems,  # DMA [2]
+    sems,  # DMA [2, 2] (block parity, nope/rope)
     *,
     sm_scale: float,
 ):
@@ -697,7 +697,8 @@ def _dense_window_kernel(
     num_tiles, tile, _ = kv_ref.shape
     quarter = tile // 4
     page_size = cache_kv_nope_hbm_ref.shape[1]
-    max_pages = nope_win_ref.shape[0] // page_size
+    max_pages = nope_win_x2_ref.shape[1] // page_size
+    num_blocks = pl.num_programs(0)
     steps_per_block = pl.num_programs(1)
 
     blk = pl.program_id(0)
@@ -705,36 +706,46 @@ def _dense_window_kernel(
     step = blk * steps_per_block + step_in_blk
     window = blk_window_ref[blk]
     eligible = window >= 0
+    nope_win_ref = nope_win_x2_ref.at[blk % 2]
+    rope_win_ref = rope_win_x2_ref.at[blk % 2]
 
-    def page_copies(k):
-        page = blk_pages_ref[blk * max_pages + k]
+    def page_copies(b, k):
+        page = blk_pages_ref[b * max_pages + k]
         nope = pltpu.make_async_copy(
             cache_kv_nope_hbm_ref.at[page],
-            nope_win_ref.at[pl.ds(k * page_size, page_size)],
-            sems.at[0],
+            nope_win_x2_ref.at[b % 2, pl.ds(k * page_size, page_size)],
+            sems.at[b % 2, 0],
         )
         rope = pltpu.make_async_copy(
             cache_kv_rope_hbm_ref.at[page],
-            rope_win_ref.at[pl.ds(k * (page_size // 4), page_size // 4)],
-            sems.at[1],
+            rope_win_x2_ref.at[b % 2, pl.ds(k * (page_size // 4), page_size // 4)],
+            sems.at[b % 2, 1],
         )
         return nope, rope
 
+    def window_copies(b, method):
+        def body(k, carry):
+            for cp in page_copies(b, k):
+                getattr(cp, method)()
+            return carry
+
+        lax.fori_loop(0, cdiv(blk_window_ref[b], page_size), body, 0)
+
     def fetch_window():
-        num_pages = cdiv(window, page_size)
+        # Block blk - 1 started this block's copies if both are eligible.
+        prefetched = (blk > 0) & (blk_window_ref[jnp.maximum(blk - 1, 0)] >= 0)
 
-        def start(k, carry):
-            for cp in page_copies(k):
-                cp.start()
-            return carry
+        @pl.when(jnp.logical_not(prefetched))
+        def _():
+            window_copies(blk, "start")
 
-        def wait(k, carry):
-            for cp in page_copies(k):
-                cp.wait()
-            return carry
+        window_copies(blk, "wait")
+        # The other buffer's block is done; fill it for the next block.
+        nxt = jnp.minimum(blk + 1, num_blocks - 1)
 
-        lax.fori_loop(0, num_pages, start, 0)
-        lax.fori_loop(0, num_pages, wait, 0)
+        @pl.when((blk + 1 < num_blocks) & (blk_window_ref[nxt] >= 0))
+        def _():
+            window_copies(nxt, "start")
 
     def dequant_window():
         """Window rows -> kv_ref tiles in slot order; rows >= window are 0."""
@@ -962,8 +973,8 @@ def _dense_window_attention(
     num_tiles = DENSE_MAX_WINDOW // DENSE_KV_TILE
     rows = tq * num_q_heads
     scratch_shapes = [
-        pltpu.VMEM((max_pages * page_size, 128), jnp.int32),
-        pltpu.VMEM((max_pages * page_size // 4, 128), jnp.int32),
+        pltpu.VMEM((2, max_pages * page_size, 128), jnp.int32),
+        pltpu.VMEM((2, max_pages * page_size // 4, 128), jnp.int32),
         pltpu.VMEM((num_tiles, DENSE_KV_TILE, head_dim), jnp.bfloat16),
         pltpu.VMEM((DENSE_MAX_WINDOW // 32, block_tokens), jnp.int32),
         pltpu.VMEM((num_tiles, block_tokens, DENSE_KV_TILE), jnp.int32),
@@ -971,7 +982,7 @@ def _dense_window_attention(
         pltpu.VMEM((rows, head_dim), jnp.float32),
         pltpu.VMEM((rows, 128), jnp.float32),
         pltpu.VMEM((rows, 128), jnp.float32),
-        pltpu.SemaphoreType.DMA((2,)),
+        pltpu.SemaphoreType.DMA((2, 2)),
     ]
     scalar_prefetches = (
         jnp.where(eligible, blk_window, -1).astype(jnp.int32),
