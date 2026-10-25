@@ -37,9 +37,11 @@ Rank r owns rows [r * T / tp, (r + 1) * T / tp), the order the reduce-scatter
 produces and the all-gather consumes. The rank enters the graph as data, so
 every rank traces and compiles the same program.
 
-The decision reads the token count while tracing, so it leaves a shape guard
-and the backbone is re-traced per bucket group (compilation/shape_variants).
-Every DP rank runs the same bucket, so all EP ranks take the same MoE op.
+The sequence-parallel steps run in a compiled module of their own
+(model.DeepseekV4ModelSP over the same layers), chosen per step on the padded
+bucket size outside both graphs; each graph compiles only its own buckets
+(compilation/bucket_filter). Every DP rank runs the same bucket, so all EP
+ranks take the same MoE op.
 """
 
 import torch
@@ -63,15 +65,17 @@ def tp_world_size() -> int:
     return get_tensor_model_parallel_world_size()
 
 
-def eligible(num_tokens) -> bool:
-    """Whether a backbone step of ``num_tokens`` tokens runs sequence-parallel.
+def enabled() -> bool:
+    """Whether the sequence-parallel graph is built at all."""
+    return bool(envs.TPU_DSV4_PREFILL_SP) and tp_world_size() > 1
 
-    ``num_tokens`` must be a (possibly symbolic) tensor dimension: comparing it
-    is what leaves the guard the per-bucket re-trace partitions on.
-    """
-    tp = tp_world_size()
-    if not envs.TPU_DSV4_PREFILL_SP or tp <= 1:
+
+def eligible(num_tokens: int) -> bool:
+    """Whether a backbone step of ``num_tokens`` (padded) tokens is routed to
+    the sequence-parallel graph. The same rule filters each graph's buckets."""
+    if not enabled():
         return False
+    tp = tp_world_size()
     minimum = max(int(envs.TPU_DSV4_PREFILL_SP_MIN_TOKENS), tp * ROW_ALIGNMENT)
     return bool(num_tokens >= minimum and num_tokens % (tp * ROW_ALIGNMENT) == 0)
 

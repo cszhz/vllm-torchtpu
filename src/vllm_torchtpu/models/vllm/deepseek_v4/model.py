@@ -22,6 +22,7 @@ from itertools import islice
 
 import torch
 import torch.nn as nn
+from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -52,6 +53,7 @@ from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import bucket_filter
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,  # noqa: E501
@@ -542,14 +544,9 @@ class DeepseekV4Model(nn.Module):
             return input_ids
         return dp_group.all_gather(input_ids, dim=0)
 
-    def _sequence_parallel_step(self, hidden_states: torch.Tensor) -> bool:
-        """Whether this step keeps the residual streams sharded over TP.
-
-        Asked of the embedded [tokens, hidden] tensor so the decision is a
-        shape guard (see sequence_parallel.eligible).
-        """
-        if not sp.eligible(hidden_states.shape[0]):
-            return False
+    @staticmethod
+    def check_sequence_parallel_supported() -> None:
+        """Refuse configurations the sequence-parallel graph does not handle."""
         assert get_pp_group().world_size == 1, (
             "DeepSeek-V4 sequence-parallel prefill does not support PP"
         )
@@ -563,7 +560,6 @@ class DeepseekV4Model(nn.Module):
         assert not envs.MOE_EXPERT_COUNT_TAP_DIR, (
             "TPU_DSV4_PREFILL_SP does not support MOE_EXPERT_COUNT_TAP_DIR"
         )
-        return True
 
     def make_empty_intermediate_tensors(
         self,
@@ -587,6 +583,20 @@ class DeepseekV4Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        """The replicated-TP backbone; sequence-parallel steps go to
+        DeepseekV4ModelSP, a separate compiled graph over the same layers."""
+        return self.forward_impl(
+            input_ids, positions, intermediate_tensors, inputs_embeds, False
+        )
+
+    def forward_impl(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None,
+        sequence_parallel: bool,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -605,7 +615,6 @@ class DeepseekV4Model(nn.Module):
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
         num_tokens = hidden_states.shape[0]
-        sequence_parallel = self._sequence_parallel_step(hidden_states)
         padding_mask = None
         if sequence_parallel:
             rank = sp.rank_as_data(hidden_states.device)
@@ -849,6 +858,39 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     )
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+    }
+)
+class DeepseekV4ModelSP(nn.Module):
+    """The backbone's sequence-parallel graph (TPU_DSV4_PREFILL_SP).
+
+    A compiled module of its own over the backbone's layers and parameters: it
+    holds the backbone without registering it, so parameters, loading and
+    state dicts see one copy. DeepseekV4ForCausalLM routes it only the
+    sequence-parallel buckets and each module compiles only its own buckets
+    (compilation/bucket_filter), so neither graph branches on the token count.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, backbone: DeepseekV4Model):
+        super().__init__()
+        object.__setattr__(self, "_backbone", backbone)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        return self._backbone.forward_impl(
+            input_ids, positions, intermediate_tensors, inputs_embeds, True
+        )
+
+
 class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
     """DeepSeek-V4 causal language model registered for TPU inference."""
 
@@ -869,6 +911,14 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.model_sp = None
+        if sp.enabled():
+            self.model.check_sequence_parallel_supported()
+            self.model_sp = DeepseekV4ModelSP(
+                vllm_config=vllm_config, backbone=self.model
+            )
+            bucket_filter.assign(self.model_sp, sp.eligible)
+            bucket_filter.assign(self.model, lambda n: not sp.eligible(n))
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -898,7 +948,19 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        if self.model_sp is None:
+            return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        # Routed on the padded bucket size, outside both compiled graphs.
+        if sp.eligible(positions.shape[0]):
+            with (
+                bucket_filter.serving(sp.eligible),
+                set_model_tag("backbone_sp"),
+            ):
+                return self.model_sp(
+                    input_ids, positions, intermediate_tensors, inputs_embeds
+                )
+        with bucket_filter.serving(bucket_filter.assigned(self.model)):
+            return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return getattr(self.model, "_mtp_hidden_buffer", None)
