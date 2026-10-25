@@ -67,6 +67,22 @@ def test_remote_dspark_handoff_waits_for_prefill_completion(tmp_path) -> None:
     assert take_remote_dspark_handoff("request", tmp_path) == params
 
 
+def test_remote_dspark_handoff_maps_internal_id_to_proxy_id(tmp_path) -> None:
+    params = {"uuid": 7, "req_id": "cmpl-external-0-internal"}
+    publish_remote_dspark_handoff(
+        params["req_id"],
+        params,
+        tmp_path,
+        ready=False,
+        control_request_id="external",
+    )
+    assert take_remote_dspark_handoff("external", tmp_path) is None
+
+    complete_remote_dspark_handoff(params["req_id"], tmp_path)
+    assert take_remote_dspark_handoff("external", tmp_path) == params
+    assert take_remote_dspark_handoff(params["req_id"], tmp_path) is None
+
+
 def test_transport_proposal_feedback_round_trip():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))

@@ -3253,3 +3253,25 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+def test_remote_dspark_bootstrap_feedback_uses_raiden_source_id():
+    transport = MagicMock()
+    runner = SimpleNamespace(
+        _remote_dspark_transport=transport,
+        _profiler_rank=1,
+        _remote_dspark_proposal_rank=True,
+        _remote_dspark_producer_request_ids=None,
+        _remote_dspark_source_request_ids={"consumer-id": "producer-id"},
+    )
+    chunk = SimpleNamespace(
+        aux_hidden_states=[torch.ones(1, 4)],
+        query_start_loc_np=np.array([0, 1]),
+        num_reqs=1,
+    )
+    TPUModelRunner._send_remote_dspark_feedback(
+        runner, ["consumer-id"], [torch.tensor([[3]])], [chunk], bootstrap=True
+    )
+    feedback = transport.send_feedback.call_args.args[0]
+    assert feedback["request_ids"] == ["producer-id"]
+    assert runner._remote_dspark_source_request_ids == {}

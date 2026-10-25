@@ -643,6 +643,7 @@ async def send_remote_dspark_request_to_prefill(
         {
             "do_remote_decode": True,
             "do_remote_prefill": False,
+            "_remote_dspark_control_request_id": request_id,
         }
     )
     # P's truncated prompt uses one generated-token slot as the boundary

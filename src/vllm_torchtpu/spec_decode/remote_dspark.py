@@ -67,6 +67,7 @@ def publish_remote_dspark_handoff(
     socket_dir: str | os.PathLike[str] | None = None,
     *,
     ready: bool = True,
+    control_request_id: str | None = None,
 ) -> None:
     """Atomically publish the early Raiden handle to the colocated proxy."""
     path = remote_dspark_handoff_path(request_id, socket_dir)
@@ -75,7 +76,7 @@ def publish_remote_dspark_handoff(
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     payload = {
-        "request_id": request_id,
+        "request_id": control_request_id or request_id,
         "kv_transfer_params": kv_transfer_params,
     }
     try:
@@ -90,7 +91,10 @@ def complete_remote_dspark_handoff(
 ) -> None:
     """Expose a staged handle after all producer ranks finish their KV writes."""
     path = remote_dspark_handoff_path(request_id, socket_dir)
-    os.replace(path.with_suffix(".pending"), path)
+    pending = path.with_suffix(".pending")
+    payload = json.loads(pending.read_text(encoding="utf-8"))
+    destination = remote_dspark_handoff_path(payload["request_id"], socket_dir)
+    os.replace(pending, destination)
 
 
 def take_remote_dspark_handoff(

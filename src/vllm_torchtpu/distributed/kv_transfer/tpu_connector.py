@@ -2213,7 +2213,14 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 if remote_dspark:
                     # Register pointers ahead, but expose them to the proxy
                     # only after every producer rank has materialized its KV.
-                    publish_remote_dspark_handoff(req_id, params, ready=False)
+                    publish_remote_dspark_handoff(
+                        req_id,
+                        params,
+                        ready=False,
+                        control_request_id=request.kv_transfer_params.get(
+                            "_remote_dspark_control_request_id"
+                        ),
+                    )
                     logger.info(
                         "Staged remote DSpark Raiden handoff: req_id=%s uuid=%s",
                         req_id,

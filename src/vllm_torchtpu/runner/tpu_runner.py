@@ -97,6 +97,9 @@ from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
+    TPUConnectorMetadata,
+)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
@@ -1031,6 +1034,7 @@ class TPUModelRunner(GPUModelRunner):
         self._remote_dspark_transport: RemoteDSparkTransport | None = None
         self._remote_dspark_proposal_rank = False
         self._remote_dspark_producer_request_ids: list[str] | None = None
+        self._remote_dspark_source_request_ids: dict[str, str] = {}
         self._remote_dspark_awaiting_feedback = False
         if self._remote_dspark_role:
             if speculative_config is None or speculative_config.method != "dspark":
@@ -3783,6 +3787,18 @@ class TPUModelRunner(GPUModelRunner):
                 ],
             )
         # Update cached state
+        if self._remote_dspark_role == "consumer":
+            for req_id in scheduler_output.finished_req_ids:
+                self._remote_dspark_source_request_ids.pop(req_id, None)
+            metadata = cast(
+                TPUConnectorMetadata | None, scheduler_output.kv_connector_metadata
+            )
+            if metadata is not None:
+                for req_id, load in metadata.reqs_to_load.items():
+                    source_req_id = getattr(load, "source_req_id", None)
+                    if not isinstance(source_req_id, str):
+                        raise RuntimeError("remote DSpark requires a Raiden source ID")
+                    self._remote_dspark_source_request_ids[req_id] = source_req_id
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
@@ -4474,6 +4490,10 @@ class TPUModelRunner(GPUModelRunner):
                     raise RuntimeError(
                         "remote DSpark bootstrap unexpectedly has a proposal mapping"
                     )
+                feedback_request_ids = [
+                    self._remote_dspark_source_request_ids.pop(req_id)
+                    for req_id in request_ids
+                ]
             elif self._remote_dspark_producer_request_ids is None:
                 raise RuntimeError(
                     "remote DSpark feedback has no matching producer proposal"
