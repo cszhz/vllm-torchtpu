@@ -238,8 +238,9 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     if at is not None:
         args += [*at["arrays"], at["bt_flat"], *at["weights"]]
 
-    def make(inplace):
-        step = SK.build(dataclasses.replace(scfg, cache_inplace=inplace), axis="d")
+    def make(inplace, sc=None):
+        sc = scfg if sc is None else sc
+        step = SK.build(dataclasses.replace(sc, cache_inplace=inplace), axis="d")
         n_out = 0 if inplace else n_arr
         return jax.jit(
             jax.shard_map(functools.partial(per_rank, step), mesh=mesh,
@@ -274,6 +275,35 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
             ok=sum(mism) == 0 and sum(changed) > 0 and int(diff(oa[0], ob[0])) == 0,
         )
         del orig, ca, cb, oa, ob, na
+
+    if var.get("pipeline_check") == "1" and at is not None:
+        # one in-place step each from identical caches and inputs: the program with
+        # VLLM_TPU_DSV4_MK_ATTN_PIPELINE off vs on (pf_fault: the prefetch control)
+        diff = jax.jit(lambda x, y: jnp.sum(x != y))
+        cp = jax.jit(lambda x: x + jnp.zeros((), x.dtype))
+        off = dataclasses.replace(scfg, attn_pipeline=False, attn_split=False)
+        on = dataclasses.replace(scfg, attn_pipeline=True, attn_split=scfg.attn_tp > 1)
+        orig = [cp(x) for x in args[c0 : c0 + n_arr]]
+        ca, cb = [cp(x) for x in orig], [cp(x) for x in orig]
+        oa = make(True, off)(*args[:c0], *ca, *args[c0 + n_arr :])
+        AP.PF_FAULT = var.get("pf_fault", "")
+        try:
+            ob = make(True, on)(*args[:c0], *cb, *args[c0 + n_arr :])
+            jax.block_until_ready((oa, ob))
+        finally:
+            AP.PF_FAULT = ""
+        mism = [int(diff(x, y)) for x, y in zip(ca, cb)]
+        written = sum(int(diff(x, y)) for x, y in zip(ca, orig))
+        res_m, aux_m = int(diff(oa[0], ob[0])), int(diff(oa[1], ob[1]))
+        result(
+            check="pipeline_off_vs_on", var=var, owners=owners, T=T,
+            res_mismatch=res_m, aux_mismatch=aux_m, cache_mismatch=sum(mism),
+            cache_arrays_differing=sum(m > 0 for m in mism), words_written=written,
+            finite=bool(np.isfinite(np.asarray(oa[0].addressable_shards[0].data,
+                                               np.float32)).all()),
+            bitexact=sum(mism) == 0 and res_m == 0 and aux_m == 0 and written > 0,
+        )  # fmt: skip
+        del orig, ca, cb, oa, ob
 
     if var.get("hlocheck") == "1":  # large copies XLA inserted around the kernel
         import re
