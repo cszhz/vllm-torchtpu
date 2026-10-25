@@ -180,7 +180,6 @@ class DeepseekV4MoE(nn.Module):
         are the same rows in the same slot order.
         """
         runner = self.experts
-        assert not envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL
         assert self.shared_experts is not None
         rows = seq_parallel.all_gather(local_rows)
         # The runner's order (gate, shared expert, routed op), which is also
@@ -189,7 +188,13 @@ class DeepseekV4MoE(nn.Module):
         shared = self.shared_experts(rows)
         routed_layer = runner.routed_experts
         routed = routed_layer.quant_method._forward_monolithic_tpu(
-            routed_layer, rows, router_logits, input_ids, local_rows=True
+            routed_layer,
+            rows,
+            router_logits,
+            input_ids,
+            # As VllmMoERunner._apply_quant_method hands it over.
+            order_after=shared if envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL else None,
+            local_rows=True,
         )
         shared = seq_parallel.reduce_scatter(shared)
         if runner.routed_scaling_factor != 1.0:
