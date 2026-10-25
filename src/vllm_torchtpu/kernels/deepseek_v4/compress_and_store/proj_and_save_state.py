@@ -69,6 +69,20 @@ class Configs:
 # Upper bound on tokens per grid step.
 MAX_TILE_N = 128
 
+# Strided accumulator rows reach 8 sublanes per vector access only when the
+# token stride (in 128-lane chunks) has no factor of 8: stride 16 splits each
+# access 4 ways, stride 8 two ways, odd strides not at all.
+ACC_PAD_ROWS = 1
+
+
+def acc_rows_per_token(slots_per_token: int, last_dim: int) -> int:
+    """Accumulator rows per token: the state's slots plus padding when the
+    unpadded chunk stride would split strided vector stores."""
+    chunks_per_token = slots_per_token * last_dim // 128
+    if chunks_per_token % 8 == 0:
+        return slots_per_token + ACC_PAD_ROWS
+    return slots_per_token
+
 
 def store_state_chunks(ref, val, chunk_offset, chunks_per_token):
     """Stores ``val`` (tile_n, c * 128) as 128-lane chunks ``chunk_offset..``
@@ -106,7 +120,7 @@ def kernel(
     # scratch_memory
     w_vmem,  # [hidden_size, 2 * state_width], resident for the whole call
     w_sems,  # [num_k]
-    acc_ref,  # (2, tile_n * slots_per_token, 1, lanes) f32
+    acc_ref,  # (2, tile_n * acc_rows_per_token, 1, lanes) f32
     sem_ref,  # [2]
     write_rows_ref,  # [2] rows in flight from each acc buffer
     run_starts_ref,  # [tile_n + 1] first token of each run of one tile
@@ -122,10 +136,20 @@ def kernel(
     state_width = cfgs.dims.size_m // 2
     last_dim = acc_ref.shape[-1]
     slots_per_token = cfgs.dims.size_m // last_dim
-    chunks_per_token = cfgs.dims.size_m // 128
+    acc_pitch = acc_rows_per_token(slots_per_token, last_dim)
+    chunk_pitch = acc_pitch * last_dim // 128
     acc_ref_u8 = acc_ref.bitcast(jnp.uint8)
     # A CSA int32 NoPE array hosts the state too; write it as uint8 slabs.
     cache = csa_cache_layout.as_u8_slabs(cache)
+    padded = acc_pitch != slots_per_token
+    if padded:
+        num_pages, page_rows_, sub_rows, lanes = cache.shape
+        assert page_rows_ % slots_per_token == 0
+        # Token-major views, so one DMA moves a run's tokens and skips the pad.
+        cache_tokens = cache.reshape(
+            num_pages, page_rows_ // slots_per_token, slots_per_token, sub_rows, lanes
+        )
+        acc_tokens = acc_ref_u8.reshape(2, tile_n, acc_pitch, sub_rows, lanes)
     write_rows_ref[0] = 0
     write_rows_ref[1] = 0
 
@@ -186,9 +210,21 @@ def kernel(
         def _(r):
             start = run_starts_ref[r]
             slot = slot_mapping[base + start]
-            run_rows = (run_ends_ref[r] - start) * slots_per_token
-            dest = cache.at[slot // page_rows, pl.ds(slot % page_rows, run_rows)]
-            src = acc_ref_u8.at[buf_idx, pl.ds(start * slots_per_token, run_rows)]
+            run_tokens = run_ends_ref[r] - start
+            run_rows = run_tokens * slots_per_token
+            if padded:
+                dest = cache_tokens.at[
+                    slot // page_rows,
+                    pl.ds((slot % page_rows) // slots_per_token, run_tokens),
+                ]
+                src = acc_tokens.at[
+                    buf_idx, pl.ds(start, run_tokens), pl.ds(0, slots_per_token)
+                ]
+            else:
+                dest = cache.at[slot // page_rows, pl.ds(slot % page_rows, run_rows)]
+                src = acc_ref_u8.at[
+                    buf_idx, pl.ds(start * slots_per_token, run_rows)
+                ]
             pltpu.make_async_copy(src, dest, sem_ref.at[buf_idx]).start()
 
     def inner_kernel(
@@ -238,12 +274,12 @@ def kernel(
                     new_acc = prod
                 else:
                     old_acc = load_state_chunks(
-                        acc, tile_n, chunk_offset, num_chunks, chunks_per_token
+                        acc, tile_n, chunk_offset, num_chunks, chunk_pitch
                     )
                     new_acc = old_acc + prod
                 if k == num_k - 1 and m == 1:
                     new_acc = new_acc + _ape_selected()
-                store_state_chunks(acc, new_acc, chunk_offset, chunks_per_token)
+                store_state_chunks(acc, new_acc, chunk_offset, chunk_pitch)
 
         _dma_copy_out(n_idx, buf_idx)
 
@@ -355,7 +391,10 @@ def proj_and_save_state(
     scratch_shapes = [
         pltpu.VMEM((hidden_size, state_dim), wkv_wgate.dtype),
         pltpu.SemaphoreType.DMA((cfgs.num_k,)),
-        pltpu.VMEM((2, tile_n * slots_per_token, 1, last_dim), jnp.float32),
+        pltpu.VMEM(
+            (2, tile_n * acc_rows_per_token(slots_per_token, last_dim), 1, last_dim),
+            jnp.float32,
+        ),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SMEM((2,), jnp.int32),
         pltpu.SMEM((tile_n + 1,), jnp.int32),
