@@ -81,6 +81,10 @@ def _run_swa(
             jnp.full((q.shape[0], q.shape[1]), -1e9, dtype=jnp.float32),
         )
     kv_pages_per_block = max(1, envs.TPU_DSV4_SWA_KV_BLOCK_TOKENS // logical_page_size)
+    single_pass = (
+        envs.TPU_DSV4_SWA_SINGLE_PASS
+        and q.shape[0] <= envs.TPU_DSV4_SWA_SINGLE_PASS_MAX_TOKENS
+    )
     return mla_sliding_window_ragged_paged_attention(
         q=q,
         new_kv=new_kv,
@@ -100,7 +104,8 @@ def _run_swa(
         unnormalized_output=not swa_only,
         non_causal_block=non_causal_block,
         chunk_prefill_size=verify_q_len,
-        single_pass=envs.TPU_DSV4_SWA_SINGLE_PASS,
+        single_pass=single_pass,
+        single_pass_bq=envs.TPU_DSV4_SWA_SINGLE_PASS_BQ if single_pass else None,
     )
 
 
@@ -186,7 +191,6 @@ def _attention_hca(
         num_kv_pages_per_block=hca_num_kv_pages_per_block,
         num_queries_per_block=hca_num_queries_per_block,
         chunk_prefill_size=verify_q_len,
-        skip_empty_passes=envs.TPU_DSV4_SKIP_EMPTY_ATTN_PASSES,
         prefetch_early=envs.TPU_DSV4_HCA_PREFETCH_EARLY,
     )
     return output, updated_sw_cache

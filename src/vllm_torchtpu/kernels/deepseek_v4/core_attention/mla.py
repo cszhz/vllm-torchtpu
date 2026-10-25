@@ -748,7 +748,6 @@ def prepare_outputs(
         "num_queries_per_block",
         "vmem_limit_bytes",
         "decode_batch_size",
-        "skip_empty_passes",
         "prefetch_early",
         "probe",
     ),
@@ -775,7 +774,6 @@ def mla_ragged_paged_attention(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_batch_size: int = 8,
-    skip_empty_passes: bool = False,
     prefetch_early: bool = False,
     probe: int = 0,
 ) -> jax.Array:
@@ -1057,11 +1055,10 @@ def mla_ragged_paged_attention(
     )
 
     def maybe_skip(start_seq_idx, end_seq_idx, run):
-        # The prefill and mixed passes were always launched; an empty one costs
-        # ~1 us (a decode step's mixed pass is empty).
-        if not skip_empty_passes:
-            return run(q)
-        return skip_if_empty(start_seq_idx, end_seq_idx, run)
+        # Not cond-skipped: an XLA conditional costs more (~5 us, twin
+        # j-00a06dc8) than an empty launch (~1 us).
+        del start_seq_idx, end_seq_idx
+        return run(q)
 
     if chunk_prefill_size is not None:
         # Handle prefill where the query length is fixed per sequence.

@@ -1457,6 +1457,7 @@ def run_mla_batched_decode_kernel(
         "non_causal_block",
         "q_compute_block_size",
         "single_pass",
+        "single_pass_bq",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -1489,6 +1490,7 @@ def mla_sliding_window_ragged_paged_attention(
     non_causal_block: bool = False,
     decode_seq_batch_size: int = 32,
     single_pass: bool = False,
+    single_pass_bq: int | None = None,
 ) -> tuple[
     jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     jax.Array,  # [total_num_pages, physical_page_size_per_kv_packing, 4, 128] uint8
@@ -1865,7 +1867,13 @@ def mla_sliding_window_ragged_paged_attention(
         page_indices,
         cu_q_lens,
         num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-        num_queries_per_block=num_queries_per_blocks[2],
+        # Single pass: the q block fits a verify window rather than a prefill
+        # chunk (decode-sized buckets only, see the caller).
+        num_queries_per_block=(
+            single_pass_bq
+            if single_pass and single_pass_bq
+            else num_queries_per_blocks[2]
+        ),
         start_seq_idx=jnp.array(0) if single_pass else distribution[1],
         end_seq_idx=distribution[2],
         in_output=output,

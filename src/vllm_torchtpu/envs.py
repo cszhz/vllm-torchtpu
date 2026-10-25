@@ -160,9 +160,10 @@ if TYPE_CHECKING:
     TPU_DSV4_SWA_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
     TPU_DSV4_SWA_Q_COMPUTE_BLOCK_SIZE: int = 16
     TPU_DSV4_SWA_KV_BLOCK_TOKENS: int = 256
-    TPU_DSV4_SKIP_EMPTY_ATTN_PASSES: bool = False
     TPU_DSV4_HCA_PREFETCH_EARLY: bool = False
     TPU_DSV4_SWA_SINGLE_PASS: bool = False
+    TPU_DSV4_SWA_SINGLE_PASS_MAX_TOKENS: int = 32
+    TPU_DSV4_SWA_SINGLE_PASS_BQ: int = 8
     TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS: int = 0
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -1124,14 +1125,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_SWA_KV_BLOCK_TOKENS": env_positive_int(
         "TPU_DSV4_SWA_KV_BLOCK_TOKENS", 256
     ),
-    # DSv4 HCA attention: skip the verify / mixed kernel passes that have no
-    # sequences this step (each empty launch costs ~1 us; a decode step with
-    # speculative decoding has an empty mixed pass).
-    "TPU_DSV4_SKIP_EMPTY_ATTN_PASSES": env_bool("TPU_DSV4_SKIP_EMPTY_ATTN_PASSES"),
     # DSv4 sliding-window attention: run every sequence in one mixed-case kernel
     # launch instead of three (decode / verify / mixed), two of which are empty
     # on a speculative-decoding decode step (~1-1.5 us per empty launch).
     "TPU_DSV4_SWA_SINGLE_PASS": env_bool("TPU_DSV4_SWA_SINGLE_PASS"),
+    # ... only for buckets of T <= this many tokens (decode steps), with this
+    # mixed-case q block (a verify window, not a prefill chunk).
+    "TPU_DSV4_SWA_SINGLE_PASS_MAX_TOKENS": env_int(
+        "TPU_DSV4_SWA_SINGLE_PASS_MAX_TOKENS", 32
+    ),
+    "TPU_DSV4_SWA_SINGLE_PASS_BQ": env_positive_int("TPU_DSV4_SWA_SINGLE_PASS_BQ", 8),
     # DSv4 HCA attention: issue the next KV block's page DMAs before the current
     # block's compute instead of after it, so the copy overlaps the compute.
     "TPU_DSV4_HCA_PREFETCH_EARLY": env_bool("TPU_DSV4_HCA_PREFETCH_EARLY"),
