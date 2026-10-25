@@ -253,9 +253,10 @@ def _plan_kernel(
         if scale_lanes:
             bits = column(bits_all, lane_t, j // topk)
             scale = scale + jnp.where(lane_s == row, bits, 0)
-    tg_ref[...] = jnp.clip(
-        jnp.sum(gather, axis=0, keepdims=True), 0, jnp.int32(gather_hi)
-    )
+    tg = jnp.clip(jnp.sum(gather, axis=0, keepdims=True), 0, jnp.int32(gather_hi))
+    # A 1-D table is the layout the fused kernel reads; from [1, n] XLA
+    # relayouts it with an op of its own.
+    tg_ref[...] = tg.reshape(tg_ref.shape)
     if scale_lanes:
         ss = lax.bitcast_convert_type(jnp.sum(scale, axis=0, keepdims=True), jnp.float32)
         if ss_ref.shape[0] > 1:  # written as the [rows, 128] slab the kernel reads
@@ -358,11 +359,12 @@ def build_decode_plan(
     )
     i32 = jnp.int32
     # With `plan` pinning, every table the fused kernel reads leaves this
-    # kernel in HBM (and the scale slab already in its [rows, 128] shape);
-    # pos / mirror_pos feed XLA ops and stay in VMEM.
+    # kernel in HBM and in the shape the fused kernel reads (token gather 1-D,
+    # scale slab [rows, 128]); pos / mirror_pos feed XLA ops and stay in VMEM.
     hbm_tables = operand_pin.enabled("plan")
     out_shape = [jax.ShapeDtypeStruct((G, ep), i32) for _ in range(5)]
-    out_shape.append(jax.ShapeDtypeStruct((1, gather_rows), i32))
+    tg_shape = (gather_rows,) if hbm_tables else (1, gather_rows)
+    out_shape.append(jax.ShapeDtypeStruct(tg_shape, i32))
     if quantized:
         ss_shape = (scale_rows, HIDDEN_LANE_BLOCK) if hbm_tables else (1, scale_lanes)
         out_shape.append(jax.ShapeDtypeStruct(ss_shape, jnp.float32))
