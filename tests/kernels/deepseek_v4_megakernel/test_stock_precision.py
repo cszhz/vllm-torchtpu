@@ -28,6 +28,7 @@ os.environ["XLA_FLAGS"] = (
 import functools  # noqa: E402
 
 import jax  # noqa: E402
+import jax.extend.core as jex  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
@@ -168,3 +169,94 @@ def test_negative_control_two_roundings(make_inputs):
     frac = float(np.mean(_ulp_diff(out, ref) > 0))
     print(f"two roundings: {frac:.3f} of elements differ from stock")
     assert frac > 0.1
+
+
+# ---- mHC gates ---------------------------------------------------------------
+
+
+def _gate_inputs(seed):
+    """Raw mixes, squared sums, hc scale and base, sized so the gate logits
+    span the sigmoid's range (|logit| up to ~12)."""
+    rng = np.random.default_rng(seed)
+    m, nm, h = CFG.rows, CFG.n_mix, CFG.hidden
+    sqr = rng.uniform(0.1, 50.0, (m, 1)) * CFG.hc_mult * h
+    rs = 1.0 / np.sqrt(sqr / (CFG.hc_mult * h))
+    mixes = rng.standard_normal((m, nm)) * 4.0 / rs
+    scale = rng.uniform(0.5, 2.0, (1, 3))
+    base = rng.standard_normal((1, nm))
+    return tuple(jnp.asarray(a, F32) for a in (mixes, sqr, scale, base))
+
+
+def _gate_kernel_body(mix_ref, sqr_ref, sc_ref, bs_ref, pre_ref, post_ref, comb_ref):
+    pre, post, logits = DR.mhc_gates(
+        mix_ref[...], sqr_ref[...], sc_ref[...], bs_ref[...], CFG
+    )
+    pre_ref[...], post_ref[...] = pre, post
+    n = CFG.hc_mult**2
+    cols = DR.sinkhorn(
+        [logits[:, k : k + 1] for k in range(n)],
+        CFG.hc_mult,
+        CFG.hc_eps,
+        CFG.sinkhorn_iters,
+    )
+    comb_ref[...] = jnp.concatenate(cols, axis=1)
+
+
+def _stock_gate_body(mix_ref, sqr_ref, sc_ref, bs_ref, pre_ref, post_ref, comb_ref):
+    pre_ref[...], post_ref[...], comb_ref[...] = mhc_utils.gates_in_block(
+        mix_ref[...],
+        sqr_ref[...],
+        sc_ref,
+        bs_ref,
+        hc_mult=CFG.hc_mult,
+        hidden_size=CFG.hidden,
+        rms_eps=CFG.rms_eps,
+        hc_pre_eps=CFG.hc_eps,
+        gates=mhc_utils.GateConsts(CFG.hc_eps, CFG.hc_post_mult, CFG.sinkhorn_iters),
+    )
+
+
+@functools.partial(jax.jit, static_argnums=0)
+def _gates(body, mixes, sqr, scale, base):
+    m, k = mixes.shape[0], CFG.hc_mult
+    return pl.pallas_call(
+        body,
+        out_shape=tuple(jax.ShapeDtypeStruct((m, n), F32) for n in (k, k, k * k)),
+        interpret=True,
+    )(mixes, sqr, scale, base)
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_gates_match_stock(seed):
+    """pre and post (and the Sinkhorn comb) are bit-identical to stock
+    gates_in_block on the same inputs."""
+    args = _gate_inputs(seed)
+    got = _gates(_gate_kernel_body, *args)
+    ref = _gates(_stock_gate_body, *args)
+    for name, a, b in zip(("pre", "post", "comb"), got, ref):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b), err_msg=name)
+
+
+def _depends_on(jaxpr, outvar):
+    """Primitive names of the equations ``outvar`` depends on."""
+    producer = {v: e for e in jaxpr.eqns for v in e.outvars}
+    seen, names, todo = set(), set(), [outvar]
+    while todo:
+        e = producer.get(todo.pop())
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        names.add(e.primitive.name)
+        todo += [v for v in e.invars if not isinstance(v, jex.Literal)]
+    return names
+
+
+def test_post_gate_is_spelled_out():
+    """On TPU, Mosaic lowers ``logistic`` to its native, less accurate form;
+    on CPU it is XLA's, so only the jaxpr shows which one the post gate uses.
+    Stock spells post out and keeps logistic for pre; so must the kernel."""
+    closed = jax.make_jaxpr(lambda *a: DR.mhc_gates(*a, CFG))(*_gate_inputs(0))
+    pre, post, _ = closed.jaxpr.outvars
+    assert "logistic" in _depends_on(closed.jaxpr, pre)  # the walk sees it
+    deps = _depends_on(closed.jaxpr, post)
+    assert "logistic" not in deps and {"exp", "div"} <= deps, deps

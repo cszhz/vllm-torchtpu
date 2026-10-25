@@ -450,16 +450,10 @@ def make_dense_ops(
 
         sc = vec(slot, scale_name)  # [1, 3]
         bs = vec(slot, base_name)  # [1, 24]
-        rs = lax.rsqrt(sqr / (hcm * h) + eps)
-        sm = mixes * rs
-        pre = jax.nn.sigmoid(sm[:, :hcm] * sc[:, 0:1] + bs[:, :hcm]) + cfg.hc_eps
-        post_n = (
-            jax.nn.sigmoid(sm[:, hcm : 2 * hcm] * sc[:, 1:2] + bs[:, hcm : 2 * hcm])
-            * cfg.hc_post_mult
-        )
+        pre, post_n, comb_logits = mhc_gates(mixes, sqr, sc, bs, cfg)
         # Tokens onto lanes: one [1, 128] row per (i, j) entry.
         tsc[...] = jnp.zeros(tsc.shape, F32)
-        tsc[0:M, 0 : hcm * hcm] = sm[:, 2 * hcm :] * sc[:, 2:3] + bs[:, 2 * hcm :]
+        tsc[0:M, 0 : hcm * hcm] = comb_logits
         tt = tsc[...].T
         sk = sinkhorn_init(
             [tt[k : k + 1, :] for k in range(hcm * hcm)], hcm, cfg.hc_eps
@@ -757,6 +751,19 @@ def _kernel(cfg: DenseChainConfig, typed: bool, faults: Faults, probes: bool, *r
     res_out[...] = res[...]
     post_out[...] = mixst[:, POST0 : POST0 + LANE]
     comb_out[...] = mixst[:, COMB0 : COMB0 + LANE]
+
+
+def mhc_gates(mixes, sqr, sc, bs, cfg: DenseChainConfig):
+    """``mhc.utils.gates_in_block`` up to the Sinkhorn: (pre, post, comb
+    logits) from the raw mixes [M, n_mix] and squared sums [M, 1]; sc [1, 3]
+    and bs [1, n_mix] f32."""
+    m = cfg.hc_mult
+    sm = mixes * lax.rsqrt(sqr / (m * cfg.hidden) + cfg.rms_eps)
+    pre = jax.nn.sigmoid(sm[:, :m] * sc[:, 0:1] + bs[:, :m]) + cfg.hc_eps
+    post_logits = sm[:, m : 2 * m] * sc[:, 1:2] + bs[:, m : 2 * m]
+    # Spelled out as stock does: Mosaic's native logistic is less accurate.
+    post = (1.0 / (1.0 + jnp.exp(-post_logits))) * cfg.hc_post_mult
+    return pre, post, sm[:, 2 * m :] * sc[:, 2:3] + bs[:, 2 * m :]
 
 
 def _sum4(a, b, c, d):

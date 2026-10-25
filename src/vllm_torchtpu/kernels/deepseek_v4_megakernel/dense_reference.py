@@ -38,10 +38,7 @@ from vllm_torchtpu.kernels.deepseek_v4_megakernel.dense_config import (
     HCA,
     DenseChainConfig,
 )
-from vllm_torchtpu.kernels.deepseek_v4_megakernel.dense_ring import (
-    EW,
-    sinkhorn,
-)
+from vllm_torchtpu.kernels.deepseek_v4_megakernel.dense_ring import EW
 from vllm_torchtpu.kernels.quantized_matmul.util import (
     quantize_tensor,
     xla_quantized_matmul,
@@ -136,19 +133,28 @@ def mhc_fused_kernel_order(x, res, post, comb, fn, scale, base, cfg):
     mixes = mix[:, :nm]
     for c in range(1, cfg.hc_chunks):
         mixes = mixes + mix[:, c * nm : (c + 1) * nm]
-    rs = jax.lax.rsqrt(ss / (m * h) + cfg.rms_eps)
-    sm = mixes * rs
-    pre = jax.nn.sigmoid(sm[:, :m] * scale[0] + base[:m]) + cfg.hc_eps
-    post_n = jax.nn.sigmoid(sm[:, m : 2 * m] * scale[1] + base[m : 2 * m])
-    post_n = post_n * cfg.hc_post_mult
-    cl = sm[:, 2 * m :] * scale[2] + base[2 * m :]
-    cols = [cl[:, k : k + 1] for k in range(m * m)]
-    comb_n = jnp.concatenate(sinkhorn(cols, m, cfg.hc_eps, cfg.sinkhorn_iters), 1)
+    pre, post_n, comb_n = stock_gates(mixes, ss, scale, base, cfg)
     gf = g.astype(F32)
     lay = pre[:, 0:1] * gf[:, :h]
     for i in range(1, m):
         lay = lay + pre[:, i : i + 1] * gf[:, i * h : (i + 1) * h]
     return g, post_n, comb_n, lay.astype(BF16)
+
+
+def stock_gates(mixes, sqr, scale, base, cfg: DenseChainConfig):
+    """The served mHC gates (in-kernel gates, decode-sized token counts):
+    ``mhc.utils.gates_in_block``. Returns (pre, post, comb [M, m*m])."""
+    return mhc_utils.gates_in_block(
+        mixes,
+        sqr,
+        scale.reshape(1, -1),
+        base.reshape(1, -1),
+        hc_mult=cfg.hc_mult,
+        hidden_size=cfg.hidden,
+        rms_eps=cfg.rms_eps,
+        hc_pre_eps=cfg.hc_eps,
+        gates=mhc_utils.GateConsts(cfg.hc_eps, cfg.hc_post_mult, cfg.sinkhorn_iters),
+    )
 
 
 def mhc_post_only(x, res, post, comb, m, h):
@@ -164,7 +170,7 @@ def mhc_post_only(x, res, post, comb, m, h):
 
 
 def mhc_fused_jnp(x, res, post, comb, fn, scale, base, cfg: DenseChainConfig):
-    """``fused_post_pre_kernel._fused_kernel`` + ``mhc_pre_gates`` in jnp.
+    """``fused_post_pre_kernel._fused_kernel`` with in-kernel gates, in jnp.
 
     x [M, h] bf16, res [M, 4h] bf16, post [M, 4], comb [M, 16] (row-major
     (i, j)), fn f32 [24, 4h]. Returns (res, post, comb, layer_input).
@@ -185,25 +191,11 @@ def mhc_fused_jnp(x, res, post, comb, fn, scale, base, cfg: DenseChainConfig):
         mixes = mixes + jax.lax.dot_general(g, c, dn, preferred_element_type=F32)
     gf = g.astype(F32)
     sqr = jnp.sum(gf * gf, axis=-1, keepdims=True)
-    scaled = mixes[:, :m] * jax.lax.rsqrt(sqr / (m * h) + cfg.rms_eps)
-    pre = jax.nn.sigmoid(scaled * scale[0] + base[:m]) + cfg.hc_eps
+    pre, post_n, comb_n = stock_gates(mixes, sqr, scale, base, cfg)
     lay = pre[:, 0:1] * gf[:, :h]
     for i in range(1, m):
         lay = lay + pre[:, i : i + 1] * gf[:, i * h : (i + 1) * h]
-    _, post_n, comb_n = mhc_utils.mhc_pre_gates(
-        mixes,
-        sqr,
-        m,
-        h,
-        scale,
-        base,
-        cfg.rms_eps,
-        cfg.hc_eps,
-        cfg.hc_eps,
-        cfg.hc_post_mult,
-        cfg.sinkhorn_iters,
-    )
-    return g, post_n, comb_n.reshape(-1, m * m), lay.astype(BF16)
+    return g, post_n, comb_n, lay.astype(BF16)
 
 
 def mhc_fused_stock(x, res, post, comb, fn, scale, base, cfg: DenseChainConfig):
@@ -224,6 +216,7 @@ def mhc_fused_stock(x, res, post, comb, fn, scale, base, cfg: DenseChainConfig):
         cfg.hc_post_mult,
         cfg.sinkhorn_iters,
         gemm_precision="highest" if cfg.hc_chunks == 3 else "default",
+        gates_in_kernel=True,
     )
     return r.reshape(-1, m * h), p.reshape(-1, m), c.reshape(-1, m * m), lay
 
