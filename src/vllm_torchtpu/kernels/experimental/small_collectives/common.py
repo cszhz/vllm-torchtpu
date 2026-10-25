@@ -110,13 +110,36 @@ def scalar_operands(rank, peers):
     return args, [pl.BlockSpec(memory_space=pltpu.SMEM)] * len(args)
 
 
-def call(kernel, x, out_rows, rank, peers, scratch, collective_id, name):
+def compiler_params(collective_id, skip_device_barrier=False):
+    """CompilerParams for a communicating kernel. ``skip_device_barrier``
+    drops the device barrier Mosaic otherwise runs at the entry of every
+    kernel with remote DMAs: safe for these kernels, whose own group barrier
+    (``barrier``) already proves every member entered the call and allocated
+    its scratch before any byte is pushed into it."""
+    if skip_device_barrier:
+        return pltpu.CompilerParams(
+            collective_id=collective_id, skip_device_barrier=True
+        )
+    return pltpu.CompilerParams(collective_id=collective_id)
+
+
+def call(
+    kernel,
+    x,
+    out_rows,
+    rank,
+    peers,
+    scratch,
+    collective_id,
+    name,
+    skip_device_barrier=False,
+):
     args, specs = scalar_operands(rank, peers)
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((out_rows, x.shape[1]), x.dtype),
         in_specs=[*specs, pl.BlockSpec()],
         scratch_shapes=scratch,
-        compiler_params=pltpu.CompilerParams(collective_id=collective_id),
+        compiler_params=compiler_params(collective_id, skip_device_barrier),
         name=name,
     )(*args, x)

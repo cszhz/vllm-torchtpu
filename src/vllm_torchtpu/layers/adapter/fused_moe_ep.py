@@ -1120,8 +1120,12 @@ def prebuild_fused_moe_ep(
             if shared_in_op and envs.TPU_SMALL_ALL_REDUCE
             else 0
         ),
-        shared_fold_restore=bool(
-            shared_in_op and envs.MOE_FUSED_EP_V2_FOLD_RESTORE_INTO_SHARED_AR
+        # 1: fold where the Pallas restore is in effect; 2: at every decode
+        # bucket the small all-reduce takes (MOE_FUSED_EP_V2_FOLD_ANY_DECODE).
+        shared_fold_restore=(
+            (2 if envs.MOE_FUSED_EP_V2_FOLD_ANY_DECODE else 1)
+            if shared_in_op and envs.MOE_FUSED_EP_V2_FOLD_RESTORE_INTO_SHARED_AR
+            else 0
         ),
     )
     if shared_in_op:

@@ -29,6 +29,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.small_collectives.common import (
     Group,
     barrier,
+    compiler_params,
     push,
     wait_bytes_of,
 )
@@ -38,7 +39,9 @@ from vllm_torchtpu.kernels.experimental.small_collectives.common import (
 COLLECTIVE_ID = 7
 
 
-def oneshot_all_gather(x, *, num_cores, axis, rank, collective_id=COLLECTIVE_ID):
+def oneshot_all_gather(
+    x, *, num_cores, axis, rank, collective_id=COLLECTIVE_ID, skip_device_barrier=False
+):
     """[num_cores * rows, ...]: every core's ``x`` in mesh order, inside a
     shard_map over mesh axis ``axis`` of ``num_cores`` cores.
 
@@ -76,6 +79,6 @@ def oneshot_all_gather(x, *, num_cores, axis, rank, collective_id=COLLECTIVE_ID)
         ],
         out_specs=pl.BlockSpec(memory_space=hbm),
         scratch_shapes=[pltpu.SemaphoreType.DMA] * 3,
-        compiler_params=pltpu.CompilerParams(collective_id=collective_id),
+        compiler_params=compiler_params(collective_id, skip_device_barrier),
         name=f"oneshot_all_gather_n{n}_r{rows}",
     )(jnp.reshape(rank, (1,)).astype(jnp.int32), x)

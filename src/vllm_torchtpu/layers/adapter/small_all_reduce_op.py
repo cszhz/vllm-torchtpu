@@ -86,12 +86,20 @@ def group_all_reduce(groups: tuple[tuple[int, ...], ...], cap: int, axis: str):
     rows and by XLA above."""
     cores = len(groups[0])
     index_groups = [list(g) for g in groups]
+    form, chunks, skip = all_reduce.group_form(groups)
 
     def body(block, rank, peers):
         if block.shape[0] > cap:
             return lax.psum(block, axis, axis_index_groups=index_groups)
         return all_reduce.small_all_reduce(
-            block, num_cores=cores, axis=axis, rank=rank, peers=peers
+            block,
+            num_cores=cores,
+            axis=axis,
+            rank=rank,
+            peers=peers,
+            form=form,
+            chunks=chunks,
+            skip_device_barrier=skip,
         )
 
     return body
@@ -151,11 +159,12 @@ def prebuild() -> None:
     _OP = _build_op(mesh, groups, max_rows())
     logger.info(
         "Small TP all-reduce armed | cores=%d | groups=%s | max_rows=%d | "
-        "one_shot_max_bytes=%d",
+        "one_shot_max_bytes=%d | form=%s",
         _CORES,
         groups,
         max_rows(),
         all_reduce.ONE_SHOT_MAX_BYTES,
+        all_reduce.group_form(groups),
     )
 
 

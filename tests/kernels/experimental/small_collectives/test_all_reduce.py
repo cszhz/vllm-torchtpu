@@ -165,3 +165,85 @@ def test_the_serving_body_switches_to_xla_above_the_cap(mesh, rows, kernel):
             mesh, lambda x: jax.lax.psum(x, AXIS, axis_index_groups=groups), per_core
         )
     assert np.array_equal(got.view(np.uint16), want.view(np.uint16))
+
+
+# The served DP4 x TP4 layout on one host: group positions (0, 1) and (2, 3)
+# are the two cores of one chip.
+CHIP_PAIRS = ((0, 1, 4, 5), (6, 7, 2, 3))
+
+
+def _check_two_roundings(got, per_core, groups):
+    """The pairs form rounds the pair sums and then the total: held to XLA
+    psum's own bound ((n - 1) / 2 steps at the sum of magnitudes, one at the
+    result), and every member of a group bit-identical."""
+    for group in groups:
+        terms = per_core[list(group)].astype(np.float64)
+        want = exact_sum(per_core[list(group)])
+        magnitudes = np.abs(terms).sum(axis=0)
+        tolerance = (len(group) - 1) / 2 * bf16_ulp(magnitudes) + bf16_ulp(np.abs(want))
+        for core in group:
+            ok = within(got[core], want, tolerance)
+            assert ok.all(), f"core {core}: {np.count_nonzero(~ok)} elements off"
+            assert np.array_equal(
+                got[core].view(np.uint16), got[group[0]].view(np.uint16)
+            ), f"core {core} differs from its group"
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16, 32, 64])
+@pytest.mark.parametrize("chunks", [1, 2, 4])
+@pytest.mark.parametrize("groups", [CHIP_PAIRS, SUBGROUPS], ids=["chip-pairs", "interleaved"])
+@pytest.mark.parametrize("skip", [False, True])
+def test_pairs_form(mesh, rows, chunks, groups, skip):
+    per_core = blocks((N, rows, 7168), seed=40 + rows)
+    table_rank, table_peers = _tables(groups)
+
+    def body(x, r, p):
+        return ar.small_all_reduce(
+            x, num_cores=4, axis=AXIS, rank=r, peers=p, form="pairs",
+            chunks=chunks, skip_device_barrier=skip,
+        )
+
+    got = run_sharded(mesh, body, per_core, table_rank, table_peers)
+    _check_two_roundings(got, per_core, groups)
+
+
+def test_pairs_form_oracle_sees_a_missing_member(mesh):
+    """Positive control: the pairs output checked against inputs where one
+    member's block is zeroed must fail the two-roundings oracle."""
+    per_core = blocks((N, 16, 7168), seed=12)
+    rank, peers = _tables(CHIP_PAIRS)
+
+    def body(x, r, p):
+        return ar.small_all_reduce(x, num_cores=4, axis=AXIS, rank=r, peers=p, form="pairs")
+
+    got = run_sharded(mesh, body, per_core, rank, peers)
+    _check_two_roundings(got, per_core, CHIP_PAIRS)
+    wrong = per_core.copy()
+    wrong[5] = 0
+    with pytest.raises(AssertionError):
+        _check_two_roundings(got, wrong, CHIP_PAIRS)
+
+
+def test_skip_device_barrier_is_bit_identical(mesh):
+    per_core = blocks((N, 32, 7168), seed=13)
+    a = _grouped(mesh, per_core, CHIP_PAIRS)
+    rank, peers = _tables(CHIP_PAIRS)
+
+    def body(x, r, p):
+        return ar.small_all_reduce(
+            x, num_cores=4, axis=AXIS, rank=r, peers=p, skip_device_barrier=True
+        )
+
+    b = run_sharded(mesh, body, per_core, rank, peers)
+    assert np.array_equal(a.view(np.uint16), b.view(np.uint16))
+
+
+def test_group_form_reads_the_layout(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_SMALL_ALL_REDUCE_PAIRS", 2, raising=False)
+    assert ar.group_form(CHIP_PAIRS)[:2] == ("pairs", 2)
+    assert ar.group_form(SUBGROUPS)[0] is None
+    assert ar.group_form(((0, 1, 2, 3, 4, 5, 6, 7),))[0] is None
+    monkeypatch.setattr(envs, "TPU_SMALL_ALL_REDUCE_PAIRS", 0, raising=False)
+    assert ar.group_form(CHIP_PAIRS)[0] is None

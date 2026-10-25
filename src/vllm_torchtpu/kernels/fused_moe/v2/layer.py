@@ -75,6 +75,9 @@ from vllm_torchtpu.kernels.experimental.small_collectives.all_reduce import (
 from vllm_torchtpu.kernels.experimental.small_collectives.all_reduce import (
     supports as small_all_reduce_supports,
 )
+from vllm_torchtpu.kernels.experimental.small_collectives.all_reduce import (
+    group_form as small_all_reduce_group_form,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
     TokenReplicaLayout,
     replica_wire_rows,
@@ -360,6 +363,13 @@ SMALL_BATCH_LOCAL_TOKENS = 16
 PALLAS_RESTORE_MAX_LOCAL_TOKENS = 4
 ONESHOT_GATHER_LOCAL_TOKENS = (2, 4)
 
+
+def _oneshot_gather_max_local_tokens():
+    """ONESHOT_GATHER_LOCAL_TOKENS[1], or the serving env's override."""
+    from vllm_torchtpu import envs
+
+    return envs.MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS
+
 # Per-config cache of the shard_map'd MoE callable; a fresh shard_map
 # body would re-trace the whole kernel for every hidden layer.
 _LAYER_SM_CACHE = {}
@@ -620,6 +630,11 @@ def fused_ep_moe_v2(
         row_alignment=U32_SUBLANE_TILE,
     )
     t_local = token_layout.local_rows
+    # (form, chunks, skip_device_barrier) of the small collectives over the
+    # replica groups (TPU_SMALL_ALL_REDUCE_PAIRS / ..._SKIP_DEVICE_BARRIER).
+    small_ar_form = small_all_reduce_group_form(
+        tuple(tuple(g) for g in token_layout.groups)
+    )
     # route pads its outputs to these rows, which the torch op's fake can size
     # without a guard on the token count; compute drops the padding again.
     t_wire = replica_wire_rows(T // ep, len(token_layout.groups[0]), U32_SUBLANE_TILE)
@@ -701,7 +716,7 @@ def fused_ep_moe_v2(
         and merge_exchange
         and ONESHOT_GATHER_LOCAL_TOKENS[0]
         <= t_local
-        <= ONESHOT_GATHER_LOCAL_TOKENS[1]
+        <= _oneshot_gather_max_local_tokens()
     )
     pallas_plan = (
         bool(pallas_plan)
@@ -1163,7 +1178,14 @@ def fused_ep_moe_v2(
                 shared_p, own + combined, pos * token_layout.local_rows, 0
             )
             out = small_all_reduce(
-                shared_p, num_cores=width, axis=ax, rank=pos.reshape(1), peers=peers
+                shared_p,
+                num_cores=width,
+                axis=ax,
+                rank=pos.reshape(1),
+                peers=peers,
+                form=small_ar_form[0],
+                chunks=small_ar_form[1],
+                skip_device_barrier=small_ar_form[2],
             )
             return out[: token_layout.input_rows]
         full = restore(combined)
@@ -1180,7 +1202,14 @@ def fused_ep_moe_v2(
             peers = jnp.asarray(by_rank, jnp.int32)[me]
             pos = jnp.asarray(token_layout.slots, jnp.int32)[me].reshape(1)
             shared_l = small_all_reduce(
-                shared_l, num_cores=width, axis=ax, rank=pos, peers=peers
+                shared_l,
+                num_cores=width,
+                axis=ax,
+                rank=pos,
+                peers=peers,
+                form=small_ar_form[0],
+                chunks=small_ar_form[1],
+                skip_device_barrier=small_ar_form[2],
             )
         elif width > 1:
             shared_l = lax.psum(shared_l, ax, axis_index_groups=groups)
@@ -1352,7 +1381,13 @@ def fused_ep_moe_v2(
                 )
 
                 def gather(payload):
-                    return oneshot_all_gather(payload, num_cores=ep, axis=ax, rank=me)
+                    return oneshot_all_gather(
+                        payload,
+                        num_cores=ep,
+                        axis=ax,
+                        rank=me,
+                        skip_device_barrier=small_ar_form[2],
+                    )
 
             else:
                 gather = None
@@ -1618,7 +1653,7 @@ def fused_ep_moe_v2(
                 lambda rows: token_layout.restore(
                     rows, ax, me=me if pallas_restore else None
                 ),
-                fold=pallas_restore,
+                fold=pallas_restore or shared_fold_restore == 2,
             )
         return token_layout.restore(combined, ax, me=me if pallas_restore else None)
 
@@ -1769,7 +1804,8 @@ def fused_ep_moe_v2(
         float(shared_out_scale),
         int(shared_rs_min_rows),
         int(shared_small_ar_max_rows),
-        bool(shared_fold_restore),
+        int(shared_fold_restore),
+        small_ar_form,
     )
     body, out_specs = {
         "fused": (decode_fn if decode_glue else local_fn, P(ax)),

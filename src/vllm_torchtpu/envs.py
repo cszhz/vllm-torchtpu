@@ -140,6 +140,10 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_SMALL_ALL_REDUCE: bool = True
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
+    TPU_SMALL_ALL_REDUCE_PAIRS: int = 0
+    TPU_SMALL_COLLECTIVES_SKIP_DEVICE_BARRIER: bool = False
+    MOE_FUSED_EP_V2_FOLD_ANY_DECODE: bool = False
+    MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS: int = 4
     TPU_FP8_LINEAR_PALLAS: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = ""
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = FP8_LINEAR_PALLAS_DEFAULT_SITES
@@ -941,6 +945,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_FOLD_RESTORE_INTO_SHARED_AR": env_bool(
         "MOE_FUSED_EP_V2_FOLD_RESTORE_INTO_SHARED_AR"
     ),
+    # With FOLD_RESTORE_INTO_SHARED_AR: fold at every decode-glue bucket the
+    # small all-reduce takes (e.g. T32 at TP4, t_local 8, with
+    # TPU_SMALL_ALL_REDUCE_MAX_ROWS=32), not only where the Pallas restore is
+    # in effect (t_local <= 4).
+    "MOE_FUSED_EP_V2_FOLD_ANY_DECODE": env_bool("MOE_FUSED_EP_V2_FOLD_ANY_DECODE"),
+    # Largest local token count the one-shot Pallas EP gather takes (smallest
+    # stays 2).
+    "MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS": env_nonnegative_int(
+        "MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS", 4
+    ),
     # A JSON file naming, per MoE layer, which global experts each EP rank
     # holds and in what slot order (expert_placement.py), or the name of one
     # shipped in vllm_torchtpu/expert_placements/. Empty: the checkpoint's
@@ -1062,6 +1076,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DSv4 served LIBTPU flags).
     "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
         "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
+    ),
+    # Four-member TP groups laid out as two chips (group positions 0,1 and 2,3
+    # each the two cores of one chip, as DP4 x TP4 on 2x2x2 lists them): sum
+    # with the small all-reduce's chip-aware "pairs" form (on-chip
+    # reduce-scatter, cross-chip swap of pair sums, on-chip all-gather: half the
+    # two-shot's chip-to-chip bytes) pipelined over this many column chunks.
+    # Rounds twice, like XLA's psum. 0 = off (two-shot / one-shot as before).
+    "TPU_SMALL_ALL_REDUCE_PAIRS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_PAIRS", 0
+    ),
+    # Small Pallas collectives (all-reduce, one-shot gather): skip Mosaic's
+    # default entry device barrier; their own group barrier already orders
+    # every push after every member's entry.
+    "TPU_SMALL_COLLECTIVES_SKIP_DEVICE_BARRIER": env_bool(
+        "TPU_SMALL_COLLECTIVES_SKIP_DEVICE_BARRIER"
     ),
     # Per-channel FP8 dense linears at decode token counts (<= fp8_skinny.MAX_M rows)
     # run as the weight-streaming Pallas kernel (kernels/quantized_matmul/
