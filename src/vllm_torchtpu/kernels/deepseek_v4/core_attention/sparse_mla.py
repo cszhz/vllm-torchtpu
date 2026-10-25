@@ -141,19 +141,41 @@ NOPE_DIM = 448
 NOPE_SCALE_PERIOD = 64
 
 
-def _dequant_dsv4_fp8(bkv_nope: jax.Array):
-    """Dequantize FP8 values to BF16."""
-    nope_fp8 = pltpu.bitcast(bkv_nope[:, :NOPE_DIM], jnp.float8_e4m3fn).astype(
-        jnp.bfloat16
-    )
-    # scales[d] = scales[d % 64]
-    tail = pltpu.bitcast(bkv_nope[:, -128:], jnp.float8_e8m0fnu).astype(jnp.bfloat16)
+def _dequant_dsv4_fp8(words: jax.Array) -> list[jax.Array]:
+    """int32 [n, 128] nope words -> the record's 4 sub-rows as BF16 [n, 128].
+
+    Byte b of word (t, l) is record byte 128 b + l of token t (csa_cache_layout).
+    A truncating cast keeps the low half / low byte, so each sub-row costs a
+    shift and a pack; a (4, 128) -> (1, 512) uint8 reshape relayouts sublanes.
+    Sub-row 3 lanes NOPE_DIM % 128: are the scale bytes, not values; the caller
+    replaces them.
+    """
+
+    def int16_pairs(halves):  # int16 [n, 128] -> int32 [n // 2, 128], same bits
+        return pltpu.bitcast(halves, jnp.int32)
+
+    def low_and_high_bytes(halves):
+        high = lax.shift_right_logical(int16_pairs(halves), 8)
+        return [
+            halves.astype(jnp.int8),
+            pltpu.bitcast(high, jnp.int16).astype(jnp.int8),
+        ]
+
+    low_halves = words.astype(jnp.int16)
+    high_halves = lax.shift_right_logical(words, 16).astype(jnp.int16)
+    sub_rows = low_and_high_bytes(low_halves) + low_and_high_bytes(high_halves)
+    tail = pltpu.bitcast(sub_rows[-1], jnp.float8_e8m0fnu).astype(jnp.bfloat16)
     lane = lax.broadcasted_iota(jnp.int32, tail.shape, 1)
+    # scales[d] = scales[d % 64]
     tile = jnp.where(
         lane < NOPE_SCALE_PERIOD, pltpu.roll(tail, NOPE_SCALE_PERIOD, 1), tail
     )
-    nope_scales = jnp.concatenate([tile] * 4, axis=1)[:, :NOPE_DIM]
-    return (nope_fp8 * nope_scales).astype(jnp.bfloat16)
+    return [
+        (pltpu.bitcast(r, jnp.float8_e4m3fn).astype(jnp.bfloat16) * tile).astype(
+            jnp.bfloat16
+        )
+        for r in sub_rows
+    ]
 
 
 def _attention_kernel(
@@ -173,7 +195,7 @@ def _attention_kernel(
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     # Scratch
-    bkv_nope_x2_ref,  # [2, batch_size, page_size * 4, 128]
+    bkv_nope_x2_ref,  # int32[2, batch_size, topk, 128]
     bkv_rope_x2_ref,  # [2, batch_size, page_size, rope_dim]
     bq_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
     bo_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
@@ -189,10 +211,8 @@ def _attention_kernel(
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
     assert kv_lens_ref.shape[0] == num_tokens
-    # csa_gather emits int32 words; these are the uint8 nope slabs
-    # [.., topk * 4, 128] and bf16 rope rows [.., topk // 2, 128] they encode,
-    # a free bitcast of the same bytes.
-    cache_kv_nope_hbm_ref = cache_kv_nope_hbm_ref.bitcast(jnp.uint8)
+    # csa_gather emits int32 words; the rope ones are the bf16 rows
+    # [.., topk // 2, 128] they encode, a free bitcast of the same bytes.
     cache_kv_rope_hbm_ref = cache_kv_rope_hbm_ref.bitcast(jnp.bfloat16)
     # The gathered rope buffer carries two top-k entries per row (csa_gather).
     bkv_sz = cache_kv_rope_hbm_ref.shape[1] * 2
@@ -401,10 +421,7 @@ def _attention_kernel(
         return q
 
     def load_bkv(bkv_sem_idx, batch_idx):
-        bkv_nope = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx][...]
-        # The gather nope is (4, 128) u8, reshape it to (1, 512) u8.
-        bkv_nope = bkv_nope.reshape(bkv_sz, -1)
-        bkv_nope = _dequant_dsv4_fp8(bkv_nope)
+        bkv_nope = _dequant_dsv4_fp8(bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx][...])
 
         # The gathered rope block is [bkv_sz // 2, 2 * rope_dim]: entry i in
         # lanes 0:rope_dim, entry i + bkv_sz // 2 in the upper half (see
@@ -416,7 +433,11 @@ def _attention_kernel(
         bkv_rope = jnp.concatenate(
             [bkv_rope[:, :rope_dim], bkv_rope[:, rope_dim:]], axis=0
         )
-        bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+        # Rope dims land in lanes NOPE_DIM % 128: of the last nope sub-row.
+        bkv_rope = jnp.concatenate(
+            [bkv_nope[-1][:, : NOPE_DIM % 128], bkv_rope], axis=-1
+        )
+        bkv = jnp.concatenate([*bkv_nope[:-1], bkv_rope], axis=-1)
 
         # In vLLM, multiple caches may overlay on the same KV Tensor. For example,
         # compressor state cache write data in bfloat16 / float32 format, certain
@@ -718,12 +739,12 @@ def sparse_ragged_paged_attention(
 
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
 
-        # One batch entry's worth of gathered top-k rows, per cache, in the
-        # uint8 / bf16 views the kernel bitcasts the int32 words to.
+        # One batch entry's worth of gathered top-k rows, per cache: nope as
+        # its int32 words, rope in the bf16 view the kernel bitcasts it to.
         _, topk_rows, lanes = cache_kv_nope.shape
         bkv_nope_double_buf = pltpu.VMEM(
-            (2, batch_size, topk_rows * 4, lanes),
-            jnp.uint8,
+            (2, batch_size, topk_rows, lanes),
+            jnp.int32,
         )
         _, rope_rows, lanes = cache_kv_rope.shape
         bkv_rope_double_buf = pltpu.VMEM(
