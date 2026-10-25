@@ -823,6 +823,31 @@ class DeepseekV4Model(nn.Module):
         )
 
 
+def _without_dynamic_marks(out):
+    """The SP backbone's outputs, as views where dynamo stamped a tensor dynamic.
+
+    The runner hands these to its dynamic=False compiled regions (the logits
+    gather), and a `_dynamo_dynamic_indices` stamp on a tensor object outranks
+    dynamic=False there (see spec_decode/eagle3._static_shape_args). A view is
+    a distinct object without the stamp and copies nothing.
+    """
+
+    def unmark(t):
+        if isinstance(t, torch.Tensor) and getattr(t, "_dynamo_dynamic_indices", None):
+            logger.warning_once(
+                "DeepSeek-V4 SP backbone returned a tensor marked dynamic %s; "
+                "handing the runner a view instead.",
+                t._dynamo_dynamic_indices,
+            )
+            return t[:]
+        return t
+
+    if isinstance(out, tuple):
+        hidden, aux = out
+        return unmark(hidden), [unmark(t) for t in aux]
+    return unmark(out)
+
+
 def _with_full_shared_alias(name: str, params_dict: dict) -> list[str]:
     """`name`, plus the unsharded shared-expert copy's parameter it also feeds.
 
@@ -964,9 +989,10 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
                 bucket_filter.serving(sp.eligible),
                 set_model_tag("backbone_sp"),
             ):
-                return self.model_sp(
+                out = self.model_sp(
                     input_ids, positions, intermediate_tensors, inputs_embeds
                 )
+            return _without_dynamic_marks(out)
         with bucket_filter.serving(bucket_filter.assigned(self.model)):
             return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
