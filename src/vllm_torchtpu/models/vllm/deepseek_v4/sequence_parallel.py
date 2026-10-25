@@ -33,9 +33,13 @@ the TP group instead:
 The final hidden states are all-gathered once, after the head collapse and
 the final norm.
 
-Rank r owns rows [r * T / tp, (r + 1) * T / tp), the order the reduce-scatter
-produces and the all-gather consumes. The rank enters the graph as data, so
-every rank traces and compiles the same program.
+Rank r owns rows [r * T / tp, (r + 1) * T / tp), where r is this core's
+position in its TP group as the EP mesh lists it -- the order the
+reduce-scatter produces and the all-gather consumes. The rank enters the graph
+as data, so every rank traces and compiles the same program. The collectives
+are JAX ops over the EP mesh, grouped by TP group (as the small TP all-reduce
+is): vLLM's own all-gather allocates its output at a size derived from the
+symbolic token count, which torch_tpu's export cannot lower.
 
 The sequence-parallel steps run in a compiled module of their own
 (model.DeepseekV4ModelSP over the same layers), chosen per step on the padded
@@ -44,16 +48,21 @@ bucket size outside both graphs; each graph compiles only its own buckets
 ranks take the same MoE op.
 """
 
+from typing import Any
+
+import jax
 import torch
+from jax.sharding import PartitionSpec
+from torch_tpu._internal.pallas import jax_op
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
-    get_tp_group,
     model_parallel_is_initialized,
-    tensor_model_parallel_all_gather,
-    tensor_model_parallel_reduce_scatter,
 )
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Each rank's shard stays a multiple of a bf16 sublane tile.
 ROW_ALIGNMENT = 16
@@ -80,27 +89,106 @@ def eligible(num_tokens: int) -> bool:
     return bool(num_tokens >= minimum and num_tokens % (tp * ROW_ALIGNMENT) == 0)
 
 
-def rank_as_data(device: torch.device) -> torch.Tensor:
-    """This rank's index in its TP group as an i32[1] device value."""
-    # Shared with the indexer's kv-split, which needs the same property.
-    from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (  # noqa: E501
-        tp_rank_as_data,
+# Built by `prebuild` at model load: the ops close over the EP mesh, which a
+# compiled forward may not see.
+_AG: Any = None
+_RS: Any = None
+_RANK: torch.Tensor | None = None
+
+
+def _group_ops(mesh, groups: tuple[tuple[int, ...], ...]):
+    from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME
+
+    spec = PartitionSpec(EP_AXIS_NAME)
+    tp = len(groups[0])
+    index_groups = [list(g) for g in groups]
+
+    def shard_mapped(body):
+        return lambda x: jax.shard_map(
+            body, mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False
+        )(x)
+
+    gather = shard_mapped(
+        lambda b: jax.lax.all_gather(
+            b, EP_AXIS_NAME, axis=0, tiled=True, axis_index_groups=index_groups
+        )
+    )
+    scatter = shard_mapped(
+        lambda b: jax.lax.psum_scatter(
+            b,
+            EP_AXIS_NAME,
+            scatter_dimension=0,
+            tiled=True,
+            axis_index_groups=index_groups,
+        )
     )
 
-    return tp_rank_as_data(get_tp_group(), device)
+    # Every operand annotated jax.Array: torch_tpu infers static argnums from
+    # the signature and refuses an unannotated one.
+    def ag(x: jax.Array) -> jax.Array:
+        return gather(x)
+
+    def rs(x: jax.Array) -> jax.Array:
+        return scatter(x)
+
+    ops = []
+    for name, fn, rows in (
+        ("ag", ag, lambda n: n * tp),
+        ("rs", rs, lambda n: n // tp),
+    ):
+        op = jax_op(
+            f"pallas::dsv4_sp_tp_{name}",
+            fn,
+            mesh=mesh,
+            input_partition_specs=(spec,),
+            output_partition_specs=spec,
+        )
+        # The default fake exports fn at the operand's shape, which would pin
+        # the caller's dynamic token dimension.
+        op.register_fake(
+            lambda x, rows=rows: x.new_empty((rows(x.shape[0]), *x.shape[1:]))
+        )
+        ops.append(op)
+    return ops
+
+
+def prebuild() -> None:
+    """Build the TP-group collectives and this core's rank, outside any traced
+    region (the groups come from a collective). Idempotent."""
+    global _AG, _RS, _RANK
+    if _AG is not None:
+        return
+    from vllm_torchtpu.distributed.ep_mesh import (
+        build_ep_mesh,
+        ep_mesh_index,
+        ep_token_replica_groups,
+    )
+
+    mesh = build_ep_mesh()
+    if mesh is None:
+        raise NotImplementedError(
+            "TPU_DSV4_PREFILL_SP runs its collectives over the expert-parallel "
+            "mesh, and this deployment has no expert-parallel group."
+        )
+    groups = ep_token_replica_groups()
+    assert len(groups[0]) == tp_world_size(), (groups, tp_world_size())
+    me = ep_mesh_index()
+    (group,) = [g for g in groups if me in g]
+    _RANK = torch.tensor([group.index(me)], dtype=torch.int32, device="tpu")
+    _AG, _RS = _group_ops(mesh, groups)
+    logger.info("DeepSeek-V4 sequence-parallel prefill armed | groups=%s", groups)
+
+
+def rank_as_data() -> torch.Tensor:
+    """This core's position in its TP group as an i32[1] device value."""
+    assert _RANK is not None, "sequence_parallel.prebuild() did not run"
+    return _RANK
 
 
 def shard(x: torch.Tensor, rank: torch.Tensor) -> torch.Tensor:
     """This rank's contiguous rows of a replicated [tokens, ...] tensor."""
     blocks = x.unflatten(0, (tp_world_size(), -1))
     return blocks.index_select(0, rank).squeeze(0)
-
-
-def select_rows(x: torch.Tensor, rank: torch.Tensor, rows) -> torch.Tensor:
-    """Rows [rank * rows, (rank + 1) * rows) of `x`, by index rather than by
-    slicing, so `x` may be longer than the step (a fixed-size buffer)."""
-    index = torch.arange(rows, dtype=torch.int32, device=x.device) + rank * rows
-    return x.index_select(0, index)
 
 
 def gather(x: torch.Tensor, num_tokens=None) -> torch.Tensor:
@@ -110,10 +198,10 @@ def gather(x: torch.Tensor, num_tokens=None) -> torch.Tensor:
     it, so its size is that symbol rather than tp * (num_tokens // tp) and it
     lines up with the step's other [tokens, ...] tensors.
     """
-    out = tensor_model_parallel_all_gather(x, 0)
+    out = _AG(x)
     return out if num_tokens is None else out.narrow(0, 0, num_tokens)
 
 
 def reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     """Sum TP partial outputs over the group; keep this rank's rows."""
-    return tensor_model_parallel_reduce_scatter(x, 0)
+    return _RS(x)

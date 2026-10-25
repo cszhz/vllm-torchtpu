@@ -617,11 +617,14 @@ class DeepseekV4Model(nn.Module):
         num_tokens = hidden_states.shape[0]
         padding_mask = None
         if sequence_parallel:
-            rank = sp.rank_as_data(hidden_states.device)
+            rank = sp.rank_as_data()
             hidden_states = sp.shard(hidden_states, rank)
-            mask_buffer = token_padding.local_padding_mask_buffer()
-            if envs.TPU_MOE_SKIP_PADDED_TOKENS and mask_buffer is not None:
-                padding_mask = sp.select_rows(mask_buffer, rank, hidden_states.shape[0])
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+                # Sliced to the step's rows as the stock MoE path does; this
+                # graph has no lower bound on the token count to pin it.
+                padding_mask = token_padding.local_padding_mask(num_tokens)
+                if padding_mask is not None:
+                    padding_mask = sp.shard(padding_mask, rank)
             if moe_input_ids is not None:
                 moe_input_ids = sp.shard(moe_input_ids, rank)
         if get_pp_group().is_first_rank:
@@ -956,6 +959,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
             return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
         # Routed on the padded bucket size, outside both compiled graphs.
         if sp.eligible(positions.shape[0]):
+            sp.prebuild()  # once; it needs the EP mesh, which no trace may see
             with (
                 bucket_filter.serving(sp.eligible),
                 set_model_tag("backbone_sp"),

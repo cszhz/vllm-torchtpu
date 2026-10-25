@@ -107,17 +107,6 @@ def local_padding_mask(num_tokens: int) -> torch.Tensor | None:
     return _padding_state.get_local_padding_mask(num_tokens)
 
 
-def local_padding_mask_buffer() -> torch.Tensor | None:
-    """This rank's whole [max_local_tokens] padding mask, or None.
-
-    For a caller that selects rows itself: slicing to a symbolic token count
-    that may reach the buffer length makes Dynamo specialize that count.
-    """
-    if _padding_state is None:
-        return None
-    return _padding_state.local_padding_mask
-
-
 def mask_router_logits_for_padding(router_logits: torch.Tensor) -> torch.Tensor:
     """Replace padded rows of local router_logits with NaN.
 

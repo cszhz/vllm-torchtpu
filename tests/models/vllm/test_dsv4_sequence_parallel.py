@@ -375,8 +375,3 @@ def test_moe_block_masks_this_ranks_padded_rows(tp):
     logits = seen["logits"]
     assert torch.isnan(logits[mask]).all()
     assert torch.isfinite(logits[~mask]).all()
-
-
-def test_select_rows_reads_this_ranks_block_of_a_longer_buffer():
-    buffer = torch.arange(100)
-    assert torch.equal(sp.select_rows(buffer, _rank(2), 8), torch.arange(16, 24))
