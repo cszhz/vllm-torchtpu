@@ -47,6 +47,13 @@ def _hbm():
     return pl.BlockSpec(memory_space=pl.ANY)
 
 
+def _pinned_hbm():
+    # Buffers a peer writes into, or a DMA still reads, after the kernel that
+    # started it returned: XLA must not place them in VMEM, which the kernels
+    # in between reuse.
+    return pl.BlockSpec(memory_space=pltpu.HBM)
+
+
 def _pieces(rows, chunks):
     """Row ranges splitting ``rows`` into ``chunks`` DMAs of 16-row multiples."""
     step = max(16, -(-rows // chunks) // 16 * 16)
@@ -201,8 +208,8 @@ def reduce_scatter_start(x, *, num_cores, axis, rank, peers, chunks=1):
             pltpu.SemaphoreType.DMA(()),
             jax.ShapeDtypeStruct((n, r, hidden), x.dtype),
         ),
-        in_specs=[*specs, _hbm()],
-        out_specs=(sem, sem, _hbm()),
+        in_specs=[*specs, _pinned_hbm()],
+        out_specs=(sem, sem, _pinned_hbm()),
         compiler_params=pltpu.CompilerParams(
             collective_id=ASYNC_RS_COLLECTIVE_ID, has_side_effects=True
         ),
@@ -248,8 +255,8 @@ def reduce_scatter_done(handle, *, after=None, tile_rows=REDUCE_TILE_ROWS):
             jax.ShapeDtypeStruct((r, hidden), land.dtype),
             jax.ShapeDtypeStruct(land.shape, land.dtype),
         ),
-        in_specs=[sem, sem, _hbm(), _hbm(), *[_hbm()] * len(extra)],
-        out_specs=(_hbm(), _hbm()),
+        in_specs=[sem, sem, _pinned_hbm(), _pinned_hbm(), *[_hbm()] * len(extra)],
+        out_specs=(_hbm(), _pinned_hbm()),
         input_output_aliases={2: 1},
         compiler_params=pltpu.CompilerParams(has_side_effects=True),
         name=f"large_reduce_scatter_done_n{n}_r{n * r}",
