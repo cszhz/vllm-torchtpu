@@ -372,7 +372,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
                     optimization_barrier2_op,
                 )
 
-                optimization_barrier2_op()
+                object.__setattr__(self, "fence_op", optimization_barrier2_op())
 
     def _build_token_split_op(self, tp: int):
         mesh = get_pallas_op_mesh()
@@ -606,12 +606,9 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
                 # The SparseCore top-k's done otherwise sits right behind its
                 # start with the TensorCore idle; joining it with the q
                 # projection (which does not need it) lets the scheduler put
-                # that projection between the two.
-                from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (  # noqa: E501
-                    optimization_barrier2,
-                )
-
-                local, fence = optimization_barrier2(local, fence)
+                # that projection between the two. The op is built at init
+                # (Dynamo cannot trace its lru_cache'd builder).
+                local, fence = self.fence_op(local, fence)
                 return build_sp_ops()["ag"](local).view(num_tokens, -1), fence
             return build_sp_ops()["ag"](local).view(num_tokens, -1)
         if fence is not None:
