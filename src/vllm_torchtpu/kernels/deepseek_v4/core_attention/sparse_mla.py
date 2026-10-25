@@ -449,18 +449,46 @@ def _attention_kernel(
         bkv_rope = jnp.concatenate(
             [bkv_nope[-1][:, : NOPE_DIM % 128], bkv_rope], axis=-1
         )
-        bkv = jnp.concatenate([*bkv_nope[:-1], bkv_rope], axis=-1)
+        # Rows past kv_len were zeroed in VMEM (zero_rows_past_kv_len).
+        return jnp.concatenate([*bkv_nope[:-1], bkv_rope], axis=-1)
 
-        # In vLLM, multiple caches may overlay on the same KV Tensor. For example,
-        # compressor state cache write data in bfloat16 / float32 format, certain
-        # byte pattern are interpreted as NaN in FP8, e.g. float8_e8m0fnu byte 0xFF
-        # decodes to NaN.
-        # We need to mask out the data by the actual kv_len to avoid NaN propagting
-        # to the downstream computation.
-        kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        bkv = jnp.where(k_span < kv_len, bkv, 0)
-        return bkv
+    def zero_rows_past_kv_len(bkv_sem_idx):
+        """Zeroes the gathered rows at or past each entry's kv_len, in VMEM.
+
+        In vLLM, multiple caches may overlay on the same KV Tensor. For example,
+        compressor state cache write data in bfloat16 / float32 format, certain
+        byte pattern are interpreted as NaN in FP8, e.g. float8_e8m0fnu byte 0xFF
+        decodes to NaN, which would reach the output through P @ V. Zero words
+        dequantize to zeros, so this is the [bkv_sz, head_dim] select load_bkv
+        would otherwise pay per entry, paid only by batches holding a short entry.
+        """
+        kv_lens = [kv_lens_ref[batch_start_seq_idx + b] for b in range(batch_size)]
+        min_kv_len = functools.reduce(jnp.minimum, kv_lens)
+
+        @pl.when(min_kv_len < bkv_sz)
+        def _():
+            def zero_entry(b, carry):
+                kv_len = kv_lens_ref[batch_start_seq_idx + b]
+                nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, b]
+                row = lax.broadcasted_iota(jnp.int32, nope_ref.shape, 0)
+                nope_ref[...] = jnp.where(row < kv_len, nope_ref[...], 0)
+                # Rope word (t, l) holds entries e and e + 1 in its low and
+                # high halves, e = 2 t + bkv_sz // 2 * (l >= rope lanes / 2).
+                rope_ref = bkv_rope_x2_ref.at[bkv_sem_idx, b]
+                words = pltpu.bitcast(rope_ref[...], jnp.int32)
+                lane = lax.broadcasted_iota(jnp.int32, words.shape, 1)
+                entry = 2 * lax.broadcasted_iota(jnp.int32, words.shape, 0) + jnp.where(
+                    lane < words.shape[1] // 2, 0, bkv_sz // 2
+                )
+                words = jnp.where(
+                    entry + 1 < kv_len,
+                    words,
+                    jnp.where(entry < kv_len, words & 0xFFFF, 0),
+                )
+                rope_ref[...] = pltpu.bitcast(words, rope_ref.dtype)
+                return carry
+
+            lax.fori_loop(0, batch_size, zero_entry, 0)
 
     def load_swa_output(bq_sem_idx, batch_idx):
         swa_acc = swa_acc_x2_ref[bq_sem_idx, batch_idx, ...]
@@ -502,6 +530,7 @@ def _attention_kernel(
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
         wait_fetch_swa_batch(batch_start_seq_idx, bi_sem_idx)
         wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
+        zero_rows_past_kv_len(bi_sem_idx)
 
         @pl.when(pl.program_id(0) >= 2)
         def _wait_send():
