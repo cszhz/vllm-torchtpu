@@ -132,13 +132,19 @@ def _symbolic(ag, rs, take, full, partial, slot):
             # Dynamo orders the placeholders its own way; the four tensors
             # differ in rank or trailing dims, which identifies them.
             by_sig = {
-                (t.dim(), tuple(t.shape[1:])): t
+                (t.dim(), tuple(t.shape[1:]), t is not slot): t
                 for t in (full, partial, positions, slot)
             }
             concrete = [
                 rows
                 if isinstance(e, torch.SymInt)
-                else by_sig[(e.dim(), tuple(int(d) for d in e.shape[1:]))]
+                else by_sig[
+                    (
+                        e.dim(),
+                        tuple(int(d) for d in e.shape[1:]),
+                        isinstance(e.shape[0], torch.SymInt),
+                    )
+                ]
                 for e in captured["inputs"]
             ]
             out[case + "_placeholders"] = [
