@@ -1187,6 +1187,7 @@ def test_from_runner_tp8_dp2(monkeypatch):
         "TPU_EXPERT_PLACEMENT",
     ):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("VLLM_TPU_DSV4_INDEXER_KV_LAYOUT", "sal")
     kernel = _SpecKernel()
     mk = VA.DSv4Megakernel.from_runner(_tp_runner(), kernel)
     assert kernel.spec.mode == VA.MODE_DP and kernel.spec.attn_tp == 8
@@ -1202,6 +1203,27 @@ def test_from_runner_tp8_dp2(monkeypatch):
     monkeypatch.setenv("TPU_EXPERT_PLACEMENT", "dsv4_pro_agentx_ep16")
     VA.DSv4Megakernel.from_runner(_tp_runner(), kernel)
     assert (kernel.spec.moe_placement, kernel.spec.expert_slots) == ("perm", 24)
+
+
+def test_from_runner_refuses_any_indexer_layout_but_sal(monkeypatch):
+    """Both indexer K-cache layouts have the same allocated shape, so only
+    this check stops the kernel from reading head-along-sublane records as
+    seq-along-lane ones (and writing records the stock path then misreads)."""
+    mesh = NS(devices=np.zeros(16), axis_names=("d",))
+    monkeypatch.setattr(VA, "_engine_mesh_and_rank", lambda tp: (mesh, 10, 10))
+    for k in ("VLLM_TPU_DSV4_MK_LOGITS", "TPU_EXPERT_PLACEMENT"):
+        monkeypatch.delenv(k, raising=False)
+    kernel = _SpecKernel()
+    monkeypatch.delenv("VLLM_TPU_DSV4_INDEXER_KV_LAYOUT", raising=False)
+    with pytest.raises(VA.Unsupported, match="INDEXER_KV_LAYOUT='has'.*=sal"):
+        VA.DSv4Megakernel.from_runner(_tp_runner(), kernel)  # the env default
+    monkeypatch.setenv("VLLM_TPU_DSV4_INDEXER_KV_LAYOUT", "has")
+    with pytest.raises(VA.Unsupported, match="seq-along-lane layout only"):
+        VA.DSv4Megakernel.from_runner(_tp_runner(), kernel)
+    assert not hasattr(kernel, "spec")  # refused before any weight is touched
+    monkeypatch.setenv("VLLM_TPU_DSV4_INDEXER_KV_LAYOUT", "sal")
+    VA.DSv4Megakernel.from_runner(_tp_runner(), kernel)
+    assert kernel.spec.attn_tp == 8
 
 
 def test_placement_operands_are_this_ep_ranks_table_rows():

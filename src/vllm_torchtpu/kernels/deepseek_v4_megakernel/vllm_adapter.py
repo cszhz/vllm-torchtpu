@@ -1165,6 +1165,15 @@ class DSv4Megakernel:
             getattr(hf, "model_type", None) == "deepseek_v4",
             f"model_type {getattr(hf, 'model_type', None)!r}",
         )
+        # The indexer K cache is allocated with the same shape in both layouts,
+        # so a layout mismatch would trace and run with misread keys.
+        layout = envs.VLLM_TPU_DSV4_INDEXER_KV_LAYOUT
+        _need(
+            layout == "sal",
+            f"VLLM_TPU_DSV4_INDEXER_KV_LAYOUT={layout!r}: the kernel reads and "
+            "writes the CSA indexer K cache in the seq-along-lane layout only; "
+            "set VLLM_TPU_DSV4_INDEXER_KV_LAYOUT=sal",
+        )
         pc = runner.parallel_config
         _need(pc.pipeline_parallel_size == 1, "pipeline parallelism")
         # vLLM TP inside each DP engine (TP8 x DP2): the kernel's attention
