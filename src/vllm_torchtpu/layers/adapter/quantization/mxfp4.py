@@ -45,6 +45,7 @@ scaling.
    - Returns output tensor
 """
 
+import functools
 from typing import TYPE_CHECKING, Any, cast
 
 import jax.numpy as jnp
@@ -401,8 +402,13 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         Shapes are read off those tensors rather than recomputed so the two
         cannot drift apart. Returns the op, or None to leave this layer on GMM.
         """
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
         from vllm_torchtpu.kernels.fused_moe.v2.host import U32_SUBLANE_TILE
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import prebuild_fused_moe_ep
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            FUSED_MOE_EP_SP_OP_ATTR,
+            prebuild_fused_moe_ep,
+        )
 
         if not (
             envs.USE_MOE_FUSED_EP_KERNEL
@@ -447,7 +453,8 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 (experts, inter // block, 1, hidden), dtype=torch.float32, device="meta"
             ),
         )
-        return prebuild_fused_moe_ep(
+        build = functools.partial(
+            prebuild_fused_moe_ep,
             layer,
             topk=layer.moe_config.experts_per_token,
             renormalize=layer.renormalize,
@@ -466,6 +473,14 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 and (inter // block) % U32_SUBLANE_TILE != 0
             ),
         )
+        op = build()
+        if (
+            op is not None
+            and envs.TPU_DSV4_PREFILL_SP
+            and get_tensor_model_parallel_world_size() > 1
+        ):
+            setattr(self, FUSED_MOE_EP_SP_OP_ATTR, build(sequence_parallel=True))
+        return op
 
     def _resolve_tpu_activation(self, layer) -> str:
         # This variant runs the clamped kernel, so the string is not
@@ -781,3 +796,46 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 order_after,
             )
         return super()._forward_monolithic_tpu(layer, x, router_logits, input_ids)
+
+    def forward_sequence_parallel(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        order_after: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The routed experts' output at this rank's own rows of a
+        sequence-parallel step, through the token-sharded fused EP op.
+
+        Same operands as the fused branch of `_forward_monolithic_tpu`; only
+        the op differs, so every token gets the same experts and arithmetic.
+        """
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            FUSED_MOE_EP_SP_OP_ATTR,
+            fused_moe_ep,
+            hash_topk_ids_operand,
+            score_bias_operand,
+        )
+
+        if getattr(self, FUSED_MOE_EP_SP_OP_ATTR, None) is None:
+            raise RuntimeError(
+                "sequence-parallel prefill needs the token-sharded fused EP op, "
+                "which was not built for this layer (TPU_DSV4_PREFILL_SP with the "
+                "fused EP W4A8 kernel armed)"
+            )
+        layer = cast("TpuRoutedExperts", layer)
+        return fused_moe_ep(
+            self,
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer._tpu_fused_w13_scale,
+            layer._tpu_fused_w2_scale,
+            router_logits,
+            score_bias_operand(layer),
+            hash_topk_ids_operand(layer, input_ids),
+            expert_placement.expert_slot_table(layer),
+            order_after,
+            op_attr=FUSED_MOE_EP_SP_OP_ATTR,
+        )

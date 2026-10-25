@@ -96,6 +96,9 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_LOG_HOST_TENSORS_AFTER_LOAD: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
+    TPU_DSV4_PREFILL_SP: bool = False
+    TPU_DSV4_PREFILL_SP_MIN_TOKENS: int = 512
+    TPU_DSV4_PREFILL_SP_REPLICATED_SHARED: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
@@ -833,6 +836,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental: shard DSv4 attention wq_b/wo_a/wo_b across a chip's two
     # cores while KV and attention stay DP (deepseek_v4/attn_intra_chip.py).
     "TPU_DSV4_ATTN_INTRA_CHIP_TP": env_bool("TPU_DSV4_ATTN_INTRA_CHIP_TP"),
+    # DSv4 sequence-parallel prefill (deepseek_v4/sequence_parallel.py): steps
+    # of at least TPU_DSV4_PREFILL_SP_MIN_TOKENS tokens keep the mHC residual
+    # streams sharded by token over the TP group.
+    "TPU_DSV4_PREFILL_SP": env_bool("TPU_DSV4_PREFILL_SP"),
+    "TPU_DSV4_PREFILL_SP_MIN_TOKENS": env_int("TPU_DSV4_PREFILL_SP_MIN_TOKENS", 512),
+    # With TPU_DSV4_PREFILL_SP: keep an unsharded copy of each shared expert so
+    # sequence-parallel steps run it on this rank's rows with no collective.
+    "TPU_DSV4_PREFILL_SP_REPLICATED_SHARED": env_bool(
+        "TPU_DSV4_PREFILL_SP_REPLICATED_SHARED"
+    ),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is

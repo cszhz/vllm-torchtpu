@@ -26,6 +26,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_dp_group,
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -61,6 +62,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op impo
     get_mhc_split_fn_op,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.deepseek_v4 import sequence_parallel as sp
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
@@ -202,6 +204,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
+        sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Defer each post into the next pre so the pair is one kernel.
 
@@ -209,6 +212,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         carries `(residual, post_mix, res_mix)` -- the recombine that output
         still owes. The chain is opened by the layer-0 attention pre, which
         has no preceding post, and closed by the caller.
+
+        With `sequence_parallel`, every row-wise tensor here (and `input_ids`)
+        holds this rank's rows only; see sequence_parallel.py.
         """
         if residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
@@ -229,7 +235,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         x = self._norm(self.attn_norm, x)
-        x = self.attn(positions, x)
+        if sequence_parallel:
+            x = sp.reduce_scatter(
+                self.attn(positions, sp.gather(x), reduce_output=False)
+            )
+        else:
+            x = self.attn(positions, x)
 
         residual, post_mix, res_mix, x = self.mhc_ops.fused(
             x,
@@ -242,7 +253,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             *self._norm_arg(self.ffn_norm),
         )
         x = self._norm(self.ffn_norm, x)
-        x = self.ffn(x, input_ids)
+        if sequence_parallel:
+            x = self.ffn.forward_sequence_parallel(x, input_ids)
+        else:
+            x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
 
@@ -524,6 +538,32 @@ class DeepseekV4Model(nn.Module):
             return input_ids
         return dp_group.all_gather(input_ids, dim=0)
 
+    def _sequence_parallel_step(self, hidden_states: torch.Tensor) -> bool:
+        """Whether this step keeps the residual streams sharded over TP.
+
+        Asked of the embedded [tokens, hidden] tensor so the decision is a
+        shape guard (see sequence_parallel.eligible).
+        """
+        if not sp.eligible(hidden_states.shape[0]):
+            return False
+        assert get_pp_group().world_size == 1, (
+            "DeepSeek-V4 sequence-parallel prefill does not support PP"
+        )
+        assert not envs.TPU_DSV4_ATTN_INTRA_CHIP_TP, (
+            "TPU_DSV4_PREFILL_SP and TPU_DSV4_ATTN_INTRA_CHIP_TP are exclusive"
+        )
+        assert get_pcp_group().world_size == 1, (
+            "DeepSeek-V4 sequence-parallel prefill does not support PCP"
+        )
+        # Both read per-rank state laid out for the replicated rows.
+        assert not envs.TPU_MOE_SKIP_PADDED_TOKENS, (
+            "TPU_DSV4_PREFILL_SP does not support TPU_MOE_SKIP_PADDED_TOKENS"
+        )
+        assert not envs.MOE_EXPERT_COUNT_TAP_DIR, (
+            "TPU_DSV4_PREFILL_SP does not support MOE_EXPERT_COUNT_TAP_DIR"
+        )
+        return True
+
     def make_empty_intermediate_tensors(
         self,
         batch_size: int,
@@ -551,7 +591,6 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = typing.cast(
@@ -563,6 +602,15 @@ class DeepseekV4Model(nn.Module):
         moe_input_ids = input_ids
         if input_ids is not None and self.start_layer < self.config.num_hash_layers:
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
+
+        sequence_parallel = self._sequence_parallel_step(hidden_states)
+        if sequence_parallel:
+            rank = sp.rank_as_data(hidden_states.device)
+            hidden_states = sp.shard(hidden_states, rank)
+            if moe_input_ids is not None:
+                moe_input_ids = sp.shard(moe_input_ids, rank)
+        if get_pp_group().is_first_rank:
+            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
@@ -578,13 +626,17 @@ class DeepseekV4Model(nn.Module):
                 post_mix,
                 res_mix,
                 residual,
+                sequence_parallel=sequence_parallel,
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the full hc-stream state and collapse it the
                 # way the drafts were trained on: settle the deferred post,
                 # then mean over the hc streams (upstream numerics).
                 aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
-                aux_hidden_states.append(aux_recon.mean(dim=1))
+                aux_hidden = aux_recon.mean(dim=1)
+                if sequence_parallel:
+                    aux_hidden = sp.gather(aux_hidden)
+                aux_hidden_states.append(aux_hidden)
                 final_aux_recon = aux_recon
 
         if post_mix is not None:
@@ -611,6 +663,8 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        if sequence_parallel:
+            hidden_states = sp.gather(hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -659,10 +713,11 @@ class DeepseekV4Model(nn.Module):
                         break
                     if name not in params_dict:
                         continue
-                    param = staged.stage(name, params_dict[name])
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    loaded_params.add(name)
+                    for target in _with_full_shared_alias(name, params_dict):
+                        param = staged.stage(target, params_dict[target])
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                        loaded_params.add(target)
                     break
                 else:
                     if ".experts." in name:
@@ -718,12 +773,13 @@ class DeepseekV4Model(nn.Module):
                             continue
                         if name not in params_dict:
                             continue
-                        param = staged.stage(name, params_dict[name])
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                        loaded_params.add(name)
+                        for target in _with_full_shared_alias(name, params_dict):
+                            param = staged.stage(target, params_dict[target])
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param, loaded_weight)
+                            loaded_params.add(target)
                         continue
         finally:
             staged.flush_all()
@@ -742,6 +798,17 @@ class DeepseekV4Model(nn.Module):
             ckpt_up_proj_name="w3",
             num_experts=self.config.n_routed_experts,
         )
+
+
+def _with_full_shared_alias(name: str, params_dict: dict) -> list[str]:
+    """`name`, plus the unsharded shared-expert copy's parameter it also feeds.
+
+    DeepseekV4MoE.shared_experts_full exists only under
+    TPU_DSV4_PREFILL_SP_REPLICATED_SHARED and has no checkpoint tensors of its
+    own: it is loaded from the shared expert's, without the TP split.
+    """
+    alias = name.replace(".shared_experts.", ".shared_experts_full.")
+    return [name, alias] if alias != name and alias in params_dict else [name]
 
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:

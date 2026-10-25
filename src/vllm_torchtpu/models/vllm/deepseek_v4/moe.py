@@ -26,6 +26,8 @@ from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.models.utils import extract_layer_index
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.models.vllm.deepseek_v4 import sequence_parallel as sp
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
 
 
@@ -78,6 +80,9 @@ class DeepseekV4MoE(nn.Module):
                 requires_grad=False,
             )
 
+        # An unsharded copy of the shared expert for sequence-parallel steps,
+        # loaded from the same checkpoint tensors (see model.load_weights).
+        self.shared_experts_full = None
         if config.n_shared_experts is None:
             self.shared_experts = None
         else:
@@ -91,6 +96,21 @@ class DeepseekV4MoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+            if (
+                envs.TPU_DSV4_PREFILL_SP
+                and envs.TPU_DSV4_PREFILL_SP_REPLICATED_SHARED
+                and self.tp_size > 1
+            ):
+                self.shared_experts_full = DeepseekV4MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=intermediate_size,
+                    hidden_act=config.hidden_act,
+                    swiglu_limit=self.swiglu_limit,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                    is_sequence_parallel=True,
+                    prefix=f"{prefix}.shared_experts_full",
+                )
 
         self.tp_rank = get_tensor_model_parallel_rank()
         assert config.n_routed_experts % self.tp_size == 0
@@ -157,3 +177,40 @@ class DeepseekV4MoE(nn.Module):
         )
 
         return final_hidden_states.view(org_shape)
+
+    def forward_sequence_parallel(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """The MoE output at this rank's rows of a sequence-parallel step.
+
+        The same terms the MoE runner forms for the replicated path --
+        (TP-reduced shared) + routed_scaling_factor * (routed) -- with the
+        routed experts on this rank's rows through the token-sharded fused EP
+        op and the shared expert's TP partial reduce-scattered (or computed
+        unsharded on these rows).
+        """
+        if self.gate.tid2eid is not None and input_ids is None:
+            raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+        runner = self.experts
+        routed_layer = runner.routed_experts
+        router_logits, _ = self.gate(hidden_states)
+        shared = None
+        if self.shared_experts_full is not None:
+            shared = self.shared_experts_full(hidden_states)
+        elif self.shared_experts is not None:
+            shared = sp.reduce_scatter(self.shared_experts(sp.gather(hidden_states)))
+        routed = routed_layer.quant_method.forward_sequence_parallel(
+            routed_layer,
+            hidden_states,
+            router_logits,
+            input_ids,
+            # As VllmMoERunner: the kernel waits for the shared expert.
+            order_after=(
+                (hidden_states if shared is None else shared)
+                if envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL
+                else None
+            ),
+        )
+        if runner.routed_scaling_factor != 1.0:
+            routed = routed * runner.routed_scaling_factor
+        return routed if shared is None else shared + routed
