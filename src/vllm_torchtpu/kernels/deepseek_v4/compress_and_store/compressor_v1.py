@@ -156,6 +156,17 @@ def _pack_array(x, safe, valid, default_value):
     return jnp.where(valid, x[safe], default_value)
 
 
+def boundary_rope_pack(seq_along_lane: bool) -> int:
+    """Slots `prepare_boundary_batch` aligns each prefill cache row's tokens to.
+
+    Row-addressed caches merge one row's tokens inside an aligned group of
+    `SLOT_PACK`. The SEQ_ALONG_LANE indexer cache is written by lane and merges
+    no rows, so its boundary tokens are packed densely: no padding tokens run
+    through the grid, and its final store has no gaps to compact.
+    """
+    return 1 if seq_along_lane else config.SLOT_PACK
+
+
 def prepare_boundary_batch(
     positions: jax.Array,
     token_to_req_indices: jax.Array,
@@ -201,7 +212,7 @@ def prepare_boundary_batch(
 
     # 4. Calculate alignment offset for prefill block
     K = jnp.sum(is_decode)
-    K_aligned = ((K + 3) // 4) * 4
+    K_aligned = ((K + rope_pack - 1) // rope_pack) * rope_pack
 
     # 5. Combine destination indices
     prefill_size = rope_pack * max_prefill_boundary
@@ -297,6 +308,7 @@ def compressor_forward(
         is_decode_token=is_decode_token,
         compress_ratio=compress_ratio,
         num_reqs=num_reqs,
+        rope_pack=boundary_rope_pack(seq_along_lane),
     )
 
     cache, rope_cache = compress_kernel.compress_norm_rope_store(
