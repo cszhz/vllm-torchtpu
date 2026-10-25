@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_MK_MAX_CTX: int = 1048576
     VLLM_TPU_DSV4_MK_VMEM_SHARE: bool = False
     VLLM_TPU_DSV4_MK_NO_BOUNDS_CHECKS: bool = False
+    VLLM_TPU_DSV4_MK_AR_LIVE_ROWS: bool = False
     VLLM_TPU_DSV4_MK_STATS_PERIOD_S: float = 60.0
     VLLM_TPU_DSV4_MK_TRACE_STEPS: int = 32
     VLLM_TPU_DSV4_MK_TRACE_RUNS: int = 0
@@ -1091,6 +1092,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Megakernel step compiled without Mosaic's per-DMA bounds checks
     # (StepKernelConfig.no_bounds_checks).
     "VLLM_TPU_DSV4_MK_NO_BOUNDS_CHECKS": env_bool("VLLM_TPU_DSV4_MK_NO_BOUNDS_CHECKS"),
+    # Megakernel all-reduces over the live requests' rows only
+    # (StepKernelConfig.ar_live_rows).
+    "VLLM_TPU_DSV4_MK_AR_LIVE_ROWS": env_bool("VLLM_TPU_DSV4_MK_AR_LIVE_ROWS"),
     # Period of the megakernel step-mix and A/B latency logs.
     "VLLM_TPU_DSV4_MK_STATS_PERIOD_S": env_float(
         "VLLM_TPU_DSV4_MK_STATS_PERIOD_S", 60.0

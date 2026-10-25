@@ -126,6 +126,10 @@ class StepKernelConfig:
     # tile. Every DMA index here comes from validated tables (the blocks were
     # measured with the checks off); this turns them off for the whole step.
     no_bounds_checks: bool = False
+    # Both all-reduces exchange and sum only the rows of live requests (rows
+    # [0, 8 * requests) in 16-row blocks) and zero the rest of their output;
+    # every op is row-wise, so the live rows are unchanged.
+    ar_live_rows: bool = False
 
     @property
     def n_debug_outputs(self) -> int:
@@ -722,7 +726,13 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
     spec = scfg.ar_spec()
     # One all-reduce scratch: AR#1 always uses slot 0, AR#2 slot 1, so
     # consecutive all-reduces alternate slots (the cross-rank WAR rule).
-    ar = AR.AllReduce(spec, {k: v for k, v in s.items() if k.startswith("ar_")}, me)
+    live_blocks = None
+    if scfg.ar_live_rows:
+        lb = AR.LIVE_BLOCK
+        live_blocks = (counts[2] * scfg.QP + lb - 1) // lb
+    ar = AR.AllReduce(
+        spec, {k: v for k, v in s.items() if k.startswith("ar_")}, me, live_blocks
+    )
 
     def allreduce(li, slot):
         if "ar" in skip:
@@ -733,7 +743,10 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
         def _():
             ar.wait_sends(slot)  # this slot's previous use (one layer back)
 
-        s["xin"][...] = ar(s["part"][...], slot).astype(BF16)
+        if scfg.ar_live_rows:
+            ar.reduce_into(s["part"], s["xin"], slot)
+        else:
+            s["xin"][...] = ar(s["part"][...], slot).astype(BF16)
 
     # ---- post only (aux layers, final) ---------------------------------------
     def post_rows_to(dst_hbm):

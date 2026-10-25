@@ -73,6 +73,7 @@ def main():
     # MoE: a random static expert permutation per layer (moe_phase placement)
     p.add_argument("--placement", action="store_true")
     p.add_argument("--vmem-share", action="store_true", help="vmem_share on")
+    p.add_argument("--ar-live", action="store_true", help="ar_live_rows on")
     p.add_argument("--dump", default="", help="save the kernel outputs (.npz)")
     a = p.parse_args()
     R, T, q, B = a.R, a.T, a.q, a.B
@@ -90,6 +91,7 @@ def main():
         fault="a2a_heads" if a.fault == "a2a_heads" else "", moe_impl=a.moe,
         debug_att=a.debug_att, attn_tp=a.attn_tp,
         moe_placement="perm" if a.placement else "", vmem_share=a.vmem_share,
+        ar_live_rows=a.ar_live,
     )  # fmt: skip
     w = dw.make_weights(full)
     packs = [

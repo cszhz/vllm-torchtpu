@@ -148,7 +148,7 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
         dense=cfg, q=a.q, B=nb, moe_impl=moe_impl, moe_leased=var.get("lease", "1") == "1",
         aux_layers=tuple(x for x in (L - 3, L - 2, L - 1) if x >= 0),
         attn_tp=int(var.get("attn_tp", 1)), vmem_share=var.get("share") == "1",
-        no_bounds_checks=var.get("nobc") == "1",
+        no_bounds_checks=var.get("nobc") == "1", ar_live_rows=var.get("arlive") == "1",
     )  # fmt: skip
     if moe_impl != "real":
         moe_args = []

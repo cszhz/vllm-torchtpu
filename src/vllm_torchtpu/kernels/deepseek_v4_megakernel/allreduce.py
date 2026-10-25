@@ -139,12 +139,22 @@ def barrier(R, me):
     pl.semaphore_wait(sem, R - 1)
 
 
+LIVE_BLOCK = 16  # rows per transfer chunk of a live-row all-reduce (bf16 tile)
+
+
 class AllReduce:
     """The all-reduce of one AllReduceSpec over kernel scratch `scr` (a dict
-    holding at least the spec's `ar_*` names); `me` is this rank's mesh index."""
+    holding at least the spec's `ar_*` names); `me` is this rank's mesh index.
 
-    def __init__(self, spec: AllReduceSpec, scr, me):
+    live_blocks (hrsag reduce_into only; traced int32, the same on every
+    rank): only rows [0, live_blocks * 16) are exchanged and summed, as
+    16-row DMAs; the destination's rows past them are zeroed."""
+
+    def __init__(self, spec: AllReduceSpec, scr, me, live_blocks=None):
         self.spec, self.scr, self.me = spec, scr, me
+        self.live = live_blocks
+        if live_blocks is not None:
+            assert spec.mode == "hrsag", "live rows: hrsag only"
 
     def _copy(self, src, dst, rnd, slot, peer_off):
         s = self.scr
@@ -170,10 +180,11 @@ class AllReduce:
             return (G, G, R // G - 1) if rnd == 1 else (1, 1, G - 1)
         return 1, 1, R - 1
 
-    def _desc(self, slot, rnd, off):
+    def _desc(self, slot, rnd, off, blk=None):
         """Round `rnd`'s send to peer me ^ off (`off` may be traced). A peer's
         send to this rank uses the same offset, hence the same semaphore and
-        byte count, so the same descriptor also waits for the receive."""
+        byte count, so the same descriptor also waits for the receive.
+        blk: only the 16-row block `blk` (traced) of the payload."""
         sp, s, me = self.spec, self.scr, self.me
         if sp.mode == "flat":
             src, dst = s["ar_send"].at[slot], s["ar_recv"].at[slot, me]
@@ -200,6 +211,9 @@ class AllReduce:
         else:
             bit = lax.rem(me // (1 << rnd), 2)
             src, dst = s["ar_send"].at[rnd, slot], s["ar_recv"].at[rnd, slot, bit]
+        if blk is not None:
+            rows = pl.ds(pl.multiple_of(blk * LIVE_BLOCK, LIVE_BLOCK), LIVE_BLOCK)
+            src, dst = src.at[rows], dst.at[rows]
         return self._copy(src, dst, rnd, slot, off)
 
     def copies(self, slot, rnd):
@@ -210,12 +224,21 @@ class AllReduce:
         """fn(descriptor) for every peer of the round, in a rolled loop (one
         descriptor site of code whatever the peer count)."""
         first, step, count = self._offs(rnd)
+
+        def peer(off):
+            if self.live is None:
+                fn(self._desc(slot, rnd, off))
+                return
+            lax.fori_loop(
+                0, self.live, lambda b, c: (fn(self._desc(slot, rnd, off, b)), c)[1], 0
+            )
+
         if count == 1:
-            fn(self._desc(slot, rnd, first))
+            peer(first)
             return
 
         def body(k, c):
-            fn(self._desc(slot, rnd, first + step * k))
+            peer(first + step * k)
             return c
 
         lax.fori_loop(0, count, body, 0)
@@ -241,15 +264,19 @@ class AllReduce:
         G, C, R = sp.group, sp.chunk, sp.R
         lme, host = lax.rem(me, G), me // G
         nblk = sp.rows // row_block
+        live = nblk
+        if self.live is not None:
+            assert row_block == LIVE_BLOCK
+            live = self.live
 
         def rows(r):
             return pl.ds(pl.multiple_of(r * row_block, row_block), row_block)
 
         def over_rows(fn):
-            if nblk == 1:
+            if self.live is None and nblk == 1:
                 fn(0)
             else:
-                lax.fori_loop(0, nblk, lambda r, c: (fn(r), c)[1], 0)
+                lax.fori_loop(0, live, lambda r, c: (fn(r), c)[1], 0)
 
         def pack(r):
             for j in range(G):
@@ -286,10 +313,18 @@ class AllReduce:
         over_rows(host_sum)
         self._round(slot, 2)
         over_rows(unpack)
+        if self.live is not None:  # rows past the live ones: zero, not stale
+
+            def zero(r, c):
+                dst[rows(r)] = jnp.zeros((row_block, dst.shape[1]), dst.dtype)
+                return c
+
+            lax.fori_loop(live, nblk, zero, 0)
 
     def __call__(self, x, slot):
         """x f32 [rows, hidden] partial -> f32 [rows, hidden] sum over ranks."""
         sp, s, me = self.spec, self.scr, self.me
+        assert self.live is None, "live rows: use reduce_into"
         R = sp.R
         if sp.mode == "flat":
             s["ar_send"][slot] = x.astype(BF16)
