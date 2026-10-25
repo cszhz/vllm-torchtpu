@@ -16,7 +16,11 @@
 import pytest
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
 
-from vllm_torchtpu.omni.patches import _QWEN_IMAGE_PIPELINES, _WAN_PIPELINES
+from vllm_torchtpu.omni.patches import (
+    _LTX2_PIPELINES,
+    _QWEN_IMAGE_PIPELINES,
+    _WAN_PIPELINES,
+)
 
 pytestmark = pytest.mark.omni
 
@@ -33,8 +37,12 @@ def _pipelines_in(package: str) -> set[str]:
 
 @pytest.mark.parametrize(
     ("pipelines", "package"),
-    [(_QWEN_IMAGE_PIPELINES, "qwen_image"), (_WAN_PIPELINES, "wan2_2")],
-    ids=["qwen_image", "wan2_2"],
+    [
+        (_QWEN_IMAGE_PIPELINES, "qwen_image"),
+        (_WAN_PIPELINES, "wan2_2"),
+        (_LTX2_PIPELINES, "ltx2"),
+    ],
+    ids=["qwen_image", "wan2_2", "ltx2"],
 )
 def test_patched_pipelines_match_registry(pipelines, package):
     in_package = _pipelines_in(package)

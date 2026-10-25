@@ -57,8 +57,20 @@ _WAN_PIPELINES = frozenset(
         "CausVidWanPipeline",
     }
 )
+_LTX2_PIPELINES = frozenset(
+    {
+        "LTX2Pipeline",
+        "LTX2TextToAudioPipeline",
+        "LTX2TwoStagePipeline",
+        "LTX2DistilledOneStagePipeline",
+        "LTX2DistilledTwoStagePipeline",
+        "LTX2DistilledPipeline",
+        "LTX2T2VDMD2Pipeline",
+        "LTX2I2VDMD2Pipeline",
+    }
+)
 # Every pipeline that some model-specific patch above applies to.
-_PATCHED_PIPELINES = _QWEN_IMAGE_PIPELINES | _WAN_PIPELINES
+_PATCHED_PIPELINES = _QWEN_IMAGE_PIPELINES | _WAN_PIPELINES | _LTX2_PIPELINES
 
 
 def _serves(od_config: "OmniDiffusionConfig | None", pipelines: frozenset[str]) -> bool:
@@ -243,6 +255,59 @@ def _patch_wan_ffn_gelu_fence(
     logger.info("Applied TPU patch: fusion fence after Wan FFN GELU.")
 
 
+_D2H_STREAM_PATCHED = "_tpu_d2h_stream_patched"
+
+
+def _patch_diffusion_worker_d2h_stream() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni creates the D2H stream of
+    # WorkerProc._async_output_loop (vllm_omni/diffusion/worker/diffusion_worker.py)
+    # on the current device index instead of
+    # torch.device(torch.accelerator.current_accelerator().type, self.gpu_id).
+    #
+    # Problem: WorkerProc._async_output_loop creates its D2H stream on device
+    #   index self.gpu_id. On TPU, OmniTpuPlatform.set_device selects device
+    #   index 0 in every worker process, so a worker with gpu_id >= 1 asks for
+    #   a stream on a device index that its process did not select.
+    # Fix: run the loop with a proxy as self whose gpu_id is the current
+    #   device index; other attribute reads and writes go to the worker.
+    # Effect: the output thread of a worker with gpu_id >= 1 gets its stream
+    #   instead of failing at startup.
+    # Scope: the proxy is live for the whole output-thread lifetime, not only
+    #   while the stream is created. Only attribute reads/writes are
+    #   forwarded, so identity/type checks on self inside the loop would see
+    #   the proxy (the upstream loop does none).
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
+
+    orig_async_output_loop = WorkerProc._async_output_loop
+    if getattr(orig_async_output_loop, _D2H_STREAM_PATCHED, False):
+        return
+
+    def _tpu_async_output_loop(self: Any) -> None:
+        orig_async_output_loop(_CurrentDeviceWorkerProxy(self))
+
+    setattr(_tpu_async_output_loop, _D2H_STREAM_PATCHED, True)
+    WorkerProc._async_output_loop = _tpu_async_output_loop
+    logger.info("Applied TPU patch: diffusion D2H stream on the current device.")
+
+
+class _CurrentDeviceWorkerProxy:
+    """Forward attribute access to a worker, reporting the current device as
+    ``gpu_id``."""
+
+    def __init__(self, worker: Any) -> None:
+        object.__setattr__(self, "_worker", worker)
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "gpu_id":
+            return torch.accelerator.current_device_index()
+        return getattr(self._worker, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._worker, name, value)
+
+
 # TODO: Remove once vLLM-Omni synchronizes the device at the end of its
 # startup warmup (e.g. self.executor.collective_rpc("synchronize_device") in
 # _dummy_run).
@@ -389,3 +454,135 @@ def _wrap_fresh_timestep(cls: type) -> None:
 
     setattr(_fresh_timestep_forward, _FRESH_TIMESTEP_PATCHED, True)
     cls.forward = _fresh_timestep_forward
+
+
+_SDPA_FALLBACK_PATCHED = "_tpu_sdpa_fallback_patched"
+
+
+def _patch_sdpa_fallback_dispatch() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni's AttentionImpl.forward dispatches
+    # out-of-tree platforms instead of raising NotImplementedError.
+    #
+    # Problem: Attention builds `sdpa_fallback` from vLLM-Omni's SDPAImpl,
+    #   whatever the selected backend. AttentionImpl.forward picks
+    #   forward_cuda/_npu/... from the platform and raises NotImplementedError
+    #   on TPU, so every sdpa_fallback call fails there.
+    # Fix: SDPAImpl.forward is replaced by TpuSDPAImpl.forward, which runs
+    #   SDPAImpl._forward_impl with broadcast key masks, as forward_cuda does.
+    # Effect: sdpa_fallback calls run on TPU instead of raising
+    #   NotImplementedError. LTX-2's _LTX2ParallelAttention sends masked calls
+    #   to sdpa_fallback: with sequence parallelism the audio latents are
+    #   padded to a multiple of the SP size, so audio self-attention and
+    #   audio-to-video cross-attention carry a key-padding mask. SANA-Video,
+    #   LingBot-Video and SenseNova-U1 also call sdpa_fallback.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+
+    from vllm_torchtpu.omni.attention import TpuSDPAImpl
+
+    if getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False):
+        return
+    # The flag lands on TpuSDPAImpl.forward, the function shared by both classes.
+    setattr(TpuSDPAImpl.forward, _SDPA_FALLBACK_PATCHED, True)
+    SDPAImpl.forward = TpuSDPAImpl.forward
+    logger.info("Applied TPU patch: SDPAImpl.forward routes to TpuSDPAImpl.")
+
+
+_VOCODER_CPU_INIT_PATCHED = "_tpu_vocoder_cpu_init_patched"
+
+
+def _patch_ltx2_vocoder_cpu_init(
+    od_config: "OmniDiffusionConfig | None" = None,
+) -> bool | None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once torch_tpu implements kaiser_window and sinc, or
+    # vLLM-Omni builds the vocoder and runs
+    # ltx2_runtime._restore_ltx_bwe_resampler_filter on CPU.
+    #
+    # Problem: DiffusersPipelineLoader._init_from_load_format constructs the
+    #   pipeline under a `with torch.device("tpu:N"):` context. LTX-2.3 and
+    #   LTX-2.5 use Diffusers LTX2VocoderWithBWE (`act_fn="snakebeta"`,
+    #   `antialias=True`), whose __init__ builds AntiAliasAct1d -> UpSample1d
+    #   -> kaiser_sinc_filter1d and calls torch.kaiser_window(...) on the
+    #   active default device before weights are loaded, failing on TPU with
+    #   `DispatchStub: missing kernel for tpu`. At decode,
+    #   ltx2_runtime._restore_ltx_bwe_resampler_filter rebuilds the BWE
+    #   resampler's FP32 Hann filter with torch.sinc on the filter's device,
+    #   failing on TPU with `operator 'aten::sinc.out' is not implemented`.
+    # Fix: Constructing the vocoder on CPU (matching text_encoder and
+    #   latent_upsampler in ltx2_components.py) builds the filter buffers on
+    #   the host before _place_aux_components moves the module to
+    #   pipeline.device. The restore helper runs upstream's rebuild on a CPU
+    #   stand-in filter and moves the result to the filter's device, so later
+    #   decodes hit upstream's identity check and skip the rebuild.
+    # Effect: LTX-2.3 loads and decodes on TPU.
+    # -------------------------------------------------------------------------
+    if not _serves(od_config, _LTX2_PIPELINES):
+        return False
+    from vllm_omni.diffusion.models.ltx2 import ltx2_components, ltx2_runtime
+
+    _wrap_ltx2_bwe_filter_restore(ltx2_runtime)
+    if getattr(ltx2_components._load_component, _VOCODER_CPU_INIT_PATCHED, False):
+        return
+    orig_load_component = ltx2_components._load_component
+
+    def _cpu_vocoder_load_component(
+        component_cls: Any,
+        model: str,
+        subfolder: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if subfolder == "vocoder":
+            with torch.device("cpu"):
+                return orig_load_component(
+                    component_cls, model, subfolder, *args, **kwargs
+                )
+        return orig_load_component(component_cls, model, subfolder, *args, **kwargs)
+
+    setattr(_cpu_vocoder_load_component, _VOCODER_CPU_INIT_PATCHED, True)
+    ltx2_components._load_component = _cpu_vocoder_load_component
+    logger.info("Applied TPU patch: CPU-context init for LTX-2 vocoder.")
+
+
+_BWE_FILTER_CPU_RESTORE_PATCHED = "_tpu_bwe_filter_cpu_restore_patched"
+
+
+def _wrap_ltx2_bwe_filter_restore(ltx2_runtime: Any) -> None:
+    # _run_ltx_vocoder resolves the helper as an ltx2_runtime global at call
+    # time, so replacing the module attribute covers every caller.
+    restore = ltx2_runtime._restore_ltx_bwe_resampler_filter
+    if getattr(restore, _BWE_FILTER_CPU_RESTORE_PATCHED, False):
+        return
+
+    def _cpu_restore_ltx_bwe_resampler_filter(vocoder: Any) -> None:
+        resampler: Any = getattr(vocoder, "resampler", None)
+        current: Any = getattr(resampler, "filter", None)
+        previous = getattr(resampler, "_ltx_restored_filter", None)
+        if (
+            not isinstance(current, torch.Tensor)
+            or current.device.type == "cpu"
+            or current is previous
+        ):
+            return restore(vocoder)
+        # Upstream reads only the filter's device, never its values.
+        resampler.filter = torch.empty_like(current, device="cpu")
+        try:
+            restore(vocoder)
+        finally:
+            rebuilt: Any = getattr(resampler, "_ltx_restored_filter", None)
+            if rebuilt is previous or resampler.filter is not rebuilt:
+                resampler.filter = current
+            else:
+                rebuilt = rebuilt.to(current.device)
+                resampler.filter = rebuilt
+                resampler._ltx_restored_filter = rebuilt
+
+    setattr(
+        _cpu_restore_ltx_bwe_resampler_filter, _BWE_FILTER_CPU_RESTORE_PATCHED, True
+    )
+    ltx2_runtime._restore_ltx_bwe_resampler_filter = (
+        _cpu_restore_ltx_bwe_resampler_filter
+    )
+    logger.info("Applied TPU patch: CPU rebuild of the LTX-2 BWE resampler filter.")

@@ -188,6 +188,14 @@ PATCHES = (
         "vllm_torchtpu.omni.patches:_patch_wan_pair_swap_rope",
         ("diffusion_worker",),
     ),
+    Patch(
+        "vllm_torchtpu.omni.patches:_patch_diffusion_worker_d2h_stream",
+        ("diffusion_worker",),
+    ),
+    Patch(
+        "vllm_torchtpu.omni.patches:_patch_sdpa_fallback_dispatch",
+        ("diffusion_worker",),
+    ),
     # Model-specific diffusion patches. Append new ones here with
     # stages=("diffusion_model_load",) and od_config=True.
     Patch(
@@ -207,6 +215,11 @@ PATCHES = (
     ),
     Patch(
         "vllm_torchtpu.omni.patches:_patch_wan_fresh_timestep",
+        ("diffusion_model_load",),
+        od_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.omni.patches:_patch_ltx2_vocoder_cpu_init",
         ("diffusion_model_load",),
         od_config=True,
     ),

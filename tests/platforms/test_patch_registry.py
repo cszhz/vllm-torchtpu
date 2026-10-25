@@ -276,12 +276,15 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_diffusion_ipc_cpu_pack",
         "_patch_diffusion_startup_warmup_sync",
         "_patch_wan_pair_swap_rope",
+        "_patch_diffusion_worker_d2h_stream",
+        "_patch_sdpa_fallback_dispatch",
     ]
     assert stages["diffusion_model_load"] == [
         "_patch_qwen_image_rope_txt_freqs_clone",
         "_patch_wan_ffn_gelu_fence",
         "_patch_wan_fused_qk_norm_rope",
         "_patch_wan_fresh_timestep",
+        "_patch_ltx2_vocoder_cpu_init",
     ]
     assert [p.target for p in reg.PATCHES if p.od_config] == [
         p.target for p in reg.PATCHES if "diffusion_model_load" in p.stages

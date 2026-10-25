@@ -11,8 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
+import subprocess
 import sys
+import textwrap
+import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -27,6 +31,7 @@ from .mock_omni import (  # isort: split
 )
 
 import vllm_omni
+from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu import patch_registry
@@ -41,10 +46,17 @@ from vllm_torchtpu.omni.attention import (
     TpuSDPAImpl,
 )
 from vllm_torchtpu.omni.patches import (
+    _BWE_FILTER_CPU_RESTORE_PATCHED,
+    _D2H_STREAM_PATCHED,
+    _SDPA_FALLBACK_PATCHED,
+    _VOCODER_CPU_INIT_PATCHED,
     _extend_async_output_timeout,
     _patch_diffusion_ipc_cpu_pack,
     _patch_diffusion_startup_warmup_sync,
+    _patch_diffusion_worker_d2h_stream,
+    _patch_ltx2_vocoder_cpu_init,
     _patch_qwen_image_rope_txt_freqs_clone,
+    _patch_sdpa_fallback_dispatch,
     _patch_wan_ffn_gelu_fence,
     _patch_wan_fused_qk_norm_rope,
     _patch_wan_pair_swap_rope,
@@ -62,6 +74,7 @@ pytestmark = pytest.mark.omni
 
 _WAN = SimpleNamespace(model_class_name="WanPipeline")
 _QWEN_IMAGE = SimpleNamespace(model_class_name="QwenImagePipeline")
+_LTX2 = SimpleNamespace(model_class_name="LTX2Pipeline")
 _WAN_MODULES = (
     "vllm_omni.diffusion.layers.rope",
     "vllm_omni.diffusion.models.wan2_2.wan2_2_transformer",
@@ -123,11 +136,16 @@ def test_backend_selection_imports_no_model_module(monkeypatch):
 def test_model_patches_skip_other_models(monkeypatch, model_class_name):
     # Another model's patch neither imports its module nor completes, so it
     # still runs if this process loads that model later.
-    for name in (*_WAN_MODULES, "vllm_omni.diffusion.models.qwen_image"):
+    for name in (
+        *_WAN_MODULES,
+        "vllm_omni.diffusion.models.qwen_image",
+        "vllm_omni.diffusion.models.ltx2",
+    ):
         monkeypatch.setitem(sys.modules, name, None)
     od_config = SimpleNamespace(model_class_name=model_class_name)
     assert _patch_qwen_image_rope_txt_freqs_clone(od_config=od_config) is False
     assert _patch_wan_ffn_gelu_fence(od_config=od_config) is False
+    assert _patch_ltx2_vocoder_cpu_init(od_config=od_config) is False
     assert _patch_qwen_image_rope_txt_freqs_clone(od_config=None) is False
 
 
@@ -679,3 +697,258 @@ def test_wan_self_attention_patch_falls_back_on_f32():
 
     _patch_wan_fused_qk_norm_rope(od_config=_WAN)
     assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
+
+
+def test_sdpa_fallback_routes_to_tpu_sdpa(monkeypatch):
+    # Upstream AttentionImpl.forward raises on out-of-tree platforms; after
+    # the patch, sdpa_fallback (a plain SDPAImpl) runs PyTorch SDPA.
+    def _raise_oot(self, query, key, value, attn_metadata=None):
+        raise NotImplementedError("No forward implementation for platform: oot")
+
+    monkeypatch.setattr(SDPAImpl, "forward", _raise_oot)
+    fallback = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.3)
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(2, 5, 2, 8) for _ in range(3))
+    with pytest.raises(NotImplementedError):
+        fallback.forward(q, k, v)
+
+    _patch_sdpa_fallback_dispatch()
+    assert getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False)
+    assert SDPAImpl.forward is TpuSDPAImpl.forward
+
+    keep = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]])
+    for mask in (None, keep.bool(), keep.float()):
+        meta = None if mask is None else SimpleNamespace(attn_mask=mask)
+        scores = torch.einsum("bqhd,bkhd->bhqk", q.double(), k.double()) * 0.3
+        if mask is not None:
+            scores = scores.masked_fill(~keep.bool()[:, None, None, :], -torch.inf)
+        want = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), v.double())
+        torch.testing.assert_close(
+            fallback.forward(q, k, v, meta), want.float(), rtol=1e-5, atol=1e-5
+        )
+
+    # Installing again returns at the flag check, before the info log.
+    infos = []
+    monkeypatch.setattr("vllm_torchtpu.omni.patches.logger.info", infos.append)
+    _patch_sdpa_fallback_dispatch()
+    assert infos == []
+    assert SDPAImpl.forward is TpuSDPAImpl.forward
+
+
+_DIFFUSION_WORKER = "vllm_omni.diffusion.worker.diffusion_worker"
+
+
+class _FakeWorkerProc:
+    """Builds its stream device from self.gpu_id like the upstream loop."""
+
+    def __init__(self, gpu_id):
+        self.gpu_id = gpu_id
+        self.queue = "queue"
+
+    def _async_output_loop(self):
+        self.stream_device = torch.device("cpu", self.gpu_id)
+        self.seen_queue = self.queue
+
+
+def _install_worker_proc(monkeypatch, cls):
+    module = types.ModuleType(_DIFFUSION_WORKER)
+    module.WorkerProc = cls
+    monkeypatch.setitem(sys.modules, _DIFFUSION_WORKER, module)
+
+
+@pytest.fixture
+def worker_proc(monkeypatch):
+    # A fresh subclass per test, so the patch never edits a shared class.
+    cls = type("WorkerProc", (_FakeWorkerProc,), {})
+    _install_worker_proc(monkeypatch, cls)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 1)
+    return cls
+
+
+def test_d2h_stream_uses_current_device_index(worker_proc):
+    _patch_diffusion_worker_d2h_stream()
+
+    worker = worker_proc(gpu_id=3)
+    worker._async_output_loop()
+
+    assert worker.stream_device == torch.device("cpu", 1)
+    assert worker.seen_queue == "queue"
+    assert worker.gpu_id == 3
+
+
+def test_d2h_stream_patch_is_idempotent(worker_proc):
+    orig_loop = worker_proc._async_output_loop
+
+    _patch_diffusion_worker_d2h_stream()
+    patched_loop = worker_proc._async_output_loop
+    _patch_diffusion_worker_d2h_stream()
+
+    assert patched_loop is not orig_loop
+    assert getattr(patched_loop, _D2H_STREAM_PATCHED, False)
+    assert worker_proc._async_output_loop is patched_loop
+
+
+def test_d2h_stream_patch_targets_real_worker_proc():
+    # Runs in a fresh interpreter because tests/omni mock vllm_omni in
+    # sys.modules. Skipped when no importable vLLM-Omni is on the path.
+    code = textwrap.dedent(
+        """
+        import sys
+
+        try:
+            from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
+        except ImportError as e:
+            print(e)
+            sys.exit(77)
+
+        from vllm_torchtpu.omni.patches import (
+            _D2H_STREAM_PATCHED,
+            _patch_diffusion_worker_d2h_stream,
+        )
+
+        orig_loop = WorkerProc._async_output_loop
+        _patch_diffusion_worker_d2h_stream()
+        assert WorkerProc._async_output_loop is not orig_loop
+        assert getattr(WorkerProc._async_output_loop, _D2H_STREAM_PATCHED, False)
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if result.returncode == 77:
+        pytest.skip(f"vllm_omni is not importable: {result.stdout.strip()}")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_ltx2_vocoder_cpu_init_patch(monkeypatch):
+    calls = []
+
+    def _load_component(
+        component_cls, model, subfolder, *, local_files_only, dtype, revision
+    ):
+        calls.append((subfolder, local_files_only, dtype, revision))
+        return torch.empty(0).device.type
+
+    # A real module: the MagicMock-backed ltx2 package reports every
+    # attribute as present, which would trip the idempotency guard.
+    ltx2_components = types.ModuleType("ltx2_components")
+    ltx2_components._load_component = _load_component
+    monkeypatch.setattr(
+        vllm_omni_mock.diffusion.models.ltx2, "ltx2_components", ltx2_components
+    )
+
+    _patch_ltx2_vocoder_cpu_init(od_config=_LTX2)
+    patched = ltx2_components._load_component
+    assert patched is not _load_component
+    assert getattr(patched, _VOCODER_CPU_INIT_PATCHED, False)
+
+    load_kwargs = {"local_files_only": True, "dtype": torch.float32, "revision": None}
+    with torch.device("meta"):
+        assert patched(object, "m", "vocoder", **load_kwargs) == "cpu"
+        assert patched(object, "m", "vae", **load_kwargs) == "meta"
+    assert calls == [
+        ("vocoder", True, torch.float32, None),
+        ("vae", True, torch.float32, None),
+    ]
+
+    _patch_ltx2_vocoder_cpu_init(od_config=_LTX2)
+    assert ltx2_components._load_component is patched
+
+
+def _upstream_restore_ltx_bwe_resampler_filter(vocoder):
+    # Copy of vllm-omni v0.32.0rc1 ltx2_runtime._restore_ltx_bwe_resampler_filter
+    # (ltx2_runtime.py:81-110); vllm_omni is mocked here, so the real module
+    # cannot be imported.
+    resampler = getattr(vocoder, "resampler", None)
+    current_filter = getattr(resampler, "filter", None)
+    ratio = getattr(resampler, "ratio", None)
+    kernel_size = getattr(resampler, "kernel_size", None)
+    if (
+        not isinstance(current_filter, torch.Tensor)
+        or not isinstance(ratio, int)
+        or not isinstance(kernel_size, int)
+    ):
+        return
+    if current_filter is getattr(resampler, "_ltx_restored_filter", None):
+        return
+    rolloff = 0.99
+    lowpass_filter_width = 6
+    width = math.ceil(lowpass_filter_width / rolloff)
+    if kernel_size != 2 * width * ratio + 1:
+        return
+    device = current_filter.device
+    time_axis = torch.arange(kernel_size, device=device, dtype=torch.float32)
+    time_axis = (time_axis / ratio - width) * rolloff
+    time_clamped = time_axis.clamp(-lowpass_filter_width, lowpass_filter_width)
+    window = torch.cos(time_clamped * math.pi / lowpass_filter_width / 2).square()
+    filter_value = (torch.sinc(time_axis) * window * rolloff / ratio).reshape(1, 1, -1)
+    resampler.filter = filter_value
+    resampler._ltx_restored_filter = filter_value
+
+
+class _FakeBweResampler(torch.nn.Module):
+    def __init__(self, device, kernel_size=29):
+        super().__init__()
+        self.ratio = 2
+        self.kernel_size = kernel_size
+        bf16 = torch.empty(1, 1, kernel_size, dtype=torch.bfloat16, device=device)
+        self.register_buffer("filter", bf16, persistent=False)
+
+
+def test_ltx2_bwe_filter_cpu_restore_patch(monkeypatch):
+    calls = []  # (filter device seen by upstream, filter after upstream)
+
+    def _restore(vocoder):
+        device = vocoder.resampler.filter.device.type
+        _upstream_restore_ltx_bwe_resampler_filter(vocoder)
+        calls.append((device, vocoder.resampler.filter))
+
+    ltx2_runtime = types.ModuleType("ltx2_runtime")
+    ltx2_runtime._restore_ltx_bwe_resampler_filter = _restore
+    ltx2_components = types.ModuleType("ltx2_components")
+    ltx2_components._load_component = lambda *args, **kwargs: None
+    ltx2 = vllm_omni_mock.diffusion.models.ltx2
+    monkeypatch.setattr(ltx2, "ltx2_runtime", ltx2_runtime)
+    monkeypatch.setattr(ltx2, "ltx2_components", ltx2_components)
+
+    _patch_ltx2_vocoder_cpu_init(od_config=_LTX2)
+    patched = ltx2_runtime._restore_ltx_bwe_resampler_filter
+    assert patched is not _restore
+    assert getattr(patched, _BWE_FILTER_CPU_RESTORE_PATCHED, False)
+    _patch_ltx2_vocoder_cpu_init(od_config=_LTX2)
+    assert ltx2_runtime._restore_ltx_bwe_resampler_filter is patched
+
+    # A CPU filter goes straight to upstream.
+    cpu_vocoder = types.SimpleNamespace(resampler=_FakeBweResampler("cpu"))
+    patched(cpu_vocoder)
+    want = cpu_vocoder.resampler.filter
+    assert calls == [("cpu", want)] and want.dtype == torch.float32
+
+    # Off CPU ("meta" stands in for TPU), upstream rebuilds on CPU and the
+    # FP32 result moves to the filter's device as the restored filter.
+    resampler = _FakeBweResampler("meta")
+    vocoder = types.SimpleNamespace(resampler=resampler)
+    patched(vocoder)
+    assert calls[-1][0] == "cpu" and torch.equal(calls[-1][1], want)
+    restored = resampler.filter
+    assert restored.device.type == "meta" and restored.dtype == torch.float32
+    assert restored.shape == want.shape
+    assert resampler._buffers["filter"] is restored
+    assert resampler._ltx_restored_filter is restored
+
+    # The next decode hits upstream's identity check: nothing is rebuilt.
+    patched(vocoder)
+    assert calls[-1] == ("meta", restored)
+    assert resampler.filter is restored
+    assert resampler._ltx_restored_filter is restored
+
+    # Upstream's early return (unexpected kernel size) leaves the filter alone.
+    other = _FakeBweResampler("meta", kernel_size=31)
+    original = other.filter
+    patched(types.SimpleNamespace(resampler=other))
+    assert calls[-1][0] == "cpu"
+    assert other.filter is original
+    assert not hasattr(other, "_ltx_restored_filter")
