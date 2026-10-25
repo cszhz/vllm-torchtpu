@@ -5572,7 +5572,11 @@ class TPUModelRunner(GPUModelRunner):
             )
         else:
             input_ids = torch.zeros((num_tokens), dtype=torch.int32).to(self.device)
-            actual_num_reqs = min(num_tokens, num_reqs)
+            # An idle DP rank's lockstep forward only pairs collectives and its
+            # output is discarded. One request keeps its attention passes as
+            # short as a busy rank's; `num_reqs` 1-token decodes made the idle
+            # rank the slowest in the lockstep. Values only: same program.
+            actual_num_reqs = 1 if dp_lockstep else min(num_tokens, num_reqs)
         inputs_embeds = None
         if self.uses_mrope:
             position_ids = torch.zeros((3, num_tokens), dtype=torch.int32).to(
