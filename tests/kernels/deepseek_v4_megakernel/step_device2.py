@@ -65,6 +65,9 @@ def main():
     p.add_argument("--iters", type=int, default=10)
     # extra variants on the same weights, comma separated: moe=stub,T=32/owners=4
     p.add_argument("--variants", default="")
+    # the embedding and the per-layer small weights identical on every rank, as
+    # serving replicates them (default: drawn per rank)
+    p.add_argument("--replicated", action="store_true")
     a = p.parse_args()
     result(phase="start", args=vars(a))
     devs = sorted(jax.devices(), key=lambda d: d.id)
@@ -102,8 +105,22 @@ def main():
         kind = "fp8" if s.dtype == dc.FP8 else "bf16"
         shape = (R * nl, s.n_tiles, s.tile_rows, s.tile_cols)
         tiles[n] = gen(shape, jnp.dtype(s.dtype), kind)
-    smalls = gen((R * L, cfg.smalls_rows, 128), jnp.float32, "scale")
-    embed = gen((R, 129280, H), jnp.bfloat16, "bf16")
+    if a.replicated:
+        def gen_rep(shape, dtype, kind):  # one rank's draw, tiled over the ranks
+            one = (shape[0] // R,) + shape[1:]
+
+            def f(k):
+                if kind == "scale":
+                    x = jax.random.uniform(k, one, jnp.float32, 0.5, 1.5) * 1e-2
+                else:
+                    x = (jax.random.normal(k, one, jnp.float32) * 0.02).astype(dtype)
+                return jnp.tile(x, (R,) + (1,) * (len(one) - 1))
+
+            return jax.jit(f, out_shardings=EP)(next(keys))
+    else:
+        gen_rep = gen
+    smalls = gen_rep((R * L, cfg.smalls_rows, 128), jnp.float32, "scale")
+    embed = gen_rep((R, 129280, H), jnp.bfloat16, "bf16")
     pos_max = 1 << 17
     ang = jnp.arange(pos_max)[:, None] * 160000.0 ** (-jnp.arange(32) / 32.0)[None]
     cs = jnp.concatenate([jnp.cos(ang), jnp.sin(ang)], 1).astype(jnp.float32)
