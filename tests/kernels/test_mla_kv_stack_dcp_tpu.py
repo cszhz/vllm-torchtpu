@@ -180,6 +180,26 @@ def test_best_env_stacked_caches_match_per_layer_bitwise():
         assert _run_stacked_vs_per_layer(fault=None, steps=STEPS_BEST) == []
 
 
+def test_best_env_whole_output_stacked_caches_match_per_layer_bitwise():
+    """The best config's knobs with the op's output read whole
+    (`merge_pieces=False`, the call TPU_DCP_MLA_OPROJ_ALL_REDUCE makes on every
+    bucket): stacked == per-layer, bitwise, on the same paths."""
+    with mock.patch.dict(os.environ, BEST_ENV):
+        assert (
+            _run_stacked_vs_per_layer(fault=None, steps=STEPS_BEST, merge_pieces=False)
+            == []
+        )
+
+
+def test_best_env_whole_output_wrong_stack_row_is_caught():
+    with mock.patch.dict(os.environ, BEST_ENV):
+        bad = _run_stacked_vs_per_layer(
+            fault="row0", steps=STEPS_BEST, merge_pieces=False
+        )
+    assert any(b.startswith("out ") for b in bad), bad
+    assert any(b.startswith("cache ") for b in bad), bad
+
+
 def test_best_env_wrong_stack_row_is_caught():
     with mock.patch.dict(os.environ, BEST_ENV):
         bad = _run_stacked_vs_per_layer(fault="row0", steps=STEPS_BEST)
@@ -258,18 +278,18 @@ def _check_best_paths(preps, gathers):
     assert any(g["kv_write"] and g["row_offset"] for g in gathers)
 
 
-def _run_stacked_vs_per_layer(fault=None, steps=STEPS):
+def _run_stacked_vs_per_layer(fault=None, steps=STEPS, merge_pieces=True):
     """Runs the steps on per-layer and stacked caches. fault=None: asserts every
     output and cache bitwise equal (returns []). fault="row0": the stacked arm's
     kv_stack is (0, NUM_BLOCKS) for every layer; fault="wrong_offset": the
-    stacked arm's gathers get the next layer's row offset. Returns the
-    mismatches."""
+    stacked arm's gathers get the next layer's row offset. merge_pieces=False
+    passes the op's whole-output flag. Returns the mismatches."""
     patches, preps, gathers = _spied(fault)
     jax.clear_caches()  # the spies count traces
     for p in patches:
         p.start()
     try:
-        bad = _run(fault, steps)
+        bad = _run(fault, steps, merge_pieces)
     finally:
         for p in patches:
             p.stop()
@@ -278,7 +298,7 @@ def _run_stacked_vs_per_layer(fault=None, steps=STEPS):
     return bad
 
 
-def _run(fault, steps):
+def _run(fault, steps, merge_pieces=True):
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
         streamidx_topk_dcp_step,
     )
@@ -325,6 +345,8 @@ def _run(fault, steps):
 
     # TPU_DCP_RANK_OPERAND: the shard's rank as data (as the adapter passes it).
     rank_kw = {}
+    if not merge_pieces:
+        rank_kw["merge_pieces"] = False
     if os.environ.get("TPU_DCP_RANK_OPERAND") == "1":
         rank_kw["dcp_rank_ids"] = jax.device_put(
             jnp.arange(dcp, dtype=jnp.int32), sharded
