@@ -70,7 +70,7 @@ def _measure(rank):
 
     def fn(full, partial, slot):
         local = take(full, slot)
-        back = ag(local.reshape(local.shape[0], -1)).reshape(full.shape)
+        back = ag(local.reshape(local.shape[0], -1), full).reshape(full.shape)
         return local, back, rs(partial)
 
     res = {"rank": rank}

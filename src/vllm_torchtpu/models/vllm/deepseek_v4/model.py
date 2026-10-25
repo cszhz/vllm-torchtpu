@@ -241,7 +241,11 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         x = self._norm(self.attn_norm, x)
         if seq_parallel_rows:
-            x = self.attn(positions, seq_parallel.all_gather(x), seq_parallel_rows=True)
+            x = self.attn(
+                positions,
+                seq_parallel.all_gather(x, like=positions),
+                seq_parallel_rows=True,
+            )
         else:
             x = self.attn(positions, x)
 
@@ -256,7 +260,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             *self._norm_arg(self.ffn_norm),
         )
         x = self._norm(self.ffn_norm, x)
-        x = self.ffn(x, input_ids, seq_parallel_rows=seq_parallel_rows)
+        x = self.ffn(
+            x, input_ids, seq_parallel_like=positions if seq_parallel_rows else None
+        )
         return x, residual, post_mix, res_mix
 
 
@@ -606,8 +612,9 @@ class DeepseekV4Model(nn.Module):
                 # way the drafts were trained on: settle the deferred post,
                 # then mean over the hc streams (upstream numerics).
                 aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
-                aux = aux_recon.mean(dim=1)
-                aux_hidden_states.append(seq_parallel.all_gather(aux) if sp else aux)
+                if sp:
+                    aux_recon = seq_parallel.all_gather(aux_recon, like=positions)
+                aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
 
         if post_mix is not None:
@@ -621,6 +628,13 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = self.mhc_post_op(
                     hidden_states, residual, post_mix, res_mix
                 )
+                if sp:
+                    # The head runs on every row, as without sequence
+                    # parallelism: its torch ops would otherwise allocate by
+                    # the per-core row count, which torch_tpu refuses.
+                    hidden_states = seq_parallel.all_gather(
+                        hidden_states, like=positions
+                    )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -634,8 +648,6 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
-        if sp:
-            hidden_states = seq_parallel.all_gather(hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

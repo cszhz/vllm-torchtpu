@@ -147,17 +147,20 @@ class DeepseekV4MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
-        seq_parallel_rows: bool = False,
+        seq_parallel_like: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass executing router gate and fused expert computation.
 
-        With ``seq_parallel_rows``, ``hidden_states`` holds this core's slot of
-        the rows (see ``seq_parallel``) and so does the result.
+        With ``seq_parallel_like`` (a tensor of the forward's token count, see
+        ``seq_parallel.all_gather``), ``hidden_states`` holds this core's slot
+        of the rows (see ``seq_parallel``) and so does the result.
         """
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
-        if seq_parallel_rows:
-            return self._forward_seq_parallel(hidden_states, input_ids)
+        if seq_parallel_like is not None:
+            return self._forward_seq_parallel(
+                hidden_states, input_ids, seq_parallel_like
+            )
 
         org_shape = hidden_states.shape
         # FusedMoEFactory gives the runner our gate, so it computes the logits.
@@ -170,7 +173,10 @@ class DeepseekV4MoE(nn.Module):
         return final_hidden_states.view(org_shape)
 
     def _forward_seq_parallel(
-        self, local_rows: torch.Tensor, input_ids: torch.Tensor | None
+        self,
+        local_rows: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        like: torch.Tensor,
     ) -> torch.Tensor:
         """The runner's shared + routed sum, on this core's rows only.
 
@@ -181,7 +187,7 @@ class DeepseekV4MoE(nn.Module):
         """
         runner = self.experts
         assert self.shared_experts is not None
-        rows = seq_parallel.all_gather(local_rows)
+        rows = seq_parallel.all_gather(local_rows, like)
         # The runner's order (gate, shared expert, routed op), which is also
         # the order the trace first reads their weights in.
         router_logits, _ = runner.gate(rows)
