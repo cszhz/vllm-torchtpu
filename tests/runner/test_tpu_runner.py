@@ -3275,3 +3275,33 @@ def test_remote_dspark_bootstrap_feedback_uses_raiden_source_id():
     feedback = transport.send_feedback.call_args.args[0]
     assert feedback["request_ids"] == ["producer-id"]
     assert runner._remote_dspark_source_request_ids == {}
+
+
+def test_remote_dspark_bootstrap_removes_reserved_speculative_slots():
+    runner = SimpleNamespace(
+        _remote_dspark_source_request_ids={"bootstrap": "producer-id"}
+    )
+    output = SimpleNamespace(
+        scheduled_spec_decode_tokens={"bootstrap": [-1], "verify": [42]},
+        num_scheduled_tokens={"bootstrap": 2, "verify": 2},
+        total_num_scheduled_tokens=4,
+    )
+    TPUModelRunner._prepare_remote_dspark_bootstrap(runner, output)
+    assert output.scheduled_spec_decode_tokens == {"verify": [42]}
+    assert output.num_scheduled_tokens == {"bootstrap": 1, "verify": 2}
+    assert output.total_num_scheduled_tokens == 3
+
+
+def test_remote_dspark_bootstrap_preserves_real_proposals():
+    runner = SimpleNamespace(
+        _remote_dspark_source_request_ids={"request": "producer-id"}
+    )
+    output = SimpleNamespace(
+        scheduled_spec_decode_tokens={"request": [42]},
+        num_scheduled_tokens={"request": 2},
+        total_num_scheduled_tokens=2,
+    )
+    TPUModelRunner._prepare_remote_dspark_bootstrap(runner, output)
+    assert output.scheduled_spec_decode_tokens == {"request": [42]}
+    assert output.num_scheduled_tokens == {"request": 2}
+    assert output.total_num_scheduled_tokens == 2

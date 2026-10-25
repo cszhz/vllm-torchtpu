@@ -3761,6 +3761,24 @@ class TPUModelRunner(GPUModelRunner):
             device="cpu",
         )
 
+    def _prepare_remote_dspark_bootstrap(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        # Upstream reserves speculative slots with -1 before any proposal is
+        # available. Bootstrap must execute only the last prompt token so its
+        # feedback seeds the first remote proposal, rather than verifying -1.
+        for req_id, tokens in list(
+            scheduler_output.scheduled_spec_decode_tokens.items()
+        ):
+            if (
+                req_id in self._remote_dspark_source_request_ids
+                and tokens
+                and all(token == -1 for token in tokens)
+            ):
+                del scheduler_output.scheduled_spec_decode_tokens[req_id]
+                scheduler_output.num_scheduled_tokens[req_id] -= len(tokens)
+                scheduler_output.total_num_scheduled_tokens -= len(tokens)
+
     @torch.no_grad()
     @_pp_step
     def execute_model(
@@ -3773,6 +3791,8 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if self._remote_dspark_role == "consumer":
+            self._prepare_remote_dspark_bootstrap(scheduler_output)
         if (
             self._remote_dspark_role == "consumer"
             and scheduler_output.scheduled_spec_decode_tokens
