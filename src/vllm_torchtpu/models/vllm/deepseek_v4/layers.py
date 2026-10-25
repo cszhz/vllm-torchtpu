@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import jax
 import torch
 import torch.nn as nn
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -161,7 +162,6 @@ class DeepseekV4MLP(nn.Module):
         return self.__dict__["_tp_slice_ops"][replicated]
 
     def _build_shared_ops(self, pins) -> None:
-        import jax
         from torch_tpu._internal import pallas
 
         from vllm_torchtpu.kernels.megablox.gmm_v2 import silu_and_mul_with_clamp
