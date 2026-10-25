@@ -47,6 +47,11 @@ def mhc_collapse_head(
     )
 
 
+# The shared-MLP JAX ops of TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS, one per
+# configuration rather than per layer (one exported program each).
+_SHARED_OPS: dict[tuple, object] = {}
+
+
 class DeepseekV4MLP(nn.Module):
     """DeepSeek-V4 feed-forward layer for dense/shared expert projections."""
 
@@ -102,6 +107,8 @@ class DeepseekV4MLP(nn.Module):
         from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
         gu, dn = self.gate_up_proj, self.down_proj
+        if not hasattr(self.act_fn, "swiglu_limit"):
+            return False
         if any(getattr(m, KEEP_VLLM_LAYOUT_ATTR, False) for m in (gu, dn)):
             return False
         w, ws = gu.weight, getattr(gu, "weight_scale", None)
@@ -141,30 +148,85 @@ class DeepseekV4MLP(nn.Module):
         synchronize_tensors(tensors)
         pins = (getattr(gu, FP8_PALLAS_ATTR, None), getattr(dn, FP8_PALLAS_ATTR, None))
         object.__setattr__(self, "_tp_slice", (tensors, pins))
+        self._build_shared_ops(pins)
         return True
 
-    def _forward_tp_slice(self, x: torch.Tensor) -> torch.Tensor:
+    def _shared_op(self, replicated: bool):
+        """The MLP as one JAX op over BOTH weight sets -- the replicated
+        weights and this rank's TP slice -- using one of them. Each side of the
+        TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS shape branch is its own trace, and a
+        bucket compiled by one trace is served through another, which needs the
+        same graph inputs in the same order (compilation/shape_variants); both
+        sides therefore read both sets. Built outside the trace (arm_tp_slice)."""
+        return self.__dict__["_tp_slice_ops"][replicated]
+
+    def _build_shared_ops(self, pins) -> None:
+        import jax
+        from torch_tpu._internal import pallas
+
+        from vllm_torchtpu.kernels.megablox.gmm_v2 import silu_and_mul_with_clamp
         from vllm_torchtpu.layers.adapter.linear_common import (
-            quantized_matmul,
-            quantized_matmul_pallas,
+            _fp8_linear_pallas,
+            _quantized_matmul_jax,
         )
 
-        (w, ws, d, ds), (pin_w, pin_d) = self.__dict__["_tp_slice"]
+        limit = float(self.act_fn.swiglu_limit)
+        pin_g, pin_d = pins
 
-        def mm(a, wq, sc, pin):
+        def mm(a, w, sc, pin):
             if pin is None:
-                return quantized_matmul(a, wq, sc)
-            return quantized_matmul_pallas(a, wq, sc, pin)
+                return _quantized_matmul_jax(a, w, sc)
+            return _fp8_linear_pallas(a, w, sc, hbm_pin=bool(pin))
 
-        h = self.act_fn(mm(x, w, ws, pin_w))
-        return mm(h, d, ds, pin_d)
+        def make(replicated: bool):
+            def fn(
+                x: jax.Array,
+                wf: jax.Array,
+                sf: jax.Array,
+                df: jax.Array,
+                dsf: jax.Array,
+                wt: jax.Array,
+                st: jax.Array,
+                dt: jax.Array,
+                dst: jax.Array,
+            ) -> jax.Array:
+                w, sc, d, ds = (wt, st, dt, dst) if replicated else (wf, sf, df, dsf)
+                h = mm(x, w, sc, pin_g)
+                n = h.shape[1] // 2
+                h = silu_and_mul_with_clamp(h[:, :n], h[:, n:], limit).astype(x.dtype)
+                return mm(h, d, ds, pin_d)
+
+            op = pallas.jax_op(
+                f"pallas::dsv4_shared_mlp_{'tp' if replicated else 'full'}"
+                f"_g{pin_g}_d{pin_d}_l{str(limit).replace('.', 'p')}",
+                fn,
+            )
+
+            def fake(x, wf, sf, df, dsf, wt, st, dt, dst):
+                return torch.empty(
+                    x.shape[0], df.shape[1], dtype=x.dtype, device=x.device
+                )
+
+            op.register_fake(fake)
+            return op
+
+        ops = {}
+        for replicated in (False, True):
+            key = (replicated, pin_g, pin_d, limit)
+            if key not in _SHARED_OPS:
+                _SHARED_OPS[key] = make(replicated)
+            ops[replicated] = _SHARED_OPS[key]
+        object.__setattr__(self, "_tp_slice_ops", ops)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if "_tp_slice" in self.__dict__:
             from vllm_torchtpu.layers.adapter.fused_moe_ep import SP_GATE
 
-            if SP_GATE["replicated"]:
-                return self._forward_tp_slice(x)
+            slices, _ = self.__dict__["_tp_slice"]
+            gu, dn = self.gate_up_proj, self.down_proj
+            return self._shared_op(SP_GATE["replicated"])(
+                x, gu.weight, gu.weight_scale, dn.weight, dn.weight_scale, *slices
+            )
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
