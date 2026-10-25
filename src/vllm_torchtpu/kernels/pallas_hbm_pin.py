@@ -30,7 +30,10 @@ sets the custom call's operand memory space, which stops the staging (see
 ``TPU_PALLAS_HBM_PIN=1``: operands whose BlockSpec says HBM or ANY.
 ``TPU_PALLAS_HBM_PIN=2``: also blocked operands with no explicit memory space
 (the Pallas pipeline DMAs their blocks from HBM itself).
-``TPU_PALLAS_HBM_PIN_SKIP=<regex>``: kernel names (pallas_call ``name=``) to leave alone.
+``TPU_PALLAS_HBM_PIN_SKIP=<regex>``: kernel names (pallas_call ``name=``) to leave alone;
+default ``^proj_and_save_state_runs$`` (the prefill compressor: pinning its
+hidden states makes XLA add a [512, 7168] relayout copy, +43 us per twin
+mixed step, measured). Set it to an empty string to pin everything.
 ``TPU_PALLAS_HBM_PIN_ONLY=<regex>``: only kernels whose name matches.
 
 Same kernels, same arithmetic: bit-identical outputs. Only traced operands are
@@ -67,7 +70,7 @@ def install_pallas_hbm_pin() -> None:
     orig = pl.pallas_call
     if getattr(orig, _MARK, False):
         return
-    skip = os.environ.get("TPU_PALLAS_HBM_PIN_SKIP", "")
+    skip = os.environ.get("TPU_PALLAS_HBM_PIN_SKIP", "^proj_and_save_state_runs$")
     only = os.environ.get("TPU_PALLAS_HBM_PIN_ONLY", "")
     skip_re = re.compile(skip) if skip else None
     only_re = re.compile(only) if only else None
