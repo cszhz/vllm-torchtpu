@@ -72,6 +72,8 @@ def main():
     p.add_argument("--vocab-shard", action="store_true")
     # MoE: a random static expert permutation per layer (moe_phase placement)
     p.add_argument("--placement", action="store_true")
+    p.add_argument("--vmem-share", action="store_true", help="vmem_share on")
+    p.add_argument("--dump", default="", help="save the kernel outputs (.npz)")
     a = p.parse_args()
     R, T, q, B = a.R, a.T, a.q, a.B
     perm = (
@@ -87,7 +89,7 @@ def main():
         dense=tp_cfg, q=q, B=B, aux_layers=(1, 2),
         fault="a2a_heads" if a.fault == "a2a_heads" else "", moe_impl=a.moe,
         debug_att=a.debug_att, attn_tp=a.attn_tp,
-        moe_placement="perm" if a.placement else "",
+        moe_placement="perm" if a.placement else "", vmem_share=a.vmem_share,
     )  # fmt: skip
     w = dw.make_weights(full)
     packs = [
@@ -223,6 +225,8 @@ def main():
     ]
     outs = jax.block_until_ready(f(*[jax.device_put(x, shard) for x in args]))
     res, aux = outs[0], outs[1]
+    if a.dump:
+        np.savez(a.dump, *[np.asarray(o).view(np.uint8) for o in outs])
     rc = SR.RefConfig(full=full, R=R, T=T, q=q, aux_layers=(1, 2), ar_mode="hrsag",
                       ar_group=8, attn_tp=a.attn_tp)  # fmt: skip
     ref = (

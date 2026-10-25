@@ -411,6 +411,14 @@ def moe_scratch_shapes(
     return impl.moe_scratch_shapes(geom, leased, own_ar)
 
 
+def moe_scratch_names(
+    geom: StepGeometry, leased: bool, own_ar: bool = True
+) -> list[str]:
+    from . import moe_phase as impl
+
+    return impl.moe_scratch_names(geom, leased, own_ar)
+
+
 # Skeleton-side buffer ownership, for reference:
 #   pool (u8): dense weight ring banks; banks [lease_bank0, n_banks) are lent
 #     to whichever phase runs (attention, then MoE), banks below keep

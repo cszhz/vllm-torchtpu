@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_MK_BUCKETS: str = "16,32,64"
     VLLM_TPU_DSV4_MK_OWN_REQS: int = 4
     VLLM_TPU_DSV4_MK_MAX_CTX: int = 1048576
+    VLLM_TPU_DSV4_MK_VMEM_SHARE: bool = False
     VLLM_TPU_DSV4_MK_STATS_PERIOD_S: float = 60.0
     VLLM_TPU_DSV4_MK_TRACE_STEPS: int = 32
     VLLM_TPU_DSV4_MK_TRACE_RUNS: int = 0
@@ -1083,6 +1084,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # score / top-k scratch. The adapter picks the smallest bucket holding
     # the step's rows and context; a step no bucket serves goes stock.
     "VLLM_TPU_DSV4_MK_MAX_CTX": env_int("VLLM_TPU_DSV4_MK_MAX_CTX", 1048576),
+    # Megakernel buffers with disjoint lifetimes share VMEM
+    # (StepKernelConfig.vmem_share): same arithmetic, room for buckets above 64.
+    "VLLM_TPU_DSV4_MK_VMEM_SHARE": env_bool("VLLM_TPU_DSV4_MK_VMEM_SHARE"),
     # Period of the megakernel step-mix and A/B latency logs.
     "VLLM_TPU_DSV4_MK_STATS_PERIOD_S": env_float(
         "VLLM_TPU_DSV4_MK_STATS_PERIOD_S", 60.0

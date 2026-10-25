@@ -115,6 +115,12 @@ class StepKernelConfig:
     # (moe_w["held"]), "replicas" (also moe_w["copy"])
     moe_placement: str = ""
     strict_causal: bool = False  # StepGeometry.strict_causal
+    # Buffers whose lifetimes within a layer are disjoint share VMEM (same
+    # shape and dtype, or a leading-column view): og <- qs, xg <- q, and when
+    # the MoE phase computes exactly T rows its xq <- xq and acc <- acc[:, :H];
+    # the embedded rows x0 are read from HBM once instead of held in VMEM.
+    # Arithmetic is unchanged; it frees VMEM for row buckets above 64.
+    vmem_share: bool = False
 
     @property
     def n_debug_outputs(self) -> int:
@@ -157,6 +163,14 @@ class StepKernelConfig:
     @property
     def QP(self) -> int:  # global rows per request block (f32-tile aligned)
         return -(-self.q // 8) * 8
+
+    def moe_shared(self) -> frozenset[str]:
+        """MoE phase scratch names served by skeleton buffers (vmem_share)."""
+        if not (self.vmem_share and self.moe_impl == "real"):
+            return frozenset()
+        if -(-self.T // 32) * 32 != self.T:  # the phase's padded rows
+            return frozenset()
+        return frozenset(("xq", "acc"))
 
     @property
     def og_in_rx(self) -> bool:
@@ -355,6 +369,8 @@ def _scratch(scfg: StepKernelConfig, typed: bool):
     )
     for k, v in scfg.ar_spec().scratch().items():
         scr[k] = v
+    if scfg.vmem_share:  # served by qs / q (StepKernelConfig.vmem_share)
+        del scr["og"], scr["xg"]
     if scfg.attn_impl == "real":
         B = scfg.B
         scr.update(
@@ -418,6 +434,14 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
     moe_scr = scr_refs[len(names_scr) : len(names_scr) + n_moe_scr]
     attn_scr = scr_refs[len(names_scr) + n_moe_scr :]
     assert len(attn_scr) == n_attn_scr
+    if scfg.vmem_share:
+        s["og"], s["xg"] = s["qs"], s["q"]
+        shared = {"xq": s["xq"], "acc": s["acc"].at[:, pl.ds(0, cfg.hidden)]}
+        it = iter(moe_scr)
+        moe_scr = [
+            shared[k] if k in scfg.moe_shared() else next(it)
+            for k in _moe_names(scfg, typed)
+        ]
     me = lax.axis_index(ax)
     geom = scfg.geometry()
 
@@ -957,7 +981,13 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
         )
 
     smalls_copy(0, 0).start()
-    x0v = x0[...]
+    if scfg.vmem_share:  # x0 stays in HBM: land it in xin (zeroed below)
+        cp = pltpu.make_async_copy(x0, xin, s["osem"].at[0])
+        cp.start()
+        cp.wait()
+        x0v = xin[...]
+    else:
+        x0v = x0[...]
     xin[...] = jnp.zeros((T, h), BF16)
     for j in range(hcm):
         s["res"][:, j * h : (j + 1) * h] = x0v
@@ -999,6 +1029,11 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
     post_rows_to(res_out)
 
 
+def _moe_names(scfg: StepKernelConfig, typed: bool) -> list[str]:
+    leased = scfg.moe_leased and not typed
+    return SP.moe_scratch_names(scfg.geometry(), leased, own_ar=False)
+
+
 def build(scfg: StepKernelConfig, *, axis: str, interpret=False):
     """Per-rank step fn (call under shard_map over `axis`):
 
@@ -1019,6 +1054,12 @@ def build(scfg: StepKernelConfig, *, axis: str, interpret=False):
     moe_scr = (
         SP.moe_scratch_shapes(scfg.geometry(), leased, own_ar=False) if moe else []
     )
+    if moe and scfg.moe_shared():
+        moe_scr = [
+            v
+            for k, v in zip(_moe_names(scfg, typed), moe_scr)
+            if k not in scfg.moe_shared()
+        ]
     L = cfg.n_layers
     sched, base = cfg.schedule
     ltype = jnp.asarray(cfg.layer_types, jnp.int32)
@@ -1035,7 +1076,8 @@ def build(scfg: StepKernelConfig, *, axis: str, interpret=False):
         )
         n_arr = len(alay.arrays) if alay else 0
         in_specs = (
-            [smem] * 6 + [vmem] * 3 + [anyspace] * (1 + len(names))
+            [smem] * 6 + [anyspace if scfg.vmem_share else vmem] + [vmem] * 2
+            + [anyspace] * (1 + len(names))
             + ([vmem, vmem, smem] if scfg.ctx_q else [])
             + ([smem] * 3 + [anyspace] * (1 + 4 * L) if moe else [])
             + [smem] * (moe and {"": 0, "perm": 1, "replicas": 2}[scfg.moe_placement])

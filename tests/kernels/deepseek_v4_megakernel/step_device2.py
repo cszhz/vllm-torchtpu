@@ -147,7 +147,7 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     scfg = SK.StepKernelConfig(
         dense=cfg, q=a.q, B=nb, moe_impl=moe_impl, moe_leased=var.get("lease", "1") == "1",
         aux_layers=tuple(x for x in (L - 3, L - 2, L - 1) if x >= 0),
-        attn_tp=int(var.get("attn_tp", 1)),
+        attn_tp=int(var.get("attn_tp", 1)), vmem_share=var.get("share") == "1",
     )  # fmt: skip
     if moe_impl != "real":
         moe_args = []
@@ -312,6 +312,9 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     if var.get("profile") == "1":
         result(check="scopes", var=var, planes=profile_scopes(run))
     res0 = np.asarray(out[0].addressable_shards[0].data, np.float32)
+    import hashlib  # first step's own-row output of this process's first rank
+
+    digest = hashlib.sha256(res0.tobytes()).hexdigest()[:16]
     result(
         check="step_time", var=var, T=T, B=nb, lease=var.get("lease", "1"), owners=owners,
         layers=L, moe=moe_impl, attn=attn_impl, inplace=inplace, max_ctx=max_ctx,
@@ -319,7 +322,7 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
         p0=int(var.get("p0", 120000)), skip="+".join(skip), attn_ablate=attn_ablate,
         banks=banks, median_ms=statistics.median(ts), p10_ms=ts[len(ts) // 10],
         p90_ms=ts[(9 * len(ts)) // 10], n=a.iters, pipe_ms=pipe_ms, dispatch_ms=disp_ms,
-        finite=bool(np.isfinite(res0).all()),
+        finite=bool(np.isfinite(res0).all()), share=scfg.vmem_share, res_digest=digest,
     )  # fmt: skip
 
 

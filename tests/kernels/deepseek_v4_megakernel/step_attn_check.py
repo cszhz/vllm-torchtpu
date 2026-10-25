@@ -64,6 +64,8 @@ def main():
     # seq_len (incl. the 7 new rows) of the two requests
     p.add_argument("--seqs", default="1030,3000")
     p.add_argument("--strict", action="store_true", help="StepKernelConfig.strict_causal")
+    p.add_argument("--vmem-share", action="store_true", help="vmem_share on")
+    p.add_argument("--dump", default="", help="save the kernel outputs (.npz)")
     a = p.parse_args()
     R, T, q, B = 16, 16, 7, 1
     M = B * q
@@ -78,7 +80,7 @@ def main():
     scfg = SK.StepKernelConfig(
         dense=tp_cfg, q=q, B=B, aux_layers=aux_layers, attn_impl="real",
         max_ctx=a.max_ctx, fault="" if a.fault == "none" else a.fault, debug_att=True,
-        strict_causal=a.strict,
+        strict_causal=a.strict, vmem_share=a.vmem_share,
     )  # fmt: skip
     w = dw.make_weights(full)
     packs = [dw.pack_weights(SR.rank_weights(w, full, r, R), tp_cfg) for r in range(R)]
@@ -144,6 +146,8 @@ def main():
             *[tiles[n] for n in names], *arrays]  # fmt: skip
     outs = jax.block_until_ready(f(*[jax.device_put(x, shard) for x in args]))
     res, aux, att0 = outs[0], outs[1], np.asarray(outs[2])
+    if a.dump:  # every output incl. the updated caches
+        np.savez(a.dump, *[np.asarray(o).view(np.uint8) for o in outs])
     outs = outs[:2] + outs[3:]
     rc = SR.RefConfig(full=full, R=R, T=T, q=q, aux_layers=aux_layers, ar_mode="hrsag",
                       ar_group=8)  # fmt: skip

@@ -111,6 +111,11 @@ def moe_scratch_shapes(geom, leased, own_ar=True):
     return list(_scratch(geom, leased, own_ar)[1].values())
 
 
+def moe_scratch_names(geom, leased, own_ar=True):
+    """Names of moe_scratch_shapes' entries, in the same order."""
+    return list(_scratch(geom, leased, own_ar)[1])
+
+
 class _PhaseBlock(MoEBlock):
     """MoEBlock whose weights are picked by a traced layer: either stacked
     per-rank arrays [L, EL, ...] (indexed in the DMA: no branch) or per-layer
@@ -294,13 +299,17 @@ def moe_phase(
         _quantize_rows(s, inputs.x, T, M)
         live = _smem_columns(lambda t, k: inputs.row_valid[t], 1, T, M)[0] > 0
         logits = pad(inputs.logits[...])
+        # attribution only: every layer routes by the hash tables (random
+        # token-id tables in the harnesses = uniform routing)
+        spread = "hash_all" in ABLATE and geom.num_hash_layers > 0
         bcp.wait()
         lane = lax.broadcasted_iota(I32, (M, 128), 1)
 
         def select(hashed):
             if hashed:
+                hl = lax.rem(layer, geom.num_hash_layers) if spread else layer
                 hids = _smem_columns(
-                    lambda t, k: inputs.hash_ids[layer, t * 8 + k], cfg.topk, T, M
+                    lambda t, k: inputs.hash_ids[hl, t * 8 + k], cfg.topk, T, M
                 )
                 ids, ws = rt.route(
                     logits,
@@ -326,8 +335,11 @@ def moe_phase(
             s["sel_ids"][...] = sid
             s["sel_w"][...] = sw
 
-        pl.when(is_hash)(lambda: select(True))
-        pl.when(jnp.logical_not(is_hash))(lambda: select(False))
+        if spread:
+            select(True)
+        else:
+            pl.when(is_hash)(lambda: select(True))
+            pl.when(jnp.logical_not(is_hash))(lambda: select(False))
         ids = [s["sel_ids"][:, k : k + 1] for k in range(cfg.topk)]
         ws = [s["sel_w"][:, k : k + 1] for k in range(cfg.topk)]
         dense, hit = rt.combine_matrix(ids, ws, E)
