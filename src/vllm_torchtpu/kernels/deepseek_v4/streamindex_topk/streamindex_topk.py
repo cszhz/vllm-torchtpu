@@ -1242,6 +1242,64 @@ def merge_kv_split_topk(
     return jnp.where(long_row[:, None], from_sc, compact)
 
 
+def token_window_metadata(
+    seq_lens: jax.Array,  # i32[S]
+    page_indices: jax.Array,  # i32[S * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[S + 1]
+    distribution: jax.Array,  # i32[3]
+    offset: jax.Array,  # i32 scalar: first row of the window
+    *,
+    window: int,
+    compression_ratio: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """(seq_lens, page_indices, cu_q_lens, distribution) of the token rows
+    `[offset, offset + window)` of a batch, as a batch of its own.
+
+    Sequences are renumbered from the first one with a row in the window (its
+    page-table row moves with it). A sequence cut by the window keeps its rows'
+    positions: its length drops by the rows past the window. The length the
+    scoring passes see is then rounded up to a whole compressed block (capped
+    at the real length) so the block a cut row may select -- the whole batch's
+    row lengths allow a row its own open block when the sequence continues --
+    is scored; the passes leave positions unmasked and the row lengths (from
+    the whole batch, `row_window`) cut every row exactly.
+
+    The caller guarantees no cut inside the verify/decode segments (window >=
+    their rows, windows aligned to multiples of `window`).
+    """
+    S = seq_lens.shape[0]
+    pps = page_indices.shape[0] // S
+    ids = jnp.arange(S, dtype=jnp.int32)
+    live = ids < distribution[2]
+    s0 = jnp.sum(live & (cu_q_lens[1:] <= offset)).astype(jnp.int32)
+    src = jnp.minimum(s0 + ids, S - 1)
+    # Sequences with a row in the window: from s0 up to the last one that
+    # starts before the window's end (no zero-row sequence is handed over).
+    s1 = jnp.sum(live & (cu_q_lens[:-1] < offset + window)).astype(jnp.int32)
+    n_live = jnp.maximum(s1 - s0, 0)
+    j_live = ids < n_live
+    cu_full = cu_q_lens[jnp.minimum(s0 + jnp.arange(S + 1, dtype=jnp.int32), S)]
+    cu_w = jnp.clip(cu_full - offset, 0, window)
+    cu_w = jnp.where(
+        jnp.arange(S + 1) <= n_live, cu_w, cu_w[jnp.minimum(n_live, S)]
+    ).astype(jnp.int32)
+    end = cu_q_lens[src + 1]
+    after = jnp.maximum(end - (offset + window), 0)
+    exact = seq_lens[src] - after
+    c = compression_ratio
+    padded = jnp.minimum(seq_lens[src], (exact + c - 1) // c * c)
+    seq_w = jnp.where(j_live, padded, 0).astype(seq_lens.dtype)
+    pages_w = page_indices.reshape(S, pps)[src].reshape(-1)
+    dist_w = jnp.stack(
+        [
+            jnp.clip(distribution[0] - s0, 0, n_live),
+            jnp.clip(distribution[1] - s0, 0, n_live),
+            n_live,
+        ]
+    ).astype(distribution.dtype)
+    return seq_w, pages_w, cu_w, dist_w
+
+
 def _effective_row_lengths(
     seq_lens: jax.Array,  # i32[max_num_seqs]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1300,6 +1358,7 @@ def _effective_row_lengths(
         "sc_flat_scores",
         "sc_topk_coop_max_rows",
         "kv_split",
+        "row_window_tokens",
     ),
 )
 def streamindex_topk(
@@ -1333,8 +1392,16 @@ def streamindex_topk(
     sc_topk_coop_max_rows: int = 0,
     kv_split: int = 1,
     kv_split_rank: jax.Array | int = 0,
+    row_window: tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None = None,
+    row_window_tokens: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
+
+    row_window (TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE): `q` holds rows
+    `[offset, offset + T)` of a `row_window_tokens`-row batch and the metadata
+    is that window's (`token_window_metadata`); `row_window = (seq_lens,
+    cu_q_lens, distribution, offset)` of the whole batch sets each row's
+    visible length exactly as the whole batch's top-k does.
 
     kv_split > 1 (ported from patemotter fdcc70a0d): score only rank
     `kv_split_rank`'s contiguous, page-aligned 1/kv_split share of every
@@ -1837,18 +1904,35 @@ def streamindex_topk(
         )
 
         num_positions = max(num_sublanes_total * 128, k)
-        eff_row_lengths = _effective_row_lengths(
-            seq_lens=global_seq_lens,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            num_tokens=max_num_tokens,
-            num_positions=num_positions,
-            compression_ratio=compression_ratio,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            interleave_c=interleave_c,
-            kv_window=kv_window,
-        )
+        if row_window is None:
+            eff_row_lengths = _effective_row_lengths(
+                seq_lens=global_seq_lens,
+                cu_q_lens=cu_q_lens,
+                distribution=distribution,
+                num_tokens=max_num_tokens,
+                num_positions=num_positions,
+                compression_ratio=compression_ratio,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
+                kv_window=kv_window,
+            )
+        else:
+            if cp_size > 1 or kv_window is not None:
+                raise NotImplementedError("row_window needs cp_size == 1, no kv_split.")
+            full_seq_lens, full_cu, full_dist, row_offset = row_window
+            eff_row_lengths = jax.lax.dynamic_slice(
+                _effective_row_lengths(
+                    seq_lens=full_seq_lens,
+                    cu_q_lens=full_cu,
+                    distribution=full_dist,
+                    num_tokens=row_window_tokens,
+                    num_positions=num_positions,
+                    compression_ratio=compression_ratio,
+                ),
+                (row_offset,),
+                (max_num_tokens,),
+            )
 
         split_chunks = False
         call_chunk_tokens = chunk_tokens
