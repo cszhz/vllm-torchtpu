@@ -200,7 +200,8 @@ def _over_cols(width, fn):
 
 
 def _quantize_rows(s, x, T, M):
-    """moe_router.rowquant_fp8 of x [T, H] bf16 into s["xq"] (rows >= T zero)
+    """moe_router.rowquant_fp8 of x [T, H] bf16 into s["xq"] (rows >= T zero;
+    compact: into s["xq4"] as u32 words of 4 rows)
     and s["xs"], in two rolled passes (row max, then quantize)."""
     H = x.shape[1]
 
@@ -218,6 +219,12 @@ def _quantize_rows(s, x, T, M):
 
     def quant(cs, w):
         v = x[:, cs]
+        if "xq4" in s:  # MoEConfig.compact: u32 words of 4 rows
+            q = jnp.where(usable, v * sinv, jnp.zeros_like(v))
+            if M > T:
+                q = jnp.concatenate([q, jnp.zeros((M - T, w), q.dtype)])
+            s["xq4"][:, cs] = pltpu.bitcast(q.astype(rt.FP8), U32)
+            return
         s["xq"][0:T, cs] = jnp.where(usable, v * sinv, jnp.zeros_like(v)).astype(rt.FP8)
         if M > T:
             s["xq"][T:M, cs] = jnp.zeros((M - T, w), rt.FP8)

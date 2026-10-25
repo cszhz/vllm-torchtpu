@@ -324,7 +324,8 @@ class MoEBlock:
     def scratch(cfg: MoEConfig):
         H, E, M, S, NB = cfg.hidden, cfg.n_experts, cfg.rows, cfg.S, cfg.nbuf
         return {
-            "xq": pltpu.VMEM((M, H), FP8),
+            # compact keeps xq only as u32 words of 4 rows ("xq4")
+            **({} if cfg.compact else {"xq": pltpu.VMEM((M, H), FP8)}),
             "xs": pltpu.VMEM((M, 128), F32),
             "dense": pltpu.VMEM((M, E), F32),
             "hitv": pltpu.VMEM((8, 128), I32),
@@ -371,7 +372,6 @@ class MoEBlock:
             "nsub": pltpu.SMEM((1,), I32),  # (item, chunk) steps of the layer
             # xq as u32 words of 4 rows (pltpu.bitcast), for row gathers
             "xq4": pltpu.VMEM((M // 4, H), U32),
-            "xg4": pltpu.VMEM((CT // 4, H), U32),  # one chunk being gathered
             # the current entry's gathered rows, chunk c at rows [c*CT, c*CT+CT)
             "xg": pltpu.VMEM((M, H), FP8),
             "gsc": pltpu.VMEM((M, 128), F32),  # their x row scales
@@ -382,7 +382,10 @@ class MoEBlock:
     # -- routing ---------------------------------------------------------------
     def quantize_rows(self, x):
         q, scale = rt.rowquant_fp8(x)
-        self.s["xq"][...] = q
+        if self.cfg.compact:
+            self.s["xq4"][...] = pltpu.bitcast(q, U32)
+        else:
+            self.s["xq"][...] = q
         self.s["xs"][...] = jnp.broadcast_to(scale, self.s["xs"].shape)
 
     def route(self, logits, live_rows, bias=None, hash_ids=None):
@@ -516,7 +519,6 @@ class MoEBlock:
         )
         cp = pltpu.make_async_copy(s["rtv"], s["rts"], s["msem"].at[0])
         cp.start()
-        s["xq4"][...] = pltpu.bitcast(s["xq"][...], U32)
         xs = s["xs"][:, 0:1]
         diag = lax.broadcasted_iota(I32, (M, 128), 0) == lax.broadcasted_iota(
             I32, (M, 128), 1
@@ -587,18 +589,25 @@ class MoEBlock:
                 s["gw"][rs, :] = jnp.broadcast_to(
                     jnp.sum(jnp.where(sel, wl, 0.0), axis=1, keepdims=True), (CT, 128)
                 )
-                s["xg4"][...] = jnp.zeros(s["xg4"].shape, U32)
+                # the chunk's u32 words in ybuf rows 0-7 (free here: the
+                # previous item's scatter has read it)
+                g4 = s["ybuf"].at[0 : CT // 4]
+                g4[...] = jnp.zeros(g4.shape, F32)
 
                 def copy(t, cc):
                     r = self._row(c * CT + t, j)
                     w = s["xq4"][pl.ds(r >> 2, 1), :]
                     b = (w >> ((r & 3) * 8).astype(U32)) & jnp.uint32(255)
                     q = pl.ds(t >> 2, 1)
-                    s["xg4"][q, :] = s["xg4"][q, :] | (b << ((t & 3) * 8).astype(U32))
+                    old = lax.bitcast_convert_type(g4[q, :], U32)
+                    new = old | (b << ((t & 3) * 8).astype(U32))
+                    g4[q, :] = lax.bitcast_convert_type(new, F32)
                     return cc
 
                 lax.fori_loop(0, jnp.minimum(count - c * CT, CT), copy, 0)
-                s["xg"][rs, :] = pltpu.bitcast(s["xg4"][...], FP8)
+                s["xg"][rs, :] = pltpu.bitcast(
+                    lax.bitcast_convert_type(g4[...], U32), FP8
+                )
 
             if c == 0:
                 one()
