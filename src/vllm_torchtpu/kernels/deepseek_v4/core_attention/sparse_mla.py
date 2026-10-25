@@ -24,6 +24,10 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+# Tokens per grid step for 128-token gather chunks. Each step's prologue and
+# epilogue (the first QK and the last PV, which nothing overlaps) are paid
+# once per step, so wider steps amortize them over more tokens.
+PREFILL_ATTENTION_KERNEL_BATCH_SIZE = 32
 
 
 def cdiv(a, b):
