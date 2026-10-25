@@ -44,7 +44,7 @@ def test_planner_is_load_bearing_single_branch(fake_ex: ExecSpec):
     ms = make_fake_model_spec(L=4, att_every=1, H=256)
     p = planner.plan(ms, fake_ex)
 
-    # Only FakeMixerModule and FakeFFNModule are in the spec -> no FakeAltMixerModule declarations
+    # Only FakeMixerModule and FakeFFNModule are in the spec -> no alt-mixer decls
     assert p.static_kinds == ("att_in", "att_out", "router", "sh13", "sh2")
     assert p.dynamic_kinds == ("e13", "e2")
     assert "lin_in" not in p.kinds

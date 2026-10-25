@@ -42,7 +42,7 @@ from vllm_torchtpu.megakernel.spec import (
 
 
 def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
-    """Verify `ScratchReq.phase` overlays, budget checks, `build_scratch`, and `fitted_plan`."""
+    """Verify `ScratchReq.phase` overlays, budgets, `build_scratch`, `fitted_plan`."""
     ms_hybrid = make_fake_model_spec(L=4, att_every=4, H=256)
     cp, scr = vmem.build_scratch(ms_hybrid, fake_ex)
 
