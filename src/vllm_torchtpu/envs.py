@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     TPU_DSV4_HCA_MIXED_Q_BLOCK: int = 32
     TPU_DSV4_HCA_MLA_PIPELINED: bool = False
     TPU_DSV4_SWA_PADDED_LM: bool = False
+    TPU_DSV4_VERIFY_FAST_PATH: bool = False
     TPU_DSV4_FUSED_QKV_ROPE: bool = False
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = False
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = False
@@ -1004,6 +1005,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of zero-filling them and slicing/re-padding (two XLA ops per layer).
     # Real rows are bit-identical.
     "TPU_DSV4_SWA_PADDED_LM": env_bool("TPU_DSV4_SWA_PADDED_LM"),
+    # DSv4 attention and indexer: a batch of speculative verify windows only
+    # (no decode-only or mixed sequences) runs the static-length kernel passes
+    # alone behind one lax.cond per op, without the empty decode/mixed launches.
+    # Same passes, bit-identical.
+    "TPU_DSV4_VERIFY_FAST_PATH": env_bool("TPU_DSV4_VERIFY_FAST_PATH"),
     # DSv4 attention: q RMSNorm+RoPE and kv RoPE as one kernel (one launch and
     # one cos/sin gather instead of two). Bit-identical.
     "TPU_DSV4_FUSED_QKV_ROPE": env_bool("TPU_DSV4_FUSED_QKV_ROPE"),

@@ -64,6 +64,7 @@ def _run_swa(
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
     padded_lm_out: bool = False,
+    verify_fast_path: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sliding-window pass: updates the SWA cache and returns its partials.
 
@@ -99,6 +100,7 @@ def _run_swa(
         non_causal_block=non_causal_block,
         chunk_prefill_size=verify_q_len,
         padded_lm_out=padded_lm_out and not swa_only,
+        verify_fast_path=verify_fast_path,
     )
 
 
@@ -129,6 +131,7 @@ def _attention_hca(
     hca_mixed_q_block: int = 32,
     hca_pipelined: bool = False,
     swa_padded_lm: bool = False,
+    verify_fast_path: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """SWA-only layers, and HCA layers over a single raw-bf16 latent array.
 
@@ -144,6 +147,8 @@ def _attention_hca(
     the current one, with static-size page copies (same arithmetic).
     `swa_padded_lm`: hand the SWA l/m to the next kernel lane-padded, without
     the zero-fill and slice/pad copies (same arithmetic on real rows).
+    `verify_fast_path`: a batch of verify windows only skips the empty decode
+    and mixed passes of both kernels (same arithmetic).
     """
     if main_cache_kv.shape[0] == 0 or (swa_only and sw_cache.shape[0] == 0):
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
@@ -169,6 +174,7 @@ def _attention_hca(
         non_causal_block=non_causal_block,
         verify_q_len=verify_q_len,
         padded_lm_out=swa_padded_lm,
+        verify_fast_path=verify_fast_path,
     )
 
     if swa_only:
@@ -203,6 +209,7 @@ def _attention_hca(
         chunk_prefill_size=verify_q_len,
         bkv_prefetch="after_wait" if hca_pipelined else "after_compute",
         fast_dma=hca_pipelined,
+        verify_fast_path=verify_fast_path,
     )
     return output, updated_sw_cache
 
@@ -235,6 +242,7 @@ def _attention_csa(
     masked_dense_max_kv: int = 0,
     masked_dense_min_tokens: int = 512,
     swa_padded_lm: bool = False,
+    verify_fast_path: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -267,6 +275,7 @@ def _attention_csa(
         non_causal_block=non_causal_block,
         verify_q_len=verify_q_len,
         padded_lm_out=swa_padded_lm,
+        verify_fast_path=verify_fast_path,
     )
 
     if two_caches_same_buffer:

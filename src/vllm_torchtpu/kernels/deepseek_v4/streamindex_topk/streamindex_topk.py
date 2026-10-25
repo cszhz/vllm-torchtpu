@@ -1296,6 +1296,7 @@ def _effective_row_lengths(
         "sc_topk_one_launch",
         "sc_topk_coop_max_rows",
         "kv_split",
+        "verify_fast_path",
     ),
 )
 def streamindex_topk(
@@ -1331,6 +1332,7 @@ def streamindex_topk(
     sc_topk_coop_max_rows: int = 0,
     kv_split: int = 1,
     kv_split_rank: jax.Array | int = 0,
+    verify_fast_path: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1417,6 +1419,10 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      verify_fast_path: with `uniform_q_len` and a single scoring piece, a
+        batch holding only verify windows runs the static-length pass alone,
+        behind one `lax.cond` (the empty mixed and decode passes, and their
+        schedules, are not computed). Same pass, same scores.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1893,10 +1899,14 @@ def streamindex_topk(
             chunk_starts = (None,)
         else:
             chunk_starts = tuple(m * chunk_len for m in range(num_chunks))
-        passes = tuple(
-            (spec, _pass_metadata(spec, chunk_starts, chunk_len))
-            for spec in _pass_specs(decode_batch_end)
-        )
+        def passes_for(specs):
+            return tuple(
+                (spec, _pass_metadata(spec, chunk_starts, chunk_len)) for spec in specs
+            )
+
+        all_specs = _pass_specs(decode_batch_end)
+        # The uniform (verify) pass is the first spec when `uniform_q_len` is set.
+        fast_verify = verify_fast_path and uniform_q_len is not None and num_chunks == 1
         topk_idxs = []
         topk_scores_list = []
         for m in range(num_chunks):
@@ -1919,14 +1929,27 @@ def streamindex_topk(
                 )
             else:
                 row_lengths = eff_row_lengths[start : start + chunk_len]
-            scores = _scores_for_chunk(
-                passes,
-                m,
-                chunk_starts[m],
-                chunk_len,
-                out_dtype,
-                tc_group,
-            )
+            def chunk_scores(specs, m=m, tc_group=tc_group):
+                return _scores_for_chunk(
+                    passes_for(specs),
+                    m,
+                    chunk_starts[m],
+                    chunk_len,
+                    out_dtype,
+                    tc_group,
+                )
+
+            if fast_verify:
+                only_verify = (distribution[0] == 0) & (
+                    distribution[1] == distribution[2]
+                )
+                scores = lax.cond(
+                    only_verify,
+                    lambda: chunk_scores(all_specs[:1]),
+                    lambda: chunk_scores(all_specs),
+                )
+            else:
+                scores = chunk_scores(all_specs)
             scores = scores.reshape(chunk_len, -1)
             if scores.shape[1] < k:
                 scores = jnp.pad(

@@ -258,6 +258,7 @@ def _indexer_impl(
             ),
             kv_split=kv_split,
             kv_split_rank=0 if split_rank is None else split_rank,
+            verify_fast_path=envs.TPU_DSV4_VERIFY_FAST_PATH,
         )
         return out if kv_split == 1 else jnp.concatenate(out, axis=1)
 
@@ -400,6 +401,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             f"{'' if uniform_q_len is None else f'_u{uniform_q_len}'}"
             f"_{kv_layout}"
             f"{'' if kv_split == 1 else f'_split{kv_split}'}"
+            f"{'_vfp' if envs.TPU_DSV4_VERIFY_FAST_PATH else ''}"
         )
         global _indexer_op_cache
         if op_name in _indexer_op_cache:
