@@ -241,12 +241,16 @@ def make_dense_ops(
     # ---- elementwise helpers ----------------------------------------------
     skip = faults.skip
 
-    def rms_norm_to(src, src_c0, n, dst, slot, wname, ss=None):
-        """dst[:, :n] = rms_norm(src[:, c0:c0+n]) with vLLM's rounding.
+    def rms_norm_to(src, src_c0, n, dst, slot, wname, ss=None, *, weight_dtype):
+        """dst[:, :n] = rms_norm(src[:, c0:c0+n]), f32 statistics.
 
-        ss: the row sums of squares if the producer already has them (in
-        this function's chunk order). Returns max |dst| per row (f32), which
-        the next fp8 activation quantization needs.
+        weight_dtype: F32 multiplies the weight in f32 and rounds once, as
+        the stock mHC kernels' fused attn_norm / ffn_norm do
+        (``mhc.utils.finish_layer_input``); BF16 rounds x * rsqrt to bf16
+        first and multiplies the weight in bf16 (vLLM ``rms_norm`` as
+        written in torch). ss: the row sums of squares if the producer
+        already has them (in this function's chunk order). Returns max |dst|
+        per row (f32), which the next fp8 activation quantization needs.
         """
         if "norm" in skip:
             return jnp.ones((M, 1), F32)
@@ -259,7 +263,8 @@ def make_dense_ops(
         amax = jnp.zeros((M, 1), F32)
         for c, w in _chunks(n, EW):
             v = src[:, src_c0 + c : src_c0 + c + w].astype(F32) * r
-            out = mul_vec(v.astype(BF16), slot, wname, c, BF16)
+            out = mul_vec(v.astype(weight_dtype), slot, wname, c, weight_dtype)
+            out = out.astype(BF16)
             dst[:, c : c + w] = out.astype(dst.dtype)
             amax = jnp.maximum(
                 amax, jnp.max(jnp.abs(out), axis=1, keepdims=True).astype(F32)
@@ -627,7 +632,7 @@ def _kernel(cfg: DenseChainConfig, typed: bool, faults: Faults, probes: bool, *r
             return g_l + off[name]
 
         sk, ss = mhc("hc_attn", g("hc_attn"), slot, "hc_attn_base", "hc_attn_scale")
-        amax = rms_norm_to(hin, 0, h, xa, slot, "attn_norm", ss)
+        amax = rms_norm_to(hin, 0, h, xa, slot, "attn_norm", ss, weight_dtype=F32)
 
         def emit_qkv(c0, cw, out):
             qkv[:, pl.ds(c0, cw)] = out
@@ -635,10 +640,12 @@ def _kernel(cfg: DenseChainConfig, typed: bool, faults: Faults, probes: bool, *r
         finish_sinkhorn(
             fp8_linear("wqa", g("wqa"), xa, slot, emit_qkv, bg=sk, amax=amax)
         )
-        amax_q = rms_norm_to(qkv, 0, cfg.q_lora, qr, slot, "q_norm")
+        amax_q = rms_norm_to(qkv, 0, cfg.q_lora, qr, slot, "q_norm", weight_dtype=BF16)
         q0 = pl_["qkv"][0]
         pf[slot, :, q0 : q0 + cfg.q_lora] = qr[...].astype(F32)
-        rms_norm_to(qkv, cfg.q_lora, cfg.head_dim, xg, slot, "kv_norm")
+        rms_norm_to(
+            qkv, cfg.q_lora, cfg.head_dim, xg, slot, "kv_norm", weight_dtype=BF16
+        )
         pf[slot, :, q0 + cfg.q_lora : q0 + cfg.qkv_cols] = xg[:, : cfg.head_dim].astype(
             F32
         )
@@ -667,7 +674,7 @@ def _kernel(cfg: DenseChainConfig, typed: bool, faults: Faults, probes: bool, *r
         fp8_linear("wo_b", g("wo_b"), z, slot, emit_x)
 
         sk, ss = mhc("hc_ffn", g("hc_ffn"), slot, "hc_ffn_base", "hc_ffn_scale")
-        amax_f = rms_norm_to(hin, 0, h, xa, slot, "ffn_norm", ss)
+        amax_f = rms_norm_to(hin, 0, h, xa, slot, "ffn_norm", ss, weight_dtype=F32)
         finish_sinkhorn(
             matmul("gate", g("gate"), lambda k0, w: xa[:, pl.ds(k0, w)], sk)
         )

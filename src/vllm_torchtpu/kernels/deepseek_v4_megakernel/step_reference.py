@@ -156,6 +156,9 @@ def step_reference(rc: RefConfig, w, embed, cos_sin_cache, ids, pos, seq_lens,
     if order == "stock_kernels":
         mhc = DREF.mhc_fused_stock
     norm = DREF.rms_norm_kernel_order if kernel_order else DREF.rms_norm
+    in_norm = (
+        DREF.layer_input_norm_kernel_order if kernel_order else DREF.layer_input_norm
+    )
 
     def lin(xv, lw, name, sname=None):
         sname = sname or name
@@ -183,7 +186,7 @@ def step_reference(rc: RefConfig, w, embed, cos_sin_cache, ids, pos, seq_lens,
             x, res, post, comb, lw["hc_attn_fn"], lw["hc_attn_scale"],
             lw["hc_attn_base"], full,
         )  # fmt: skip
-        xa = norm(hh, lw["attn_norm"], eps)
+        xa = in_norm(hh, lw["attn_norm"], eps)
         qkv = lin(xa, lw, "wqa")
         qr = norm(qkv[:, : full.q_lora], lw["q_norm"], eps)
         ctxkv = None
@@ -248,7 +251,7 @@ def step_reference(rc: RefConfig, w, embed, cos_sin_cache, ids, pos, seq_lens,
             x, res, post, comb, lw["hc_ffn_fn"], lw["hc_ffn_scale"],
             lw["hc_ffn_base"], full,
         )  # fmt: skip
-        xf = norm(hh, lw["ffn_norm"], eps)
+        xf = in_norm(hh, lw["ffn_norm"], eps)
         parts = []
         for r in range(R):
             gu = lin(xf, lws[r], "w13")

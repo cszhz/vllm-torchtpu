@@ -794,7 +794,9 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
             ops.fp8_linear(
                 "wqa_ctx", g("wqa_ctx", lt), main_x, slot, emit(s["ctx_raw"])
             )
-            ops.rms_norm_to(s["ctx_raw"], 0, d, s["ctx_kvn"], slot, "kv_norm")
+            ops.rms_norm_to(
+                s["ctx_raw"], 0, d, s["ctx_kvn"], slot, "kv_norm", weight_dtype=BF16
+            )
             kv_rope(s["ctx_kvn"], cs_ctx)
             if dbg_ctx is not None:
 
@@ -812,15 +814,21 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
                     "hc_attn", g("hc_attn"), slot, "hc_attn_base", "hc_attn_scale"
                 )
             with sc("mk_wqa"):
-                amax = ops.rms_norm_to(hin, 0, h, xa, slot, "attn_norm", ss)
+                amax = ops.rms_norm_to(
+                    hin, 0, h, xa, slot, "attn_norm", ss, weight_dtype=F32
+                )
                 ops.finish_sinkhorn(
                     ops.fp8_linear(
                         "wqa", g("wqa"), xa, slot, emit(qkv), bg=sk, amax=amax
                     )
                 )
             with sc("mk_wq_b"):
-                amax_q = ops.rms_norm_to(qkv, 0, cfg.q_lora, s["qr"], slot, "q_norm")
-                ops.rms_norm_to(qkv, cfg.q_lora, d, s["kvn"], slot, "kv_norm")
+                amax_q = ops.rms_norm_to(
+                    qkv, 0, cfg.q_lora, s["qr"], slot, "q_norm", weight_dtype=BF16
+                )
+                ops.rms_norm_to(
+                    qkv, cfg.q_lora, d, s["kvn"], slot, "kv_norm", weight_dtype=BF16
+                )
                 if attn:
                     kv_rope()
                 ops.fp8_linear(
@@ -903,7 +911,9 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
                     "hc_ffn", g("hc_ffn"), slot, "hc_ffn_base", "hc_ffn_scale"
                 )
             with sc("mk_gate"):
-                amax_f = ops.rms_norm_to(hin, 0, h, xa, slot, "ffn_norm", ss)
+                amax_f = ops.rms_norm_to(
+                    hin, 0, h, xa, slot, "ffn_norm", ss, weight_dtype=F32
+                )
                 ops.finish_sinkhorn(
                     ops.matmul("gate", g("gate"), lambda k0, w: xa[:, pl.ds(k0, w)], sk)
                 )

@@ -74,6 +74,18 @@ def rms_norm_kernel_order(x, w, eps):
     return (xf * r).astype(BF16) * w.astype(BF16)
 
 
+def layer_input_norm(h, w, eps):
+    """attn_norm / ffn_norm as the stock mHC kernels fuse them: the weight
+    multiply in f32, one rounding (``mhc.utils.finish_layer_input``)."""
+    return mhc_utils.finish_layer_input(h, w.reshape(1, -1), eps)
+
+
+def layer_input_norm_kernel_order(h, w, eps):
+    xf = h.astype(F32)
+    r = jax.lax.rsqrt(_chunked_sum_sq(xf, EW) / h.shape[1] + eps)
+    return (xf * r * w.astype(F32)).astype(BF16)
+
+
 def ktiled_dot(x, w, tile_rows):
     """x @ w accumulated over K tiles in order (the ring's accumulation)."""
     acc = None
@@ -296,6 +308,7 @@ def dense_layer(lw, state, cos_sin, cfg: DenseChainConfig, csa: bool, order: str
     if order == "kernel":
         mhc = mhc_fused_kernel_order
         rms_norm_ = rms_norm_kernel_order
+        in_norm = layer_input_norm_kernel_order
 
         def lin(x, name, wname=None):
             wname = wname or name
@@ -308,6 +321,7 @@ def dense_layer(lw, state, cos_sin, cfg: DenseChainConfig, csa: bool, order: str
     else:
         mhc = mhc_fused_stock if order == "stock_kernels" else mhc_fused_jnp
         rms_norm_ = rms_norm
+        in_norm = layer_input_norm
 
         def lin(x, name, wname=None):
             wname = wname or name
@@ -324,7 +338,7 @@ def dense_layer(lw, state, cos_sin, cfg: DenseChainConfig, csa: bool, order: str
         x, res, post, comb, lw["hc_attn_fn"], lw["hc_attn_scale"],
         lw["hc_attn_base"], cfg,
     )  # fmt: skip
-    xa = rms_norm_(h, lw["attn_norm"], eps)
+    xa = in_norm(h, lw["attn_norm"], eps)
     qkv = lin(xa, "wqa")
     qr = rms_norm_(qkv[:, : cfg.q_lora], lw["q_norm"], eps)
     kv = rms_norm_(qkv[:, cfg.q_lora :], lw["kv_norm"], eps)
@@ -347,7 +361,7 @@ def dense_layer(lw, state, cos_sin, cfg: DenseChainConfig, csa: bool, order: str
         x, res, post, comb, lw["hc_ffn_fn"], lw["hc_ffn_scale"],
         lw["hc_ffn_base"], cfg,
     )  # fmt: skip
-    xf = rms_norm_(h, lw["ffn_norm"], eps)
+    xf = in_norm(h, lw["ffn_norm"], eps)
     logits = bdot(xf, lw["gate"], "gate")
     gu = lin(xf, "w13")
     act = swiglu_clamp(gu, cfg.swiglu_limit)
