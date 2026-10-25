@@ -3255,13 +3255,13 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     assert seen_u_dtypes == [torch.float32, torch.float32]
 
 
-def test_remote_dspark_bootstrap_feedback_uses_raiden_source_id():
+@pytest.mark.parametrize("proposal_rank", [False, True])
+def test_remote_dspark_feedback_preserves_source_id_on_all_ranks(proposal_rank):
     transport = MagicMock()
     runner = SimpleNamespace(
         _remote_dspark_transport=transport,
         _profiler_rank=1,
-        _remote_dspark_proposal_rank=True,
-        _remote_dspark_producer_request_ids=None,
+        _remote_dspark_proposal_rank=proposal_rank,
         _remote_dspark_source_request_ids={"consumer-id": "producer-id"},
     )
     chunk = SimpleNamespace(
@@ -3269,12 +3269,34 @@ def test_remote_dspark_bootstrap_feedback_uses_raiden_source_id():
         query_start_loc_np=np.array([0, 1]),
         num_reqs=1,
     )
-    TPUModelRunner._send_remote_dspark_feedback(
-        runner, ["consumer-id"], [torch.tensor([[3]])], [chunk], bootstrap=True
+    for _ in range(2):
+        TPUModelRunner._send_remote_dspark_feedback(
+            runner, ["consumer-id"], [torch.tensor([[3]])], [chunk]
+        )
+        feedback = transport.send_feedback.call_args.args[0]
+        assert feedback["request_ids"] == ["producer-id"]
+        assert runner._remote_dspark_source_request_ids == {
+            "consumer-id": "producer-id"
+        }
+
+
+def test_remote_dspark_proposal_rows_follow_source_ids_after_reordering():
+    transport = MagicMock()
+    transport.recv_proposal.return_value = (["producer-a", "producer-b"], [[11], [21]])
+    runner = SimpleNamespace(
+        spec_decode_manager=object(),
+        _remote_dspark_transport=transport,
+        _remote_dspark_role="consumer",
+        _remote_dspark_proposal_rank=True,
+        _remote_dspark_source_request_ids={
+            "consumer-a": "producer-a",
+            "consumer-b": "producer-b",
+        },
+        input_batch=SimpleNamespace(req_ids=["consumer-b", "consumer-a"], num_reqs=2),
     )
-    feedback = transport.send_feedback.call_args.args[0]
-    assert feedback["request_ids"] == ["producer-id"]
-    assert runner._remote_dspark_source_request_ids == {}
+    drafts = TPUModelRunner.take_draft_token_ids(runner)
+    assert drafts.req_ids == ["consumer-b", "consumer-a"]
+    assert drafts.draft_token_ids == [[21], [11]]
 
 
 def test_remote_dspark_bootstrap_removes_reserved_speculative_slots():
@@ -3312,16 +3334,10 @@ def test_remote_dspark_terminal_batch_does_not_wait_for_feedback(finished):
     runner = SimpleNamespace(
         input_batch=SimpleNamespace(req_ids=["first", "second"], num_reqs=2),
         _remote_dspark_awaiting_feedback=True,
-        _remote_dspark_producer_request_ids=["producer-first", "producer-second"],
     )
     output = SimpleNamespace(finished_req_ids=finished)
     TPUModelRunner._clear_finished_remote_dspark_batch(runner, output)
     if finished == {"first", "second"}:
         assert not runner._remote_dspark_awaiting_feedback
-        assert runner._remote_dspark_producer_request_ids is None
     else:
         assert runner._remote_dspark_awaiting_feedback
-        assert runner._remote_dspark_producer_request_ids == [
-            "producer-first",
-            "producer-second",
-        ]

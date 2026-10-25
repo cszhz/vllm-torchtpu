@@ -138,6 +138,46 @@ class RemoteDraftProtocolError(RuntimeError):
     """A remote draft message violates request ordering or KV ownership."""
 
 
+def remote_dspark_source_ids(
+    request_ids: list[str], source_request_ids: dict[str, str]
+) -> list[str]:
+    """Resolve live consumer rows to their persistent Raiden producer IDs."""
+    if len(request_ids) != len(set(request_ids)):
+        raise RemoteDraftProtocolError("remote DSpark consumer request IDs repeat")
+    missing = [req_id for req_id in request_ids if req_id not in source_request_ids]
+    if missing:
+        raise RemoteDraftProtocolError(
+            f"remote DSpark requests have no Raiden source ID: {missing}"
+        )
+    sources = [source_request_ids[req_id] for req_id in request_ids]
+    if len(sources) != len(set(sources)):
+        raise RemoteDraftProtocolError("remote DSpark Raiden source IDs repeat")
+    return sources
+
+
+def route_remote_draft_proposals(
+    producer_request_ids: list[str],
+    token_ids: list[list[int]],
+    consumer_request_ids: list[str],
+    source_request_ids: dict[str, str],
+) -> list[list[int]]:
+    """Return proposal rows in consumer order, rejecting missing/foreign rows."""
+    sources = remote_dspark_source_ids(consumer_request_ids, source_request_ids)
+    if len(producer_request_ids) != len(token_ids):
+        raise RemoteDraftProtocolError(
+            "remote DSpark proposal request and token row counts differ"
+        )
+    if len(producer_request_ids) != len(set(producer_request_ids)):
+        raise RemoteDraftProtocolError("remote DSpark proposal request IDs repeat")
+    if set(producer_request_ids) != set(sources):
+        raise RemoteDraftProtocolError(
+            "remote DSpark proposal requests do not match consumer Raiden sources: "
+            f"expected {sources}, got {producer_request_ids}"
+        )
+    proposals = dict(zip(producer_request_ids, token_ids, strict=True))
+    return [proposals[source_id] for source_id in sources]
+
+
 class _WeightSynchronizer(Protocol):
     def bind_weights(self, device_tensors: list[list[torch.Tensor]]) -> None: ...
 

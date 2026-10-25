@@ -188,6 +188,8 @@ from vllm_torchtpu.spec_decode.remote_dspark import (
     RemoteTensorTransfer,
     complete_remote_dspark_handoff,
     is_remote_draft_proposal_rank,
+    remote_dspark_source_ids,
+    route_remote_draft_proposals,
 )
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
@@ -1033,7 +1035,6 @@ class TPUModelRunner(GPUModelRunner):
             )
         self._remote_dspark_transport: RemoteDSparkTransport | None = None
         self._remote_dspark_proposal_rank = False
-        self._remote_dspark_producer_request_ids: list[str] | None = None
         self._remote_dspark_source_request_ids: dict[str, str] = {}
         self._remote_dspark_awaiting_feedback = False
         if self._remote_dspark_role:
@@ -3771,7 +3772,6 @@ class TPUModelRunner(GPUModelRunner):
             # The final proposal has no verify feedback. Retire its runner
             # state before a new prefill can wait on that terminal round.
             self._remote_dspark_awaiting_feedback = False
-            self._remote_dspark_producer_request_ids = None
 
     def _prepare_remote_dspark_bootstrap(
         self, scheduler_output: "SchedulerOutput"
@@ -3899,20 +3899,10 @@ class TPUModelRunner(GPUModelRunner):
             feedback_req_ids = remote_feedback.get("request_ids")
             if not isinstance(feedback_req_ids, list):
                 raise RuntimeError("remote DSpark feedback request_ids must be a list")
-            if (
-                self._remote_dspark_proposal_rank
-                and feedback_req_ids != expected_req_ids
-            ):
+            if feedback_req_ids != expected_req_ids:
                 raise RuntimeError(
                     "remote DSpark feedback request order mismatch: expected "
                     f"{expected_req_ids}, got {feedback_req_ids}"
-                )
-            if not self._remote_dspark_proposal_rank and len(feedback_req_ids) != len(
-                expected_req_ids
-            ):
-                raise RuntimeError(
-                    "remote DSpark feedback row count mismatch: expected "
-                    f"{len(expected_req_ids)}, got {len(feedback_req_ids)}"
                 )
 
         # Run the multimodal (vision) encoder. vLLM's base
@@ -4439,21 +4429,18 @@ class TPUModelRunner(GPUModelRunner):
             consumer_request_ids = list(
                 self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
-            if len(producer_request_ids) != len(consumer_request_ids) or len(
-                token_ids
-            ) != len(consumer_request_ids):
-                raise RuntimeError(
-                    "remote DSpark proposal row count does not match the consumer "
-                    f"batch: producer={len(producer_request_ids)} "
-                    f"tokens={len(token_ids)} consumer={len(consumer_request_ids)}"
-                )
-            self._remote_dspark_producer_request_ids = producer_request_ids
+            routed_tokens = route_remote_draft_proposals(
+                producer_request_ids,
+                token_ids,
+                consumer_request_ids,
+                self._remote_dspark_source_request_ids,
+            )
             logger.info(
                 "Remote DSpark proposal request mapping: producer=%s consumer=%s",
                 producer_request_ids,
                 consumer_request_ids,
             )
-            return DraftTokenIds(consumer_request_ids, token_ids)
+            return DraftTokenIds(consumer_request_ids, routed_tokens)
         drafts = self.spec_decode_manager.take_draft_token_ids()
         if (
             self._remote_dspark_role == "producer"
@@ -4469,11 +4456,12 @@ class TPUModelRunner(GPUModelRunner):
         request_ids: list[str],
         next_tokens_per_chunk: list[torch.Tensor],
         draft_chunks: list[DraftChunkInputs],
-        *,
-        bootstrap: bool,
     ) -> None:
         transport = self._remote_dspark_transport
         assert transport is not None
+        feedback_request_ids = remote_dspark_source_ids(
+            request_ids, self._remote_dspark_source_request_ids
+        )
         aux_hidden_states: list[PackedTensorRows | RemoteTensorTransfer] = []
         for chunk_index, chunk in enumerate(draft_chunks):
             aux = chunk.aux_hidden_states
@@ -4517,28 +4505,6 @@ class TPUModelRunner(GPUModelRunner):
                 sum(tensor.transferred_bytes for tensor in packed_tensors),
                 sum(tensor.padded_bytes for tensor in packed_tensors),
             )
-        feedback_request_ids = request_ids
-        if self._remote_dspark_proposal_rank:
-            if bootstrap:
-                if self._remote_dspark_producer_request_ids is not None:
-                    raise RuntimeError(
-                        "remote DSpark bootstrap unexpectedly has a proposal mapping"
-                    )
-                feedback_request_ids = [
-                    self._remote_dspark_source_request_ids.pop(req_id)
-                    for req_id in request_ids
-                ]
-            elif self._remote_dspark_producer_request_ids is None:
-                raise RuntimeError(
-                    "remote DSpark feedback has no matching producer proposal"
-                )
-            elif len(self._remote_dspark_producer_request_ids) != len(request_ids):
-                raise RuntimeError(
-                    "remote DSpark feedback row count does not match the proposal"
-                )
-            else:
-                feedback_request_ids = self._remote_dspark_producer_request_ids
-                self._remote_dspark_producer_request_ids = None
         transport.send_feedback(
             {
                 "request_ids": feedback_request_ids,
@@ -5183,7 +5149,6 @@ class TPUModelRunner(GPUModelRunner):
                 req_ids,
                 next_tokens_per_chunk,
                 state.draft_chunks,
-                bootstrap=not is_spec_step,
             )
 
         request_seq_lens = []

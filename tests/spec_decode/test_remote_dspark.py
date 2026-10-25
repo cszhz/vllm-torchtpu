@@ -34,6 +34,8 @@ from vllm_torchtpu.spec_decode.remote_dspark import (
     mark_remote_dspark_request,
     publish_remote_dspark_handoff,
     remote_dspark_handoff_path,
+    remote_dspark_source_ids,
+    route_remote_draft_proposals,
     take_remote_dspark_handoff,
 )
 
@@ -43,6 +45,66 @@ def test_remote_dspark_request_marker() -> None:
 
     assert is_remote_dspark_request(params)
     assert not is_remote_dspark_request({"do_remote_decode": True})
+
+
+@pytest.mark.parametrize("order", [["local-a", "local-b"], ["local-b", "local-a"]])
+def test_remote_proposals_route_by_raiden_identity(order):
+    sources = {"local-a": "producer-a", "local-b": "producer-b"}
+    proposals = route_remote_draft_proposals(
+        ["producer-b", "producer-a"], [[21, 22], [11]], order, sources
+    )
+    expected = {"local-a": [11], "local-b": [21, 22]}
+    assert proposals == [expected[req_id] for req_id in order]
+
+
+def test_remote_source_ids_survive_split_and_mixed_feedback():
+    sources = {"local-a": "producer-a", "local-b": "producer-b"}
+    assert remote_dspark_source_ids(["local-a"], sources) == ["producer-a"]
+    assert remote_dspark_source_ids(["local-b", "local-a"], sources) == [
+        "producer-b",
+        "producer-a",
+    ]
+    assert sources == {"local-a": "producer-a", "local-b": "producer-b"}
+
+
+@pytest.mark.parametrize(
+    ("request_ids", "sources", "error"),
+    [
+        (["local-a"], {}, "no Raiden source ID"),
+        (["local-a", "local-a"], {"local-a": "producer-a"}, "consumer.*repeat"),
+        (
+            ["local-a", "local-b"],
+            {"local-a": "producer-a", "local-b": "producer-a"},
+            "source IDs repeat",
+        ),
+    ],
+)
+def test_remote_source_ids_reject_ambiguous_or_missing_identity(
+    request_ids, sources, error
+):
+    with pytest.raises(RemoteDraftProtocolError, match=error):
+        remote_dspark_source_ids(request_ids, sources)
+
+
+@pytest.mark.parametrize(
+    ("producer_ids", "tokens", "error"),
+    [
+        (["producer-a"], [[11]], "do not match"),
+        (["producer-a", "producer-x"], [[11], [21]], "do not match"),
+        (["producer-a", "producer-a"], [[11], [21]], "request IDs repeat"),
+        (["producer-a", "producer-b"], [[11]], "row counts differ"),
+    ],
+)
+def test_remote_proposals_reject_missing_foreign_or_duplicate_rows(
+    producer_ids, tokens, error
+):
+    with pytest.raises(RemoteDraftProtocolError, match=error):
+        route_remote_draft_proposals(
+            producer_ids,
+            tokens,
+            ["local-a", "local-b"],
+            {"local-a": "producer-a", "local-b": "producer-b"},
+        )
 
 
 def test_remote_dspark_handoff_is_atomic_and_consumed_once(tmp_path) -> None:
