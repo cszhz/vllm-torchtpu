@@ -187,6 +187,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
                     split_slice=sl,
                     scale_for=w_n,
                     shard_axis=-1,
+                    small_field="in_s",
                 ),
             ),
         ]
@@ -230,6 +231,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
                     pad=((0, slot_w),),
                     scale_for=w_n,
                     shard_axis=-1,
+                    small_field="in_s",
                 ),
             ),
         ]
@@ -259,7 +261,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
             shard_axis=-1,
             already_sharded=True,
             already_fp8=False,
-            flipped=True,
+            flipped=False,
         ),
     )
 
@@ -271,7 +273,9 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
             shape=(dim,),
             hf_shape=(dim,),
             dtype=F32,
-            transform=ParamTransform(shard_axis=shard, replicate_ranks=(shard is None)),
+            transform=ParamTransform(
+                shard_axis=shard, replicate_ranks=(shard is None), small_field=canon
+            ),
             vllm_aliases=(
                 VLLMAlias(
                     source=f"{p}{hf_stem}",
@@ -315,6 +319,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
                 fuse_axis=-1,
                 scale_for=_n("lin_z"),
                 shard_axis=-1,
+                small_field="in_s",
             ),
         ),
         *_ba_pair("lin_b", "in_proj_b", 4, b_slot_width, ba_alias),
@@ -346,7 +351,10 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
             hf_shape=(H,),
             dtype=F32,
             transform=ParamTransform(
-                scale_for=_n("lin_out"), shard_axis=None, replicate_ranks=True
+                scale_for=_n("lin_out"),
+                shard_axis=None,
+                replicate_ranks=True,
+                small_field="out_s",
             ),
         ),
         HFParamDecl(
@@ -359,6 +367,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
                 shard_axis=-1,
                 channel_splits=(kq_dim, kq_dim, v_dim),
                 flatten_tail=True,
+                small_field="conv",
             ),
             vllm_aliases=(
                 VLLMAlias(

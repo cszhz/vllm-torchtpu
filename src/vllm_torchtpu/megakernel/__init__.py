@@ -41,6 +41,7 @@ from . import (
     stream,
     validate,
     vmem,
+    weights,
 )
 from .cache import (
     CachePipe,
@@ -157,12 +158,25 @@ from .spec import (
 )
 from .stream import TwoRing
 from .vmem import fit_default_tiles, fitted_plan
+from .weights import (
+    ArrayOps,
+    JaxArrayOps,
+    MappingWeightSource,
+    WeightSource,
+    default_eplb_cores,
+    encode_eplb_ecopy,
+    load_hf,
+    load_logical_weights,
+    load_weights,
+    pack_logical_weights,
+)
 
 __all__ = [
     "DEFAULT_PROFILE",
     "POOL_STATE_NAME",
     "REQUIRED",
     "AllReduceRing",
+    "ArrayOps",
     "Baseline",
     "CacheExec",
     "CachePipe",
@@ -184,10 +198,12 @@ __all__ = [
     "GQAModule",
     "GQAParams",
     "HFParamDecl",
+    "JaxArrayOps",
     "KVCacheDecl",
     "KernelContext",
     "LMHead",
     "LayerType",
+    "MappingWeightSource",
     "MegakernelConfigError",
     "MegakernelLayoutError",
     "MoE",
@@ -219,6 +235,7 @@ __all__ = [
     "TwoRing",
     "VLLMAlias",
     "WeightDecl",
+    "WeightSource",
     "allocate_test_layout",
     "build",
     "cache",
@@ -229,11 +246,13 @@ __all__ = [
     "comm",
     "conv_to_raw_page",
     "decls",
+    "default_eplb_cores",
     "default_pool_layout",
     "default_tiles",
     "derive",
     "derive_pool_layout",
     "encode_ecopy",
+    "encode_eplb_ecopy",
     "errors",
     "exec_spec",
     "experimental",
@@ -249,6 +268,9 @@ __all__ = [
     "kv_to_raw_page",
     "list_models",
     "list_profiles",
+    "load_hf",
+    "load_logical_weights",
+    "load_weights",
     "make_flat_fused_pooled_step",
     "make_flat_pooled_step",
     "make_fused_pooled_step",
@@ -262,6 +284,7 @@ __all__ = [
     "module_options",
     "modules",
     "ops",
+    "pack_logical_weights",
     "planner",
     "pool",
     "pool_alias",
@@ -287,5 +310,6 @@ __all__ = [
     "unfold",
     "validate",
     "vmem",
+    "weights",
     "with_cache",
 ]

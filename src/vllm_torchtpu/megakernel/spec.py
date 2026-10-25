@@ -67,6 +67,9 @@ class WeightDecl:
     lead_dims: tuple[
         int, ...
     ] = ()  # Extra per-layer leading dims (e.g. `(EW,)` for experts)
+    fuse_from: tuple[
+        str, ...
+    ] = ()  # Optional logical buffers concatenated along axis=-1 into this weight
 
 
 @dataclass(frozen=True)

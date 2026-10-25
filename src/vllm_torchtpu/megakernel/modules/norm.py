@@ -67,6 +67,7 @@ class NormModule(Module):
     OPTIONS: ClassVar[dict[str, Any]] = {
         "zero_centered": False,
         "param_name": None,
+        "small_field": None,
     }
 
     def __init__(
@@ -77,18 +78,21 @@ class NormModule(Module):
         zero_centered: bool | None = None,
         eps: float | None = None,
         param_name: str | None = None,
+        small_field: str | None = None,
     ) -> None:
         self.prefix = prefix
         self.geometry = geometry
         self.zero_centered = zero_centered
         self.eps = eps
         self.param_name = param_name
+        self.small_field = small_field
         self.options = FrozenDict(
             {
                 "zero_centered": False
                 if zero_centered is None
                 else bool(zero_centered),
                 "param_name": param_name,
+                "small_field": small_field,
             }
         )
 
@@ -121,6 +125,7 @@ class NormModule(Module):
             zero_centered=resolved.options.get("zero_centered", False),
             eps=resolved.values.get("eps"),
             param_name=resolved.options.get("param_name"),
+            small_field=resolved.options.get("small_field"),
         )
 
     def canonical_param_name(self, prefix: str | None = None) -> str:
@@ -146,7 +151,7 @@ class NormModule(Module):
                 hf_name=hf_name,
                 shape=(H,),
                 dtype=F32,
-                transform=ParamTransform(shard_axis=None),
+                transform=ParamTransform(shard_axis=None, small_field=self.small_field),
                 vllm_aliases=(
                     VLLMAlias(
                         source=hf_name,

@@ -193,6 +193,7 @@ class MoEModule(Module):
                 dtype=F32,
                 stream_ring="hbm",
                 lead_dims=(ew,),
+                fuse_from=("e13_s", "e2_s"),
             ),
         ]
 

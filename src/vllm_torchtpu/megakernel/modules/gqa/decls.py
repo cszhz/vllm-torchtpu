@@ -168,7 +168,7 @@ def gqa_hf_params(
                         targets=(w_name,),
                         scale_targets=(s_name,),
                         scale_source=f"{p}{proj}_proj.weight_scale",
-                        shard_axis=0,
+                        shard_axis=-1,
                         already_sharded=True,
                         already_fp8=True,
                         flipped=True,
@@ -188,6 +188,7 @@ def gqa_hf_params(
                     scale_for=w_name,
                     shard_axis=0,
                     kv_repeat=True,
+                    small_field="in_s",
                 ),
             ),
         ]
@@ -242,6 +243,7 @@ def gqa_hf_params(
                 fuse_axis=-1,
                 scale_for=_n("q_proj"),
                 shard_axis=-1,
+                small_field="in_s",
             ),
         ),
         *_kv_decls("k", 1),
@@ -273,7 +275,10 @@ def gqa_hf_params(
             hf_shape=(H,),
             dtype=F32,
             transform=ParamTransform(
-                scale_for=_n("att_out"), shard_axis=None, replicate_ranks=True
+                scale_for=_n("att_out"),
+                shard_axis=None,
+                replicate_ranks=True,
+                small_field="out_s",
             ),
         ),
     ]
@@ -286,7 +291,9 @@ def gqa_hf_params(
                     shape=(NH, HD),
                     hf_shape=(HD,),
                     dtype=F32,
-                    transform=ParamTransform(shard_axis=0, head_reduce="mean"),
+                    transform=ParamTransform(
+                        shard_axis=0, head_reduce="mean", small_field="qn"
+                    ),
                     vllm_aliases=(
                         VLLMAlias(
                             source=f"{p}q_norm.weight",
@@ -303,7 +310,9 @@ def gqa_hf_params(
                     shape=(NKV, HD),
                     hf_shape=(HD,),
                     dtype=F32,
-                    transform=ParamTransform(shard_axis=0, kv_repeat=True),
+                    transform=ParamTransform(
+                        shard_axis=0, kv_repeat=True, small_field="kn"
+                    ),
                     vllm_aliases=(
                         VLLMAlias(
                             source=f"{p}k_norm.weight",

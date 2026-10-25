@@ -41,7 +41,13 @@ def _make_ref_module(m: ModuleOrBinding | None, g: ModelGeometry) -> Module | No
         raise MegakernelConfigError(f"Expected Module or ModuleBinding, got {m!r}")
     if issubclass(m.module_cls, NormModule):
         zc, eps_val = norm_zc_and_eps(m, None, g.eps)
-        return m.module_cls(m.prefix, geometry=g, zero_centered=zc, eps=eps_val)
+        return m.module_cls(
+            m.prefix,
+            geometry=g,
+            zero_centered=zc,
+            eps=eps_val,
+            param_name=m.options.get("param_name"),
+        )
     opts = {k: v for k, v in m.options.items() if v is not None}
     return m.module_cls(geometry=g, prefix=m.prefix, **opts)
 
@@ -94,7 +100,13 @@ def composed_reference_step(
             raise MegakernelConfigError(
                 f"layer {lyr} slot 'pre_norm' is None (kernel requires pre_norm)"
             )
-        x_mix = pre_mod.reference(logical_weights["in_norm"][lyr], res, g=g)[0]
+        pre_key = (
+            pre_mod.renamed_param_name(pre_mod.prefix, g)
+            if isinstance(pre_mod, NormModule)
+            else "in_norm"
+        )
+        pre_w = logical_weights[pre_key if pre_key in logical_weights else "in_norm"]
+        x_mix = pre_mod.reference(pre_w[lyr], res, g=g)[0]
         mix_mod = _make_ref_module(sched.mixer[lyr], g)
         if mix_mod is None:
             raise MegakernelConfigError(f"Layer {lyr} has no mixer module")
@@ -119,7 +131,15 @@ def composed_reference_step(
             raise MegakernelConfigError(
                 f"layer {lyr} slot 'post_norm' is None (kernel requires post_norm)"
             )
-        x_ffn = post_mod.reference(logical_weights["post_norm"][lyr], res, g=g)[0]
+        post_key = (
+            post_mod.renamed_param_name(post_mod.prefix, g)
+            if isinstance(post_mod, NormModule)
+            else "post_norm"
+        )
+        post_w = logical_weights[
+            post_key if post_key in logical_weights else "post_norm"
+        ]
+        x_ffn = post_mod.reference(post_w[lyr], res, g=g)[0]
         ffn_mod = _make_ref_module(sched.ffn[lyr], g)
         if ffn_mod is None:
             raise MegakernelConfigError(f"Layer {lyr} has no ffn module")
@@ -131,7 +151,13 @@ def composed_reference_step(
     fn_mod = _make_ref_module(final_norm, g)
     if fn_mod is None:
         raise MegakernelConfigError("final_norm is None (kernel requires final_norm)")
-    out_b = fn_mod.reference(logical_weights["final_norm"], res, g=g, out_dtype=BF16)[0]
+    fn_key = (
+        fn_mod.renamed_param_name(fn_mod.prefix, g)
+        if isinstance(fn_mod, NormModule)
+        else "final_norm"
+    )
+    fn_w = logical_weights[fn_key if fn_key in logical_weights else "final_norm"]
+    out_b = fn_mod.reference(fn_w, res, g=g, out_dtype=BF16)[0]
     out_states: dict[str, Any] = {"kc": step_state["kc"], "vc": step_state["vc"]}
     if ngdn > 0 and conv_in is not None and rec_in is not None:
         conv_out, rec_out = step_state["conv_out"], step_state["rec_out"]

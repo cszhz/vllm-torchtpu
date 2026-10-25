@@ -121,12 +121,7 @@ def resolve_moe_binding(
         }
     )
     return ResolvedModuleGeometry(
-        module_cls=cls,
-        prefix=binding.prefix,
-        values=vals,
-        options=opts,
-        rename=binding.rename,
-        transforms=binding.transforms,
+        cls, binding.prefix, vals, opts, binding.rename, binding.transforms
     )
 
 
@@ -183,6 +178,7 @@ def moe_hf_params(
                     fuse_axis=-1,
                     scale_for=w_n,
                     shard_axis=-1,
+                    small_field="sh13_s",
                 ),
             ),
         ]
@@ -236,22 +232,21 @@ def moe_hf_params(
             transform=ParamTransform(transpose=(1, 0), shard_axis=None),
             vllm_aliases=(
                 VLLMAlias(
+                    source=f"{p}_fused_gate_gu_fp8_weight",
+                    targets=(_n("router"), _n("sh_gate_proj"), _n("sh_up_proj")),
+                    scale_targets=(_n("sh_gate_proj_s"), _n("sh_up_proj_s")),
+                    scale_source=f"{p}_fused_gate_gu_fp8_scale",
+                    shard_axis=-1,
+                    already_sharded=False,
+                    already_fp8=True,
+                    flipped=True,
+                ),
+                VLLMAlias(
                     source=f"{p}gate.weight",
                     targets=(_n("router"),),
                     already_sharded=False,
                     already_fp8=False,
                     flipped=False,
-                ),
-                VLLMAlias(
-                    source=f"{p}_fused_gate_gu_fp8_weight",
-                    targets=(_n("router"), _n("sh_gate_proj"), _n("sh_up_proj")),
-                    scale_targets=(_n("sh_gate_proj_s"), _n("sh_up_proj_s")),
-                    scale_source=f"{p}_fused_gate_gu_fp8_scale",
-                    router_scale_source=f"{p}_fused_gate_gu_fp8_scale",
-                    shard_axis=-1,
-                    already_sharded=False,
-                    already_fp8=True,
-                    flipped=True,
                 ),
             ),
         ),
@@ -264,17 +259,19 @@ def moe_hf_params(
                 shape=(H,),
                 hf_shape=(1, H),
                 dtype=F32,
-                transform=ParamTransform(shard_axis=None, replicate_ranks=True),
+                transform=ParamTransform(
+                    shard_axis=None, replicate_ranks=True, small_field="sh_gate"
+                ),
                 vllm_aliases=(
                     VLLMAlias(
-                        source=f"{p}shared_expert_gate.weight",
+                        source=f"{p}_fused_se_gate_weight",
                         targets=(_n("sh_gate"),),
                         already_sharded=False,
                         already_fp8=False,
                         flipped=False,
                     ),
                     VLLMAlias(
-                        source=f"{p}_fused_se_gate_weight",
+                        source=f"{p}shared_expert_gate.weight",
                         targets=(_n("sh_gate"),),
                         already_sharded=False,
                         already_fp8=False,
@@ -301,7 +298,7 @@ def moe_hf_params(
             targets=(_n("e_gate_proj"), _n("e_up_proj")),
             scale_targets=(_n("e_gate_proj_s"), _n("e_up_proj_s")),
             scale_source=f"{p}experts.w13_weight_scale",
-            shard_axis=shard_e13,
+            shard_axis=-1,
             already_sharded=True,
             already_fp8=True,
             flipped=True,
@@ -322,22 +319,22 @@ def moe_hf_params(
                 ),
                 vllm_aliases=(
                     VLLMAlias(
-                        source=f"{p}shared_expert.down_proj",
-                        targets=(_n("sh2"),),
-                        scale_targets=(_n("sh2_s"),),
-                        scale_source=f"{p}shared_expert.down_proj.weight_scale",
-                        shard_axis=0,
-                        already_sharded=True,
-                        already_fp8=True,
-                        flipped=True,
-                    ),
-                    VLLMAlias(
                         source=f"{p}_fused_se_down_fp8_weight",
                         targets=(_n("sh2"),),
                         scale_targets=(_n("sh2_s"),),
                         scale_source=f"{p}_fused_se_down_fp8_scale",
                         shard_axis=0,
                         already_sharded=False,
+                        already_fp8=True,
+                        flipped=True,
+                    ),
+                    VLLMAlias(
+                        source=f"{p}shared_expert.down_proj",
+                        targets=(_n("sh2"),),
+                        scale_targets=(_n("sh2_s"),),
+                        scale_source=f"{p}shared_expert.down_proj.weight_scale",
+                        shard_axis=0,
+                        already_sharded=True,
                         already_fp8=True,
                         flipped=True,
                     ),
@@ -350,7 +347,10 @@ def moe_hf_params(
                 hf_shape=(H,),
                 dtype=F32,
                 transform=ParamTransform(
-                    scale_for=_n("sh2"), shard_axis=None, replicate_ranks=True
+                    scale_for=_n("sh2"),
+                    shard_axis=None,
+                    replicate_ranks=True,
+                    small_field="sh2_s",
                 ),
             ),
             *_exp_gu_pair("e_gate_proj", "gate_proj", 0, e13_alias),
@@ -373,7 +373,7 @@ def moe_hf_params(
                         targets=(_n("e2"),),
                         scale_targets=(_n("e2_s"),),
                         scale_source=f"{p}experts.w2_weight_scale",
-                        shard_axis=shard_e2,
+                        shard_axis=1,
                         already_sharded=True,
                         already_fp8=True,
                         flipped=True,

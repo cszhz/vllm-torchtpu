@@ -129,6 +129,7 @@ class ParamTransform:
     channel_splits: tuple[int, ...] | None = None
     flatten_tail: bool = False
     expert_axis: int | None = None
+    small_field: str | None = None
 
     def __post_init__(self) -> None:
         if self.transpose is not None and (
@@ -154,7 +155,6 @@ class VLLMAlias:
     targets: tuple[str, ...]
     scale_targets: tuple[str, ...] = ()
     scale_source: str | None = None
-    router_scale_source: str | None = None
     shard_axis: int | None = None
     already_sharded: bool = True
     already_fp8: bool = True

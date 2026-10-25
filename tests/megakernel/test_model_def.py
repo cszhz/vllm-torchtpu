@@ -266,23 +266,33 @@ class _DenseMLPModule(MoEModule):
 
 
 def test_core_model_def_modules_have_no_qwen_literals_and_fit_line_budget():
-    """Core `ModelDef` modules have no Qwen names, no fmt: skip, and <= 400 lines."""
-    for mod in (
-        module,
-        spec,
-        derive,
-        geometry,
-        schedule,
-        reference,
-        validate,
-        model_def,
-    ):
-        path = Path(mod.__file__)
+    """Core `ModelDef` and `weights/` modules have no Qwen names and <= 400 lines."""
+    from vllm_torchtpu.megakernel import weights as weights_pkg
+
+    weights_dir = Path(weights_pkg.__file__).parent
+    weight_files = sorted(weights_dir.glob("*.py"))
+    assert len(weight_files) >= 4
+    core_files = [
+        Path(mod.__file__)
+        for mod in (
+            module,
+            spec,
+            derive,
+            geometry,
+            schedule,
+            reference,
+            validate,
+            model_def,
+        )
+    ] + weight_files
+    for path in core_files:
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines()
         assert len(lines) <= 400, f"{path.name} has {len(lines)} lines (> 400)"
         assert "fmt: skip" not in text, f"{path.name} contains fmt: skip"
         assert "noqa: E501" not in text, f"{path.name} contains noqa: E501"
+        if path in weight_files:
+            assert "noqa" not in text, f"{path.name} contains noqa"
         low = text.lower()
         assert "qwen" not in low, f"{path.name} must not mention Qwen"
 
@@ -852,11 +862,11 @@ def test_synthetic_model_def_every2_dense_override_cpu_kernel_vs_reference(
         schedule = Schedule(
             mixer=Every(n=2, last=attn, rest=linear),
             ffn=moe,
-            pre_norm=Norm.bind("input_layernorm", zero_centered=True),
-            post_norm=Norm.bind("post_attention_layernorm", zero_centered=True),
+            pre_norm=Norm.bind("attn_norm", zero_centered=True),
+            post_norm=Norm.bind("ffn_norm", zero_centered=True),
         )
         embed = Embedding("model.embed_tokens")
-        final_norm = Norm.bind("model.norm", zero_centered=True)
+        final_norm = Norm.bind("final_ln", zero_centered=True)
         lm_head = LMHead("lm_head", tied_to=None)
 
     assert SynthHybrid.default_profile() is DEFAULT_PROFILE
@@ -907,16 +917,59 @@ def test_synthetic_model_def_every2_dense_override_cpu_kernel_vs_reference(
     play = SynthHybrid.pool_layout(g_tiny, R=ex.R)
     assert play.num_pools == 2 and play.recurrent_slots_per_pool == 1
 
-    # Run CPU kernel vs composed reference on unmodified random weights
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
+    # Load HF weights via generic loaders on SynthHybrid (att_every=2 != 4, custom
+    # norm prefixes attn_norm / ffn_norm / final_ln) and feed them into the CPU
+    # kernel vs composed reference check.
+    hf_raw = qwen35.random_hf_weights(jax.random.PRNGKey(42), g_tiny)
+    hf_synth = {
+        k: v
+        for k, v in hf_raw.items()
+        if k not in ("in_norm", "post_norm", "final_norm")
+    }
+    hf_synth["attn_norm"] = hf_raw["in_norm"]
+    hf_synth["ffn_norm"] = hf_raw["post_norm"]
+    hf_synth["final_ln"] = hf_raw["final_norm"]
+
+    w_l_loaded = mk.load_logical_weights(SynthHybrid, ex, hf_synth, g=g_tiny)
+    assert {"attn_norm", "ffn_norm", "final_ln"} <= set(w_l_loaded)
+    w_mk_packed = mk.pack_logical_weights(SynthHybrid, ex, w_l_loaded, g=g_tiny)
+    for r in range(ex.R):
+        w_rank = mk.load_weights(
+            SynthHybrid,
+            ex,
+            mk.MappingWeightSource(w_l_loaded),
+            g=g_tiny,
+            tp_rank=r,
+        )
+        assert set(w_rank) == set(w_mk_packed) | {"plan", "w_flat"}
+        for k in w_mk_packed:
+            if isinstance(w_mk_packed[k], tuple):
+                for lyr, (got_l, exp_l) in enumerate(
+                    zip(w_rank[k], w_mk_packed[k], strict=True)
+                ):
+                    np.testing.assert_array_equal(
+                        np.asarray(got_l).view(np.uint8),
+                        np.asarray(exp_l[r]).view(np.uint8),
+                        err_msg=f"SynthHybrid rank {r} layer {lyr} mismatch on {k}",
+                    )
+            else:
+                np.testing.assert_array_equal(
+                    np.asarray(w_rank[k]).view(np.uint8),
+                    np.asarray(w_mk_packed[k][r]).view(np.uint8),
+                    err_msg=f"SynthHybrid rank {r} mismatch on {k}",
+                )
+
+    pos, hid_l, _, st_l = qwen35.random_logical_inputs(
         jax.random.PRNGKey(42), g_tiny, ex
     )
-    ref_out, ref_st = SynthHybrid.reference_step(g_tiny, ex, pos, hid_l, w_l, st_l)
+    ref_out, ref_st = SynthHybrid.reference_step(
+        g_tiny, ex, pos, hid_l, w_l_loaded, st_l
+    )
 
     devs = jax.devices("cpu")[: ex.R]
     mesh = jax.sharding.Mesh(np.asarray(devs), ("tp",))
     pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
-        pos, hid_l, w_l, st_l, g_tiny, ex, mesh=mesh
+        pos, hid_l, w_l_loaded, st_l, g_tiny, ex, mesh=mesh
     )
     step_fn, _ = mk.make_step(mesh, ms, ex)
     out_mk, st_out_mk = step_fn(pos_mk, hid_mk, w_mk, st_mk)
@@ -1035,7 +1088,7 @@ def test_synthetic_model_def_every2_dense_override_cpu_kernel_vs_reference(
         lambda: _UnregisteredSynthMissingFinalNorm.derive_geometry(synth_hf_cfg),
         lambda: _UnregisteredSynthMissingFinalNorm.to_model_spec(g_tiny, R=ex.R),
         lambda: _UnregisteredSynthMissingFinalNorm.reference_step(
-            g_tiny, ex, pos, hid_l, w_l, st_l
+            g_tiny, ex, pos, hid_l, {}, st_l
         ),
     ):
         with pytest.raises(

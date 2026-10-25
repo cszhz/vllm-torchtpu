@@ -28,6 +28,7 @@ import pytest
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+import vllm_torchtpu.megakernel as mk
 from vllm_torchtpu.megakernel import (
     POOL_STATE_NAME,
     REQUIRED,
@@ -194,36 +195,80 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
                 covered.update(alias.scale_targets)
         assert covered == canon_names, (sub, canon_names - covered)
 
-    # Check combined_hf_param_shapes on MoE and verify apply_hf_transforms matches
-    # split_hf_weights bitwise for both moe_tp=True and moe_tp=False.
+    # Check combined_hf_param_shapes on MoE and verify load_logical_weights and
+    # load_hf / w_flat match the base golden hashes (4d43f2936) across all 12 combos.
+    import hashlib
+    import json
+    from pathlib import Path
+
     moe_fused = combined_hf_param_shapes(moe_mod_tp.hf_params("mlp"))
     assert set(moe_fused.keys()) == {"sh13", "sh13_s", "e13", "e13_s"}
 
-    ex = ExecSpec(R=2, B=2, T=1, ctx=128)
-    for g_case in (qwen35.TINY, qwen35.TINY_EP):
-        hf_cfg_case = _make_mock_hf_config(g_case)
-        moe_mod_case = MoEModule.bind("mlp", moe_tp=g_case.moe_tp).resolve(hf_cfg_case)
-        rep_decls = (
-            in_norm_mod.hf_params("input_layernorm")
-            + gqa_mod.hf_params("self_attn")
-            + gdn_mod.hf_params("linear_attn")
-            + post_norm_mod.hf_params("post_attention_layernorm")
-            + moe_mod_case.hf_params("mlp")
-            + final_norm_mod.hf_params("model.norm")
-        )
+    golden_path = Path(__file__).parent / "golden" / "b5_weight_hashes.json"
+    golden = json.loads(golden_path.read_text(encoding="utf-8"))
+    assert golden["base_commit"] == "4d43f2936f571c305f516031038d1378e62e6295"
+
+    def _arr_info(a: Any) -> dict[str, Any]:
+        b = np.ascontiguousarray(np.asarray(a)).view(np.uint8).tobytes()
+        return {
+            "shape": list(a.shape),
+            "dtype": str(a.dtype),
+            "sha256": hashlib.sha256(b).hexdigest(),
+        }
+
+    ex_base = ExecSpec(R=2, B=2, T=1, ctx=2048)
+    g_eplb = dataclasses.replace(qwen35.TINY_EP, e_slots=72)
+    e_cores_eplb = mk.default_eplb_cores(g_eplb, ex_base.R)
+    geom_cases = [
+        ("TINY", qwen35.TINY, None, ("default", "candidate30", "candidate30-fused")),
+        ("TINY_EP", qwen35.TINY_EP, None, ("default", "candidate30")),
+        ("TINY_EP_EPLB72", g_eplb, e_cores_eplb, ("default",)),
+    ]
+    checked_packed = 0
+    for g_name, g_case, e_cores, profiles in geom_cases:
         hf = qwen35.random_hf_weights(jax.random.PRNGKey(0), g_case)
-        transformed = apply_hf_transforms(rep_decls, hf, R=ex.R)
-        expected_logical = qwen35.split_hf_weights(hf, g_case, ex)
-        assert set(transformed.keys()) == set(expected_logical.keys())
-        for k, got_arr in transformed.items():
-            exp_arr = expected_logical[k]
-            assert got_arr.shape == exp_arr.shape, (k, got_arr.shape, exp_arr.shape)
-            assert got_arr.dtype == exp_arr.dtype, (k, got_arr.dtype, exp_arr.dtype)
-            np.testing.assert_array_equal(
-                np.asarray(got_arr).view(np.uint8),
-                np.asarray(exp_arr).view(np.uint8),
-                err_msg=f"Bitwise mismatch on {k} (moe_tp={g_case.moe_tp})",
-            )
+        w_l = mk.load_logical_weights(
+            qwen35.Qwen35, ex_base, hf, g=g_case, e_cores=e_cores
+        )
+        got_logical = {
+            k: _arr_info(v) for k, v in sorted(w_l.items()) if k != "e_cores"
+        }
+        assert got_logical == golden["logical"][g_name], f"logical mismatch on {g_name}"
+
+        for prof_name in profiles:
+            prof = qwen35.Qwen35.get_profile(prof_name)
+            for stack_e in (False, True):
+                ex_c = prof.exec_for(
+                    dataclasses.replace(ex_base, stack_e=stack_e),
+                    B=ex_base.B,
+                    T=ex_base.T,
+                    g=g_case,
+                )
+                ex_c = mk.fit_default_tiles(g_case.to_model_spec(), ex_c)
+                w_mk = mk.load_hf(qwen35.Qwen35, ex_c, hf, g=g_case, e_cores=e_cores)
+                p = planner.plan(g_case.to_model_spec(), ex_c)
+                w_flat = [
+                    x
+                    for k in p.w_names
+                    for x in (
+                        w_mk[k] if isinstance(w_mk[k], (tuple, list)) else (w_mk[k],)
+                    )
+                ]
+                got_w_mk = {
+                    k: [_arr_info(x) for x in v]
+                    if isinstance(v, tuple)
+                    else _arr_info(v)
+                    for k, v in sorted(w_mk.items())
+                }
+                got_w_flat = [_arr_info(x) for x in w_flat]
+                combo_key = f"{g_name}/{prof_name}/stack_e={stack_e}"
+                exp_combo = golden["packed"][combo_key]
+                assert got_w_mk == exp_combo["w_mk"], f"w_mk mismatch on {combo_key}"
+                assert got_w_flat == exp_combo["w_flat"], (
+                    f"w_flat mismatch on {combo_key}"
+                )
+                checked_packed += 1
+    assert checked_packed == 12
 
     # Verify apply_hf_transforms rejects wrong shapes and unsupported transform fields.
     q_decl = gqa_by_name["q_proj"]
@@ -424,76 +469,7 @@ def _pack_single_module_step_inputs(
 
     hid_pad = jnp.pad(hidden[:B], ((0, M - B), (0, 0)))
     hid_mk = jnp.tile(hid_pad[None, :, :], (R, 1, 1)).reshape(R * M, g.H)
-
-    def tile_w(arr: jax.Array, kind: str) -> jax.Array:
-        *lead, k_in, n_in = arr.shape
-        nt_, tk_ = p.nt[kind], p.tk[kind]
-        return arr.reshape((*lead, nt_, tk_, n_in))
-
-    lay = p.smalls_layout
-    S = p.smalls_width
-    sm = jnp.zeros((R, L, 1, S), dtype=F32)
-
-    def set_sm(name: str, val: jax.Array) -> None:
-        nonlocal sm
-        if name not in lay:
-            return
-        o, w = lay[name]
-        if val.ndim == 2:
-            val = jnp.broadcast_to(val[None, :, :], (R, L, val.shape[-1]))
-        vw = min(w, val.shape[-1])
-        sm = sm.at[:, :, 0, o : o + vw].set(val[:, :, :vw].astype(F32))
-
-    for sm_key in (
-        "in_norm",
-        "post_norm",
-        "sh_gate",
-        "sh13_s",
-        "sh2_s",
-        "qn",
-        "kn",
-        "conv",
-        "alog",
-        "dtb",
-        "gnorm",
-        "ecopy",
-    ):
-        if sm_key in logical_weights:
-            set_sm(sm_key, logical_weights[sm_key])
-
-    mod_names = {m.name for m in spec.all_modules()}
-    if "gqa" in mod_names:
-        set_sm("in_s", logical_weights["att_in_s"])
-        set_sm("out_s", logical_weights["att_out_s"])
-    if "gdn" in mod_names:
-        set_sm("in_s", logical_weights["lin_in_s"])
-        set_sm("out_s", logical_weights["lin_out_s"])
-
-    fn = jnp.broadcast_to(
-        logical_weights["final_norm"][None, None, :], (R, 1, g.H)
-    ).astype(F32)
-    weights_mk: dict[str, Any] = {}
-    for w_name in p.w_names:
-        if w_name == "smalls":
-            weights_mk["smalls"] = sm
-        elif w_name == "final_norm":
-            weights_mk["final_norm"] = fn
-        elif w_name == "router":
-            rt = jnp.broadcast_to(
-                logical_weights["router"][None, :, :, :], (R, L, g.H, g.E)
-            ).astype(BF16)
-            weights_mk["router"] = tile_w(rt, "router")
-        elif w_name == "es":
-            weights_mk["es"] = jnp.concatenate(
-                [logical_weights["e13_s"], logical_weights["e2_s"]], axis=-1
-            )[:, :, :, None, :].astype(F32)
-        elif w_name in ("e13", "e2") and not ex.stack_e:
-            raw_e = logical_weights[w_name]
-            weights_mk[w_name] = tuple(
-                tile_w(raw_e[:, lyr], w_name) for lyr in range(L)
-            )
-        else:
-            weights_mk[w_name] = tile_w(logical_weights[w_name], w_name)
+    weights_mk = mk.pack_logical_weights(spec, ex, logical_weights, g=g)
 
     states_mk: dict[str, Any] = {}
     for s_name in p.s_names:
@@ -808,4 +784,154 @@ def test_moe_module_reference_matches_kernel_make_step_cpu(moe_tp: bool):
         assert max_diff < 2e-2, (
             f"MoE kernel vs module.reference rank {r} (moe_tp={moe_tp}) "
             f"max_diff={max_diff}"
+        )
+
+
+def test_slice_alias_targets_jax_array_ops_and_loader_validations():
+    """Unit test `slice_alias_targets` (`JaxArrayOps`) and loader validations."""
+    from vllm_torchtpu.megakernel.ops import FP8
+    from vllm_torchtpu.megakernel.weights import (
+        JaxArrayOps,
+        resolve_spec_and_norms,
+        slice_alias_targets,
+    )
+
+    ops = JaxArrayOps()
+    g = qwen35.TINY
+    ex = ExecSpec(R=2, B=2, T=1, ctx=128)
+    moe_decls = {d.name: d for d in MoEModule(geometry=g).hf_params("mlp")}
+    gdn_decls = {d.name: d for d in GDNModule(geometry=g).hf_params("linear_attn")}
+
+    # 1. Fused 3-target alias (_fused_gate_gu_fp8_weight): router dequantized to BF16,
+    #    sh_gate_proj + sh_up_proj sliced per TP rank.
+    fused_alias = moe_decls["router"].vllm_aliases[0]
+    t_decls = [moe_decls[tn] for tn in fused_alias.targets]
+    s_decls = {sn: moe_decls[sn] for sn in fused_alias.scale_targets}
+    total_cols = g.E + 2 * g.IS
+    w_fused = (
+        jax.random.normal(jax.random.PRNGKey(1), (g.H, total_cols), dtype=F32) * 0.25
+    ).astype(FP8)
+    s_fused = jnp.linspace(0.01, 0.05, total_cols, dtype=F32)
+    sliced_r1 = slice_alias_targets(
+        ops, fused_alias, w_fused, s_fused, t_decls, s_decls, R=2, tp_rank=1
+    )
+    exp_router = (w_fused[:, : g.E].astype(F32) * s_fused[: g.E][None, :]).astype(BF16)
+    np.testing.assert_array_equal(
+        np.asarray(sliced_r1["router"]).view(np.uint8),
+        np.asarray(exp_router).view(np.uint8),
+    )
+    isr = g.ISR(2)
+    np.testing.assert_array_equal(
+        np.asarray(sliced_r1["sh_gate_proj"]).view(np.uint8),
+        np.asarray(w_fused[:, g.E + isr : g.E + 2 * isr]).view(np.uint8),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(sliced_r1["sh_gate_proj_s"]),
+        np.asarray(s_fused[g.E + isr : g.E + 2 * isr]),
+    )
+
+    # 2. Fast path vs padded slow path: padded GDN lin_b/lin_a keeps scales
+    ba_alias = gdn_decls["lin_b"].vllm_aliases[0]
+    ba_t = [gdn_decls[tn] for tn in ba_alias.targets]
+    ba_s = {sn: gdn_decls[sn] for sn in ba_alias.scale_targets}
+    vh = g.vh(2)
+    w_ba_bf16 = jax.random.normal(jax.random.PRNGKey(2), (g.H, 2 * vh), dtype=BF16)
+    ba_out = slice_alias_targets(
+        ops,
+        ba_alias,
+        w_ba_bf16,
+        None,
+        ba_t,
+        ba_s,
+        R=2,
+        tp_rank=0,
+        fuse_groups={"lin_in": ("lin_b", "lin_a"), "lin_in_s": ("lin_b_s", "lin_a_s")},
+    )
+    assert "lin_b" in ba_out and "lin_b_s" in ba_out
+    assert "lin_a" in ba_out and "lin_a_s" in ba_out
+    assert ba_out["lin_b"].shape == (g.H, 64)
+    assert ba_out["lin_b_s"].shape == (64,)
+
+    # Even if already_fp8=True on a padded group, fast path is skipped so scales stay
+    ba_fp8_alias = dataclasses.replace(ba_alias, already_fp8=True)
+    w_ba_fp8, s_ba_fp8 = ops.quantize_fp8(w_ba_bf16)
+    ba_fp8_out = slice_alias_targets(
+        ops,
+        ba_fp8_alias,
+        w_ba_fp8,
+        s_ba_fp8,
+        ba_t,
+        ba_s,
+        R=2,
+        tp_rank=0,
+        fuse_groups={"lin_in": ("lin_b", "lin_a"), "lin_in_s": ("lin_b_s", "lin_a_s")},
+    )
+    assert ba_fp8_out["lin_b_s"].shape == (64,)
+    assert ba_fp8_out["lin_a_s"].shape == (64,)
+
+    # 3. Error checks: already_fp8 mismatch, already_sharded width mismatch, scale width
+    with pytest.raises(ValueError, match="declared already_fp8=True"):
+        slice_alias_targets(
+            ops,
+            fused_alias,
+            w_fused.astype(BF16),
+            s_fused,
+            t_decls,
+            s_decls,
+            R=2,
+            tp_rank=0,
+        )
+    with pytest.raises(ValueError, match="already_sharded=False"):
+        slice_alias_targets(
+            ops,
+            fused_alias,
+            w_fused[:, : g.E + isr],
+            s_fused,
+            t_decls,
+            s_decls,
+            R=2,
+            tp_rank=0,
+        )
+    with pytest.raises(ValueError, match="Scale for alias .* has trailing width"):
+        slice_alias_targets(
+            ops,
+            fused_alias,
+            w_fused,
+            s_fused[:-1],
+            t_decls,
+            s_decls,
+            R=2,
+            tp_rank=0,
+        )
+
+    # 4. resolve_spec_and_norms requires a ModelDef subclass
+    with pytest.raises(TypeError, match="Expected a ModelDef subclass"):
+        resolve_spec_and_norms(g.to_model_spec(), ex, g=g)
+
+    # 5. _coerce_canonical_hf_entry transposes hf_shape and rejects invalid shapes
+    hf_valid = qwen35.random_hf_weights(jax.random.PRNGKey(3), g)
+    hf_bad = dict(hf_valid, sh2=jnp.zeros((g.L, g.H * g.IS, 1), dtype=FP8))
+    with pytest.raises(ValueError, match="trailing shape"):
+        mk.load_logical_weights(qwen35.Qwen35, ex, hf_bad, g=g)
+
+    # Transposed 2D hf_shape (L, H, IS) on sh2 (shape=(IS, H), transpose=(1, 0)) works
+    g_rect = dataclasses.replace(g, IS=512)
+    hf_rect = qwen35.random_hf_weights(jax.random.PRNGKey(30), g_rect)
+    sh2_nk = jnp.transpose(hf_rect["sh2"], (0, 2, 1))
+    assert sh2_nk.shape == (g_rect.L, g_rect.H, g_rect.IS)
+    w_l_trans = mk.load_logical_weights(
+        qwen35.Qwen35, ex, dict(hf_rect, sh2=sh2_nk), g=g_rect
+    )
+    w_l_canon = mk.load_logical_weights(qwen35.Qwen35, ex, hf_rect, g=g_rect)
+    np.testing.assert_array_equal(
+        np.asarray(w_l_trans["sh2"]).view(np.uint8),
+        np.asarray(w_l_canon["sh2"]).view(np.uint8),
+    )
+
+    # 6. EPLB branch validates expert dtype/shape
+    g_eplb = dataclasses.replace(qwen35.TINY_EP, e_slots=72)
+    hf_ep = qwen35.random_hf_weights(jax.random.PRNGKey(4), g_eplb)
+    with pytest.raises(ValueError, match="dtype"):
+        mk.load_logical_weights(
+            qwen35.Qwen35, ex, dict(hf_ep, e2=hf_ep["e2"].astype(BF16)), g=g_eplb
         )
