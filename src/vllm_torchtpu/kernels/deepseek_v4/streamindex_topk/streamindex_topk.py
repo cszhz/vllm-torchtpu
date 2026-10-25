@@ -51,7 +51,7 @@ except ImportError:
 MlaCase = config.MlaCase
 KVLayout = config.KVLayout
 DEFAULT_BUFFER_COUNT = config.DEFAULT_BUFFER_COUNT
-DEFAULT_VMEM_LIMIT_BYTES = vmem_budget.dsv4_limit_bytes()
+DEFAULT_VMEM_LIMIT_BYTES = vmem_budget.dsv4_attn_limit_bytes()
 DCP_AXIS_NAME = "dcp"
 
 cp_local_to_global = metadata.cp_local_to_global
