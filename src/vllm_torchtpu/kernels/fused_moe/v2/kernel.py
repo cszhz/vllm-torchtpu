@@ -70,6 +70,10 @@ HEIGHT_RUNGS = 4
 # widened four-bit weight block and each matrix-unit weight load then
 # serves this many tiles' rows; commits and the scale mirror stay per tile.
 PASS_TILES = 2
+# Row blocks the token-gather issue loop handles per iteration. The loop is
+# a serial chain of scalar-memory loads and DMA starts; unrolling it lets the
+# scheduler overlap one row's index load with the previous row's start.
+GATHER_ISSUE_UNROLL = 8
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -1183,7 +1187,18 @@ def _build_fused_ep_moe_kernel(
                         ).start()
                     return _
 
-                lax.fori_loop(0, live_blocks, issue_block, jnp.int32(0))
+                def issue_group(g, carry):
+                    for u in range(GATHER_ISSUE_UNROLL):
+                        issue_block(g * GATHER_ISSUE_UNROLL + u, carry)
+                    return carry
+
+                # Whole groups unrolled, then the remainder block by block;
+                # the rows issue in the same order either way.
+                whole = live_blocks // GATHER_ISSUE_UNROLL
+                lax.fori_loop(0, whole, issue_group, jnp.int32(0))
+                lax.fori_loop(
+                    whole * GATHER_ISSUE_UNROLL, live_blocks, issue_block, jnp.int32(0)
+                )
 
             @pl.when(gather_slot == 0)
             def _():
