@@ -106,3 +106,17 @@ def test_unique_rows_and_original_output_on_every_tp_rank(groups, rows, alignmen
 def test_invalid_replica_groups_are_rejected(groups):
     with pytest.raises(ValueError):
         TokenReplicaLayout.create(ep=4, input_rows=16, groups=groups)
+
+
+@pytest.mark.parametrize("width", [2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 3, 7, 8, 9, 24, 257])
+def test_defer_keeps_the_slice_on_top_of_an_input_shaped_block(width, rows):
+    groups = tuple(tuple(range(g, g + width)) for g in range(0, 8, width))
+    layout = TokenReplicaLayout.create(
+        ep=8, input_rows=rows, groups=groups, row_alignment=8
+    )
+    mine = jnp.arange(layout.local_rows * 4, dtype=jnp.float32).reshape(-1, 4) + 1
+    deferred = layout.defer(mine)
+    assert deferred.shape == (rows, 4)
+    np.testing.assert_array_equal(deferred[: layout.local_rows], mine)
+    assert not np.asarray(deferred[layout.local_rows :]).any()
