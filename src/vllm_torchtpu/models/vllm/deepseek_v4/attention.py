@@ -689,9 +689,19 @@ class VllmDeepseekV4MLAAttention(
                 "indexer_rotary_emb",
                 getattr(self.mla_attn, "rotary_emb", None),
             )
-            topk_indices = self.indexer(
-                hidden_states, qr, indexer_weights, positions, indexer_emb
-            )
+            if envs.TPU_DSV4_CSA_TOPK_FENCE_Q and self.indexer._token_split_active(
+                positions.shape[0]
+            ):
+                # TPU_DSV4_CSA_TOPK_FENCE_Q: fence the local top-k with the
+                # projected q before the top-k all-gather (scheduling only).
+                topk_indices, q = self.indexer(
+                    hidden_states, qr, indexer_weights, positions, indexer_emb,
+                    fence=q,
+                )
+            else:
+                topk_indices = self.indexer(
+                    hidden_states, qr, indexer_weights, positions, indexer_emb
+                )
         if compressor is not None:
             compressor(hidden_states, positions, self.mla_attn.rotary_emb)
 

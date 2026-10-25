@@ -366,6 +366,13 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             )
             object.__setattr__(self, "token_split_above", tok_above)
             object.__setattr__(self, "token_split_op", self._build_token_split_op(tp))
+            if envs.TPU_DSV4_CSA_TOPK_FENCE_Q:
+                # Built here, outside any trace, like the other jax ops.
+                from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (  # noqa: E501
+                    optimization_barrier2_op,
+                )
+
+                optimization_barrier2_op()
 
     def _build_token_split_op(self, tp: int):
         mesh = get_pallas_op_mesh()
@@ -524,7 +531,11 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         positions: torch.Tensor,
         rotary_emb: nn.Module,
         slot_mapping: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        fence: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """fence (TPU_DSV4_CSA_TOPK_FENCE_Q, token-split path only): a tensor
+        this rank's top-k is fenced with before its all-gather; returns
+        (top-k, fence) so the caller uses the fenced copy. Scheduling only."""
         num_tokens = query.shape[0]
         token_split = self._token_split_active(num_tokens)
         if token_split:
@@ -548,9 +559,10 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         # placeholder rather than None, so test emptiness.
         kv_cache = getattr(self.k_cache, "kv_cache", None)
         if kv_cache is None or kv_cache.numel() == 0:
-            return torch.zeros(
+            dummy = torch.zeros(
                 (num_tokens, self.topk_tokens), dtype=torch.int32, device=q.device
             )
+            return dummy if fence is None else (dummy, fence)
 
         # The TPU runner stores its own AttentionMetadata, not the vLLM base class.
         attn_ctx = cast(
@@ -590,7 +602,20 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             )
 
             local = self.token_split_op(q, q_positions, *args[2:], rank)
+            if fence is not None:
+                # The SparseCore top-k's done otherwise sits right behind its
+                # start with the TensorCore idle; joining it with the q
+                # projection (which does not need it) lets the scheduler put
+                # that projection between the two.
+                from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (  # noqa: E501
+                    optimization_barrier2,
+                )
+
+                local, fence = optimization_barrier2(local, fence)
+                return build_sp_ops()["ag"](local).view(num_tokens, -1), fence
             return build_sp_ops()["ag"](local).view(num_tokens, -1)
+        if fence is not None:
+            raise ValueError("fence is only taken on the token-split path")
         if (
             self.kv_split == 1
             or q.shape[0] < self.kv_split_min_tokens

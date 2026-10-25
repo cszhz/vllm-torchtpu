@@ -188,6 +188,7 @@ if TYPE_CHECKING:
     TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
     TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4: int = 0
     TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE: int = 0
+    TPU_DSV4_CSA_TOPK_FENCE_Q: bool = False
     TPU_DSV4_SEQ_PARALLEL: bool = False
     TPU_NUM_GPU_BLOCKS_OVERRIDE: int = 0
     TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: int = 0
@@ -1297,6 +1298,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (token split) completes under the q projection instead of right behind
     # its start. Scheduling only. 0 = off.
     "TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE": env_int("TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE", 0),
+    # Indexer token-split path: fence this rank's SparseCore top-k with the
+    # projected + roped q before the top-k all-gather, so the q projection
+    # runs while the top-k is on the SparseCore instead of after its done.
+    # Scheduling only.
+    "TPU_DSV4_CSA_TOPK_FENCE_Q": env_bool("TPU_DSV4_CSA_TOPK_FENCE_Q"),
     # DeepSeek-V4 sequence parallelism over the TP group: the mHC residual
     # stream, the mHC seams and the MoE (router, fused EP, a replicated shared
     # expert) run on this rank's 1/tp of the tokens. Attention all-gathers its
