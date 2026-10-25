@@ -109,7 +109,6 @@ def _mla_ragged_paged_attention_kernel(
     bq_sz,
     batch_size: int = 1,
     prefetch_early: bool = False,
-    probe: int = 0,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
@@ -193,8 +192,6 @@ def _mla_ragged_paged_attention_kernel(
     def _fetch_bkv(
         batch_start_seq_idx, bkv_idx, bkv_sem_idx, *, wait=False, enabled=True
     ):
-        if probe == 3:  # timing probe: no KV DMA
-            return
         for b in range(batch_size):
             sem = sems.at[0, b, bkv_sem_idx]
             # bkv_x2_ref shape:
@@ -539,21 +536,17 @@ def _mla_ragged_paged_attention_kernel(
                 # because the score of invalid Q.K^T pairs are masked (to be zero) in
                 # flash attention, so that the invalid kv entries
                 # (as long as they are not NaN or inf) won't affect to the output.
-                if probe == 2:  # timing probe: no VMEM->vreg KV load / relayout
-                    bkv = jnp.zeros((batch_size, bkv_sz, head_dim), q_dtype)
-                else:
-                    bkv = load_bkv(bkv_sem_idx, bkv_idx)
+                bkv = load_bkv(bkv_sem_idx, bkv_idx)
 
                 bq = load_bq(bq_sem_idx)
 
-                if probe != 1:  # probe 1: no compute
-                    flash_attention(
-                        bq,
-                        bkv,
-                        bq_idx=bq_idx,
-                        bkv_idx=bkv_idx,
-                        kv_lens_to_attend_segment=kv_lens_to_attend_segment,
-                    )
+                flash_attention(
+                    bq,
+                    bkv,
+                    bq_idx=bq_idx,
+                    bkv_idx=bkv_idx,
+                    kv_lens_to_attend_segment=kv_lens_to_attend_segment,
+                )
 
                 # Prefetch next bkv. Issued after the compute and without a branch, so
                 # the scalar work of the per-page copies is scheduled alongside the
@@ -749,7 +742,6 @@ def prepare_outputs(
         "vmem_limit_bytes",
         "decode_batch_size",
         "prefetch_early",
-        "probe",
     ),
 )
 def mla_ragged_paged_attention(
@@ -775,7 +767,6 @@ def mla_ragged_paged_attention(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_batch_size: int = 8,
     prefetch_early: bool = False,
-    probe: int = 0,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -966,7 +957,6 @@ def mla_ragged_paged_attention(
                     bkv_p=bkv_p,
                     batch_size=batch_size,
                     prefetch_early=prefetch_early,
-                    probe=probe,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
@@ -1054,15 +1044,9 @@ def mla_ragged_paged_attention(
         ),
     )
 
-    def maybe_skip(start_seq_idx, end_seq_idx, run):
-        # Not cond-skipped: an XLA conditional costs more (~5 us, twin
-        # j-00a06dc8) than an empty launch (~1 us).
-        del start_seq_idx, end_seq_idx
-        return run(q)
-
     if chunk_prefill_size is not None:
         # Handle prefill where the query length is fixed per sequence.
-        q = maybe_skip(distribution[0], distribution[1], lambda q: run_mla_kernel(
+        q = run_mla_kernel(
             q,
             cache_kv,
             kv_lens,
@@ -1080,10 +1064,10 @@ def mla_ragged_paged_attention(
             static_q_len=chunk_prefill_size,
             batch_size=1,
             case=MlaCase.PREFILL,
-        ))
+        )
 
     # Handle mixed case where the query length per sequence is variable.
-    q = maybe_skip(distribution[1], distribution[2], lambda q: run_mla_kernel(
+    q = run_mla_kernel(
         q,
         cache_kv,
         kv_lens,
@@ -1101,7 +1085,7 @@ def mla_ragged_paged_attention(
         static_q_len=None,
         batch_size=1,
         case=MlaCase.MIXED,
-    ))
+    )
     output = prepare_outputs(
         q, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]

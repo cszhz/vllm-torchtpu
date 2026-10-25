@@ -1765,22 +1765,19 @@ def mla_sliding_window_ragged_paged_attention(
     # data won't be used downstream at all, so un-initialized buffer is fine.
     in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
 
-    def skip_if_empty(start_seq_idx, end_seq_idx, run, operands):
+    def fixed_pass(run, operands):
         # `single_pass`: every sequence (decode, verify window, prefill chunk)
         # runs in the one mixed-case launch below; the decode and fixed-length
         # passes are not launched. Each launch costs ~1-1.5 us even when its
         # sequence range is empty, which with speculative decoding is every
         # decode step's decode and mixed pass.
-        del start_seq_idx, end_seq_idx
         if single_pass:
             return operands
         return run(*operands)
 
     bkv_sz = num_kv_pages_per_blocks[0] * logical_page_size
     if sliding_window <= bkv_sz:
-        output, updated_kv, out_l, out_m = skip_if_empty(
-            jnp.array(0),
-            distribution[0],
+        output, updated_kv, out_l, out_m = fixed_pass(
             lambda o_in, kv_in, l_in, m_in: run_mla_batched_decode_kernel(
                 q,
                 new_kv,
@@ -1806,9 +1803,7 @@ def mla_sliding_window_ragged_paged_attention(
             (in_output, cache_kv, l, m),
         )
     else:
-        output, updated_kv, out_l, out_m = skip_if_empty(
-            jnp.array(0),
-            distribution[0],
+        output, updated_kv, out_l, out_m = fixed_pass(
             lambda o_in, kv_in, l_in, m_in: run_mla_kernel(
                 q,
                 new_kv,
@@ -1833,9 +1828,7 @@ def mla_sliding_window_ragged_paged_attention(
 
     if chunk_prefill_size is not None:
         # Handle prefill where the query length is fixed per sequence.
-        output, updated_kv, out_l, out_m = skip_if_empty(
-            distribution[0],
-            distribution[1],
+        output, updated_kv, out_l, out_m = fixed_pass(
             lambda o_in, kv_in, l_in, m_in: run_mla_kernel(
                 q,
                 new_kv,
