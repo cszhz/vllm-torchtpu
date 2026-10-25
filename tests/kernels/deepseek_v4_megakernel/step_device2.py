@@ -192,7 +192,8 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
     inplace = var.get("inplace") == "1"
     at = (
         attn_operands(
-            mesh, EP, R, L, nb, owners, a.q, seq, int(var.get("synth_ctx", max_ctx))
+            mesh, EP, R, L, nb, owners, a.q, seq, int(var.get("synth_ctx", max_ctx)),
+            replica_of=(lambda r: r // GS) if var.get("rep") == "group" else None,
         )  # cache arrays sized for this
         if attn_impl == "real"
         else None
@@ -441,9 +442,11 @@ def profile_scopes(run, n_steps=3, devices=("TPU:0", "TPU:3")):
     return res
 
 
-def attn_operands(mesh, EP, R, L, nb, owners, q, seq, max_ctx):
+def attn_operands(mesh, EP, R, L, nb, owners, q, seq, max_ctx, replica_of=None):
     """Per-rank synthetic served caches (attn_phase_synth), stacked on a
-    leading rank axis; built on each process's own devices."""
+    leading rank axis; built on each process's own devices. replica_of(rank):
+    ranks mapped to the same value get identical caches (an attention group's
+    KV replicas, as serving keeps them); default: every rank its own."""
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -455,7 +458,8 @@ def attn_operands(mesh, EP, R, L, nb, owners, q, seq, max_ctx):
     for d in jax.local_devices():
         r = devs.index(d)
         seqs = [int(seq[r, j]) if seq[r, j] > 0 else max_ctx - 72 for j in range(nb)]
-        out = S.synth_rank(jax.random.key(1000 + r), kinds, seqs, max_ctx,
+        rk = r if replica_of is None else replica_of(r)
+        out = S.synth_rank(jax.random.key(1000 + rk), kinds, seqs, max_ctx,
                            served_dtypes=True)  # fmt: skip
         per[d] = jax.tree.map(  # synth builds on the default device: move it
             lambda x, d=d: jax.device_put(x, d) if isinstance(x, jax.Array) else x, out
