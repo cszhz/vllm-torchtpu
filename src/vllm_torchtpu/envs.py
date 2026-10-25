@@ -139,7 +139,7 @@ if TYPE_CHECKING:
     TPU_DSV4_SC_TOPK_COOP_MAX_ROWS: int = 0
     TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS: int = 0
     TPU_DSV4_INDEXER_KV_SPLIT_A2A: bool = False
-    TPU_DSV4_INDEXER_KV_SPLIT_DECODE_BUCKETS: list[int] = []
+    TPU_DSV4_INDEXER_KV_SPLIT_DECODE_TOKENS: list[int] = []
     TPU_DSV4_CSA_GATHER_NO_PAD: bool = False
     TPU_DSV4_CSA_MASKED_DENSE_MAX_KV: int = 0
     TPU_DSV4_CSA_MASKED_DENSE_MIN_TOKENS: int = 512
@@ -1002,14 +1002,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Indexer kv split: send each rank only the shares of its own token block
     # (all-to-all) instead of all-gathering every rank's whole share.
     "TPU_DSV4_INDEXER_KV_SPLIT_A2A": env_bool("TPU_DSV4_INDEXER_KV_SPLIT_A2A"),
-    # Token buckets (':'-separated, e.g. "32:64") in which the DSv4 indexer
-    # splits the compressed positions over the TP ranks with one all-gather of
-    # the shares and every rank merging all rows (decode-sized batches).
-    "TPU_DSV4_INDEXER_KV_SPLIT_DECODE_BUCKETS": lambda: [
+    # Token-bucket range "lo:hi" (inclusive, e.g. "32:64") in which the DSv4
+    # indexer splits the compressed positions over the TP ranks with one
+    # all-gather of the shares and every rank merging all rows (decode-sized
+    # batches). A range, not a set: the bucket size is a symbolic shape under
+    # torch.compile, and only inequalities keep it symbolic.
+    "TPU_DSV4_INDEXER_KV_SPLIT_DECODE_TOKENS": lambda: [
         int(v)
-        for v in os.getenv("TPU_DSV4_INDEXER_KV_SPLIT_DECODE_BUCKETS", "")
-        .replace(",", ":")
-        .split(":")
+        for v in os.getenv("TPU_DSV4_INDEXER_KV_SPLIT_DECODE_TOKENS", "").split(":")
         if v.strip()
     ],
     # DSv4 CSA: size the SparseCore KV gather's per-subcore chunk so its output

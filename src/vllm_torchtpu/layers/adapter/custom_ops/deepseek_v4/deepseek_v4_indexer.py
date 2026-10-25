@@ -369,13 +369,20 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         # top-k candidates (same indices, same order).
         tp = get_tensor_model_parallel_world_size()
         split_min = envs.TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS
-        decode_buckets = frozenset(envs.TPU_DSV4_INDEXER_KV_SPLIT_DECODE_BUCKETS)
-        split_on = split_min > 0 or bool(decode_buckets)
+        decode_range = envs.TPU_DSV4_INDEXER_KV_SPLIT_DECODE_TOKENS
+        if decode_range and len(decode_range) != 2:
+            raise ValueError(
+                "TPU_DSV4_INDEXER_KV_SPLIT_DECODE_TOKENS must be 'lo:hi', got "
+                f"{decode_range}"
+            )
+        split_on = split_min > 0 or bool(decode_range)
         object.__setattr__(self, "kv_split", tp if (split_on and tp > 1) else 1)
         object.__setattr__(
             self, "kv_split_min_tokens", split_min if split_min > 0 else 1 << 30
         )
-        object.__setattr__(self, "kv_split_decode_buckets", decode_buckets)
+        object.__setattr__(
+            self, "kv_split_decode_range", tuple(decode_range) or (1 << 30, 0)
+        )
         if self.kv_split > 1:
             object.__setattr__(
                 self, "indexer_split_ops", self._build_indexer_op(self.kv_split)
@@ -561,7 +568,8 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             idx_q_start_loc,
             idx_req_dist,
         )
-        decode_split = q.shape[0] in self.kv_split_decode_buckets
+        lo, hi = self.kv_split_decode_range
+        decode_split = lo <= q.shape[0] <= hi
         if self.kv_split == 1 or (
             q.shape[0] < self.kv_split_min_tokens and not decode_split
         ):
