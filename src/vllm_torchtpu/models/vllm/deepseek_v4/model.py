@@ -208,7 +208,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
-        seq_parallel_rows: bool = False,
+        seq_parallel_like: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Defer each post into the next pre so the pair is one kernel.
 
@@ -217,9 +217,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         still owes. The chain is opened by the layer-0 attention pre, which
         has no preceding post, and closed by the caller.
 
-        With `seq_parallel_rows`, everything passed and returned holds this
-        core's slot of the rows (see `seq_parallel`); the sublayers gather
-        the rows they need.
+        With `seq_parallel_like` (see `seq_parallel.all_gather`), everything
+        passed and returned holds this core's slot of the rows (see
+        `seq_parallel`); the sublayers gather the rows they need.
         """
         if residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
@@ -240,10 +240,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         x = self._norm(self.attn_norm, x)
-        if seq_parallel_rows:
+        if seq_parallel_like is not None:
             x = self.attn(
                 positions,
-                seq_parallel.all_gather(x, like=positions),
+                seq_parallel.all_gather(x, like=seq_parallel_like),
                 seq_parallel_rows=True,
             )
         else:
@@ -260,9 +260,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             *self._norm_arg(self.ffn_norm),
         )
         x = self._norm(self.ffn_norm, x)
-        x = self.ffn(
-            x, input_ids, seq_parallel_like=positions if seq_parallel_rows else None
-        )
+        x = self.ffn(x, input_ids, seq_parallel_like=seq_parallel_like)
         return x, residual, post_mix, res_mix
 
 
@@ -588,7 +586,11 @@ class DeepseekV4Model(nn.Module):
         sp = get_pp_group().world_size == 1 and seq_parallel.active(
             hidden_states.shape[0]
         )
+        # What the gathers size their rows from: a forward input, so that
+        # the trace lifts no graph input earlier than the other buckets' do.
+        sp_like = None
         if sp:
+            sp_like = input_ids if input_ids is not None else inputs_embeds
             hidden_states = seq_parallel.take_local(hidden_states)
 
         residual, post_mix, res_mix = None, None, None
@@ -605,7 +607,7 @@ class DeepseekV4Model(nn.Module):
                 post_mix,
                 res_mix,
                 residual,
-                seq_parallel_rows=sp,
+                seq_parallel_like=sp_like,
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the full hc-stream state and collapse it the
@@ -613,7 +615,7 @@ class DeepseekV4Model(nn.Module):
                 # then mean over the hc streams (upstream numerics).
                 aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
                 if sp:
-                    aux_recon = seq_parallel.all_gather(aux_recon, like=positions)
+                    aux_recon = seq_parallel.all_gather(aux_recon, like=sp_like)
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
 
@@ -632,9 +634,7 @@ class DeepseekV4Model(nn.Module):
                     # The head runs on every row, as without sequence
                     # parallelism: its torch ops would otherwise allocate by
                     # the per-core row count, which torch_tpu refuses.
-                    hidden_states = seq_parallel.all_gather(
-                        hidden_states, like=positions
-                    )
+                    hidden_states = seq_parallel.all_gather(hidden_states, like=sp_like)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})

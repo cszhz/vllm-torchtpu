@@ -188,20 +188,22 @@ class DeepseekV4MoE(nn.Module):
         runner = self.experts
         assert self.shared_experts is not None
         rows = seq_parallel.all_gather(local_rows, like)
-        # The runner's order (gate, shared expert, routed op), which is also
-        # the order the trace first reads their weights in.
+        # The runner's order (gate, DP-size context, shared expert, routed
+        # op), which is also the order the trace first reads their inputs in:
+        # shape_variants needs it to match the other buckets' traces.
         router_logits, _ = runner.gate(rows)
-        shared = self.shared_experts(rows)
-        routed_layer = runner.routed_experts
-        routed = routed_layer.quant_method._forward_monolithic_tpu(
-            routed_layer,
-            rows,
-            router_logits,
-            input_ids,
-            # As VllmMoERunner._apply_quant_method hands it over.
-            order_after=shared if envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL else None,
-            local_rows=True,
-        )
+        with runner._sequence_parallel_context():
+            shared = self.shared_experts(rows)
+            routed_layer = runner.routed_experts
+            routed = routed_layer.quant_method._forward_monolithic_tpu(
+                routed_layer,
+                rows,
+                router_logits,
+                input_ids,
+                # As VllmMoERunner._apply_quant_method hands it over.
+                order_after=shared if envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL else None,
+                local_rows=True,
+            )
         shared = seq_parallel.reduce_scatter(shared)
         if runner.routed_scaling_factor != 1.0:
             routed = routed * runner.routed_scaling_factor
