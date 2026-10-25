@@ -22,8 +22,12 @@ core otherwise repeats the seams' per-token work on all rows.
 The ops run over the expert-parallel mesh with the TP groups as
 ``axis_index_groups``, as ``small_all_reduce_op`` does: torch_tpu wants every
 JAX op of a module on the one mesh, and a TP group is smaller than it under
-DP x TP. This core's slot is passed as data, so every rank traces the same
-graph.
+DP x TP. ``take_local`` reads this core's slot from the small TP all-reduce's
+rank tensor rather than a tensor of its own: every rank then traces the same
+graph, and the token-sharded traces take the same graph inputs, in the same
+order, as the other buckets' traces -- the embedding's all-reduce lifts that
+tensor first in both -- which ``compilation.shape_variants`` requires to hand
+buckets between traces.
 """
 
 import jax
@@ -39,6 +43,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_mesh_index,
     ep_token_replica_groups,
 )
+from vllm_torchtpu.layers.adapter import fused_moe_ep, small_all_reduce_op
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -46,8 +51,6 @@ logger = init_logger(__name__)
 _AG = None
 _RS = None
 _TAKE = None
-# This core's slot in its TP group, int32 [1] on device.
-_SLOT: torch.Tensor | None = None
 _CORES = 0
 
 
@@ -113,7 +116,7 @@ def _build_ops(mesh, groups: tuple[tuple[int, ...], ...]):
 def prebuild() -> None:
     """Build the ops and this core's slot outside any traced region (the
     groups come from a collective). A no-op unless the flag is set."""
-    global _AG, _RS, _TAKE, _SLOT, _CORES
+    global _AG, _RS, _TAKE, _CORES
     if envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS == 0 or _AG is not None:
         return
     mesh = build_ep_mesh()
@@ -125,8 +128,17 @@ def prebuild() -> None:
     groups = ep_token_replica_groups()
     me = ep_mesh_index()
     (group,) = [g for g in groups if me in g]
+    if fused_moe_ep._RANK_BUFFER is None:
+        raise NotImplementedError(
+            "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS needs the fused EP MoE armed: it "
+            "returns the MoE's rows token-sharded"
+        )
+    if small_all_reduce_op._RANK is None or len(group) != small_all_reduce_op._CORES:
+        raise NotImplementedError(
+            "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS takes this core's TP slot from "
+            "TPU_SMALL_ALL_REDUCE's rank tensor; set TPU_SMALL_ALL_REDUCE=1"
+        )
     _CORES = len(group)
-    _SLOT = torch.tensor([group.index(me)], dtype=torch.int32, device="tpu")
     _AG, _RS, _TAKE = _build_ops(mesh, groups)
     logger.info(
         "DSv4 sequence parallelism armed | min_tokens=%d | cores=%d | groups=%s",
@@ -157,7 +169,7 @@ def cores() -> int:
 def take_local(x: torch.Tensor) -> torch.Tensor:
     """This core's rows of a TP-replicated ``x``."""
     assert _TAKE is not None
-    return _TAKE(x, _SLOT)
+    return _TAKE(x, small_all_reduce_op._RANK)
 
 
 def all_gather(x: torch.Tensor) -> torch.Tensor:
