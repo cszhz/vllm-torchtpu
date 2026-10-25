@@ -90,6 +90,8 @@ cleanup() {
             tail -200 "$out/proxy.log" >&2 || true
         fi
         echo "========== $role server exceptions ==========" >&2
+        grep -E 'Raiden pool admission complete|Raiden pool geometry|Remote DSpark Target KV admission' \
+            "$server_out/server.log" >&2 || true
         grep -n -B 8 -A 40 -E 'Traceback|ERROR|RuntimeError|ValueError|KeyError|Exception' \
             "$server_out/server.log" >&2 || true
         echo "========== Last 200 lines of $role server.log ==========" >&2
