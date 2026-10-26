@@ -39,7 +39,11 @@ logger = init_logger(__name__)
 _cache: dict[str, Any] = {}
 
 
-def _body(groups, cap, axis, consts, kernel_kw):
+def _body(groups, cap, axis, consts, kernel_kw, reduced_above_cap=False, fn_mode="vmem"):
+    """reduced_above_cap (the MoE side): above ``cap`` rows the operand is
+    already the reduced sum (the fused EP op hands over a partial only up to
+    the same cap), so only the seam runs. fn_mode: ``ar_seam``'s fn
+    placement ("pin": entry DMA from HBM under the all-reduce)."""
     cores = len(groups[0])
     index_groups = [list(g) for g in groups]
     form, chunks, skip = all_reduce.group_form(groups)
@@ -47,7 +51,9 @@ def _body(groups, cap, axis, consts, kernel_kw):
 
     def body(x_p, residual, post, comb, fn_cat, hc_scale, hc_base, norm_w, rank, peers):
         if x_p.shape[0] > cap:
-            x = lax.psum(x_p, axis, axis_index_groups=index_groups)
+            x = x_p if reduced_above_cap else lax.psum(
+                x_p, axis, axis_index_groups=index_groups
+            )
             return fused_post_pre_kernel.mhc_fused_post_pre(
                 x, residual, post, comb, utils.CatFn(fn_cat), hc_scale, hc_base,
                 rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
@@ -59,6 +65,7 @@ def _body(groups, cap, axis, consts, kernel_kw):
             norm_weight=norm_w, norm_eps=rms_eps, num_cores=cores, axis=axis, rank=rank,
             peers=peers, form=form, chunks=chunks, fn_chunks=kernel_kw["fn_chunks"],
             small_block=kernel_kw["small_block"], skip_device_barrier=skip,
+            fn_mode=fn_mode,
         )
 
     return body
@@ -75,7 +82,7 @@ def _fake(x_p, residual, *args):
     )
 
 
-def get_ar_seam_op(consts, kernel_kw):
+def get_ar_seam_op(consts, kernel_kw, *, moe_fn_mode=None):
     """The op, or None when the small all-reduce is not armed. ``consts`` =
     (rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
     sinkhorn_repeat); ``kernel_kw`` = the unfused seam's options
@@ -97,6 +104,9 @@ def get_ar_seam_op(consts, kernel_kw):
         f"{v:.6g}".replace(".", "p").replace("-", "m") for v in consts
     ) + "_" + "_".join(f"{k}{v}" for k, v in sorted(kernel_kw.items()))
     name = name.replace("+", "")
+    if moe_fn_mode is not None:
+        # MoE side (TPU_DSV4_MHC_MOE_AR_SEAM): the fused EP op's partial.
+        name += f"_moe_f{moe_fn_mode}"
     op = _cache.get(name)
     if op is not None:
         return op
@@ -104,7 +114,10 @@ def get_ar_seam_op(consts, kernel_kw):
     groups = ep_token_replica_groups()
     cap = sar.max_rows()
     spec = PartitionSpec(EP_AXIS_NAME)
-    body = _body(groups, cap, EP_AXIS_NAME, consts, kernel_kw)
+    body = _body(
+        groups, cap, EP_AXIS_NAME, consts, kernel_kw,
+        reduced_above_cap=moe_fn_mode is not None, fn_mode=moe_fn_mode or "vmem",
+    )
 
     def fn(
         x_p: jax.Array,
@@ -132,8 +145,8 @@ def get_ar_seam_op(consts, kernel_kw):
     op.register_fake(_fake)
     _cache[name] = op
     logger.info(
-        "mHC AR+seam armed | groups=%s | cap=%d | form=%s | %s",
-        groups, cap, all_reduce.group_form(groups), kernel_kw,
+        "mHC AR+seam armed | groups=%s | cap=%d | form=%s | %s | moe_fn_mode=%s",
+        groups, cap, all_reduce.group_form(groups), kernel_kw, moe_fn_mode,
     )
     return op
 

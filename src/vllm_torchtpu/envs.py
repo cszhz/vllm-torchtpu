@@ -220,6 +220,8 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_MHC_FN_CHUNKS: int = 3
     VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS: int = 0
     VLLM_TPU_DSV4_MHC_SEAM_FN_HBM: str = ""
+    TPU_DSV4_MHC_AR_SEAM: bool = False
+    TPU_DSV4_MHC_MOE_AR_SEAM: int = 0
     VLLM_TPU_DSV4_MHC_POST_HEAD: bool = True
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
@@ -1493,6 +1495,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DSV4_MHC_SEAM_FN_HBM": lambda: os.getenv(
         "VLLM_TPU_DSV4_MHC_SEAM_FN_HBM", ""
     ),
+    # DeepSeek-V4 mHC: attention side -- wo_b's TP all-reduce and the ffn seam
+    # as one Pallas call (mhc/ar_seam_kernel.py). Bit-identical; measured
+    # parity with the low-VMEM unfused pair, so off.
+    "TPU_DSV4_MHC_AR_SEAM": env_bool("TPU_DSV4_MHC_AR_SEAM"),
+    # DeepSeek-V4 mHC: MoE side -- the fused EP op returns its pre-all-reduce
+    # partial (fold path) and the next layer's attention seam sums it in the
+    # same Pallas call as the seam, with hc_attn_fn DMA'd from HBM under the
+    # all-reduce's ICI rounds (behind the fused MoE, XLA's fn prefetch is
+    # exposed). 1 = fn by entry DMA (HBM-pinned), 2 = fn as an XLA-placed VMEM
+    # block (removal arm for the fn overlap). 0 = off. Bit-identical.
+    "TPU_DSV4_MHC_MOE_AR_SEAM": env_int("TPU_DSV4_MHC_MOE_AR_SEAM", 0),
     # DeepSeek-V4 mHC: fuse the posts that only feed the hc head collapse or
     # DSpark's aux stream mean into one kernel each, so the (T, 4, H) streams
     # are never written (one to three posts per forward).

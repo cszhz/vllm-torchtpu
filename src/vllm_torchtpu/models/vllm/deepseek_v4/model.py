@@ -67,7 +67,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op impo
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
-from vllm_torchtpu.layers.adapter.fused_moe_ep import SP_GATE
+from vllm_torchtpu.layers.adapter.fused_moe_ep import MOE_DEFER_GATE, SP_GATE
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import (
     DeepseekV4MoE,
     dsv4_sequence_parallel,
@@ -205,6 +205,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             }
             object.__setattr__(self, "_seam_ops", seam_ops)
             self._arm_ar_seam()
+            self._arm_moe_ar_seam()
             if self.seq_parallel:
                 # Built outside the trace alongside the mHC ops.
                 from vllm_torchtpu.models.vllm.deepseek_v4.seq_parallel import (
@@ -231,6 +232,61 @@ class DeepseekV4DecoderLayer(nn.Module):
         """The fused seam op for the seam that gates ``fn_name``'s sublayer."""
         ops = self.mhc_ops
         return self.__dict__.get("_seam_ops", {}).get(fn_name, ops.fused)
+
+    def _arm_moe_ar_seam(self) -> None:
+        """TPU_DSV4_MHC_MOE_AR_SEAM: build the op that sums the previous
+        layer's fused-EP partial (its in-op shared all-reduce, deferred) and
+        runs this layer's attention seam on the sum, in one Pallas call with
+        hc_attn_fn DMA'd under the all-reduce. The model asks the previous
+        layer's MoE for its partial only when this op exists."""
+        object.__setattr__(self, "_moe_ar_seam_op", None)
+        mode = envs.TPU_DSV4_MHC_MOE_AR_SEAM
+        opts = self.mhc_opts
+        if not (
+            mode in (1, 2)
+            and opts.gates_in_kernel
+            and opts.fuse_norm
+            and opts.stacked_fn
+            and get_tp_group().world_size > 1
+        ):
+            return
+        from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+            deepseek_v4_mhc_ar_seam_op as ar_seam,
+        )
+
+        op = ar_seam.get_ar_seam_op(
+            self._ar_seam_consts(),
+            self._ar_seam_kernel_kw(),
+            moe_fn_mode="pin" if mode == 1 else "vmem",
+        )
+        if op is None or tuple(ar_seam.tp_ranks()) != tuple(
+            get_tp_group().ranks
+        ):
+            return
+        object.__setattr__(self, "_moe_ar_seam_op", op)
+
+    def _ar_seam_consts(self) -> tuple:
+        return (
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+        )
+
+    def _ar_seam_kernel_kw(self) -> dict:
+        opts = self.mhc_opts
+        kernel_kw = dict(
+            gates_in_kernel=True,
+            small_block=envs.VLLM_TPU_DSV4_MHC_SMALL_BLOCK,
+            fn_chunks=envs.VLLM_TPU_DSV4_MHC_FN_CHUNKS,
+        )
+        if opts.gates_max_tokens >= 0:
+            kernel_kw["gates_max_tokens"] = opts.gates_max_tokens
+        if opts.token_block:
+            kernel_kw["token_block_size"] = opts.token_block
+        return kernel_kw
+
     def _arm_ar_seam(self) -> None:
         """TPU_DSV4_MHC_AR_SEAM: build the fused attention-AR + ffn-seam op
         (outside the trace, with the mHC ops) and hand wo_b's all-reduce to
@@ -371,8 +427,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
+        x_partial: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Defer each post into the next pre so the pair is one kernel.
+
+        x_partial (TPU_DSV4_MHC_MOE_AR_SEAM): `x` is the previous MoE's
+        partial over the TP group (see the model loop); this layer's seam op
+        sums it.
 
         `x` arrives as the previous sublayer's raw output and the caller
         carries `(residual, post_mix, res_mix)` -- the recombine that output
@@ -384,6 +445,24 @@ class DeepseekV4DecoderLayer(nn.Module):
             residual = x
             x, post_mix, res_mix = self.hc_pre(
                 x, self._fn3("hc_attn_fn"), self.hc_attn_scale, self.hc_attn_base
+            )
+        elif x_partial:
+            from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+                deepseek_v4_mhc_ar_seam_op as ar_seam,
+            )
+
+            rank, peers = ar_seam.rank_peers()
+            residual, post_mix, res_mix, x = self.__dict__["_moe_ar_seam_op"](
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                *self._fn3("hc_attn_fn"),
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                *self._norm_arg(self.attn_norm),
+                rank,
+                peers,
             )
         else:
             residual, post_mix, res_mix, x = self._seam("hc_attn_fn")(
@@ -734,10 +813,25 @@ class DeepseekV4Model(nn.Module):
         )
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None
+        # TPU_DSV4_MHC_MOE_AR_SEAM: a layer's MoE hands its pre-all-reduce
+        # partial to the next layer's attention seam, which sums it. Only on
+        # the replicated layout, never into a chain end (the last layer, an
+        # aux hidden state), and only where the next layer armed the op.
+        moe_seam = bool(envs.TPU_DSV4_MHC_MOE_AR_SEAM) and not seq_parallel
+        x_partial = False
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
+            nxt = idx + 1
+            defer = (
+                moe_seam
+                and nxt < self.end_layer
+                and nxt not in self.aux_hidden_state_layers
+                and self.layers[nxt].__dict__.get("_moe_ar_seam_op") is not None
+            )
+            MOE_DEFER_GATE["want"] = defer
+            MOE_DEFER_GATE["done"] = False
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -745,7 +839,11 @@ class DeepseekV4Model(nn.Module):
                 post_mix,
                 res_mix,
                 residual,
+                x_partial=x_partial,
             )
+            x_partial = defer and MOE_DEFER_GATE["done"]
+            MOE_DEFER_GATE["want"] = False
+            MOE_DEFER_GATE["done"] = False
             if idx + 1 in self.aux_hidden_state_layers:
                 if fuse_tail and idx + 1 == self.end_layer:
                     continue  # the fused tail below emits this aux mean

@@ -452,6 +452,7 @@ def fused_ep_moe_v2(
     shared_rs_min_rows=0,
     shared_small_ar_max_rows=0,
     shared_fold_restore=False,
+    shared_defer_ar=0,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -840,6 +841,8 @@ def fused_ep_moe_v2(
     # routed rows, so one reduce-scatter replaces the shared all-reduce; below,
     # it is all-reduced and added after the restore, which is what the runner
     # computes with this off.
+    if shared_defer_ar and not shared_in_op:
+        raise ValueError("shared_defer_ar hands over the in-op shared partial")
     if shared_in_op and not has_order_after:
         raise ValueError("shared_in_op needs the shared partial as order_after")
     kfn = build_fused_ep_moe_kernel(
@@ -1294,6 +1297,26 @@ def fused_ep_moe_v2(
             def restore(rows):
                 return token_layout.restore(rows, ax)
         width = len(token_layout.groups[0])
+        # shared_defer_ar (TPU_DSV4_MHC_MOE_AR_SEAM): up to this many rows the
+        # op returns a PARTIAL whose sum over the replica group is the layer
+        # output, and the next layer's mHC seam op sums it (in its own Pallas
+        # call, mhc/ar_seam_kernel.py). The fold path hands over its
+        # pre-all-reduce block untouched -- the same bits the small
+        # all-reduce here would have summed; every other path reduces here
+        # and hands over (output on the group's slot 0, zeros elsewhere),
+        # whose sum is the output exactly.
+        defer = (
+            shared_defer_ar > 0
+            and width > 1
+            and token_layout.input_rows <= shared_defer_ar
+        )
+
+        def handover(out):
+            if not defer:
+                return out
+            slot = jnp.asarray(token_layout.slots, jnp.int32)[me]
+            return jnp.where(slot == 0, out, jnp.zeros_like(out))
+
         groups = [list(g) for g in token_layout.groups]
         scale = jnp.asarray(shared_out_scale, combined.dtype)
         if shared_out_scale != 1.0:
@@ -1311,7 +1334,7 @@ def fused_ep_moe_v2(
                 axis_index_groups=groups,
                 tiled=True,
             )
-            return restore(shared_own + combined)
+            return handover(restore(shared_own + combined))
         padded_rows = token_layout.local_rows * width
         if (
             fold
@@ -1335,6 +1358,8 @@ def fused_ep_moe_v2(
             shared_p = lax.dynamic_update_slice_in_dim(
                 shared_p, own + combined, pos * token_layout.local_rows, 0
             )
+            if defer and padded_rows == token_layout.input_rows:
+                return shared_p
             out = small_all_reduce(
                 shared_p,
                 num_cores=width,
@@ -1345,7 +1370,7 @@ def fused_ep_moe_v2(
                 chunks=small_ar_form[1],
                 skip_device_barrier=small_ar_form[2],
             )
-            return out[: token_layout.input_rows]
+            return handover(out[: token_layout.input_rows])
         full = restore(combined)
         if width > 1 and token_layout.input_rows <= shared_small_ar_max_rows and (
             small_all_reduce_supports(token_layout.input_rows, hidden, width)
@@ -1371,7 +1396,7 @@ def fused_ep_moe_v2(
             )
         elif width > 1:
             shared_l = lax.psum(shared_l, ax, axis_index_groups=groups)
-        return shared_l + full
+        return handover(shared_l + full)
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
@@ -1986,6 +2011,7 @@ def fused_ep_moe_v2(
         int(shared_rs_min_rows),
         int(shared_small_ar_max_rows),
         int(shared_fold_restore),
+        int(shared_defer_ar),
         small_ar_form,
     )
     body, out_specs = {

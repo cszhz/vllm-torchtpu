@@ -97,6 +97,9 @@ CASES = [
     ((tuple(range(8)),), 16, None, 1, 3, 16),  # c8
     ((tuple(range(8)),), 32, None, 1, 3, 16),
     ((tuple(range(8)),), 1, None, 1, 2, 8),  # one-shot
+    ((tuple(range(8)),), 24, None, 1, 2, 8),  # c4 extra bucket 24 (TPU_TOKEN_BUCKET_EXTRA)
+    ((tuple(range(8)),), 16, None, 1, 2, 8),  # c4 T16
+    (((0, 1, 2, 3), (4, 5, 6, 7)), 8, "pairs", 2, 3, 16),  # c16 T8
     (((6, 0, 2, 4, 3, 5, 7, 1),), 16, None, 1, 3, 16),  # permuted peer table
     (((0, 1, 2, 3), (4, 5, 6, 7)), 16, "pairs", 2, 3, 16),  # c16: pairs TP4 x2
     (((0, 1, 2, 3), (4, 5, 6, 7)), 32, "pairs", 2, 3, 16),

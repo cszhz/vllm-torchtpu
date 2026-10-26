@@ -737,9 +737,18 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         )
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import FUSED_MOE_EP_NOSP_OP_ATTR
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            FUSED_MOE_EP_DEFER_OP_ATTR,
+            FUSED_MOE_EP_NOSP_DEFER_OP_ATTR,
+            FUSED_MOE_EP_NOSP_OP_ATTR,
+            defer_op_for,
+        )
 
         setattr(self, FUSED_MOE_EP_NOSP_OP_ATTR, op_nosp)
+        # TPU_DSV4_MHC_MOE_AR_SEAM: the partial-returning companions (None
+        # unless armed).
+        setattr(self, FUSED_MOE_EP_DEFER_OP_ATTR, defer_op_for(op))
+        setattr(self, FUSED_MOE_EP_NOSP_DEFER_OP_ATTR, defer_op_for(op_nosp))
         expert_placement.check_layer_served(layer, fused_armed=op is not None)
         if op is not None:
             reason = fused_moe_ep_unsupported_reason(

@@ -125,6 +125,21 @@ FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
 # each bucket's trace sees the value its own shape branch set.
 FUSED_MOE_EP_NOSP_OP_ATTR = "_fused_moe_ep_op_nosp"
 SP_GATE = {"replicated": False}
+# TPU_DSV4_MHC_MOE_AR_SEAM: the companion op (same layer, same program) that
+# returns its pre-all-reduce partial at decode buckets for the next layer's
+# mHC seam to sum (``shared_defer_ar``), per op and per SP variant, and the
+# trace-time handshake: the model sets "want" around a layer's MoE call, and
+# fused_moe_ep sets "done" when the companion took the call.
+FUSED_MOE_EP_DEFER_OP_ATTR = "_fused_moe_ep_op_defer"
+FUSED_MOE_EP_NOSP_DEFER_OP_ATTR = "_fused_moe_ep_op_nosp_defer"
+MOE_DEFER_GATE = {"want": False, "done": False}
+_DEFER_OPS: dict[int, Any] = {}
+
+
+def defer_op_for(op) -> Any:
+    """The partial-returning companion of ``op`` (built by ``_build_op``
+    under TPU_DSV4_MHC_MOE_AR_SEAM), or None."""
+    return None if op is None else _DEFER_OPS.get(id(op))
 # Set on a layer whose op returns shared + routed (MOE_FUSED_EP_SHARED_IN_OP).
 SHARED_IN_OP_ATTR = "_tpu_fused_ep_shared_in_op"
 # The runner's routed_scaling_factor, stashed on the routed-experts layer.
@@ -209,6 +224,7 @@ def _build_op(
     shared_rs_min_rows=0,
     shared_small_ar_max_rows=0,
     shared_fold_restore=False,
+    shared_defer_ar=0,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -217,6 +233,7 @@ def _build_op(
     """
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
+    build_args = dict(locals())
     key = (
         topk,
         renormalize,
@@ -248,6 +265,7 @@ def _build_op(
         shared_rs_min_rows,
         shared_small_ar_max_rows,
         shared_fold_restore,
+        shared_defer_ar,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -278,6 +296,7 @@ def _build_op(
             shared_rs_min_rows=shared_rs_min_rows,
             shared_small_ar_max_rows=shared_small_ar_max_rows,
             shared_fold_restore=shared_fold_restore,
+            shared_defer_ar=shared_defer_ar,
         )
         if shared_in_op
         else {}
@@ -441,6 +460,26 @@ def _build_op(
             sorted_gather,
         )
     _OPS[key] = op
+    if (
+        not shared_defer_ar
+        and envs.TPU_DSV4_MHC_MOE_AR_SEAM
+        and shared_in_op
+        and shared_fold_restore
+        and sorted_gather is None
+        and shared_small_ar_max_rows > 0
+        and _replica_width(token_replica_groups) > 1
+    ):
+        # Same rows cap as the in-op small all-reduce, which is also the cap
+        # the seam op (deepseek_v4_mhc_ar_seam_op) sums below.
+        build_args.pop("fused_ep_moe_v2", None)
+        build_args.pop("WeightFormat", None)
+        build_args["shared_defer_ar"] = shared_small_ar_max_rows
+        _DEFER_OPS[id(op)] = _build_op(**build_args)
+        logger.info_once(
+            "Fused EP MoE: decode partial handed to the next mHC seam "
+            "(TPU_DSV4_MHC_MOE_AR_SEAM) up to %d rows",
+            shared_small_ar_max_rows,
+        )
     return op
 
 
@@ -703,8 +742,15 @@ def fused_moe_ep(
     answer.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
+    defer = getattr(owner, FUSED_MOE_EP_DEFER_OP_ATTR, None)
     if SP_GATE["replicated"]:
-        op = getattr(owner, FUSED_MOE_EP_NOSP_OP_ATTR, None) or op
+        nosp = getattr(owner, FUSED_MOE_EP_NOSP_OP_ATTR, None)
+        if nosp is not None:
+            op = nosp
+            defer = getattr(owner, FUSED_MOE_EP_NOSP_DEFER_OP_ATTR, None)
+    if MOE_DEFER_GATE["want"] and defer is not None:
+        op = defer
+        MOE_DEFER_GATE["done"] = True
     if w1.dtype == torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N]. Even a single block must
         # retain its axis; the per-channel helper would incorrectly drop it.
