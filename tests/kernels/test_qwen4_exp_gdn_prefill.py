@@ -28,7 +28,7 @@ def test_qwen_prefill_then_decode_preserves_bf16_ssm_and_fp32_conv(tokens, monke
     from vllm_torchtpu.kernels.gdn.v3 import wrapper
     from vllm_torchtpu.layers.core import gdn_attention
 
-    monkeypatch.setattr(envs, "TPU_GDN_CONV_QK_PAIR_LAYOUT", False)
+    monkeypatch.setitem(vars(envs), "TPU_GDN_CONV_QK_PAIR_LAYOUT", False)
     n_kq, n_v, dim, width, page = 16, 48, 128, 10240, 1664
     rng = np.random.default_rng(20261008)
 
