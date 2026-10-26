@@ -2139,6 +2139,11 @@ def streamindex_topk(
         # XLA would common the identical per-chunk fills into one buffer then clone
         # it back out (~370us on 1GB of scores). `row_lengths` bounds the reads.
         scores = None
+        if chunk_token_start is not None:
+            # Pipelined pieces: the mixed pass goes first so that a piece holding
+            # no verify-window rows can skip the uniform pass (below) - every
+            # piece would otherwise launch it, empty, for its page-table copy.
+            passes = tuple(sorted(passes, key=lambda sp: sp[0]["case"] != MlaCase.MIXED))
         for spec, pass_meta in passes:
 
             def run(scores_init, spec=spec, pass_meta=pass_meta):
@@ -2159,7 +2164,18 @@ def streamindex_topk(
                     **spec,
                 )
 
-            if scores is not None and spec["case"] == MlaCase.DECODE:
+            if (
+                scores is not None
+                and chunk_token_start is not None
+                and spec["case"] == MlaCase.PREFILL
+            ):
+                scores = jax.lax.cond(
+                    pass_meta.num_steps[chunk_idx] > 0,
+                    run,
+                    lambda scores_init: scores_init,
+                    scores,
+                )
+            elif scores is not None and spec["case"] == MlaCase.DECODE:
                 # An empty pass still pays its launch and the page-table copy
                 # into SMEM; skipping it leaves the buffer as the pass would.
                 scores = jax.lax.cond(
