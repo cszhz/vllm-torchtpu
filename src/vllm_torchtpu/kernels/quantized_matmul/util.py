@@ -13,14 +13,30 @@
 # limitations under the License.
 """Utility functions for quantized matmul kernel."""
 
+import functools
 from collections.abc import Callable
 from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax._src import dtypes
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import TunedValue
+
+# Per-row activation quantization takes the one-pass Pallas kernel from this
+# many tokens up (prefill); shorter batches keep XLA's reduce + convert pair.
+ROW_QUANT_MIN_TOKENS = 512
+# bf16 input bytes per grid step of the one-pass kernel, and the fewest grid
+# steps it may take, so the input DMA of one tile hides behind another.
+ROW_QUANT_TILE_BYTES = 2 * 1024 * 1024
+ROW_QUANT_MIN_STEPS = 4
+# Rows reduced and quantized together: one fp8 (32, 128) tile high.
+ROW_QUANT_ROW_GROUP = 32
+# Columns per amax/quantize step inside a row group.
+ROW_QUANT_COL_CHUNK = 512
 
 
 def unfold_args(
@@ -60,8 +76,116 @@ def quantize_tensor(
         x_q = x_q.reshape(orig_shape)
 
         return x_q, scale.transpose(1, 2, 0).astype(jnp.float32)
+    if _row_quant_kernel_applies(x, dim, dtype):
+        return quantize_rows(x, dtype)
     data_q, scale = quantize_block(x, axis=dim, target_dtype=dtype)
     return data_q, scale.astype(jnp.float32)
+
+
+def _row_quant_kernel_applies(x: jax.Array, dim: int, dtype: jnp.dtype) -> bool:
+    return (
+        x.ndim == 2
+        and dim in (-1, 1)
+        and x.dtype == jnp.bfloat16
+        and jnp.issubdtype(dtype, jnp.floating)
+        and x.shape[0] >= ROW_QUANT_MIN_TOKENS
+        and x.shape[0] % 128 == 0
+        and x.shape[1] % 128 == 0
+    )
+
+
+def _row_quant_tile_m(t: int, k: int) -> int:
+    """Largest power-of-two row tile within the byte and step budgets that
+    divides t; at least 128, the lane width of the scale's output block."""
+    limit = min(ROW_QUANT_TILE_BYTES // (2 * k), t // ROW_QUANT_MIN_STEPS)
+    tile_m = 128
+    while tile_m * 2 <= limit and t % (tile_m * 2) == 0:
+        tile_m *= 2
+    return tile_m
+
+
+def _row_quant_kernel(
+    x_ref, x_q_ref, scale_ref, scale_col_ref, *, inv_dtype_max, dtype_max
+):
+    """quantize_block(axis=1) on one [tile_m, K] block, reading x once.
+
+    Same arithmetic as the XLA lowering of quantize_block: bf16 amax, its f32
+    times the rounded 1/dtype_max (XLA rewrites the divide by the constant
+    into that multiply), 0 -> 1, f32 divide, clip, convert.
+    """
+    tile_m, k = x_ref.shape
+    chunk = min(ROW_QUANT_COL_CHUNK, k)
+    while k % chunk:
+        chunk //= 2
+    n_chunks = k // chunk
+
+    def cols(c):
+        return pl.ds(pl.multiple_of(c * chunk, chunk), chunk)
+
+    def row_group(g, carry):
+        rows = pl.ds(
+            pl.multiple_of(g * ROW_QUANT_ROW_GROUP, ROW_QUANT_ROW_GROUP),
+            ROW_QUANT_ROW_GROUP,
+        )
+        acc = jax.lax.fori_loop(
+            0,
+            n_chunks,
+            lambda c, m: jnp.maximum(m, jnp.abs(x_ref[rows, cols(c)])),
+            jnp.zeros((ROW_QUANT_ROW_GROUP, chunk), x_ref.dtype),
+            unroll=True,
+        )
+        abs_max = jnp.max(acc, axis=1, keepdims=True)
+        scale = abs_max.astype(jnp.float32) * inv_dtype_max
+        scale = jnp.where(scale == 0, 1.0, scale)
+        scale_col_ref[rows, :] = scale
+
+        def quantize_chunk(c, carry):
+            data = x_ref[rows, cols(c)].astype(jnp.float32) / scale
+            x_q_ref[rows, cols(c)] = jnp.clip(data, -dtype_max, dtype_max).astype(
+                x_q_ref.dtype
+            )
+            return carry
+
+        jax.lax.fori_loop(0, n_chunks, quantize_chunk, 0, unroll=True)
+        return carry
+
+    jax.lax.fori_loop(0, tile_m // ROW_QUANT_ROW_GROUP, row_group, 0)
+    # Lane-dense, so the [T] scale the matmul epilogue reads is a bitcast.
+    scale_ref[...] = jnp.transpose(scale_col_ref[...])
+
+
+def quantize_rows(x: jax.Array, dtype: jnp.dtype) -> tuple[jax.Array, jax.Array]:
+    """Per-row quantize_tensor of a [T, K] bf16 activation in one pass over x.
+
+    XLA splits quantize_block into an amax reduce fusion and a divide/convert
+    fusion that each read x. This kernel reads each [tile_m, K] tile once and
+    writes x_q and the [T, 1] f32 scale.
+    """
+    t, k = x.shape
+    dtype_max = float(jnp.finfo(dtype).max)
+    kernel = functools.partial(
+        _row_quant_kernel,
+        inv_dtype_max=float(np.float32(1) / np.float32(dtype_max)),
+        dtype_max=dtype_max,
+    )
+    tile_m = _row_quant_tile_m(t, k)
+    x_q, scale = pl.pallas_call(
+        kernel,
+        grid=(t // tile_m,),
+        in_specs=[pl.BlockSpec((tile_m, k), lambda i: (i, 0))],
+        out_specs=[
+            pl.BlockSpec((tile_m, k), lambda i: (i, 0)),
+            pl.BlockSpec((1, tile_m), lambda i: (0, i)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((t, k), dtype),
+            jax.ShapeDtypeStruct((1, t), jnp.float32),
+        ],
+        scratch_shapes=[pltpu.VMEM((tile_m, 1), jnp.float32)],
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        name="act_quant_rows",
+    )(x)
+    return x_q, scale.reshape(t, 1)
 
 
 def next_multiple(x, multiple):
