@@ -48,6 +48,11 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+
+def _rope_lib():
+    from vllm_torchtpu.kernels.deepseek_v4 import rope  # lazy: pulls the model's quantization deps
+    return rope
+
 NEG = float(jnp.finfo(jnp.float32).min)
 NT = (((1,), (1,)), ((), ()))
 NN = (((1,), (0,)), ((), ()))
@@ -79,6 +84,10 @@ class Config:
     slots: int = 3  # HCA ring depth: blocks in flight = slots - 1 ahead of the one consumed
     trim: bool = True  # issue only the live pages of a request's last block (else clamp + re-read)
     coalesce: bool = False  # one DMA per run of consecutive physical pages
+    rope_in_kernel: bool = False  # stage B (B2+B4): q per-head RMSNorm + RoPE and kv RoPE in the prologue
+    q_eps: float = 1e-6
+    compute_tile: int = 0  # >0: consume a KV block in sub-tiles of this many rows (live ones only, online softmax)
+    zsize_issue: bool = False  # branch-free issue of all pages, dead ones as zero-length DMAs
     issue_chunk: int = 16  # >0: trimmed issue as unrolled chunks of this many pages (tail clamped within a chunk)
     scale_fold: bool = False  # exp2 with sm_scale*log2e folded (changes rounding)
     tail_mask_only: bool = False  # mask only the block holding the visibility edge
@@ -137,8 +146,24 @@ def _recip(x):
 
 
 def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_pt_ref, hca_pt_ref,
-            q_ref, nkv_ref, sink_ref, _swa_in, hca_in, out_ref, swa_hbm,
-            swa_buf, wbuf, kv_buf, m_scr, l_scr, acc_scr, sems):
+            q_ref, nkv_ref, sink_ref, *rest):
+    if cfg.rope_in_kernel:
+        (cs_ref, _swa_in, hca_in, out_ref, swa_hbm,
+         swa_buf, wbuf, kv_buf, m_scr, l_scr, acc_scr, sems, qs_scr, nkvs_scr) = rest
+        rope_lib = _rope_lib()
+        # q: projection tiles -> [T, H, 512], per-head RMSNorm + RoPE (rope.qnorm_rope_flat's body, same ops/order)
+        rope_lib._untile_heads(q_ref.bitcast(jnp.uint32), qs_scr)
+        rope_lib._qnorm_rope_body(qs_scr, cs_ref, qs_scr, rotary_dim=cs_ref.shape[-1], eps=cfg.q_eps,
+                                  inverse=False, out_dtype=qs_scr.dtype)
+        # kv: RoPE on the last lane block only (rope.rope's body); the other lanes pass through untouched
+        tail = nkv_ref[:, HEAD_DIM - LANES:].astype(jnp.float32)
+        cos, sin = rope_lib._cos_sin_lanes(cs_ref[...], rotary_dim=cs_ref.shape[-1], inverse=False)
+        nkvs_scr[:, :HEAD_DIM - LANES] = nkv_ref[:, :HEAD_DIM - LANES]
+        nkvs_scr[:, HEAD_DIM - LANES:] = (tail * cos + rope_lib._rotate_gptj(tail) * sin).astype(nkvs_scr.dtype)
+        q_ref, nkv_ref = qs_scr, nkvs_scr
+    else:
+        (_swa_in, hca_in, out_ref, swa_hbm,
+         swa_buf, wbuf, kv_buf, m_scr, l_scr, acc_scr, sems) = rest
     T, H, C, W, P = cfg.tokens, cfg.heads, cfg.chunk, cfg.window, cfg.swa_page
     R, B, HP = cfg.rows, cfg.blk_rows, cfg.hca_page
     if hca_in.dtype == jnp.int32:  # int32 [N_h * 2 * hca_page, 128] (flattened by the wrapper)
@@ -213,7 +238,7 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_pt_ref, hca_pt_
 
     def issued_pages(nc, b):
         nl = live_pages(nc, b)
-        if cfg.trim and CH:
+        if cfg.trim and CH and not cfg.zsize_issue:
             return jnp.minimum(cdiv(nl, CH) * CH, BP)
         return nl
 
@@ -231,6 +256,14 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_pt_ref, hca_pt_
                 page_copy(jnp.clip(hca_pt_ref[base + jnp.minimum(p, last)], 0, n_pages_hbm - 1), p, slot)
             return
         nl = live_pages(nc, b)
+        if cfg.zsize_issue:
+            for p in range(BP):
+                live = (p < nl).astype(jnp.int32)
+                page = hca_pt_ref[base + jnp.maximum(jnp.minimum(p, nl - 1), 0)]
+                sz = ROWS * live
+                pltpu.make_async_copy(hca2d.at[pl.ds(pl.multiple_of(page * ROWS, ROWS), sz)],
+                                      kv_buf.at[slot, pl.ds(p * ROWS, sz)], sems.at[3 + slot]).start()
+            return
         if CH:
             for c in range(cdiv(BP, CH)):
                 @pl.when(c * CH < nl)
@@ -379,7 +412,22 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_pt_ref, hca_pt_
             hca_wait(nc, b, slot)
             issue(cur, (g + S - 1) % S)
             cur = advance(cur)
-            if not cfg.no_hca_compute:
+            if not cfg.no_hca_compute and cfg.compute_tile:
+                CT = cfg.compute_tile
+                n_live_rows = live_pages(nc, b) * HP
+                kt_ = lax.broadcasted_iota(jnp.int32, (1, CT), 1)
+                kr_ = lax.broadcasted_iota(jnp.int32, (CT, 1), 0)
+                buf = kv_buf.at[slot]
+
+                def sub(st, c):
+                    r0 = pl.multiple_of(st * CT, CT)
+                    kvt = _decode_tokens(buf.at[pl.ds(pl.multiple_of(2 * r0, 2 * CT), 2 * CT)], CT)
+                    kvt = jnp.where(r0 + kr_ < n_live_rows, kvt, jnp.zeros((), kvt.dtype))
+                    update(q, kvt, b * B + r0 + kt_ < vis, first=False)
+                    return c
+
+                lax.fori_loop(0, jnp.maximum(cdiv(jnp.minimum(n_live_rows, B), CT), 1), sub, 0)
+            elif not cfg.no_hca_compute:
                 kvb = _decode_tokens(kv_buf.at[slot], B)
                 if cfg.trim:
                     kr = lax.broadcasted_iota(jnp.int32, (B, 1), 0)
@@ -474,10 +522,21 @@ def fused_hca_attention(
     chunk: int = 7,
     blk_pages: int = 128,
     interpret: bool = False,
+    cs_rows=None,
     **knobs,
 ):
-    """Returns (out bf16 [T, H, 512], sw_cache with this step's rows stored)."""
-    T, H, D = q.shape
+    """Returns (out bf16 [T, H, 512], sw_cache with this step's rows stored).
+
+    With ``rope_in_kernel=True`` (stage B), ``q`` is the raw projection output in its token tiles
+    (``rope.token_tiles(q_flat, H)``, from `fused_hca_attention_rope`) and ``new_kv`` the pre-RoPE kv;
+    ``cs_rows`` [T, rotary_dim] f32 are the tokens' cos/sin rows."""
+    rope_in = knobs.get("rope_in_kernel", False)
+    if rope_in:
+        T, H = q.shape[0] * q.shape[3], q.shape[1]
+        D = q.shape[2] * q.shape[4]
+    else:
+        T, H, D = q.shape
+    out_dtype = q.dtype
     assert D == HEAD_DIM, q.shape
     max_req = cu_q_lens.shape[0] - 1
     hca_page = hca_cache.shape[1] // 2
@@ -503,28 +562,44 @@ def fused_hca_attention(
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    in_specs = [smem] * 6 + [vmem, vmem, vmem] + ([vmem] if rope_in else []) + [hbm, hbm]
+    scratch = [
+        pltpu.VMEM((2, 2 * cfg.window, LANES), jnp.int32),  # SWA window ring
+        pltpu.VMEM((2 * T, LANES), jnp.int32),  # this step's rows as cache words
+        pltpu.VMEM((cfg.slots, 2 * cfg.blk_rows, LANES), jnp.int32),  # HCA block ring
+        pltpu.VMEM((cfg.rows, 1), jnp.float32),  # m
+        pltpu.VMEM((cfg.rows, 1), jnp.float32),  # l
+        pltpu.VMEM((cfg.rows, HEAD_DIM), jnp.float32),  # acc
+        pltpu.SemaphoreType.DMA((3 + cfg.slots,)),  # SWA window x2, SWA write, HCA ring x slots
+    ]
+    if rope_in:
+        scratch += [pltpu.VMEM((T, H, HEAD_DIM), out_dtype), pltpu.VMEM((T, HEAD_DIM), new_kv.dtype)]
+    operands = [distribution.astype(jnp.int32), seq_lens.astype(jnp.int32), cu,
+                kv_lens_to_attend.astype(jnp.int32), swa_win, hca_pt, q, new_kv, sinks]
+    if rope_in:
+        operands.append(cs_rows)
+    operands += [sw_cache, hca_cache]
     out, swa = pl.pallas_call(
         functools.partial(_kernel, cfg),
-        out_shape=[jax.ShapeDtypeStruct(q.shape, q.dtype),
+        out_shape=[jax.ShapeDtypeStruct((T, H, HEAD_DIM), out_dtype),
                    jax.ShapeDtypeStruct(sw_cache.shape, sw_cache.dtype)],
-        in_specs=[smem] * 6 + [vmem, vmem, vmem, hbm, hbm],
+        in_specs=in_specs,
         out_specs=[vmem, hbm],
-        input_output_aliases={9: 1},
-        scratch_shapes=[
-            pltpu.VMEM((2, 2 * cfg.window, LANES), jnp.int32),  # SWA window ring
-            pltpu.VMEM((2 * T, LANES), jnp.int32),  # this step's rows as cache words
-            pltpu.VMEM((cfg.slots, 2 * cfg.blk_rows, LANES), jnp.int32),  # HCA block ring
-            pltpu.VMEM((cfg.rows, 1), jnp.float32),  # m
-            pltpu.VMEM((cfg.rows, 1), jnp.float32),  # l
-            pltpu.VMEM((cfg.rows, HEAD_DIM), jnp.float32),  # acc
-            pltpu.SemaphoreType.DMA((3 + cfg.slots,)),  # SWA window x2, SWA write, HCA ring x slots
-        ],
+        input_output_aliases={len(operands) - 2: 1},
+        scratch_shapes=scratch,
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
         interpret=pltpu.InterpretParams() if interpret else False,
-        name=f"fused_hca_decode_t{T}_h{H}_b{cfg.blk_rows}_s{cfg.slots}",
-    )(
-        distribution.astype(jnp.int32), seq_lens.astype(jnp.int32), cu,
-        kv_lens_to_attend.astype(jnp.int32), swa_win, hca_pt,
-        q, new_kv, sinks, sw_cache, hca_cache,
-    )
+        name=f"fused_hca_decode_t{T}_h{H}_b{cfg.blk_rows}_s{cfg.slots}{'_rope' if rope_in else ''}",
+    )(*operands)
     return out, swa
+
+
+def fused_hca_attention_rope(q_flat, kv, positions, cos_sin_cache, *args, eps=1e-6, **kw):
+    """Stage B (B2+B4): `fused_hca_attention` taking the raw q projection ``q_flat`` [T, H * 512] and the
+    pre-RoPE kv [T, 512]; the per-head q RMSNorm + RoPE and the kv RoPE run in the kernel's prologue with
+    the stock ops (rope.qnorm_rope_flat / rope.rope bodies). ``kw['heads']`` = H."""
+    rope_lib = _rope_lib()
+    H = kw.pop("heads")
+    cs_rows = jnp.take(cos_sin_cache, positions, axis=0)  # layer-invariant: one gather per step in served
+    q_tiles = rope_lib.token_tiles(q_flat, H)  # the projection's own tiling: an XLA bitcast
+    return fused_hca_attention(q_tiles, kv, *args, cs_rows=cs_rows, rope_in_kernel=True, q_eps=eps, **kw)

@@ -227,6 +227,96 @@ def _attention_hca(
     return output, updated_sw_cache
 
 
+def _attention_hca_rope(
+    q_flat: jax.Array,  # [T, H * head_dim]: the raw q projection (before RMSNorm + RoPE)
+    kv_raw: jax.Array,  # [T, head_dim]: kv after kv_norm, before RoPE
+    sw_cache: jax.Array,
+    swa_kv_lens: jax.Array,
+    swa_page_indices: jax.Array,
+    swa_cu_q_lens: jax.Array,
+    swa_distribution: jax.Array,
+    main_cache_kv: jax.Array,
+    main_kv_lens: jax.Array,
+    extra: jax.Array,
+    main_page_indices: jax.Array,
+    main_cu_q_lens: jax.Array,
+    main_distribution: jax.Array,
+    attention_sinks: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    head_dim: int,
+    q_eps: float,
+    **kwargs,
+) -> tuple[jax.Array, jax.Array]:
+    """`_attention_hca` with the q per-head RMSNorm + RoPE and the kv RoPE inside
+    (TPU_DSV4_FUSED_HCA_ROPE): in the fused kernel's prologue when it serves the
+    step, else the stock rope kernels then `_attention_hca`."""
+    from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
+
+    T = q_flat.shape[0]
+    H = q_flat.shape[1] // head_dim
+    verify_q_len = kwargs.get("verify_q_len")
+    chunk = verify_q_len or 8
+    if (
+        main_cache_kv.shape[0] != 0
+        and envs.TPU_DSV4_FUSED_HCA_DECODE
+        and q_flat.dtype == jnp.bfloat16
+        and rope_kernel.can_untile_heads(T, H, head_dim)
+        and fused_hca_decode.supported(
+            tokens=T,
+            heads=H,
+            chunk=chunk,
+            two_caches_same_buffer=kwargs["two_caches_same_buffer"],
+            swa_only=kwargs["swa_only"],
+            non_causal_block=kwargs.get("non_causal_block", False),
+        )
+    ):
+        return fused_hca_decode.fused_hca_attention_rope(
+            q_flat,
+            kv_raw,
+            positions,
+            cos_sin_cache,
+            sw_cache,
+            swa_kv_lens,
+            swa_page_indices,
+            swa_cu_q_lens,
+            swa_distribution,
+            main_cache_kv,
+            extra,
+            main_page_indices,
+            attention_sinks,
+            eps=q_eps,
+            heads=H,
+            sm_scale=kwargs["sm_scale"],
+            sliding_window=kwargs["sliding_window"],
+            logical_page_size=kwargs["logical_page_size"],
+            chunk=chunk,
+            blk_pages=envs.TPU_DSV4_FUSED_HCA_BLK_PAGES,
+        )
+    q = rope_kernel.qnorm_rope_flat(
+        q_flat, positions, cos_sin_cache, num_heads=H, eps=q_eps
+    )
+    kv = rope_kernel.rope(kv_raw, positions, cos_sin_cache)
+    return _attention_hca(
+        q,
+        kv,
+        sw_cache,
+        swa_kv_lens,
+        swa_page_indices,
+        swa_cu_q_lens,
+        swa_distribution,
+        main_cache_kv,
+        main_kv_lens,
+        extra,
+        main_page_indices,
+        main_cu_q_lens,
+        main_distribution,
+        attention_sinks,
+        **kwargs,
+    )
+
+
 def _attention_csa(
     q: jax.Array,
     new_kv: jax.Array,

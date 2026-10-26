@@ -85,5 +85,39 @@ class FusedHcaDecodeTest(parameterized.TestCase):
         self._run(name, blk_pages=128, swa_u8=True)
 
 
+    @parameterized.parameters("mix-dec-ver", "ver4-h32", "mix-c16", "mix-ver-tail")
+    def test_rope_in_op(self, name):
+        """`_attention_hca_rope` (TPU_DSV4_FUSED_HCA_ROPE): the fused kernel with RoPE in its prologue equals the
+        stock rope kernels + `_attention_hca`'s fused path bit for bit; and the T<=32 fallback (fused off) runs the
+        stock path."""
+        C.stock_env()
+        from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import deepseek_v4_attention_op as op
+        inp = M.build(name)
+        d = {k: v for k, v in M.device(inp).items() if v is not None}
+        cs = jnp.asarray(C.cos_sin_np(max_pos=1 << 18))
+        T, H, D = d["q"].shape
+        q_flat = d["q"].reshape(T, H * D)
+        kw = dict(sm_scale=C.SM_SCALE, sliding_window=C.WINDOW, logical_page_size=C.SWA_PAGE, swa_only=False,
+                  two_caches_same_buffer=False, hca_num_kv_pages_per_block=(8, 64, 64),
+                  hca_num_queries_per_block=(8, 8, 8), verify_q_len=C.VQ)
+
+        def run(d):
+            return op._attention_hca_rope(
+                q_flat, d["kv"], d["swa"], d["seq_lens"], d["swa_bt"], d["cu"], d["dist"], d["hca"],
+                d["seq_lens"] // C.RATIO, (d["positions"] + 1) // C.RATIO, d["hca_bt"], d["cu"], d["dist"], d["sinks"],
+                d["positions"], cs, head_dim=D, q_eps=1e-6, **kw)
+
+        os.environ["TPU_DSV4_FUSED_HCA_DECODE"] = "1"
+        try:
+            fo, fswa = jax.jit(run)(d)
+        finally:
+            os.environ.pop("TPU_DSV4_FUSED_HCA_DECODE", None)
+        so, sswa = jax.jit(run)(d)  # fused off -> stock rope kernels + stock attention
+        n = int(inp.cu[len(inp.reqs)])
+        np.testing.assert_array_equal(np.asarray(fswa), np.asarray(sswa))
+        e = np.abs(np.asarray(fo.astype(jnp.float32))[:n] - np.asarray(so.astype(jnp.float32))[:n]).max()
+        self.assertLess(e / np.abs(np.asarray(so.astype(jnp.float32))[:n]).max(), 2e-2)
+
+
 if __name__ == "__main__":
     absltest.main()

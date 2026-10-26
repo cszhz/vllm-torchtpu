@@ -49,6 +49,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_o
     VllmDeepseekV4SWACache,
     _attention_csa,
     _attention_hca,
+    _attention_hca_rope,
     get_packed_mla_head_size,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
@@ -429,8 +430,15 @@ class VllmDeepseekV4MLAAttention(
             }
         )
 
+        rope_fused = self._hca_rope_fused
+        if rope_fused:
+            kernel_tuning = dict(
+                kernel_tuning,
+                head_dim=int(self.mla_attn.head_dim),
+                q_eps=float(self.mla_attn.eps),
+            )
         wrapped_fn = functools.partial(
-            _attention_csa if is_csa else _attention_hca,
+            _attention_csa if is_csa else (_attention_hca_rope if rope_fused else _attention_hca),
             sm_scale=sm_scale,
             sliding_window=self.window_size,
             logical_page_size=logical_page_size,
@@ -450,6 +458,7 @@ class VllmDeepseekV4MLAAttention(
             f"{'_aliased' if two_caches_same_buffer else ''}"
             f"{'_ncb' if non_causal else ''}"
             f"{f'_vq{verify_q_len}' if verify_q_len else ''}"
+            f"{'_frope' if rope_fused else ''}"
             f"{'' if built_from_real_caches else '_prof'}"
         )
 
@@ -490,6 +499,10 @@ class VllmDeepseekV4MLAAttention(
         )
         if is_csa:
             input_partition_specs += (P(),)  # main_cache_rope
+        if rope_fused:
+            # q arrives as the flat projection [T, heads * head_dim]; + positions, cos_sin_cache
+            input_partition_specs = (P(attn_data_axis, attn_head_axis),) + input_partition_specs[1:]
+            input_partition_specs += (P(), P())
 
         # Donate sw_cache to permit in-place updates by the Pallas
         # sliding-window kernel.
@@ -635,6 +648,17 @@ class VllmDeepseekV4MLAAttention(
         """Project the q latent: [num_tokens, heads * head_dim], heads side by side."""
         return self.wq_b(qr)
 
+    @property
+    def _hca_rope_fused(self) -> bool:
+        """HCA layer whose q RMSNorm + RoPE and kv RoPE run inside the attention op
+        (TPU_DSV4_FUSED_HCA_DECODE + TPU_DSV4_FUSED_HCA_ROPE)."""
+        return bool(
+            envs.TPU_DSV4_FUSED_HCA_DECODE
+            and envs.TPU_DSV4_FUSED_HCA_ROPE
+            and self.compress_ratio > 1
+            and self.compress_ratio != 4
+        )
+
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
@@ -645,9 +669,16 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self._project_q(qr)
-        q = self.qnorm_rope(q, positions)
-        kv = self.kv_rope(kv, positions)
+        rope_fused = self._hca_rope_fused
+        if rope_fused:
+            # Raw projection + pre-RoPE kv; the attention op applies both RoPEs.
+            q = self.wq_b(qr)
+            if isinstance(q, tuple):
+                q = q[0]
+        else:
+            q = self._project_q(qr)
+            q = self.qnorm_rope(q, positions)
+            kv = self.kv_rope(kv, positions)
 
         topk_indices = None
         compressor = getattr(self.mla_attn, "compressor", None)
@@ -806,6 +837,11 @@ class VllmDeepseekV4MLAAttention(
             main_distribution,
             self.attn_sink,
         )
+        if self._hca_rope_fused:
+            operands += (
+                positions.to(torch.int32),
+                self.mla_attn.rotary_emb.cos_sin_cache,
+            )
         if is_csa:
             main_cache_rope = self._as_kernel_cache_view(_live_cache(rope_entry))
             if main_cache_rope is None:
