@@ -91,7 +91,11 @@ class Cell:
         return self.stride + host.token_gather_window_rows(self.tile_m)
 
 
-CELLS = {c.name: c for c in (Cell("mix32", 32), Cell("mix64", 64), Cell("mix128", 128), Cell("mix256", 256))}
+CELLS = {c.name: c for c in (
+    Cell("mix32", 32), Cell("mix64", 64), Cell("mix128", 128), Cell("mix256", 256),
+    # the /workload-microbenchmark twins: c16 TP4 twin (EP4, 96 experts), c4/c8 TP8 twin (EP8, 192)
+    Cell("tw16", 128, ep=4, e_total=96), Cell("tw4", 256, ep=8, e_total=192),
+)}
 # Production cells (the operating points); mix32/64 are edge cells.
 PROD_CELLS = ("mix128", "mix256")
 KINDS = ("served", "served_pad", "uniform", "hot", "one_shard", "unrouted", "dup")

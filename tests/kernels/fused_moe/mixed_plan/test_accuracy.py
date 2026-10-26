@@ -46,6 +46,10 @@ EDGE = [
     ("mix256", "dup"),
     ("mix256", "one_shard"),
     ("mix128", "unrouted"),
+    ("tw16", "uniform"),
+    ("tw16", "unrouted"),
+    ("tw4", "uniform"),
+    ("tw4", "hot"),
 ]
 PROD = [(c, k) for c in spec.PROD_CELLS for k in ("served", "served_pad", "uniform")]
 FAST = os.environ.get("KPLAN_FAST") == "1"

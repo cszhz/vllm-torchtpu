@@ -99,6 +99,7 @@ def _mixed_plan_kernel(
     (rs_s, al_s, co_s, pd_s, tr_s, tg_s, ss_s, er_s, sb_s, vi_s, cn_s, pos_s, mir_s) = refs[13:26]
     sem = refs[26]
     E, G, P = e_total, e_total // ep, t_local * topk
+    epp = -(-ep // 8) * 8
     me = me_ref[0]
     first = me * G
     copies = []
@@ -280,11 +281,13 @@ def _mixed_plan_kernel(
         # C^T[t, k]: run k's pairs in tokens before t.
         pairs_all = ex_ref[:, 0:P]  # [ep, P]
         g_col = _iota((G, 1, 1), 0) + first
-        hit_gd = pairs_all[None, :, :] == g_col  # [G, ep, P]
-        if ep % 16 == 0:  # whole bf16 tiles: merge the leading dim in bf16
+        if ep % 16 == 0:
+            hit_gd = pairs_all[None, :, :] == g_col  # [G, ep, P]  # whole bf16 tiles: merge the leading dim in bf16
             m = hit_gd.astype(jnp.bfloat16).reshape(E, P)
-        else:  # 8-row f32 tiles, then pack
-            m = hit_gd.astype(jnp.float32).reshape(E, P).astype(jnp.bfloat16)
+        else:  # rows k = source k % ep, replicated by a 0/1 dot (no sub-tile reshape)
+            rep = _bf16(_iota((E, ep), 1) == _iota((E, ep), 0) % ep)
+            pk = _mm(rep, pairs_all)  # [E, P] = pairs[k % ep, p]
+            m = _bf16(pk == first + _iota((E, 1), 0) // ep)
         q = _bf16(_iota((t_local, P), 1) // topk == _iota((t_local, P), 0))
         s_t = lax.dot_general(q, m, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
         lower_t = _bf16(_iota((t_local, t_local), 1) < _iota((t_local, t_local), 0))
@@ -322,14 +325,20 @@ def _mixed_plan_kernel(
             ).astype(jnp.int32)
             prev = prev + jnp.left_shift(r, 8 * qb)
         dsb = sb - prev
-        lhs_s = _bf16(
-            jnp.concatenate([jnp.right_shift(dsb, 8 * qb) & 255 for qb in range(4)], axis=0)
-        )  # [4 ep, t]
+        # [4 epp, t]: row qb * epp + d = byte qb of dsb[d] (epp = ep rounded up to a tile).
+        lhs_s = jnp.zeros((4 * epp, t_local), jnp.float32)
+        for qb in range(4):
+            pick = _bf16(_iota((4 * epp, ep), 0) == qb * epp + _iota((4 * epp, ep), 1))
+            lhs_s = lhs_s + lax.dot_general(
+                pick, _bf16(jnp.right_shift(dsb, 8 * qb) & 255), (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+        lhs_s = lhs_s.astype(jnp.bfloat16)
 
         tg_s[...] = jnp.zeros_like(tg_s)
         ss_s[...] = jnp.zeros_like(ss_s)
         lane_r = _iota((1, _BLOCK_ROWS), 1)
-        sub_d = _iota((ep, _BLOCK_ROWS), 0)
+        sub_d = _iota((epp, _BLOCK_ROWS), 0)
         k_sub = start_col  # [E, 1]
 
         def blk(b, carry):
@@ -360,7 +369,7 @@ def _mixed_plan_kernel(
             hit = sub_d == src
             bits = jnp.zeros_like(token)
             for qb in range(4):
-                part = jnp.sum(jnp.where(hit, sc[qb * ep : (qb + 1) * ep], 0), axis=0, keepdims=True)
+                part = jnp.sum(jnp.where(hit, sc[qb * epp : (qb + 1) * epp], 0), axis=0, keepdims=True)
                 bits = bits + jnp.left_shift(part, 8 * qb)
             bits = jnp.where(valid, bits, 0)
             u0 = pl.multiple_of(b * 8, 8)
@@ -393,8 +402,7 @@ def mixed_plan_supported(*, e_total, ep, t_local, topk, shard_stride, tile_m, bl
     return (
         e_total % ep == 0
         and G % 8 == 0
-        and ep % 8 == 0
-        and e_total % HIDDEN_LANE_BLOCK == 0
+        and e_total % 8 == 0
         and t_local % 16 == 0
         and t_local <= 256
         and (block % HIDDEN_LANE_BLOCK == 0 or P <= 512)
