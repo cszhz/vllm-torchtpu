@@ -449,6 +449,30 @@ def test_arm_builds_a_controller_from_the_placed_layers(monkeypatch):
     assert c.mover.p2p.group == ("gloo", (4, 5)) and c.mover.p2p._global(1) == 5
 
 
+def test_arm_sees_a_layout_selected_only_through_the_served_config(monkeypatch):
+    """DP32 D1 (`j-cb74cf3e`): the cluster recipe selects the layout with
+    `--additional-config deepseek_v41.expert_layout` and never sets the
+    TPU_EXPERT_PLACEMENT alias in the server; after model construction the
+    layout is only visible through the served config, which arm() must be
+    handed, or it logs "no layer is placed" and the controller never arms."""
+    from vllm_torchtpu import expert_placement
+
+    _arm_env(monkeypatch)
+    _fake_placed_world(monkeypatch)
+    placement = expert_placement.current()
+    seen = []
+
+    def current(vllm_config=None):
+        seen.append(vllm_config)
+        return placement if vllm_config is not None else None
+
+    monkeypatch.setattr(expert_placement, "current", current)
+    assert rl.arm(ep_rank=0, ep_world=2) is None  # no config, no env alias: refused
+    cfg = object()
+    c = rl.arm(ep_rank=0, ep_world=2, vllm_config=cfg)
+    assert c is not None and seen[-1] is cfg
+
+
 def test_arm_refuses_without_the_knob_staging_or_lockstep(monkeypatch):
     _fake_placed_world(monkeypatch)
     _arm_env(monkeypatch, TPU_MOE_EPLB_DYNAMIC=False)

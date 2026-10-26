@@ -731,6 +731,7 @@ def arm(
     ep_world: int,
     ep_global_ranks: list[int] | None = None,
     lockstep: bool = True,
+    vllm_config=None,
 ) -> Controller | None:
     """Build this rank's controller, or return None with the reason logged.
 
@@ -739,13 +740,18 @@ def arm(
     here, collectively. Needs the dynamic knob, a layout with staging slots
     applied to at least one layer, the load tap registered, and the DP
     lockstep (every rank performs the step all-reduce every step).
+
+    `vllm_config` is the served model's config: a layout selected through
+    `--additional-config deepseek_v41.expert_layout` (the cluster recipe) is
+    only visible through it once model construction is over, and the
+    `TPU_EXPERT_PLACEMENT` alias the local harness sets may be absent.
     """
     from vllm_torchtpu import envs, expert_mover, expert_placement
     from vllm_torchtpu.layers.adapter import expert_load
 
     if not envs.TPU_MOE_EPLB_DYNAMIC:
         return None
-    placement = expert_placement.current()
+    placement = expert_placement.current(vllm_config)
     modules = expert_placement.applied_layers()
     if placement is None or not modules:
         logger.warning(
@@ -845,6 +851,7 @@ def arm_for_runner(runner) -> Controller | None:
             ep_world=int(group.world_size),
             ep_global_ranks=[int(r) for r in group.ranks],
             lockstep=bool(runner._dp_lockstep_enabled()),
+            vllm_config=getattr(runner, "vllm_config", None),
         )
     except Exception:  # noqa: BLE001 - serving goes on with the static layout
         logger.exception("expert relayout: arming failed; serving the static layout")
