@@ -82,7 +82,7 @@ def _bits(a):
     ids=["tp8", "tp4pairs", "tp4", "tp4perm"],
 )
 @pytest.mark.parametrize("fold", [1, 2])
-@pytest.mark.parametrize("rows", [8, 16, 24, 32, 64])
+@pytest.mark.parametrize("rows", [4, 8, 16, 24, 32, 64])
 def test_defer_partial_sums_to_output(mesh, monkeypatch, groups, pairs, hidden, fold, rows):
     monkeypatch.setattr(envs, "TPU_SMALL_ALL_REDUCE_PAIRS", pairs, raising=False)
     rank, inputs, shared = _inputs(mesh, groups, rows, hidden)
