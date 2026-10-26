@@ -86,6 +86,8 @@ def _indexer_impl(
     kv_split: int = 1,
     row_window: tuple | None = None,
     row_window_tokens: int = 0,
+    window_pieces: int = 1,
+    group_max: bool = False,
 ) -> jax.Array:
     out_width = k if kv_split == 1 else 2 * k
     if cache_kv.shape[0] == 0:
@@ -145,7 +147,13 @@ def _indexer_impl(
             num_kv_pages_per_block=num_kv_pages_per_block,
             num_queries_per_block=num_queries_per_block,
             decode_req_batch_size=4,
-            chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
+            chunk_tokens=(
+                q.shape[0] // window_pieces
+                if window_pieces > 1
+                else envs.TPU_STREAMIDX_CHUNK_TOKENS
+            ),
+            chunk_sched_groups=envs.TPU_STREAMIDX_CHUNK_SCHED_GROUPS,
+            group_max=group_max,
             kv_layout=KVLayout.SEQ_ALONG_LANE,
             uniform_q_len=verify_q_len,
             sc_flat_scores=envs.TPU_DSV4_SC_TOPK_FLAT_SCORES,
@@ -258,6 +266,7 @@ def _indexer_token_split_jax(
     num_queries_per_block: tuple[int, int, int],
     verify_q_len: int | None = None,
     flat_head_dim: int = 0,
+    window_pieces: int = 1,
 ) -> jax.Array:
     """TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE: the top-k of rows
     [rank * T/tp, (rank + 1) * T/tp) only, as the whole batch selects them."""
@@ -276,6 +285,8 @@ def _indexer_token_split_jax(
         flat_head_dim=flat_head_dim,
         row_window=(seq_lens, cu_q_lens, distribution, offset),
         row_window_tokens=window * tp,
+        window_pieces=window_pieces,
+        group_max=envs.TPU_DSV4_INDEXER_GROUP_MAX,
     )  # fmt: skip
 
 
@@ -379,11 +390,16 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         spec = get_current_vllm_config().speculative_config
         verify_q_len = None if spec is None else spec.num_speculative_tokens + 1
         flat = envs.TPU_DSV4_ROPE_QUANT_FLAT
+        pieces = envs.TPU_DSV4_INDEXER_TOKEN_SPLIT_PIECES
+        assert pieces >= 1 and pieces & (pieces - 1) == 0, "power of 2"
         op_name = (
             f"pallas::deepseek_v4_indexer_tok_k{self.topk_tokens}"
             f"_c{self.compress_ratio}_h{self.n_head}_tp{tp}"
             f"{'' if verify_q_len is None else f'_vq{verify_q_len}'}"
             f"{'_flat' if flat else ''}"
+            f"{f'_pc{pieces}' if pieces > 1 else ''}"
+            f"{'' if envs.TPU_STREAMIDX_CHUNK_SCHED_GROUPS else '_ng'}"
+            f"{'_gm' if envs.TPU_DSV4_INDEXER_GROUP_MAX else ''}"
         )
         if op_name in _indexer_op_cache:
             return _indexer_op_cache[op_name]
@@ -400,6 +416,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
                 num_kv_pages_per_block=envs.TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK,
                 num_queries_per_block=envs.TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK,
                 verify_q_len=verify_q_len,
+                window_pieces=pieces,
             ),
             mesh=mesh,
             input_partition_specs=(
