@@ -26,7 +26,11 @@ jnp = jax.numpy
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import spec  # noqa: E402
 
-ON_TPU = jax.default_backend() == "tpu"
+
+
+def _on_tpu():
+    # Not at import: touching the backend during collection is refused by conftest.
+    return jax.default_backend() == "tpu"
 
 # name -> fn(cell, exchange, local_blocks, block_hist, me, interpret) -> dict
 IMPLS = {
@@ -54,7 +58,7 @@ def _case(cn, kind, seed=1):
 
 def _run(impl, cell, pairs, ex, me):
     lb, bh = spec.local_inputs(cell, pairs, me)
-    f = jax.jit(lambda e, l, b, m: IMPLS[impl](cell, e, l, b, m, not ON_TPU))
+    f = jax.jit(lambda e, l, b, m: IMPLS[impl](cell, e, l, b, m, not _on_tpu()))
     return jax.device_get(f(ex, lb, bh, jnp.int32(me)))
 
 
@@ -95,9 +99,10 @@ def test_fault_control_catch_rate():
     assert not blind_prod, f"faults blind on every production class: {blind_prod}"
 
 
-@pytest.mark.skipif(not ON_TPU, reason="combine reference runs the TPU path")
 @pytest.mark.parametrize("cn", spec.PROD_CELLS)
 def test_combine_native_vs_f64_and_faults(cn):
+    if not _on_tpu():
+        pytest.skip("combine reference runs the TPU path")
     cell = spec.CELLS[cn]
     pairs = spec.make_pairs(cell, "served_pad", 3)
     sb = spec.make_scale_bits(cell, 3)
