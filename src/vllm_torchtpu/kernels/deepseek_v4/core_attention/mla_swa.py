@@ -30,6 +30,8 @@ SMALL_DECODE_SEQ_BATCH = 4
 # bq blocks computed per loop step of the prefill/mixed kernel when each reads
 # a single bkv block.
 Q_BLOCKS_PER_STEP = 4
+# Rows of one sublane group of the [rows, keys] scores; each holds one query.
+MASK_SUBLANES = 8
 
 
 def cdiv(a, b):
@@ -237,6 +239,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         assert q.shape[0] % num_q_heads == 0
         assert q.shape[1] == head_dim
         assert kv.shape == (bkv_sz, head_dim)
+        assert num_q_heads % MASK_SUBLANES == 0
         n = q.shape[0] // num_q_heads
 
         # split bq into chunks of size q_compute_block_size
@@ -251,13 +254,6 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 return jnp.full_like(ref, init_val)
             else:
                 return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
-
-        # k_span is shared across all chunks (only depends on the bkv column).
-        k_span = (
-            start_offset
-            + bkv_idx * bkv_sz
-            + lax.broadcasted_iota(jnp.int32, (1, bkv_sz), 1)
-        )
 
         # Process the bq rows in `num_chunks` independent slices for better
         # parallelism.
@@ -276,33 +272,46 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             cacc_ref = acc_ref.at[start_row : start_row + chunk_size]
 
             # Follow FlashAttention-2 forward pass.
-            # q_span is per-row (identical across the bkv columns and across the
-            # num_q_heads rows of one query).
-            q_span = (
-                kv_len
-                - q_len
-                + bq_idx * bq_sz
-                + (start_row + lax.broadcasted_iota(jnp.int32, (chunk_size, 1), 0))
-                // num_q_heads
-            )
-            # A key is valid iff 0 <= q_span - k_span < sliding_window (causal +
+            # A key is valid iff 0 <= q_pos - k_pos < sliding_window (causal +
             # within window).
             # When int32 -> uint32, negative values become large positive values.
             # So we only need to check the upper bound.
-            keep = (q_span - k_span).astype(jnp.uint32) < jnp.uint32(sliding_window)
+            # The mask only depends on (query, key), and one query's num_q_heads
+            # rows fill whole sublane groups, so it is built for one sublane
+            # group per query and broadcast over the query's head groups.
+            mask_shape = (chunk_sz, 1, MASK_SUBLANES, bkv_sz)
+            q_pos = (
+                kv_len
+                - q_len
+                + bq_idx * bq_sz
+                + c * chunk_sz
+                + lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+            )
+            k_pos = (
+                start_offset
+                + bkv_idx * bkv_sz
+                + lax.broadcasted_iota(jnp.int32, mask_shape, 3)
+            )
+            keep = (q_pos - k_pos).astype(jnp.uint32) < jnp.uint32(sliding_window)
 
             if non_causal_block:
                 # DSpark draft block mode: the last q_len positions of the sequence
                 # are one parallel-drafting block attending bidirectionally within
                 # itself. The upper bound is NOT free here: the causal uint32 trick
-                # excluded the final page's tail garbage (k_span >= kv_len), so the
+                # excluded the final page's tail garbage (k_pos >= kv_len), so the
                 # block clause must re-impose it.
-                keep = keep | ((k_span >= kv_len - q_len) & (k_span < kv_len))
+                keep = keep | ((k_pos >= kv_len - q_len) & (k_pos < kv_len))
 
             s = jnp.einsum("nd,md->nm", qc, kv, preferred_element_type=jnp.float32)
             s *= sm_scale
 
-            s = jnp.where(keep, s, jnp.finfo(s.dtype).min)
+            s = jnp.where(
+                keep,
+                s.reshape(
+                    chunk_sz, num_q_heads // MASK_SUBLANES, MASK_SUBLANES, bkv_sz
+                ),
+                jnp.finfo(s.dtype).min,
+            ).reshape(chunk_size, bkv_sz)
             s_rowmax = jnp.max(s, axis=1)
             if single_bkv_block:
                 m_curr = s_rowmax
