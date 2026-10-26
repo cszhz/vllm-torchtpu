@@ -120,7 +120,7 @@ def chained(fn, R):
 
 
 def main():
-    rs = [4, 12, 24]
+    rs = [int(r) for r in os.environ.get('KPLAN_RS', '4,12,24').split(',')]
     res = []
     rng = np.random.default_rng(0)
     for t_local in (128, 256):
@@ -154,7 +154,7 @@ def main():
             res.append(r)
             print("PROBE", json.dumps(r), flush=True)
     out = os.environ.get("CDK_OUTPUT_DIR", "/tmp")
-    json.dump(res, open(os.path.join(out, "kplan_probe00.json"), "w"), indent=1)
+    json.dump(res, open(os.path.join(out, os.environ.get("KPLAN_PROBE_OUT", "kplan_probe00.json")), "w"), indent=1)
     print("DONE", flush=True)
 
 
