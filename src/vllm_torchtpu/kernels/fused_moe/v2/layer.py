@@ -375,6 +375,13 @@ def _mixed_plan_kernel_enabled():
     return bool(envs.TPU_DSV4_EP_MIXED_PLAN_KERNEL)
 
 
+def _mixed_exchange_oneshot_enabled():
+    """TPU_DSV4_EP_MIXED_EXCHANGE_ONESHOT (only with the mixed plan kernel)."""
+    from vllm_torchtpu import envs
+
+    return bool(envs.TPU_DSV4_EP_MIXED_EXCHANGE_ONESHOT)
+
+
 def _oneshot_gather_max_local_tokens():
     """ONESHOT_GATHER_LOCAL_TOKENS[1], or the serving env's override."""
     from vllm_torchtpu import envs
@@ -735,6 +742,7 @@ def fused_ep_moe_v2(
             block=block,
         )
     )
+    mixed_exchange_oneshot = mixed_plan and _mixed_exchange_oneshot_enabled()
     # e4m3 rows only; see _gather_rows_with_meta.
     merge_exchange = (
         bool(merge_exchange)
@@ -1345,9 +1353,22 @@ def fused_ep_moe_v2(
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, slot_l, row_scale_l, rank_l[0, 0]
         )
-        exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
-            ep, layout[-1]
-        )
+        if mixed_exchange_oneshot:
+            from vllm_torchtpu.kernels.experimental.small_collectives.oneshot_gather import (  # noqa: E501
+                oneshot_all_gather,
+            )
+
+            exchange = oneshot_all_gather(
+                packed[None, :],
+                num_cores=ep,
+                axis=ax,
+                rank=rank_l[0, 0],
+                skip_device_barrier=small_ar_form[2],
+            ).reshape(ep, layout[-1])
+        else:
+            exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
+                ep, layout[-1]
+            )
         return compute_local(
             q_g,
             exchange,
@@ -1919,6 +1940,7 @@ def fused_ep_moe_v2(
         oneshot_gather,
         combine_restore,
         mixed_plan,
+        mixed_exchange_oneshot,
         bool(shared_in_op),
         float(shared_out_scale),
         int(shared_rs_min_rows),

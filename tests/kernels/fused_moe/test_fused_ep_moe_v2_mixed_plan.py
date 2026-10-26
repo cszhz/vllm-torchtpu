@@ -32,8 +32,9 @@ pytestmark = pytest.mark.multichip
 SHAPE = dict(hidden=512, inter=256, e_total=384, topk=6)
 
 
+@pytest.mark.parametrize("oneshot", [False, True], ids=["xla_exchange", "oneshot_exchange"])
 @pytest.mark.parametrize("tokens", [256, 1024, 2048], ids=["t32", "t128", "t256"])
-def test_mixed_plan_kernel_is_bit_exact_in_the_layer(tokens, monkeypatch):
+def test_mixed_plan_kernel_is_bit_exact_in_the_layer(tokens, oneshot, monkeypatch):
     mesh = _mesh()
     w1, w2, w1_scale, w2_scale = _make_weights(
         mesh, 30, hidden=SHAPE["hidden"], inter=SHAPE["inter"],
@@ -59,6 +60,7 @@ def test_mixed_plan_kernel_is_bit_exact_in_the_layer(tokens, monkeypatch):
     want = np.asarray(fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common))
     assert not calls
     monkeypatch.setattr(layer, "_mixed_plan_kernel_enabled", lambda: True)
+    monkeypatch.setattr(layer, "_mixed_exchange_oneshot_enabled", lambda: oneshot)
     jax.clear_caches()
     got = np.asarray(fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common))
     assert calls, "the mixed plan kernel did not engage"

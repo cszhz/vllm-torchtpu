@@ -151,6 +151,7 @@ if TYPE_CHECKING:
     TPU_SMALL_COLLECTIVES_SKIP_DEVICE_BARRIER: bool = False
     MOE_FUSED_EP_V2_FOLD_ANY_DECODE: bool = False
     TPU_DSV4_EP_MIXED_PLAN_KERNEL: bool = False
+    TPU_DSV4_EP_MIXED_EXCHANGE_ONESHOT: bool = False
     MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS: int = 4
     TPU_FP8_LINEAR_PALLAS: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = ""
@@ -979,6 +980,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fused-EP routing plan in one Pallas call (mixed_plan_kernel) instead of
     # ~100 XLA ops and two SparseCore scatters. Same bits.
     "TPU_DSV4_EP_MIXED_PLAN_KERNEL": env_bool("TPU_DSV4_EP_MIXED_PLAN_KERNEL"),
+    # With the mixed plan kernel on: move the routing exchange with the
+    # one-shot Pallas all-gather on the TensorCore instead of XLA's all-gather
+    # (SparseCore-offloaded ahead of the activation gather at c4/c8, a
+    # synchronous TensorCore collective at c16). Same bits.
+    "TPU_DSV4_EP_MIXED_EXCHANGE_ONESHOT": env_bool("TPU_DSV4_EP_MIXED_EXCHANGE_ONESHOT"),
     # Largest local token count the one-shot Pallas EP gather takes (smallest
     # stays 2).
     "MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS": env_nonnegative_int(
