@@ -336,6 +336,11 @@ def main_kernel(
                 in_ref, top_k=top_k, num_lanes=num_simd_lanes, step_entries=step_entries
             )
             run &= gather_steps > 0
+            # A negative sequence marks a token whose consumer reads its rows
+            # from the paged cache itself (see `csa_gather_topk`).
+            local = jnp.minimum(b * num_cores + core_index, lookup.num_tokens - 1)
+            token = jnp.full((num_simd_lanes,), lookup.token_start + local, jnp.int32)
+            run &= plsc.load_gather(seq_vmem_ref, [token])[0] >= 0
 
         @pl.when(run)
         def _run_gather():
@@ -471,7 +476,8 @@ def csa_gather_topk(
     Args:
       topk_indices: (T, top_k) int32, per token the compressed tokens of its
         sequence to read, -1 for none.
-      seq_ids: (>= T,) int32, each token's sequence.
+      seq_ids: (>= T,) int32, each token's sequence; a token whose entry is
+        negative is skipped, its rows left unwritten.
       page_indices: (num_seqs * pages_per_seq,) int32 page table.
       num_valid_indices: entries of the chunk to gather, as in `csa_gather`.
 

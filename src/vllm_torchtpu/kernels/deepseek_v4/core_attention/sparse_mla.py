@@ -1289,7 +1289,8 @@ def sparse_ragged_paged_attention(
             cache_kv_nope,
             cache_kv_rope,
             topk_indices,
-            seq_ids_segment,
+            # The SparseMLA kernel reads a `DenseRefs` batch's rows itself.
+            seq_ids_segment if dense_inputs is None else dense_inputs[0],
             page_indices,
             num_valid_indices,
             token_start=start_pos,
