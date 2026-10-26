@@ -475,6 +475,7 @@ def _attention_csa(
         and not use_union_dense
         and q.shape[0] <= union_verify_max_tokens
         and q.shape[0] > union_verify_above
+        and csa_window_union.supported(q.shape[0], main_cu_q_lens.shape[0] - 1)
     )
     union_rows = None
     if use_union_verify and union_verify_early and not two_caches_same_buffer:

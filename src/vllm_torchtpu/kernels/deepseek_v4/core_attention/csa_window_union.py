@@ -48,7 +48,9 @@ Interface (frozen between the two kernels):
          (r & 127), bit (r >> 7) & 31 (the `csa_union_dense` layout).
   ucnt   i32[nw_cap * L]  lane 0 of row w = U_w, the window's union size.
 Rows of nope_g / rope_g at ranks >= U_w, and mask rows of tokens outside every
-window, are not written.
+window, are not written. A token's valid top-k ids must be distinct (the
+indexer's exact top-k emits distinct column indices): the 4-bit counters and
+the mask bits are built with adds.
 """
 
 import functools
@@ -85,6 +87,13 @@ def nw_cap_for(num_tokens: int, max_num_seqs: int) -> int:
     return cdiv(num_tokens, WQ) + max_num_seqs
 
 
+def supported(num_tokens: int, max_num_seqs: int) -> bool:
+    """Trace-time route condition: one SparseCore worker per window slot is
+    needed (T <= 128 with max_num_seqs <= 16 fits the 32 workers of v7x)."""
+    L, nc, ns = sc_geometry()
+    return num_tokens % 8 == 0 and nw_cap_for(num_tokens, max_num_seqs) <= nc * ns
+
+
 # ----------------------------------------------------------------------------
 # Window metadata (XLA; layer-invariant -> CSE'd once per step in the model).
 
@@ -96,7 +105,9 @@ def window_meta(cu_q_lens, distribution, kv_lens, *, num_tokens, s_cap, lanes=No
         L, nc, ns = sc_geometry()
         lanes, workers = L, nc * ns
     L = lanes
-    nseq = kv_lens.shape[0]
+    # max_num_seqs as the sparse kernel takes it (cu_q_lens has one more entry).
+    nseq = cu_q_lens.shape[0] - 1
+    kv_lens = kv_lens[:nseq]
     nw_cap = nw_cap_for(num_tokens, nseq)
     assert nw_cap <= workers, (nw_cap, workers)
     seq_ids = jnp.arange(nseq, dtype=jnp.int32)
@@ -592,7 +603,7 @@ def prepare(topk_indices, kv_lens, page_indices, cu_q_lens, distribution,
     union/gather call. Needs no q and no SWA output, so the caller can issue it
     ahead of the SWA pass."""
     T = topk_indices.shape[0]
-    max_num_seqs = kv_lens.shape[0]
+    max_num_seqs = cu_q_lens.shape[0] - 1
     pps = page_indices.shape[0] // max_num_seqs
     s_cap = pps * cache_kv_nope.shape[1]
     meta = window_meta(cu_q_lens, distribution, kv_lens, num_tokens=T, s_cap=s_cap)

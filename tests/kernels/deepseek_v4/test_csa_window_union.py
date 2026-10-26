@@ -46,7 +46,7 @@ pytestmark = pytest.mark.skipif(
 
 L1_CELLS = ["c4T8-mid", "c8T32-ragged", "c16T32-last", "edge-tiny", "edge-pageb",
             "edge-maxb", "edge-maxb8"]
-ACC_CELLS = ["c4T8-mid", "c8T16-mid", "c16T32-u90", "c16T8-last", "c8T32-ragged",
+ACC_CELLS = ["c4T8-mid", "c8T16-mid", "c16T32-u90", "c16T32-last", "c8T32-last", "c16T8-last", "c8T32-ragged",
              "edge-short", "edge-tiny", "edge-pageb", "edge-maxb", "edge-sink", "edge-maxb8"]
 
 
@@ -168,3 +168,32 @@ def test_positive_control_causal_leak_caught_by_poison(name):
         WU.union_gather = orig
     _, ok, _ = C.gate(cand[rows], want, ref_err)
     assert not (ok and np.isfinite(cand[rows]).all())
+
+
+def test_qlen1_empty_window_and_pad_rows():
+    """A 1-token request with no compressed rows (U = 0: the idle-replica slot shape)
+    gets the SWA + sink result; rows outside every window return q bit-exactly."""
+    cell = C.CELLS["c8T16-mid"]  # 2 verify windows in rows 0..13 of T = 16
+    inp = C.build_inputs(cell)
+    s = 2  # third sequence: one token at row 14, kv_len 0, top-k all -1
+    inp["cu"][s + 1:] = inp["cu"][s] + 1
+    inp["dist"] = np.array([0, cell.R, cell.R + 1], np.int32)
+    inp["kv_lens"][s] = 0
+    inp["seq_of"][14] = s
+    inp["pos"][14] = 0
+    inp["tk"][14] = -1
+    inp["nseq"] = 3
+    d, deq = C.device_inputs(inp, cache="quant")
+    want, rows = C.oracle(inp, d, deq)
+    assert 14 in rows and 15 not in rows
+    inc = np.asarray(jax.jit(_region(cell.conc, False))(d, d["q"]).astype(jnp.float32))
+    cand = np.asarray(jax.jit(_region(cell.conc, True))(d, d["q"]).astype(jnp.float32))
+    ref_err, _, _ = C.gate(inc[rows], want)
+    err, ok, tol = C.gate(cand[rows], want, ref_err)
+    assert ok, (err, tol, ref_err)
+    np.testing.assert_array_equal(cand[15], np.asarray(d["q"][15].astype(jnp.float32)))
+
+
+def test_route_condition():
+    assert WU.supported(128, 16) and WU.supported(32, 16) and WU.supported(8, 8)
+    assert not WU.supported(128, 17)
