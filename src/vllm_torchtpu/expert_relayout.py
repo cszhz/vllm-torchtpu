@@ -357,6 +357,9 @@ class Mover(Protocol):
 
     def start(self, plan: Plan, modules: dict[tuple[str, int], object]) -> None: ...
 
+    def pump(self) -> None:
+        """One bounded slice of this rank's device work, from the step hook."""
+
     def staged_generation(self) -> int: ...
 
     def failed(self) -> bool: ...
@@ -375,6 +378,9 @@ class NoopMover:
 
     def start(self, plan, modules) -> None:
         self._staged = plan.generation
+
+    def pump(self) -> None:
+        pass
 
     def staged_generation(self) -> int:
         return self._staged
@@ -455,6 +461,7 @@ class Controller:
         min_staged = -neg_staged_max
         if self.state == STAGING:
             assert self.pending is not None
+            self.mover.pump()
             if self.mover.failed():
                 self._abort(step, "the mover failed")
             elif min_staged >= self.pending.generation:

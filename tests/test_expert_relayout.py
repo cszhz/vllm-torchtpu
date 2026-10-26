@@ -173,6 +173,9 @@ class _Mover:
         if self.auto:
             self.staged = plan.generation
 
+    def pump(self):
+        pass
+
     def staged_generation(self):
         return self.staged
 
@@ -377,3 +380,69 @@ def test_the_tap_exists_under_the_dynamic_knob(monkeypatch):
     assert expert_load.enabled()
     monkeypatch.setitem(vars(envs), "TPU_MOE_EPLB_DYNAMIC", False)
     assert not expert_load.enabled()
+
+
+# ---------------------------------------------------------------------------
+# Plan -> mover -> table, end to end on the host
+
+
+def test_a_solved_generation_moves_exactly_the_bytes_its_table_names():
+    """Solve a generation from a hot window, run the mover for every rank over
+    an in-process mailbox on slot-major weight tensors, then check that every
+    slot the new table names holds its expert's original bytes -- the
+    consistency the device bit-exact test relies on."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu import expert_mover as mv
+
+    experts, shards, active, staging = 8, 2, 4, 1
+    lay = _layout()
+    rows = {0: _rows(hot=(0, 1))}
+    layouts, moves, _ = rl.solve_group("target", {0: lay}, rows, min_gain=0.0, **SPEC)
+    assert moves, "the hot window must move something"
+    nxt = layouts[0]
+    plan = rl.Plan(1, 0, layouts, moves)
+    # Each rank's weights: slot s of rank r holds bytes that spell the expert.
+    k, n = 4, 8
+
+    def weights(rank):
+        w = torch.zeros((active + staging, k, n), dtype=torch.int32)
+        for j, e in enumerate(lay.held[rank]):
+            if e != rl.FREE:
+                w[j] = 1000 * rank + e  # distinct per (origin rank, expert)
+        return w
+
+    mods = {
+        r: SimpleNamespace(local_num_experts=active + staging, w13_weight=weights(r))
+        for r in range(shards)
+    }
+    exchange = mv.LocalExchange()
+    movers = [
+        mv.SlabMover(r, mv.TorchTransport(), exchange.endpoint(r))
+        for r in range(shards)
+    ]
+    import time
+
+    for r, m in enumerate(movers):
+        m.start(plan, {("target", 0): mods[r]})
+    for _ in range(400):
+        for m in movers:
+            m.pump()
+        if all(m.staged_generation() == 1 or m.failed() for m in movers):
+            break
+        time.sleep(0.005)
+    assert all(m.staged_generation() == 1 for m in movers)
+    table = nxt.slot_table(experts, SPEC["replica_cap"])
+    for e, slots in enumerate(table):
+        for s in slots:
+            if s == rl.FREE:
+                continue
+            r, j = divmod(s, active + staging)
+            value = int(mods[r].w13_weight[j, 0, 0])
+            assert value % 1000 == e, f"slot {s} should hold expert {e}, holds {value}"
+    # Every expert is still held somewhere and nobody holds one twice.
+    held = [e for row in nxt.held for e in row if e != rl.FREE]
+    assert set(held) == set(range(experts))
+    for row in nxt.held:
+        live = [e for e in row if e != rl.FREE]
+        assert len(live) == len(set(live)) == active

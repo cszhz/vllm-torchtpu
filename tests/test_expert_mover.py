@@ -64,6 +64,21 @@ def _plan():
     )
 
 
+def _pump_until_settled(movers, rounds=400):
+    """Drive every mover's pump from one "main thread" until all are staged,
+    failed or idle, the way the controllers' step hooks would."""
+    import time
+
+    for _ in range(rounds):
+        for m in movers:
+            m.pump()
+        if all(m.failed() or m._phase == "idle" for m in movers):
+            break
+        time.sleep(0.005)
+    for m in movers:
+        m.join(timeout=10)
+
+
 def _run_both(plan, modules_by_rank, transport=None):
     exchange = mv.LocalExchange()
     movers = [
@@ -72,8 +87,7 @@ def _run_both(plan, modules_by_rank, transport=None):
     ]
     for r, m in enumerate(movers):
         m.start(plan, {("target", 7): modules_by_rank[r]})
-    for m in movers:
-        m.join(timeout=30)
+    _pump_until_settled(movers)
     return movers
 
 
@@ -132,7 +146,7 @@ def test_a_failing_leg_marks_the_generation_failed():
         mv.SlabMover(r, mv.TorchTransport(), exchange.endpoint(r)) for r in range(2)
     ]
     movers[1].start(plan, {("target", 7): mods[1]})
-    movers[1].join(timeout=10)
+    _pump_until_settled([movers[1]])
     assert movers[1].failed() and movers[1].staged_generation() == 0
 
 
@@ -143,7 +157,7 @@ def test_cancel_stops_before_the_writes_and_settle_moves_the_generation():
     mover.cancel()  # before start: the thread sees it at its first check
     plan = rl.Plan(3, 0, moves=[rl.Move("target", 7, 22, 1, 2, 0, 4)])
     mover.start(plan, {("target", 7): mods[0]})
-    mover.join(timeout=10)
+    _pump_until_settled([mover])
     assert mover.staged_generation() == 0 and not mover.failed()
     mover.settle(3)
     assert mover.staged_generation() == 3
