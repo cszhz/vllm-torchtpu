@@ -817,7 +817,15 @@ class DeepseekV4Model(nn.Module):
         # partial to the next layer's attention seam, which sums it. Only on
         # the replicated layout, never into a chain end (the last layer, an
         # aux hidden state), and only where the next layer armed the op.
+        # A shape branch (T <= cap, the small all-reduce's power-of-2 row cap):
+        # above it every trace keeps the stock MoE all-reduce and seam ops.
         moe_seam = bool(envs.TPU_DSV4_MHC_MOE_AR_SEAM) and not seq_parallel
+        if moe_seam:
+            from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+                deepseek_v4_mhc_ar_seam_op as ar_seam,
+            )
+
+            moe_seam = positions.shape[0] <= ar_seam.moe_cap()
         x_partial = False
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),

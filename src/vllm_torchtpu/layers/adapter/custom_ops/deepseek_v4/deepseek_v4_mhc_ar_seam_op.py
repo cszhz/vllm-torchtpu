@@ -113,6 +113,10 @@ def get_ar_seam_op(consts, kernel_kw, *, moe_fn_mode=None):
     mesh = build_ep_mesh()
     groups = ep_token_replica_groups()
     cap = sar.max_rows()
+    # The fused EP op hands over a partial up to max_rows(replica width)
+    # (fused_moe_ep._small_ar_max_rows); the MoE-side seam must sum exactly
+    # those buckets.
+    assert cap == sar.max_rows(len(groups[0])), (cap, groups)
     spec = PartitionSpec(EP_AXIS_NAME)
     body = _body(
         groups, cap, EP_AXIS_NAME, consts, kernel_kw,
@@ -149,6 +153,14 @@ def get_ar_seam_op(consts, kernel_kw, *, moe_fn_mode=None):
         groups, cap, all_reduce.group_form(groups), kernel_kw, moe_fn_mode,
     )
     return op
+
+
+def moe_cap() -> int:
+    """Token rows up to which the MoE side hands over a partial (the small
+    all-reduce's cap for this core's group); the model gates on it."""
+    from vllm_torchtpu.layers.adapter import small_all_reduce_op as sar
+
+    return sar.max_rows()
 
 
 def rank_peers():
