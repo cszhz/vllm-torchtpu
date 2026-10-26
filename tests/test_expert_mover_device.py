@@ -120,6 +120,21 @@ def test_an_fp4_pair_slot_moves_as_its_on_device_bytes():
     assert torch.equal(got[5], dst_before[5])
 
 
+def test_an_fp4_pair_slot_moves_through_raw_host_memory():
+    """Same move, host buffers from tpu-sync's RawHostBuffer (pinned_host)."""
+    transport = mv.RawTransferTransport(host_memory="raw")
+    src, dst = _fp4(6, SLOTS, K, N), _fp4(7, SLOTS, K, N)
+    src_image, dst_before = _image(transport, src), _image(transport, dst)
+    future, host = transport.d2h(src, 2, 1)
+    future.wait()
+    assert transport._ours(host)
+    transport.h2d(host, dst, 0).wait()
+    transport.release(host)
+    got = _image(transport, dst)
+    assert torch.equal(got[0], src_image[2])
+    assert torch.equal(got[1:], dst_before[1:])
+
+
 def test_a_uint8_view_of_an_fp4_tensor_is_refused():
     """`.view(float4_e2m1fn_x2)` of a uint8 device tensor keeps the uint8
     buffer, half of what the x2 shape resolves to on the device; raw transfer

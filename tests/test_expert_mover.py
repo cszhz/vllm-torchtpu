@@ -265,3 +265,51 @@ def test_scale_tables_move_whole_and_patch_a_slot_block_of_rows():
             torch.testing.assert_close(dst[: 3 * rows], before_b[: 3 * rows])
             torch.testing.assert_close(dst[4 * rows :], before_b[4 * rows :])
     assert movers[1].last_report["tables"] == 2
+
+
+def test_raw_host_memory_is_viewed_bound_and_pooled_by_ownership(monkeypatch):
+    """The raw transport's `raw` host memory: a RawHostBuffer is bound to the
+    device (allocating) through a tiny anchor, viewed as a contiguous uint8
+    tensor of the requested shape, and pooled on release by ownership rather
+    than by torch's is_pinned(), which such views do not report."""
+    pytest.importorskip("tpu_sync.api.torch.raw_transfer")
+    import ctypes
+
+    from tpu_sync.api.torch import raw_transfer
+
+    bound = []
+
+    class FakeRawHostBuffer:
+        def __init__(self, size_bytes):
+            self._mem = (ctypes.c_uint8 * size_bytes)()
+            self.size_bytes = size_bytes
+
+        @property
+        def data_ptr(self):
+            assert bound, "data_ptr read before the buffer was bound"
+            return ctypes.addressof(self._mem)
+
+    class FakePrepared:
+        def __init__(self, anchor, buf, **kw):
+            bound.append((tuple(anchor.shape), buf.size_bytes))
+
+    monkeypatch.setattr(raw_transfer, "RawHostBuffer", FakeRawHostBuffer, raising=False)
+    monkeypatch.setattr(
+        raw_transfer, "PreparedTorchRawTransfer", FakePrepared, raising=False
+    )
+    monkeypatch.setattr(
+        raw_transfer, "major_slice_bytes", lambda t, **kw: 64, raising=False
+    )
+    tr = mv.RawTransferTransport(host_memory="raw")
+    host = tr._take((2, 64), torch.device("cpu"))
+    assert (
+        tuple(host.shape) == (2, 64)
+        and host.is_contiguous()
+        and host.dtype == torch.uint8
+    )
+    assert bound == [((8,), 128)]  # one bind of a 128-byte buffer through the anchor
+    assert tr._ours(host) and not tr._ours(torch.empty(3, dtype=torch.uint8))
+    tr.release(host)
+    assert tr._take((2, 64), torch.device("cpu")) is host  # pooled and reused
+    tr.release(torch.empty((2, 64), dtype=torch.uint8))  # foreign: not pooled
+    assert tr.pooled_bytes() == 0

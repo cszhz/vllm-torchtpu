@@ -791,7 +791,9 @@ def arm(
             expert_placement.configured_value(),
         )
         return None
-    transport = expert_mover.make_transport(envs.TPU_MOE_EPLB_MOVER)
+    transport = expert_mover.make_transport(
+        envs.TPU_MOE_EPLB_MOVER, host_memory=envs.TPU_MOE_EPLB_MOVER_HOST_MEMORY
+    )
     ranks = (
         list(ep_global_ranks) if ep_global_ranks is not None else list(range(ep_world))
     )

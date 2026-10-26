@@ -38,6 +38,7 @@ layer's output after the install is the static layout's bit for bit.
 
 from __future__ import annotations
 
+import ctypes
 import threading
 import time
 from typing import Any
@@ -115,6 +116,29 @@ def _pinned(shape) -> torch.Tensor:
         return torch.empty(shape, dtype=torch.uint8)
 
 
+# RawHostBuffer owners by the data pointer of the tensor viewing them: the
+# pool keeps the tensors, this keeps their memory alive.
+_RAW_HOST_OWNERS: dict[int, object] = {}
+
+
+def _raw_host(rt, shape, anchor: torch.Tensor) -> torch.Tensor:
+    """A uint8 tensor over tpu-sync's own pinned host memory (`RawHostBuffer`
+    in PJRT's pinned_host space, the memory libtpu DMAs to without a staged
+    copy), the way the Engram host transfer allocates. torch's
+    `pin_memory=True` is whatever the accelerator hooks make of it. The buffer
+    allocates when bound to a device, which `PreparedTorchRawTransfer` does
+    against `anchor`, a tiny tensor on the weights' device."""
+    nbytes = 1
+    for d in shape:
+        nbytes *= int(d)
+    buf = rt.RawHostBuffer(nbytes)
+    rt.PreparedTorchRawTransfer(anchor, buf)  # binds (allocates); the hold is dropped
+    owner = (ctypes.c_uint8 * buf.size_bytes).from_address(buf.data_ptr)
+    t = torch.frombuffer(owner, dtype=torch.uint8)[:nbytes].view(*shape)
+    _RAW_HOST_OWNERS[t.data_ptr()] = buf
+    return t
+
+
 class TorchTransport:
     """Slices through torch, as logical bytes: the test path on CPU tensors,
     and the fallback where tpu-sync is not importable. Host buffers are
@@ -151,13 +175,20 @@ class RawTransferTransport(TorchTransport):
     asynchronously (a PjRtCopyFuture per copy), paced by the library so a copy
     never parks the step's kernel launches."""
 
-    def __init__(self) -> None:
+    def __init__(self, host_memory: str = "torch") -> None:
         from tpu_sync.api.torch import raw_transfer
 
+        if host_memory not in ("torch", "raw"):
+            raise ValueError(
+                f"host_memory must be 'torch' or 'raw'; got {host_memory!r}"
+            )
+        self.host_memory = host_memory
+        self._anchor: torch.Tensor | None = None  # binds RawHostBuffers to the device
         # Pinning host memory costs milliseconds per buffer, and the whole
         # scale-table images are tens of MB each, so buffers are pooled by
         # shape across generations rather than pinned anew on the main thread.
         self._pool: dict[tuple[int, ...], list[torch.Tensor]] = {}
+        self._owned: set[int] = set()  # data pointers of buffers this pool made
         self._lock = threading.Lock()
         # Pinned copies made for unpinned h2d sources; `release_pending`
         # returns them to the pool once the mover's generation is done.
@@ -182,15 +213,32 @@ class RawTransferTransport(TorchTransport):
     def slice_bytes(self, t: torch.Tensor) -> int:
         return int(self._rt.major_slice_bytes(t))
 
-    def _take(self, shape: tuple[int, ...]) -> torch.Tensor:
+    def _take(self, shape: tuple[int, ...], device=None) -> torch.Tensor:
         with self._lock:
             free = self._pool.get(shape)
             if free:
                 return free.pop()
-        return _pinned(shape)
+        if self.host_memory == "raw":
+            if self._anchor is None:
+                self._anchor = torch.zeros(8, dtype=torch.uint8, device=device)
+            host = _raw_host(self._rt, shape, self._anchor)
+        else:
+            host = _pinned(shape)
+        with self._lock:
+            self._owned.add(host.data_ptr())
+        return host
+
+    def _ours(self, host: torch.Tensor) -> bool:
+        with self._lock:
+            if host.data_ptr() in self._owned:
+                return True
+        try:
+            return bool(host.is_pinned())
+        except Exception:  # noqa: BLE001 - no accelerator hooks: not pinned
+            return False
 
     def release(self, host: torch.Tensor) -> None:
-        if not host.is_pinned():
+        if not self._ours(host):
             return
         with self._lock:
             self._pool.setdefault(tuple(host.shape), []).append(host)
@@ -205,7 +253,7 @@ class RawTransferTransport(TorchTransport):
             return sum(t.numel() for free in self._pool.values() for t in free)
 
     def d2h(self, t: torch.Tensor, first: int, count: int):
-        host = self._take((count, self.slice_bytes(t)))
+        host = self._take((count, self.slice_bytes(t)), t.device)
         future = self._rt.transfer_d2h_async(
             t,
             host,
@@ -216,8 +264,8 @@ class RawTransferTransport(TorchTransport):
         return future, host
 
     def h2d(self, host: torch.Tensor, t: torch.Tensor, first: int):
-        if not host.is_pinned():
-            pinned = self._take(tuple(host.shape))
+        if not self._ours(host):
+            pinned = self._take(tuple(host.shape), t.device)
             pinned.copy_(host)
             host = pinned
             self._pending_release.append(pinned)
@@ -240,15 +288,17 @@ def _on_tpu() -> bool:
         return False
 
 
-def make_transport(kind: str):
+def make_transport(kind: str, host_memory: str = "torch"):
     """`raw_transfer` (the default) or `torch`. Without a usable tpu-sync the
     raw transport falls back to torch only where there is no TPU (tests,
     chip-less hosts): on a device torch cannot move the fp4 pair dtype, so
-    the error surfaces and the dynamic re-layout stays off."""
+    the error surfaces and the dynamic re-layout stays off. `host_memory`
+    picks the raw transport's host buffers: `torch` (pin_memory=True) or
+    `raw` (tpu-sync's RawHostBuffer)."""
     if kind == "torch":
         return TorchTransport()
     try:
-        return RawTransferTransport()
+        return RawTransferTransport(host_memory=host_memory)
     except ImportError as e:
         if _on_tpu():
             raise
@@ -421,6 +471,9 @@ class SlabMover:
         self._failed = False
         self._cancel = threading.Event()
         self._phase = "idle"
+        self._pumps = 0
+        self._pump_s = 0.0
+        self._pump_max_s = 0.0
         self._thread: threading.Thread | None = None
         self._thread_done = threading.Event()
         self._thread_error: BaseException | None = None
@@ -526,6 +579,7 @@ class SlabMover:
         if self._cancel.is_set():
             self._phase = "idle"
             return
+        t0 = time.perf_counter()
         try:
             getattr(self, f"_pump_{self._phase}")()
         except Exception:  # noqa: BLE001 - reported through failed()
@@ -534,6 +588,11 @@ class SlabMover:
             )
             self._failed = True
             self._phase = "idle"
+        finally:
+            dt = time.perf_counter() - t0
+            self._pumps += 1
+            self._pump_s += dt
+            self._pump_max_s = max(self._pump_max_s, dt)
 
     def staged_generation(self) -> int:
         return self._staged
@@ -672,10 +731,14 @@ class SlabMover:
             "sent_bytes": sent,
             "tables": len(self._tables),
             "seconds": seconds,
+            "pumps": self._pumps,
+            "pump_seconds": self._pump_s,
+            "pump_max_seconds": self._pump_max_s,
         }
         logger.info(
             "expert mover | rank %d staged generation %s: %d in / %d out, "
-            "%.1f MB received, %.1f MB sent, %d tables re-imaged, %.2f s",
+            "%.1f MB received, %.1f MB sent, %d tables re-imaged, %.2f s; "
+            "%d pumps on the step thread, %.0f ms total, %.1f ms max",
             self.rank,
             self._gen,
             len(self._in_moves),
@@ -684,7 +747,11 @@ class SlabMover:
             sent / 1e6,
             len(self._tables),
             seconds,
+            self._pumps,
+            self._pump_s * 1e3,
+            self._pump_max_s * 1e3,
         )
+        self._pumps, self._pump_s, self._pump_max_s = 0, 0.0, 0.0
         for host in self._to_release:
             self.transport.release(host)
         self._to_release = []
