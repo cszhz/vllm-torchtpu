@@ -484,6 +484,7 @@ def fused_ep_moe_v2(
     dispatch="all_gather",
     dispatch_groups=1,
     plan="xla",
+    sc_scatter=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -1080,7 +1081,7 @@ def fused_ep_moe_v2(
         ):
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
         merged_scale_bits = None
-        if use_split_sc:
+        if use_sc_scatter:
             from vllm_torchtpu.kernels.fused_moe.v2.scatter import scatter_pair
 
             # Under the all-to-all the rows arrived out of token order: token
@@ -1250,16 +1251,32 @@ def fused_ep_moe_v2(
     )
     from vllm_torchtpu.kernels.fused_moe.v2.scatter import can_scatter_pair
 
-    use_split_sc = (
-        preprocess_topology is not None
-        and stage == "fused"
-        and weight_format == WeightFormat.FP4
-        and supports_activation_gather(t_local * hidden)
-        and can_scatter_pair(
+    def pair_scatter_fits():
+        """Whether the SparseCore pair scatter can hold this shape.
+
+        Called last of the conjunctions below, because it reads the chip's
+        SparseCore geometry: a CPU trace never reaches it unless something
+        asked for the kernel.
+        """
+        return can_scatter_pair(
             T * topk,
             ragged_stride,
             act_scale_slab_rows(ragged_stride) * HIDDEN_LANE_BLOCK,
         )
+
+    eligible_sc = stage == "fused" and weight_format == WeightFormat.FP4
+    use_split_sc = (
+        preprocess_topology is not None
+        and eligible_sc
+        and supports_activation_gather(t_local * hidden)
+        and pair_scatter_fits()
+    )
+    # The pair scatter needs a SparseCore and nothing else. The topology
+    # preprocessing above needs eight ranks on two adjacent chips, which is
+    # why the two used to be armed together and why the scatter has never run
+    # at a wide EP width; this arms it on its own.
+    use_sc_scatter = use_split_sc or (
+        sc_scatter and eligible_sc and pair_scatter_fits()
     )
 
     def gather_payload(packed):
@@ -1630,6 +1647,7 @@ def fused_ep_moe_v2(
         token_layout,
         bool(sharded_plan),
         plan,
+        bool(sc_scatter),
         x.dtype,
         w1.dtype,
         w2.dtype,

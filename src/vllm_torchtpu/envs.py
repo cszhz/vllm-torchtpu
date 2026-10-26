@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_BARRIER_ROUNDS: int = 2
     MOE_FUSED_EP_KERNEL_TAIL_BARRIER: bool = True
     MOE_FUSED_EP_PLAN: str = "xla"
+    MOE_FUSED_EP_SC_SCATTER: bool = False
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
@@ -767,6 +768,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_PLAN": env_with_choices(
         "MOE_FUSED_EP_PLAN", "xla", ["xla", "kernel"]
     ),
+    # Scatter the routing plan's two slab tables -- the token gather and the
+    # activation row scales -- with one SparseCore kernel (v2/scatter.py)
+    # instead of two XLA scatters of the same index. Same tables bit for bit.
+    # Independent of MOE_FUSED_EP_PREPROCESS_BACKEND, which arms this kernel
+    # only alongside a topology the wide-EP widths do not have.
+    "MOE_FUSED_EP_SC_SCATTER": env_bool("MOE_FUSED_EP_SC_SCATTER"),
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its

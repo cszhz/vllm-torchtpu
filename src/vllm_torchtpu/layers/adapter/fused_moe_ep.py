@@ -192,6 +192,7 @@ def _build_op(
     dispatch="all_gather",
     dispatch_groups=1,
     plan="xla",
+    sc_scatter=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -225,6 +226,7 @@ def _build_op(
         dispatch,
         dispatch_groups,
         plan,
+        sc_scatter,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -269,6 +271,7 @@ def _build_op(
             dispatch=dispatch,
             dispatch_groups=dispatch_groups,
             plan=plan,
+            sc_scatter=sc_scatter,
             **bias_kw,
             **routing_kw,
         )
@@ -809,6 +812,7 @@ def prebuild_fused_moe_ep(
         dispatch=envs.MOE_FUSED_EP_DISPATCH,
         dispatch_groups=envs.MOE_FUSED_EP_DISPATCH_GROUPS,
         plan=envs.MOE_FUSED_EP_PLAN,
+        sc_scatter=envs.MOE_FUSED_EP_SC_SCATTER,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

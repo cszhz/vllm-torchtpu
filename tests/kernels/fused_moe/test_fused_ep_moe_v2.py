@@ -1463,6 +1463,67 @@ def test_all_to_all_dispatch_is_bit_exact_at_the_dp32_shape(dispatch):
 # the layer's output is too, under every dispatch.
 
 
+# The SparseCore pair scatter (v2/scatter.py) writes the token gather and the
+# activation row-scale slab in one kernel. It was reachable only alongside the
+# split-SparseCore preprocessing, which needs eight ranks on two adjacent
+# chips, so nothing exercised it; MOE_FUSED_EP_SC_SCATTER arms it on its own.
+
+
+@pytest.mark.parametrize("dispatch", ("all_gather",) + EXCHANGES)
+def test_sc_scatter_is_bit_exact_at_the_dp32_shape(dispatch):
+    mesh = _mesh()
+    rng = np.random.default_rng(95)
+    x, gating, _, _, placed_weights, slot_table, common = _placed_fp4_case(
+        mesh,
+        rng,
+        e_total=96,
+        spare=1,
+        tokens=1152,
+        hidden=1024,
+        inter=512,
+        topk=6,
+        routing="score_bias",
+    )
+    placed = dict(expert_slot=jnp.asarray(slot_table))
+    two = _served(x, gating, placed_weights, dispatch=dispatch, **placed, **common)
+    one = _served(
+        x, gating, placed_weights, dispatch=dispatch, sc_scatter=True, **placed, **common
+    )
+    np.testing.assert_array_equal(np.asarray(one), np.asarray(two))
+
+
+def test_sc_scatter_composes_with_the_plan_kernel():
+    """Both knobs on: one SparseCore scatter over the plan kernel's rows."""
+    mesh = _mesh()
+    rng = np.random.default_rng(99)
+    x, gating, _, _, placed_weights, slot_table, common = _placed_fp4_case(
+        mesh,
+        rng,
+        e_total=96,
+        spare=1,
+        tokens=1152,
+        hidden=1024,
+        inter=512,
+        topk=6,
+        routing="score_bias",
+    )
+    placed = dict(expert_slot=jnp.asarray(slot_table))
+    base = _served(
+        x, gating, placed_weights, dispatch="pallas_all_to_all", **placed, **common
+    )
+    both = _served(
+        x,
+        gating,
+        placed_weights,
+        dispatch="pallas_all_to_all",
+        plan="kernel",
+        sc_scatter=True,
+        **placed,
+        **common,
+    )
+    np.testing.assert_array_equal(np.asarray(both), np.asarray(base))
+
+
 @pytest.mark.parametrize("dispatch", ("all_gather",) + EXCHANGES)
 def test_plan_kernel_is_bit_exact_at_the_dp32_shape(dispatch):
     """96 experts over 8 shards with one spare slot each and 1152 tokens."""
