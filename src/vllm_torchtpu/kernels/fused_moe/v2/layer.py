@@ -1358,13 +1358,20 @@ def fused_ep_moe_v2(
                 oneshot_all_gather,
             )
 
+            # Whole (8, 128) int32 HBM tiles per source: a one-row block per
+            # core is a partial-tile DMA destination (it faulted the slice).
+            width = layout[-1]
+            padded = align_up(width, 8 * HIDDEN_LANE_BLOCK)
+            blocks = jnp.pad(packed, (0, padded - width)).reshape(
+                padded // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK
+            )
             exchange = oneshot_all_gather(
-                packed[None, :],
+                blocks,
                 num_cores=ep,
                 axis=ax,
                 rank=rank_l[0, 0],
                 skip_device_barrier=small_ar_form[2],
-            ).reshape(ep, layout[-1])
+            ).reshape(ep, padded)[:, :width]
         else:
             exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
                 ep, layout[-1]
