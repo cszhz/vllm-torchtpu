@@ -23,7 +23,7 @@ perf steps take. The integration pipeline also runs the lane, because its LKG
 promotion waits on two of its steps.
 
 Releases and nightly images are published by the `vllm-torchtpu-release`
-pipeline in the TPU Release cluster; [`release/README.md`](release/README.md)
+pipeline in the TPU Release cluster; [`release/README.md`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/release/README.md)
 has how to cut a release. Its nightly step runs
 `scripts/publish_nightly_images.sh` on `main`, pushing the `ci`, `dev` and
 `prod` images to GAR as `nightly-YYYYMMDD` and `latest`, and the `dev` image to
