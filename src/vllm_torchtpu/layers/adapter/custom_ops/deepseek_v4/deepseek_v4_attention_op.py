@@ -46,10 +46,6 @@ BATCH_AXIS = None
 # Kernel tuning (decode, prefill, mixed), from microbenchmark results.
 SWA_KV_PAGES_PER_BLOCK = (2, 2, 2)
 HCA_KV_PAGES_PER_BLOCK = (128, 64, 64)
-# Largest step (in tokens) whose CSA SWA pass branches around its prefill/mixed
-# launches when the step is decode-only. Bigger steps carry prefill rows, and
-# without the branch their SWA kernels run under the SparseCore gathers.
-CSA_SWA_DECODE_ONLY_COND_MAX_TOKENS = 128
 # Largest HCA kv block the SWA batched decode kernel takes in: 256 tokens
 # overflows VMEM at 128 heads and 1024 tokens.
 HCA_FUSED_MAX_KV_TOKENS = 128
@@ -78,7 +74,6 @@ def _run_swa(
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
     lane_padded_lm: bool = False,
-    skip_non_decode_by_cond: bool = True,
     **hca,
 ) -> tuple[jax.Array, ...]:
     """Sliding-window pass: updates the SWA cache and returns its partials.
@@ -116,7 +111,6 @@ def _run_swa(
         non_causal_block=non_causal_block,
         chunk_prefill_size=verify_q_len,
         lane_padded_lm=lane_padded_lm,
-        skip_non_decode_by_cond=skip_non_decode_by_cond,
         **hca,
     )
 
@@ -329,7 +323,6 @@ def _attention_csa(
         # The sparse kernel reads l/m at 128 lanes; skip the slice-then-pad.
         lane_padded_lm=True,
         **({"decode_by_caller": True} if swa_in_sparse else {}),
-        skip_non_decode_by_cond=q.shape[0] <= CSA_SWA_DECODE_ONLY_COND_MAX_TOKENS,
     )
     swa_output, updated_sw_cache, swa_l, swa_m = swa_results[:4]
     swa_kwargs = {}
