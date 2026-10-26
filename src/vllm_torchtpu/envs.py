@@ -201,6 +201,7 @@ if TYPE_CHECKING:
     TPU_DSV4_CSA_WINDOW_MIXED: bool = False
     TPU_DSV4_CSA_WINDOW_MIXED_ABOVE: int = 256
     TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS: int = 32
+    TPU_DSV4_CSA_WINDOW_MIXED_GROUPS: int = 1
     TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
     TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
     TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4: int = 0
@@ -1374,6 +1375,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_CSA_WINDOW_MIXED": env_bool("TPU_DSV4_CSA_WINDOW_MIXED"),
     "TPU_DSV4_CSA_WINDOW_MIXED_ABOVE": env_int("TPU_DSV4_CSA_WINDOW_MIXED_ABOVE", 256),
     "TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS": env_int("TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS", 32),
+    # Window groups per step: one SparseCore call per group, so group g + 1's
+    # dedup/gather runs under group g's TensorCore attention (1 = one call).
+    "TPU_DSV4_CSA_WINDOW_MIXED_GROUPS": env_int("TPU_DSV4_CSA_WINDOW_MIXED_GROUPS", 1),
     "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS": env_int(
         "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS", 512
     ),

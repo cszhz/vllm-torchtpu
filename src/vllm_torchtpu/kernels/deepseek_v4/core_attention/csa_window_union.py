@@ -165,7 +165,7 @@ def window_meta(cu_q_lens, distribution, kv_lens, *, num_tokens, s_cap, lanes=No
     return jnp.concatenate([row0, wrows, arows], axis=0).reshape(-1)
 
 
-def _wave_rows(nw, q0, qn, seq_b, S, *, nw_cap, workers, waves, L, max_team=None):
+def _wave_rows(nw, q0, qn, seq_b, S, *, nw_cap, workers, waves, L, max_team=None, slot=None):
     """Assignment rows of `waves` waves (i32[waves * workers, L]): wave k takes
     windows [k * workers, k * workers + n_k), n_k = clip(nw - k * workers, 0,
     workers), G_k = workers // n_k subcores per window (a short last wave splits
@@ -184,11 +184,14 @@ def _wave_rows(nw, q0, qn, seq_b, S, *, nw_cap, workers, waves, L, max_team=None
         aj = wid % G
         magic = (65536 + G - 1) // G
         wsafe = jnp.minimum(aw, nw_cap - 1)
-        rows.append(jnp.zeros((workers, L), jnp.int32).at[:, :9].set(
-            jnp.stack([aw, aj, jnp.full_like(wid, G), jnp.full_like(wid, magic),
-                       jnp.where(live_w, q0[wsafe], 0), jnp.where(live_w, qn[wsafe], 0),
-                       jnp.where(live_w, seq_b[wsafe], 0), jnp.where(live_w, S[wsafe], 0),
-                       jnp.full_like(wid, nw)], axis=1).astype(jnp.int32)))
+        cols = [aw, aj, jnp.full_like(wid, G), jnp.full_like(wid, magic),
+                jnp.where(live_w, q0[wsafe], 0), jnp.where(live_w, qn[wsafe], 0),
+                jnp.where(live_w, seq_b[wsafe], 0), jnp.where(live_w, S[wsafe], 0),
+                jnp.full_like(wid, nw)]
+        if slot is not None:
+            cols.append(jnp.where(live_w, slot[wsafe], 0))
+        rows.append(jnp.zeros((workers, L), jnp.int32).at[:, :len(cols)].set(
+            jnp.stack(cols, axis=1).astype(jnp.int32)))
     return jnp.concatenate(rows, axis=0)
 
 
@@ -292,6 +295,7 @@ def _union_gather_kernel(
     nz_shifts: int = 4,
     waves: int = 1,
     workers: int = 32,
+    slot_meta: bool = False,
 ):
     # version 0: as first measured (j-6e9128d7). version 1: top-k / page-table
     # DMAs concurrent with the zero pass, zero pass 8 stores per iteration,
@@ -475,7 +479,8 @@ def _union_gather_kernel(
             cpm = div_g(nch + G - 1)
             c0 = jnp.minimum(j * cpm, nch)
             n = jnp.minimum(c0 + cpm, nch) - c0
-            row0 = q0 * TILE
+            ts = a[9] if slot_meta else q0  # first gathered tile of this window
+            row0 = ts * TILE
 
             def g_descs(i, s):
                 off = pl.multiple_of((c0 + i) * L, L)
@@ -487,7 +492,7 @@ def _union_gather_kernel(
 
             def o_descs(i, s, half=0):
                 r0 = (c0 + i) * L
-                rr = (q0 + srl(r0, 10)) * (TILE // 4) + srl(r0 & (TILE // 2 - 1), 1)
+                rr = (ts + srl(r0, 10)) * (TILE // 4) + srl(r0 & (TILE // 2 - 1), 1)
                 return (
                     pltpu.make_async_copy(
                         gnope.at[s], nope_out.at[pl.ds(row0 + r0, L)], so.at[0, s]
@@ -562,7 +567,7 @@ def _union_gather_kernel(
 @functools.partial(
     jax.jit,
     static_argnames=("num_tokens", "max_num_seqs", "skip_gather", "stop_after", "version",
-                     "mask_sb_major", "_nz_shifts"),
+                     "mask_sb_major", "_nz_shifts", "n_tiles", "nw_cap_override"),
 )
 def union_gather(
     meta: jax.Array,
@@ -578,6 +583,8 @@ def union_gather(
     version: int = 2,
     mask_sb_major: bool = False,
     _nz_shifts: int = 4,
+    n_tiles: int | None = None,
+    nw_cap_override: int | None = None,
 ):
     """L1. Returns nope_g, rope_g, mask i32[T, W_WORDS], ucnt (module docstring).
 
@@ -589,8 +596,12 @@ def union_gather(
     assert num_tokens * TILE // 4 * 4 == num_tokens * TILE
     L, nc, ns = sc_geometry()
     workers = nc * ns
-    nw_cap = nw_cap_for(T, max_num_seqs)
+    # n_tiles / nw_cap_override: one group of a grouped mixed step (`group_meta`):
+    # the gathered buffer holds n_tiles tiles, window w's at its slot (lane 9).
+    nw_cap = nw_cap_for(T, max_num_seqs) if nw_cap_override is None else nw_cap_override
     waves = cdiv(nw_cap, workers)
+    slot_meta = n_tiles is not None
+    n_tiles = T if n_tiles is None else n_tiles
     assert meta.shape == ((1 + nw_cap + waves * workers) * L,), meta.shape
     page_size = cache_kv_nope.shape[1]
     pps = page_indices.shape[0] // max_num_seqs
@@ -623,10 +634,11 @@ def union_gather(
             nz_shifts=_nz_shifts,
             waves=waves,
             workers=workers,
+            slot_meta=slot_meta,
         ),
         out_type=(
-            jax.ShapeDtypeStruct((T * TILE, LANES), jnp.int32),
-            jax.ShapeDtypeStruct((T * TILE // 4, LANES), jnp.int32),
+            jax.ShapeDtypeStruct((n_tiles * TILE, LANES), jnp.int32),
+            jax.ShapeDtypeStruct((n_tiles * TILE // 4, LANES), jnp.int32),
             jax.ShapeDtypeStruct((T * W_WORDS,), jnp.int32),
             jax.ShapeDtypeStruct((nw_cap * L,), jnp.int32),
         ),
@@ -659,6 +671,83 @@ def union_gather(
         # is free for T % 8 == 0: mask[sb, t] = words [128 sb, 128 sb + 128).
         return nope_g, rope_g, mask.reshape(W_WORDS // LANES, T, LANES), ucnt
     return nope_g, rope_g, mask.reshape(T, W_WORDS), ucnt
+
+
+def group_meta(cu_q_lens, distribution, kv_lens, *, num_tokens, s_cap, groups, g):
+    """Meta of group g of `groups` (windows [g * nw // groups, (g + 1) * nw // groups)
+    of the step), for a grouped mixed step: the SparseCore call of group g + 1
+    runs under the TensorCore call of group g. Window rows are the group's
+    (local index); window i's gathered tiles start at slot i * MAX_TILES of the
+    group's buffer (lane 9 of its assignment row, `tslot` for the TensorCore).
+    Returns (meta, tslot i32[T], nwc) with nwc the group's window capacity."""
+    L, nc, ns = sc_geometry()
+    workers = nc * ns
+    nseq = cu_q_lens.shape[0] - 1
+    kv_lens = kv_lens[:nseq]
+    nw_cap = nw_cap_for(num_tokens, nseq)
+    nwc = cdiv(nw_cap, groups) + 1
+    seq_ids = jnp.arange(nseq, dtype=jnp.int32)
+    qlen = cu_q_lens[1:] - cu_q_lens[:-1]
+    live = (seq_ids < distribution[2]) & (qlen > 0)
+    nwin = jnp.where(live, (qlen + WQ - 1) // WQ, 0)
+    wend = jnp.cumsum(nwin)
+    nw = wend[-1]
+    lo = (g * nw) // groups
+    hi = ((g + 1) * nw) // groups
+    n_g = hi - lo
+    b = lo + jnp.arange(nwc, dtype=jnp.int32)
+    seq_b = jnp.clip(jnp.searchsorted(wend, b, side="right"), 0, nseq - 1).astype(jnp.int32)
+    j = b - (wend[seq_b] - nwin[seq_b])
+    q0 = cu_q_lens[seq_b] + j * WQ
+    qn = jnp.where(b < hi, jnp.clip(cu_q_lens[seq_b + 1] - q0, 0, WQ), 0)
+    q0 = jnp.where(qn > 0, q0, 0)
+    S = jnp.where(qn > 0, jnp.minimum(kv_lens[seq_b] + 1, s_cap), 0)
+    slot = jnp.arange(nwc, dtype=jnp.int32) * MAX_TILES_MIXED
+    wrows = jnp.zeros((nwc, L), jnp.int32).at[:, :4].set(
+        jnp.stack([q0, qn, seq_b, S], axis=1).astype(jnp.int32))
+    waves = cdiv(nwc, workers)
+    arows = _wave_rows(n_g, q0, qn, seq_b, S, nw_cap=nwc, workers=workers, waves=waves, L=L, slot=slot)
+    row0 = jnp.zeros((1, L), jnp.int32).at[0, 0].set(n_g)
+    meta = jnp.concatenate([row0, wrows, arows], axis=0).reshape(-1)
+    tslot = jnp.zeros((num_tokens,), jnp.int32).at[jnp.where(qn > 0, q0, num_tokens)].set(
+        slot, mode="drop")
+    return meta, tslot, nwc
+
+
+MAX_TILES_MIXED = 8  # tiles per window slot (U <= 8192 = WQ x TOPK)
+
+
+def prepare_grouped(topk_indices, kv_lens, page_indices, cu_q_lens, distribution,
+                    cache_kv_nope, cache_kv_rope, *, groups):
+    """L1 of a grouped mixed step: one SparseCore call per group."""
+    T = topk_indices.shape[0]
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    pps = page_indices.shape[0] // max_num_seqs
+    s_cap = pps * cache_kv_nope.shape[1]
+    out = []
+    for g in range(groups):
+        meta, tslot, nwc = group_meta(cu_q_lens, distribution, kv_lens, num_tokens=T,
+                                      s_cap=s_cap, groups=groups, g=g)
+        nope_g, rope_g, mask, ucnt = union_gather(
+            meta, topk_indices, page_indices, cache_kv_nope, cache_kv_rope,
+            num_tokens=T, max_num_seqs=max_num_seqs, mask_sb_major=MASK_SB_MAJOR,
+            n_tiles=nwc * MAX_TILES_MIXED, nw_cap_override=nwc)
+        out.append(dict(meta=meta, tslot=tslot, nope_g=nope_g, rope_g=rope_g, mask=mask, ucnt=ucnt))
+    return out
+
+
+def attend_grouped(q, groups_rows, attention_sinks, swa_accumution, swa_l, swa_m, *, sm_scale,
+                   l2_config=None):
+    from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_window_attention
+
+    L, nc, ns = sc_geometry()
+    for rows in groups_rows:
+        q = csa_window_attention.window_attention(
+            q, rows["nope_g"], rows["rope_g"], rows["mask"], rows["meta"], rows["ucnt"],
+            attention_sinks, swa_accumution, swa_l, swa_m, sm_scale=sm_scale,
+            nw_cap=rows["ucnt"].shape[0] // L, tslot=rows["tslot"],
+            **(L2_CONFIG if l2_config is None else l2_config))
+    return q
 
 
 # ----------------------------------------------------------------------------

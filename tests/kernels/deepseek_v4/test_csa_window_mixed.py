@@ -89,19 +89,32 @@ def test_union_gather_waves_bit_exact(name):
         np.testing.assert_array_equal(mk[q0:q0 + qn], plan["mask"][q0:q0 + qn])
 
 
+@pytest.mark.parametrize("arm", ["win", "win_g4"])
 @pytest.mark.parametrize("poison", [False, True])
 @pytest.mark.parametrize("name", ACC_CELLS)
-def test_window_mixed_matches_oracle(name, poison):
+def test_window_mixed_matches_oracle(name, poison, arm):
     cell = K.cell_obj(name)
     inp = K.build_inputs(name)
     d, deq = C.device_inputs(inp, cache="quant", poison=poison)
     want, rows = C.oracle(inp, d, deq)
     inc = np.asarray(jax.jit(K.inc(cell.conc))(d, d["q"]).astype(jnp.float32))
-    cand = np.asarray(jax.jit(K.win(cell.conc))(d, d["q"]).astype(jnp.float32))
+    cand = np.asarray(jax.jit(K.ARMS[arm](cell.conc))(d, d["q"]).astype(jnp.float32))
     ref_err, _, _ = C.gate(inc[rows], want)
     err, ok, tol = C.gate(cand[rows], want, ref_err)
     assert np.isfinite(cand[rows]).all()
-    assert ok, (name, err, tol, ref_err)
+    assert ok, (name, arm, err, tol, ref_err)
+
+
+@pytest.mark.parametrize("name", L1_CELLS)
+def test_grouped_equals_ungrouped_bitwise(name):
+    """Grouping only splits the windows over calls: same windows, same per-window order -> identical bits."""
+    cell = K.cell_obj(name)
+    inp = K.build_inputs(name)
+    d, _ = C.device_inputs(inp, cache="quant")
+    a = np.asarray(jax.jit(K.win(cell.conc))(d, d["q"]).astype(jnp.float32))
+    for g in (K.win_g2, K.win_g4):
+        b = np.asarray(jax.jit(g(cell.conc))(d, d["q"]).astype(jnp.float32))
+        np.testing.assert_array_equal(a, b)
 
 
 def test_positive_control_truncated_union_fails():

@@ -338,6 +338,20 @@ def _attention_hca_rope(
     )
 
 
+def _window_mixed_prepare(topk, kv_lens, page_indices, cu_q_lens, distribution,
+                          cache_kv, cache_rope, groups):
+    """L1 of the mixed-bucket union-of-window route: one SparseCore call, or one
+    per group (`groups` > 1) so group g + 1's runs under group g's attention."""
+    if groups > 1:
+        return csa_window_union.prepare_grouped(
+            topk, kv_lens, page_indices, cu_q_lens, distribution, cache_kv,
+            cache_rope, groups=groups,
+        )  # fmt: skip
+    return csa_window_union.prepare(
+        topk, kv_lens, page_indices, cu_q_lens, distribution, cache_kv, cache_rope,
+    )  # fmt: skip
+
+
 def _attention_csa(
     q: jax.Array,
     new_kv: jax.Array,
@@ -379,6 +393,7 @@ def _attention_csa(
     window_mixed: bool = False,
     window_mixed_above: int = 256,
     window_mixed_min_heads: int = 32,
+    window_mixed_groups: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -497,9 +512,9 @@ def _attention_csa(
     )
     union_rows = None
     if use_window_mixed and not two_caches_same_buffer:
-        union_rows = csa_window_union.prepare(
+        union_rows = _window_mixed_prepare(
             extra, main_kv_lens, main_page_indices, main_cu_q_lens,
-            main_distribution, main_cache_kv, main_cache_rope,
+            main_distribution, main_cache_kv, main_cache_rope, window_mixed_groups,
         )  # fmt: skip
     if use_union_verify and union_verify_early and not two_caches_same_buffer:
         union_rows = csa_window_union.prepare(
@@ -510,7 +525,25 @@ def _attention_csa(
         (extra, swa_output, union_plan, union_rows)
     )
 
-    if use_union_verify or use_window_mixed:
+    if use_window_mixed:
+        if union_rows is None:
+            union_rows = _window_mixed_prepare(
+                extra, main_kv_lens, main_page_indices, main_cu_q_lens,
+                main_distribution, main_cache_kv, main_cache_rope, window_mixed_groups,
+            )  # fmt: skip
+        if window_mixed_groups > 1:
+            output = csa_window_union.attend_grouped(
+                q, union_rows, attention_sinks, swa_output, swa_l, swa_m,
+                sm_scale=sm_scale,
+            )  # fmt: skip
+        else:
+            output = csa_window_union.attend(
+                q, union_rows, attention_sinks, swa_output, swa_l, swa_m,
+                sm_scale=sm_scale,
+            )  # fmt: skip
+        return output, updated_sw_cache
+
+    if use_union_verify:
         if union_rows is None:
             union_rows = csa_window_union.prepare(
                 extra, main_kv_lens, main_page_indices, main_cu_q_lens,

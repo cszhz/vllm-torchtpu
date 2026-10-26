@@ -180,6 +180,14 @@ def win(conc):
     return _region(conc, window_mixed=True, window_mixed_above=256, window_mixed_min_heads=1)
 
 
+def win_g2(conc):
+    return _region(conc, window_mixed=True, window_mixed_above=256, window_mixed_min_heads=1, window_mixed_groups=2)
+
+
+def win_g4(conc):
+    return _region(conc, window_mixed=True, window_mixed_above=256, window_mixed_min_heads=1, window_mixed_groups=4)
+
+
 def sparse(conc):
     """Reference arm: union-dense off (the per-token sparse path)."""
     return _region(conc, union_dense=False)
@@ -223,4 +231,4 @@ def inc_bf16p(conc):
     return _patched(inc(conc), ud, PV_BF16=True)
 
 
-ARMS = {"inc": inc, "win": win, "sparse": sparse, "win_l1": win_l1, "win_bf16p": win_bf16p, "inc_bf16p": inc_bf16p}
+ARMS = {"inc": inc, "win": win, "win_g2": win_g2, "win_g4": win_g4, "sparse": sparse, "win_l1": win_l1, "win_bf16p": win_bf16p, "inc_bf16p": inc_bf16p}

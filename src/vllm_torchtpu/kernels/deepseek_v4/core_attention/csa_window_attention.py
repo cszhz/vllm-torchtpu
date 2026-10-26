@@ -122,6 +122,7 @@ def _kernel(
     sub: int = 256,
     mask_sb: bool = False,
     tails: tuple = TAIL_ROWS,
+    tslot_ref=None,
 ):
     _, num_q_heads, head_dim = q_hbm_ref.shape
     rows = WQ * num_q_heads
@@ -163,7 +164,7 @@ def _kernel(
             copy(rope_v, rope_v, sems.at[1, slot], True)
             copy(mask_v, mask_v, sems.at[2, slot], True)
             return
-        g = q0 + j
+        g = (q0 if tslot_ref is None else tslot_ref[q0]) + j
         copy(nope_hbm_ref.at[pl.ds(g * TILE, n)], nope_v, sems.at[0, slot], False)
         copy(rope_hbm_ref.at[pl.ds(g * half, nr)], rope_v, sems.at[1, slot], False)
         col = j // blocks_per_super
@@ -941,8 +942,12 @@ def window_attention(
     hbm_pin: bool = False,
     tails: tuple = TAIL_ROWS,
     pin_lm: bool = True,
+    tslot: jax.Array | None = None,
 ) -> jax.Array:
-    """Rows of live windows get CSA attention over their union folded with the
+    """`tslot` (i32[T], grouped mixed steps): window at q0's first gathered tile
+    is tslot[q0] (default q0).
+
+    Rows of live windows get CSA attention over their union folded with the
     SWA partials and the sink; all other rows return q."""
     _, actual_heads, actual_dim = q.shape
     q = prepare_q_inputs(q)
@@ -950,8 +955,12 @@ def window_attention(
     rows = WQ * H
     L = ucnt.shape[0] // nw_cap
     assert ucnt.shape[0] == nw_cap * L and meta.shape[0] >= (1 + nw_cap) * L
-    assert nope_g.shape == (T * TILE, LANES), nope_g.shape
-    assert rope_g.shape == (T * TILE // 4, LANES), rope_g.shape
+    if tslot is None:
+        assert nope_g.shape == (T * TILE, LANES), nope_g.shape
+        assert rope_g.shape == (T * TILE // 4, LANES), rope_g.shape
+    else:
+        assert version != 2 and tslot.shape == (T,), (version, tslot.shape)
+        assert rope_g.shape[0] * 4 == nope_g.shape[0] and nope_g.shape[0] % TILE == 0
     if mask.ndim == 3:  # super-block-major [W / 128, T, 128]
         assert mask.shape[1] == T and mask.shape[2] == LANES and version != 2, mask.shape
     else:
@@ -1017,6 +1026,12 @@ def window_attention(
             scratch += [pltpu.VMEM((TILE, D), jnp.bfloat16),
                         pltpu.VMEM((rows, TILE), jnp.float32)]
     prefetch = (meta.astype(jnp.int32), ucnt.astype(jnp.int32))
+    if tslot is not None:
+        prefetch += (tslot.astype(jnp.int32),)
+        inner = kernel
+
+        def kernel(meta_ref, ucnt_ref, tslot_ref, *refs):
+            return inner(meta_ref, ucnt_ref, *refs, tslot_ref=tslot_ref)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
 
     def pin(x):
