@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Pipeline-parallel paths of TPUModelRunner."""
 
 from unittest.mock import MagicMock
@@ -19,6 +31,7 @@ def _runner(**attrs):
     runner.model_config.dtype = torch.bfloat16
     runner._pp_intermediate_template = None
     runner._pp_topk_buffer = None
+    runner._pp_pending_kv_save_nan_check = None
     for name in (
         "forward_model",
         "_pp_intermediate_tensors",
@@ -127,15 +140,23 @@ class TestTopkHandoff:
 
 class TestIntermediateStageSampleTokens:
     def test_without_a_pending_step_returns_empty(self):
-        runner = _runner(_pp_pending_scheduler_output=None)
+        runner = _runner(
+            _pp_pending_scheduler_output=None,
+            _pp_pending_kv_save_nan_check=object(),
+        )
 
         assert (
             runner._sample_tokens_pp_intermediate_stage() is EMPTY_MODEL_RUNNER_OUTPUT
         )
+        assert runner._pp_pending_kv_save_nan_check is None
 
     def test_reports_kv_connector_progress_for_the_pending_step(self):
         scheduler_output = object()
-        runner = _runner(_pp_pending_scheduler_output=scheduler_output)
+        nan_check = object()
+        runner = _runner(
+            _pp_pending_scheduler_output=scheduler_output,
+            _pp_pending_kv_save_nan_check=nan_check,
+        )
         runner.get_finished_kv_transfers.return_value = (
             {"r1"},
             None,
@@ -147,11 +168,12 @@ class TestIntermediateStageSampleTokens:
 
         output = runner._sample_tokens_pp_intermediate_stage()
 
-        runner.maybe_wait_for_kv_save.assert_called_once_with()
+        runner.maybe_wait_for_kv_save.assert_called_once_with(nan_check)
         runner.get_finished_kv_transfers.assert_called_once_with(scheduler_output)
         assert output is not EMPTY_MODEL_RUNNER_OUTPUT
         assert output.kv_connector_output.finished_sending == {"r1"}
         assert runner._pp_pending_scheduler_output is None
+        assert runner._pp_pending_kv_save_nan_check is None
 
     def test_quiet_connector_returns_empty(self):
         runner = _runner(_pp_pending_scheduler_output=object())

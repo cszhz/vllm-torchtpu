@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -343,14 +354,22 @@ class StructuredDecodingManager:
     def apply_grammar_bitmask(
         self, logits: torch.Tensor, grammar_bitmask: torch.Tensor, arange: torch.Tensor
     ) -> torch.Tensor:
-        assert logits.shape[0] == grammar_bitmask.shape[0]
+        # Both input checks use torch._assert, not assert or raise: it survives
+        # python -O, and under torch.compile(fullgraph=True) the caller still
+        # gets a plain AssertionError with the message.
+        torch._assert(
+            logits.shape[0] == grammar_bitmask.shape[0],
+            "grammar_bitmask must have one row per logits row: "
+            f"logits.shape[0]={logits.shape[0]}, "
+            f"grammar_bitmask.shape[0]={grammar_bitmask.shape[0]}",
+        )
         target_dim = logits.shape[-1]
-        if target_dim < self.vocab_size:
-            raise ValueError(
-                "TPU logits vocab dimension must be at least "
-                f"vocab_size ({self.vocab_size}) (padded to hardware alignment "
-                f"boundary), but got logits.shape[-1]={target_dim}"
-            )
+        torch._assert(
+            target_dim >= self.vocab_size,
+            "TPU logits vocab dimension must be at least "
+            f"vocab_size ({self.vocab_size}) (padded to hardware alignment "
+            f"boundary), but got logits.shape[-1]={target_dim}",
+        )
         # Unpack the bitmask for the entire batch at once.
         # grammar_bitmask: (B, N) where B=num_reqs, N=cdiv(vocab_size, 32)
         # arange: (32,)

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Async MTP contracts across real scheduler, runner and TPU operations.
 
 No model weights are needed. Accelerator initialization is deferred to fixtures.
@@ -82,7 +94,6 @@ def make_runner(device, monkeypatch, k):
         device=torch.device("cpu"),
         vocab_size=512,
         block_sizes=[256],
-        kernel_block_sizes=[256],
         max_num_blocks_per_req=[8],
         num_spec_tokens=k,
     )
@@ -162,7 +173,9 @@ def test_mamba_read_offset_follows_storage_owner(
     runner.cache_config = SimpleNamespace(block_size=256)
     runner._pending_mamba_state_copies = []
     runner._mamba_slot_stride = 4
-    runner.mamba_state_indices_cpu = torch.zeros(2, dtype=torch.int32)
+    runner._unfenced_h2d_sources = []
+    runner._free_h2d_sources = {}
+    runner._registered_h2d_sources = set()
     runner._init_mamba_slot_pool(9)
     if layout == "compact":
         runner._mamba_copy_plan = []

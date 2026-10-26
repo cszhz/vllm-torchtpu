@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """KV-cache spec derivation, page-size padding, budgeting and allocation.
 
 Moved verbatim out of `TPUModelRunner`; see vllm-project/vllm-torchtpu#713.
@@ -223,7 +234,7 @@ class KVCacheManager:
         if has_attention and not self.runner._unified_kv_layout:
             self._update_attention_page_size_padded(layers, block_size)
             if has_mamba:
-                self._update_mamba_page_size_padded(layers)
+                self._update_mamba_page_size_padded(layers, block_size)
 
         hma_enabled = not self.runner.scheduler_config.disable_hybrid_kv_cache_manager
 
@@ -679,7 +690,9 @@ class KVCacheManager:
             self.runner.cache_config.mamba_page_size_padded = attn_page_sizes.pop()
 
     def _update_mamba_page_size_padded(
-        self, layers: dict[str, AttentionLayerBase]
+        self,
+        layers: dict[str, AttentionLayerBase],
+        block_size: int | None = None,
     ) -> None:
         """Pad attention and mamba page sizes so vLLM's num_blocks matches
         what the TPU allocates per layer.
@@ -695,6 +708,8 @@ class KVCacheManager:
         Args:
             layers: A dictionary mapping layer names to their corresponding
                 attention module instances (e.g., `MambaBase`, `Attention`).
+            block_size: Finalized attention block size. Defaults to
+                `self.runner.vllm_config.cache_config.block_size`.
         """
         attn_modules = [
             m for m in layers.values() if isinstance(m, (Attention, MLAAttention))
@@ -713,8 +728,11 @@ class KVCacheManager:
             TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
         )
         assert attention_backend is not None
+        if block_size is None:
+            block_size = self.runner.vllm_config.cache_config.block_size
+        assert block_size is not None
         attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
-            self.runner.block_size,
+            block_size,
             num_kv_heads,
             first_attn_module.head_size,
             self.runner.kv_cache_dtype,
@@ -1099,7 +1117,6 @@ class KVCacheManager:
             kernel_block_sizes = prepare_kernel_block_sizes(
                 kv_cache_config, self.runner.attn_groups
             )
-        self.runner._kernel_block_sizes = kernel_block_sizes
         kernel_block_size_by_gid = build_kernel_block_size_by_group_id(
             kv_cache_config=kv_cache_config,
             kernel_block_sizes=kernel_block_sizes,
