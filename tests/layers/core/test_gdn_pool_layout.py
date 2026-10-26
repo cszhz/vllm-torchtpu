@@ -102,6 +102,7 @@ def test_pooled_prepared_input_crosses_real_shard_map(monkeypatch, prepared):
         kernel_size=4,
         pool_block_tokens=256,
         mesh=mesh,
+        conv_state_dtype=jnp.bfloat16,
     )
     assert plans and len(specs) == 1
     if prepared:
