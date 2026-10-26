@@ -598,8 +598,15 @@ def union_gather(
 # Entry points used by the CSA attention op.
 
 
+# L2 configuration attend() runs (L2 round 3, "v8rpsn"): tile pairs + one narrow
+# (<= 512-row) last-tile body, operands pinned to HBM except l/m, SWA l/m
+# broadcast in-kernel, super-block-major mask (no wrapper reshape/copy).
+L2_CONFIG = dict(version=7, tails=(512,), lm_raw=True, hbm_pin=True, pin_lm=False)
+MASK_SB_MAJOR = True
+
+
 def prepare(topk_indices, kv_lens, page_indices, cu_q_lens, distribution,
-            cache_kv_nope, cache_kv_rope, *, mask_sb_major=False):
+            cache_kv_nope, cache_kv_rope, *, mask_sb_major=MASK_SB_MAJOR):
     """L1 for one CSA layer: window meta (layer-invariant XLA) + the SparseCore
     union/gather call. Needs no q and no SWA output, so the caller can issue it
     ahead of the SWA pass."""
@@ -614,7 +621,7 @@ def prepare(topk_indices, kv_lens, page_indices, cu_q_lens, distribution,
     return dict(meta=meta, nope_g=nope_g, rope_g=rope_g, mask=mask, ucnt=ucnt)
 
 
-def attend(q, rows, attention_sinks, swa_accumution, swa_l, swa_m, *, sm_scale, l2_version=3):
+def attend(q, rows, attention_sinks, swa_accumution, swa_l, swa_m, *, sm_scale, l2_config=None):
     """L2: every live window's tokens attend its union rows (+ SWA partials,
     sink); rows outside every window return q."""
     from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_window_attention
@@ -624,4 +631,4 @@ def attend(q, rows, attention_sinks, swa_accumution, swa_l, swa_m, *, sm_scale, 
     return csa_window_attention.window_attention(
         q, rows["nope_g"], rows["rope_g"], rows["mask"], rows["meta"], rows["ucnt"],
         attention_sinks, swa_accumution, swa_l, swa_m, sm_scale=sm_scale,
-        nw_cap=nw_cap, version=l2_version)
+        nw_cap=nw_cap, **(L2_CONFIG if l2_config is None else l2_config))

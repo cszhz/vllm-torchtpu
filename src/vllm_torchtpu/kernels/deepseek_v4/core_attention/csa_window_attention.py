@@ -40,6 +40,10 @@ valid rows DMAs and attends only that many rows (static body per size).
 `hbm_pin`: constrain the HBM operands to HBM (no XLA VMEM staging copies).
 `version=6`: v4's narrow tail DMA + every tile in column sub-tiles of `sub`
 rows under one fori_loop body (trip = ceil(valid / sub)), bf16 P per sub-tile.
+`version=7`: v3 + v4's narrow body for the window's last tile when it has
+<= 512 valid rows (full pairs run v3's branch unchanged).
+`tails`: the narrow tail sizes of v4 / v7 (v7 with (512,) keeps one narrow
+size: a smaller program).
 `lm_raw`: SWA l / m DMA'd as [qn, H] rows and lane-broadcast in the kernel
 (no XLA per-row broadcast in front of the call).
 `pv_bf16`: P pushed as bf16 (default f32 P x bf16 KV, as SparseMLA / union-dense).
@@ -117,6 +121,7 @@ def _kernel(
     lm_raw: bool = False,
     sub: int = 256,
     mask_sb: bool = False,
+    tails: tuple = TAIL_ROWS,
 ):
     _, num_q_heads, head_dim = q_hbm_ref.shape
     rows = WQ * num_q_heads
@@ -237,17 +242,30 @@ def _kernel(
     def tail_cases(valid):
         """(n, predicate) per tile body: narrow tails 128 / 256 / 512, else full."""
         out, lo = [], 0
-        for n in TAIL_ROWS:
+        for n in tails:
             out.append((n, jnp.logical_and(valid > lo, valid <= n)))
             lo = n
         out.append((TILE, valid > lo))
         return out
 
     def fetch_any(q0, qn, j, slot, U, *, wait=False):
-        if version not in (4, 5, 6):
+        if version not in (4, 5, 6, 7):
             fetch_tile(q0, qn, j, slot, wait=wait)
             return
-        for n, pred in tail_cases(U - j * TILE):
+        valid = U - j * TILE
+        if version == 7:  # full tiles: one branch, narrow cases nested behind it
+            @pl.when(valid > tails[-1])
+            def _():
+                fetch_tile(q0, qn, j, slot, wait=wait)
+
+            @pl.when(valid <= tails[-1])
+            def _():
+                for n, pred in tail_cases(valid)[:-1]:
+                    @pl.when(pred)
+                    def _():
+                        fetch_tile(q0, qn, j, slot, wait=wait, n=n)
+            return
+        for n, pred in tail_cases(valid):
             @pl.when(pred)
             def _():
                 fetch_tile(q0, qn, j, slot, wait=wait, n=n)
@@ -382,7 +400,7 @@ def _kernel(
     st_ref[_BO_QN + 1] = 0
     st_ref[_PENDING] = -1
 
-    if version in (1, 3, 4, 5, 6):  # window 0's q / SWA (later windows: prefetched)
+    if version in (1, 3, 4, 5, 6, 7):  # window 0's q / SWA (later windows: prefetched)
         @pl.when(nw > 0)
         def _():
             q0, qn, _, _ = win(0)
@@ -390,7 +408,7 @@ def _kernel(
 
     def window_body(w, _):
         q0, qn, U, nt = win(w)
-        qs = (w % 2) if version in (1, 3, 4, 5, 6) else 0
+        qs = (w % 2) if version in (1, 3, 4, 5, 6, 7) else 0
         if version == 0:
             fetch_q_swa(q0, qn, qs)
 
@@ -399,12 +417,12 @@ def _kernel(
         @pl.when(jnp.logical_and(nt > 0, st_ref[_PENDING] != w))
         def _():
             fetch_any(q0, qn, 0, st_ref[_KV_SLOT], U)
-            if version == 3:
+            if version in (3, 7):
                 @pl.when(nt > 1)
                 def _():
-                    fetch_tile(q0, qn, 1, st_ref[_KV_SLOT] + 1)
+                    fetch_any(q0, qn, 1, st_ref[_KV_SLOT] + 1, U)
 
-        if version in (1, 3, 4, 5, 6):
+        if version in (1, 3, 4, 5, 6, 7):
             @pl.when(w + 1 < nw)
             def _():
                 q0n, qnn, _, _ = win(w + 1)
@@ -532,8 +550,89 @@ def _kernel(
             st_ref[_KV_SLOT] = nbase
             return 0
 
+        def pair_body_v7(pi, _):
+            """v7: v3 + a narrow body for the window's last tile when it has
+            <= 512 valid rows (DMA and attend only 128 / 256 / 512 rows).
+            Full pairs take the v3 branch unchanged."""
+            base = st_ref[_KV_SLOT]  # 0 or 2
+            nbase = 2 - base
+            j0 = 2 * pi
+            j1 = j0 + 1
+
+            @pl.when(j1 + 1 < nt)
+            def _():
+                fetch_any(q0, qn, j1 + 1, nbase, U)
+
+                @pl.when(j1 + 2 < nt)
+                def _():
+                    fetch_any(q0, qn, j1 + 2, nbase + 1, U)
+
+            @pl.when(jnp.logical_and(j1 + 1 >= nt, w + 1 < nw))
+            def _():
+                q0n, qnn, Un, ntn = win(w + 1)
+
+                @pl.when(ntn > 0)
+                def _():
+                    fetch_any(q0n, qnn, 0, nbase, Un)
+
+                    @pl.when(ntn > 1)
+                    def _():
+                        fetch_any(q0n, qnn, 1, nbase + 1, Un)
+
+                    st_ref[_PENDING] = w + 1
+
+            fetch_any(q0, qn, j0, base, U, wait=True)
+            v0_ = U - j0 * TILE
+            v1_ = U - j1 * TILE
+            lim = tails[-1]
+            pair = j1 < nt
+            narrow1 = jnp.logical_and(pair, v1_ <= lim)  # j1 is the last tile
+            narrow0 = jnp.logical_and(jnp.logical_not(pair), v0_ <= lim)  # j0 last
+
+            @pl.when(jnp.logical_and(v0_ > lim, v0_ < TILE))
+            def _():
+                zero_tail(base, v0_)
+
+            @pl.when(jnp.logical_and(pair, jnp.logical_not(narrow1)))
+            def _():
+                fetch_any(q0, qn, j1, base + 1, U, wait=True)
+
+                @pl.when(v1_ < TILE)
+                def _():
+                    zero_tail(base + 1, v1_)
+
+                q = load_bq(qs)
+                flash(q, load_tile(base), load_mask(base, j0))
+                flash(q, load_tile(base + 1), load_mask(base + 1, j1))
+
+            @pl.when(narrow1)
+            def _():
+                fetch_any(q0, qn, j1, base + 1, U, wait=True)
+                for n, pred in tail_cases(v1_)[:-1]:
+                    @pl.when(pred)
+                    def _():
+                        q = load_bq(qs)
+                        flash(q, load_tile(base), load_mask(base, j0))
+                        flash(q, load_tile_narrow(base + 1, n, v1_),
+                              load_mask_narrow(base + 1, j1, n))  # fmt: skip
+
+            @pl.when(jnp.logical_and(jnp.logical_not(pair), jnp.logical_not(narrow0)))
+            def _():
+                flash(load_bq(qs), load_tile(base), load_mask(base, j0))
+
+            for n, pred in tail_cases(v0_)[:-1]:
+                @pl.when(jnp.logical_and(narrow0, pred))
+                def _():
+                    flash(load_bq(qs), load_tile_narrow(base, n, v0_),
+                          load_mask_narrow(base, j0, n))  # fmt: skip
+
+            st_ref[_KV_SLOT] = nbase
+            return 0
+
         if version == 3:
             lax.fori_loop(0, (nt + 1) // 2, pair_body, 0, unroll=False)
+        elif version == 7:
+            lax.fori_loop(0, (nt + 1) // 2, pair_body_v7, 0, unroll=False)
         else:
             lax.fori_loop(0, nt, tile_body, 0, unroll=False)
 
@@ -815,7 +914,8 @@ def _kernel_v2(
 
 @functools.partial(
     jax.jit, static_argnames=("sm_scale", "nw_cap", "version", "pv_bf16", "zero_tail_rows",
-                     "vmem_limit_bytes", "probe", "lm_raw", "sub", "hbm_pin")
+                     "vmem_limit_bytes", "probe", "lm_raw", "sub", "hbm_pin", "tails",
+                     "pin_lm")
 )
 def window_attention(
     q: jax.Array,  # [T, actual_heads, D] bf16
@@ -839,6 +939,8 @@ def window_attention(
     lm_raw: bool = False,
     sub: int = 256,
     hbm_pin: bool = False,
+    tails: tuple = TAIL_ROWS,
+    pin_lm: bool = True,
 ) -> jax.Array:
     """Rows of live windows get CSA attention over their union folded with the
     SWA partials and the sink; all other rows return q."""
@@ -866,8 +968,8 @@ def window_attention(
     sinks = jnp.pad(attention_sinks, (0, H - actual_heads),
                     constant_values=jnp.finfo(attention_sinks.dtype).min)  # fmt: skip
     sinks = jnp.broadcast_to(jnp.tile(sinks, WQ)[:, None], (rows, LANES)).astype(jnp.float32)
-    nq = 2 if version in (1, 3, 4, 5, 6) else 1
-    ns = 4 if version == 3 else 2  # raw tile slots
+    nq = 2 if version in (1, 3, 4, 5, 6, 7) else 1
+    ns = 4 if version in (3, 7) else 2  # raw tile slots
     assert not (lm_raw and version == 2), "lm_raw: v0 / v1 only"
     lm_shape = (nq, WQ, H) if lm_raw else (nq, rows, LANES)
     if version == 2:
@@ -895,7 +997,7 @@ def window_attention(
         kernel = functools.partial(_kernel, sm_scale=sm_scale, L=L, version=version,
                                    pv_bf16=pv_bf16, zero_tail_rows=zero_tail_rows,
                                    probe=probe, lm_raw=lm_raw, sub=sub,
-                                   mask_sb=mask.ndim == 3)
+                                   mask_sb=mask.ndim == 3, tails=tuple(tails))
         scratch = [
             pltpu.VMEM((ns, TILE, LANES), jnp.int32),
             pltpu.VMEM((ns, TILE // 2, LANES), jnp.bfloat16),
@@ -947,6 +1049,10 @@ def window_attention(
             rope_g,
             mask if mask.ndim == 3 else mask.reshape(T, -1, LANES),
             swa_acc,
+        )),
+        # [T, H] f32 l / m pinned to HBM get a relayout copy (~0.67 us each at
+        # T32 H16): pinned only when pin_lm.
+        *map(pin if pin_lm else (lambda x: x), (
             swa_l_raw if lm_raw else per_row(swa_l),
             swa_m_raw if lm_raw else per_row(swa_m),
         )),
