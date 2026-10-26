@@ -32,7 +32,7 @@ def chained(f, M):
             # has its own indexer output); otherwise XLA CSEs the gather path (page ids, SC gather, union plan) once
             # per program and the chain times the attention kernel alone (j-c694e3a0: 1 custom call per inc call).
             q, topk = jax.lax.optimization_barrier((q, d["topk"]))
-            q = f(dict(d, topk=topk), q).astype(q.dtype)
+            q = f(dict(d, topk=topk, topk0=d["topk"]), q).astype(q.dtype)
         return q
     return jax.jit(run)
 
