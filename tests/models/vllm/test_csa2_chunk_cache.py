@@ -271,12 +271,14 @@ def test_compact_swa_maps_history_before_optimistic_cpu_window():
         size = 128 if not step else 6
         pages = window.map_request("a", optimistic, optimistic + size, 0)
         # Device-side rejection corrects positions after CPU metadata is built.
-        for token in range(max(0, committed - 127), committed):
+        # DSpark reads 128 historical tokens, including the one before the
+        # causal window. Consecutive full rejection reaches the rollback bound.
+        for token in range(max(0, committed - 128), committed):
             assert storage[pages[token // 32], token % 32] == token
         for token in range(committed, committed + size):
             storage[pages[token // 32], token % 32] = token
         optimistic = committed + size
-        committed += size if not step else 1 + step % 6
+        committed += size if not step else 1
 
 
 @pytest.mark.cpu_test

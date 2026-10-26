@@ -145,7 +145,8 @@ class NativeSWAWindow:
             config.num_speculative_tokens * config.max_concurrent_batches
             + config.num_prefill_lookahead_tokens
         )
-        retained = spec.sliding_window - 1 + spec.extra_retained_tokens + self.rollback
+        # DSpark's noncausal window includes all W tokens preceding the first Q.
+        retained = spec.sliding_window + spec.extra_retained_tokens + self.rollback
         self.capacity = (
             1
             + config.scheduler_config.max_num_seqs
@@ -180,7 +181,7 @@ class NativeSWAWindow:
             max(
                 0,
                 replay,
-                start - self.spec.sliding_window + 1 - self.spec.extra_retained_tokens,
+                start - self.spec.sliding_window - self.spec.extra_retained_tokens,
             )
             // size
         )
@@ -202,7 +203,6 @@ class NativeSWAWindow:
                 end
                 - self.rollback
                 - self.spec.sliding_window
-                + 1
                 - self.spec.extra_retained_tokens,
             )
             // size
