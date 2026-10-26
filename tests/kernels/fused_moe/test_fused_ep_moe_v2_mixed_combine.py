@@ -26,7 +26,8 @@ from .test_fused_ep_moe_v2 import (  # noqa: F401
 
 pytestmark = pytest.mark.multichip
 
-SHAPE = dict(hidden=512, inter=256, e_total=384, topk=6)
+# hidden 1024: 8 lane blocks, so the default strided relayout (LB % 8 == 0) is what runs.
+SHAPE = dict(hidden=1024, inter=256, e_total=384, topk=6)
 
 
 def _run(mesh, tokens, seed, monkeypatch, plan_kernel, combine_kernel, calls):
