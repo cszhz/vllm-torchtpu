@@ -1012,7 +1012,10 @@ def sparse_mla_attention(
             )
             return output, kv_cache_nope, kv_cache_rope
 
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        if envs.TPU_MLA_SPARSE_SPLIT_Q:
+            q, split_kwargs = ql_nope, {"q_pe": q_pe}
+        else:
+            q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         output = sparse_mla_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1025,6 +1028,7 @@ def sparse_mla_attention(
             k_scale=dequant_scale,
             cache_layout=cache_layout,
             **chunk_kwargs,
+            **split_kwargs,
         )
 
         lkv_dim = ql_nope.shape[-1]
