@@ -197,3 +197,50 @@ def test_qlen1_empty_window_and_pad_rows():
 def test_route_condition():
     assert WU.supported(128, 16) and WU.supported(32, 16) and WU.supported(8, 8)
     assert not WU.supported(128, 17)
+
+
+def _eight_token_windows():
+    """Two 8-token requests whose 8 rows select identical top-k lists: every union row has count 8 (0b1000
+    in its nibble) — the L4 chunk shape of a short prefill tail in a decode bucket."""
+    cell = C.CELLS["c8T16-mid"]
+    inp = C.build_inputs(cell)
+    tk = inp["tk"].copy()
+    first1 = tk[7].copy()  # seq 1's first token list
+    tk[0:8] = tk[0]
+    tk[8:16] = first1
+    inp["tk"] = tk
+    inp["cu"][1] = 8
+    inp["cu"][2:] = 16
+    inp["seq_of"][:8], inp["seq_of"][8:] = 0, 1
+    inp["pos"][:8] = inp["ctx"][0] + np.arange(8)
+    inp["pos"][8:] = inp["ctx"][1] + np.arange(8)
+    inp["kv_lens"][:2] += 1
+    return cell, inp
+
+
+def test_eight_token_window_count_8_bit_exact():
+    cell, inp = _eight_token_windows()
+    d, _ = C.device_inputs(inp, cache="random")
+    T, ms, s_cap = inp["T"], inp["ms"], inp["pps"] * C.PAGE
+    plan = WU.plan_host(inp["tk"], inp["cu"], inp["dist"], inp["kv_lens"], inp["table"], C.PAGE, s_cap=s_cap)
+    assert plan["U"] == [1024, 1024]
+    meta = WU.window_meta(d["cu"], d["dist"], d["kv_lens"], num_tokens=T, s_cap=s_cap)
+    ng, rg, mk, uc = WU.union_gather(meta, d["topk"], d["pages"], d["nope"], d["rope"], num_tokens=T,
+                                     max_num_seqs=ms, mask_sb_major=False)
+    rn, _, _ = WU.reference_union_gather(d["nope"], d["rope"], plan, T)
+    uc, ng, mk, rn = map(np.asarray, (uc, ng, mk, rn))
+    assert [int(uc[0]), int(uc[16])] == [1024, 1024]
+    np.testing.assert_array_equal(ng[:1024], rn[:1024])
+    np.testing.assert_array_equal(ng[8 * 1024:9 * 1024], rn[8 * 1024:9 * 1024])
+    np.testing.assert_array_equal(mk, plan["mask"])
+
+
+def test_eight_token_window_matches_oracle():
+    cell, inp = _eight_token_windows()
+    d, deq = C.device_inputs(inp, cache="quant", poison=True)
+    want, rows = C.oracle(inp, d, deq)
+    inc = np.asarray(jax.jit(_region(cell.conc, False))(d, d["q"]).astype(jnp.float32))
+    cand = np.asarray(jax.jit(_region(cell.conc, True))(d, d["q"]).astype(jnp.float32))
+    ref_err, _, _ = C.gate(inc[rows], want)
+    err, ok, tol = C.gate(cand[rows], want, ref_err)
+    assert np.isfinite(cand[rows]).all() and ok, (err, tol, ref_err)

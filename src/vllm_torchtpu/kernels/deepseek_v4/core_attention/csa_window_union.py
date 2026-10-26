@@ -335,7 +335,8 @@ def _union_gather_kernel(
         # of its first union row; U = total.
         def prefix(i, carry):
             x = cnt[pl.ds(i * L, L)]
-            nz = (x | srl(x, 1) | srl(x, 2)) & 0x11111111
+            # counts reach WQ = 8 (0b1000): all four nibble bits matter
+            nz = (x | srl(x, 1) | srl(x, 2) | srl(x, 3)) & 0x11111111
             pc = srl(nz * 0x11111111, 28)
             cs = plsc.cumsum(pc)
             base[pl.ds(i * L, L)] = cs - pc + carry
