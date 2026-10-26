@@ -130,7 +130,7 @@ def get_ar_seam_op(consts, kernel_kw, *, moe_fn_mode=None):
         norm_w: jax.Array,
         rank: jax.Array,
         peers: jax.Array,
-    ):
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         return jax.shard_map(
             body, mesh=mesh, in_specs=(spec,) * 10, out_specs=(spec,) * 4, check_vma=False
         )(x_p, residual, post, comb, fn_cat, hc_scale, hc_base, norm_w, rank, peers)
