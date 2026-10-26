@@ -494,6 +494,24 @@ def expert_ffn_int8(
     return acc2, None
 
 
+def kernel_barrier_config():
+    """(rounds per all-pairs barrier, whether the kernel keeps its tail one).
+
+    The fused kernel runs two all-pairs barriers a call -- one after the
+    prologue, one after `drain_transport` -- of two rounds each. A round costs
+    1.4 us at ep 8 in the dispatch issue (ledger 2tsjq052-01) and 2.2 us here,
+    so the four are ~8.8 us of a call, and at DP32 each is also a point where
+    every rank waits for the slowest. One round is sufficient (see
+    `_all_pairs_barrier`), and the tail barrier guards nothing
+    `drain_transport` has not already waited for with exact counts in both
+    directions. Both stay on by default until measured at DP32.
+    """
+    return (
+        max(1, int(envs.MOE_FUSED_EP_KERNEL_BARRIER_ROUNDS)),
+        bool(envs.MOE_FUSED_EP_KERNEL_TAIL_BARRIER),
+    )
+
+
 def _all_pairs_barrier(ep, rounds=2):
     """Barrier over every shard: transport peers are not only neighbours.
 
@@ -603,6 +621,7 @@ def _build_fused_ep_moe_kernel(
         raise NotImplementedError(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
         )
+    barrier_rounds, tail_barrier = kernel_barrier_config()
     # The kernel fetches lhs rows by index from the ungathered token buffer
     # [tokens, lane blocks, 128], using the token-gather table, and ships
     # results over an all-to-all carrying unweighted rows; it returns
@@ -1056,7 +1075,7 @@ def _build_fused_ep_moe_kernel(
                     weight_starts(visit_sm[b], b)
 
         prologue()
-        _all_pairs_barrier(ep)
+        _all_pairs_barrier(ep, barrier_rounds)
 
         def _start_next_gate_up(visit_i, slot, last_tile):
             """`() -> ()`: start the NEXT expert's gate/up slab, called from
@@ -1986,7 +2005,8 @@ def _build_fused_ep_moe_kernel(
             _rows_wait(mehop_scl_sem, rscl_hbm, count(host.COUNT_SELF_MIRROR))
 
         drain_transport()
-        _all_pairs_barrier(ep)
+        if tail_barrier:
+            _all_pairs_barrier(ep, barrier_rounds)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     # The VMEM buffers come from the same list the VMEM accounting sums, in
@@ -2116,6 +2136,8 @@ def _build_fused_ep_moe_kernel(
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
             f"_g{g_local}_c{capacity}_nb{nbuf}"
+            f"{'' if barrier_rounds == 2 else f'_b{barrier_rounds}'}"
+            f"{'' if tail_barrier else '_notail'}"
         )
         return pl.pallas_call(
             kernel,
@@ -2243,7 +2265,10 @@ def build_fused_ep_moe_kernel(**kwargs):
     the size is logged on every insert so a boot that is accumulating
     programs says so, rather than being read off host memory afterwards.
     """
-    key = tuple(sorted(kwargs.items()))
+    # The barrier knobs are not arguments -- every caller would have to thread
+    # them -- so the cache key carries them, or a process that moved one would
+    # keep serving the program built before it did.
+    key = tuple(sorted(kwargs.items())) + (kernel_barrier_config(),)
     fn = _BUILD_CACHE.get(key)
     if fn is None:
         with _BUILD_CACHE_LOCK:

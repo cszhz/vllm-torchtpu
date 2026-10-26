@@ -82,6 +82,8 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_DISPATCH_BARRIER_ROUNDS: int = 2
     MOE_FUSED_EP_DISPATCH_ORDER: str = "stagger"
     MOE_FUSED_EP_DISPATCH_PAYLOAD_DRAIN: str = "issue"
+    MOE_FUSED_EP_KERNEL_BARRIER_ROUNDS: int = 2
+    MOE_FUSED_EP_KERNEL_TAIL_BARRIER: bool = True
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
@@ -734,6 +736,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MOE_FUSED_EP_DISPATCH_PAYLOAD_DRAIN",
         "issue",
         ["issue", "wait"],
+    ),
+    # The fused EP kernel's own all-pairs barriers: rounds each (see
+    # MOE_FUSED_EP_DISPATCH_BARRIER_ROUNDS for why one is sufficient), and
+    # whether it keeps the one after `drain_transport`, which waits for
+    # nothing that drain has not already waited for with exact counts.
+    "MOE_FUSED_EP_KERNEL_BARRIER_ROUNDS": lambda: int(
+        os.getenv("MOE_FUSED_EP_KERNEL_BARRIER_ROUNDS", "2") or 2
+    ),
+    "MOE_FUSED_EP_KERNEL_TAIL_BARRIER": lambda: bool(
+        int(os.getenv("MOE_FUSED_EP_KERNEL_TAIL_BARRIER", "1") or 1)
     ),
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
