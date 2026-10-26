@@ -344,18 +344,43 @@ def solve_group(
         return {}, [], {}
     shards = next(iter(layouts.values())).shards
     rows = np.stack([windows[lid] for lid in layer_ids], axis=1)  # [K, L, E]
-    phy2log, _, _ = eplb_policy.rebalance_experts_global(
-        torch.as_tensor(rows, dtype=torch.float32),
-        shards * active,
-        active,
-        max_copies=replica_cap,
-    )
-    lists = eplb_policy.rank_lists(phy2log, active)
+
+    def policy(rows_kle):
+        phy2log, _, _ = eplb_policy.rebalance_experts_global(
+            torch.as_tensor(rows_kle, dtype=torch.float32),
+            shards * active,
+            active,
+            max_copies=replica_cap,
+        )
+        return eplb_policy.rank_lists(phy2log, active)
+
+    try:
+        lists = policy(rows)
+        targets_of = {lid: lists[i] for i, lid in enumerate(layer_ids)}
+    except ValueError:
+        # The greedy packer refuses a layer whose last slots could only take
+        # an expert the rank already holds, and the batch fails as a whole.
+        # Pack the layers one at a time and skip the refused ones; every rank
+        # sees the same windows, so every rank skips the same layers.
+        targets_of = {}
+        for i, lid in enumerate(layer_ids):
+            try:
+                targets_of[lid] = policy(rows[:, i : i + 1, :])[0]
+            except ValueError:
+                continue
+        logger.warning(
+            "expert relayout | %s: the packer refused %d of %d layers this generation",
+            group,
+            len(layer_ids) - len(targets_of),
+            len(layer_ids),
+        )
     out_layouts, moves, predicted = {}, [], {}
     for i, lid in enumerate(layer_ids):
+        if lid not in targets_of:
+            continue
         old = layouts[lid]
         mean_rows = rows[:, i, :].mean(axis=0)
-        targets = _match_ranks(lists[i], old)
+        targets = _match_ranks(targets_of[lid], old)
         nxt = _budgeted_next(old, targets, mean_rows, staging, cap=replica_cap)
         if nxt.held == old.held:
             continue

@@ -175,6 +175,30 @@ def test_solve_group_layouts_always_fit_the_slot_table():
     assert checked >= 12
 
 
+def test_a_refused_layer_is_skipped_and_the_others_still_solve(monkeypatch):
+    """DP8 `eplb-dyn-dp8-f`: the greedy packer refused 6 windows ("fewer
+    replicas than ranks are needed") and the whole batched solve died with
+    them. The layers are then packed one at a time and the refused one is
+    skipped."""
+    real = eplb_policy.rebalance_experts_global
+
+    def picky(rows, *args, **kwargs):
+        # Refuse any batch that contains layer 1's window (its expert 7 is the
+        # hot one); a batch of layer 0 alone goes through.
+        if bool((rows[:, :, 7] > 100).any()):
+            raise ValueError("no rank can take a copy without holding the expert twice")
+        return real(rows, *args, **kwargs)
+
+    monkeypatch.setattr(eplb_policy, "rebalance_experts_global", picky)
+    lay0, lay1 = _layout(), _layout()
+    windows = {0: _rows(hot=(0, 1)), 1: _rows(hot=(7,))}
+    layouts, moves, _ = rl.solve_group(
+        "target", {0: lay0, 1: lay1}, windows, min_gain=0.0, **SPEC
+    )
+    assert 1 not in layouts
+    assert 0 in layouts and moves and all(m.layer == 0 for m in moves)
+
+
 def test_removes_never_orphan_a_single_copy():
     lay = _layout()
     # Rank 0 wants 7 and would drop 3, but 3 has no other holder in the
