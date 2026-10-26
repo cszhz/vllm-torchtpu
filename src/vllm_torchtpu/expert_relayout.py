@@ -744,8 +744,8 @@ def arm(
     )
     first = next(iter(kept_modules.values()))
     try:
-        parts = expert_mover.describe_parts(first)
-    except RuntimeError as e:  # a layer without expert tensors (tests' fakes)
+        parts = expert_mover.describe_parts(first, transport)
+    except Exception as e:  # noqa: BLE001 - a layer without expert tensors (tests' fakes)
         parts = str(e)
     logger.info("expert relayout | first placed layer's tensors: %s", parts)
     logger.info(

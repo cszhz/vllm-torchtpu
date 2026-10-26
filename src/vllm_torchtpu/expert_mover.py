@@ -48,10 +48,22 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-WEIGHT_PARTS = ("w13_weight", "w2_weight")
-SCALE_PARTS = ("w13_weight_scale", "w2_weight_scale")
-BIAS_PARTS = ("w13_bias", "w2_bias")
-PARTS = WEIGHT_PARTS + SCALE_PARTS + BIAS_PARTS
+# The expert tensors of a placed layer, by part id (what move_tag carries).
+# Each part names its attribute candidates in order: the fused EP kernel reads
+# the row-padded flat scale tables (`_tpu_fused_*_scale`, mxfp4.py), not the
+# quantizer's [E, blocks, 1, N] scale Parameters, so those are what move.
+PART_ALIASES = (
+    ("w13_weight",),
+    ("w2_weight",),
+    ("_tpu_fused_w13_scale", "w13_weight_scale"),
+    ("_tpu_fused_w2_scale", "w2_weight_scale"),
+    ("w13_bias",),
+    ("w2_bias",),
+)
+PARTS = tuple(aliases[0] for aliases in PART_ALIASES)
+WEIGHT_PARTS = PARTS[0:2]
+SCALE_PARTS = PARTS[2:4]
+BIAS_PARTS = PARTS[4:6]
 _GROUP_IDS = {"target": 0, "draft": 1}
 
 
@@ -61,57 +73,29 @@ def move_tag(group: str, layer: int, dst_slot: int, part: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Device <-> host, by byte regions of a tensor's STORAGE
+# Device <-> host, by major-dimension slices of a tensor
 #
-# The fused path's weights and their scales come back from the quantizer's
-# jax_op as a tuple, i.e. as views into one shared output storage, and
-# tpu-sync's raw transfer refuses a view ("must start at storage offset 0",
-# "does not span its entire base storage buffer"). torch_tpu copies of such
-# views are not safe either (a clone of an offset view returned the wrong
-# bytes on the chips). So the transport never looks at a tensor's dtype or
-# shape: it reinterprets the tensor's whole storage as [n, 32, 128] uint8 --
-# 4 KiB per major row, the uint8 tile exactly, so physical equals logical --
-# and copies slot regions as 4 KiB-aligned byte ranges with the raw transfer's
-# major-dimension offsets. A slot of a slot-major tensor is one contiguous
-# region of the storage at the tensor's storage offset plus slot x slot bytes.
+# tpu-sync's raw transfer copies a tensor's major-dimension slices as the
+# PHYSICAL bytes of its device buffer (tiled, packed), paced, asynchronously,
+# straight into the live storage the compiled program reads (compiled mode
+# looks each argument's buffer up per call, so a DMA into a staging slot is
+# what the next step sees once the slot table points at it). A slot of a
+# slot-major weight is one slice; its bytes mean nothing on the host but land
+# byte-for-byte in a slot of a same-shaped tensor on another rank.
+#
+# The rows of a flat scale table ([slots * rows, N]) cannot be a partial copy
+# (rank-2 partial copies are refused: one row is a fraction of a tile row), so
+# a table moves whole: D2H the table, cut or patch the slot's rows in the host
+# image (rows is a multiple of the f32 tile's 8 rows, so a slot's rows are one
+# contiguous physical range), H2D the table back. The slice byte size comes
+# from raw_transfer.major_slice_bytes: the device layout can pad the minor
+# dims, and the fp4 pair dtype's storage is accounted at one byte per nibble,
+# so nbytes / shape[0] is not it in general.
 #
 # torch_tpu dispatches device tensors from one thread only, so every device
 # leg is ISSUED from the controller's step hook on the main thread,
 # asynchronously, and polled there. Only host memory crosses to the mover's
 # thread.
-
-BLOCK = 4096
-_TILE = (32, 128)
-
-
-def storage_blocks(t: torch.Tensor) -> torch.Tensor:
-    """The tensor's whole storage as [n, 32, 128] uint8 (4 KiB per row)."""
-    storage = t.untyped_storage()
-    nbytes = storage.nbytes()
-    if nbytes % BLOCK:
-        raise ValueError(
-            f"storage of {nbytes} bytes is not a whole number of 4 KiB blocks"
-        )
-    flat = torch.empty(0, dtype=torch.uint8, device=t.device)
-    flat.set_(storage)
-    return flat.view(nbytes // BLOCK, *_TILE)
-
-
-def region_of(
-    t: torch.Tensor, first: int, count: int, unit_elems: int
-) -> tuple[int, int]:
-    """(byte offset into the storage, byte length) of `count` units of
-    `unit_elems` elements starting at unit `first` of tensor `t` (a slot of a
-    slot-major tensor, or rows of a flat table). Both 4 KiB aligned."""
-    elsize = t.element_size()
-    off = (t.storage_offset() + first * unit_elems) * elsize
-    nbytes = count * unit_elems * elsize
-    if off % BLOCK or nbytes % BLOCK:
-        raise ValueError(
-            f"region at byte {off} of {nbytes} bytes is not 4 KiB aligned; the raw "
-            "transfer copies whole 4 KiB blocks"
-        )
-    return off, nbytes
 
 
 class _Done:
@@ -124,17 +108,30 @@ class _Done:
         pass
 
 
+def _pinned(shape) -> torch.Tensor:
+    try:
+        return torch.empty(shape, dtype=torch.uint8, pin_memory=True)
+    except (RuntimeError, TypeError):
+        return torch.empty(shape, dtype=torch.uint8)
+
+
 class TorchTransport:
-    """Byte regions through torch on the storage reinterpretation: the test
-    path on CPU tensors, and the fallback where tpu-sync is not importable."""
+    """Slices through torch, as logical bytes: the test path on CPU tensors,
+    and the fallback where tpu-sync is not importable. Host buffers are
+    [count, slice bytes] uint8."""
 
-    def d2h(self, t: torch.Tensor, off: int, nbytes: int):
-        blocks = storage_blocks(t).view(-1)
-        return _Done(), blocks[off : off + nbytes].detach().cpu().clone()
+    def slice_bytes(self, t: torch.Tensor) -> int:
+        return t.nbytes // int(t.shape[0])
 
-    def h2d(self, host: torch.Tensor, t: torch.Tensor, off: int):
-        blocks = storage_blocks(t).view(-1)
-        blocks[off : off + host.numel()].copy_(host.to(t.device))
+    def d2h(self, t: torch.Tensor, first: int, count: int):
+        rows = t[first : first + count].detach().contiguous()
+        host = rows.view(torch.uint8).cpu().reshape(count, -1).clone()
+        return _Done(), host
+
+    def h2d(self, host: torch.Tensor, t: torch.Tensor, first: int):
+        count = int(host.shape[0])
+        dst = t[first : first + count].view(torch.uint8)
+        dst.copy_(host.reshape(dst.shape).to(t.device))
         return _Done()
 
     @staticmethod
@@ -143,53 +140,84 @@ class TorchTransport:
 
 
 class RawTransferTransport(TorchTransport):
-    """Byte regions through tpu-sync's raw PJRT copies into pinned host
-    memory, asynchronously (a PjRtCopyFuture per copy), paced by the library
-    so a copy never parks the step's kernel launches."""
+    """Slices through tpu-sync's raw PJRT copies into pinned host memory,
+    asynchronously (a PjRtCopyFuture per copy), paced by the library so a copy
+    never parks the step's kernel launches."""
 
     def __init__(self) -> None:
         from tpu_sync.api.torch import raw_transfer
 
+        try:
+            # The module's __getattr__ loads the extension for unknown names,
+            # so an old tpu-sync answers this with an import error, not an
+            # attribute error.
+            usable = callable(raw_transfer.major_slice_bytes)
+        except Exception as e:  # noqa: BLE001 - any failure means "not usable"
+            raise ImportError(
+                "tpu_sync.api.torch.raw_transfer has no usable major_slice_bytes: "
+                "the installed tpu-sync predates its fp4 (float4_e2m1fn_x2) "
+                f"support ({e!r})"
+            ) from e
+        if not usable:
+            raise ImportError(
+                "tpu_sync.api.torch.raw_transfer.major_slice_bytes is not callable"
+            )
         self._rt = raw_transfer
 
-    @staticmethod
-    def _pinned(nblocks: int) -> torch.Tensor:
-        try:
-            return torch.empty((nblocks, *_TILE), dtype=torch.uint8, pin_memory=True)
-        except (RuntimeError, TypeError):
-            return torch.empty((nblocks, *_TILE), dtype=torch.uint8)
+    def slice_bytes(self, t: torch.Tensor) -> int:
+        return int(self._rt.major_slice_bytes(t))
 
-    def d2h(self, t: torch.Tensor, off: int, nbytes: int):
-        host = self._pinned(nbytes // BLOCK)
+    def d2h(self, t: torch.Tensor, first: int, count: int):
+        host = _pinned((count, self.slice_bytes(t)))
         future = self._rt.transfer_d2h_async(
-            storage_blocks(t),
+            t,
             host,
-            src_offsets_major_dim=[off // BLOCK],
+            src_offsets_major_dim=[first],
             dst_offsets_major_dim=[0],
-            copy_sizes_major_dim=[nbytes // BLOCK],
+            copy_sizes_major_dim=[count],
         )
-        return future, host.view(-1)
+        return future, host
 
-    def h2d(self, host: torch.Tensor, t: torch.Tensor, off: int):
-        blocks = host.contiguous().view(-1, *_TILE)
+    def h2d(self, host: torch.Tensor, t: torch.Tensor, first: int):
+        if not host.is_pinned():
+            pinned = _pinned(tuple(host.shape))
+            pinned.copy_(host)
+            host = pinned
         return self._rt.transfer_h2d_async(
-            blocks,
-            storage_blocks(t),
+            host,
+            t,
             src_offsets_major_dim=[0],
-            dst_offsets_major_dim=[off // BLOCK],
-            copy_sizes_major_dim=[blocks.shape[0]],
+            dst_offsets_major_dim=[first],
+            copy_sizes_major_dim=[int(host.shape[0])],
         )
+
+
+def _on_tpu() -> bool:
+    try:
+        return (
+            torch.accelerator.is_available()
+            and torch.accelerator.current_accelerator().type == "tpu"
+        )
+    except Exception:  # noqa: BLE001 - no accelerator stack at all
+        return False
 
 
 def make_transport(kind: str):
+    """`raw_transfer` (the default) or `torch`. Without a usable tpu-sync the
+    raw transport falls back to torch only where there is no TPU (tests,
+    chip-less hosts): on a device torch cannot move the fp4 pair dtype, so
+    the error surfaces and the dynamic re-layout stays off."""
     if kind == "torch":
         return TorchTransport()
     try:
         return RawTransferTransport()
-    except ImportError:
+    except ImportError as e:
+        if _on_tpu():
+            raise
         logger.warning(
-            "expert mover: tpu_sync.api.torch.raw_transfer not importable; "
-            "slot copies go through torch"
+            "expert mover: tpu-sync raw transfer unavailable (%s); slot copies go "
+            "through torch on this chip-less host",
+            e,
         )
         return TorchTransport()
 
@@ -272,48 +300,61 @@ class _LocalEndpoint:
 # ---------------------------------------------------------------------------
 # The mover
 
+SLOT, ROWS = "slot", "rows"
+
 
 def _parts(module) -> list[tuple[int, str, torch.Tensor, str]]:
-    """(part index, name, tensor, kind) for every expert tensor the module has:
-    kind "slot" for slot-major tensors, "rows" for the flat scale tables. A
-    module with none is a plan error, not a module with nothing to move."""
+    """(part id, attribute, tensor, kind) for every expert tensor the module
+    has: SLOT for slot-major tensors (rank >= 3, one slot = one major slice),
+    ROWS for the flat scale tables (rank 2, a slot = a block of rows). A module
+    with none is a plan error, not a module with nothing to move."""
     out = []
-    for i, name in enumerate(PARTS):
-        t = getattr(module, name, None)
-        if t is None:
-            continue
-        kind = "slot" if name in WEIGHT_PARTS or name in BIAS_PARTS else "rows"
-        out.append((i, name, t.data if isinstance(t, torch.nn.Parameter) else t, kind))
+    for part, aliases in enumerate(PART_ALIASES):
+        for name in aliases:
+            t = getattr(module, name, None)
+            if t is None:
+                continue
+            t = t.data if isinstance(t, torch.nn.Parameter) else t
+            if t.dim() >= 3:
+                kind = SLOT
+            elif t.dim() == 2 and aliases[0] in SCALE_PARTS:
+                kind = ROWS
+            else:
+                raise RuntimeError(
+                    f"{name} of shape {tuple(t.shape)} is not movable: slots are "
+                    "major slices of a rank >= 3 tensor or row blocks of a flat "
+                    "scale table"
+                )
+            out.append((part, name, t, kind))
+            break
     if not out:
         raise RuntimeError(f"{module!r} has none of the expert tensors {PARTS}")
     return out
 
 
-def slot_region(t: torch.Tensor, slot: int) -> tuple[int, int]:
-    unit = 1
-    for d in t.shape[1:]:
-        unit *= int(d)
-    return region_of(t, slot, 1, unit)
+def _slot_count(module) -> int:
+    """Physical slots on this rank: the weights' leading dimension."""
+    for name in WEIGHT_PARTS:
+        t = getattr(module, name, None)
+        if t is not None:
+            return int(t.shape[0])
+    return int(module.local_num_experts)
 
 
-def rows_region(t: torch.Tensor, module, slot: int) -> tuple[int, int]:
-    rows = int(t.shape[0]) // int(module.local_num_experts)
-    unit = 1
-    for d in t.shape[1:]:
-        unit *= int(d)
-    return region_of(t, slot * rows, rows, unit)
-
-
-def describe_parts(module) -> str:
-    """One line per expert tensor: shape, dtype, storage offset and size --
-    what the raw transfer will address (logged at arm for the first layer)."""
+def describe_parts(module, transport=None) -> str:
+    """One line per expert tensor: shape, dtype, kind and (with a transport)
+    the device bytes of one slot -- logged at arm for the first layer."""
     lines = []
+    slots = _slot_count(module)
     for _, name, t, kind in _parts(module):
-        lines.append(
-            f"{name}: {tuple(t.shape)} {str(t.dtype).split('.')[-1]} {kind}, "
-            f"storage {t.untyped_storage().nbytes()} B at offset "
-            f"{t.storage_offset() * t.element_size()} B"
-        )
+        line = f"{name}: {tuple(t.shape)} {str(t.dtype).split('.')[-1]} {kind}"
+        if transport is not None:
+            per_slice = transport.slice_bytes(t)
+            per_slot = (
+                per_slice if kind == SLOT else per_slice * (int(t.shape[0]) // slots)
+            )
+            line += f", {per_slot / 1e6:.2f} MB/slot"
+        lines.append(line)
     return "; ".join(lines)
 
 
@@ -322,15 +363,13 @@ class SlabMover:
     expert_relayout.py), in three phases driven by `pump()` from the step
     hook on the main thread:
 
-    d2h   issue the source regions' device -> host copies (up to
-          `slabs_per_pump` per call), poll them;
-    p2p   a thread sends every outgoing host buffer (non-blocking) and
-          receives every incoming one;
-    h2d   issue the staging regions' host -> device copies, poll them; then
-          the generation is staged.
-
-    Every region is a 4 KiB-aligned byte range of a tensor's storage: a slot
-    of a slot-major weight, or a slot's rows of a flat scale table.
+    d2h   issue the source slots' device -> host copies, and the whole-table
+          copies of every scale table a move touches (up to `slabs_per_pump`
+          issues per call); poll them; cut the outgoing payloads;
+    p2p   a thread sends every outgoing payload (non-blocking) and receives
+          every incoming one;
+    h2d   issue the staging slots' host -> device copies, and the patched
+          tables' whole-table copies; poll them; then the generation is staged.
     """
 
     def __init__(
@@ -355,20 +394,20 @@ class SlabMover:
         self._t0 = 0.0
         self._out_moves: list = []
         self._in_moves: list = []
-        self._out_todo: list = []  # (move, part, tensor, off, nbytes)
+        # Outgoing SLOT copies: (move, part, tensor, slot) -> payload hosts.
+        self._out_todo: list = []
         self._out_inflight: list = []  # (future, host, move, part)
-        self._out_ready: list = []  # (move, part, host)
-        self._in_regions: list = []  # (move, part, tensor, off, host)
-        self._h2d_todo: list = []  # (host, tensor, off)
+        self._out_ready: list = []  # (move, part, payload)
+        # Outgoing ROWS payloads cut from table images: (move, part, table key).
+        self._out_rows: list = []
+        # Incoming: (move, part, tensor, kind, slot, payload host).
+        self._incoming: list = []
+        # Whole-table images, keyed by (group, layer, part):
+        # {"tensor", "rows", "host", "future", "patches": [(slot, payload)]}
+        self._tables: dict = {}
+        self._tables_todo: list = []
+        self._h2d_todo: list = []  # (host, tensor, first)
         self._h2d_inflight: list = []
-
-    @staticmethod
-    def _region(tensor, kind, module, slot):
-        return (
-            slot_region(tensor, slot)
-            if kind == "slot"
-            else rows_region(tensor, module, slot)
-        )
 
     # -- Mover protocol
 
@@ -393,19 +432,47 @@ class SlabMover:
             self._failed = True
             self._phase = "idle"
 
+    def _table(self, m, part, tensor, module):
+        key = (m.group, m.layer, part)
+        if key not in self._tables:
+            rows = int(tensor.shape[0]) // _slot_count(module)
+            self._tables[key] = {
+                "tensor": tensor,
+                "rows": rows,
+                "host": None,
+                "future": None,
+                "patches": [],
+            }
+            self._tables_todo.append(key)
+        return self._tables[key]
+
     def _prepare(self, plan, modules) -> None:
         incoming, outgoing = plan.moves_for(self.rank)
         for m in outgoing:
             module = modules[(m.group, m.layer)]
             for part, _, tensor, kind in _parts(module):
-                off, nbytes = self._region(tensor, kind, module, m.src_slot)
-                self._out_todo.append((m, part, tensor, off, nbytes))
+                if kind == SLOT:
+                    self._out_todo.append((m, part, tensor, m.src_slot))
+                else:
+                    self._table(m, part, tensor, module)
+                    self._out_rows.append((m, part, (m.group, m.layer, part)))
         for m in incoming:
             module = modules[(m.group, m.layer)]
             for part, _, tensor, kind in _parts(module):
-                off, nbytes = self._region(tensor, kind, module, m.dst_slot)
-                self._in_regions.append(
-                    (m, part, tensor, off, torch.empty(nbytes, dtype=torch.uint8))
+                if kind == SLOT:
+                    nbytes = self.transport.slice_bytes(tensor)
+                else:
+                    table = self._table(m, part, tensor, module)
+                    nbytes = self.transport.slice_bytes(tensor) * table["rows"]
+                self._incoming.append(
+                    (
+                        m,
+                        part,
+                        tensor,
+                        kind,
+                        m.dst_slot,
+                        torch.empty(nbytes, dtype=torch.uint8),
+                    )
                 )
         self._out_moves = outgoing
         self._in_moves = incoming
@@ -451,43 +518,61 @@ class SlabMover:
 
     def _pump_d2h(self) -> None:
         budget = self.slabs_per_pump
+        while self._tables_todo and budget > 0:
+            table = self._tables[self._tables_todo.pop(0)]
+            t = table["tensor"]
+            table["future"], table["host"] = self.transport.d2h(t, 0, int(t.shape[0]))
+            budget -= 1
         while self._out_todo and budget > 0:
-            m, part, tensor, off, nbytes = self._out_todo.pop(0)
-            future, host = self.transport.d2h(tensor, off, nbytes)
+            m, part, tensor, slot = self._out_todo.pop(0)
+            future, host = self.transport.d2h(tensor, slot, 1)
             self._out_inflight.append((future, host, m, part))
             budget -= 1
         still = []
         for future, host, m, part in self._out_inflight:
             if self.transport.ready(future):
-                self._out_ready.append((m, part, host))
+                self._out_ready.append((m, part, host.reshape(-1)))
             else:
                 still.append((future, host, m, part))
         self._out_inflight = still
-        if not self._out_todo and not self._out_inflight:
-            self._thread_done.clear()
-            self._thread_error = None
-            self._thread = threading.Thread(
-                target=self._exchange, name="expert-mover", daemon=True
-            )
-            self._thread.start()
-            self._phase = "p2p"
+        tables_pending = any(
+            tb["future"] is not None and not self.transport.ready(tb["future"])
+            for tb in self._tables.values()
+        )
+        if self._tables_todo or self._out_todo or self._out_inflight or tables_pending:
+            return
+        # Every image is on the host: cut the outgoing row payloads.
+        for m, part, key in self._out_rows:
+            table = self._tables[key]
+            rows = table["rows"]
+            image = table["host"].reshape(-1)
+            row_bytes = image.numel() // int(table["tensor"].shape[0])
+            a = m.src_slot * rows * row_bytes
+            self._out_ready.append((m, part, image[a : a + rows * row_bytes].clone()))
+        self._thread_done.clear()
+        self._thread_error = None
+        self._thread = threading.Thread(
+            target=self._exchange, name="expert-mover", daemon=True
+        )
+        self._thread.start()
+        self._phase = "p2p"
 
     def _exchange(self) -> None:
         """The host-to-host leg, on the mover's thread: CPU memory only."""
         try:
             in_flight = []
-            for m, part, host in self._out_ready:
+            for m, part, payload in self._out_ready:
                 h = self.p2p.send(
-                    m.dst_rank, move_tag(m.group, m.layer, m.dst_slot, part), host
+                    m.dst_rank, move_tag(m.group, m.layer, m.dst_slot, part), payload
                 )
-                in_flight.append((h, host))
-            for m, part, _tensor, _off, host in self._in_regions:
+                in_flight.append(h)
+            for m, part, _t, _kind, dst_slot, payload in self._incoming:
                 if self._cancel.is_set():
                     return
                 self.p2p.recv(
-                    m.src_rank, move_tag(m.group, m.layer, m.dst_slot, part), host
+                    m.src_rank, move_tag(m.group, m.layer, dst_slot, part), payload
                 )
-            for h, _ in in_flight:
+            for h in in_flight:
                 if h is not None:
                     h.wait()
         except BaseException as e:  # noqa: BLE001 - handed to the main thread
@@ -503,17 +588,30 @@ class SlabMover:
         if self._cancel.is_set():
             self._phase = "idle"
             return
-        self._h2d_todo = [
-            (host, tensor, off) for _m, _p, tensor, off, host in self._in_regions
-        ]
+        patched = set()
+        for m, part, tensor, kind, dst_slot, payload in self._incoming:
+            if kind == SLOT:
+                self._h2d_todo.append((payload.reshape(1, -1), tensor, dst_slot))
+                continue
+            key = (m.group, m.layer, part)
+            table = self._tables[key]
+            image = table["host"].reshape(-1)
+            rows = table["rows"]
+            row_bytes = image.numel() // int(tensor.shape[0])
+            a = dst_slot * rows * row_bytes
+            image[a : a + rows * row_bytes].copy_(payload)
+            patched.add(key)
+        for key in patched:
+            table = self._tables[key]
+            self._h2d_todo.append((table["host"], table["tensor"], 0))
         self._phase = "h2d"
         self._pump_h2d()
 
     def _pump_h2d(self) -> None:
         budget = self.slabs_per_pump
         while self._h2d_todo and budget > 0:
-            host, tensor, off = self._h2d_todo.pop(0)
-            self._h2d_inflight.append(self.transport.h2d(host, tensor, off))
+            host, tensor, first = self._h2d_todo.pop(0)
+            self._h2d_inflight.append(self.transport.h2d(host, tensor, first))
             budget -= 1
         self._h2d_inflight = [
             f for f in self._h2d_inflight if not self.transport.ready(f)
@@ -522,8 +620,8 @@ class SlabMover:
             self._finish()
 
     def _finish(self) -> None:
-        received = sum(h.numel() for *_, h in self._in_regions)
-        sent = sum(h.numel() for _, _, h in self._out_ready)
+        received = sum(p.numel() for *_, p in self._incoming)
+        sent = sum(p.numel() for _, _, p in self._out_ready)
         seconds = time.monotonic() - self._t0
         self.last_report = {
             "generation": self._gen,
@@ -531,17 +629,19 @@ class SlabMover:
             "outgoing": len(self._out_moves),
             "received_bytes": received,
             "sent_bytes": sent,
+            "tables": len(self._tables),
             "seconds": seconds,
         }
         logger.info(
             "expert mover | rank %d staged generation %s: %d in / %d out, "
-            "%.1f MB received, %.1f MB sent, %.2f s",
+            "%.1f MB received, %.1f MB sent, %d tables re-imaged, %.2f s",
             self.rank,
             self._gen,
             len(self._in_moves),
             len(self._out_moves),
             received / 1e6,
             sent / 1e6,
+            len(self._tables),
             seconds,
         )
         self._staged = self._gen
