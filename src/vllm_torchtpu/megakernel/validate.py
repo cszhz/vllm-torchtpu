@@ -15,22 +15,27 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
 from typing import Any
 
-from .decls import ModuleBinding, _lookup_raw_key
-from .errors import MegakernelConfigError
+from .decls import REQUIRED, ModuleBinding, _lookup_raw_key, _resolve_field_spec
+from .errors import EligibilityResult, MegakernelConfigError
 from .geometry import FromHF
+from .modules.moe import MoEModule
 from .modules.norm import NormModule
 from .profile import Profile
 from .schedule import (
+    Every,
     FromHFLayerTypes,
     ModuleOrBinding,
     ResolvedSchedule,
     Schedule,
     _module_cls_of,
     _module_name_of,
+    _resolve_slot_spec,
 )
+from .spec import Module
 
 
 def model_label(cls: Any, model_name: str | None = None) -> str:
@@ -248,10 +253,144 @@ def validate_model_def(
                 )
 
 
+def _resolved_ffn_bindings(
+    cls: Any, hf_config: Any, from_hf: FromHF
+) -> list[ModuleOrBinding]:
+    sched = cls.schedule
+    if not isinstance(sched, Schedule) or sched.ffn is None:
+        return []
+    l_spec = from_hf.fields.get("layers", "num_hidden_layers")
+    num_l: int | None = None
+    try:
+        raw_l = _resolve_field_spec(hf_config, "layers", l_spec)
+        if not isinstance(raw_l, bool) and int(raw_l) >= 1:
+            num_l = int(raw_l)
+    except (ValueError, TypeError):
+        pass
+    if num_l is None:
+        num_l = _infer_static_layers(cls, from_hf)
+    if num_l is not None and num_l >= 1:
+        try:
+            ffn_l = _resolve_slot_spec(sched.ffn, hf_config, num_l, "ffn")
+            for lyr, ov in sched.overrides.items():
+                if 0 <= lyr < num_l and "ffn" in ov:
+                    ffn_l[lyr] = ov["ffn"]
+            return [m for m in ffn_l if m is not None]
+        except MegakernelConfigError:
+            pass
+    spec = sched.ffn
+    if isinstance(spec, (ModuleBinding, Module)):
+        out: list[ModuleOrBinding] = [spec]
+    elif isinstance(spec, Every):
+        out = [spec.last] if spec.rest is None else [spec.rest, spec.last]
+    elif isinstance(spec, FromHFLayerTypes):
+        out = list(spec.mapping.values())
+    elif isinstance(spec, Sequence) and not isinstance(spec, (str, bytes)):
+        out = [x for x in spec if isinstance(x, (ModuleBinding, Module))]
+    else:
+        out = []
+    for ov in sched.overrides.values():
+        if "ffn" in ov and ov["ffn"] is not None:
+            out.append(ov["ffn"])
+    return out
+
+
+def validate_model_hf_config(cls: Any, hf_config: Any) -> EligibilityResult:
+    """Validate `hf_config` against `cls` (`ModelDef` schedule + geometry)."""
+    if hf_config is None:
+        return EligibilityResult(True)
+    from_hf = cls._from_hf_decl()
+    for ffn in _resolved_ffn_bindings(cls, hf_config, from_hf):
+        m_cls = _module_cls_of(ffn)
+        if not (
+            issubclass(m_cls, MoEModule) and getattr(m_cls, "routed_experts", True)
+        ):
+            continue
+        if isinstance(ffn, ModuleBinding):
+            exp_spec = ffn.fields.get("experts", "num_experts")
+            exp_key = exp_spec[0] if isinstance(exp_spec, tuple) else str(exp_spec)
+            is_exp = "experts" in ffn.explicit_fields
+            aliases = getattr(m_cls, "FIELD_ALIASES", {})
+            exp_aliases = tuple(a for a, t in aliases.items() if t == "experts")
+            try:
+                raw_e = _resolve_field_spec(
+                    hf_config,
+                    "experts",
+                    exp_spec,
+                    fallback=REQUIRED,
+                    aliases=exp_aliases,
+                    explicit=is_exp,
+                )
+                valid_e = (
+                    isinstance(raw_e, int) and not isinstance(raw_e, bool) and raw_e > 0
+                )
+            except (ValueError, TypeError):
+                valid_e = False
+        else:
+            exp_key = "num_experts"
+            raw_e = getattr(ffn, "E", getattr(ffn, "experts", 0))
+            valid_e = (
+                isinstance(raw_e, int) and not isinstance(raw_e, bool) and raw_e > 0
+            )
+        if not valid_e:
+            return EligibilityResult(
+                False,
+                "non_moe_checkpoint",
+                f"Megakernel disabled for {cls.__name__}: {cls.__name__} "
+                f"supports MoE checkpoints only "
+                f"(missing or non-positive {exp_key!r}); skipping.",
+            )
+    hid_spec = from_hf.fields.get("hidden", "hidden_size")
+    hid_key = hid_spec[0] if isinstance(hid_spec, tuple) else str(hid_spec)
+    has_hid = _lookup_raw_key(hf_config, hid_key) not in (None, REQUIRED)
+    geom_keys = {
+        (v[0] if isinstance(v, tuple) else str(v))
+        for v in from_hf.fields.values()
+        if isinstance(v, (str, tuple))
+    } | set(cls.default_hf_config or ())
+    geom_keys -= {"architectures", "model_type", "torch_dtype", "transformers_version"}
+    present_geom = {
+        k: val
+        for k in geom_keys
+        if (val := _lookup_raw_key(hf_config, k)) not in (None, REQUIRED)
+    }
+    if has_hid or present_geom:
+        cfg_for_geom = (
+            hf_config
+            if (has_hid or cls.default_hf_config is None)
+            else {**dict(cls.default_hf_config), **present_geom}
+        )
+        try:
+            g_hf = cls.derive_geometry(cfg_for_geom)
+        except (MegakernelConfigError, ValueError, KeyError) as exc:
+            return EligibilityResult(
+                False,
+                "invalid_geometry",
+                f"Megakernel disabled for {cls.__name__}: {exc}; skipping.",
+            )
+        if cls.default_hf_config is not None:
+            g_def = cls.derive_geometry(cls.default_hf_config)
+            if g_hf != g_def:
+                diffs = [
+                    f"{f.name}={getattr(g_hf, f.name)!r} "
+                    f"(expected {getattr(g_def, f.name)!r})"
+                    for f in dataclasses.fields(g_def)
+                    if getattr(g_hf, f.name) != getattr(g_def, f.name)
+                ]
+                return EligibilityResult(
+                    False,
+                    "geometry_mismatch",
+                    f"Megakernel disabled for {cls.__name__}: hf_config geometry "
+                    f"differs in {', '.join(diffs)}; skipping.",
+                )
+    return EligibilityResult(True)
+
+
 __all__ = [
     "describe_binding",
     "model_label",
     "norm_zc_and_eps",
     "validate_model_def",
+    "validate_model_hf_config",
     "validate_norms",
 ]

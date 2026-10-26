@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Exception types of the megakernel library (framework-free)."""
+"""Exception and result types of the megakernel library (framework-free)."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 
 class MegakernelConfigError(RuntimeError):
@@ -28,4 +30,18 @@ class MegakernelLayoutError(ValueError):
     """
 
 
-__all__ = ["MegakernelConfigError", "MegakernelLayoutError"]
+@dataclass(frozen=True)
+class EligibilityResult:
+    """Structured eligibility result returned by startup and config gates."""
+
+    eligible: bool
+    reason: str = "ok"
+    message: str = ""
+    level: str = "warning"
+
+    @property
+    def code(self) -> str:
+        return self.reason
+
+
+__all__ = ["EligibilityResult", "MegakernelConfigError", "MegakernelLayoutError"]

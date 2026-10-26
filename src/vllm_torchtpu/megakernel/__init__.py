@@ -36,6 +36,7 @@ from . import (
     profile,
     profiles,
     reference,
+    runtime,
     schedule,
     spec,
     stream,
@@ -58,7 +59,7 @@ from .cache_experimental import (
     make_fused_pooled_step,
 )
 from .comm import AllReduceRing
-from .errors import MegakernelConfigError, MegakernelLayoutError
+from .errors import EligibilityResult, MegakernelConfigError, MegakernelLayoutError
 from .exec_spec import DebugOptions, ExecSpec, Tiles, default_tiles
 from .kernel import (
     KernelContext,
@@ -182,6 +183,7 @@ __all__ = [
     "CachePipe",
     "DebugOptions",
     "DirectHBM",
+    "EligibilityResult",
     "Embedding",
     "EmbeddingModule",
     "Every",
@@ -300,6 +302,7 @@ __all__ = [
     "register_model",
     "register_profile",
     "rup",
+    "runtime",
     "scatter_pool_states",
     "schedule",
     "should_fuse_pool_io",

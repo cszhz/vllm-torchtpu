@@ -1081,7 +1081,7 @@ def _time_pooled_step_fn(
 
 
 def _assert_driver_created_from_real_qwen35_config(mesh: Mesh, g: Any) -> None:
-    """Assert `megakernel_runtime.maybe_create` creates `Qwen35Megakernel` on TPU."""
+    """Assert `megakernel_runtime.maybe_create` creates `MegakernelDriver` on TPU."""
     import types
     import unittest.mock as mock
 
@@ -1136,7 +1136,8 @@ def _assert_driver_created_from_real_qwen35_config(mesh: Mesh, g: Any) -> None:
         ):
             drv = driver_mod.maybe_create(runner)
         assert drv is not None, "maybe_create silently returned None on real config"
-        assert isinstance(drv, driver_mod.Qwen35Megakernel)
+        assert isinstance(drv, driver_mod.MegakernelDriver)
+        assert drv.model_def is qwen35.Qwen35
         assert drv.geom == dataclasses.replace(qwen35.FULL_EP, e_slots=g.E // 8)
 
 

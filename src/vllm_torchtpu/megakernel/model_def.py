@@ -34,7 +34,7 @@ from .derive import (
     resolve_model_schedule,
     shrink_model_hf_config,
 )
-from .errors import MegakernelConfigError
+from .errors import EligibilityResult, MegakernelConfigError
 from .exec_spec import ExecSpec
 from .geometry import FromHF, LMHead, ModelGeometry, _BoundFromHF
 from .modules.gdn import GDNModule
@@ -49,7 +49,12 @@ from .schedule import (
     Schedule,
 )
 from .spec import ModelSpec, Module
-from .validate import model_label, validate_model_def, validate_norms
+from .validate import (
+    model_label,
+    validate_model_def,
+    validate_model_hf_config,
+    validate_norms,
+)
 
 
 class ModelDef:
@@ -57,8 +62,10 @@ class ModelDef:
 
     _IS_MODEL_DEF: ClassVar[bool] = True
     name: ClassVar[str] = ""
+    display_name: ClassVar[str] = ""
     hf_architectures: ClassVar[tuple[str, ...]] = ()
     hf_model_type: ClassVar[tuple[str, ...]] = ()
+    supported_tp_sizes: ClassVar[tuple[int, ...]] = ()
     layer_type_name: ClassVar[str | None] = None
     geometry: ClassVar[Any] = None
     schedule: ClassVar[Schedule | None] = None
@@ -74,6 +81,7 @@ class ModelDef:
         super().__init_subclass__(**kwargs)
         for attr, empty in (
             ("name", ""),
+            ("display_name", ""),
             ("hf_architectures", ()),
             ("hf_model_type", ()),
         ):
@@ -218,6 +226,11 @@ class ModelDef:
         if key in (cls.profiles or {}):
             return cls.profiles[key]
         return cls.default_profile() if key == "default" else get_profile(key)
+
+    @classmethod
+    def validate_hf_config(cls, hf_config: Any) -> EligibilityResult:
+        """Validate `hf_config` against this model's schedule and geometry."""
+        return validate_model_hf_config(cls, hf_config)
 
     @classmethod
     def reference_step(
