@@ -111,6 +111,70 @@ def test_budget_limits_adds_and_keeps_every_expert_held():
     assert sorted(e for e in nxt2.held[1] if e != rl.FREE) == [2, 3, 4, 5]
 
 
+def test_budget_keeps_a_moving_hot_expert_under_the_replica_cap():
+    """DP8 `eplb-dyn-dp8-e` generation 3: ranks 0 and 1 hold the hot expert 0
+    (at the cap). Their targets drop it and one light expert each but the
+    budget admits one add, so they remove the light one (held elsewhere too)
+    and keep 0, while ranks 2 and 3 add it: four copies against a cap of two,
+    which the slot table cannot hold. With the cap, the adds of 0 are blocked
+    and the layout stays valid."""
+    old = rl.LayerLayout(
+        [[0, 1, 2, rl.FREE], [0, 3, 4, rl.FREE], [5, 6, 1, rl.FREE], [7, 3, 5, rl.FREE]]
+    )
+    targets = [[2, 5, 6], [4, 6, 7], [5, 0, 1], [7, 3, 0]]
+    load = np.array([100, 1, 5, 1, 5, 5, 5, 5], dtype=float)
+    loose = rl._budgeted_next(old, targets, load, staging=1)
+    assert loose.copies(8).max() == 4  # the step that crashed the install
+    nxt = rl._budgeted_next(old, targets, load, staging=1, cap=2)
+    copies = nxt.copies(8)
+    assert copies.max() <= 2 and copies.min() >= 1
+    assert all(len(r) == 3 for r in nxt.ranks())
+    nxt.slot_table(8, 2)  # what install builds; must not raise
+    assert 0 not in nxt.held[2] and 0 not in nxt.held[3]
+    assert nxt.held != old.held  # the other adds still happen
+
+
+def test_solve_group_layouts_always_fit_the_slot_table():
+    """Random windows over random valid layouts: every planned layout holds
+    each expert at least once and at most `replica_cap` times, with the
+    active count per rank unchanged, and every move names a live source."""
+    rng = np.random.default_rng(7)
+    checked = 0
+    for shards, experts, active, cap in ((2, 8, 4, 2), (4, 12, 4, 2), (4, 14, 4, 3)):
+        spec = dict(experts=experts, active=active, staging=1, replica_cap=cap)
+        for _ in range(12):
+            seed_rows = torch.as_tensor(
+                rng.integers(1, 200, size=(3, 1, experts)), dtype=torch.float32
+            )
+            try:
+                phy2log, _, _ = eplb_policy.rebalance_experts_global(
+                    seed_rows, shards * active, active, max_copies=cap
+                )
+            except ValueError:  # the greedy packer's known refusal on odd shapes
+                continue
+            held = [
+                list(r) + [rl.FREE] for r in eplb_policy.rank_lists(phy2log, active)[0]
+            ]
+            old = rl.LayerLayout(held)
+            rows = rng.integers(1, 300, size=(4, experts)).astype(float)
+            rows[:, rng.integers(experts)] *= 20  # one hot expert
+            try:
+                layouts, moves, _ = rl.solve_group(
+                    "target", {0: old}, {0: rows}, min_gain=0.0, **spec
+                )
+            except ValueError:
+                continue
+            checked += 1
+            for lay in layouts.values():
+                copies = lay.copies(experts)
+                assert copies.min() >= 1 and copies.max() <= cap
+                assert all(len(r) == active for r in lay.ranks())
+                lay.slot_table(experts, cap)
+            for m in moves:
+                assert old.held[m.src_rank][m.src_slot] == m.expert
+    assert checked >= 12
+
+
 def test_removes_never_orphan_a_single_copy():
     lay = _layout()
     # Rank 0 wants 7 and would drop 3, but 3 has no other holder in the

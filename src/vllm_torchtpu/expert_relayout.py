@@ -229,7 +229,11 @@ def _match_ranks(new_lists: list[list[int]], old: LayerLayout) -> list[list[int]
 
 
 def _budgeted_next(
-    old: LayerLayout, targets: list[list[int]], load: np.ndarray, staging: int
+    old: LayerLayout,
+    targets: list[list[int]],
+    load: np.ndarray,
+    staging: int,
+    cap: int | None = None,
 ) -> LayerLayout:
     """The next layout toward `targets` within the move budget.
 
@@ -238,6 +242,15 @@ def _budgeted_next(
     departing experts as it gained; an expert is removed only where another
     rank still holds it afterwards, so every intermediate layout is complete.
     Adds are kept by descending load, removes chosen by ascending load.
+
+    `cap` bounds the copies of one expert in the layout this returns, which
+    the slot table's width requires. The policy's target honours it, but the
+    step toward the target need not: a rank that departs two experts and adds
+    one removes the lighter departure and keeps the hot one, while other ranks
+    add that hot expert, so a replicated hot expert gains copies net. An
+    expert over the cap gives back its adds on the highest-numbered ranks
+    (those ranks take their next wanted expert instead), and the loop runs to
+    a fixed point; the choice is deterministic, as every rank solves alone.
     """
     shards = old.shards
     old_sets = [set(r) for r in old.ranks()]
@@ -250,11 +263,13 @@ def _budgeted_next(
         r: sorted(old_sets[r] - target_sets[r], key=lambda e: (load[e], e))
         for r in range(shards)
     }
-    kept = {
-        r: adds[r][: min(len(adds[r]), staging, len(old.free_slots(r)))]
-        for r in range(shards)
-    }
+    budget = {r: min(staging, len(old.free_slots(r))) for r in range(shards)}
+    blocked: dict[int, set[int]] = {r: set() for r in range(shards)}
     while True:
+        kept = {
+            r: [e for e in adds[r] if e not in blocked[r]][: budget[r]]
+            for r in range(shards)
+        }
         # Holders after this generation's adds, before its removes.
         holders: dict[int, set[int]] = {}
         for r in range(shards):
@@ -273,9 +288,20 @@ def _budgeted_next(
             if len(chosen) < len(kept[r]):
                 # Not enough removable departures: give back the least
                 # valuable adds and try again with everyone's holders.
-                kept[r] = kept[r][: len(chosen)]
+                budget[r] = len(chosen)
                 trimmed = True
             removes[r] = chosen
+        if cap is not None:
+            for e in sorted(holders):
+                excess = len(holders[e]) - cap
+                if excess <= 0:
+                    continue
+                adders = sorted(
+                    (r for r in range(shards) if e in kept[r]), reverse=True
+                )
+                for r in adders[:excess]:
+                    blocked[r].add(e)
+                    trimmed = True
         if not trimmed:
             break
     nxt = old.copy()
@@ -330,8 +356,25 @@ def solve_group(
         old = layouts[lid]
         mean_rows = rows[:, i, :].mean(axis=0)
         targets = _match_ranks(lists[i], old)
-        nxt = _budgeted_next(old, targets, mean_rows, staging)
+        nxt = _budgeted_next(old, targets, mean_rows, staging, cap=replica_cap)
         if nxt.held == old.held:
+            continue
+        copies = nxt.copies(experts)
+        if (
+            copies.min() < 1
+            or copies.max() > replica_cap
+            or any(len(r) != active for r in nxt.ranks())
+        ):
+            # Never hand install a layout the slot table cannot hold.
+            logger.warning(
+                "expert relayout | %s layer %d: budgeted layout invalid "
+                "(copies %d..%d, cap %d), layer skipped this generation",
+                group,
+                lid,
+                int(copies.min()),
+                int(copies.max()),
+                replica_cap,
+            )
             continue
         before = tm.predict(mean_rows, old.ranks(), old.copies(experts))[0]
         after = tm.predict(mean_rows, nxt.ranks(), nxt.copies(experts))[0]
