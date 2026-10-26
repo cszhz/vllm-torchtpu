@@ -111,9 +111,9 @@ class _RawReader:
     lane-padded, so a logical-size copy counts as partial, which rank < 3
     refuses). A read is issued from the step thread (`issue`), the DMA lands
     while the step runs, and the result is adopted by `poll` a step or two
-    later. The first read is checked against the torch path and the reader
-    disables itself on a mismatch (the raw bytes are the device's physical
-    layout: a 1-D int32 array is linear with padding at the end)."""
+    later. At bind a synchronous read is checked against the torch path and
+    the reader is refused on a mismatch (the raw bytes are the device's
+    physical layout: a 1-D int32 array is linear with padding at the end)."""
 
     def __init__(self) -> None:
         from tpu_sync.api.torch import raw_transfer
@@ -158,6 +158,25 @@ class _RawReader:
             self._bufs.append(buf)
             self._views.append(flat.numpy().view(np.int32).reshape(-1))
         self._srcs = srcs
+        # The self-check, here and synchronous: a read issued now, waited for,
+        # against the torch path read at the same point (no step in between).
+        self.issue(-1)
+        self._rt.await_all(self._futures)
+        self._futures, self._prepared = None, []
+        width = max(v.size for v in self._views)
+        host = np.zeros((len(self._views), width), dtype=np.int64)
+        for i, v in enumerate(self._views):
+            host[i, : v.size] = v
+        ref = _read_all_sync()
+        if ref.shape != host.shape or not np.array_equal(ref, host):
+            raise ValueError(
+                "raw readback disagrees with the torch readback (the 1-D "
+                "accumulator's physical layout is not linear)"
+            )
+        self.checked = True
+        self.stats["issues"] = 0
+        self.stats["issue_ms"] = 0.0
+        self.stats["issue_ms_max"] = 0.0
 
     def issue(self, step: int) -> None:
         if self._futures is not None:
@@ -184,11 +203,6 @@ class _RawReader:
         self._futures, self._prepared = None, []
         self.latest, self.latest_step = host, step
         self.stats["ready_steps"].append(step - (self.issued_step or step))
-        if not self.checked:
-            self.checked = True
-            ref = _read_all_sync()
-            if ref.shape != host.shape or not np.array_equal(ref, host):
-                raise ValueError("raw readback disagrees with the torch readback")
 
     def poll(self, step: int) -> bool:
         """Adopt a completed read; True when `latest` changed."""

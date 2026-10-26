@@ -142,13 +142,21 @@ def _fake_raw(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "tpu_sync.api.torch.raw_transfer", rt)
     # The CPU guard keeps the suite on the torch path; lift it for these.
-    monkeypatch.setattr(expert_load, "_reader", lambda: expert_load._READER or _bind())
+    monkeypatch.setattr(expert_load, "_reader", _bind)
     return rt, issued
 
 
 def _bind():
-    reader = expert_load._RawReader()
-    reader.bind()
+    """Production's `_reader()` without its CPU guard: bind once, refuse for
+    good on any error."""
+    if expert_load._READER is not None or expert_load._STATE.get("raw_disabled"):
+        return expert_load._READER
+    try:
+        reader = expert_load._RawReader()
+        reader.bind()
+    except Exception:  # noqa: BLE001
+        expert_load._STATE["raw_disabled"] = True
+        return None
     expert_load._READER = reader
     return reader
 
@@ -167,25 +175,22 @@ def test_raw_reader_issues_ahead_adopts_when_ready_and_checks_itself(monkeypatch
     b._tpu_expert_load.copy_(torch.tensor([5, 6], dtype=torch.int32))
     for _ in range(3):
         expert_load.maybe_log(0)
-    assert issued == []  # nothing due before step 4 (= 8 - 4)
+    reader = expert_load._READER
+    assert reader.checked and len(issued) == 2  # the bind's own check read
     expert_load.maybe_log(0)  # step 4: issued four steps ahead of the boundary
-    assert (
-        len(issued) == 2 and expert_load._READER.latest is None
-    )  # one per accumulator
+    assert len(issued) == 4 and reader.latest is None
     for f in issued:
         f.land()
     expert_load.maybe_log(0)  # step 5: adopted
-    reader = expert_load._READER
-    assert reader.latest_step == 5
+    assert reader.latest_step == 5 and reader.stats["ready_steps"] == [1]
     assert reader.latest.tolist() == [[1, 2, 3, 4], [5, 6, 0, 0]]
-    assert reader.checked and reader.stats["ready_steps"] == [1]
     for _ in range(3):
         expert_load.maybe_log(0)  # steps 6..8
     snap = expert_load.snapshot()  # the boundary takes the adopted read (3 old)
-    assert len(issued) == 2 and snap[("target", 0)].tolist() == [1, 2, 3, 4]
-    for _ in range(7):  # steps 9..15: the step-12 read landed? no: unlanded, so
-        expert_load.maybe_log(0)  # the next consumer waits for it
-    assert len(issued) == 4
+    assert len(issued) == 4 and snap[("target", 0)].tolist() == [1, 2, 3, 4]
+    for _ in range(7):  # steps 9..15: the step-12 read is issued, never lands,
+        expert_load.maybe_log(0)  # so the consumer at 15 waits for it
+    assert len(issued) == 6
     expert_load.snapshot()
     assert all(f.done for f in issued)
 
@@ -205,6 +210,5 @@ def test_raw_reader_disagreeing_with_torch_falls_back(monkeypatch):
             super().__init__(torch.full_like(tensor, 9), buf, skip)
 
     rt.PreparedTorchRawTransfer = Corrupt
-    for _ in range(4):  # the read lands wrong bytes at the step-4 log point
-        expert_load.maybe_log(0)
+    expert_load.maybe_log(0)  # the bind's synchronous check refuses the reader
     assert expert_load._STATE.get("raw_disabled") and expert_load._READER is None
