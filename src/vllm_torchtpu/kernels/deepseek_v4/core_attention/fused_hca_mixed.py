@@ -82,12 +82,16 @@ class Config:
     hca_ppr: int
     num_hca_pages: int
     nw: int  # SWA write pages per request
+    na: int = 0  # SWA pages per request covering [s0, pf + q_len) (window-from-cache table)
     blk_pages: int = 128
     slots: int = 3
     issue_chunk: int = 16
     edge_mask_only: bool = True  # unmasked interior tiles (else every tile masked)
     unroll: int = 1  # interior-tile loop unroll
     kt_tail: int = 0  # >0: tail / edge tiles of this many rows (wide kt tiles only where all rows see them)
+    kt_mid: int = 0  # >0: a middle tile width between kt and kt_tail
+    swa_skip_cached: bool = False  # q blocks past the first W tokens of a request skip the cached-window keys
+    swa_fc: bool = False  # window keys of each q block DMA'd back from the SWA pages (exact rows, lane-padded width)
     swa_merge: bool = False  # window keys + the first compressed tile in one (masked) update
     stats128: bool = False
     row_split: int = 1  # wide/narrow unmasked tiles processed as this many independent row groups  # m / l kept lane-replicated [rows, 128] (upstream flash_attention form)
@@ -106,9 +110,9 @@ class Config:
         return self.hca_ppr * self.hca_page
 
 
-def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_win_ref, swa_wr_ref, hca_pt_ref,
+def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_win_ref, swa_wr_ref, swa_all_ref, hca_pt_ref,
             nkv_ref, sink_ref, q_hbm, _swa_in, hca_in, out_hbm, swa_hbm,
-            swa_buf, swa_kv, wbuf, ring, res, qbuf, obuf, m_scr, l_scr, acc_scr, osz, sems):
+            swa_buf, swa_kv, wbuf, ring, res, qbuf, obuf, m_scr, l_scr, acc_scr, osz, winbuf, sems):
     T, H, W, P, HP = cfg.tokens, cfg.heads, cfg.window, cfg.swa_page, cfg.hca_page
     B, S, BP, KT = cfg.blk_rows, cfg.slots, cfg.blk_pages, cfg.kt
     ROWS2 = 2 * HP
@@ -120,7 +124,7 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_win_ref, swa_wr
     swa_hbm = _words(swa_hbm)
     nreq = dist_ref[2]
     nsmall = dist_ref[1]  # requests [0, nsmall) are decode / verify
-    SEM_SWA_W, SEM_RING, SEM_Q, SEM_O = 2, 3, 3 + S, 5 + S
+    SEM_SWA_W, SEM_RING, SEM_Q, SEM_O, SEM_WIN = 2, 3, 3 + S, 5 + S, 7 + S
 
     def req_scalars(r):
         cu_r = cu_ref[r]
@@ -314,9 +318,35 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_win_ref, swa_wr
             tok0 = cu_r + QB * k
             return tok0, jnp.minimum(QB, qlen - QB * k), jnp.minimum(tok0, T - QB)
 
+        LW = _round_up(W + QB, 16)
+        lp0 = s0 // P
+
+        def win_span(k):
+            first = pf + QB * k
+            a = jnp.maximum(first - (W - 1), 0)
+            return a, first + jnp.minimum(QB, qlen - QB * k) - a
+
+        def win_copy(k, slot, *, wait):
+            """Window rows [a, a + n) of q block k from the SWA cache pages (written above) -> winbuf[slot]."""
+            a, n = win_span(k)
+            off = a % P
+            c1 = jnp.minimum(n, P - off)
+            c2 = jnp.minimum(n - c1, P)
+            c3 = n - c1 - c2
+            lp = a // P - lp0
+            for i, (src, dst, cnt) in enumerate(((off, 0, c1), (0, c1, c2), (0, c1 + c2, c3))):
+                @pl.when(cnt > 0)
+                def _(i=i, src=src, dst=dst, cnt=cnt):
+                    page = swa_all_ref[cfg.na * r + lp + i]
+                    cp = pltpu.make_async_copy(swa_hbm.at[page, pl.ds(2 * src, 2 * cnt)],
+                                               winbuf.at[slot, pl.ds(2 * dst, 2 * cnt)], sems.at[SEM_WIN + slot])
+                    cp.wait() if wait else cp.start()
+
         @pl.when(nq > 0)
         def _():
             q_copy(offs(0)[2], QB, 0).start()
+            if cfg.swa_fc:
+                win_copy(0, 0, wait=False)
 
         def qblock(k, oc):
             tok0, nrow, off = offs(k)
@@ -326,6 +356,13 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_win_ref, swa_wr
             @pl.when(k + 1 < nq)
             def _():
                 q_copy(offs(k + 1)[2], QB, 1 - qslot).start()
+
+            if cfg.swa_fc:
+                win_copy(k, qslot, wait=True)
+
+                @pl.when(k + 1 < nq)
+                def _():
+                    win_copy(k + 1, 1 - qslot, wait=False)
 
             q = qbuf[qslot, :QB].reshape(rows, HEAD_DIM)
             qpos = pf + (off - cu_r) + row_tok  # [rows, 1]
@@ -362,6 +399,23 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_win_ref, swa_wr
                 kv0, m0_ = tile_mask(0, KS, res[pl.ds(0, KS)])
                 update(q, jnp.concatenate([kv, kv0], axis=0), jnp.concatenate([cmask, nmask, m0_], axis=1),
                        first=True, rows=rows)
+            elif not cfg.no_swa_compute and cfg.swa_fc:
+                a_w, n_w = win_span(k)
+                jw = lax.broadcasted_iota(jnp.int32, (1, LW), 1)
+                jr = lax.broadcasted_iota(jnp.int32, (LW, 1), 0)
+                wk = _decode_tokens(winbuf.at[qslot], LW)
+                wk = jnp.where(jr < n_w, wk, jnp.zeros((), wk.dtype))
+                dpos = qpos - (a_w + jw)
+                update(q, wk, (jw < n_w) & (dpos >= 0) & (dpos < W), first=True, rows=rows)
+            elif not cfg.no_swa_compute and cfg.swa_skip_cached:
+                # blocks starting >= W tokens into the request never see a cached window row: new rows only
+                @pl.when(tok0 - cu_r < W)
+                def _():
+                    update(q, kv, jnp.concatenate([cmask, nmask], axis=1), first=True, rows=rows)
+
+                @pl.when(tok0 - cu_r >= W)
+                def _():
+                    update(q, newk, nmask, first=True, rows=rows)
             elif not cfg.no_swa_compute:
                 update(q, kv, jnp.concatenate([cmask, nmask], axis=1), first=True, rows=rows)
 
@@ -371,8 +425,11 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_win_ref, swa_wr
                 lo = vis_lo if cfg.edge_mask_only else r0
                 n_big = jnp.maximum(lo - r0, 0) // KT
                 r1 = r0 + n_big * KT
-                n_small = jnp.maximum(lo - r1, 0) // KS if KS != KT else 0
-                r2 = r1 + n_small * KS
+                KM = cfg.kt_mid
+                n_mid = jnp.maximum(lo - r1, 0) // KM if KM else 0
+                r1m = r1 + n_mid * KM if KM else r1
+                n_small = jnp.maximum(lo - r1m, 0) // KS if KS != KT else 0
+                r2 = r1m + n_small * KS
                 n_edge = cdiv(jnp.maximum(vis_hi - r2, 0), KS)
 
                 RS = cfg.row_split if rows % (cfg.row_split * 16) == 0 else 1
@@ -388,7 +445,9 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_win_ref, swa_wr
 
                 lax.fori_loop(0, n_big, full_tile(KT, r0), 0)
                 if KS != KT:
-                    lax.fori_loop(0, n_small, full_tile(KS, r1), 0)
+                    if KM:
+                        lax.fori_loop(0, n_mid, full_tile(KM, r1), 0)
+                    lax.fori_loop(0, n_small, full_tile(KS, r1m), 0)
 
                 def edge_tile(t, c):
                     rs = pl.multiple_of(r2 + t * KS, 16)
@@ -428,6 +487,9 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_win_ref, swa_wr
         for c0 in range(0, T, WT):
             wbuf[2 * c0:2 * (c0 + WT)] = _tokens_to_words(nkv_ref[c0:c0 + WT])
         swa_writes(wait=False)
+        if cfg.swa_fc:  # q blocks read their window (incl. this step's rows) back from the SWA pages
+            winbuf[...] = jnp.zeros(winbuf.shape, winbuf.dtype)
+            swa_writes(wait=True)
         swa_window(0, 0, wait=False)
         cur = (jnp.int32(0), jnp.int32(0), jnp.bool_(True))
         for j in range(S - 1):
@@ -450,7 +512,8 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_win_ref, swa_wr
             return tuple(g_cur) + (oc,)
 
         lax.fori_loop(0, nreq, req_body, (jnp.int32(0),) + tuple(cur) + (jnp.int32(0),))
-        swa_writes(wait=True)
+        if not cfg.swa_fc:
+            swa_writes(wait=True)
 
     out_wait(0)
     out_wait(1)
@@ -517,9 +580,10 @@ def fused_hca_mixed_attention(
     hca_ppr = hca_pt.shape[0] // max_req
     P = logical_page_size
     nw = cdiv(T, P) + 1
+    na = cdiv(T + sliding_window, P) + 2
     cfg = Config(tokens=T, heads=H, chunk=chunk, bq=bq, kt=kt, window=sliding_window, swa_page=P,
                  hca_page=hca_page, sm_scale=float(sm_scale), max_req=max_req, hca_ppr=hca_ppr,
-                 num_hca_pages=num_hca_pages, nw=nw, blk_pages=min(blk_pages, hca_ppr), **knobs)
+                 num_hca_pages=num_hca_pages, nw=nw, na=na, blk_pages=min(blk_pages, hca_ppr), **knobs)
     cu = cu_q_lens.astype(jnp.int32)
     qlens = cu[1:] - cu[:-1]
     pf = seq_lens.astype(jnp.int32) - qlens
@@ -529,6 +593,8 @@ def fused_hca_mixed_attention(
     swa_win = jnp.take_along_axis(swa_pt, cols, axis=1).reshape(-1)
     wcols = jnp.minimum((pf // P)[:, None] + jnp.arange(nw, dtype=jnp.int32)[None, :], width - 1)
     swa_wr = jnp.take_along_axis(swa_pt, wcols, axis=1).reshape(-1)
+    acols = jnp.minimum(lp[:, None] + jnp.arange(na, dtype=jnp.int32)[None, :], width - 1)
+    swa_all = jnp.take_along_axis(swa_pt, acols, axis=1).reshape(-1)
     sinks = attention_sinks.reshape(H, 1)
     if hca_cache.dtype == jnp.int32:  # int32 words (CPU interpreter dry runs)
         hca_cache = hca_cache.reshape(-1, LANES)
@@ -548,7 +614,8 @@ def fused_hca_mixed_attention(
         pltpu.VMEM((rows_max, LANES if knobs.get("stats128") else 1), jnp.float32),  # l
         pltpu.VMEM((rows_max, HEAD_DIM), jnp.float32),
         pltpu.SMEM((6,), jnp.int32),  # out DMA (n, src, dst) per slot
-        pltpu.SemaphoreType.DMA((7 + cfg.slots,)),  # SWA win x2, SWA write, ring x S, q x2, out x2
+        pltpu.VMEM((2, 2 * _round_up(cfg.window + bq, 16), LANES), jnp.int32),  # per-q-block window words x2
+        pltpu.SemaphoreType.DMA((9 + cfg.slots,)),  # SWA win x2, SWA write, ring x S, q x2, out x2, block window x2
     ]
     if vmem_limit_bytes is None:
         est = (2 * 2 * cfg.window * LANES * 4 + cfg.window * HEAD_DIM * 2 + 2 * T * LANES * 4
@@ -557,15 +624,15 @@ def fused_hca_mixed_attention(
                + rows_max * HEAD_DIM * 4 + 3 * rows_max * max(kt, 2 * cfg.window + bq + 16) * 4)
         vmem_limit_bytes = min(int(est * 1.5) + (8 << 20), 60 << 20)
     operands = [distribution.astype(jnp.int32), seq_lens.astype(jnp.int32), cu,
-                kv_lens_to_attend.astype(jnp.int32), swa_win, swa_wr, hca_pt, new_kv, sinks, q,
+                kv_lens_to_attend.astype(jnp.int32), swa_win, swa_wr, swa_all, hca_pt, new_kv, sinks, q,
                 sw_cache, hca_cache]
     out, swa = pl.pallas_call(
         functools.partial(_kernel, cfg),
         out_shape=[jax.ShapeDtypeStruct((T, H, HEAD_DIM), q.dtype),
                    jax.ShapeDtypeStruct(sw_cache.shape, sw_cache.dtype)],
-        in_specs=[smem] * 7 + [vmem, vmem, hbm, hbm, hbm],
+        in_specs=[smem] * 8 + [vmem, vmem, hbm, hbm, hbm],
         out_specs=[hbm, hbm],
-        input_output_aliases={10: 1},
+        input_output_aliases={11: 1},
         scratch_shapes=scratch,
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True, vmem_limit_bytes=vmem_limit_bytes),
         interpret=pltpu.InterpretParams() if interpret else False,
