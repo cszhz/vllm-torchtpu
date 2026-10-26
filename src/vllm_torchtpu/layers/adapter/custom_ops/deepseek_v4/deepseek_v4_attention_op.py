@@ -534,7 +534,7 @@ def _attention_csa(
         if window_mixed_groups > 1:
             output = csa_window_union.attend_grouped(
                 q, union_rows, attention_sinks, swa_output, swa_l, swa_m,
-                sm_scale=sm_scale,
+                sm_scale=sm_scale, groups=window_mixed_groups,
             )  # fmt: skip
         else:
             output = csa_window_union.attend(

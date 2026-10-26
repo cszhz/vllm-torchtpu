@@ -741,15 +741,16 @@ def prepare_grouped(topk_indices, kv_lens, page_indices, cu_q_lens, distribution
     all of them before the first attention)."""
     args = (topk_indices, kv_lens, page_indices, cu_q_lens, distribution, cache_kv_nope,
             cache_kv_rope)
-    return dict(first=_group_l1(args, 0, groups), args=args, groups=groups)
+    # No static entries: the plan crosses an optimization_barrier in the op.
+    return dict(first=_group_l1(args, 0, groups), args=args)
 
 
-def attend_grouped(q, plan, attention_sinks, swa_accumution, swa_l, swa_m, *, sm_scale,
+def attend_grouped(q, plan, attention_sinks, swa_accumution, swa_l, swa_m, *, sm_scale, groups,
                    l2_config=None):
     from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_window_attention
 
     L, nc, ns = sc_geometry()
-    groups, args = plan["groups"], plan["args"]
+    args = plan["args"]
     rows = plan["first"]
     for g in range(groups):
         nxt = None
