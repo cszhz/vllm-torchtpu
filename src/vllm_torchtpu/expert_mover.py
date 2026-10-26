@@ -231,7 +231,9 @@ class RawTransferTransport(TorchTransport):
                 return free.pop()
         if self.host_memory == "raw":
             if self._anchor is None:
-                self.prepare_device(device)
+                raise RuntimeError(
+                    "raw host memory needs prepare_device(anchor) before the first take"
+                )
             host = _raw_host(self._rt, shape, self._anchor)
         else:
             host = _pinned(shape)
@@ -239,15 +241,17 @@ class RawTransferTransport(TorchTransport):
             self._owned.add(host.data_ptr())
         return host
 
-    def prepare_device(self, device) -> None:
-        """Make the anchor that binds RawHostBuffers to `device`, now and
-        outside any step: a device op issued from a pump, with the step's
-        forward still a deferred torch_tpu graph, forces that graph to
-        materialize at a cut it never had, which is a compile mid-step
-        (`eplb-dyn-dp8-i` hung its first staging step this way)."""
+    def prepare_device(self, anchor: torch.Tensor) -> None:
+        """Adopt `anchor`, an existing small device tensor, as what binds
+        RawHostBuffers to its device. Nothing here creates a device op: a
+        tensor made for the purpose (torch.zeros on the device) hung the
+        process when materialized outside a step (after warm-up, at arm) and
+        forced a mid-step compile when made from a pump (`eplb-dyn-dp8-i`)."""
         if self.host_memory != "raw" or self._anchor is not None:
             return
-        anchor = torch.zeros(8, dtype=torch.uint8, device=device)
+        if anchor.device.type == "cpu":
+            self._anchor = anchor
+            return
         self._rt.PreparedTorchRawTransfer(anchor, self._rt.RawHostBuffer(1 << 16))
         self._anchor = anchor
 

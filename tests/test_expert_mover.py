@@ -301,15 +301,17 @@ def test_raw_host_memory_is_viewed_bound_and_pooled_by_ownership(monkeypatch):
         raw_transfer, "major_slice_bytes", lambda t, **kw: 64, raising=False
     )
     tr = mv.RawTransferTransport(host_memory="raw")
-    tr.prepare_device(torch.device("cpu"))  # the anchor is made and bound at arm
-    assert bound == [((8,), 1 << 16)]
+    with pytest.raises(RuntimeError, match="prepare_device"):
+        tr._take((2, 64), torch.device("cpu"))  # no anchor adopted yet
+    tr.prepare_device(torch.zeros(8, dtype=torch.uint8))  # an existing (CPU) tensor
+    assert bound == []  # a CPU anchor needs no bind
     host = tr._take((2, 64), torch.device("cpu"))
     assert (
         tuple(host.shape) == (2, 64)
         and host.is_contiguous()
         and host.dtype == torch.uint8
     )
-    assert bound[1:] == [((8,), 128)]  # the buffer's own bind through that anchor
+    assert bound == [((8,), 128)]  # the buffer's own bind through that anchor
     assert tr._ours(host) and not tr._ours(torch.empty(3, dtype=torch.uint8))
     tr.release(host)
     assert tr._take((2, 64), torch.device("cpu")) is host  # pooled and reused

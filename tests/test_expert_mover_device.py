@@ -124,6 +124,7 @@ def test_an_fp4_pair_slot_moves_through_raw_host_memory():
     """Same move, host buffers from tpu-sync's RawHostBuffer (pinned_host)."""
     transport = mv.RawTransferTransport(host_memory="raw")
     src, dst = _fp4(6, SLOTS, K, N), _fp4(7, SLOTS, K, N)
+    transport.prepare_device(torch.zeros(8, dtype=torch.int32, device="tpu"))
     src_image, dst_before = _image(transport, src), _image(transport, dst)
     future, host = transport.d2h(src, 2, 1)
     future.wait()

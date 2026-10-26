@@ -928,7 +928,9 @@ def arm(
         # step: a pump must never issue a device op of its own.
         prepare = getattr(transport, "prepare_device", None)
         if prepare is not None:
-            prepare(first.w13_weight.device)
+            # The first layer's load accumulator (a few KB on the device) is
+            # the anchor: an existing tensor, so arming issues no device op.
+            prepare(expert_load.operand(first))
         parts = expert_mover.describe_parts(first, transport)
     except Exception as e:  # noqa: BLE001 - a layer without expert tensors (tests' fakes)
         parts = str(e)
