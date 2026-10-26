@@ -63,6 +63,62 @@ def quantize_query(
     return _query_op(q, positions, cos_sin, weights)
 
 
+def reuses_candidates(
+    candidates: torch.Tensor, block_size: int, score_width: int
+) -> bool:
+    """Whether candidate-filtered layers score a gathered compact key cache."""
+    return (
+        block_size in (8, 16, 32, 64, 128)
+        and 0 < candidates.shape[1] * block_size < score_width
+    )
+
+
+def prepare_candidate_keys(
+    cache: "PackedFP8IndexCacheRows",
+    page_table: torch.Tensor,
+    candidates: torch.Tensor,
+    requests: torch.Tensor,
+    *,
+    block_size: int,
+    score_width: int,
+    stage_cache: dict[Any, Any],
+    source_prefix: str,
+    candidate_source: int,
+) -> tuple[torch.Tensor, ...]:
+    """Gather the stage-shared candidate key cache once per publication.
+
+    The candidate source calls this right after publishing, so the SparseCore
+    gather overlaps the following layers instead of the first consumer.
+    """
+    key = (
+        "packed_fp8_candidate_keys",
+        source_prefix,
+        stage_cache.get(("candidate_index_version", source_prefix), 0),
+        candidate_source,
+        stage_cache.get(("candidate_publication", candidate_source), 0),
+        # This cache lives within one batch. Hashing its symbolic row count
+        # would force Dynamo to specialize the dynamic token dimension.
+        candidates.shape[1],
+        block_size,
+        score_width,
+        cache.layout,
+    )
+    prepared = stage_cache.get(key)
+    if prepared is None:
+        assert _prepare_op is not None
+        prepared = _prepare_op(
+            cache.banks,
+            page_table.int(),
+            candidates.int(),
+            requests.int(),
+            cache._layout_args(),
+            block_size,
+            score_width,
+        )
+        stage_cache[key] = prepared
+    return prepared
+
+
 def paged_indexer(
     q: torch.Tensor,
     cache: "PackedFP8IndexCacheRows",
@@ -88,36 +144,20 @@ def paged_indexer(
         candidate_filter
         and stage_cache is not None
         and q.shape[0] > 0
-        and block_size in (8, 16, 32, 64, 128)
-        and 0 < candidates.shape[1] * block_size < score_width
+        and reuses_candidates(candidates, block_size, score_width)
     ):
         assert candidate_source is not None
-        key = (
-            "packed_fp8_candidate_keys",
-            source_prefix,
-            stage_cache.get(("candidate_index_version", source_prefix), 0),
-            candidate_source,
-            stage_cache.get(("candidate_publication", candidate_source), 0),
-            # This cache lives within one batch. Hashing its symbolic row count
-            # would force Dynamo to specialize the dynamic token dimension.
-            candidates.shape[1],
-            block_size,
-            score_width,
-            cache.layout,
+        prepared = prepare_candidate_keys(
+            cache,
+            page_table,
+            candidates,
+            requests,
+            block_size=block_size,
+            score_width=score_width,
+            stage_cache=stage_cache,
+            source_prefix=source_prefix,
+            candidate_source=candidate_source,
         )
-        prepared = stage_cache.get(key)
-        if prepared is None:
-            assert _prepare_op is not None
-            prepared = _prepare_op(
-                cache.banks,
-                page_table.int(),
-                candidates.int(),
-                requests.int(),
-                cache._layout_args(),
-                block_size,
-                score_width,
-            )
-            stage_cache[key] = prepared
         assert _prepared_select_op is not None
         selected = _prepared_select_op(
             q,

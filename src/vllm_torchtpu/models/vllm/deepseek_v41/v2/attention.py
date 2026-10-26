@@ -22,7 +22,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 
-from . import csa2_adapter
+from . import csa2_adapter, fp8_indexer
 from .attention_kernels import (
     gathered_kv_cache_scope,
     paged_attention,
@@ -1728,6 +1728,30 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     value=-1,
                 )
             )
+            block_size = max(1, indexer.indexer_op.candidate_block_size)
+            score_width = max(1, self._max_model_len // self.compress_ratio)
+            candidates = self.candidate_block_buffer[:count]
+            if (
+                isinstance(index_cache, PackedFP8IndexCacheRows)
+                and stage_cache is not None
+                and not split
+                and count > 0
+                and fp8_indexer.reuses_candidates(candidates, block_size, score_width)
+            ):
+                # Gather the consumers' compact keys now: the SparseCore DMA
+                # then overlaps the intervening layers rather than stalling
+                # the first consumer, and precedes later shared-owner writes.
+                fp8_indexer.prepare_candidate_keys(
+                    index_cache,
+                    records,
+                    candidates,
+                    requests_part,
+                    block_size=block_size,
+                    score_width=score_width,
+                    stage_cache=stage_cache,
+                    source_prefix=indexer.k_cache.prefix,
+                    candidate_source=self.candidate_source_layer,
+                )
         return selected
 
     def _select_indices(self, scores, lengths, logical_compressed, count):
