@@ -118,10 +118,17 @@ def _pinned(shape) -> torch.Tensor:
 class TorchTransport:
     """Slices through torch, as logical bytes: the test path on CPU tensors,
     and the fallback where tpu-sync is not importable. Host buffers are
-    [count, slice bytes] uint8."""
+    [count, slice bytes] uint8; `release` hands one back for reuse (a no-op
+    here, a pool in the raw transport, whose pinned allocations are slow)."""
 
     def slice_bytes(self, t: torch.Tensor) -> int:
         return t.nbytes // int(t.shape[0])
+
+    def release(self, host: torch.Tensor) -> None:
+        pass
+
+    def release_pending(self) -> None:
+        pass
 
     def d2h(self, t: torch.Tensor, first: int, count: int):
         rows = t[first : first + count].detach().contiguous()
@@ -147,6 +154,14 @@ class RawTransferTransport(TorchTransport):
     def __init__(self) -> None:
         from tpu_sync.api.torch import raw_transfer
 
+        # Pinning host memory costs milliseconds per buffer, and the whole
+        # scale-table images are tens of MB each, so buffers are pooled by
+        # shape across generations rather than pinned anew on the main thread.
+        self._pool: dict[tuple[int, ...], list[torch.Tensor]] = {}
+        self._lock = threading.Lock()
+        # Pinned copies made for unpinned h2d sources; `release_pending`
+        # returns them to the pool once the mover's generation is done.
+        self._pending_release: list[torch.Tensor] = []
         try:
             # The module's __getattr__ loads the extension for unknown names,
             # so an old tpu-sync answers this with an import error, not an
@@ -167,8 +182,30 @@ class RawTransferTransport(TorchTransport):
     def slice_bytes(self, t: torch.Tensor) -> int:
         return int(self._rt.major_slice_bytes(t))
 
+    def _take(self, shape: tuple[int, ...]) -> torch.Tensor:
+        with self._lock:
+            free = self._pool.get(shape)
+            if free:
+                return free.pop()
+        return _pinned(shape)
+
+    def release(self, host: torch.Tensor) -> None:
+        if not host.is_pinned():
+            return
+        with self._lock:
+            self._pool.setdefault(tuple(host.shape), []).append(host)
+
+    def release_pending(self) -> None:
+        pending, self._pending_release = self._pending_release, []
+        for host in pending:
+            self.release(host)
+
+    def pooled_bytes(self) -> int:
+        with self._lock:
+            return sum(t.numel() for free in self._pool.values() for t in free)
+
     def d2h(self, t: torch.Tensor, first: int, count: int):
-        host = _pinned((count, self.slice_bytes(t)))
+        host = self._take((count, self.slice_bytes(t)))
         future = self._rt.transfer_d2h_async(
             t,
             host,
@@ -180,9 +217,10 @@ class RawTransferTransport(TorchTransport):
 
     def h2d(self, host: torch.Tensor, t: torch.Tensor, first: int):
         if not host.is_pinned():
-            pinned = _pinned(tuple(host.shape))
+            pinned = self._take(tuple(host.shape))
             pinned.copy_(host)
             host = pinned
+            self._pending_release.append(pinned)
         return self._rt.transfer_h2d_async(
             host,
             t,
@@ -408,6 +446,7 @@ class SlabMover:
         self._tables_todo: list = []
         self._h2d_todo: list = []  # (host, tensor, first)
         self._h2d_inflight: list = []
+        self._to_release: list = []  # transport buffers handed back at the end
 
     # -- Mover protocol
 
@@ -522,11 +561,13 @@ class SlabMover:
             table = self._tables[self._tables_todo.pop(0)]
             t = table["tensor"]
             table["future"], table["host"] = self.transport.d2h(t, 0, int(t.shape[0]))
+            self._to_release.append(table["host"])
             budget -= 1
         while self._out_todo and budget > 0:
             m, part, tensor, slot = self._out_todo.pop(0)
             future, host = self.transport.d2h(tensor, slot, 1)
             self._out_inflight.append((future, host, m, part))
+            self._to_release.append(host)
             budget -= 1
         still = []
         for future, host, m, part in self._out_inflight:
@@ -644,5 +685,9 @@ class SlabMover:
             len(self._tables),
             seconds,
         )
+        for host in self._to_release:
+            self.transport.release(host)
+        self._to_release = []
+        self.transport.release_pending()
         self._staged = self._gen
         self._phase = "idle"

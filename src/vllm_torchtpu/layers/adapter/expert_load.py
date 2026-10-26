@@ -84,6 +84,22 @@ def registered_layers() -> int:
     return len(_REGISTERED)
 
 
+def _read_all() -> np.ndarray:
+    """Every registered layer's accumulator as one [layers, widest] int64 host
+    array (rows zero-padded to the widest: the target's layers and the
+    drafter's have different slot counts). One device -> host transfer rather
+    than one per layer: this runs in the step hook."""
+    buffers = [getattr(layer, LOAD_ATTR) for _, layer, _ in _REGISTERED]
+    width = max(b.numel() for b in buffers)
+    if all(b.numel() == width for b in buffers):
+        stacked = torch.stack(buffers)
+    else:
+        stacked = torch.stack(
+            [torch.nn.functional.pad(b, (0, width - b.numel())) for b in buffers]
+        )
+    return stacked.cpu().numpy().astype(np.int64)
+
+
 def snapshot() -> dict[tuple[str, int], np.ndarray]:
     """Every registered layer's cumulative counts, keyed by its layout
     (group, layer index), as int64 host arrays. The counts are replicated
@@ -91,12 +107,15 @@ def snapshot() -> dict[tuple[str, int], np.ndarray]:
     the dynamic re-layout solve without a collective (expert_relayout.py)."""
     from vllm_torchtpu import expert_placement
 
+    if not _REGISTERED:
+        return {}
+    host = _read_all()
     out = {}
-    for name, layer, _ in _REGISTERED:
+    for i, (name, layer, _) in enumerate(_REGISTERED):
         key = expert_placement.layout_key(layer)
         if key is None:
             continue
-        out[key] = getattr(layer, LOAD_ATTR).cpu().numpy().astype(np.int64)
+        out[key] = host[i, : getattr(layer, LOAD_ATTR).numel()].copy()
     return out
 
 
@@ -121,22 +140,15 @@ def maybe_log(dp_rank: int) -> None:
     every = envs.TPU_MOE_EXPERT_LOAD_LOG_EVERY
     if every <= 0 or _STATE["steps"] % every:
         return
-    # One readback per layer: the target's layers and the drafter's have
-    # different slot counts, so the rows are padded to the widest for the
-    # snapshot and summarized at their own width.
-    buffers = [
-        getattr(layer, LOAD_ATTR).cpu().numpy().astype(np.int64)
-        for _, layer, _ in _REGISTERED
-    ]
-    width = max(b.size for b in buffers)
-    host = np.zeros((len(buffers), width), dtype=np.int64)
-    for i, b in enumerate(buffers):
-        host[i, : b.size] = b
+    # One readback for every layer, rows padded to the widest slot count and
+    # summarized at their own width.
+    widths = [getattr(layer, LOAD_ATTR).numel() for _, layer, _ in _REGISTERED]
+    host = _read_all()
     previous = _STATE["previous"]
     window = host if previous is None else host - previous
     _STATE["previous"] = host
     stats = [
-        summarize(window[i, : buffers[i].size], ep)
+        summarize(window[i, : widths[i]], ep)
         for i, (_, _, ep) in enumerate(_REGISTERED)
     ]
     lbs = np.array([s["moe_lb"] for s in stats])
@@ -166,7 +178,7 @@ def maybe_log(dp_rank: int) -> None:
             window=window,
             layer_names=np.array([name for name, _, _ in _REGISTERED]),
             ep=np.array([ep for _, _, ep in _REGISTERED]),
-            physical=np.array([b.size for b in buffers]),
+            physical=np.array(widths),
             step=_STATE["steps"],
             wall=time.time(),
         )
