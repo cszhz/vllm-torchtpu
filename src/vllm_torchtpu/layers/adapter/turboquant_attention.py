@@ -32,7 +32,6 @@ import torch
 from jax.experimental import shard_map
 from jax.sharding import PartitionSpec as P
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
-from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
@@ -171,16 +170,7 @@ def _tq_rpa_kernel_entry(
     return shard_map.shard_map(
         fn,
         mesh=mesh,
-        in_specs=(
-            qkv_spec,
-            qkv_spec,
-            qkv_spec,
-            cache_spec,
-            P(None),
-            P(None),
-            P(None),
-            P(None),
-        ),
+        in_specs=(qkv_spec, qkv_spec, qkv_spec, cache_spec, P(), P(), P(), P()),
         out_specs=(cache_spec, qkv_spec),
         check_rep=False,
     )(
@@ -266,43 +256,17 @@ class PallasTurboQuantAttentionBackendImpl(PallasAttentionBackendImpl):
     """Reuses the Pallas impl's forward, op registration and cache writeback;
     only the kernel entry differs."""
 
-    def __init__(
-        self,
-        num_heads: int,
-        head_size: int,
-        scale: float,
-        num_kv_heads: int,
-        alibi_slopes: list[float] | None,
-        sliding_window: int | None,
-        kv_cache_dtype: str,
-        logits_soft_cap: float | None = None,
-        attn_type: str = AttentionType.DECODER,
-        kv_sharing_target_layer_name: int | None = None,
-        sinks: torch.Tensor | None = None,
-        **kwargs,
-    ) -> None:
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        kv_cache_dtype = kwargs.get("kv_cache_dtype") or args[6]
         if not is_turboquant_kv_cache_dtype(kv_cache_dtype):
             raise ValueError(
                 f"{type(self).__name__} requires a TurboQuant kv_cache_dtype, "
                 f"got {kv_cache_dtype!r}."
             )
-        if sinks is not None:
+        if self.sinks is not None:
             raise NotImplementedError("TurboQuant KV cache does not support sinks.")
-        validate_turboquant_head_dim(head_size)
-        super().__init__(
-            num_heads,
-            head_size,
-            scale,
-            num_kv_heads,
-            alibi_slopes,
-            sliding_window,
-            kv_cache_dtype,
-            logits_soft_cap=logits_soft_cap,
-            attn_type=attn_type,
-            kv_sharing_target_layer_name=kv_sharing_target_layer_name,
-            sinks=sinks,
-            **kwargs,
-        )
+        validate_turboquant_head_dim(self.head_size)
         if self._bm_kernel:
             raise NotImplementedError(
                 "TurboQuant KV cache does not support VLLM_TPU_BLOCK_MAJOR_KV=1."
@@ -311,10 +275,14 @@ class PallasTurboQuantAttentionBackendImpl(PallasAttentionBackendImpl):
             raise NotImplementedError(
                 "TurboQuant KV cache requires VLLM_KV_CACHE_LAYOUT=NHD."
             )
-        preset = kv_cache_dtype.lower().strip()
+        preset = str(kv_cache_dtype).lower().strip()
         set_active_turboquant_preset(preset)
-        get_tq_tables(preset, head_size)  # build the Lloyd-Max tables eagerly
+        get_tq_tables(preset, self.head_size)  # build the Lloyd-Max tables eagerly
         self.tq_preset = preset
+        vllm_config = get_current_vllm_config_or_none()
+        spec = vllm_config.speculative_config if vllm_config is not None else None
+        if spec is not None and self.head_size != 64:
+            self.decode_query_size = spec.num_speculative_tokens + 1
         self._kernel_entry = functools.partial(  # type: ignore[misc]
             _tq_rpa_kernel_entry, tq_preset=preset
         )
@@ -338,14 +306,15 @@ def check_turboquant_config(vllm_config: VllmConfig) -> None:
             cache_config.block_size = (  # type: ignore[assignment]
                 PallasTurboQuantAttentionBackend.get_page_size(vllm_config)
             )
-        if model_config.is_hybrid and cache_config.enable_prefix_caching:
-            logger.warning(
-                "TurboQuant KV cache on hybrid Mamba+Attention models uses the "
-                "compact Mamba state layout rather than the unified KV pool; "
-                "disabling prefix caching (enable_prefix_caching=False, "
-                "mamba_cache_mode='none')."
-            )
-            cache_config.enable_prefix_caching = False
+        if model_config.is_hybrid:
+            if cache_config.enable_prefix_caching:
+                logger.warning(
+                    "TurboQuant KV cache on hybrid Mamba+Attention models uses the "
+                    "compact Mamba state layout rather than the unified KV pool; "
+                    "disabling prefix caching (enable_prefix_caching=False, "
+                    "mamba_cache_mode='none')."
+                )
+                cache_config.enable_prefix_caching = False
             if cache_config.mamba_cache_mode == "align":
                 cache_config.mamba_cache_mode = "none"
             cache_config.mamba_block_size = model_config.max_model_len

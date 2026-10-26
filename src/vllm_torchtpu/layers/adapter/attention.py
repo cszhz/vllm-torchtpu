@@ -53,6 +53,7 @@ from vllm_torchtpu.block_major_pool import (
 )
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+from vllm_torchtpu.gdn_pool_layout import TURBOQUANT_KV_CACHE_DTYPES
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     indexer_kv_layout,
@@ -149,11 +150,7 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
-    # TurboQuant packs K+V into opaque per-slot bytes (see turboquant_attention).
-    "turboquant_k8v4": torch.uint8,
-    "turboquant_4bit_nc": torch.uint8,
-    "turboquant_k3v4_nc": torch.uint8,
-    "turboquant_3bit_nc": torch.uint8,
+    **dict.fromkeys(TURBOQUANT_KV_CACHE_DTYPES, torch.uint8),
 }
 
 

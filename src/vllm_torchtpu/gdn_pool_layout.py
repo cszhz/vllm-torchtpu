@@ -87,8 +87,9 @@ TURBOQUANT_KV_CACHE_DTYPES = (
 
 
 def is_turboquant_kv_cache_dtype(cache_dtype: object) -> bool:
-    return isinstance(cache_dtype, str) and cache_dtype.lower().strip().startswith(
-        "turboquant_"
+    return (
+        isinstance(cache_dtype, str)
+        and cache_dtype.lower().strip() in TURBOQUANT_KV_CACHE_DTYPES
     )
 
 

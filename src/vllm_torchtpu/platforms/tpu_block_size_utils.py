@@ -20,6 +20,7 @@ import torch
 
 from vllm_torchtpu.gdn_pool_layout import (
     QWEN_GDN_ARCHITECTURES,
+    TURBOQUANT_KV_CACHE_DTYPES,
     PooledGDNStateLayout,
     derive_pooled_gdn_state_layout,
     pooled_gdn_state_dtypes,
@@ -79,11 +80,7 @@ _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
-    # TurboQuant packs K+V into opaque per-slot bytes.
-    "turboquant_k8v4": torch.uint8,
-    "turboquant_4bit_nc": torch.uint8,
-    "turboquant_k3v4_nc": torch.uint8,
-    "turboquant_3bit_nc": torch.uint8,
+    **dict.fromkeys(TURBOQUANT_KV_CACHE_DTYPES, torch.uint8),
 }
 
 _SLOT_ALIGNMENT_BYTES = 16

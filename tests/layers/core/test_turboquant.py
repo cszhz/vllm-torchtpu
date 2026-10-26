@@ -70,6 +70,24 @@ def test_vreg_pack_update_dequant_roundtrip(preset, page_size, head_dim):
         empty_page, packed_toks[:, :, 0, :], valid_mask, layout=layout
     )
     dk, dv = tq._dequant_tq_page_vreg(page, jnp.float32, layout=layout, tables=tables)
+    dk_unscaled, dv_4, kn_row = tq._dequant_tq_page_vreg(
+        [page, page, page, page],
+        jnp.float32,
+        layout=layout,
+        tables=tables,
+        return_k_norm=True,
+    )
+    np.testing.assert_allclose(
+        np.asarray(dv_4), np.tile(np.asarray(dv), (4, 1)), rtol=0, atol=0
+    )
+    dk_reconstructed = (
+        np.asarray(dk_unscaled) * np.asarray(kn_row).T
+        if kn_row is not None
+        else np.asarray(dk_unscaled)
+    )
+    np.testing.assert_allclose(
+        dk_reconstructed, np.tile(np.asarray(dk), (4, 1)), rtol=1e-3, atol=1e-3
+    )
 
     q_in = q if layout.is_key_fp8 else np.asarray(tq.rotate(q, tables.hadamard))
     approx_scores = np.asarray(dk) @ q_in
