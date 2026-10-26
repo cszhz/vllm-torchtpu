@@ -14,6 +14,7 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel."""
 
 import functools
+import math
 from enum import Enum
 
 import jax
@@ -35,6 +36,9 @@ MASK_SUBLANES = 8
 
 # Rows per DMA when the decode pass zero-fills the padding rows of the outputs.
 PAD_ZERO_ROWS = 16
+
+# Tokens per grid step of the kernel that packs new KV into cache words.
+KV_WORDS_BLOCK_TOKENS = 256
 
 
 def cdiv(a, b):
@@ -137,7 +141,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    new_kv_hbm_ref,  # [max_num_tokens, token_bytes // 128, 128] uint8
+    new_kv_hbm_ref,  # int32[1, max_num_tokens * token_bytes // 512, 128]
     # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
     cache_kv_hbm_ref,
     in_output_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
@@ -178,6 +182,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
 
     # An int32 CSA host array is viewed as the uint8 slabs it holds.
     cache_kv_hbm_ref = csa_cache_layout.as_u8_slabs(cache_kv_hbm_ref)
+    new_kv_hbm_ref = new_kv_token_rows(new_kv_hbm_ref, q_hbm_ref.shape[0])
     updated_cache_kv_hbm_ref = csa_cache_layout.as_u8_slabs(updated_cache_kv_hbm_ref)
     total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim = (
         cache_kv_hbm_ref.shape
@@ -958,6 +963,59 @@ def prepare_kv_inputs(kv: jax.Array):
     return interleaved.reshape(tokens, head_dim * 2)
 
 
+def _kv_words_kernel(kv_ref, words_ref):
+    tb, head_dim = kv_ref.shape
+    words_per_token = head_dim // 256
+    # Word (r, j) of block b holds token 2r's lane in its low half, 2r + 1's high.
+    pairs = pltpu.bitcast(kv_ref[...], jnp.int32)
+    high_mask = jnp.int32(-(1 << 16))
+    for g in range(words_per_token):
+        lo = pairs[:, 256 * g : 256 * g + 128]
+        hi = pairs[:, 256 * g + 128 : 256 * g + 256]
+        even = (lo & 0xFFFF) | lax.shift_left(hi, 16)
+        odd = lax.shift_right_logical(lo, 16) | (hi & high_mask)
+        for parity, words in ((0, even), (1, odd)):
+            words_ref[
+                pl.ds(
+                    parity * words_per_token + g, tb // 2, stride=2 * words_per_token
+                ),
+                :,
+            ] = words
+
+
+def prepare_kv_words(kv: jax.Array):
+    """bf16 new KV as int32 ``[1, tokens * head_dim // 256, 128]`` words.
+
+    Word ``(g, j)`` of a token holds bf16 lane ``j`` of 128-lane block ``2g``
+    in its low half and of block ``2g + 1`` in its high half, so the kernels'
+    uint8 view (`new_kv_token_rows`) holds exactly the bytes of
+    `prepare_kv_inputs`. One Pallas pass builds it; XLA needs several.
+    """
+    assert kv.dtype == jnp.bfloat16
+    tokens, head_dim = kv.shape
+    assert head_dim % 256 == 0
+    tb = math.gcd(tokens, KV_WORDS_BLOCK_TOKENS)
+    assert tb % 16 == 0, tokens
+    rows_per_token = head_dim // 256
+    words = pl.pallas_call(
+        _kv_words_kernel,
+        grid=(tokens // tb,),
+        in_specs=[pl.BlockSpec((tb, head_dim), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((tb * rows_per_token, 128), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((tokens * rows_per_token, 128), jnp.int32),
+        name="SWA-kv_words",
+    )(kv)
+    return words.reshape(1, tokens * rows_per_token, 128)
+
+
+def new_kv_token_rows(ref, num_tokens: int):
+    """In-kernel uint8 ``[num_tokens, token_bytes // 128, 128]`` view of
+    `prepare_kv_words`."""
+    rows = csa_cache_layout.as_u8_slabs(ref)
+    _, num_rows, sub_rows, lanes = rows.shape
+    return rows.reshape(num_tokens, num_rows * sub_rows // num_tokens, lanes)
+
+
 def prepare_outputs(
     out,  # [max_num_tokens, num_q_heads, head_dim]
     actual_num_q_heads: int,
@@ -997,7 +1055,7 @@ def _mla_batched_decode_pipeline(
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    new_kv_hbm_ref,  # [max_num_tokens, token_bytes // 128, 128] uint8
+    new_kv_hbm_ref,  # int32[1, max_num_tokens * token_bytes // 512, 128]
     # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
     cache_kv_hbm_ref,
     # Output
@@ -1032,6 +1090,7 @@ def _mla_batched_decode_pipeline(
     _, num_q_heads, head_dim = q_hbm_ref.shape
     # An int32 CSA host array is viewed as the uint8 slabs it holds.
     cache_kv_hbm_ref = csa_cache_layout.as_u8_slabs(cache_kv_hbm_ref)
+    new_kv_hbm_ref = new_kv_token_rows(new_kv_hbm_ref, q_hbm_ref.shape[0])
     updated_cache_kv_hbm_ref = csa_cache_layout.as_u8_slabs(updated_cache_kv_hbm_ref)
     total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim = (
         cache_kv_hbm_ref.shape
@@ -1469,7 +1528,7 @@ def _mla_batched_decode_kernel(
 
 def run_mla_batched_decode_kernel(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
-    new_kv: jax.Array,  # [max_num_tokens, lkv_dim]
+    new_kv: jax.Array,  # int32 words, see `prepare_kv_words`
     # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
     cache_kv: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_seqs]
@@ -1756,8 +1815,7 @@ def mla_sliding_window_ragged_paged_attention(
     slots_per_token = token_bytes // slot_bytes
     phys_tokens_per_page = physical_page_size_per_kv_packing // slots_per_token
 
-    new_kv = prepare_kv_inputs(new_kv)  # [max_num_tokens, token_bytes] uint8
-    new_kv = new_kv.reshape(new_kv.shape[0], slots_per_token * kv_packing, lkv_dim)
+    new_kv = prepare_kv_words(new_kv)
     assert logical_page_size <= phys_tokens_per_page
 
     _, num_q_heads, _ = q.shape
@@ -1776,7 +1834,7 @@ def mla_sliding_window_ragged_paged_attention(
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
-        new_kv: jax.Array,  # [max_num_tokens, lkv_dim]
+        new_kv: jax.Array,  # int32 words, see `prepare_kv_words`
         # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
         cache_kv: jax.Array,
         kv_lens: jax.Array,  # i32[max_num_seqs]
