@@ -82,11 +82,14 @@ def test_fault_control_catch_rate():
     for kind in CLASSES:
         cn = "mix128" if kind in ("served", "served_pad", "uniform") else "mix32"
         cell, pairs, sb, ex, mes = _case(cn, kind)
-        me = mes[-1]
-        ref = _run("incumbent", cell, pairs, ex, me)
+        # Every shard the plan cells use: a fault invisible from one shard (no
+        # routed pairs of its own, no experts with rows) is not blind.
+        refs = {me: _run("incumbent", cell, pairs, ex, me) for me in mes}
         for f in spec.FAULTS:
-            bad = spec.compare(spec.oracle_plan(cell, pairs, sb, me, fault=f), ref)
-            rate[f][kind] = bool(bad)
+            rate[f][kind] = any(
+                bool(spec.compare(spec.oracle_plan(cell, pairs, sb, me, fault=f), refs[me]))
+                for me in mes
+            )
     lines = []
     blind_prod = []
     for f in spec.FAULTS:
@@ -107,12 +110,15 @@ def test_combine_native_vs_f64_and_faults(cn):
     pairs = spec.make_pairs(cell, "served_pad", 3)
     sb = spec.make_scale_bits(cell, 3)
     ex = spec.make_exchange(cell, pairs, sb)
-    me = spec.busiest_shard(cell, pairs)
+    # Source 0: bucket padding sits in the tail sources, so source 0 routes.
+    me = 0
     plan = _run("incumbent", cell, pairs, ex, me)
     arr, scl, w, routes = spec.make_combine_inputs(cell, pairs, me, 3)
+    assert bool(np.asarray(routes).any()), "degenerate combine cell: no routed rows"
     pos, mir = jnp.asarray(plan["pos"]), jnp.asarray(plan["mirror_pos"])
     native = np.asarray(jax.jit(spec.incumbent_combine)(arr, scl, pos, mir, w, routes), np.float64)
     want = spec.oracle_combine(arr, scl, pos, mir, w, routes)
+    assert np.abs(want).max() > 0, "degenerate combine cell: oracle output is zero"
     scale = np.maximum(np.abs(want).max(1, keepdims=True), 1e-30)
     err = np.abs(native - want) / scale
     tol = max(4 * float(err.max()), 2.0 ** -8)  # bf16 output rounding, calibrated on native

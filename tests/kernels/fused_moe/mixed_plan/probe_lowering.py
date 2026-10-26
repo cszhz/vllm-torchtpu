@@ -139,7 +139,7 @@ def main():
     ex = rng.integers(0, 9, (EP, count_at + E)).astype(np.int32)
     for me in (0, 7):
         try:
-            out, t = clock(fa_call, (jnp.array([me], jnp.int32), jnp.asarray(ex)))
+            out, t = clock(functools.partial(fa_call, count_at=count_at), (jnp.array([me], jnp.int32), jnp.asarray(ex)))
             first = me * G
             rows = int((((ex[:, count_at + first:count_at + first + G] + 1) // 2) * 2).sum())
             nu = (rows + 127) // 128
