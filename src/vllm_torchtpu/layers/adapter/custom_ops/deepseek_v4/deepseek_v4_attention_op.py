@@ -30,6 +30,9 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import (
     mla_ragged_paged_attention,
 )
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import (
+    HCA_FUSED_Q_COMPUTE_BLOCK_SIZE,
+    HCA_FUSED_QUERIES_PER_BLOCK,
+    SWA_FOLDED_QUERIES_PER_BLOCK,
     mla_sliding_window_ragged_paged_attention,
     uses_batched_decode,
 )
@@ -50,14 +53,6 @@ HCA_KV_PAGES_PER_BLOCK = (128, 64, 64)
 # Largest HCA kv block the SWA batched decode kernel takes in: 256 tokens
 # overflows VMEM at 128 heads and 1024 tokens.
 HCA_FUSED_MAX_KV_TOKENS = 128
-# Queries per q chunk of the HCA-fused SWA prefill/mixed kernel; the SWA-only
-# kernels keep 4.
-HCA_FUSED_Q_COMPUTE_BLOCK_SIZE = 16
-# Queries per block of the HCA-fused SWA mixed kernel. Each 32 of them attend
-# over the window a 32-query block would read (`num_queries_per_view`).
-HCA_FUSED_QUERIES_PER_BLOCK = 128
-# The same for the SWA-only mixed kernels of CSA and SWA layers.
-SWA_FOLDED_QUERIES_PER_BLOCK = 128
 
 logger.info(
     "DeepSeek-V4 attention: HCA pass fused into the SWA kernels for kv blocks "

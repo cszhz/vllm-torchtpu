@@ -26,6 +26,14 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+# Queries per q chunk of the HCA-fused SWA prefill/mixed kernel; the SWA-only
+# kernels keep 4.
+HCA_FUSED_Q_COMPUTE_BLOCK_SIZE = 16
+# Queries per block of the HCA-fused SWA mixed kernel. Each 32 of them attend
+# over the window a 32-query block would read (`num_queries_per_view`).
+HCA_FUSED_QUERIES_PER_BLOCK = 128
+# The same for the SWA-only mixed kernels of CSA and SWA layers.
+SWA_FOLDED_QUERIES_PER_BLOCK = 128
 
 
 def cdiv(a, b):
