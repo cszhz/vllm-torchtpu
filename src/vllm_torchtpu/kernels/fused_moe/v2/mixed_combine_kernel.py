@@ -133,7 +133,7 @@ def _route(acc, tab, P, i, opts):
     return jnp.where(jnp.full(acc.shape, r, jnp.int32) != 0, acc, 0.0)
 
 
-def _bulk_kernel(*refs, t_local, topk, out_dtype, pick, opts):
+def _bulk_kernel(*refs, t_local, topk, out_dtype, pick, opts, strided=False):
     if pick == "mxu":
         (tables_hbm, arr_hbm, scale_hbm, mir_ref, w_ref, out_hbm,
          tab, arr_vm, scl_vm, coef_vm, tile_vm, out_vm, sems) = refs
@@ -206,9 +206,9 @@ def _bulk_kernel(*refs, t_local, topk, out_dtype, pick, opts):
                 acc = term if acc is None else acc + term
             if acc is None:
                 acc = jnp.zeros((LB, L), jnp.float32)
-            tile_vm[u] = _route(acc, tab, P, i, opts).astype(out_dtype)
+            _store_token(tile_vm, u, _route(acc, tab, P, i, opts), LB, out_dtype, strided)
         if "noout" not in opts:
-            out_vm[par] = tile_vm[...].reshape(GROUP, hidden)
+            _relayout(tile_vm, out_vm, par, 0, 0, GROUP, LB, L, out_dtype, strided)
         pltpu.make_async_copy(
             out_vm.at[par],
             out_hbm.at[pl.ds(pl.multiple_of(g * GROUP, GROUP), GROUP)],
@@ -228,7 +228,7 @@ def _bulk_kernel(*refs, t_local, topk, out_dtype, pick, opts):
 def _ring_kernel(
     tables_hbm, arr_hbm, scale_hbm, out_hbm,
     tab, rows_vm, scl_vm, tile_vm, out_vm, sems,
-    *, t_local, topk, out_dtype, opts,
+    *, t_local, topk, out_dtype, opts, strided=False,
 ):
     """kernel._build_combine_kernel's ring, coefficient picked in-kernel."""
     P = t_local * topk
@@ -286,14 +286,14 @@ def _ring_kernel(
                     acc = term if acc is None else acc + term
                 if acc is None:
                     acc = jnp.zeros((LB, L), jnp.float32)
-                tile_vm[i] = _route(acc, tab, P, base + i, opts).astype(out_dtype)
+                _store_token(tile_vm, i, _route(acc, tab, P, base + i, opts), LB, out_dtype,
+                             strided)
             return carry
 
         lax.fori_loop(0, groups, chunk, jnp.int32(0))
         for g in range(groups if "noout" not in opts else 0):
-            out_vm[par, pl.ds(g * GROUP, GROUP)] = tile_vm[pl.ds(g * GROUP, GROUP)].reshape(
-                GROUP, hidden
-            )
+            _relayout(tile_vm, out_vm, par, g * GROUP * (LB if strided else 1), g * GROUP,
+                      GROUP, LB, L, out_dtype, strided)
         pltpu.make_async_copy(
             out_vm.at[par], out_hbm.at[pl.ds(step * tb, tb)], osem(par)
         ).start()
@@ -314,6 +314,30 @@ def _ring_kernel(
             pltpu.make_async_copy(rows_vm.at[p], rows_vm.at[p], rsem(p)).wait()
     for p in range(RING_PARITIES):
         pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], osem(p)).wait()
+
+
+def _relayout(tile_vm, out_vm, par, row0, out0, n_tok, LB, L, out_dtype, strided):
+    """Tokens [n_tok] of the row-layout tile -> lane-dense out_vm[par, out0:out0+n_tok].
+
+    strided: tile_vm is f32 [tokens * LB, L] (token u's row block j at row u*LB+j);
+    lane block j of n_tok tokens is ONE sublane-strided load (stride LB), cast
+    and stored as an aligned [n_tok, L] tile. Otherwise tile_vm is out_dtype
+    [tokens, LB, L] and the block is relaid out by a value reshape.
+    """
+    if strided:
+        for j in range(LB):
+            v = tile_vm[pl.ds(row0 + j, n_tok, stride=LB), :]
+            out_vm[par, pl.ds(out0, n_tok), pl.ds(j * L, L)] = v.astype(out_dtype)
+    else:
+        out_vm[par, pl.ds(out0, n_tok)] = tile_vm[pl.ds(row0, n_tok)].reshape(n_tok, LB * L)
+
+
+def _store_token(tile_vm, u, val, LB, out_dtype, strided):
+    if strided:
+        start = u * LB if isinstance(u, int) else pl.multiple_of(u * LB, 8)
+        tile_vm[pl.ds(start, LB), :] = val
+    else:
+        tile_vm[u] = val.astype(out_dtype)
 
 
 def combine_tables(pos, mirror_pos, weights, row_routes, recv_rows):
@@ -340,7 +364,8 @@ def build_mixed_combine(
     out_dtype,
     *,
     gather="bulk",
-    pick="pre",
+    pick="inline",
+    out="strided",
     opts=(),
     interpret=False,
 ):
@@ -348,7 +373,9 @@ def build_mixed_combine(
 
     pos / mirror_pos: i32 [t_local, topk] or flat token-major ([P] or [1, P]).
     weights: f32 [t_local, topk]; row_routes: bool [t_local, 1].
-    gather: "bulk" | "ring"; pick: "pre" | "inline" (bulk only; ring is inline).
+    gather: "bulk" | "ring"; pick: "pre" | "inline" | "mxu" (bulk only; ring is inline).
+    out: "strided" (sublane-strided relayout from an f32 tile; needs LB % 8 == 0,
+    else falls back) | "reshape" (value reshape of an out_dtype tile).
     opts: timing-only removal arms (SKIPS) or positive-control faults (FAULTS).
     """
     t_local, topk = weights.shape
@@ -363,12 +390,16 @@ def build_mixed_combine(
     if not mixed_combine_supported(t_local, topk):
         raise ValueError(f"mixed combine needs t_local % {2 * GROUP} == 0, got {t_local}")
     tables = combine_tables(pos, mirror_pos, weights, row_routes, R)
+    strided = out == "strided" and LB % 8 == 0
+    tile_rows = GROUP if gather == "bulk" else _ring_step_tokens(t_local)
+    tile = ((tile_rows * LB, L), jnp.float32) if strided else ((tile_rows, LB, L), out_dtype)
     vmem = pltpu.VMEM
     if gather == "bulk":
         if pick not in ("pre", "inline", "mxu"):
             raise ValueError(pick)
         kernel = functools.partial(
-            _bulk_kernel, t_local=t_local, topk=topk, out_dtype=out_dtype, pick=pick, opts=opts
+            _bulk_kernel, t_local=t_local, topk=topk, out_dtype=out_dtype, pick=pick, opts=opts,
+            strided=strided,
         )
         scratch = (
             pltpu.SMEM((3 * P + t_local,), jnp.int32),
@@ -376,7 +407,7 @@ def build_mixed_combine(
             vmem((-(-M // L) * L if pick == "mxu" else M, tile_m), jnp.float32),
             vmem((topk, t_local, L) if pick == "mxu" else (P if pick == "pre" else 1, 1, L),
                  jnp.float32),
-            vmem((GROUP, LB, L), out_dtype),
+            vmem(*tile),
             vmem((2, GROUP, hidden), out_dtype),
             pltpu.SemaphoreType.DMA((5,)),
         )
@@ -386,19 +417,22 @@ def build_mixed_combine(
         if not tb:
             raise ValueError(f"ring combine does not cover t_local={t_local}")
         kernel = functools.partial(
-            _ring_kernel, t_local=t_local, topk=topk, out_dtype=out_dtype, opts=opts
+            _ring_kernel, t_local=t_local, topk=topk, out_dtype=out_dtype, opts=opts,
+            strided=strided,
         )
         scratch = (
             pltpu.SMEM((3 * P + t_local,), jnp.int32),
             vmem((RING_PARITIES, topk * tb, LB, L), arrivals.dtype),
             vmem((M, tile_m), jnp.float32),
-            vmem((tb, LB, L), out_dtype),
+            vmem(*tile),
             vmem((RING_PARITIES, tb, hidden), out_dtype),
             pltpu.SemaphoreType.DMA((1 + 2 * RING_PARITIES,)),
         )
         name = f"moe_v2_mixed_combine_ring_t{t_local}_k{topk}_b{tb}"
     else:
         raise ValueError(gather)
+    if strided:
+        name += "_s"
     if opts:
         name += "_" + "_".join(opts)
     hbm = pltpu.MemorySpace.HBM
@@ -428,10 +462,19 @@ def build_mixed_combine(
         tables,
         # Pinned to HBM: the kernel copies them itself; unconstrained, XLA
         # would prefetch them into VMEM first (plan_kernel.build_decode_combine).
-        pltpu.with_memory_space_constraint(arrivals, hbm),
-        pltpu.with_memory_space_constraint(arrival_scales, hbm),
+        _pin_hbm(arrivals),
+        _pin_hbm(arrival_scales),
         *extra,
     )
+
+
+def _pin_hbm(x):
+    """with_memory_space_constraint(x, HBM), unless x is already typed HBM (an
+    operand produced by another Pallas call's HBM output inside the layer)."""
+    ms = getattr(getattr(x, "aval", None), "memory_space", None)
+    if ms is not None and "hbm" in str(ms).lower():
+        return x
+    return pltpu.with_memory_space_constraint(x, pltpu.MemorySpace.HBM)
 
 
 def descriptors(t_local, topk, recv_rows, gather):

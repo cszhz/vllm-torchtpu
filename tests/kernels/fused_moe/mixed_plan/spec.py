@@ -463,10 +463,12 @@ CANDIDATE_FAULTS = {
 # name -> build_mixed_combine kwargs. Timing-only removal arms carry opts from
 # mixed_combine_kernel.SKIPS (wrong outputs allowed).
 COMBINE_VARIANTS = {
-    "a2": dict(gather="bulk", pick="pre"),
-    "a2_inline": dict(gather="bulk", pick="inline"),
-    "a2_ring": dict(gather="ring"),
-    "a2m": dict(gather="bulk", pick="mxu"),
+    "a2": dict(gather="bulk", pick="pre", out="reshape"),
+    "a2_inline": dict(gather="bulk", pick="inline", out="reshape"),
+    "a2_ring": dict(gather="ring", out="reshape"),
+    "a2m": dict(gather="bulk", pick="mxu", out="reshape"),
+    "a2s": dict(gather="bulk", pick="inline", out="strided"),
+    "a2s_ring": dict(gather="ring", out="strided"),
 }
 
 
