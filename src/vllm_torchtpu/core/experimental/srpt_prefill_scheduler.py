@@ -41,14 +41,16 @@ still wait while decodes fill the budget.
 
 With ``VLLM_TPU_SRPT_ATTN_WORK_CAP=W`` (default 0, off) a step's attention work,
 ``sum(n * (c + n / 2))`` over the chunks it schedules (``n`` new tokens after
-``c`` computed ones, decodes included), is kept near ``W`` by shrinking prefill
+``c`` computed ones, decodes included), is kept under ``W`` by shrinking prefill
 chunks. Data-parallel ranks step in lockstep, so one rank's deep-context chunk
-otherwise stretches every rank's step and the decodes in it. A shrunk chunk is
-rounded to a multiple of ``VLLM_TPU_SRPT_ATTN_TILE_TOKENS`` (default 32, the
-query tile of the TPU attention kernels) so it does not pay for a partly used
-tile; the step's first prefill chunk always gets at least one tile, so a chunk
-whose context alone exceeds ``W`` still advances. A chunk the cap shrank counts
-as progress for the anti-starvation rule above.
+otherwise stretches every rank's step and the decodes in it. A shrunk chunk's
+end, not its length, is rounded down to a multiple of
+``VLLM_TPU_SRPT_ATTN_TILE_TOKENS`` (default 32, the query tile of the TPU
+attention kernels), so a chunk that starts off that grid still ends on it:
+DeepSeek-V4 long-context outputs lose coherence when shrunk chunks end off its
+16-token grid. The step's first prefill chunk always advances to the next
+multiple, so a chunk whose context alone exceeds ``W`` still advances. A chunk
+the cap shrank counts as progress for the anti-starvation rule above.
 
 Under KV pressure upstream preempts ``running[-1]``, which is the longest
 non-stalled prefill chunk, so a long prompt can be preempted repeatedly.
@@ -166,22 +168,25 @@ class SrptPrefillScheduler(AsyncScheduler):
         self, context: int, num_new_tokens: int, work: float, prefill_scheduled: bool
     ) -> int:
         """Tokens of a prefill chunk of ``num_new_tokens`` after ``context``
-        computed ones that fit the attention work left after ``work``,
-        rounded to the attention tile."""
+        computed ones that fit the attention work left after ``work``, with
+        the chunk's end rounded down to the attention tile."""
         room = self.attn_work_cap - work
         fit = int(math.sqrt(context * context + 2 * room) - context) if room > 0 else 0
         if fit >= num_new_tokens:
             return num_new_tokens
+        # Rounding the end rather than the length lets a chunk that starts off
+        # the tile grid end on it; rounding down keeps the step under the cap.
         tile = self.attn_tile_tokens
-        # Round to the nearest tile, ties and the upper quarter up.
-        rounded = (fit + tile * 3 // 4) // tile * tile
-        if rounded >= num_new_tokens:
-            return num_new_tokens
-        if rounded >= tile:
-            return rounded
+        end = (context + fit) // tile * tile
+        if end > context:
+            return end - context
         if not prefill_scheduled:
-            return min(num_new_tokens, tile)
+            return min(num_new_tokens, self._tokens_to_next_tile(context))
         return 0
+
+    def _tokens_to_next_tile(self, context: int) -> int:
+        """Tokens from ``context`` to the next multiple of the attention tile."""
+        return self.attn_tile_tokens - context % self.attn_tile_tokens
 
     def _reserve_prefill_lookahead(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
@@ -387,8 +392,10 @@ class SrptPrefillScheduler(AsyncScheduler):
                 admit = self._attn_cap_tokens(
                     hit_tokens, admit, work, prefill_scheduled
                 )
-            # Enough budget, and the cap lets the target advance a tile.
-            if left >= need and admit >= min(need, self.attn_tile_tokens):
+            # Enough budget, and the cap lets the target reach the next tile.
+            if left >= need and admit >= min(
+                need, self._tokens_to_next_tile(hit_tokens)
+            ):
                 break
             # Non-stalled prefill chunks sit last in `kept`, ordered by
             # remaining tokens, so this is the longest one.

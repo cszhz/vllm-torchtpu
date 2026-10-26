@@ -1140,12 +1140,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # SrptPrefillScheduler: cap on a step's attention work, sum of
     # n * (context + n / 2) over its scheduled chunks; prefill chunks are shrunk
-    # to stay near it (0 disables).
+    # to stay under it (0 disables).
     "VLLM_TPU_SRPT_ATTN_WORK_CAP": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_WORK_CAP", 0
     ),
-    # SrptPrefillScheduler: chunks shrunk by the attention work cap are rounded
-    # to a multiple of this many tokens (the attention kernel's query tile).
+    # SrptPrefillScheduler: a chunk shrunk by the attention work cap ends on a
+    # multiple of this many tokens, rounded down (the attention kernel's query
+    # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
