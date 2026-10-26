@@ -413,8 +413,11 @@ def stock_region(parts=("rope", "comp", "attn")):
             kv = rope_kernel.rope(kv, d["positions"], cs)
         hca, st = d["hca"], d["st"]
         if "comp" in parts:
+            # wkv_scale (TPU_DSV4_COMPRESSOR_FP8 operand): per-column ones for a bf16
+            # weight, never read.
+            ws = jnp.ones((d["w"].shape[1],), jnp.float32)
             hca, st = _compressor_jax_hca(
-                d["hidden"], d["w"], d["ape"], d["norm_w"], cs, d["positions"], d["st_bt"], d["cu"],
+                d["hidden"], d["w"], ws, d["ape"], d["norm_w"], cs, d["positions"], d["st_bt"], d["cu"],
                 d["hca_bt"].reshape(-1), d["dist"], hca, st,
                 state_block_size=sbs, head_dim=D, compress_ratio=RATIO, overlap=False, rms_eps=RMS_EPS, quant_block=64)
         out, swa = d["q"], d["swa"]
