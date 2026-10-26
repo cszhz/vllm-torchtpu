@@ -26,6 +26,7 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
 # Scoped VMEM for decode-sized seams (see VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS).
 LOW_VMEM_LIMIT_BYTES = 32 * 1024 * 1024
+LOW_VMEM_CAPS = (0, 1, 2, 4, 8, 16, 32)
 
 
 def _fused_kernel(
@@ -332,11 +333,16 @@ def mhc_fused_post_pre(
         # next sublayer's prefetched weights) and stops it prefetching this
         # call's own operands.
         cap = envs.VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS
-        vmem_limit_bytes = (
-            LOW_VMEM_LIMIT_BYTES
-            if cap > 0 and x2d.shape[0] <= cap
-            else DEFAULT_VMEM_LIMIT_BYTES
-        )
+        if cap not in LOW_VMEM_CAPS:
+            raise ValueError(
+                f"VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS={cap}: must be 0 or a power "
+                f"of 2 up to {LOW_VMEM_CAPS[-1]} (decode-sized seams fit 32 MiB)"
+            )
+        low = cap > 0 and x2d.shape[0] <= cap
+        vmem_limit_bytes = LOW_VMEM_LIMIT_BYTES if low else DEFAULT_VMEM_LIMIT_BYTES
+        # The fn prefetch the knob below avoids only happens with the low
+        # reservation; larger seams keep the default placement.
+        fn_hbm = fn_hbm and low
     if small_block is None:
         small_block = envs.VLLM_TPU_DSV4_MHC_SMALL_BLOCK
     if fn_chunks is None:
