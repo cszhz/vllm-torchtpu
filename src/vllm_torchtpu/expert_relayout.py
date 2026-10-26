@@ -798,7 +798,9 @@ def arm(
         )
         return None
     transport = expert_mover.make_transport(
-        envs.TPU_MOE_EPLB_MOVER, host_memory=envs.TPU_MOE_EPLB_MOVER_HOST_MEMORY
+        envs.TPU_MOE_EPLB_MOVER,
+        host_memory=envs.TPU_MOE_EPLB_MOVER_HOST_MEMORY,
+        skip_buffer_lock=envs.TPU_MOE_EPLB_MOVER_SKIP_BUFFER_LOCK,
     )
     ranks = (
         list(ep_global_ranks) if ep_global_ranks is not None else list(range(ep_world))

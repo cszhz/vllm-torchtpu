@@ -175,7 +175,9 @@ class RawTransferTransport(TorchTransport):
     asynchronously (a PjRtCopyFuture per copy), paced by the library so a copy
     never parks the step's kernel launches."""
 
-    def __init__(self, host_memory: str = "torch") -> None:
+    def __init__(
+        self, host_memory: str = "torch", skip_buffer_lock: bool = False
+    ) -> None:
         from tpu_sync.api.torch import raw_transfer
 
         if host_memory not in ("torch", "raw"):
@@ -183,6 +185,12 @@ class RawTransferTransport(TorchTransport):
                 f"host_memory must be 'torch' or 'raw'; got {host_memory!r}"
             )
         self.host_memory = host_memory
+        # tpu-sync's buffer lock (a PJRT hold on the weight) costs a call to
+        # acquire and may queue behind the device's use of the weight; the
+        # weights are only ever written by this mover, into slots the running
+        # program does not read, which is why tpu-sync's own WeightSynchronizer
+        # skips the lock by default.
+        self.skip_buffer_lock = bool(skip_buffer_lock)
         self._anchor: torch.Tensor | None = None  # binds RawHostBuffers to the device
         # Pinning host memory costs milliseconds per buffer, and the whole
         # scale-table images are tens of MB each, so buffers are pooled by
@@ -211,7 +219,9 @@ class RawTransferTransport(TorchTransport):
         self._rt = raw_transfer
 
     def slice_bytes(self, t: torch.Tensor) -> int:
-        return int(self._rt.major_slice_bytes(t))
+        return int(
+            self._rt.major_slice_bytes(t, unsafe_skip_buffer_lock=self.skip_buffer_lock)
+        )
 
     def _take(self, shape: tuple[int, ...], device=None) -> torch.Tensor:
         with self._lock:
@@ -260,6 +270,7 @@ class RawTransferTransport(TorchTransport):
             src_offsets_major_dim=[first],
             dst_offsets_major_dim=[0],
             copy_sizes_major_dim=[count],
+            unsafe_skip_buffer_lock=self.skip_buffer_lock,
         )
         return future, host
 
@@ -275,6 +286,7 @@ class RawTransferTransport(TorchTransport):
             src_offsets_major_dim=[0],
             dst_offsets_major_dim=[first],
             copy_sizes_major_dim=[int(host.shape[0])],
+            unsafe_skip_buffer_lock=self.skip_buffer_lock,
         )
 
 
@@ -288,17 +300,22 @@ def _on_tpu() -> bool:
         return False
 
 
-def make_transport(kind: str, host_memory: str = "torch"):
+def make_transport(
+    kind: str, host_memory: str = "torch", skip_buffer_lock: bool = False
+):
     """`raw_transfer` (the default) or `torch`. Without a usable tpu-sync the
     raw transport falls back to torch only where there is no TPU (tests,
     chip-less hosts): on a device torch cannot move the fp4 pair dtype, so
     the error surfaces and the dynamic re-layout stays off. `host_memory`
     picks the raw transport's host buffers: `torch` (pin_memory=True) or
-    `raw` (tpu-sync's RawHostBuffer)."""
+    `raw` (tpu-sync's RawHostBuffer); `skip_buffer_lock` drops tpu-sync's
+    per-transfer buffer lock on the weights."""
     if kind == "torch":
         return TorchTransport()
     try:
-        return RawTransferTransport(host_memory=host_memory)
+        return RawTransferTransport(
+            host_memory=host_memory, skip_buffer_lock=skip_buffer_lock
+        )
     except ImportError as e:
         if _on_tpu():
             raise

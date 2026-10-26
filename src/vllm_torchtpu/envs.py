@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     TPU_MOE_EPLB_WARMUP_STEPS: int = 0
     TPU_MOE_EPLB_MOVER: str = "raw_transfer"
     TPU_MOE_EPLB_MOVER_HOST_MEMORY: str = "torch"
+    TPU_MOE_EPLB_MOVER_SKIP_BUFFER_LOCK: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -694,6 +695,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copy; the Engram host transfer allocates this way).
     "TPU_MOE_EPLB_MOVER_HOST_MEMORY": env_with_choices(
         "TPU_MOE_EPLB_MOVER_HOST_MEMORY", "torch", ["torch", "raw"]
+    ),
+    # Drop tpu-sync's per-transfer buffer lock (a PJRT hold) on the mover's
+    # weight copies: the weights are written only by the mover, into slots the
+    # running program does not read; tpu-sync's WeightSynchronizer defaults to
+    # this. Measured: the lock costs ~0.14 ms per copy on an idle device.
+    "TPU_MOE_EPLB_MOVER_SKIP_BUFFER_LOCK": env_bool(
+        "TPU_MOE_EPLB_MOVER_SKIP_BUFFER_LOCK"
     ),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.

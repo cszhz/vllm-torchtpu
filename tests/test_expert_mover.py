@@ -313,3 +313,35 @@ def test_raw_host_memory_is_viewed_bound_and_pooled_by_ownership(monkeypatch):
     assert tr._take((2, 64), torch.device("cpu")) is host  # pooled and reused
     tr.release(torch.empty((2, 64), dtype=torch.uint8))  # foreign: not pooled
     assert tr.pooled_bytes() == 0
+
+
+def test_the_raw_transport_forwards_the_buffer_lock_choice(monkeypatch):
+    pytest.importorskip("tpu_sync.api.torch.raw_transfer")
+    from tpu_sync.api.torch import raw_transfer
+
+    calls = []
+
+    def slice_bytes(t, **kw):
+        calls.append(("slice", kw))
+        return 64
+
+    def d2h(*a, **kw):
+        calls.append(("d2h", kw))
+        return mv._Done()
+
+    def h2d(*a, **kw):
+        calls.append(("h2d", kw))
+        return mv._Done()
+
+    monkeypatch.setattr(raw_transfer, "major_slice_bytes", slice_bytes, raising=False)
+    monkeypatch.setattr(raw_transfer, "transfer_d2h_async", d2h, raising=False)
+    monkeypatch.setattr(raw_transfer, "transfer_h2d_async", h2d, raising=False)
+    tr = mv.RawTransferTransport(skip_buffer_lock=True)
+    t = torch.zeros((3, 64), dtype=torch.uint8)
+    _future, host = tr.d2h(t, 0, 1)
+    tr.h2d(host, t, 2)
+    assert [c[0] for c in calls] == ["slice", "d2h", "h2d"]
+    assert all(c[1]["unsafe_skip_buffer_lock"] is True for c in calls)
+    tr2 = mv.RawTransferTransport()
+    tr2.d2h(t, 0, 1)
+    assert calls[-1][1]["unsafe_skip_buffer_lock"] is False
