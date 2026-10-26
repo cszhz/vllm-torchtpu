@@ -1,0 +1,386 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The MIXED-step combine as one Pallas call, scale looked up in-kernel.
+
+out[t] = route[t] ? sum_k f32(arrivals[min(pos[t,k], R-1)]) * coef[t,k] : 0,
+coef[t,k] = mirror_flat[min(mirror_pos[t,k], M*128-1)] * w[t,k]  (f32),
+
+with the same clamps, the same f32 coefficient and the same k order as
+layer._combine_arrivals + its row_routes select, so the result is the
+incumbent's bit for bit. The incumbent runs this as a SparseCore gather of
+the scales, an XLA coefficient fusion, a row gather (an XLA gather fusion at
+t_local 128, or moe_v2_combine's per-row DMA ring at 256) and a select; here
+the scale mirror (100-400 KB) is DMA'd whole into VMEM and each slot's scale
+is picked there, so the SparseCore leaves the combine.
+
+Two gather forms:
+
+* ``bulk`` -- the whole arrival buffer is copied into VMEM by a few large
+  DMAs (one descriptor per chunk instead of one per row), and rows are then
+  read by a dynamic major-index load. The scale picks run while the copy is
+  in flight. Reads every arrival row, not only the routed ones.
+* ``ring`` -- moe_v2_combine's per-row DMA ring (parities, lead, two
+  priorities), with the coefficient computed in-kernel instead of in XLA.
+
+The three per-slot tables and the per-token route flag travel as one i32
+HBM array the kernel fetches into SMEM itself (as build_decode_combine does).
+"""
+
+import functools
+
+import jax
+import jax.numpy as jnp
+from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.fused_moe.v2.host import pow2_shift
+
+# Tokens one sum-loop body handles: the scheduler's region, hence the
+# register budget (as kernel.COMBINE_CHUNK).
+GROUP = 16
+# Static row chunks the bulk copy is split into: all in flight at once.
+BULK_CHUNKS = 8
+# Ring geometry (kernel.COMBINE_PARITIES / COMBINE_LEAD).
+RING_PARITIES = 4
+RING_LEAD = 2
+
+# Timing-only removal arms and positive-control faults (tests only).
+SKIPS = ("nodma", "nocompute", "nopick")
+FAULTS = ("k_order", "pick_lane", "route_mul", "row_clamp")
+
+
+def mixed_combine_supported(t_local, topk):
+    return t_local > 0 and t_local % (2 * GROUP) == 0 and topk > 0
+
+
+def _ring_step_tokens(t_local):
+    tb = 64
+    while tb >= GROUP:
+        steps = t_local // tb
+        if not t_local % tb and steps >= RING_PARITIES and not steps % RING_PARITIES:
+            return tb
+        tb //= 2
+    return 0
+
+
+def _pick(tab, scl_vm, p, P, mirror_elems, tile_m, shift, lane, opts):
+    """coef of slot p as a [1, 1] f32: mirror scale (lane pick) * weight."""
+    w = lax.bitcast_convert_type(tab[2 * P + p], jnp.float32)
+    if "nopick" in opts:
+        return jnp.full((1, 1), w, jnp.float32)
+    mi = jnp.minimum(tab[P + p], mirror_elems - 1)
+    sub = jnp.right_shift(mi, shift)
+    ln = jnp.bitwise_and(mi, tile_m - 1)
+    if "pick_lane" in opts:
+        ln = ln + 1
+    s = jnp.sum(
+        jnp.where(lane == ln, scl_vm[pl.ds(sub, 1), :], 0.0), axis=1, keepdims=True
+    )
+    return s * w
+
+
+def _route(acc, tab, P, i, opts):
+    r = tab[3 * P + i]
+    if "route_mul" in opts:
+        return acc * r.astype(jnp.float32)
+    return jnp.where(jnp.full(acc.shape, r, jnp.int32) != 0, acc, 0.0)
+
+
+def _bulk_kernel(
+    tables_hbm, arr_hbm, scale_hbm, out_hbm,
+    tab, arr_vm, scl_vm, coef_vm, tile_vm, out_vm, sems,
+    *, t_local, topk, out_dtype, pick, opts,
+):
+    P = t_local * topk
+    R, LB, L = arr_hbm.shape
+    M, tile_m = scale_hbm.shape
+    hidden = LB * L
+    shift = pow2_shift(tile_m, "tile_m")
+    fetch = pltpu.make_async_copy(tables_hbm, tab, sems.at[0])
+    fetch.start()
+    chunk = -(-R // BULK_CHUNKS)
+    bulk = []
+    if "nodma" not in opts:
+        for c0 in range(0, R, chunk):
+            n = min(chunk, R - c0)
+            bulk.append(
+                pltpu.make_async_copy(
+                    arr_hbm.at[pl.ds(c0, n)], arr_vm.at[pl.ds(c0, n)], sems.at[1]
+                )
+            )
+    for cp in bulk:
+        cp.start()
+    scl = pltpu.make_async_copy(scale_hbm, scl_vm, sems.at[2])
+    scl.start()
+    fetch.wait()
+    scl.wait()
+    lane = lax.broadcasted_iota(jnp.int32, (1, tile_m), 1)
+    pick_args = (P, M * tile_m, tile_m, shift, lane, opts)
+
+    if pick == "pre":
+        # Every slot's coefficient while the arrival copy is in flight.
+        def pre(i, carry):
+            for k in range(topk):
+                p = i * topk + k
+                c = _pick(tab, scl_vm, p, *pick_args)
+                coef_vm[p] = jnp.broadcast_to(c, (1, L))
+            return carry
+
+        lax.fori_loop(0, t_local, pre, jnp.int32(0), unroll=8)
+    for cp in bulk:
+        cp.wait()
+
+    def coef(p):
+        if pick == "pre":
+            return coef_vm[p]  # [1, L], lanes equal
+        return _pick(tab, scl_vm, p, *pick_args)
+
+    def group(g, par):
+        @pl.when(g >= 2)
+        def _():
+            pltpu.make_async_copy(out_vm.at[par], out_vm.at[par], sems.at[3 + par]).wait()
+
+        for u in range(GROUP):
+            i = g * GROUP + u
+            ks = range(topk - 1, -1, -1) if "k_order" in opts else range(topk)
+            acc = None
+            for k in ks:
+                p = i * topk + k
+                if "nocompute" in opts:
+                    continue
+                hi = R // 4 if "row_clamp" in opts else R - 1
+                row = jnp.minimum(tab[p], hi)
+                term = arr_vm[row].astype(jnp.float32) * coef(p)
+                acc = term if acc is None else acc + term
+            if acc is None:
+                acc = jnp.zeros((LB, L), jnp.float32)
+            tile_vm[u] = _route(acc, tab, P, i, opts).astype(out_dtype)
+        out_vm[par] = tile_vm[...].reshape(GROUP, hidden)
+        pltpu.make_async_copy(
+            out_vm.at[par],
+            out_hbm.at[pl.ds(pl.multiple_of(g * GROUP, GROUP), GROUP)],
+            sems.at[3 + par],
+        ).start()
+
+    def pair(j, carry):
+        group(2 * j, 0)
+        group(2 * j + 1, 1)
+        return carry
+
+    lax.fori_loop(0, t_local // (2 * GROUP), pair, jnp.int32(0))
+    for par in range(2):
+        pltpu.make_async_copy(out_vm.at[par], out_vm.at[par], sems.at[3 + par]).wait()
+
+
+def _ring_kernel(
+    tables_hbm, arr_hbm, scale_hbm, out_hbm,
+    tab, rows_vm, scl_vm, tile_vm, out_vm, sems,
+    *, t_local, topk, out_dtype, opts,
+):
+    """kernel._build_combine_kernel's ring, coefficient picked in-kernel."""
+    P = t_local * topk
+    R, LB, L = arr_hbm.shape
+    M, tile_m = scale_hbm.shape
+    hidden = LB * L
+    shift = pow2_shift(tile_m, "tile_m")
+    tb = _ring_step_tokens(t_local)
+    steps = t_local // tb
+    groups = tb // GROUP
+    # sems: 0 tables/scales, 1..PAR rows, PAR+1..2PAR out
+    rsem = lambda par: sems.at[1 + par]  # noqa: E731
+    osem = lambda par: sems.at[1 + RING_PARITIES + par]  # noqa: E731
+    fetch = pltpu.make_async_copy(tables_hbm, tab, sems.at[0])
+    fetch.start()
+    fetch.wait()
+    scl = pltpu.make_async_copy(scale_hbm, scl_vm, sems.at[0])
+    scl.start()
+    lane = lax.broadcasted_iota(jnp.int32, (1, tile_m), 1)
+    pick_args = (P, M * tile_m, tile_m, shift, lane, opts)
+
+    def start_row(base, par, i, k):
+        if "nodma" in opts:
+            return
+        row = jnp.minimum(tab[(base + i) * topk + k], R - 1)
+        pltpu.make_async_copy(
+            arr_hbm.at[row], rows_vm.at[par, k * tb + i], rsem(par)
+        ).start(priority=k % 2)
+
+    def one_step(step, par):
+        nxt = jnp.minimum(step + RING_LEAD, steps - 1) * tb
+        base = step * tb
+        npar = (par + RING_LEAD) % RING_PARITIES
+        if "nodma" not in opts:
+            pltpu.make_async_copy(rows_vm.at[par], rows_vm.at[par], rsem(par)).wait()
+
+        @pl.when(step >= RING_PARITIES)
+        def _():
+            pltpu.make_async_copy(out_vm.at[par], out_vm.at[par], osem(par)).wait()
+
+        def chunk(c, carry):
+            for u in range(GROUP):
+                i = c * GROUP + u
+                for k in range(topk):
+                    start_row(nxt, npar, i, k)
+                acc = None
+                for k in range(topk):
+                    if "nocompute" in opts:
+                        continue
+                    p = (base + i) * topk + k
+                    term = rows_vm[par, k * tb + i].astype(jnp.float32) * _pick(
+                        tab, scl_vm, p, *pick_args
+                    )
+                    acc = term if acc is None else acc + term
+                if acc is None:
+                    acc = jnp.zeros((LB, L), jnp.float32)
+                tile_vm[i] = _route(acc, tab, P, base + i, opts).astype(out_dtype)
+            return carry
+
+        lax.fori_loop(0, groups, chunk, jnp.int32(0))
+        for g in range(groups):
+            out_vm[par, pl.ds(g * GROUP, GROUP)] = tile_vm[pl.ds(g * GROUP, GROUP)].reshape(
+                GROUP, hidden
+            )
+        pltpu.make_async_copy(
+            out_vm.at[par], out_hbm.at[pl.ds(step * tb, tb)], osem(par)
+        ).start()
+
+    def step_group(j, carry):
+        for par in range(RING_PARITIES):
+            one_step(j * RING_PARITIES + par, par)
+        return carry
+
+    for p in range(RING_LEAD):
+        for i in range(tb):
+            for k in range(topk):
+                start_row(p * tb, p, i, k)
+    scl.wait()
+    lax.fori_loop(0, steps // RING_PARITIES, step_group, jnp.int32(0))
+    if "nodma" not in opts:
+        for p in range(RING_LEAD):
+            pltpu.make_async_copy(rows_vm.at[p], rows_vm.at[p], rsem(p)).wait()
+    for p in range(RING_PARITIES):
+        pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], osem(p)).wait()
+
+
+def combine_tables(pos, mirror_pos, weights, row_routes):
+    """[3P + t] i32: pos | mirror_pos | bits(weights) | route, token-major."""
+    t_local, topk = weights.shape
+    P = t_local * topk
+    return jnp.concatenate(
+        [
+            pos.astype(jnp.int32).reshape(P),
+            mirror_pos.astype(jnp.int32).reshape(P),
+            lax.bitcast_convert_type(weights.astype(jnp.float32), jnp.int32).reshape(P),
+            row_routes.reshape(t_local).astype(jnp.int32),
+        ]
+    )
+
+
+def build_mixed_combine(
+    arrivals,
+    arrival_scales,
+    pos,
+    mirror_pos,
+    weights,
+    row_routes,
+    out_dtype,
+    *,
+    gather="bulk",
+    pick="pre",
+    opts=(),
+    interpret=False,
+):
+    """Combine arrivals f8[R, LB, 128] into [t_local, LB * 128] (see module doc).
+
+    pos / mirror_pos: i32 [t_local, topk] or flat token-major ([P] or [1, P]).
+    weights: f32 [t_local, topk]; row_routes: bool [t_local, 1].
+    gather: "bulk" | "ring"; pick: "pre" | "inline" (bulk only; ring is inline).
+    opts: timing-only removal arms (SKIPS) or positive-control faults (FAULTS).
+    """
+    t_local, topk = weights.shape
+    R, LB, L = arrivals.shape
+    M, tile_m = arrival_scales.shape
+    hidden = LB * L
+    P = t_local * topk
+    opts = tuple(opts)
+    for o in opts:
+        if o not in SKIPS + FAULTS:
+            raise ValueError(f"unknown option {o!r}")
+    if not mixed_combine_supported(t_local, topk):
+        raise ValueError(f"mixed combine needs t_local % {2 * GROUP} == 0, got {t_local}")
+    tables = combine_tables(pos, mirror_pos, weights, row_routes)
+    vmem = pltpu.VMEM
+    if gather == "bulk":
+        if pick not in ("pre", "inline"):
+            raise ValueError(pick)
+        kernel = functools.partial(
+            _bulk_kernel, t_local=t_local, topk=topk, out_dtype=out_dtype, pick=pick, opts=opts
+        )
+        scratch = (
+            pltpu.SMEM((3 * P + t_local,), jnp.int32),
+            vmem((R, LB, L), arrivals.dtype),
+            vmem((M, tile_m), jnp.float32),
+            vmem((P if pick == "pre" else 1, 1, L), jnp.float32),
+            vmem((GROUP, LB, L), out_dtype),
+            vmem((2, GROUP, hidden), out_dtype),
+            pltpu.SemaphoreType.DMA((5,)),
+        )
+        name = f"moe_v2_mixed_combine_bulk_t{t_local}_k{topk}"
+    elif gather == "ring":
+        tb = _ring_step_tokens(t_local)
+        if not tb:
+            raise ValueError(f"ring combine does not cover t_local={t_local}")
+        kernel = functools.partial(
+            _ring_kernel, t_local=t_local, topk=topk, out_dtype=out_dtype, opts=opts
+        )
+        scratch = (
+            pltpu.SMEM((3 * P + t_local,), jnp.int32),
+            vmem((RING_PARITIES, topk * tb, LB, L), arrivals.dtype),
+            vmem((M, tile_m), jnp.float32),
+            vmem((tb, LB, L), out_dtype),
+            vmem((RING_PARITIES, tb, hidden), out_dtype),
+            pltpu.SemaphoreType.DMA((1 + 2 * RING_PARITIES,)),
+        )
+        name = f"moe_v2_mixed_combine_ring_t{t_local}_k{topk}_b{tb}"
+    else:
+        raise ValueError(gather)
+    if opts:
+        name += "_" + "_".join(opts)
+    hbm = pltpu.MemorySpace.HBM
+    space = pl.ANY if interpret else hbm
+    params = dict(vmem_limit_bytes=64 * 1024 * 1024 * 98 // 100)
+    if not interpret:
+        params["disable_bounds_checks"] = True
+    call = pl.pallas_call(
+        kernel,
+        in_specs=[pl.BlockSpec(memory_space=space)] * 3,
+        out_specs=pl.BlockSpec(memory_space=space),
+        scratch_shapes=scratch,
+        out_shape=jax.ShapeDtypeStruct((t_local, hidden), out_dtype),
+        compiler_params=pltpu.CompilerParams(**params),
+        interpret=interpret,
+        name=name,
+    )
+    if interpret:
+        return call(tables, arrivals, arrival_scales)
+    return call(
+        tables,
+        # Pinned to HBM: the kernel copies them itself; unconstrained, XLA
+        # would prefetch them into VMEM first (plan_kernel.build_decode_combine).
+        pltpu.with_memory_space_constraint(arrivals, hbm),
+        pltpu.with_memory_space_constraint(arrival_scales, hbm),
+    )
+
+
+def descriptors(t_local, topk, recv_rows, gather):
+    """M6 driver: DMA descriptors issued per call, bytes read (tile-padded rows)."""
+    groups = t_local // GROUP
+    row_bytes = 8192
+    if gather == "bulk":
+        n = min(BULK_CHUNKS, recv_rows) + 2 + groups
+        return dict(descriptors=n, bytes_read=recv_rows * row_bytes, terms=t_local * topk)
+    tb = _ring_step_tokens(t_local)
+    steps = t_local // tb
+    n = (steps + RING_LEAD) * tb * topk + 2 + steps
+    return dict(descriptors=n, bytes_read=(steps + RING_LEAD) * tb * topk * row_bytes,
+                terms=t_local * topk)

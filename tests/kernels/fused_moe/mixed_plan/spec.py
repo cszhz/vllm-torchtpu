@@ -456,3 +456,60 @@ CANDIDATE_FAULTS = {
     "stale_block": dict(fault="stale_block"),  # last live S3 block left zero
     "dup_nohi": dict(dc_hi=False),             # duplicate ids: high plane dropped
 }
+
+
+# ---------------------------------------------------------------- combine candidates (stage A2)
+
+# name -> build_mixed_combine kwargs. Timing-only removal arms carry opts from
+# mixed_combine_kernel.SKIPS (wrong outputs allowed).
+COMBINE_VARIANTS = {
+    "a2": dict(gather="bulk", pick="pre"),
+    "a2_inline": dict(gather="bulk", pick="inline"),
+    "a2_ring": dict(gather="ring"),
+}
+
+
+def candidate_combine(arrivals, arrival_scales, pos, mirror_pos, weights, row_routes,
+                      variant="a2", opts=(), interpret=False):
+    """Stage A2 (mixed_combine_kernel.build_mixed_combine) in incumbent_combine's form."""
+    from vllm_torchtpu.kernels.fused_moe.v2.mixed_combine_kernel import build_mixed_combine
+
+    return build_mixed_combine(
+        arrivals, arrival_scales, pos, mirror_pos, weights, row_routes, jnp.bfloat16,
+        opts=opts, interpret=interpret, **COMBINE_VARIANTS[variant],
+    )
+
+
+def forced_pallas_combine(arrivals, arrival_scales, pos, mirror_pos, weights, row_routes):
+    """Arm pk128: the incumbent's moe_v2_combine ring forced at t_local 128 (tb 32),
+    coef still built in XLA (SC scale gather + fusion). Timing reference only."""
+    from vllm_torchtpu.kernels.fused_moe.v2 import kernel as kmod
+
+    t_local, topk = pos.shape
+    recv_rows, lane_blocks, lanes = arrivals.shape
+    m, tile_m = arrival_scales.shape
+    rows = jnp.minimum(pos, recv_rows - 1)
+    scl = jnp.minimum(mirror_pos, m * tile_m - 1)
+    coef = arrival_scales.reshape(-1)[scl] * weights.astype(jnp.float32)
+    saved = kmod.COMBINE_MIN_TOKENS
+    kmod.COMBINE_MIN_TOKENS = min(saved, t_local)
+    try:
+        fn = kmod._build_combine_kernel(
+            t_local=t_local, topk=topk, hidden=lane_blocks * lanes, lane_blocks=lane_blocks,
+            wire_dtype=arrivals.dtype, out_dtype=jnp.bfloat16)
+    finally:
+        kmod.COMBINE_MIN_TOKENS = saved
+    out = fn(arrivals, coef, rows)
+    return jnp.where(row_routes, out, jnp.zeros_like(out))
+
+
+def nan_poison(arrivals, pos, row_routes):
+    """Arrival rows read only by unrouted tokens -> NaN (they may be unwritten in
+    the layer). Rows a routed token reads stay finite."""
+    a = np.array(arrivals.astype(jnp.float32))
+    p = np.minimum(np.asarray(pos), a.shape[0] - 1)
+    r = np.asarray(row_routes).reshape(-1)
+    used = np.zeros(a.shape[0], bool)
+    used[p[r].reshape(-1)] = True
+    a[~used] = np.nan
+    return jnp.asarray(a).astype(arrivals.dtype)

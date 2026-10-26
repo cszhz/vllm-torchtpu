@@ -69,6 +69,10 @@ from vllm_torchtpu.kernels.fused_moe.v2.mixed_plan_kernel import (
     build_mixed_plan,
     mixed_plan_supported,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.mixed_combine_kernel import (
+    build_mixed_combine,
+    mixed_combine_supported,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import (
     pallas_select,
     pallas_select_routed,
@@ -380,6 +384,13 @@ def _mixed_exchange_oneshot_enabled():
     from vllm_torchtpu import envs
 
     return bool(envs.TPU_DSV4_EP_MIXED_EXCHANGE_ONESHOT)
+
+
+def _mixed_combine_kernel_enabled():
+    """TPU_DSV4_EP_MIXED_COMBINE_KERNEL: the mixed-bucket combine as one Pallas call."""
+    from vllm_torchtpu import envs
+
+    return bool(envs.TPU_DSV4_EP_MIXED_COMBINE_KERNEL)
 
 
 def _oneshot_gather_max_local_tokens():
@@ -743,6 +754,27 @@ def fused_ep_moe_v2(
         )
     )
     mixed_exchange_oneshot = mixed_plan and _mixed_exchange_oneshot_enabled()
+    # The combine as one Pallas call (scale picked in-kernel, row_routes
+    # applied inside): the same bits as _combine_arrivals + the select.
+    mixed_combine = (
+        _mixed_combine_kernel_enabled()
+        and t_local > SMALL_BATCH_LOCAL_TOKENS
+        and form.quantized_activations
+        and mixed_combine_supported(t_local, topk)
+    )
+
+    def combine_routed(arrivals, arrival_scales, pos, mirror_pos, topk_weights, row_routes, out_dtype):
+        if mixed_combine:
+            return build_mixed_combine(
+                arrivals, arrival_scales, pos, mirror_pos, topk_weights, row_routes, out_dtype
+            )
+        combined = _combine_arrivals(
+            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+        )
+        # A row that routed nowhere read arrival rows nobody wrote; its weight is
+        # zero, but zero times an unwritten NaN is not.
+        return jnp.where(row_routes, combined, jnp.zeros_like(combined))
+
     # e4m3 rows only; see _gather_rows_with_meta.
     merge_exchange = (
         bool(merge_exchange)
@@ -1051,10 +1083,10 @@ def fused_ep_moe_v2(
             counts=plan.counts,
             rank=rank_l,
         )
-        combined = _combine_arrivals(
-            arrivals, arrival_scales, plan.pos, plan.mirror_pos, topk_weights, out_dtype
+        combined = combine_routed(
+            arrivals, arrival_scales, plan.pos, plan.mirror_pos, topk_weights, row_routes,
+            out_dtype,
         )
-        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         if shared_l is None:
             return token_layout.restore(combined, ax)
         return _add_shared(combined, shared_l, me)
@@ -1233,12 +1265,9 @@ def fused_ep_moe_v2(
                 (t_local, topk),
             )
         )
-        combined = _combine_arrivals(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+        combined = combine_routed(
+            arrivals, arrival_scales, pos, mirror_pos, topk_weights, row_routes, out_dtype
         )
-        # A row that routed nowhere read arrival rows nobody wrote; its weight is
-        # zero, but zero times an unwritten NaN is not.
-        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         if shared_l is None:
             return token_layout.restore(combined, ax)
         return _add_shared(combined, shared_l, me)

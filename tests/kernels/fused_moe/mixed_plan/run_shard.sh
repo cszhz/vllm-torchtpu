@@ -25,4 +25,12 @@ case $1 in
 21) timeout -s KILL 2400 python3 $D/bench.py --cells mix256 --kinds served --arms plan,a1,a1@skip:s1,a1@skip:s2,a1@skip:s3,a1@skip:s1\;s2\;s3,a1@rm_s3 --rs 16,96,256 --out $O/p5_256 ;;
 22) timeout -s KILL 2400 python3 $D/bench.py --cells mix32 --kinds uniform --arms plan,a1,a1@skip:s1,a1@skip:s2,a1@skip:s3,a1@skip:s1\;s2\;s3,a1@rm_s3 --rs 16,96,256 --out $O/p5_32 ;;
 23) timeout -s KILL 2400 python3 $D/bench.py --cells mix128 --kinds served --arms plan,a1,a1@skip:s1,a1@skip:s2,a1@skip:s3,a1@skip:s1\;s2\;s3,a1@rm_s3 --rs 16,96,256 --trace --out $O/p5_128b ;;
+# stage A2 (mixed combine): probe 2x-a2-first
+30) pip install -q pytest >/dev/null 2>&1; timeout -s KILL 2400 python3 -m pytest -q -s -p no:cacheprovider $D/test_accuracy.py -k a2 ;;
+31) timeout -s KILL 2400 python3 $D/bench.py --cells mix128 --kinds served --arms combine,pk128,a2,a2_inline,a2_ring,a2@nodma,a2@nocompute,a2@nopick --rs 16,96,256 --trace --out $O/a2_128 ;;
+32) timeout -s KILL 2400 python3 $D/bench.py --cells mix256 --kinds served --arms combine,a2,a2_inline,a2_ring,a2@nodma,a2@nocompute,a2@nopick --rs 16,96,256 --trace --out $O/a2_256 ;;
+33) timeout -s KILL 2400 python3 $D/bench.py --cells tw16,tw4 --kinds served --arms combine,a2,a2_ring --rs 16,96,256 --trace --out $O/a2_tw ;;
+34) timeout -s KILL 2400 python3 $D/bench.py --cells mix128 --kinds served,served_pad --arms combine,a2,a2_inline,a2_ring,a2@nodma,a2@nocompute,a2@nopick --rs 16,96,256 --out $O/a2_128r ;;
+35) timeout -s KILL 2400 python3 $D/bench.py --cells mix256 --kinds served,served_pad --arms combine,a2,a2_inline,a2_ring,a2@nodma,a2@nocompute,a2@nopick --rs 16,96,256 --out $O/a2_256r ;;
+36) pip install -q pytest >/dev/null 2>&1; timeout -s KILL 2400 python3 -m pytest -q -s -p no:cacheprovider -m multichip tests/kernels/fused_moe/test_fused_ep_moe_v2_mixed_combine.py ;;
 esac

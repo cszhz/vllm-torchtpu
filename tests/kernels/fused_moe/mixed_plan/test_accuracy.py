@@ -163,3 +163,78 @@ def test_candidate_fault_caught(fault):
                 caught.append((cn, kind, me, bad))
     print(f"\nCANDIDATE FAULT {fault}: caught on {len(caught)} (cell, shard) -> {caught[:3]}")
     assert caught, f"candidate fault {fault} not caught"
+
+
+# ---------------------------------------------------------------- stage A2 combine
+
+A2_CELLS = ("mix128", "mix256", "tw16", "tw4")
+
+
+def _combine_case(cn, seed=3):
+    cell = spec.CELLS[cn]
+    pairs = spec.make_pairs(cell, "served_pad", seed)
+    sb = spec.make_scale_bits(cell, seed)
+    ex = spec.make_exchange(cell, pairs, sb)
+    me = 0  # bucket padding sits in the tail sources, so source 0 routes
+    plan = _run("incumbent", cell, pairs, ex, me)
+    arr, scl, w, routes = spec.make_combine_inputs(cell, pairs, me, seed)
+    assert bool(np.asarray(routes).any()), "degenerate combine cell: no routed rows"
+    return cell, arr, scl, jnp.asarray(plan["pos"]), jnp.asarray(plan["mirror_pos"]), w, routes
+
+
+@pytest.mark.parametrize("variant", list(spec.COMBINE_VARIANTS))
+@pytest.mark.parametrize("cn", A2_CELLS)
+def test_a2_combine_vs_incumbent_oracle_and_faults(cn, variant):
+    """A2 candidate: bit-exact vs the incumbent (reported; the gate if it holds),
+    within 4x native error of the f64 oracle, NaN-safe on unwritten rows, and
+    every combine fault applied to the CANDIDATE caught."""
+    if not _on_tpu():
+        pytest.skip("the incumbent combine runs the TPU path")
+    cell, arr, scl, pos, mir, w, routes = _combine_case(cn)
+    cand = jax.jit(lambda *xs, **kw: spec.candidate_combine(*xs, variant=variant, **kw),
+                   static_argnames=("opts",))
+    inc = jax.jit(spec.incumbent_combine)
+    native = np.asarray(inc(arr, scl, pos, mir, w, routes), np.float64)
+    got = np.asarray(cand(arr, scl, pos, mir, w, routes), np.float64)
+    want = spec.oracle_combine(arr, scl, pos, mir, w, routes)
+    scale = np.maximum(np.abs(want).max(1, keepdims=True), 1e-30)
+    nerr = float((np.abs(native - want) / scale).max())
+    err = float((np.abs(got - want) / scale).max())
+    tol = max(4 * nerr, 2.0 ** -8)
+    nbits = int((got != native).sum())
+    print(f"\nA2 {variant} {cn}: bitexact={nbits == 0} ndiff={nbits}/{got.size} "
+          f"err {err:.3e} native {nerr:.3e} tol {tol:.3e}")
+    assert err <= tol
+    # NaN poison: every 5th token made unrouted (weight 0, as the router leaves a
+    # padding row), and the arrival rows only those tokens read set to NaN.
+    keep = (np.arange(cell.t_local) % 5 != 0)[:, None]
+    r_nan = jnp.asarray(np.asarray(routes) & keep)
+    w_nan = jnp.where(r_nan, w, 0.0)
+    arr_nan = spec.nan_poison(arr, pos, r_nan)
+    assert not np.isfinite(np.asarray(arr_nan.astype(jnp.float32))).all(), "poison cell is empty"
+    g_nan = np.asarray(cand(arr_nan, scl, pos, mir, w_nan, r_nan), np.float64)
+    n_nan = np.asarray(inc(arr_nan, scl, pos, mir, w_nan, r_nan), np.float64)
+    assert np.isfinite(g_nan).all(), "NaN leaked from an unwritten row"
+    np.testing.assert_array_equal(g_nan, n_nan)
+    # input faults on the candidate
+    faults = {
+        "pos+1": (pos + (pos < cell.recv_rows - 1), mir, w),
+        "mirror_lane+1": (pos, mir + 1, w),
+        "drop_k0": (pos, mir, w.at[:, 0].set(0.0)),
+        "weight_missing": (pos, mir, jnp.ones_like(w)),
+    }
+    caught = {}
+    for name, (p2, m2, w2) in faults.items():
+        bad = np.asarray(cand(arr, scl, p2, m2, w2, routes), np.float64)
+        caught[name] = float((np.abs(bad - want) / scale).max()) > tol
+    # kernel faults (k_order is visible only to the bit-exact check)
+    for f in ("pick_lane", "row_clamp", "k_order"):
+        bad = np.asarray(cand(arr, scl, pos, mir, w, routes, opts=(f,)), np.float64)
+        caught[f] = (bool((bad != native).any()) if f == "k_order"
+                     else float((np.abs(bad - want) / scale).max()) > tol)
+    bad = np.asarray(cand(arr_nan, scl, pos, mir, w_nan, r_nan, opts=("route_mul",)), np.float64)
+    caught["route_mul(nan)"] = not np.isfinite(bad).all()
+    print(f"A2 FAULTS {variant} {cn}: " + " ".join(f"{k}={'caught' if v else 'BLIND'}" for k, v in caught.items()))
+    blind = [k for k, v in caught.items() if not v and not (k == "k_order" and nbits)]
+    assert not blind, f"faults not caught: {blind}"
+    assert nbits == 0, f"not bit-exact vs incumbent ({nbits} elements differ)"

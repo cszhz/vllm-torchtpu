@@ -160,11 +160,22 @@ def main():
                 if arm == "plan":
                     fn = lambda e, l, b, m, c=cell: spec.incumbent_plan(c, e, l, b, m)
                     args = pargs
-                elif arm == "combine":
+                elif arm == "combine" or arm == "pk128" or arm.split("@")[0] in spec.COMBINE_VARIANTS:
                     plan = jax.jit(lambda e, l, b, m, c=cell: spec.incumbent_plan(c, e, l, b, m))(*pargs)
                     arr, scl, w, routes = spec.make_combine_inputs(cell, pairs, me, a.seed)
-                    fn = spec.incumbent_combine
                     args = (arr, scl, plan["pos"], plan["mirror_pos"], w, routes)
+                    if arm == "combine":
+                        fn = spec.incumbent_combine
+                    elif arm == "pk128":
+                        fn = spec.forced_pallas_combine
+                    else:  # stage A2: <variant>[@opt;opt] (opts = timing-only removal arms)
+                        v, _, o = arm.partition("@")
+                        opts = tuple(x for x in o.split(";") if x)
+                        fn = lambda *xs, v=v, opts=opts: spec.candidate_combine(*xs, variant=v, opts=opts)
+                        from vllm_torchtpu.kernels.fused_moe.v2 import mixed_combine_kernel as mck
+                        print("DRIVER", arm, cn, json.dumps(mck.descriptors(
+                            cell.t_local, cell.topk, cell.recv_rows,
+                            spec.COMBINE_VARIANTS[v]["gather"])), flush=True)
                 elif arm.startswith("a1@"):  # timing-only: a1 with fault/skip=<arm[3:]> (";" for ",")
                     fn = lambda e, l, b, m, c=cell, f=arm[3:].replace(";", ","): spec.candidate_plan(c, e, l, b, m, fault=f)
                     args = pargs

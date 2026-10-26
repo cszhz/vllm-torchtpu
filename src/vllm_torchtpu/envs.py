@@ -152,6 +152,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_FOLD_ANY_DECODE: bool = False
     TPU_DSV4_EP_MIXED_PLAN_KERNEL: bool = False
     TPU_DSV4_EP_MIXED_EXCHANGE_ONESHOT: bool = False
+    TPU_DSV4_EP_MIXED_COMBINE_KERNEL: bool = False
     MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS: int = 4
     TPU_FP8_LINEAR_PALLAS: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = ""
@@ -985,6 +986,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (SparseCore-offloaded ahead of the activation gather at c4/c8, a
     # synchronous TensorCore collective at c16). Same bits.
     "TPU_DSV4_EP_MIXED_EXCHANGE_ONESHOT": env_bool("TPU_DSV4_EP_MIXED_EXCHANGE_ONESHOT"),
+    # Mixed buckets (t_local > 16, quantized rows): the combine (scale gather,
+    # coefficient, row gather, k-sum, row_routes select) as one Pallas call
+    # (mixed_combine_kernel) instead of a SparseCore gather + XLA/Pallas sum.
+    "TPU_DSV4_EP_MIXED_COMBINE_KERNEL": env_bool("TPU_DSV4_EP_MIXED_COMBINE_KERNEL"),
     # Largest local token count the one-shot Pallas EP gather takes (smallest
     # stays 2).
     "MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS": env_nonnegative_int(
