@@ -176,3 +176,21 @@ def test_make_transport_falls_back_to_torch_without_tpu_sync(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", no_tpu_sync)
     assert type(mv.make_transport("raw_transfer")) is mv.TorchTransport
     assert type(mv.make_transport("torch")) is mv.TorchTransport
+
+
+def test_ensure_movable_rehomes_views_and_leaves_whole_storages_alone():
+    base = torch.arange(2 * SLOTS * K * N, dtype=torch.int32).to(torch.uint8)
+    view = base.view(2, SLOTS, K, N)[1]  # a slot-major view into a larger storage
+    assert not mv.spans_storage(view)
+    whole = torch.zeros(SLOTS * ROWS, N)
+    assert mv.spans_storage(whole)
+    module = SimpleNamespace(
+        local_num_experts=SLOTS,
+        w13_weight=torch.nn.Parameter(view, requires_grad=False),
+        w13_weight_scale=torch.nn.Parameter(whole, requires_grad=False),
+    )
+    assert mv.ensure_movable(module) == 1
+    assert mv.spans_storage(module.w13_weight.data)
+    torch.testing.assert_close(module.w13_weight.data, view)
+    assert module.w13_weight_scale.data.data_ptr() == whole.data_ptr()  # untouched
+    assert mv.ensure_movable(module) == 0

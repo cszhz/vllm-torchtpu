@@ -94,3 +94,32 @@ def test_a_flat_scale_table_round_trips_whole_and_patched(transport_kind):
     after = scale.cpu()
     torch.testing.assert_close(after[4 * rows : 5 * rows], before[1 * rows : 2 * rows])
     torch.testing.assert_close(after[: 4 * rows], before[: 4 * rows])
+
+
+def test_a_view_into_a_larger_storage_is_refused_until_rehomed():
+    """What the first DP8 run hit: the quantizer's weights are views; the raw
+    transfer wants whole storages; ensure_movable gives them one."""
+    from types import SimpleNamespace
+
+    transport = mv.make_transport("raw_transfer")
+    assert type(transport) is mv.RawTransferTransport, "tpu_sync not importable"
+    base = (
+        torch.randint(0, 255, (2, SLOTS, K, N), dtype=torch.int32)
+        .to(torch.uint8)
+        .to("tpu")
+    )
+    view = base[1]
+    module = SimpleNamespace(
+        local_num_experts=SLOTS,
+        w13_weight=torch.nn.Parameter(view, requires_grad=False),
+    )
+    assert not mv.spans_storage(view)
+    with pytest.raises(ValueError, match="span"):
+        future, _ = transport.d2h_slot(view, 1)
+        future.wait()
+    assert mv.ensure_movable(module) == 1
+    moved = module.w13_weight.data
+    assert mv.spans_storage(moved)
+    future, host = transport.d2h_slot(moved, 1)
+    future.wait()
+    torch.testing.assert_close(host, base[1, 1].cpu())

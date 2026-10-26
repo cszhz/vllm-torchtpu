@@ -245,6 +245,49 @@ class _LocalEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# Movable weights
+
+
+def spans_storage(t: torch.Tensor) -> bool:
+    """Whether the tensor is its whole storage: no offset, no bytes beyond it.
+    tpu-sync's raw transfer addresses a storage, not a view into one."""
+    return (
+        t.storage_offset() == 0
+        and t.untyped_storage().nbytes() == t.numel() * t.element_size()
+    )
+
+
+def ensure_movable(module) -> int:
+    """Give every expert tensor of a placed layer a storage of its own.
+
+    The fused path's weight Parameters come out of the quantizer as views
+    into larger buffers, which the raw transfer refuses ("Tensor does not
+    span its entire base storage buffer"). Called at load, before compile,
+    under the dynamic knob; copies through a uint8 view (the fp4-pair dtype
+    has no copy of its own on every path). Returns how many were re-homed.
+    """
+    count = 0
+    for name in PARTS:
+        param = getattr(module, name, None)
+        if param is None:
+            continue
+        t = param.data if isinstance(param, torch.nn.Parameter) else param
+        if spans_storage(t):
+            continue
+        fresh = (
+            t.view(torch.uint8).clone().view(t.dtype)
+            if t.dtype != torch.uint8
+            else t.clone()
+        )
+        if isinstance(param, torch.nn.Parameter):
+            param.data = fresh
+        else:
+            setattr(module, name, fresh)
+        count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
 # The mover
 
 
