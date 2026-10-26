@@ -55,6 +55,7 @@ def main():
             d, deq = C.device_inputs(inp, cache="quant", poison=poison)
             want, rows = C.oracle(inp, d, deq)
             ref_err = None
+            outs = {}
             for arm, f in arms.items():
                 try:
                     out = np.asarray(jax.jit(f)(d, d["q"]).astype(jnp.float32))
@@ -77,6 +78,11 @@ def main():
                            err_mean_rel=round(float(np.abs(o - want).mean() / np.abs(want).max()), 8))
                 print("ACC " + json.dumps(rec), flush=True)
                 summary.append(rec)
+                outs[arm] = out
+                if arm.endswith("_bf16p") and arm[:-6] in outs:  # bit-exactness of the bf16-P lever
+                    a_, b_ = outs[arm[:-6]][rows], out[rows]
+                    print("BITWISE " + json.dumps(dict(cell=name, arm=arm, poison=poison, identical=bool((a_ == b_).all()),
+                                                       max_abs=float(np.abs(a_ - b_).max()))), flush=True)
             if not poison and a.faults != "none" and ref_err is not None:
                 for fl in C.FAULTS:
                     fo, frows = C.oracle(inp, d, deq, fault=fl)
