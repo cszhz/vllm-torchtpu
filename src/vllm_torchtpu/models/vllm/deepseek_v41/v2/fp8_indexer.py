@@ -27,6 +27,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import 
     PackedFP8Layout,
     read_fp8_records,
     write_fp8_records,
+    write_packed_records,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.publication import (
     representative_block_max,
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
 
 _query_op = None
 _write_op = None
+_produce_write_op = None
 _read_op = None
 _select_op = None
 _prepare_op = None
@@ -151,7 +153,8 @@ def paged_indexer(
 
 
 def initialize() -> None:
-    global _query_op, _write_op, _read_op, _select_op, _prepare_op, _prepared_select_op
+    global _query_op, _write_op, _produce_write_op, _read_op
+    global _select_op, _prepare_op, _prepared_select_op
     if _query_op is not None:
         return
     from jax.sharding import PartitionSpec as P
@@ -176,6 +179,11 @@ def initialize() -> None:
         )
 
     def fake_write(banks, records, keys, after, layout):
+        return tuple(torch.empty_like(bank) for bank in banks)
+
+    def fake_produce(
+        banks, records, latent, positions, cos_sin, k_norm_weight, after, layout, eps
+    ):
         return tuple(torch.empty_like(bank) for bank in banks)
 
     def fake_read(banks, records, layout):
@@ -230,6 +238,9 @@ def initialize() -> None:
 
     _query_op = register("packed_fp8_quantize_query", _quantize_query, fake_query, 4, 0)
     _write_op = register("packed_fp8_write", _write, fake_write, 4, 1, (0,))
+    _produce_write_op = register(
+        "packed_fp8_produce_write", _produce, fake_produce, 7, 2, (0,)
+    )
     _read_op = register("packed_fp8_read", _read, fake_read, 2, 1)
     _select_op = register("packed_fp8_select", select_indexer_jax, fake_select, 8, 7)
     _prepare_op = register(
@@ -261,6 +272,36 @@ def _write(
 ) -> tuple[jax.Array, ...]:
     banks, _ = jax.lax.optimization_barrier((banks, after))
     return write_fp8_records(banks, records, keys, PackedFP8Layout(*layout))
+
+
+def _produce(
+    banks: tuple[jax.Array, ...],
+    records: jax.Array,
+    latent: jax.Array,
+    positions: jax.Array,
+    cos_sin: jax.Array,
+    k_norm_weight: jax.Array,
+    after: jax.Array,
+    layout: tuple[int, ...],
+    eps: float,
+) -> tuple[jax.Array, ...]:
+    """Fuse ``k_norm`` -> RoPE -> E4M3 quant -> pack, then scatter the records.
+
+    ``latent`` is the per-token ``wk(latent)`` output (D128, pre-norm). The
+    fused kernel emits the same packed ``[tokens, 32]`` words and per-row FP32
+    scale that ``pack_fp8_records`` builds, assembled here into the 33-word
+    record and handed to the shared scatter -- no RoPE/quant HBM round trips.
+    """
+    from vllm_torchtpu.kernels.deepseek_v4.rope import knorm_rope_quant_pack
+
+    banks, _ = jax.lax.optimization_barrier((banks, after))
+    words, scales = knorm_rope_quant_pack(
+        latent, positions, cos_sin, k_norm_weight, eps=eps
+    )
+    values = jnp.concatenate(
+        (words, jax.lax.bitcast_convert_type(scales, jnp.int32)[:, None]), axis=1
+    )
+    return write_packed_records(banks, records, values, PackedFP8Layout(*layout))
 
 
 def _read(

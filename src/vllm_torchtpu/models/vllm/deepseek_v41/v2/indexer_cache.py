@@ -105,6 +105,38 @@ class PackedFP8IndexCacheRows(PagedCacheRows):
         for bank, value in zip(self.banks, updated):
             bank.copy_(value)
 
+    def produce_write(
+        self,
+        slots: torch.Tensor,
+        latent: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin: torch.Tensor,
+        k_norm_weight: torch.Tensor,
+        eps: float,
+        after: torch.Tensor | None = None,
+    ) -> None:
+        """Fuse ``k_norm`` -> RoPE -> E4M3 quant -> pack, then scatter the keys.
+
+        Replaces the eager ``k_norm`` / RoPE / ``write`` chain for the published
+        Index-K cache: the per-token ``wk(latent)`` output goes straight to the
+        packed records without the intermediate RoPE/quant HBM round trips.
+        """
+        after = latent.new_empty((0,)) if after is None else after
+        assert fp8_indexer._produce_write_op is not None
+        updated = fp8_indexer._produce_write_op(
+            self.banks,
+            slots.int(),
+            latent,
+            positions.int(),
+            cos_sin,
+            k_norm_weight,
+            after,
+            self._layout_args(),
+            eps,
+        )
+        for bank, value in zip(self.banks, updated):
+            bank.copy_(value)
+
 
 class PackedFP8IndexerSpec(MLAAttentionSpec):
     """Keep 132-byte records compatible with hybrid power-of-two pages."""

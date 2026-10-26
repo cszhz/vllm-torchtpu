@@ -722,11 +722,31 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     def _produce_index_k(self, latent, positions, cache, slots, valid) -> None:
         """Publish index keys from the compressor's pre-RoPE latent."""
         indexer = self.indexer
-        keys = indexer.k_norm(_value(indexer.wk(latent)))
-        keys = self._rotate(keys, positions)
-        if not isinstance(cache, PackedFP8IndexCacheRows):
-            keys = self._quantize_indexer(keys)
-        _insert(cache, slots, keys, valid)
+        projected = _value(indexer.wk(latent))
+        if (
+            isinstance(cache, PackedFP8IndexCacheRows)
+            and projected.device.type != "cpu"
+        ):
+            # One fused kernel does k_norm -> RoPE -> E4M3 quant -> pack straight
+            # into the packed records, replacing the k_norm/RoPE/quant/write chain
+            # and its intermediate HBM round trips. The wk matmul stays on the MXU.
+            # Logical record slots, masked to -1 where invalid, exactly as the
+            # eager ``write_cache`` -> ``cache.write`` path feeds write_fp8_records.
+            record_slots = slots.masked_fill(~valid, -1)
+            cache.produce_write(
+                record_slots,
+                projected,
+                positions,
+                self._tpu_rope_cache,
+                indexer.k_norm.weight,
+                indexer.k_norm.variance_epsilon,
+            )
+        else:
+            keys = indexer.k_norm(projected)
+            keys = self._rotate(keys, positions)
+            if not isinstance(cache, PackedFP8IndexCacheRows):
+                keys = self._quantize_indexer(keys)
+            _insert(cache, slots, keys, valid)
         stage_cache = _active_stage_attn_cache
         if stage_cache is not None:
             version_key = ("candidate_index_version", indexer.k_cache.prefix)
