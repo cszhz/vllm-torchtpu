@@ -43,7 +43,7 @@ ENABLE_EP=true
 QUANTIZATION=""
 ISL_OSL_CONFIGS="${GLM53_ISL_OSL_CONFIGS:-8192:1024}"
 CONCURRENCY_OPTIONS="${GLM53_CONCURRENCY_OPTIONS:-512}"
-NUM_PROMPTS="${GLM53_NUM_PROMPTS:-1024}"
+NUM_PROMPTS="${GLM53_NUM_PROMPTS:-512}"
 
 # Disable random length jitter: benchmark requests use exact nominal 8192:1024 lengths.
 RANDOM_RANGE_RATIO="0.0"
@@ -52,6 +52,26 @@ RANDOM_RANGE_RATIO="0.0"
 # (nvfp4.py): ~32x less scale data and no in-kernel dequant. Same setting as
 # the GLM-5.2 NVFP4 recipe.
 export MOE_REQUANTIZE_BLOCK_SIZE="${MOE_REQUANTIZE_BLOCK_SIZE:-512}"
+
+# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+57.39% output tok/s/device:
+# 139.72 -> 219.91 tok/s/device at ISL=8192, OSL=1024, c=512):
+# 1. Fused EP MoE v2 with W4A8 MXU matmuls + sharded schedule plan + padded-row skip
+export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
+export MOE_FUSED_EP_ENABLE_W4A8="${MOE_FUSED_EP_ENABLE_W4A8:-1}"
+export MOE_FUSED_EP_V2_SHARDED_PLAN="${MOE_FUSED_EP_V2_SHARDED_PLAN:-1}"
+export TPU_MOE_SKIP_PADDED_TOKENS="${TPU_MOE_SKIP_PADDED_TOKENS:-1}"
+# 2. TpuDpScheduler for wave-aligned prefill/decode scheduling across DP=8 ranks
+export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
+# 3. Split-Q in-VMEM join for non-DCP sparse MLA attention + pipelined DSA top-k
+export TPU_MLA_SPARSE_SPLIT_Q="${TPU_MLA_SPARSE_SPLIT_Q:-1}"
+export TPU_STREAMIDX_CHUNK_TOKENS="${TPU_STREAMIDX_CHUNK_TOKENS:-256}"
+# 4. Truncated row-major RoPE cache + fast device token substitution
+export TPU_ROPE_CACHE_TRUNCATE="${TPU_ROPE_CACHE_TRUNCATE:-1}"
+export TPU_ROPE_CACHE_ROW_MAJOR="${TPU_ROPE_CACHE_ROW_MAJOR:-1}"
+export VLLM_TPU_FAST_TOKEN_SUBSTITUTION="${VLLM_TPU_FAST_TOKEN_SUBSTITUTION:-1}"
+# 5. SparseCore async All-Gather offload (256 KiB threshold)
+export SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES="${SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES:-262144}"
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }--xla_enable_async_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=262144"
 
 # Server configuration:
 # - max-model-len=9216: exact nominal length for 8192 input + 1024 output.
@@ -65,7 +85,7 @@ MAX_NUM_BATCHED_TOKENS="${GLM53_MAX_NUM_BATCHED_TOKENS:-1024}"
 MAX_NUM_SEQS="${GLM53_MAX_NUM_SEQS:-64}"
 
 SERVER_READY_WAIT_MIN="${GLM53_SERVER_READY_WAIT_MIN:-180}"
-GPU_MEMORY_UTILIZATION="${GLM53_GPU_MEMORY_UTILIZATION:-0.90}"
+GPU_MEMORY_UTILIZATION="${GLM53_GPU_MEMORY_UTILIZATION:-0.95}"
 KV_CACHE_DTYPE="fp8"
 
 # GLM-5.3 is an MLA model: tpu_platform.get_attn_backend_cls forces
