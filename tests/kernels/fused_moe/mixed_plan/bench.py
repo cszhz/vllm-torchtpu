@@ -37,7 +37,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import spec  # noqa: E402
 
 # name -> fn(cell, exchange, local_blocks, block_hist, me) -> dict like incumbent_plan.
-CANDIDATES = {}
+CANDIDATES = {
+    "a1": lambda c, e, l, b, m: spec.candidate_plan(c, e, l, b, m),
+    # timing-only arms (wrong outputs allowed; M8 removal arms / lever pairs)
+    "a1_nohi": lambda c, e, l, b, m: spec.candidate_plan(c, e, l, b, m, dc_hi=False),
+    "a1_rm_s3": lambda c, e, l, b, m: spec.candidate_plan(c, e, l, b, m, fault="rm_s3"),
+    "a1_rm_ydot": lambda c, e, l, b, m: spec.candidate_plan(c, e, l, b, m, fault="rm_ydot"),
+}
 
 
 def md5(path):

@@ -35,6 +35,7 @@ def _on_tpu():
 # name -> fn(cell, exchange, local_blocks, block_hist, me, interpret) -> dict
 IMPLS = {
     "incumbent": lambda c, e, l, b, m, interpret: spec.incumbent_plan(c, e, l, b, m),
+    "a1": lambda c, e, l, b, m, interpret: spec.candidate_plan(c, e, l, b, m, interpret),
 }
 
 EDGE = [
@@ -42,6 +43,9 @@ EDGE = [
     ("mix32", "unrouted"),
     ("mix64", "hot"),
     ("mix64", "served_pad"),
+    ("mix256", "dup"),
+    ("mix256", "one_shard"),
+    ("mix128", "unrouted"),
 ]
 PROD = [(c, k) for c in spec.PROD_CELLS for k in ("served", "served_pad", "uniform")]
 FAST = os.environ.get("KPLAN_FAST") == "1"
@@ -133,3 +137,25 @@ def test_combine_native_vs_f64_and_faults(cn):
         bad = spec.oracle_combine(arr, scl, p2, m2, w2, routes)
         e2 = np.abs(bad - want) / scale
         assert e2.max() > tol, f"combine fault {name} not caught ({e2.max():.3e} <= {tol:.3e})"
+
+
+@pytest.mark.parametrize("fault", list(spec.CANDIDATE_FAULTS))
+def test_candidate_fault_caught(fault):
+    """Positive control for the candidate: each kernel fault turns the oracle
+    comparison red on a production cell (dup_nohi: on the duplicate-id edge
+    cell, the only class where it can act)."""
+    kw = spec.CANDIDATE_FAULTS[fault]
+    cells = [("mix256", "dup")] if fault == "dup_nohi" else [
+        ("mix128", "served"), ("mix128", "served_pad"), ("mix256", "served")]
+    caught = []
+    for cn, kind in cells:
+        cell, pairs, sb, ex, mes = _case(cn, kind)
+        for me in mes:
+            lb, bh = spec.local_inputs(cell, pairs, me)
+            f = jax.jit(lambda e, m: spec.candidate_plan(cell, e, None, None, m, not _on_tpu(), **kw))
+            got = jax.device_get(f(ex, jnp.int32(me)))
+            bad = spec.compare(spec.oracle_plan(cell, pairs, sb, me), got)
+            if bad:
+                caught.append((cn, kind, me, bad))
+    print(f"\nCANDIDATE FAULT {fault}: caught on {len(caught)} (cell, shard) -> {caught[:3]}")
+    assert caught, f"candidate fault {fault} not caught"

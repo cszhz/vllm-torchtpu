@@ -94,7 +94,7 @@ class Cell:
 CELLS = {c.name: c for c in (Cell("mix32", 32), Cell("mix64", 64), Cell("mix128", 128), Cell("mix256", 256))}
 # Production cells (the operating points); mix32/64 are edge cells.
 PROD_CELLS = ("mix128", "mix256")
-KINDS = ("served", "served_pad", "uniform", "hot", "one_shard", "unrouted")
+KINDS = ("served", "served_pad", "uniform", "hot", "one_shard", "unrouted", "dup")
 
 
 @functools.lru_cache(None)
@@ -119,7 +119,7 @@ def make_pairs(cell, kind, seed, layer=20, placement="ep16", pad_frac=0.25):
         p = np.maximum(p, 1e-9)
         sel = _select(rng, np.log(p / p.sum()), T, K)
         sel = s["slots_" + placement][layer][sel]
-    elif kind == "hot":
+    elif kind in ("hot", "dup"):
         hot = rng.choice(E, max(K, 8), replace=False)
         sel = np.stack([rng.choice(hot, K, replace=False) for _ in range(T)])
     elif kind == "one_shard":
@@ -128,6 +128,12 @@ def make_pairs(cell, kind, seed, layer=20, placement="ep16", pad_frac=0.25):
     else:  # uniform, unrouted
         sel = _select(rng, np.zeros(E), T, K)
     sel = sel.astype(np.int32)
+    if kind == "dup":
+        # A token selecting one expert twice (never produced by top-k) over
+        # 8 hot experts: the candidate's exactness edge, run prefix counts
+        # above 255 at t_local 256.
+        d = rng.random(T) < 0.5
+        sel[d, :] = sel[0, 0]  # half the tokens put all K picks on one expert
     if kind == "unrouted":
         sel[rng.random(T) < 0.4] = E
     if kind == "served_pad":
@@ -411,3 +417,38 @@ def oracle_combine(arrivals, arrival_scales, pos, mirror_pos, weights, row_route
     coef = s[mir] * np.asarray(weights, np.float64)
     out = np.einsum("tk,tkh->th", coef, a[pos])
     return np.where(np.asarray(row_routes), out, 0.0)
+
+
+# ---------------------------------------------------------------- candidates
+
+
+def candidate_plan(cell, exchange, local_blocks, block_hist, me, interpret=False, **kw):
+    """Stage A1 (mixed_plan_kernel.build_mixed_plan) in incumbent_plan's output form."""
+    del local_blocks, block_hist  # the kernel reads everything from the exchange
+    from vllm_torchtpu.kernels.fused_moe.v2.mixed_plan_kernel import build_mixed_plan
+
+    p = build_mixed_plan(
+        exchange, jnp.asarray(me, jnp.int32), layout=cell.layout, e_total=cell.e_total,
+        ep=cell.ep, t_local=cell.t_local, topk=cell.topk, block=cell.block,
+        tile_m=cell.tile_m, shard_stride=cell.stride, interpret=interpret, **kw,
+    )
+    return dict(
+        tables=jnp.stack([*p.block_tables, p.true_rows]),
+        token_gather=p.token_gather,
+        scale_slab=lax.bitcast_convert_type(p.scale_slab, jnp.int32),
+        expert_rows=p.expert_rows,
+        slab_base=p.slab_base,
+        visit=p.visit,
+        counts=p.counts,
+        pos=p.pos,
+        mirror_pos=p.mirror_pos,
+    )
+
+
+# Candidate faults injected into the KERNEL (positive control, WHITEBOARD v1 5.4).
+CANDIDATE_FAULTS = {
+    "tele_off": dict(fault="tele_off"),        # telescoping without the k-1 term
+    "sign": dict(fault="sign"),                # signed-byte recombine sign error
+    "stale_block": dict(fault="stale_block"),  # last live S3 block left zero
+    "dup_nohi": dict(dc_hi=False),             # duplicate ids: high plane dropped
+}
