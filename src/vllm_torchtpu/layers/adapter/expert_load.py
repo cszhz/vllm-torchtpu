@@ -130,8 +130,10 @@ class _RawReader:
         self.latest: np.ndarray | None = None
         self.latest_step: int | None = None
         self.checked = False
+        self._ptrs: list[int] | None = None
         self.stats = {
             "issues": 0,
+            "rebound": -1,
             "issue_ms": 0.0,
             "issue_ms_max": 0.0,
             "ready_steps": [],
@@ -182,6 +184,15 @@ class _RawReader:
         if self._futures is not None:
             return
         t0 = time.perf_counter()
+        # Do the accumulators' device buffers change between reads? (They
+        # are donated operands, so presumably yes; if not, the transfers
+        # could be bound once instead of per read.)
+        ptrs = [t.untyped_storage().data_ptr() for t in self._srcs]
+        if self._ptrs is not None:
+            self.stats["rebound"] = sum(
+                a != b for a, b in zip(ptrs, self._ptrs, strict=True)
+            )
+        self._ptrs = ptrs
         prepared, futures = [], []
         for t, buf in zip(self._srcs, self._bufs, strict=True):
             pt = self._rt.PreparedTorchRawTransfer(t, buf, True)
@@ -343,12 +354,14 @@ def maybe_log(dp_rank: int) -> None:
                 st = reader.stats
                 logger.info(
                     "expert load | read %d adopted at step %d: issued %d step(s) "
-                    "earlier, issue %.2f ms (max %.2f), compilations %s",
+                    "earlier, issue %.2f ms (max %.2f), %s buffers changed since "
+                    "the last read, compilations %s",
                     st["issues"],
                     step,
                     st["ready_steps"][-1],
                     st["issue_ms"] / max(st["issues"], 1),
                     st["issue_ms_max"],
+                    st["rebound"],
                     _compilations(),
                 )
         except Exception as e:  # noqa: BLE001 - fall back for good
