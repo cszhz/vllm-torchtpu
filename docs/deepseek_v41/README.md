@@ -67,6 +67,12 @@ with the EP width (at DP32 C768, 32 x 144 rows x 5 KB = 23.6 MB per device and
 about 140 us of exposed wait per layer); the ragged all-to-all sends each row
 only to the shards it selected (about 4 MB per device at the same point), with
 the same output bit for bit. It enters the compile hash like every knob.
+`MOE_FUSED_EP_DISPATCH=pallas_all_to_all` is the same exchange issued by a
+Pallas kernel before the layer builds its routing plan and waited for by a
+second one just before the expert kernel, so the rows travel while the plan is
+built instead of in a synchronous collective of their own; it also drops the
+size exchange (the routing payload already carries the sizes) and the zeroed
+receive buffer. Same output bit for bit.
 
 `ced` deliberately approximates decoder SWA state and is not numerically
 equivalent to a full decoder pass for long prompts. It processes all encoder

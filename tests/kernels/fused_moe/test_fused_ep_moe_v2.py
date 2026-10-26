@@ -1292,11 +1292,26 @@ def test_expert_load_counts_the_rows_per_physical_slot():
 # Dispatch: the ragged all-to-all moves each wire row only to the shards whose
 # experts it selected; the kernel computes on the same bytes through a
 # remapped token index, so the output is the all-gather dispatch's bit for bit.
+# Both exchanges -- XLA's ragged all-to-all and the Pallas issue/wait pair --
+# fill the same receive layout and are held to that.
+
+EXCHANGES = ("all_to_all", "pallas_all_to_all")
+
+
+def _served(x, gating, weights, **kw):
+    """The layer under one jax.jit, as it is served (traced into one exported
+    program). Both arms of a comparison go through here: the Pallas exchange
+    hands DMA semaphores between two kernels, so it only runs inside one
+    program, and eager execution would hold the reference to other fusions."""
+    return jax.jit(lambda x, g, *w: fused_ep_moe_v2(x, *w, g, **kw))(
+        x, gating, *weights
+    )
 
 
 @pytest.mark.parametrize("spare", [0, 1])
 @pytest.mark.parametrize("routing", ["topk", "score_bias", "hash"])
-def test_all_to_all_dispatch_is_bit_exact_with_the_all_gather(routing, spare):
+@pytest.mark.parametrize("dispatch", EXCHANGES)
+def test_all_to_all_dispatch_is_bit_exact_with_the_all_gather(routing, spare, dispatch):
     """On the served fp4 block-512 form, for the plain top-k, bias-corrected
     top-k and hash selections, under a layout with and without spare slots
     (the DP32 arm runs the layout and this dispatch together)."""
@@ -1314,15 +1329,16 @@ def test_all_to_all_dispatch_is_bit_exact_with_the_all_gather(routing, spare):
         routing=routing,
     )
     placed = dict(expert_slot=jnp.asarray(slot_table))
-    gathered = fused_ep_moe_v2(x, *placed_weights, gating, **placed, **common)
-    exchanged = fused_ep_moe_v2(
-        x, *placed_weights, gating, dispatch="all_to_all", **placed, **common
+    gathered = _served(x, gating, placed_weights, **placed, **common)
+    exchanged = _served(
+        x, gating, placed_weights, dispatch=dispatch, **placed, **common
     )
     np.testing.assert_array_equal(np.asarray(exchanged), np.asarray(gathered))
 
 
 @pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
-def test_all_to_all_dispatch_is_bit_exact_without_a_layout(sharded_plan):
+@pytest.mark.parametrize("dispatch", EXCHANGES)
+def test_all_to_all_dispatch_is_bit_exact_without_a_layout(sharded_plan, dispatch):
     mesh = _mesh()
     weights, scales, _ = _make_fp4_weights(
         mesh, 93, hidden=1024, inter=512, e_total=32, rhs_qb=512
@@ -1338,14 +1354,13 @@ def test_all_to_all_dispatch_is_bit_exact_without_a_layout(sharded_plan):
         sharded_plan=sharded_plan,
         scoring_fn="sigmoid",
     )
-    gathered = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
-    exchanged = fused_ep_moe_v2(
-        x, *weights, *scales, gating, dispatch="all_to_all", **common
-    )
+    gathered = _served(x, gating, (*weights, *scales), **common)
+    exchanged = _served(x, gating, (*weights, *scales), dispatch=dispatch, **common)
     np.testing.assert_array_equal(np.asarray(exchanged), np.asarray(gathered))
 
 
-def test_all_to_all_dispatch_is_bit_exact_at_the_dp32_shape():
+@pytest.mark.parametrize("dispatch", EXCHANGES)
+def test_all_to_all_dispatch_is_bit_exact_at_the_dp32_shape(dispatch):
     """96 experts over 8 shards with one spare slot each and 1152 tokens:
     the DP32 C768 per-device geometry, layout and all-to-all together."""
     mesh = _mesh()
@@ -1362,14 +1377,15 @@ def test_all_to_all_dispatch_is_bit_exact_at_the_dp32_shape():
         routing="score_bias",
     )
     placed = dict(expert_slot=jnp.asarray(slot_table))
-    gathered = fused_ep_moe_v2(x, *placed_weights, gating, **placed, **common)
-    exchanged = fused_ep_moe_v2(
-        x, *placed_weights, gating, dispatch="all_to_all", **placed, **common
+    gathered = _served(x, gating, placed_weights, **placed, **common)
+    exchanged = _served(
+        x, gating, placed_weights, dispatch=dispatch, **placed, **common
     )
     np.testing.assert_array_equal(np.asarray(exchanged), np.asarray(gathered))
 
 
-def test_all_to_all_dispatch_keeps_the_load_accumulator():
+@pytest.mark.parametrize("dispatch", EXCHANGES)
+def test_all_to_all_dispatch_keeps_the_load_accumulator(dispatch):
     mesh = _mesh()
     e_total, tokens, topk = 32, 256, 4
     weights, scales, _ = _make_fp4_weights(
@@ -1387,11 +1403,87 @@ def test_all_to_all_dispatch_keeps_the_load_accumulator():
         sharded_plan=True,
         scoring_fn="sqrtsoftplus",
         hash_topk_ids=hash_ids,
-        dispatch="all_to_all",
+        dispatch=dispatch,
     )
     load = jnp.zeros((e_total,), jnp.int32)
-    _, updated = fused_ep_moe_v2(
-        x, *weights, *scales, gating, expert_load=load, **common
-    )
+    _, updated = _served(x, gating, (*weights, *scales), expert_load=load, **common)
     expected = np.bincount(np.asarray(hash_ids).ravel(), minlength=e_total)
     np.testing.assert_array_equal(np.asarray(updated), expected)
+
+
+@pytest.mark.parametrize("pattern", ["ragged", "empty", "one_source"])
+def test_pallas_exchange_lands_what_the_ragged_all_to_all_lands(pattern):
+    """dispatch.exchange_start / exchange_wait against lax.ragged_all_to_all.
+
+    Every shard sends sizes[s, d] rows (at most one receive block, t_local,
+    zeros included) destination-major; source s's run lands at s * t_local
+    of every receiver. Every row the collective writes must be bit-identical;
+    rows nobody sends are never written by the Pallas pair and not compared.
+    """
+    from vllm_torchtpu.kernels.fused_moe.v2.dispatch import (
+        exchange_start,
+        exchange_wait,
+    )
+
+    mesh = _mesh()
+    t_local, lane_blocks = 40, 8
+    rng = np.random.default_rng({"ragged": 3, "empty": 4, "one_source": 5}[pattern])
+    sizes = rng.integers(0, t_local + 1, size=(EP, EP)).astype(np.int32)
+    sizes[rng.random((EP, EP)) < 0.25] = 0
+    if pattern == "empty":
+        sizes[:] = 0
+    elif pattern == "one_source":
+        sizes[1:] = 0
+    s_max = EP * t_local
+    x = jax.device_put(
+        jnp.asarray(
+            rng.standard_normal((EP * s_max, lane_blocks, 128)), jnp.bfloat16
+        ).astype(jnp.float8_e4m3fn),
+        NamedSharding(mesh, P(AXIS)),
+    )
+    sizes_g = jax.device_put(jnp.asarray(sizes), NamedSharding(mesh, P(AXIS)))
+    rank = jax.device_put(
+        jnp.arange(EP, dtype=jnp.int32).reshape(EP, 1), NamedSharding(mesh, P(AXIS))
+    )
+
+    def body(x_l, sizes_l, rank_l):
+        me = rank_l[0, 0]
+        send_sizes = sizes_l[0]
+        offsets = jnp.cumsum(send_sizes) - send_sizes
+        recv_sizes = lax.all_gather(send_sizes, AXIS, axis=0, tiled=False)[:, me]
+        want = lax.ragged_all_to_all(
+            x_l,
+            jnp.zeros((EP * t_local, *x_l.shape[1:]), x_l.dtype),
+            offsets,
+            send_sizes,
+            jnp.full((EP,), me * t_local, jnp.int32),
+            recv_sizes,
+            axis_name=AXIS,
+        )
+        recv, send_sem, recv_sem = exchange_start(
+            x_l, send_sizes, offsets, rank_l, t_local=t_local
+        )
+        expected = jnp.stack(
+            [jnp.sum(send_sizes), jnp.sum(recv_sizes) - recv_sizes[me]]
+        )
+        got = exchange_wait(recv, x_l, send_sem, recv_sem, expected, t_local=t_local)
+        return want, got, recv_sizes[None]
+
+    want, got, recv_sizes = jax.jit(
+        jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(P(AXIS),) * 3,
+            out_specs=(P(AXIS),) * 3,
+            check_vma=False,
+        )
+    )(x, sizes_g, rank)
+    want = np.asarray(want.view(jnp.uint8)).reshape(EP, EP * t_local, -1)
+    got = np.asarray(got.view(jnp.uint8)).reshape(EP, EP * t_local, -1)
+    recv_sizes = np.asarray(recv_sizes)
+    np.testing.assert_array_equal(recv_sizes, sizes.T)
+    for d in range(EP):
+        for s in range(EP):
+            n = recv_sizes[d, s]
+            block = slice(s * t_local, s * t_local + n)
+            np.testing.assert_array_equal(got[d, block], want[d, block])

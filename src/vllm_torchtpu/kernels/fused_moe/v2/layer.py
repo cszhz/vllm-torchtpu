@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu.kernels.fused_moe.v2.dispatch import exchange_start, exchange_wait
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -261,7 +262,10 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
     return mesh_block * g_local + topk_idx % g_local
 
 
-DISPATCH_MODES = ("all_gather", "all_to_all")
+DISPATCH_MODES = ("all_gather", "all_to_all", "pallas_all_to_all")
+# The dispatches that send each row only to the shards that selected it, into
+# the same receive layout, read through the same token index.
+EXCHANGE_DISPATCHES = ("all_to_all", "pallas_all_to_all")
 
 
 def _all_to_all_send_plan(local_blocks, *, g_local, ep, t_local, topk):
@@ -454,8 +458,13 @@ def fused_ep_moe_v2(
     shard r's rows at r * rows per shard in the order sent; the bytes moved
     are set by the global batch alone (at most rows per shard x topk), and
     the kernel reads the same bytes through a remapped token index, so its
-    output is the all-gather dispatch's bit for bit. Fused stage only: the
-    split stages gather by construction.
+    output is the all-gather dispatch's bit for bit. "pallas_all_to_all" is
+    the same exchange issued by a Pallas kernel before the routing plan is
+    built and waited for by another just before the expert kernel, so the
+    rows travel under the plan rather than in front of it (dispatch.py); the
+    receive sizes come from the routing payload, so it also drops the size
+    exchange, and the receive buffer is never zero-filled. Same output bit
+    for bit. Fused stage only: the split stages gather by construction.
 
     expert_load [e_total] i32, replicated, is a routed-row accumulator: with
     it the layer returns (output, expert_load + this step's rows per physical
@@ -552,7 +561,7 @@ def fused_ep_moe_v2(
         raise ValueError('routed is passed exactly when stage == "compute"')
     if dispatch not in DISPATCH_MODES:
         raise ValueError(f"dispatch must be one of {DISPATCH_MODES}; got {dispatch!r}")
-    if dispatch == "all_to_all" and stage != "fused":
+    if dispatch in EXCHANGE_DISPATCHES and stage != "fused":
         raise ValueError(
             "the all-to-all dispatch belongs to the fused stage; the split "
             "stages hand the gathered rows across their boundary"
@@ -833,12 +842,17 @@ def fused_ep_moe_v2(
         out_dtype,
         expert_load_l=None,
         token_index=None,
+        finish_rows=None,
     ):
         """Plan, kernel and combine over the exchanged rows and payload.
 
         `token_index` [T] is set by the all-to-all dispatch: the receive
         buffer's row holding each token, which the kernel's token gather is
         read through. None means the rows sit in token order (gathered).
+        `finish_rows(tables) -> (rows, tables)` is set by the Pallas
+        all-to-all, whose rows are still on the wire: q_g is None and the
+        rows come out of the wait, which runs behind every table the kernel
+        takes.
         """
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
@@ -991,6 +1005,15 @@ def fused_ep_moe_v2(
         # HBM->SMEM DMA at the head of the kernel, and the prefetch also has to
         # fit in 1 MB of SMEM.
         kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
+        if finish_rows is not None:
+            q_g, waited = finish_rows(
+                (kernel_tables, token_gather, expert_rows, slab_base, scale_slab)
+                + (visit, counts)
+            )
+            (kernel_tables, token_gather, expert_rows, slab_base, scale_slab) = waited[
+                :5
+            ]
+            visit, counts = waited[5:]
         arrivals, arrival_scales = kfn(
             kernel_tables,
             token_gather,
@@ -1111,6 +1134,46 @@ def fused_ep_moe_v2(
         )
         return received, token_index
 
+    def start_rows_pallas(q_l, local_blocks, exchange, rank_l):
+        """Put the wire rows on the wire and return what waits for them.
+
+        The same exchange as exchange_rows_all_to_all, by Pallas DMAs: issued
+        before the routing plan and waited for after it. Returns this shard's
+        index re-read behind the issue -- every plan table reads it, so none
+        can be scheduled ahead of the sends -- the token index, and
+        `finish(tables) -> (rows, tables)`, which waits behind the tables it
+        is handed.
+        """
+        send_rows, send_sizes, input_offsets = _all_to_all_send_plan(
+            local_blocks, g_local=g_local, ep=ep, t_local=t_local, topk=topk
+        )
+        send = jnp.take(q_l, send_rows, axis=0)
+        recv, send_sem, recv_sem = exchange_start(
+            send, send_sizes, input_offsets, rank_l, t_local=t_local
+        )
+        recv, rank_l = lax.optimization_barrier((recv, rank_l))
+        me = rank_l[0, 0]
+        pairs_g, _, _ = _unpack_routing_exchange(
+            exchange, layout, t_local, topk, e_total
+        )
+        # The payload already says what every shard sends here, so the size
+        # exchange of the XLA path has no counterpart.
+        recv_sizes, token_index = _all_to_all_recv_plan(
+            pairs_g, me, g_local=g_local, ep=ep, t_local=t_local, topk=topk
+        )
+        expected = jnp.stack(
+            [jnp.sum(send_sizes), jnp.sum(recv_sizes) - recv_sizes[me]]
+        ).astype(jnp.int32)
+
+        def finish(tables):
+            expected_b, tables = lax.optimization_barrier((expected, tables))
+            rows = exchange_wait(
+                recv, send, send_sem, recv_sem, expected_b, t_local=t_local
+            )
+            return rows, tables
+
+        return rank_l, token_index, finish
+
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
         (
@@ -1125,7 +1188,17 @@ def fused_ep_moe_v2(
         ) = unpack_operands(scales_gating_biases)
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
         token_index = None
-        if dispatch == "all_to_all":
+        finish_rows = None
+        if dispatch == "pallas_all_to_all":
+            topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
+                gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
+            )
+            exchange = gather_payload(packed)
+            rank_l, token_index, finish_rows = start_rows_pallas(
+                q_l, local_blocks, exchange, rank_l
+            )
+            q_g = None
+        elif dispatch == "all_to_all":
             # Select first: what a shard sends is what it routed, and what it
             # receives is in the payload, so the rows' exchange waits for the
             # payload's rather than running ahead of the selection.
@@ -1174,6 +1247,7 @@ def fused_ep_moe_v2(
             x_l.dtype,
             expert_load_l,
             token_index=token_index,
+            finish_rows=finish_rows,
         )
 
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -1331,5 +1405,11 @@ def fused_ep_moe_v2(
                     out_specs=out_specs,
                     check_vma=False,
                 )
+                if dispatch == "pallas_all_to_all":
+                    # The exchange hands two DMA semaphores from one kernel to
+                    # the next, which only works inside one program; an eager
+                    # shard_map compiles every primitive as its own, and a
+                    # program cannot return a semaphore (XLA aborts at compile).
+                    sm = jax.jit(sm)
                 _LAYER_SM_CACHE[key] = sm
     return sm(*args)

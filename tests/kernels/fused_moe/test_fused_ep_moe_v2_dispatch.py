@@ -10,6 +10,8 @@ lands at s's block of d's buffer -- so a disagreement between what a sender
 packs and what a receiver expects shows here, with no device.
 """
 
+import re
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -112,7 +114,8 @@ def test_the_plans_agree_with_a_simulated_exchange(ep, t_local, topk, g_local):
     assert send_sizes.sum(axis=1).max() <= t_local * min(topk, ep)
 
 
-def test_the_all_to_all_dispatch_is_refused_off_the_fused_stage():
+@pytest.mark.parametrize("dispatch", ["all_to_all", "pallas_all_to_all"])
+def test_the_all_to_all_dispatch_is_refused_off_the_fused_stage(dispatch):
     import jax
     from jax.sharding import Mesh
 
@@ -137,7 +140,7 @@ def test_the_all_to_all_dispatch_is_refused_off_the_fused_stage():
             capacity=128,
             weight_format=layer.WeightFormat.BF16,
             stage="route",
-            dispatch="all_to_all",
+            dispatch=dispatch,
         )
     with pytest.raises(ValueError, match="dispatch must be one of"):
         fused_ep_moe_v2(
@@ -154,3 +157,60 @@ def test_the_all_to_all_dispatch_is_refused_off_the_fused_stage():
             weight_format=layer.WeightFormat.BF16,
             dispatch="broadcast",
         )
+
+
+def test_the_pallas_exchange_lowers_for_tpu_from_a_host():
+    """The issue/wait pair hands two DMA semaphores from one pallas_call to
+    the next. Lowered for TPU from this host -- the way torch_tpu's jax.export
+    bridge sees it, for an 8-way mesh of v7x cores -- the wait must take both
+    semaphores straight from the issue, and neither call may be marked
+    side-effecting: the bridge's SPMD partitioner refuses a side-effecting
+    custom call that carries no sharding of its own."""
+    import jax
+    from jax import export, lax
+    from jax.sharding import AbstractMesh, NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.kernels.fused_moe.v2.dispatch import (
+        exchange_start,
+        exchange_wait,
+    )
+
+    ep, t_local, sent = 8, 144, 864
+    mesh = AbstractMesh(
+        (ep,),
+        ("d",),
+        abstract_device=jax.sharding.AbstractDevice(
+            device_kind="TPU7x", num_cores=1, platform="tpu"
+        ),
+    )
+
+    def body(x_l, sizes_l, rank_l):
+        sizes = sizes_l[0]
+        offsets = jnp.cumsum(sizes) - sizes
+        recv, send_sem, recv_sem = exchange_start(
+            x_l, sizes, offsets, rank_l, t_local=t_local
+        )
+        recv, rank_l = lax.optimization_barrier((recv, rank_l))
+        expected = jnp.stack([jnp.sum(sizes), jnp.sum(sizes) - sizes[rank_l[0, 0]]])
+        return exchange_wait(recv, x_l, send_sem, recv_sem, expected, t_local=t_local)
+
+    shard = NamedSharding(mesh, P("d"))
+    specs = (
+        jax.ShapeDtypeStruct((ep * sent, 40, 128), jnp.float8_e4m3fn, sharding=shard),
+        jax.ShapeDtypeStruct((ep, ep), jnp.int32, sharding=shard),
+        jax.ShapeDtypeStruct((ep, 1), jnp.int32, sharding=shard),
+    )
+    fn = jax.shard_map(
+        body, mesh=mesh, in_specs=(P("d"),) * 3, out_specs=P("d"), check_vma=False
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        module = export.export(jax.jit(fn), platforms=["tpu"])(*specs).mlir_module()
+    calls = [line for line in module.splitlines() if "tpu_custom_call" in line]
+    assert len(calls) == 2
+    assert not any("has_side_effect = true" in line for line in calls)
+    # The start returns (buffer, send sem, recv sem); the wait takes both
+    # semaphores straight from it.
+    start = re.match(r"\s*(%[\w.]+):3 = ", calls[0])
+    assert start is not None, calls[0]
+    assert f"{start.group(1)}#1, {start.group(1)}#2)" in calls[1], calls[1]

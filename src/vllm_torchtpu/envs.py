@@ -694,11 +694,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # How fused EP MoE v2 moves the routed rows to the shards holding their
     # experts: all_gather (every shard receives every row; the bytes grow
-    # with the EP width) or all_to_all (a ragged all-to-all carrying each row
-    # only to the shards it selected; the bytes are set by the global batch).
-    # Same output bit for bit. Default off until measured at the served widths.
+    # with the EP width), all_to_all (a ragged all-to-all carrying each row
+    # only to the shards it selected; the bytes are set by the global batch)
+    # or pallas_all_to_all (the same exchange issued before the routing plan
+    # and waited for after it, so it runs under the plan). Same output bit for
+    # bit. Default off until measured at the served widths.
     "MOE_FUSED_EP_DISPATCH": env_with_choices(
-        "MOE_FUSED_EP_DISPATCH", "all_gather", ["all_gather", "all_to_all"]
+        "MOE_FUSED_EP_DISPATCH",
+        "all_gather",
+        ["all_gather", "all_to_all", "pallas_all_to_all"],
     ),
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for

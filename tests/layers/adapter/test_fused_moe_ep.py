@@ -1354,10 +1354,12 @@ def test_op_key_tells_the_dispatch_modes_apart():
             gathered = bridge._build_op(*common)
             exchanged = bridge._build_op(*common, dispatch="all_to_all")
             again = bridge._build_op(*common, dispatch="all_to_all")
+            issued = bridge._build_op(*common, dispatch="pallas_all_to_all")
     assert gathered is not exchanged and exchanged is again
+    assert issued is not exchanged and issued is not gathered
 
 
-@pytest.mark.parametrize("setting", ["all_gather", "all_to_all"])
+@pytest.mark.parametrize("setting", ["all_gather", "all_to_all", "pallas_all_to_all"])
 def test_dispatch_knob_reaches_the_built_op(monkeypatch, setting):
     name = "MOE_FUSED_EP_DISPATCH"
     monkeypatch.setenv(name, setting)
