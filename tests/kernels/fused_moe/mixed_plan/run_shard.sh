@@ -9,6 +9,7 @@ python3 -c "import vllm_torchtpu.kernels.fused_moe.v2.host as h; print('host fro
 md5sum src/vllm_torchtpu/kernels/fused_moe/v2/*.py $D/*.py
 A1ARMS=plan,a1,a1_nohi,a1_rm_s3,a1_rm_ydot
 A2R='combine,a2_inline,a2_inline@nodma,a2_inline@nocompute,a2_inline@nopick,a2_inline@noout,a2_inline@rowconst,a2_inline@nodma;nocompute;nopick;noout'
+A22='combine,a2_inline,a2_ring,a2m,a2_inline@noout,a2_inline@rowconst,a2_inline@nodma;nocompute;nopick;noout,a2m@nodma,a2m@nocompute,a2m@nopick,a2m@noout,a2m@rowconst,a2m@nodma;nocompute;noout'
 case $1 in
 0) timeout -s KILL 2400 python3 $D/bench.py --cells mix128,mix256 --kinds served,served_pad --arms plan,combine --trace --out $O/b0 ;;
 1) pip install -q pytest >/dev/null 2>&1; timeout -s KILL 2400 python3 -m pytest -q -s -p no:cacheprovider $D/test_accuracy.py ;;
@@ -39,4 +40,9 @@ case $1 in
 41) timeout -s KILL 2400 python3 $D/bench.py --cells mix128 --kinds served --arms "$A2R" --rs 16,96,256 --trace --out $O/p21_128 ;;
 42) timeout -s KILL 2400 python3 $D/bench.py --cells mix256 --kinds served --arms "$A2R" --rs 16,96,256 --trace --out $O/p21_256 ;;
 43) timeout -s KILL 2400 python3 $D/bench.py --cells mix128 --kinds served_pad --arms "$A2R" --rs 16,96,256 --trace --out $O/p21_128p ;;
+# probe 22 (2x-a2-mxu): a2m (MXU pick) + attribution; supersedes probe 21's job (deleted unstarted)
+50) pip install -q pytest >/dev/null 2>&1; timeout -s KILL 2400 python3 -m pytest -q -s -p no:cacheprovider $D/test_accuracy.py -k a2 ;;
+51) timeout -s KILL 2700 python3 $D/bench.py --cells mix128 --kinds served --arms "$A22" --rs 16,96,256 --trace --out $O/p22_128 ;;
+52) timeout -s KILL 2700 python3 $D/bench.py --cells mix256 --kinds served --arms "$A22" --rs 16,96,256 --trace --out $O/p22_256 ;;
+53) timeout -s KILL 2700 python3 $D/bench.py --cells tw16,tw4,mix128 --kinds served,served_pad --arms combine,a2_inline,a2_ring,a2m --rs 16,96,256 --trace --out $O/p22_tw ;;
 esac

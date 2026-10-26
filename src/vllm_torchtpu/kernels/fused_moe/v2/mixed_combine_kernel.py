@@ -79,11 +79,48 @@ def _pick(tab, scl_vm, p, P, mirror_elems, tile_m, shift, lane, opts):
     return s * w
 
 
+def _mxu_coef(mir_ref, w_ref, scl_vm, coef_vm, *, M, opts):
+    """coef_vm[k] = scale(mirror[:, k]) * w[:, k], lane-broadcast [t, 128], all on
+    the vector unit and the MXU: the mirror row is selected by a one-hot dot over
+    the scale BITS in byte planes (every product an integer below 2**8 times 0/1,
+    so exact), the lane by a select and a dot with ones, and the four bytes are
+    recombined into the f32 bit pattern."""
+    t_local, topk = w_ref.shape
+    Mp, L = scl_vm.shape
+    f32, bf16, i32 = jnp.float32, jnp.bfloat16, jnp.int32
+    bits = lax.bitcast_convert_type(scl_vm[...], i32)
+    valid = lax.broadcasted_iota(i32, (Mp, L), 0) < M  # rows past the mirror: never read
+    planes = [
+        jnp.where(valid, lax.shift_right_logical(bits, i32(8 * j)) & 255, 0).astype(f32).astype(bf16)
+        for j in range(4)
+    ]
+    rows_iota = lax.broadcasted_iota(i32, (t_local, Mp), 1)
+    lane = lax.broadcasted_iota(i32, (t_local, L), 1)
+    ones = jnp.ones((L, L), bf16)
+    for k in range(topk):
+        mi = jnp.minimum(mir_ref[:, k:k + 1], M * L - 1)  # [t, 1]
+        ln = mi & (L - 1)
+        if "pick_lane" in opts:
+            ln = ln + 1
+        oh = (lax.shift_right_logical(mi, i32(7)) == rows_iota).astype(f32).astype(bf16)
+        b = None
+        for j in range(4):
+            g = jnp.dot(oh, planes[j], preferred_element_type=f32)  # [t, L]: mirror row bytes
+            sel = jnp.where(lane == ln, g, 0.0).astype(bf16)
+            byte = jnp.dot(sel, ones, preferred_element_type=f32).astype(i32)  # lane-broadcast
+            part = lax.shift_left(byte, i32(8 * j))
+            b = part if b is None else b | part
+        scale = lax.bitcast_convert_type(b, f32)
+        if "nopick" in opts:
+            scale = jnp.ones_like(scale)
+        coef_vm[k] = scale * w_ref[:, k:k + 1]
+
+
 def _row(pos, R, opts):
     """Arrival row of a slot, clamped into the buffer as the XLA gather clamps."""
     if "rowconst" in opts:  # timing only: every slot reads row 0
         return jnp.int32(0)
-    row = jnp.minimum(pos, R - 1)
+    row = pos  # clamped to R - 1 in combine_tables (the XLA fusion that builds the table)
     if "row_off" in opts:  # fault: off by one row
         row = jnp.maximum(row - 1, 0)
     return row
@@ -96,11 +133,13 @@ def _route(acc, tab, P, i, opts):
     return jnp.where(jnp.full(acc.shape, r, jnp.int32) != 0, acc, 0.0)
 
 
-def _bulk_kernel(
-    tables_hbm, arr_hbm, scale_hbm, out_hbm,
-    tab, arr_vm, scl_vm, coef_vm, tile_vm, out_vm, sems,
-    *, t_local, topk, out_dtype, pick, opts,
-):
+def _bulk_kernel(*refs, t_local, topk, out_dtype, pick, opts):
+    if pick == "mxu":
+        (tables_hbm, arr_hbm, scale_hbm, mir_ref, w_ref, out_hbm,
+         tab, arr_vm, scl_vm, coef_vm, tile_vm, out_vm, sems) = refs
+    else:
+        (tables_hbm, arr_hbm, scale_hbm, out_hbm,
+         tab, arr_vm, scl_vm, coef_vm, tile_vm, out_vm, sems) = refs
     P = t_local * topk
     R, LB, L = arr_hbm.shape
     M, tile_m = scale_hbm.shape
@@ -120,13 +159,15 @@ def _bulk_kernel(
             )
     for cp in bulk:
         cp.start()
-    scl = pltpu.make_async_copy(scale_hbm, scl_vm, sems.at[2])
+    scl = pltpu.make_async_copy(scale_hbm, scl_vm.at[pl.ds(0, M)], sems.at[2])
     scl.start()
     fetch.wait()
     scl.wait()
     lane = lax.broadcasted_iota(jnp.int32, (1, tile_m), 1)
     pick_args = (P, M * tile_m, tile_m, shift, lane, opts)
 
+    if pick == "mxu":
+        _mxu_coef(mir_ref, w_ref, scl_vm, coef_vm, M=M, opts=opts)
     if pick == "pre":
         # Every slot's coefficient while the arrival copy is in flight.
         def pre(i, carry):
@@ -140,9 +181,11 @@ def _bulk_kernel(
     for cp in bulk:
         cp.wait()
 
-    def coef(p):
+    def coef(p, i, k):
         if pick == "pre":
             return coef_vm[p]  # [1, L], lanes equal
+        if pick == "mxu":
+            return coef_vm[k, pl.ds(i, 1), :]  # [1, L], lanes equal
         return _pick(tab, scl_vm, p, *pick_args)
 
     def group(g, par):
@@ -159,7 +202,7 @@ def _bulk_kernel(
                 if "nocompute" in opts:
                     continue
                 row = _row(tab[p], R, opts)
-                term = arr_vm[row].astype(jnp.float32) * coef(p)
+                term = arr_vm[row].astype(jnp.float32) * coef(p, i, k)
                 acc = term if acc is None else acc + term
             if acc is None:
                 acc = jnp.zeros((LB, L), jnp.float32)
@@ -273,13 +316,13 @@ def _ring_kernel(
         pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], osem(p)).wait()
 
 
-def combine_tables(pos, mirror_pos, weights, row_routes):
-    """[3P + t] i32: pos | mirror_pos | bits(weights) | route, token-major."""
+def combine_tables(pos, mirror_pos, weights, row_routes, recv_rows):
+    """[3P + t] i32: min(pos, R-1) | mirror_pos | bits(weights) | route, token-major."""
     t_local, topk = weights.shape
     P = t_local * topk
     return jnp.concatenate(
         [
-            pos.astype(jnp.int32).reshape(P),
+            jnp.minimum(pos.astype(jnp.int32).reshape(P), recv_rows - 1),
             mirror_pos.astype(jnp.int32).reshape(P),
             lax.bitcast_convert_type(weights.astype(jnp.float32), jnp.int32).reshape(P),
             row_routes.reshape(t_local).astype(jnp.int32),
@@ -319,10 +362,10 @@ def build_mixed_combine(
             raise ValueError(f"unknown option {o!r}")
     if not mixed_combine_supported(t_local, topk):
         raise ValueError(f"mixed combine needs t_local % {2 * GROUP} == 0, got {t_local}")
-    tables = combine_tables(pos, mirror_pos, weights, row_routes)
+    tables = combine_tables(pos, mirror_pos, weights, row_routes, R)
     vmem = pltpu.VMEM
     if gather == "bulk":
-        if pick not in ("pre", "inline"):
+        if pick not in ("pre", "inline", "mxu"):
             raise ValueError(pick)
         kernel = functools.partial(
             _bulk_kernel, t_local=t_local, topk=topk, out_dtype=out_dtype, pick=pick, opts=opts
@@ -330,13 +373,14 @@ def build_mixed_combine(
         scratch = (
             pltpu.SMEM((3 * P + t_local,), jnp.int32),
             vmem((R, LB, L), arrivals.dtype),
-            vmem((M, tile_m), jnp.float32),
-            vmem((P if pick == "pre" else 1, 1, L), jnp.float32),
+            vmem((-(-M // L) * L if pick == "mxu" else M, tile_m), jnp.float32),
+            vmem((topk, t_local, L) if pick == "mxu" else (P if pick == "pre" else 1, 1, L),
+                 jnp.float32),
             vmem((GROUP, LB, L), out_dtype),
             vmem((2, GROUP, hidden), out_dtype),
             pltpu.SemaphoreType.DMA((5,)),
         )
-        name = f"moe_v2_mixed_combine_bulk_t{t_local}_k{topk}"
+        name = f"moe_v2_mixed_combine_bulk_{pick}_t{t_local}_k{topk}"
     elif gather == "ring":
         tb = _ring_step_tokens(t_local)
         if not tb:
@@ -362,9 +406,15 @@ def build_mixed_combine(
     params = dict(vmem_limit_bytes=64 * 1024 * 1024 * 98 // 100)
     if not interpret:
         params["disable_bounds_checks"] = True
+    extra = []
+    in_specs = [pl.BlockSpec(memory_space=space)] * 3
+    if gather == "bulk" and pick == "mxu":
+        extra = [mirror_pos.astype(jnp.int32).reshape(t_local, topk),
+                 weights.astype(jnp.float32)]
+        in_specs = in_specs + [pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)] * 2
     call = pl.pallas_call(
         kernel,
-        in_specs=[pl.BlockSpec(memory_space=space)] * 3,
+        in_specs=in_specs,
         out_specs=pl.BlockSpec(memory_space=space),
         scratch_shapes=scratch,
         out_shape=jax.ShapeDtypeStruct((t_local, hidden), out_dtype),
@@ -373,13 +423,14 @@ def build_mixed_combine(
         name=name,
     )
     if interpret:
-        return call(tables, arrivals, arrival_scales)
+        return call(tables, arrivals, arrival_scales, *extra)
     return call(
         tables,
         # Pinned to HBM: the kernel copies them itself; unconstrained, XLA
         # would prefetch them into VMEM first (plan_kernel.build_decode_combine).
         pltpu.with_memory_space_constraint(arrivals, hbm),
         pltpu.with_memory_space_constraint(arrival_scales, hbm),
+        *extra,
     )
 
 

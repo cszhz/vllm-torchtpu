@@ -466,6 +466,7 @@ COMBINE_VARIANTS = {
     "a2": dict(gather="bulk", pick="pre"),
     "a2_inline": dict(gather="bulk", pick="inline"),
     "a2_ring": dict(gather="ring"),
+    "a2m": dict(gather="bulk", pick="mxu"),
 }
 
 
