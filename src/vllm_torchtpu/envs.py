@@ -194,6 +194,9 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    TPU_STATIC_DECODE_INPUTS: bool = False
+    TPU_STATIC_DECODE_INPUTS_VERIFY: bool = False
+    TPU_STATIC_DECODE_INPUTS_VERIFY_CORRUPT: str = ""
 
 
 def env_with_choices(
@@ -1145,6 +1148,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies it automatically to DP/Ray engine-core actors.
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
+    "TPU_STATIC_DECODE_INPUTS": env_bool("TPU_STATIC_DECODE_INPUTS", default=False),
+    "TPU_STATIC_DECODE_INPUTS_VERIFY": env_bool(
+        "TPU_STATIC_DECODE_INPUTS_VERIFY", default=False
+    ),
+    "TPU_STATIC_DECODE_INPUTS_VERIFY_CORRUPT": env_str(
+        "TPU_STATIC_DECODE_INPUTS_VERIFY_CORRUPT", ""
     ),
 }
 
