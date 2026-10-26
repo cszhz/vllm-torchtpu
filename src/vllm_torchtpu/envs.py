@@ -213,6 +213,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_MHC_FN_CHUNKS: int = 3
     TPU_DSV4_MHC_AR_SEAM: bool = False
     VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS: int = 0
+    VLLM_TPU_DSV4_MHC_SEAM_FN_HBM: str = ""
     VLLM_TPU_DSV4_MHC_POST_HEAD: bool = True
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
@@ -1449,6 +1450,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # operands around every seam. 0 = off. A power of 2 (gate `T <= cap`).
     "VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS": env_int(
         "VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS", 0
+    ),
+    # DeepSeek-V4 mHC: which fused seams read their fn from HBM in the
+    # kernel's own pipeline instead of an XLA VMEM prefetch ahead of the call:
+    # "attn" (the seam after the MoE, gating the attention input), "ffn" (the
+    # seam after attention), "both", or "" (none). With a 32 MiB seam
+    # (VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS) XLA prefetches fn, and behind
+    # the fused MoE the copy is exposed (~2.2 us). Bit-identical.
+    "VLLM_TPU_DSV4_MHC_SEAM_FN_HBM": lambda: os.getenv(
+        "VLLM_TPU_DSV4_MHC_SEAM_FN_HBM", ""
     ),
     # DeepSeek-V4 mHC: fuse the posts that only feed the hc head collapse or
     # DSpark's aux stream mean into one kernel each, so the (T, 4, H) streams

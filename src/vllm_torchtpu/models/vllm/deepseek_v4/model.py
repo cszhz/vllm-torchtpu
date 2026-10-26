@@ -186,6 +186,24 @@ class DeepseekV4DecoderLayer(nn.Module):
                 opts=self.mhc_opts,
             )
             object.__setattr__(self, "_mhc_ops_instance", ops)
+            # VLLM_TPU_DSV4_MHC_SEAM_FN_HBM: per seam site, a variant of the
+            # fused op that streams fn from HBM (see envs).
+            fh = envs.VLLM_TPU_DSV4_MHC_SEAM_FN_HBM
+            fh_ops = None
+            if fh in ("attn", "ffn", "both"):
+                fh_ops = get_mhc_ops(
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    opts=self.mhc_opts._replace(fn_hbm=True),
+                )
+            seam_ops = {
+                name: fh_ops.fused if fh_ops is not None and fh in (site, "both") else ops.fused
+                for name, site in (("hc_attn_fn", "attn"), ("hc_ffn_fn", "ffn"))
+            }
+            object.__setattr__(self, "_seam_ops", seam_ops)
             if self.seq_parallel:
                 # Built outside the trace alongside the mHC ops.
                 from vllm_torchtpu.models.vllm.deepseek_v4.seq_parallel import (
@@ -207,6 +225,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                         "weight layout cannot be TP-sliced; unset it"
                     )
         return ops
+
+    def _seam(self, fn_name: str):
+        """The fused seam op for the seam that gates ``fn_name``'s sublayer."""
+        ops = self.mhc_ops
+        return self.__dict__.get("_seam_ops", {}).get(fn_name, ops.fused)
 
     def split_hc_fns(self) -> None:
         """Split hc_attn_fn / hc_ffn_fn into the bf16 chunks the mHC ops take.
@@ -299,7 +322,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x, self._fn3("hc_attn_fn"), self.hc_attn_scale, self.hc_attn_base
             )
         else:
-            residual, post_mix, res_mix, x = self.mhc_ops.fused(
+            residual, post_mix, res_mix, x = self._seam("hc_attn_fn")(
                 x,
                 residual,
                 post_mix,
@@ -328,7 +351,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             x = self.attn(positions, x)
 
-        residual, post_mix, res_mix, x = self.mhc_ops.fused(
+        residual, post_mix, res_mix, x = self._seam("hc_ffn_fn")(
             x,
             residual,
             post_mix,

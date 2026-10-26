@@ -172,6 +172,7 @@ def _mhc_fused_post_pre_jax(
     gates_in_kernel: bool,
     gates_max_tokens: int = -1,
     token_block_size: int = 0,
+    fn_hbm: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """One layer's post and the next layer's pre as a single kernel."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
@@ -189,6 +190,7 @@ def _mhc_fused_post_pre_jax(
         sinkhorn_repeat,
         gates_in_kernel=gates_in_kernel,
         **_kernel_kw(gates_max_tokens, token_block_size),
+        **({"fn_hbm": True} if fn_hbm else {}),
     )
 
 
@@ -212,6 +214,7 @@ def _mhc_fused_post_pre_norm_jax(
     gates_in_kernel: bool,
     gates_max_tokens: int = -1,
     token_block_size: int = 0,
+    fn_hbm: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """``_mhc_fused_post_pre_jax`` emitting the RMS-normalized layer input."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
@@ -229,6 +232,7 @@ def _mhc_fused_post_pre_norm_jax(
         sinkhorn_repeat,
         gates_in_kernel=gates_in_kernel,
         **_kernel_kw(gates_max_tokens, token_block_size),
+        **({"fn_hbm": True} if fn_hbm else {}),
         norm_weight=norm_weight,
         norm_eps=rms_eps,
     )
@@ -337,6 +341,7 @@ def _mhc_fused_post_pre_cat_jax(
     gates_in_kernel: bool,
     gates_max_tokens: int = -1,
     token_block_size: int = 0,
+    fn_hbm: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """``_mhc_fused_post_pre_jax`` taking fn as its stacked bf16 chunks."""
     return _fused_call(
@@ -349,6 +354,7 @@ def _mhc_fused_post_pre_cat_jax(
         sinkhorn_repeat=sinkhorn_repeat,
         gates_in_kernel=gates_in_kernel,
         **_kernel_kw(gates_max_tokens, token_block_size),
+        **({"fn_hbm": True} if fn_hbm else {}),
     )
 
 
@@ -370,6 +376,7 @@ def _mhc_fused_post_pre_cat_norm_jax(
     gates_in_kernel: bool,
     gates_max_tokens: int = -1,
     token_block_size: int = 0,
+    fn_hbm: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """``_mhc_fused_post_pre_cat_jax`` emitting the RMS-normalized input."""
     return _fused_call(
@@ -382,6 +389,7 @@ def _mhc_fused_post_pre_cat_norm_jax(
         sinkhorn_repeat=sinkhorn_repeat,
         gates_in_kernel=gates_in_kernel,
         **_kernel_kw(gates_max_tokens, token_block_size),
+        **({"fn_hbm": True} if fn_hbm else {}),
     )
 
 
@@ -427,6 +435,8 @@ class KernelOpts(NamedTuple):
     stacked_fn: the ops take fn as one stacked (3 * M3, K) bf16 array
         (``utils.CatFn``, one MXU pass) instead of three chunks.
     token_block: fused seam token block (0: the kernel default, 32).
+    fn_hbm: the fused seam reads fn from HBM in its own pipeline instead of
+        letting XLA prefetch it into VMEM (VLLM_TPU_DSV4_MHC_SEAM_FN_HBM).
     gates_max_tokens: in-kernel gates up to this many tokens (-1: the kernel
         default, 512; 0: no cap).
     """
@@ -436,6 +446,7 @@ class KernelOpts(NamedTuple):
     stacked_fn: bool = False
     token_block: int = 0
     gates_max_tokens: int = -1
+    fn_hbm: bool = False
 
     def suffix(self) -> str:
         return (
@@ -444,14 +455,18 @@ class KernelOpts(NamedTuple):
             + ("_cat" if self.stacked_fn else "")
             + (f"_tb{self.token_block}" if self.token_block else "")
             + (f"_gm{self.gates_max_tokens}" if self.gates_max_tokens >= 0 else "")
+            + ("_fh" if self.fn_hbm else "")
         )
 
     def kernel_kwargs(self, *, fused: bool) -> dict:
-        return {
+        kw = {
             "gates_in_kernel": self.gates_in_kernel,
             "gates_max_tokens": self.gates_max_tokens,
             "token_block_size": self.token_block if fused else 0,
         }
+        if fused and self.fn_hbm:
+            kw["fn_hbm"] = True
+        return kw
 
     def fn_specs(self) -> tuple:
         return (P(),) if self.stacked_fn else (P(), P(), P())
