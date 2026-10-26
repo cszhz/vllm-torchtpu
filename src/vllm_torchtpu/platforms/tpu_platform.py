@@ -920,9 +920,7 @@ class TpuPlatform(Platform):
 
         is_hybrid = model_config.is_hybrid if model_config is not None else False
         is_attention_free = (
-            getattr(model_config, "is_attention_free", False) is True
-            if model_config is not None
-            else False
+            model_config.is_attention_free if model_config is not None else False
         )
         if (
             vllm_config.speculative_config is not None

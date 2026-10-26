@@ -21,12 +21,15 @@ import torch
 from torch_tpu._internal import pallas
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 
 from vllm_torchtpu.layers.core.mamba_mixer2 import run_jax_mamba_mixer
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
-from vllm_torchtpu.utils import fresh_buffer, get_dp_size
+from vllm_torchtpu.utils import fresh_buffer
+
+_DEFAULT_CHUNK_SIZE = 64
 
 if TYPE_CHECKING:
 
@@ -66,21 +69,11 @@ def mamba_mixer2_core_tpu(
     rms_norm_eps: float,
     apply_rms_norm: bool,
     has_silu_activation: bool = True,
+    interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    # Speculative decoding: MambaStateShapeCalculator.mamba2_state_shape widens
-    # conv_state along dim 1 to `conv_kernel - 1 + num_spec`, whereas
-    # ragged_causal_conv1d requires `kernel_size - 1`. Slice the prefix for the
-    # kernel and update the donated buffer (donate_argnums=(1, 2)) in-place.
-    state_len = conv_state.shape[1]
-    target_state_len = kernel_size - 1
-    if state_len > target_state_len:
-        conv_state_in = conv_state[:, :target_state_len, :]
-    else:
-        conv_state_in = conv_state
-
     (new_conv_state, new_recurrent_state), output = run_jax_mamba_mixer(
         projected_states,
-        conv_state_in,
+        conv_state,
         recurrent_state,
         conv_weight,
         conv_bias,
@@ -105,9 +98,8 @@ def mamba_mixer2_core_tpu(
         rms_norm_eps=rms_norm_eps,
         apply_rms_norm=apply_rms_norm,
         has_silu_activation=has_silu_activation,
+        interpret=interpret,
     )
-    if state_len > target_state_len:
-        new_conv_state = conv_state.at[:, :target_state_len, :].set(new_conv_state)
     return new_conv_state, new_recurrent_state, output
 
 
@@ -115,16 +107,30 @@ def mamba_mixer2_core_tpu(
 class VllmMambaMixer2(MambaMixer2):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        cache_config = getattr(self, "cache_config", None)
-        if (
-            cache_config is not None
-            and (
-                getattr(cache_config, "enable_prefix_caching", False) is True
-                or getattr(cache_config, "mamba_cache_mode", "none") in ("all", "align")
-            )
-        ) or getattr(self, "mamba_cache_mode", "none") in ("all", "align"):
+        cache_config = self.cache_config
+        if cache_config is not None and (
+            cache_config.enable_prefix_caching
+            or cache_config.mamba_cache_mode in ("all", "align")
+        ):
             raise NotImplementedError(
                 "Prefix caching is not yet supported for MambaMixer2 on TPU."
+            )
+        if self.num_spec > 0:
+            raise NotImplementedError(
+                "Speculative decoding is not yet supported for MambaMixer2 on TPU."
+            )
+        if self.use_replayssm:
+            raise NotImplementedError(
+                "--use-replayssm is not supported for MambaMixer2 on TPU."
+            )
+        if is_conv_state_dim_first():
+            raise NotImplementedError(
+                "VLLM_SSM_CONV_STATE_LAYOUT=DS is not supported for MambaMixer2 on TPU."
+            )
+        if self.activation not in (None, "silu", "swish"):
+            raise NotImplementedError(
+                f"Unsupported MambaMixer2 activation {self.activation!r} on TPU; "
+                "expected None, 'silu', or 'swish'."
             )
         self._apply_py_norm = False
         self.mamba_op = self._build_mamba_op()
@@ -155,18 +161,15 @@ class VllmMambaMixer2(MambaMixer2):
         )
         return not orig_single_group_replicated
 
-    def _build_mamba_op(self):
+    def _build_mamba_op(self, *, interpret: bool = False):
         vllm_context = get_vllm_model_wrapper_context()
         mesh = vllm_context.mesh
-        parallel_config = getattr(vllm_context.vllm_config, "parallel_config", None)
-        dp_enabled = parallel_config is not None and get_dp_size(parallel_config) > 1
 
         local_n_groups = self.n_groups // self.tp_size
-        chunk_size = 32 if dp_enabled else 64
         rms_norm_eps = getattr(self.norm, "variance_epsilon", 1e-5)
         apply_rms_norm = self._use_fused_jax_rms_norm()
         self._apply_py_norm = not apply_rms_norm
-        has_silu_activation = getattr(self, "has_silu_activation", True)
+        has_silu_activation = self.activation in ("silu", "swish")
 
         op_name = f"pallas::mamba_mixer2_{self.prefix.replace('.', '_')}"
         wrapped_fn = functools.partial(
@@ -180,10 +183,11 @@ class VllmMambaMixer2(MambaMixer2):
             n_groups=local_n_groups,
             d_state=self.ssm_state_size,
             kernel_size=self.conv_kernel_size,
-            chunk_size=chunk_size,
+            chunk_size=_DEFAULT_CHUNK_SIZE,
             rms_norm_eps=rms_norm_eps,
             apply_rms_norm=apply_rms_norm,
             has_silu_activation=has_silu_activation,
+            interpret=interpret,
         )
 
         mamba_jax_op = pallas.jax_op(

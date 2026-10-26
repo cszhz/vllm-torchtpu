@@ -24,13 +24,10 @@ import torch
 from jax.sharding import Mesh
 
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op import (
+    _DEFAULT_CHUNK_SIZE,
     VllmMambaMixer2,
-    mamba_mixer2_core_tpu,
 )
-from vllm_torchtpu.layers.core.mamba_mixer2 import (
-    run_jax_mamba_mixer,
-)
-from vllm_torchtpu.layers.core.ssd_scan import _segsum_jax, ssd_minimal_discrete_hybrid
+from vllm_torchtpu.layers.core.mamba_mixer2 import run_jax_mamba_mixer
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -38,13 +35,27 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 
 def _mesh(tp_size: int = 1):
     return SimpleNamespace(
-        shape={"attn_dp": 1, "expert": 1, "model": tp_size},
-        axis_names=("attn_dp", "expert", "model"),
+        shape={"model": tp_size},
+        axis_names=("model",),
     )
 
 
-def _vllm_config(*, dp_size: int = 1):
-    return SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=dp_size))
+def _vllm_config():
+    return SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=1))
+
+
+def _fake_mamba_super_init(
+    self_obj,
+    *,
+    cache_config=None,
+    num_spec: int = 0,
+    use_replayssm: bool = False,
+    activation: str | None = "silu",
+):
+    self_obj.cache_config = cache_config
+    self_obj.num_spec = num_spec
+    self_obj.use_replayssm = use_replayssm
+    self_obj.activation = activation
 
 
 def _granite_mamba_layer(
@@ -53,6 +64,7 @@ def _granite_mamba_layer(
     tp_size: int = 1,
     n_groups: int = 4,
     bias: bool = True,
+    activation: str | None = "silu",
 ):
     layer = VllmMambaMixer2.__new__(VllmMambaMixer2)
     torch.nn.Module.__init__(layer)
@@ -63,6 +75,10 @@ def _granite_mamba_layer(
     layer.ssm_state_size = 64
     layer.conv_kernel_size = 4
     layer.n_groups = n_groups
+    layer.cache_config = None
+    layer.num_spec = 0
+    layer.use_replayssm = False
+    layer.activation = activation
     layer.intermediate_size = layer.num_heads * layer.head_dim
     layer.groups_ssm_state_size = layer.n_groups * layer.ssm_state_size
     layer.conv_dim = layer.intermediate_size + 2 * layer.groups_ssm_state_size
@@ -85,21 +101,134 @@ def _granite_mamba_layer(
     return layer
 
 
+def _sequential_mamba2_reference(
+    j_projected_states: jnp.ndarray,
+    recurrent_state: jnp.ndarray,
+    j_A: jnp.ndarray,
+    j_D: jnp.ndarray,
+    j_dt_bias: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    distribution: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    *,
+    num_heads: int,
+    head_dim: int,
+    n_groups: int,
+    d_state: int,
+    has_silu_activation: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Exact step-by-step discrete Mamba-2 SSM reference (post-identity conv1d)."""
+    tped_intermediate_size = num_heads * head_dim
+    local_groups_ssm = n_groups * d_state
+    tped_conv_size = tped_intermediate_size + 2 * local_groups_ssm
+    group_repeat = num_heads // n_groups
+
+    num_tokens = j_projected_states.shape[0]
+    expected_y = np.zeros((num_tokens, tped_intermediate_size), dtype=np.float32)
+    expected_rec = np.array(
+        recurrent_state.astype(jnp.float32), dtype=np.float32, copy=True
+    )
+
+    num_valid_seqs = int(np.asarray(distribution)[2])
+    qsl = np.asarray(query_start_loc)
+    slots = np.asarray(state_indices)
+    s_lens = np.asarray(seq_lens)
+
+    for s in range(num_valid_seqs):
+        q_start = int(qsl[s])
+        q_end = int(qsl[s + 1])
+        q_len = q_end - q_start
+        if q_len <= 0:
+            continue
+        slot = int(slots[s])
+        has_init = (int(s_lens[s]) - q_len) > 0
+        h = (
+            jnp.asarray(expected_rec[slot], dtype=jnp.float32)
+            if has_init
+            else jnp.zeros((num_heads, head_dim, d_state), dtype=jnp.float32)
+        )
+        for t in range(q_start, q_end):
+            row = j_projected_states[t]
+            xbc = row[tped_intermediate_size : tped_intermediate_size + tped_conv_size]
+            if has_silu_activation:
+                xbc = jax.nn.silu(xbc)
+            dt_t = jax.nn.softplus(
+                row[tped_intermediate_size + tped_conv_size :].astype(jnp.float32)
+                + j_dt_bias.astype(jnp.float32)
+            )
+            dA_t = jnp.exp(dt_t * j_A.astype(jnp.float32))
+            x_t = xbc[:tped_intermediate_size].reshape(num_heads, head_dim)
+            b_t = jnp.repeat(
+                xbc[
+                    tped_intermediate_size : tped_intermediate_size + local_groups_ssm
+                ].reshape(n_groups, d_state),
+                group_repeat,
+                axis=0,
+            )
+            c_t = jnp.repeat(
+                xbc[tped_intermediate_size + local_groups_ssm :].reshape(
+                    n_groups, d_state
+                ),
+                group_repeat,
+                axis=0,
+            )
+            x_f32 = x_t.astype(jnp.float32)
+            h = (
+                h * dA_t[:, None, None]
+                + (x_f32 * dt_t[:, None])[:, :, None]
+                * b_t.astype(jnp.float32)[:, None, :]
+            )
+            y_t = (
+                jnp.einsum(
+                    "hdn,hn->hd",
+                    h,
+                    c_t.astype(jnp.float32),
+                    precision=jax.lax.Precision.HIGHEST,
+                )
+                + x_f32 * j_D.astype(jnp.float32)[:, None]
+            ).reshape(-1)
+            expected_y[t] = np.asarray(y_t, dtype=np.float32)
+        expected_rec[slot] = np.asarray(h, dtype=np.float32)
+
+    return expected_y, expected_rec
+
+
+_MAMBA_INIT_KWARGS = {
+    "hidden_size": 512,
+    "ssm_state_size": 64,
+    "conv_kernel_size": 4,
+    "intermediate_size": 1024,
+    "use_conv_bias": True,
+    "use_bias": False,
+}
+
+
 class TestVllmMambaMixer2:
     def test_init_builds_mamba_op(self):
         mock_op = MagicMock()
+
+        def _super_init(self_obj, *args, **kwargs):
+            _fake_mamba_super_init(self_obj)
+
         with (
             set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
             patch(
                 "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op."
                 "MambaMixer2.__init__",
-                return_value=None,
+                side_effect=_super_init,
+                autospec=True,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op."
+                "is_conv_state_dim_first",
+                return_value=False,
             ),
             patch.object(
                 VllmMambaMixer2, "_build_mamba_op", return_value=mock_op
             ) as mock_build,
         ):
-            layer = VllmMambaMixer2()
+            layer = VllmMambaMixer2(**_MAMBA_INIT_KWARGS)
 
         mock_build.assert_called_once_with()
         assert layer.mamba_op is mock_op
@@ -115,17 +244,20 @@ class TestVllmMambaMixer2:
     def test_init_rejects_prefix_caching(
         self, enable_prefix_caching: bool, mamba_cache_mode: str
     ):
-        def _fake_super_init(self_obj, *args, **kwargs):
-            self_obj.cache_config = SimpleNamespace(
-                enable_prefix_caching=enable_prefix_caching,
-                mamba_cache_mode=mamba_cache_mode,
+        def _super_init(self_obj, *args, **kwargs):
+            _fake_mamba_super_init(
+                self_obj,
+                cache_config=SimpleNamespace(
+                    enable_prefix_caching=enable_prefix_caching,
+                    mamba_cache_mode=mamba_cache_mode,
+                ),
             )
 
         with (
             patch(
                 "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op."
                 "MambaMixer2.__init__",
-                side_effect=_fake_super_init,
+                side_effect=_super_init,
                 autospec=True,
             ),
             pytest.raises(
@@ -133,14 +265,117 @@ class TestVllmMambaMixer2:
                 match="Prefix caching is not yet supported for MambaMixer2",
             ),
         ):
-            VllmMambaMixer2(
-                hidden_size=512,
-                ssm_state_size=64,
-                conv_kernel_size=4,
-                intermediate_size=1024,
-                use_conv_bias=True,
-                use_bias=False,
-            )
+            VllmMambaMixer2(**_MAMBA_INIT_KWARGS)
+
+    def test_init_rejects_speculative_decoding(self):
+        def _super_init(self_obj, *args, **kwargs):
+            _fake_mamba_super_init(self_obj, num_spec=3)
+
+        with (
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op."
+                "MambaMixer2.__init__",
+                side_effect=_super_init,
+                autospec=True,
+            ),
+            pytest.raises(
+                NotImplementedError,
+                match="Speculative decoding is not yet supported for MambaMixer2",
+            ),
+        ):
+            VllmMambaMixer2(**_MAMBA_INIT_KWARGS)
+
+    def test_init_rejects_replayssm(self):
+        def _super_init(self_obj, *args, **kwargs):
+            _fake_mamba_super_init(self_obj, use_replayssm=True)
+
+        with (
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op."
+                "MambaMixer2.__init__",
+                side_effect=_super_init,
+                autospec=True,
+            ),
+            pytest.raises(
+                NotImplementedError,
+                match="--use-replayssm is not supported for MambaMixer2",
+            ),
+        ):
+            VllmMambaMixer2(**_MAMBA_INIT_KWARGS)
+
+    def test_init_rejects_dim_first_conv_state_layout(self):
+        def _super_init(self_obj, *args, **kwargs):
+            _fake_mamba_super_init(self_obj)
+
+        with (
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op."
+                "MambaMixer2.__init__",
+                side_effect=_super_init,
+                autospec=True,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op."
+                "is_conv_state_dim_first",
+                return_value=True,
+            ),
+            pytest.raises(
+                NotImplementedError,
+                match="VLLM_SSM_CONV_STATE_LAYOUT=DS is not supported",
+            ),
+        ):
+            VllmMambaMixer2(**_MAMBA_INIT_KWARGS)
+
+    def test_init_rejects_unsupported_activation(self):
+        def _super_init(self_obj, *args, **kwargs):
+            _fake_mamba_super_init(self_obj, activation="gelu")
+
+        with (
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op."
+                "MambaMixer2.__init__",
+                side_effect=_super_init,
+                autospec=True,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op."
+                "is_conv_state_dim_first",
+                return_value=False,
+            ),
+            pytest.raises(
+                NotImplementedError,
+                match="Unsupported MambaMixer2 activation 'gelu'",
+            ),
+        ):
+            VllmMambaMixer2(**_MAMBA_INIT_KWARGS)
+
+    @pytest.mark.parametrize(
+        ("activation", "expected_has_silu"),
+        [
+            (None, False),
+            ("silu", True),
+            ("swish", True),
+        ],
+    )
+    def test_build_mamba_op_wires_activation_chunk_size_and_interpret(
+        self, activation: str | None, expected_has_silu: bool
+    ):
+        layer = _granite_mamba_layer("model.layers.0.mamba", activation=activation)
+        fake_jax_op = MagicMock()
+
+        with (
+            set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op.pallas.jax_op",
+                return_value=fake_jax_op,
+            ) as mock_jax_op,
+        ):
+            layer._build_mamba_op(interpret=True)
+
+        wrapped_fn = mock_jax_op.call_args.args[1]
+        assert wrapped_fn.keywords["has_silu_activation"] is expected_has_silu
+        assert wrapped_fn.keywords["chunk_size"] == _DEFAULT_CHUNK_SIZE
+        assert wrapped_fn.keywords["interpret"] is True
 
     def test_build_mamba_op_registers_pallas_jax_op_and_fake(self):
         layer0 = _granite_mamba_layer("model.layers.0.mamba")
@@ -167,6 +402,7 @@ class TestVllmMambaMixer2:
             == "pallas::mamba_mixer2_model_layers_1_mamba"
         )
         assert mock_jax_op.call_args_list[0].kwargs["donate_argnums"] == (1, 2)
+        assert mock_jax_op.call_args_list[0].args[1].keywords["interpret"] is False
         assert fake_jax_op.register_fake.call_count == 2
 
         fake_fn = fake_jax_op.register_fake.call_args_list[0].args[0]
@@ -241,7 +477,7 @@ class TestVllmMambaMixer2:
                 return_value=fake_jax_op,
             ),
         ):
-            layer.mamba_op = layer._build_mamba_op()
+            layer.mamba_op = layer._build_mamba_op(interpret=True)
 
             total_proj_dim = (
                 layer.tped_intermediate_size + layer.tped_conv_size + layer.tped_dt_size
@@ -344,6 +580,7 @@ class TestVllmMambaMixer2:
                 chunk_size=chunk_size,
                 rms_norm_eps=1e-5,
                 apply_rms_norm=True,
+                interpret=True,
             )
 
         assert new_conv.shape == conv_state.shape
@@ -356,8 +593,6 @@ class TestVllmMambaMixer2:
 
     def test_strided_ldst_load_and_store_roundtrip(self):
         from vllm_torchtpu.kernels.causal_conv1d import strided_ldst
-
-        assert hasattr(strided_ldst, "store_compact_to_large")
 
         class _FakeVmemRef:
             def __init__(self, arr: np.ndarray):
@@ -459,6 +694,7 @@ class TestVllmMambaMixer2:
                 chunk_size=chunk_size,
                 apply_rms_norm=False,
                 has_silu_activation=True,
+                interpret=True,
             )
             _, y_without_silu = run_jax_mamba_mixer(
                 j_projected_states,
@@ -486,11 +722,29 @@ class TestVllmMambaMixer2:
                 chunk_size=chunk_size,
                 apply_rms_norm=False,
                 has_silu_activation=False,
+                interpret=True,
             )
 
         assert not jnp.allclose(y_with_silu, y_without_silu)
 
-    def test_multi_seq_decode_initial_states_and_padded_state_indices(self):
+    @pytest.mark.parametrize("proj_dtype", [jnp.float32, jnp.bfloat16])
+    @pytest.mark.parametrize(
+        ("num_tokens", "max_seqs", "active_seqs", "chunk_size"),
+        [
+            (4, 4, 2, 8),  # active_seqs < max_seqs, inactive slots alias slot 0
+            (16, 8, 8, 64),  # num_tokens > max_seqs (compile-bucket padding)
+            (4, 8, 3, 64),  # num_tokens < max_seqs
+            (4, 4, 0, 8),  # R == 0 idle DP dummy batch
+        ],
+    )
+    def test_multi_seq_decode_initial_states_and_padded_state_indices(
+        self,
+        proj_dtype,
+        num_tokens: int,
+        max_seqs: int,
+        active_seqs: int,
+        chunk_size: int,
+    ):
         devices = np.asarray(jax.devices()[:1]).reshape((1,))
         mesh = Mesh(devices, axis_names=("model",))
 
@@ -499,62 +753,93 @@ class TestVllmMambaMixer2:
         n_groups = 1
         d_state = 8
         kernel_size = 4
+        num_slots = max_seqs + 2
         tped_intermediate_size = num_heads * head_dim
         tped_conv_size = tped_intermediate_size + 2 * n_groups * d_state
         tped_dt_size = num_heads
 
-        # Case 1: 2 active decode sequences in a 4-seq/4-token batch with chunk_size=8,
-        # where inactive seqs 2 and 3 have state_indices == 0 aliasing active slot 0.
-        # Case 2: 8 active decode sequences in a 16-token batch with chunk_size=64
-        # (num_tokens < chunk_size).
-        for num_tokens, max_seqs, active_seqs, chunk_size in [
-            (4, 4, 2, 8),
-            (16, 8, 8, 64),
-        ]:
-            rng = jax.random.key(7 + chunk_size)
-            k1, k2 = jax.random.split(rng)
-            j_projected_states = jax.random.normal(
-                k1,
-                (num_tokens, tped_intermediate_size + tped_conv_size + tped_dt_size),
-                dtype=jnp.float32,
-            )
-            conv_state = jnp.zeros(
-                (max_seqs, kernel_size - 1, tped_conv_size), dtype=jnp.float32
-            )
-            recurrent_state = jax.random.normal(
-                k2, (max_seqs, num_heads, head_dim, d_state), dtype=jnp.float32
-            )
-            j_conv_weight = jnp.ones(
-                (tped_conv_size, 1, kernel_size), dtype=jnp.float32
-            )
-            j_A = -jnp.ones((num_heads,), dtype=jnp.float32)
-            j_D = jnp.ones((num_heads,), dtype=jnp.float32)
-            j_dt_bias = jnp.array([0.5, -0.3], dtype=jnp.float32)
+        rng = jax.random.key(7 + chunk_size + active_seqs + num_tokens)
+        k1, k2 = jax.random.split(rng)
+        j_projected_states = jax.random.normal(
+            k1,
+            (num_tokens, tped_intermediate_size + tped_conv_size + tped_dt_size),
+            dtype=proj_dtype,
+        )
+        conv_state = jnp.zeros(
+            (num_slots, kernel_size - 1, tped_conv_size), dtype=jnp.float32
+        )
+        recurrent_state = jax.random.normal(
+            k2, (num_slots, num_heads, head_dim, d_state), dtype=jnp.float32
+        )
+        recurrent_orig = np.array(recurrent_state, copy=True)
+        j_conv_weight = jnp.ones((tped_conv_size, 1, kernel_size), dtype=jnp.float32)
+        j_A = -jnp.ones((num_heads,), dtype=jnp.float32)
+        j_D = jnp.ones((num_heads,), dtype=jnp.float32)
+        j_dt_bias = jnp.array([0.5, -0.3], dtype=jnp.float32)
 
-            state_indices = jnp.array(
-                [s if s < active_seqs else 0 for s in range(max_seqs)],
-                dtype=jnp.int32,
-            )
-            query_start_loc = jnp.array(
-                [min(s, active_seqs) for s in range(max_seqs + 1)],
-                dtype=jnp.int32,
-            )
-            distribution = jnp.array(
-                [active_seqs, active_seqs, active_seqs], dtype=jnp.int32
-            )
-            seq_lens = jnp.array(
-                [5 + s if s < active_seqs else 0 for s in range(max_seqs)],
-                dtype=jnp.int32,
-            )
+        # Inactive sequences alias slot 0 or carry -1 sentinels.
+        state_indices = jnp.array(
+            [
+                s + 1 if s < active_seqs else (0 if s % 2 == 0 else -1)
+                for s in range(max_seqs)
+            ],
+            dtype=jnp.int32,
+        )
+        query_start_loc = jnp.array(
+            [min(s, active_seqs) for s in range(max_seqs + 1)],
+            dtype=jnp.int32,
+        )
+        distribution = jnp.array(
+            [active_seqs, active_seqs, active_seqs], dtype=jnp.int32
+        )
+        # Mix of continuation decode (seq_len > 1) and 1-token fresh prompt
+        # (seq_len == 1).
+        seq_lens = jnp.array(
+            [
+                (1 if s == 1 else 5 + s) if s < active_seqs else 0
+                for s in range(max_seqs)
+            ],
+            dtype=jnp.int32,
+        )
 
-            def _linear_conv1d(x, c_state, weight, bias, *args, **kwargs):
-                return x, c_state
+        def _linear_conv1d(x, c_state, weight, bias, *args, **kwargs):
+            return x, c_state
 
-            with patch(
-                "vllm_torchtpu.layers.core.mamba_mixer2.causal_conv1d.ragged_causal_conv1d",
-                side_effect=_linear_conv1d,
-            ):
-                (_, new_rec), y_out = run_jax_mamba_mixer(
+        with patch(
+            "vllm_torchtpu.layers.core.mamba_mixer2.causal_conv1d.ragged_causal_conv1d",
+            side_effect=_linear_conv1d,
+        ):
+            (_, new_rec), y_out = run_jax_mamba_mixer(
+                j_projected_states,
+                conv_state,
+                recurrent_state,
+                j_conv_weight,
+                None,
+                j_A,
+                j_D,
+                j_dt_bias,
+                None,
+                state_indices,
+                query_start_loc,
+                distribution,
+                seq_lens,
+                mesh=mesh,
+                tped_intermediate_size=tped_intermediate_size,
+                tped_conv_size=tped_conv_size,
+                tped_dt_size=tped_dt_size,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                n_groups=n_groups,
+                d_state=d_state,
+                kernel_size=kernel_size,
+                chunk_size=chunk_size,
+                apply_rms_norm=False,
+                has_silu_activation=True,
+                interpret=True,
+            )
+            if active_seqs > 0:
+                prefill_distribution = jnp.array([0, 0, active_seqs], dtype=jnp.int32)
+                (_, new_rec_prefill), y_prefill = run_jax_mamba_mixer(
                     j_projected_states,
                     conv_state,
                     recurrent_state,
@@ -566,7 +851,7 @@ class TestVllmMambaMixer2:
                     None,
                     state_indices,
                     query_start_loc,
-                    distribution,
+                    prefill_distribution,
                     seq_lens,
                     mesh=mesh,
                     tped_intermediate_size=tped_intermediate_size,
@@ -580,45 +865,65 @@ class TestVllmMambaMixer2:
                     chunk_size=chunk_size,
                     apply_rms_norm=False,
                     has_silu_activation=True,
+                    interpret=True,
                 )
 
-            assert y_out.shape == (num_tokens, tped_intermediate_size)
+        assert y_out.shape == (num_tokens, tped_intermediate_size)
+        assert y_out.dtype == proj_dtype
 
-            # Exact single-step recurrence reference for all active decode sequences:
-            for s in range(active_seqs):
-                row = j_projected_states[s]
-                xbc = jax.nn.silu(
-                    row[
-                        tped_intermediate_size : tped_intermediate_size + tped_conv_size
-                    ]
+        expected_y, expected_rec = _sequential_mamba2_reference(
+            j_projected_states,
+            recurrent_state,
+            j_A,
+            j_D,
+            j_dt_bias,
+            state_indices,
+            query_start_loc,
+            distribution,
+            seq_lens,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            n_groups=n_groups,
+            d_state=d_state,
+        )
+        tol = 2e-2 if proj_dtype == jnp.bfloat16 else 1e-4
+        if active_seqs > 0:
+            np.testing.assert_allclose(
+                np.asarray(y_out[:active_seqs].astype(jnp.float32)),
+                expected_y[:active_seqs],
+                rtol=tol,
+                atol=tol,
+            )
+            np.testing.assert_allclose(
+                np.asarray(y_out[:active_seqs].astype(jnp.float32)),
+                np.asarray(y_prefill[:active_seqs].astype(jnp.float32)),
+                rtol=tol,
+                atol=tol,
+            )
+            np.testing.assert_allclose(
+                np.asarray(new_rec),
+                np.asarray(new_rec_prefill),
+                rtol=tol,
+                atol=tol,
+            )
+        # Inactive / padded decode rows must be zero-masked.
+        np.testing.assert_array_equal(
+            np.asarray(y_out[active_seqs:].astype(jnp.float32)),
+            np.zeros((num_tokens - active_seqs, tped_intermediate_size)),
+        )
+        active_slots = {s + 1 for s in range(active_seqs)}
+        for slot in range(num_slots):
+            if slot in active_slots:
+                np.testing.assert_allclose(
+                    np.asarray(new_rec[slot]),
+                    expected_rec[slot],
+                    rtol=1e-4,
+                    atol=1e-4,
                 )
-                dt_val = jax.nn.softplus(
-                    row[tped_intermediate_size + tped_conv_size :] + j_dt_bias
+            else:
+                np.testing.assert_array_equal(
+                    np.asarray(new_rec[slot]), recurrent_orig[slot]
                 )
-                decay_val = jnp.exp(dt_val * j_A)
-                x_s = xbc[:tped_intermediate_size].reshape(num_heads, head_dim)
-                b_s = jnp.repeat(
-                    xbc[
-                        tped_intermediate_size : tped_intermediate_size + d_state
-                    ].reshape(1, d_state),
-                    num_heads,
-                    axis=0,
-                )
-                c_s = jnp.repeat(
-                    xbc[tped_intermediate_size + d_state :].reshape(1, d_state),
-                    num_heads,
-                    axis=0,
-                )
-                init_h = recurrent_state[s]
-                expected_h = (
-                    init_h * decay_val[:, None, None]
-                    + (x_s * dt_val[:, None])[:, :, None] * b_s[:, None, :]
-                )
-                expected_y = (
-                    jnp.einsum("hdn,hn->hd", expected_h, c_s) + x_s * j_D[:, None]
-                ).reshape(-1)
-                np.testing.assert_allclose(new_rec[s], expected_h, rtol=1e-4, atol=1e-4)
-                np.testing.assert_allclose(y_out[s], expected_y, rtol=1e-4, atol=1e-4)
 
     def test_prefill_multi_step_dt_discretization_and_unscaled_d_skip(self):
         devices = np.asarray(jax.devices()[:1]).reshape((1,))
@@ -691,45 +996,137 @@ class TestVllmMambaMixer2:
                 chunk_size=chunk_size,
                 apply_rms_norm=False,
                 has_silu_activation=True,
+                interpret=True,
             )
 
-        # Sequential step-by-step discrete recurrence reference:
-        # h_t = exp(dt_t * A) * h_{t-1} + (dt_t * x_t) @ B_t^T
-        # y_t = h_t @ C_t + D * x_t
-        h = jnp.zeros((num_heads, head_dim, d_state), dtype=jnp.float32)
-        expected_ys = []
-        for t in range(num_tokens):
-            row = j_projected_states[t]
-            xbc = jax.nn.silu(
-                row[tped_intermediate_size : tped_intermediate_size + tped_conv_size]
-            )
-            dt_t = jax.nn.softplus(
-                row[tped_intermediate_size + tped_conv_size :] + j_dt_bias
-            )
-            dA_t = jnp.exp(dt_t * j_A)
-            x_t = xbc[:tped_intermediate_size].reshape(num_heads, head_dim)
-            b_t = jnp.repeat(
-                xbc[tped_intermediate_size : tped_intermediate_size + d_state].reshape(
-                    1, d_state
-                ),
-                num_heads,
-                axis=0,
-            )
-            c_t = jnp.repeat(
-                xbc[tped_intermediate_size + d_state :].reshape(1, d_state),
-                num_heads,
-                axis=0,
-            )
-            h = (
-                h * dA_t[:, None, None]
-                + (x_t * dt_t[:, None])[:, :, None] * b_t[:, None, :]
-            )
-            y_t = (jnp.einsum("hdn,hn->hd", h, c_t) + x_t * j_D[:, None]).reshape(-1)
-            expected_ys.append(y_t)
+        expected_y, expected_rec = _sequential_mamba2_reference(
+            j_projected_states,
+            recurrent_state,
+            j_A,
+            j_D,
+            j_dt_bias,
+            state_indices,
+            query_start_loc,
+            distribution,
+            seq_lens,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            n_groups=n_groups,
+            d_state=d_state,
+        )
+        np.testing.assert_allclose(new_rec[0], expected_rec[0], rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(y_out, expected_y, rtol=1e-4, atol=1e-4)
 
-        expected_y_all = jnp.stack(expected_ys, axis=0)
-        np.testing.assert_allclose(new_rec[0], h, rtol=1e-4, atol=1e-4)
-        np.testing.assert_allclose(y_out, expected_y_all, rtol=1e-4, atol=1e-4)
+    def test_ragged_mixed_batch_matches_sequential_reference(self):
+        devices = np.asarray(jax.devices()[:1]).reshape((1,))
+        mesh = Mesh(devices, axis_names=("model",))
+
+        # 2 decodes (len 1 w/ init, len 1 w/o init) + 2 non-multiple prefills
+        # (len 11 continuation w/ init across 2 chunks, len 5 fresh w/o init)
+        # = 18 valid tokens inside a 24-token padded batch, chunk_size = 8.
+        num_tokens = 24
+        num_slots = 8
+        num_heads = 4
+        head_dim = 8
+        n_groups = 2
+        d_state = 8
+        kernel_size = 4
+        chunk_size = 8
+        tped_intermediate_size = num_heads * head_dim
+        tped_conv_size = tped_intermediate_size + 2 * n_groups * d_state
+        tped_dt_size = num_heads
+
+        rng = jax.random.key(987)
+        k1, k2 = jax.random.split(rng)
+        j_projected_states = jax.random.normal(
+            k1,
+            (num_tokens, tped_intermediate_size + tped_conv_size + tped_dt_size),
+            dtype=jnp.float32,
+        )
+        conv_state = jnp.zeros(
+            (num_slots, kernel_size - 1, tped_conv_size), dtype=jnp.float32
+        )
+        recurrent_state = jax.random.normal(
+            k2, (num_slots, num_heads, head_dim, d_state), dtype=jnp.float32
+        )
+        recurrent_orig = np.array(recurrent_state, copy=True)
+
+        j_conv_weight = jnp.ones((tped_conv_size, 1, kernel_size), dtype=jnp.float32)
+        j_A = jnp.array([-0.4, -0.9, -1.2, -0.6], dtype=jnp.float32)
+        j_D = jnp.array([1.5, -0.8, 0.3, 2.0], dtype=jnp.float32)
+        j_dt_bias = jnp.array([0.4, -0.2, 0.7, -0.5], dtype=jnp.float32)
+
+        # Active slots {3, 1, 5, 2}; inactive entries alias slot 3 and sentinel -1.
+        state_indices = jnp.array([3, 1, 5, 2, 3, -1], dtype=jnp.int32)
+        query_start_loc = jnp.array([0, 1, 2, 13, 18, 18, 18], dtype=jnp.int32)
+        distribution = jnp.array([2, 2, 4], dtype=jnp.int32)
+        seq_lens = jnp.array([9, 1, 19, 5, 0, 0], dtype=jnp.int32)
+
+        def _linear_conv1d(x, c_state, weight, bias, *args, **kwargs):
+            return x, c_state
+
+        with patch(
+            "vllm_torchtpu.layers.core.mamba_mixer2.causal_conv1d.ragged_causal_conv1d",
+            side_effect=_linear_conv1d,
+        ):
+            (_, new_rec), y_out = run_jax_mamba_mixer(
+                j_projected_states,
+                conv_state,
+                recurrent_state,
+                j_conv_weight,
+                None,
+                j_A,
+                j_D,
+                j_dt_bias,
+                None,
+                state_indices,
+                query_start_loc,
+                distribution,
+                seq_lens,
+                mesh=mesh,
+                tped_intermediate_size=tped_intermediate_size,
+                tped_conv_size=tped_conv_size,
+                tped_dt_size=tped_dt_size,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                n_groups=n_groups,
+                d_state=d_state,
+                kernel_size=kernel_size,
+                chunk_size=chunk_size,
+                apply_rms_norm=False,
+                has_silu_activation=True,
+                interpret=True,
+            )
+
+        expected_y, expected_rec = _sequential_mamba2_reference(
+            j_projected_states,
+            recurrent_state,
+            j_A,
+            j_D,
+            j_dt_bias,
+            state_indices,
+            query_start_loc,
+            distribution,
+            seq_lens,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            n_groups=n_groups,
+            d_state=d_state,
+        )
+        np.testing.assert_allclose(
+            np.asarray(y_out[:18]), expected_y[:18], rtol=1e-4, atol=1e-4
+        )
+        for slot in (3, 1, 5, 2):
+            np.testing.assert_allclose(
+                np.asarray(new_rec[slot]),
+                expected_rec[slot],
+                rtol=1e-4,
+                atol=1e-4,
+            )
+        for untouched in (0, 4, 6, 7):
+            np.testing.assert_array_equal(
+                np.asarray(new_rec[untouched]), recurrent_orig[untouched]
+            )
 
     def test_bfloat16_output_dtype_and_2d_conv_weight(self):
         devices = np.asarray(jax.devices()[:1]).reshape((1,))
@@ -802,6 +1199,7 @@ class TestVllmMambaMixer2:
                     kernel_size=kernel_size,
                     chunk_size=chunk_size,
                     apply_rms_norm=apply_rms_norm,
+                    interpret=True,
                 )
                 assert y_out.dtype == jnp.bfloat16
 
@@ -883,142 +1281,3 @@ class TestVllmMambaMixer2:
         layer_tp2_replicated = _granite_mamba_layer(tp_size=2, n_groups=2)
         layer_tp2_replicated.norm.n_groups = 1
         assert layer_tp2_replicated._use_fused_jax_rms_norm() is False
-
-    def test_mamba_mixer2_core_tpu_updates_only_widened_conv_state_prefix(self):
-        kernel_size = 4
-        conv_state = jnp.arange(2 * kernel_size * 3, dtype=jnp.float32).reshape(
-            2, kernel_size, 3
-        )
-        rec_state = jnp.zeros((2, 1, 2, 2), dtype=jnp.float32)
-        out = jnp.zeros((4, 2), dtype=jnp.float32)
-
-        def _fake_run_jax_mamba_mixer(_proj, c_state_in, r_state, *args, **kwargs):
-            return (c_state_in + 10.0, r_state), out
-
-        with patch(
-            "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer2_op.run_jax_mamba_mixer",
-            side_effect=_fake_run_jax_mamba_mixer,
-        ) as mock_run:
-            new_conv, _, _ = mamba_mixer2_core_tpu(
-                jnp.zeros((4, 6), dtype=jnp.float32),
-                conv_state,
-                rec_state,
-                jnp.zeros((3, 1, kernel_size), dtype=jnp.float32),
-                None,
-                -jnp.ones((1,), dtype=jnp.float32),
-                jnp.ones((1,), dtype=jnp.float32),
-                jnp.zeros((1,), dtype=jnp.float32),
-                None,
-                jnp.array([0, 1], dtype=jnp.int32),
-                jnp.array([0, 2, 4], dtype=jnp.int32),
-                jnp.array([0, 2, 2], dtype=jnp.int32),
-                jnp.array([2, 2], dtype=jnp.int32),
-                mesh=_mesh(),
-                tped_intermediate_size=2,
-                tped_conv_size=3,
-                tped_dt_size=1,
-                num_heads=1,
-                head_dim=2,
-                n_groups=1,
-                d_state=2,
-                kernel_size=kernel_size,
-                chunk_size=4,
-                rms_norm_eps=1e-5,
-                apply_rms_norm=False,
-            )
-
-        kernel_conv_state = mock_run.call_args.args[1]
-        assert kernel_conv_state.shape == (2, kernel_size - 1, 3)
-        np.testing.assert_array_equal(
-            np.asarray(kernel_conv_state), np.asarray(conv_state[:, :-1, :])
-        )
-        np.testing.assert_array_equal(
-            np.asarray(new_conv[:, :-1, :]), np.asarray(conv_state[:, :-1, :] + 10.0)
-        )
-        np.testing.assert_array_equal(
-            np.asarray(new_conv[:, -1:, :]), np.asarray(conv_state[:, -1:, :])
-        )
-
-    def test_ssd_minimal_discrete_hybrid_matches_jax_reference(self):
-        batch, seqlen, block_len, n_heads, d_head, d_state = 2, 16, 4, 4, 8, 8
-        n_chunks_per_seq = seqlen // block_len
-        n_chunks = batch * n_chunks_per_seq
-
-        rng = jax.random.key(42)
-        k1, k2, k3, k4, k5 = jax.random.split(rng, 5)
-
-        X_c = jax.random.normal(k1, (n_chunks, n_heads, block_len, d_head))
-        A_c = -jnp.exp(jax.random.normal(k2, (n_chunks, n_heads, block_len)))
-        B_c = jax.random.normal(k3, (n_chunks, n_heads, block_len, d_state))
-        C_c = jax.random.normal(k4, (n_chunks, n_heads, block_len, d_state))
-        init_states_per_batch = jax.random.normal(k5, (batch, n_heads, d_head, d_state))
-
-        initial_states = jnp.zeros((n_chunks, n_heads, d_head, d_state))
-        reset_mask = np.zeros((n_chunks,), dtype=bool)
-        for b in range(batch):
-            initial_states = initial_states.at[b * n_chunks_per_seq].set(
-                init_states_per_batch[b]
-            )
-            reset_mask[b * n_chunks_per_seq] = True
-        reset_mask = jnp.array(reset_mask)
-        last_chunk_indices = jnp.array(
-            [b * n_chunks_per_seq + n_chunks_per_seq - 1 for b in range(batch)],
-            dtype=jnp.int32,
-        )
-
-        # Reference math
-        A_cumsum = jnp.cumsum(A_c, axis=-1)
-        L = jnp.exp(_segsum_jax(A_c))
-        Y_diag = jnp.einsum(
-            "chln,chsn,chls,chsp->chlp",
-            C_c,
-            B_c,
-            L,
-            X_c,
-            precision=jax.lax.Precision.HIGHEST,
-        )
-        decay_states = jnp.exp(A_cumsum[..., -1:] - A_cumsum)
-        states_c_ref = jnp.einsum(
-            "chln,chlp,chl->chpn",
-            B_c,
-            X_c,
-            decay_states,
-            precision=jax.lax.Precision.HIGHEST,
-        )
-        decay_chunk = jnp.exp(A_cumsum[..., -1])
-
-        def scan_body(carry, args):
-            s_c, d_c, init_s, r_c = args
-            inc = jnp.where(r_c, init_s, carry)
-            nxt = inc * d_c[:, None, None] + s_c
-            return nxt, (inc, nxt)
-
-        _, (states_inc_ref, states_out_ref) = jax.lax.scan(
-            scan_body,
-            jnp.zeros((n_heads, d_head, d_state), dtype=X_c.dtype),
-            (states_c_ref, decay_chunk, initial_states, reset_mask),
-        )
-        Y_off = jnp.einsum(
-            "chln,chpn,chl->chlp",
-            C_c,
-            states_inc_ref,
-            jnp.exp(A_cumsum),
-            precision=jax.lax.Precision.HIGHEST,
-        )
-        y_ref = Y_diag + Y_off
-        final_state_ref = states_out_ref[last_chunk_indices]
-
-        y_hybrid, final_state_hybrid = ssd_minimal_discrete_hybrid(
-            X_c,
-            A_c,
-            B_c,
-            C_c,
-            last_chunk_indices,
-            initial_states,
-            reset_mask,
-        )
-
-        np.testing.assert_allclose(y_hybrid, y_ref, rtol=1e-4, atol=1e-4)
-        np.testing.assert_allclose(
-            final_state_hybrid, final_state_ref, rtol=1e-4, atol=1e-4
-        )

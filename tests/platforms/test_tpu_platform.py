@@ -284,6 +284,7 @@ class TestTpuPlatform:
         vllm_config.model_config = MagicMock(spec=ModelConfig)
         vllm_config.model_config.dtype = torch.bfloat16
         vllm_config.model_config.is_hybrid = False
+        vllm_config.model_config.is_attention_free = False
         vllm_config.model_config.hf_config = None
         vllm_config.cache_config = CacheConfig()
         vllm_config.cache_config.block_size = None

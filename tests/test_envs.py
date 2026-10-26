@@ -34,6 +34,7 @@ def vllm_config():
     config = MagicMock(spec=VllmConfig)
     config.additional_config = {}
     config.model_config.is_hybrid = False
+    config.model_config.is_attention_free = False
     config.cache_config = CacheConfig(enable_prefix_caching=False)
     config.compilation_config.compile_sizes = [16, 32]
     # Budget within the largest compile size, which the platform requires.

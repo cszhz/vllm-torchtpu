@@ -394,9 +394,11 @@ def preprocess_metadata(
     # Map batch index to sequence index.
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     seqs = jnp.arange(max_seqs)
+    safe_state_indices = jnp.where(seqs < num_seqs, state_indices, 0)
     b_idx_to_s_idx = jnp.repeat(seqs, query_lens, total_repeat_length=cfgs.batch_size)
     b_idx_query_start_loc = query_start_loc[b_idx_to_s_idx]
     all_b_idx = jnp.arange(cfgs.batch_size)
+    valid_b = all_b_idx < num_tokens
     b_idx_query_len = 1 + all_b_idx - b_idx_query_start_loc
 
     # Compute number of rows that needs to be fetched from conv_state (old) and
@@ -404,9 +406,12 @@ def preprocess_metadata(
     b_idx_to_sz_from_new = jnp.minimum(b_idx_query_len, cfgs.kernel_size)
     b_idx_to_sz_from_old = cfgs.kernel_size - b_idx_to_sz_from_new
     b_idx_to_sz_from_old = jnp.minimum(b_idx_to_sz_from_old, cfgs.prev_kernel_size)
+    b_idx_to_sz_from_old = jnp.where(valid_b, b_idx_to_sz_from_old, 0)
 
     # Determine which row needs to write its conv_state to HBM.
-    b_idx_should_write = all_b_idx == (query_start_loc[b_idx_to_s_idx + 1] - 1)
+    b_idx_should_write = valid_b & (
+        all_b_idx == (query_start_loc[b_idx_to_s_idx + 1] - 1)
+    )
     b_idx_should_write = b_idx_should_write.astype(jnp.int32)
 
     return MetadataRef(
@@ -414,9 +419,73 @@ def preprocess_metadata(
         b_idx_to_s_idx=b_idx_to_s_idx,
         b_idx_to_sz_from_old=b_idx_to_sz_from_old,
         b_idx_should_write=b_idx_should_write,
-        s_idx_to_state_idx=state_indices,
+        s_idx_to_state_idx=safe_state_indices,
         s_idx_has_initial_state=has_initial_state,
     )
+
+
+def _estimate_conv1d_vmem_bytes(
+    *,
+    tile_size: int,
+    dim: int,
+    kernel_size: int,
+    x_itemsize: int,
+    has_bias: bool,
+) -> int:
+    """Estimates peak VMEM footprint (scratches + VMEM weights + live tiles)."""
+    aligned_dim = pl.cdiv(dim, 128) * 128
+    prev_k = kernel_size - 1
+    x_scratch = 2 * tile_size * aligned_dim * x_itemsize
+    conv_state_scratch = 2 * tile_size * prev_k * aligned_dim * 4
+    prev_x_scratch = prev_k * aligned_dim * 4
+    rhs_vmem = (kernel_size + (1 if has_bias else 0)) * aligned_dim * 4
+    live_vregs = (2 * tile_size + prev_k) * aligned_dim * 4
+    return x_scratch + conv_state_scratch + prev_x_scratch + rhs_vmem + live_vregs
+
+
+def _select_conv1d_tile_size_and_vmem_limit(
+    *,
+    batch_size: int,
+    dim: int,
+    kernel_size: int,
+    requested_tile_size: int,
+    sublane_tiling: int,
+    x_itemsize: int,
+    has_bias: bool,
+    vmem_capacity_bytes: int,
+) -> tuple[int, int]:
+    """Selects a sublane-aligned `tile_size` and 90% `vmem_limit_bytes`."""
+    if requested_tile_size <= 0:
+        raise ValueError(f"Expected tile_size > 0, got {requested_tile_size}.")
+    if requested_tile_size % sublane_tiling != 0:
+        raise ValueError(
+            f"Expected tile_size ({requested_tile_size}) to be divisible by "
+            f"sublane_tiling ({sublane_tiling})."
+        )
+    vmem_limit_bytes = int(0.90 * vmem_capacity_bytes)
+    vmem_budget_bytes = int(0.80 * vmem_capacity_bytes)
+    padded_tokens = max(
+        pl.cdiv(batch_size, sublane_tiling) * sublane_tiling,
+        sublane_tiling,
+    )
+    tile_size = min(requested_tile_size, padded_tokens)
+    tile_size = max(sublane_tiling, (tile_size // sublane_tiling) * sublane_tiling)
+    while (
+        tile_size > sublane_tiling
+        and _estimate_conv1d_vmem_bytes(
+            tile_size=tile_size,
+            dim=dim,
+            kernel_size=kernel_size,
+            x_itemsize=x_itemsize,
+            has_bias=has_bias,
+        )
+        > vmem_budget_bytes
+    ):
+        tile_size = max(
+            sublane_tiling,
+            ((tile_size // 2) // sublane_tiling) * sublane_tiling,
+        )
+    return tile_size, vmem_limit_bytes
 
 
 @jax.jit(
@@ -427,14 +496,14 @@ def ragged_causal_conv1d(
     x: jax.Array,  # (batch_size, dim_size)
     conv_state: jax.Array,  # (max_num_seqs, kernel_size - 1, dim_size)
     conv_weight: jax.Array,  # (dim_size, 1, kernel_size)
-    conv_bias: jax.Array | None,  # (kernel_size,)
+    conv_bias: jax.Array | None,  # (dim_size,)
     query_start_loc: jax.Array,  # (max_num_seqs + 1,)
     state_indices: jax.Array,  # (max_num_seqs,)
     distribution: jax.Array,  # (3,)
     has_initial_state: jax.Array,  # (max_num_seqs,)
     *,
     kernel_size: int,
-    tile_size: int = 64,  # TODO(kyuyeunk): Add more robust tiling logic.
+    tile_size: int = 64,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform Conv1D where input is a ragged sequence.
 
@@ -456,24 +525,66 @@ def ragged_causal_conv1d(
         new_conv_state: Updated conv_state.
     """
 
-    # Step 1: Validate inputs.
+    # Step 1: Validate inputs (before querying TPU hardware info so invalid
+    # caller shapes fail deterministically on both CPU and TPU).
+    if x.ndim != 2:
+        raise ValueError(f"Expected 2D x (batch_size, dim), got {x.shape}.")
+    if jnp.dtype(x.dtype) not in (jnp.float32, jnp.bfloat16):
+        raise ValueError(f"Expected x.dtype in (float32, bfloat16), got {x.dtype}.")
+    if kernel_size < 2:
+        raise ValueError(f"Expected kernel_size >= 2, got {kernel_size}.")
+    if tile_size <= 0:
+        raise ValueError(f"Expected tile_size > 0, got {tile_size}.")
     num_seqs = state_indices.size
     batch_size, dim = x.shape
-    assert conv_state.shape == (conv_state.shape[0], kernel_size - 1, dim)
-    assert conv_weight.shape == (dim, 1, kernel_size)
-    if conv_bias is not None:
-        assert conv_bias.shape == (dim,)
-    assert query_start_loc.shape == (num_seqs + 1,)
-    assert state_indices.shape == (num_seqs,)
-    assert distribution.shape == (3,)
+    if conv_state.ndim != 3 or conv_state.shape[1:] != (kernel_size - 1, dim):
+        raise ValueError(
+            "Expected conv_state shape "
+            f"(num_slots, {kernel_size - 1}, {dim}), got {conv_state.shape}."
+        )
+    if conv_weight.shape != (dim, 1, kernel_size):
+        raise ValueError(
+            f"Expected conv_weight shape ({dim}, 1, {kernel_size}), "
+            f"got {conv_weight.shape}."
+        )
+    if conv_bias is not None and conv_bias.shape != (dim,):
+        raise ValueError(f"Expected conv_bias shape ({dim},), got {conv_bias.shape}.")
+    if query_start_loc.shape != (num_seqs + 1,):
+        raise ValueError(
+            f"Expected query_start_loc shape ({num_seqs + 1},), "
+            f"got {query_start_loc.shape}."
+        )
+    if state_indices.shape != (num_seqs,):
+        raise ValueError(
+            f"Expected state_indices shape ({num_seqs},), got {state_indices.shape}."
+        )
+    if has_initial_state.shape != (num_seqs,):
+        raise ValueError(
+            f"Expected has_initial_state shape ({num_seqs},), "
+            f"got {has_initial_state.shape}."
+        )
+    if distribution.shape != (3,):
+        raise ValueError(f"Expected distribution shape (3,), got {distribution.shape}.")
 
-    # Step 2: Input pre-processing.
+    # Step 2: Input pre-processing and VMEM-aware tile selection.
     x_dtype = x.dtype
-    sublane_tiling = pltpu.get_tpu_info().get_sublane_tiling(x_dtype)
-    padded_batch_size = pl.cdiv(batch_size, sublane_tiling) * sublane_tiling
-    tile_size = min(tile_size, padded_batch_size)
+    tpu_info = pltpu.get_tpu_info()
+    sublane_tiling = tpu_info.get_sublane_tiling(x_dtype)
+    tile_size, vmem_limit_bytes = _select_conv1d_tile_size_and_vmem_limit(
+        batch_size=batch_size,
+        dim=dim,
+        kernel_size=kernel_size,
+        requested_tile_size=tile_size,
+        sublane_tiling=sublane_tiling,
+        x_itemsize=jnp.dtype(x_dtype).itemsize,
+        has_bias=conv_bias is not None,
+        vmem_capacity_bytes=tpu_info.vmem_capacity_bytes,
+    )
     # TODO(kyuyeunk): Eliminate the need for padding by using dynamic sized DMA.
-    padded_batch_size = pl.cdiv(padded_batch_size, tile_size) * tile_size
+    padded_batch_size = max(
+        pl.cdiv(batch_size, tile_size) * tile_size,
+        tile_size,
+    )
     x = jnp.pad(x, ((0, padded_batch_size - batch_size), (0, 0)))
 
     # Step 3: States and weights pre-processing.
@@ -528,7 +639,10 @@ def ragged_causal_conv1d(
             pltpu.SemaphoreType.DMA((2,)),
         ),
         input_output_aliases={len(metadata): 0, len(metadata) + 1: 1},
-        compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True,
+            vmem_limit_bytes=vmem_limit_bytes,
+        ),
         name="ragged_causal_conv1d_kernel",
     )(metadata, x, conv_state, conv_rhs)
 
