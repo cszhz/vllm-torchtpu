@@ -150,6 +150,7 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_PAIRS: int = 0
     TPU_SMALL_COLLECTIVES_SKIP_DEVICE_BARRIER: bool = False
     MOE_FUSED_EP_V2_FOLD_ANY_DECODE: bool = False
+    TPU_DSV4_EP_MIXED_PLAN_KERNEL: bool = False
     MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS: int = 4
     TPU_FP8_LINEAR_PALLAS: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = ""
@@ -974,6 +975,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_SMALL_ALL_REDUCE_MAX_ROWS=32), not only where the Pallas restore is
     # in effect (t_local <= 4).
     "MOE_FUSED_EP_V2_FOLD_ANY_DECODE": env_bool("MOE_FUSED_EP_V2_FOLD_ANY_DECODE"),
+    # Mixed buckets (t_local > 16, sharded plan, quantized rows): build the
+    # fused-EP routing plan in one Pallas call (mixed_plan_kernel) instead of
+    # ~100 XLA ops and two SparseCore scatters. Same bits.
+    "TPU_DSV4_EP_MIXED_PLAN_KERNEL": env_bool("TPU_DSV4_EP_MIXED_PLAN_KERNEL"),
     # Largest local token count the one-shot Pallas EP gather takes (smallest
     # stays 2).
     "MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS": env_nonnegative_int(

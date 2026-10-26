@@ -263,7 +263,11 @@ def _mixed_plan_kernel(
     # C^T[t, k]: run k's pairs in tokens before t.
     pairs_all = ex_ref[:, 0:P]  # [ep, P]
     g_col = _iota((G, 1, 1), 0) + first
-    m = (pairs_all[None, :, :] == g_col).astype(jnp.bfloat16).reshape(E, P)
+    hit_gd = pairs_all[None, :, :] == g_col  # [G, ep, P]
+    if ep % 16 == 0:  # whole bf16 tiles: merge the leading dim in bf16
+        m = hit_gd.astype(jnp.bfloat16).reshape(E, P)
+    else:  # 8-row f32 tiles, then pack
+        m = hit_gd.astype(jnp.float32).reshape(E, P).astype(jnp.bfloat16)
     q = _bf16(_iota((t_local, P), 1) // topk == _iota((t_local, P), 0))
     s_t = lax.dot_general(q, m, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
     lower_t = _bf16(_iota((t_local, t_local), 1) < _iota((t_local, t_local), 0))
@@ -366,7 +370,7 @@ def mixed_plan_supported(*, e_total, ep, t_local, topk, shard_stride, tile_m, bl
     return (
         e_total % ep == 0
         and G % 8 == 0
-        and ep % 16 == 0
+        and ep % 8 == 0
         and e_total % HIDDEN_LANE_BLOCK == 0
         and t_local % 16 == 0
         and t_local <= 256

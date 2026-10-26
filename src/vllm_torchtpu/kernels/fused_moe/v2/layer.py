@@ -65,6 +65,10 @@ from vllm_torchtpu.kernels.fused_moe.v2.plan_kernel import (
     build_decode_plan,
     decode_plan_supported,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.mixed_plan_kernel import (
+    build_mixed_plan,
+    mixed_plan_supported,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import (
     pallas_select,
     pallas_select_routed,
@@ -362,6 +366,13 @@ SMALL_BATCH_LOCAL_TOKENS = 16
 # Outside these ranges the XLA collective is kept.
 PALLAS_RESTORE_MAX_LOCAL_TOKENS = 4
 ONESHOT_GATHER_LOCAL_TOKENS = (2, 4)
+
+
+def _mixed_plan_kernel_enabled():
+    """TPU_DSV4_EP_MIXED_PLAN_KERNEL: the mixed-bucket plan as one Pallas call."""
+    from vllm_torchtpu import envs
+
+    return bool(envs.TPU_DSV4_EP_MIXED_PLAN_KERNEL)
 
 
 def _oneshot_gather_max_local_tokens():
@@ -709,6 +720,21 @@ def fused_ep_moe_v2(
     if has_order_after and stage != "fused":
         raise ValueError('order_after is only taken by stage == "fused"')
     small_batch = t_local <= SMALL_BATCH_LOCAL_TOKENS and stage == "fused"
+    mixed_plan = (
+        _mixed_plan_kernel_enabled()
+        and sharded_plan
+        and t_local > SMALL_BATCH_LOCAL_TOKENS
+        and form.quantized_activations
+        and mixed_plan_supported(
+            e_total=e_total,
+            ep=ep,
+            t_local=t_local,
+            topk=topk,
+            shard_stride=ragged_stride,
+            tile_m=capacity,
+            block=block,
+        )
+    )
     # e4m3 rows only; see _gather_rows_with_meta.
     merge_exchange = (
         bool(merge_exchange)
@@ -952,6 +978,79 @@ def fused_ep_moe_v2(
         )
         return topk_weights, packed, local_blocks, block_hist, row_routes
 
+    def _compute_mixed(
+        q_g,
+        exchange,
+        topk_weights,
+        row_routes,
+        rank_l,
+        me,
+        w1_l,
+        w2_l,
+        w1s_l,
+        w2s_l,
+        bias_it,
+        out_dtype,
+        shared_l,
+    ):
+        """compute_local at a mixed bucket with the plan as one Pallas call.
+
+        mixed_plan_kernel.build_mixed_plan reads only the gathered exchange,
+        so it does not wait on the activation all-gather, and it scatters
+        nothing: the two SparseCore slab scatters -- and the barrier that
+        ordered them behind the activation all-gather on the same SparseCore
+        -- are gone, and the plan runs on the TensorCore while the gather is
+        in flight. Same operands, bit for bit.
+        """
+        plan = build_mixed_plan(
+            exchange,
+            me,
+            layout=layout,
+            e_total=e_total,
+            ep=ep,
+            t_local=t_local,
+            topk=topk,
+            block=block,
+            tile_m=capacity,
+            shard_stride=ragged_stride,
+        )
+        token_gather = plan.token_gather
+        if gather_positions is not None:
+            # As in compute_local: only the index into q_g moves. The window
+            # rows past the slab stay zero, as the incumbent pads after this.
+            tg = token_gather[:ragged_stride]
+            src = tg // t_local
+            tg = jnp.asarray(gather_positions, jnp.int32)[src] * t_local + (tg - src * t_local)
+            token_gather = jnp.concatenate([tg, token_gather[ragged_stride:]])
+        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
+        w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
+        w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
+        arrivals, arrival_scales = kfn(
+            (*plan.block_tables, plan.true_rows),
+            token_gather,
+            plan.expert_rows,
+            plan.slab_base,
+            q_g,
+            plan.scale_slab,
+            w1_l,
+            w2_l,
+            w1s_l,
+            w2s_l,
+            w1b_k,
+            w2b_k,
+            recv_rows=recv_rows,
+            visit=plan.visit,
+            counts=plan.counts,
+            rank=rank_l,
+        )
+        combined = _combine_arrivals(
+            arrivals, arrival_scales, plan.pos, plan.mirror_pos, topk_weights, out_dtype
+        )
+        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        if shared_l is None:
+            return token_layout.restore(combined, ax)
+        return _add_shared(combined, shared_l, me)
+
     def compute_local(
         q_g,
         exchange,
@@ -970,6 +1069,11 @@ def fused_ep_moe_v2(
     ):
         """Plan, kernel and combine over the gathered rows and payload."""
         me = rank_l[0, 0]
+        if mixed_plan:
+            return _compute_mixed(
+                q_g, exchange, topk_weights, row_routes, rank_l, me,
+                w1_l, w2_l, w1s_l, w2s_l, bias_it, out_dtype, shared_l,
+            )
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
         )
