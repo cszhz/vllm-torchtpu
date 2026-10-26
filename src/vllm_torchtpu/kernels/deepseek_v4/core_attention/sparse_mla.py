@@ -197,6 +197,8 @@ def _attention_swa_decode_kernel(
 # Prefill and mixed calls of more tokens than this read the rows of a
 # `DenseRefs` batch from the paged cache; decode-sized calls never do.
 DENSE_MIN_TOKENS = 256
+# Tokens of a `DenseRefs` batch per QK / PV matmul over its shared rows.
+DENSE_TOKENS_PER_MATMUL = 1
 
 
 class DenseRefs(NamedTuple):
@@ -673,11 +675,43 @@ def _attention_kernel(
         bkv_rope = dense.rope_vmem_ref.bitcast(jnp.bfloat16)[...]
         dense.kv_vmem_ref[...] = join_bkv(words, bkv_rope)
 
-    def load_dense_bkv(batch_idx):
+    def attend_from_cache(bi_sem_idx, bo_sem_idx, attention_sinks):
+        """`process`'s token loop for a `DenseRefs` batch: the tokens share
+        their rows, so each group of DENSE_TOKENS_PER_MATMUL tokens runs one
+        QK and one PV matmul over them, the rows loaded into the MXU once."""
+        build_dense_bkv(bi_sem_idx)
+        kv_lens = [kv_lens_ref[batch_start_seq_idx + b] for b in range(batch_size)]
         bkv = dense.kv_vmem_ref[...]
-        kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+        # Rows past every token's kv_len may decode to NaN and are zeroed; a
+        # row past only some tokens' kv_len is a finite row of the sequence,
+        # which their masked scores give probability 0.
         k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        return jnp.where(k_span < kv_len, bkv, 0)
+        bkv = jnp.where(k_span < functools.reduce(jnp.maximum, kv_lens), bkv, 0)
+        group = min(DENSE_TOKENS_PER_MATMUL, batch_size)
+        assert batch_size % group == 0
+        for first in range(0, batch_size, group):
+            tokens = range(first, first + group)
+            states = [load_swa_output(bi_sem_idx, b) for b in tokens]
+            swa_acc, swa_l, swa_m = (
+                jnp.concatenate([state[i] for state in states], axis=0)
+                for i in range(3)
+            )
+            p, exp_m_diff, l_total = flash_attention_step1_qk_softmax(
+                jnp.concatenate([load_bq(bi_sem_idx, b) for b in tokens], axis=0),
+                bkv,
+                jnp.concatenate(
+                    [jnp.full((num_q_heads, 1), kv_lens[b], jnp.int32) for b in tokens]
+                ),
+                swa_m,
+                swa_l,
+                jnp.concatenate([attention_sinks] * group, axis=0),
+                masked=True,
+            )
+            out = flash_attention_step2_pv(p, bkv, exp_m_diff, swa_acc, l_total)
+            for i, b in enumerate(tokens):
+                bo_x2_ref.at[bo_sem_idx, b][...] = out[
+                    i * num_q_heads : (i + 1) * num_q_heads
+                ]
 
     def run_swa_decode(bq_sem_idx):
         """Write the decode tokens' unnormalized SWA state where the HBM
@@ -774,13 +808,12 @@ def _attention_kernel(
             wait_send_bo_batch(bo_sem_idx)
 
         if from_cache:
-            build_dense_bkv(bi_sem_idx)
+            attend_from_cache(bi_sem_idx, bo_sem_idx, attention_sinks)
+            start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
+            return
 
         for batch_idx in range(batch_size):
-            if from_cache:
-                bkv = load_dense_bkv(batch_idx)
-            else:
-                bkv = load_bkv(bi_sem_idx, batch_idx, masked)
+            bkv = load_bkv(bi_sem_idx, batch_idx, masked)
             bq = load_bq(bi_sem_idx, batch_idx)
 
             swa_acc, swa_l, swa_m = load_swa_output(bi_sem_idx, batch_idx)
