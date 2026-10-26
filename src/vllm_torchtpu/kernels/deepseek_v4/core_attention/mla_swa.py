@@ -838,6 +838,22 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             if num_q_heads % 128 == 0:
                 bl_x2_ref.at[bo_sem_idx][...] = l_ref[...].reshape(step_sz, num_q_heads)
                 bm_x2_ref.at[bo_sem_idx][...] = m_ref[...].reshape(step_sz, num_q_heads)
+            elif 128 % num_q_heads == 0 and step_sz % (128 // num_q_heads) == 0:
+                # Each 128-lane row of l/m holds `per_row` whole queries: move
+                # query slot j of every row into its own output rows with one
+                # lane roll and one strided store. Lanes past num_q_heads are
+                # padding the wrapper slices off.
+                per_row = 128 // num_q_heads
+                num_rows = step_sz // per_row
+                for src_ref, dst_ref in (
+                    (l_ref, bl_x2_ref.at[bo_sem_idx]),
+                    (m_ref, bm_x2_ref.at[bo_sem_idx]),
+                ):
+                    rows = src_ref[...].reshape(num_rows, 128)
+                    for j in range(per_row):
+                        if j:
+                            rows = pltpu.roll(rows, 128 - num_q_heads, 1)
+                        dst_ref[pl.ds(j, num_rows, stride=per_row), :] = rows
             else:
                 # if num_q_heads can't be divided by 128, the reshape can't compile,
                 # so we need to loop through and copy row by row.
