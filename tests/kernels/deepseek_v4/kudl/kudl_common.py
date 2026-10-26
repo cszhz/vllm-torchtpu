@@ -39,6 +39,8 @@ SPECS = {
     "m16-s127k": dict(_C16, dump="dp1_kv25600", layer=2, prefix=127000),
     "m16-s470k": dict(_C16, dump="dp1_kv25600", layer=2, prefix=470000),
     "m16-s470kL1": dict(_C16, dump="dp1_kv25600", layer=1, prefix=470000),
+    # stress (not served-like): uniformly random top-k (the twin's dummy-weight regime; U8 ~ 8k)
+    "m16-rand127k": dict(_C16, dump=None, layer=0, prefix=127000),
     "m8-r22k": dict(_C8, dump="dp1_kv6144", layer=2, prefix=None),
     "m8-r51k": dict(_C8, dump="dp0_kv13312", layer=2, prefix=None),
     "m8-r100k": dict(_C8, dump="dp1_kv25600", layer=2, prefix=None),
@@ -70,10 +72,17 @@ def build_inputs(name, seed=None):
     cell = cell_obj(name)
     rng = np.random.default_rng(1234 + (seed or 0))
     conc, H, T, R, Lc = s["conc"], cell.heads, s["T"], s["R"], s["L"]
-    dump_kv = int(s["dump"].split("kv")[1])
-    dprefix = dump_kv * RATIO - 2048  # the dump chunk's first token position
-    prefix = s["prefix"] if s["prefix"] is not None else dprefix
-    rows = _load(s["dump"], s["layer"])[:Lc].astype(np.int64)
+    if s["dump"] is None:
+        prefix = dprefix = s["prefix"]
+        rows = np.full((Lc, TOPK), -1, np.int64)
+        for t in range(Lc):
+            nv = (prefix + t + 1) // RATIO
+            rows[t, : min(TOPK, nv)] = rng.choice(nv, size=min(TOPK, nv), replace=False)
+    else:
+        dump_kv = int(s["dump"].split("kv")[1])
+        dprefix = dump_kv * RATIO - 2048  # the dump chunk's first token position
+        prefix = s["prefix"] if s["prefix"] is not None else dprefix
+        rows = _load(s["dump"], s["layer"])[:Lc].astype(np.int64)
     if prefix != dprefix:
         # One map for every token (a row picked by several tokens stays one row): rows in the recent band (the
         # chunk's own range + RECENT rows before it) shift by the prefix delta (causality and recency kept exactly);
