@@ -8,6 +8,7 @@ mkdir -p $O
 python3 -c "import vllm_torchtpu.kernels.fused_moe.v2.host as h; print('host from', h.__file__)"
 md5sum src/vllm_torchtpu/kernels/fused_moe/v2/*.py $D/*.py
 A1ARMS=plan,a1,a1_nohi,a1_rm_s3,a1_rm_ydot
+A2R='combine,a2_inline,a2_inline@nodma,a2_inline@nocompute,a2_inline@nopick,a2_inline@noout,a2_inline@rowconst,a2_inline@nodma;nocompute;nopick;noout'
 case $1 in
 0) timeout -s KILL 2400 python3 $D/bench.py --cells mix128,mix256 --kinds served,served_pad --arms plan,combine --trace --out $O/b0 ;;
 1) pip install -q pytest >/dev/null 2>&1; timeout -s KILL 2400 python3 -m pytest -q -s -p no:cacheprovider $D/test_accuracy.py ;;
@@ -33,4 +34,9 @@ case $1 in
 34) timeout -s KILL 2400 python3 $D/bench.py --cells mix128 --kinds served,served_pad --arms combine,a2,a2_inline,a2_ring,a2@nodma,a2@nocompute,a2@nopick --rs 16,96,256 --out $O/a2_128r ;;
 35) timeout -s KILL 2400 python3 $D/bench.py --cells mix256 --kinds served,served_pad --arms combine,a2,a2_inline,a2_ring,a2@nodma,a2@nocompute,a2@nopick --rs 16,96,256 --out $O/a2_256r ;;
 36) pip install -q pytest >/dev/null 2>&1; timeout -s KILL 2400 python3 -m pytest -q -s -p no:cacheprovider -m multichip tests/kernels/fused_moe/test_fused_ep_moe_v2_mixed_combine.py ;;
+# probe 21 (2x-a2-attr): attribution of a2_inline's kernel time
+40) pip install -q pytest >/dev/null 2>&1; timeout -s KILL 2400 python3 -m pytest -q -s -p no:cacheprovider $D/test_accuracy.py -k a2 ;;
+41) timeout -s KILL 2400 python3 $D/bench.py --cells mix128 --kinds served --arms "$A2R" --rs 16,96,256 --trace --out $O/p21_128 ;;
+42) timeout -s KILL 2400 python3 $D/bench.py --cells mix256 --kinds served --arms "$A2R" --rs 16,96,256 --trace --out $O/p21_256 ;;
+43) timeout -s KILL 2400 python3 $D/bench.py --cells mix128 --kinds served_pad --arms "$A2R" --rs 16,96,256 --trace --out $O/p21_128p ;;
 esac
