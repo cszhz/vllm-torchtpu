@@ -96,6 +96,7 @@ class Profile:
     # buckets where eligible; exact) | True (every bucket where eligible, never
     # a T=1 bucket; approx, see `pool.POOL_IO_NUMERICS`).
     pool_gather: bool | None = False
+    supported_tp_sizes: tuple[int, ...] | None = None
     baseline: Baseline | None = None
     description: str = ""
     # The default profile of `model` (registered by the model; the reference
@@ -185,11 +186,10 @@ class Profile:
           (`tile_rule`; left `None` for the library default rule, which may be
           refined at build time to fit the VMEM budget);
         - `pool_gather`: the `CacheExec.pool_gather` of `base` unless it is the
-          library default
-          `False` ("no explicit choice"), else the profile's: `None` -> auto,
-          `True` -> `"eligible"` (gather wherever the pool backend can, e.g.
-          never on a `T=1` bucket). Pass `pool_gather="split"` to force split
-          under a GPR profile.
+          library default `False` ("no explicit choice"), else the profile's:
+          `None` -> auto, `True` -> `"eligible"` (gather wherever the pool
+          backend can, e.g. never on a `T=1` bucket). Pass `pool_gather="split"`
+          to force split under a GPR profile.
         Fused pool I/O is resolved by the caller because it also depends on the
         pool backend.
         """
