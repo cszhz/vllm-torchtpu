@@ -917,6 +917,11 @@ def arm(
     )
     first = next(iter(kept_modules.values()))
     try:
+        # Everything the mover needs on the device is made here, before any
+        # step: a pump must never issue a device op of its own.
+        prepare = getattr(transport, "prepare_device", None)
+        if prepare is not None:
+            prepare(first.w13_weight.device)
         parts = expert_mover.describe_parts(first, transport)
     except Exception as e:  # noqa: BLE001 - a layer without expert tensors (tests' fakes)
         parts = str(e)

@@ -231,13 +231,25 @@ class RawTransferTransport(TorchTransport):
                 return free.pop()
         if self.host_memory == "raw":
             if self._anchor is None:
-                self._anchor = torch.zeros(8, dtype=torch.uint8, device=device)
+                self.prepare_device(device)
             host = _raw_host(self._rt, shape, self._anchor)
         else:
             host = _pinned(shape)
         with self._lock:
             self._owned.add(host.data_ptr())
         return host
+
+    def prepare_device(self, device) -> None:
+        """Make the anchor that binds RawHostBuffers to `device`, now and
+        outside any step: a device op issued from a pump, with the step's
+        forward still a deferred torch_tpu graph, forces that graph to
+        materialize at a cut it never had, which is a compile mid-step
+        (`eplb-dyn-dp8-i` hung its first staging step this way)."""
+        if self.host_memory != "raw" or self._anchor is not None:
+            return
+        anchor = torch.zeros(8, dtype=torch.uint8, device=device)
+        self._rt.PreparedTorchRawTransfer(anchor, self._rt.RawHostBuffer(1 << 16))
+        self._anchor = anchor
 
     def _ours(self, host: torch.Tensor) -> bool:
         with self._lock:
