@@ -45,8 +45,8 @@ RING_PARITIES = 4
 RING_LEAD = 2
 
 # Timing-only removal arms and positive-control faults (tests only).
-SKIPS = ("nodma", "nocompute", "nopick")
-FAULTS = ("k_order", "pick_lane", "route_mul", "row_clamp")
+SKIPS = ("nodma", "nocompute", "nopick", "noout", "rowconst")
+FAULTS = ("k_order", "pick_lane", "route_mul", "row_off")
 
 
 def mixed_combine_supported(t_local, topk):
@@ -77,6 +77,16 @@ def _pick(tab, scl_vm, p, P, mirror_elems, tile_m, shift, lane, opts):
         jnp.where(lane == ln, scl_vm[pl.ds(sub, 1), :], 0.0), axis=1, keepdims=True
     )
     return s * w
+
+
+def _row(pos, R, opts):
+    """Arrival row of a slot, clamped into the buffer as the XLA gather clamps."""
+    if "rowconst" in opts:  # timing only: every slot reads row 0
+        return jnp.int32(0)
+    row = jnp.minimum(pos, R - 1)
+    if "row_off" in opts:  # fault: off by one row
+        row = jnp.maximum(row - 1, 0)
+    return row
 
 
 def _route(acc, tab, P, i, opts):
@@ -148,14 +158,14 @@ def _bulk_kernel(
                 p = i * topk + k
                 if "nocompute" in opts:
                     continue
-                hi = R // 4 if "row_clamp" in opts else R - 1
-                row = jnp.minimum(tab[p], hi)
+                row = _row(tab[p], R, opts)
                 term = arr_vm[row].astype(jnp.float32) * coef(p)
                 acc = term if acc is None else acc + term
             if acc is None:
                 acc = jnp.zeros((LB, L), jnp.float32)
             tile_vm[u] = _route(acc, tab, P, i, opts).astype(out_dtype)
-        out_vm[par] = tile_vm[...].reshape(GROUP, hidden)
+        if "noout" not in opts:
+            out_vm[par] = tile_vm[...].reshape(GROUP, hidden)
         pltpu.make_async_copy(
             out_vm.at[par],
             out_hbm.at[pl.ds(pl.multiple_of(g * GROUP, GROUP), GROUP)],
@@ -200,7 +210,7 @@ def _ring_kernel(
     def start_row(base, par, i, k):
         if "nodma" in opts:
             return
-        row = jnp.minimum(tab[(base + i) * topk + k], R - 1)
+        row = _row(tab[(base + i) * topk + k], R, opts)
         pltpu.make_async_copy(
             arr_hbm.at[row], rows_vm.at[par, k * tb + i], rsem(par)
         ).start(priority=k % 2)
@@ -222,7 +232,8 @@ def _ring_kernel(
                 for k in range(topk):
                     start_row(nxt, npar, i, k)
                 acc = None
-                for k in range(topk):
+                ks = range(topk - 1, -1, -1) if "k_order" in opts else range(topk)
+                for k in ks:
                     if "nocompute" in opts:
                         continue
                     p = (base + i) * topk + k
@@ -236,7 +247,7 @@ def _ring_kernel(
             return carry
 
         lax.fori_loop(0, groups, chunk, jnp.int32(0))
-        for g in range(groups):
+        for g in range(groups if "noout" not in opts else 0):
             out_vm[par, pl.ds(g * GROUP, GROUP)] = tile_vm[pl.ds(g * GROUP, GROUP)].reshape(
                 GROUP, hidden
             )

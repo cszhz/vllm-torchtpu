@@ -228,7 +228,7 @@ def test_a2_combine_vs_incumbent_oracle_and_faults(cn, variant):
         bad = np.asarray(cand(arr, scl, p2, m2, w2, routes), np.float64)
         caught[name] = float((np.abs(bad - want) / scale).max()) > tol
     # kernel faults (k_order is visible only to the bit-exact check)
-    for f in ("pick_lane", "row_clamp", "k_order"):
+    for f in ("pick_lane", "row_off", "k_order"):
         bad = np.asarray(cand(arr, scl, pos, mir, w, routes, opts=(f,)), np.float64)
         caught[f] = (bool((bad != native).any()) if f == "k_order"
                      else float((np.abs(bad - want) / scale).max()) > tol)
