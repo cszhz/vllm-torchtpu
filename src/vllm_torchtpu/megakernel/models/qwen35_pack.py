@@ -23,6 +23,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from .. import kernel
+from ..comm.replication import replicate_groups
 from ..exec_spec import ExecSpec
 from ..modules.gdn import GDNModule
 from ..ops import BF16, F32, FP8, I32, rup
@@ -34,6 +35,46 @@ from . import qwen35_pool
 def accept_states(g: Any, ex: ExecSpec, st: dict[str, Any], acc: Any) -> dict[str, Any]:
     """Delegate verify-mode GDN state selection to `GDNModule.accept`."""
     return GDNModule.accept(st, st, acc, T=ex.T, vh=g.vh(ex.R))
+
+
+def replicate_logical_inputs(
+    g: Any,
+    ex: ExecSpec,
+    logical_weights: dict[str, Any],
+    logical_states: dict[str, Any],
+) -> None:
+    """Copy shared key-head and shared-expert slices across replica ranks
+    in synthetic inputs.
+    """
+    R = ex.R
+    sh_rep = g.sh_rep(R)
+    for k in ("sh13", "sh13_s", "sh2"):
+        w_k = logical_weights.get(k)
+        if w_k is not None and sh_rep > 1:
+            logical_weights[k] = (
+                tuple(replicate_groups(part, sh_rep) for part in w_k)
+                if isinstance(w_k, tuple)
+                else replicate_groups(w_k, sh_rep)
+            )
+    kh_rep = g.kh_rep(R) if g.NGDN > 0 else 1
+    if kh_rep <= 1:
+        return
+    lay = GDNModule.lin_in_layout(g, ex)
+    qk = 2 * lay.kh * lay.KD
+    for k in ("lin_in", "lin_in_s"):
+        if k in logical_weights:
+            arr = logical_weights[k]
+            rep_qk = replicate_groups(arr[..., :qk], kh_rep)
+            logical_weights[k] = arr.at[..., :qk].set(rep_qk)
+    if "conv" in logical_weights:
+        cw = logical_weights["conv"].reshape(R, g.NGDN, 4, lay.QKV)
+        cw = cw.at[..., :qk].set(replicate_groups(cw[..., :qk], kh_rep))
+        logical_weights["conv"] = cw.reshape(R, g.NGDN, 4 * lay.QKV)
+    if "conv" in logical_states:
+        cs = logical_states["conv"]
+        logical_states["conv"] = cs.at[..., :qk].set(
+            replicate_groups(cs[..., :qk], kh_rep)
+        )
 
 
 def random_logical_inputs(
@@ -159,6 +200,7 @@ def random_logical_inputs(
         logical_states["rec"] = (
             jax.random.normal(next(it), (R, ngdn, NS, vh, KD, VD), dtype=BF16) * 0.05
         )
+    replicate_logical_inputs(g, ex, logical_weights, logical_states)
     return pos, hidden, logical_weights, logical_states
 
 
