@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_DISPATCH_PAYLOAD_DRAIN: str = "issue"
     MOE_FUSED_EP_KERNEL_BARRIER_ROUNDS: int = 2
     MOE_FUSED_EP_KERNEL_TAIL_BARRIER: bool = True
+    MOE_FUSED_EP_PLAN: str = "xla"
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
@@ -757,6 +758,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MOE_FUSED_EP_KERNEL_TAIL_BARRIER": lambda: bool(
         int(os.getenv("MOE_FUSED_EP_KERNEL_TAIL_BARRIER", "1") or 1)
+    ),
+    # How fused EP MoE v2 builds the routing plan between the dispatch and
+    # the expert kernel: xla spells it as the ~170 small ops the host.py
+    # builders emit, kernel builds every table the expert kernel takes in one
+    # pass over the exchanged count table (plan_kernel.py). Same tables bit
+    # for bit. Default off until measured at the served widths.
+    "MOE_FUSED_EP_PLAN": env_with_choices(
+        "MOE_FUSED_EP_PLAN", "xla", ["xla", "kernel"]
     ),
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for

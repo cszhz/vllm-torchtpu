@@ -1455,6 +1455,60 @@ def test_all_to_all_dispatch_is_bit_exact_at_the_dp32_shape(dispatch):
     np.testing.assert_array_equal(np.asarray(exchanged), np.asarray(gathered))
 
 
+# ---------------------------------------------------------------------------
+# The routing plan: MOE_FUSED_EP_PLAN=kernel builds every table the expert
+# kernel takes in one pass over the exchanged count table instead of in the
+# host.py builders' ~170 small ops. The tables are bit-identical
+# (test_fused_ep_moe_v2_plan.py asserts that element for element on CPU), so
+# the layer's output is too, under every dispatch.
+
+
+@pytest.mark.parametrize("dispatch", ("all_gather",) + EXCHANGES)
+def test_plan_kernel_is_bit_exact_at_the_dp32_shape(dispatch):
+    """96 experts over 8 shards with one spare slot each and 1152 tokens."""
+    mesh = _mesh()
+    rng = np.random.default_rng(95)
+    x, gating, _, _, placed_weights, slot_table, common = _placed_fp4_case(
+        mesh,
+        rng,
+        e_total=96,
+        spare=1,
+        tokens=1152,
+        hidden=1024,
+        inter=512,
+        topk=6,
+        routing="score_bias",
+    )
+    placed = dict(expert_slot=jnp.asarray(slot_table))
+    xla = _served(x, gating, placed_weights, dispatch=dispatch, **placed, **common)
+    kernel = _served(
+        x, gating, placed_weights, dispatch=dispatch, plan="kernel", **placed, **common
+    )
+    np.testing.assert_array_equal(np.asarray(kernel), np.asarray(xla))
+
+
+@pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
+def test_plan_kernel_is_bit_exact_without_a_layout(sharded_plan):
+    mesh = _mesh()
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 93, hidden=1024, inter=512, e_total=32, rhs_qb=512
+    )
+    x, gating = _make_inputs(mesh, 94, tokens=512, hidden=1024, e_total=32)
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=sharded_plan,
+        scoring_fn="sigmoid",
+    )
+    xla = _served(x, gating, (*weights, *scales), **common)
+    kernel = _served(x, gating, (*weights, *scales), plan="kernel", **common)
+    np.testing.assert_array_equal(np.asarray(kernel), np.asarray(xla))
+
+
 @pytest.mark.parametrize("dispatch", EXCHANGES)
 def test_all_to_all_dispatch_keeps_the_load_accumulator(dispatch):
     mesh = _mesh()

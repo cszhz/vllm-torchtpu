@@ -47,7 +47,13 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
 
 
 def _exclusive_prefix(x, axis):
-    """``cumsum(x, axis) - x``, as a select-sum over a small triangle."""
+    """``cumsum(x, axis) - x`` over a small triangle, for the kernel body.
+
+    Inside one Pallas program this is a handful of vector ops; `jnp.cumsum`
+    there would have to lower a reduce-window. Measured the other way round
+    in XLA, where the triangle's padded intermediates cost 4 us a call at the
+    DP32 shape -- so the per-pair pass below keeps `jnp.cumsum`.
+    """
     n = x.shape[axis]
     y = jnp.moveaxis(x, axis, -1)
     lower = jnp.arange(n, dtype=jnp.int32)[None, :] < jnp.arange(n, dtype=jnp.int32)[:, None]
@@ -74,8 +80,19 @@ class SmallTables(NamedTuple):
     run_base: jax.Array
 
 
-def shard_small_tables(rows_by_dest, me, *, e_total, ep, shard_stride, tile_m):
-    """Shard ``me``'s non-per-pair plan tables from the ``[ep, e_total]`` counts."""
+def shard_small_tables(rows_by_dest, me, *, e_total, ep, shard_stride, tile_m,
+                       groups=0, pallas=False):
+    """Shard ``me``'s non-per-pair plan tables from the ``[ep, e_total]`` counts.
+
+    ``pallas`` runs the same body as one Pallas kernel. The arithmetic is a
+    few dozen vector ops on 13 312 int32s; spelled as XLA it is ~35 separate
+    programs, and the launch cost of those is what this costs today.
+    """
+    if pallas:
+        return _as_pallas(
+            rows_by_dest, me, e_total=e_total, ep=ep, shard_stride=shard_stride,
+            tile_m=tile_m,
+        )
     g_local = e_total // ep
     counts_se = rows_by_dest.astype(jnp.int32)  # [source, expert]
     run_rows = counts_se.T  # [E, source]
@@ -210,7 +227,7 @@ def shard_pair_tables(expert_blocks, my_blocks, my_hist, small, me, *, e_total, 
     bins = jnp.arange(e_total, dtype=jnp.int32)
     window = rank_window(block, blocks_per_dest * block)
 
-    my_off = _exclusive_prefix(my_hist, axis=0)
+    my_off = jnp.cumsum(my_hist, axis=0) - my_hist
     my_rank = _rank_within_block(my_blocks, block)
     pos = (
         _lookup_per_pair(my_off + small.recv_base_e[None, :], my_blocks, bins) + my_rank
@@ -224,7 +241,7 @@ def shard_pair_tables(expert_blocks, my_blocks, my_hist, small, me, *, e_total, 
     win_hist = _window_hist(expert_blocks, my_experts, window)
     by_source = _over_sub_blocks(win_hist).reshape(ep, blocks_per_dest, g_local)
     row_table = _window_table(
-        (_exclusive_prefix(by_source, axis=1) + small.run_base[:, None, :]).reshape(
+        (jnp.cumsum(by_source, axis=1) - by_source + small.run_base[:, None, :]).reshape(
             n_blocks, g_local
         ),
         win_hist,
@@ -237,3 +254,54 @@ def shard_pair_tables(expert_blocks, my_blocks, my_hist, small, me, *, e_total, 
         on_me, my_row, jnp.int32(off_shard_slab_row(shard_stride, ep))
     ).reshape(-1)
     return pos, mirror_pos, slab_row
+
+
+def _as_pallas(rows_by_dest, me, *, e_total, ep, shard_stride, tile_m):
+    """`shard_small_tables` as one kernel: one launch instead of ~35."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    g_local = e_total // ep
+    i32 = jnp.int32
+    shapes = (
+        (jax.ShapeDtypeStruct((g_local, ep), i32),) * 5
+        + (
+            jax.ShapeDtypeStruct((g_local,), i32),
+            jax.ShapeDtypeStruct((g_local,), i32),
+            jax.ShapeDtypeStruct((g_local,), i32),
+            jax.ShapeDtypeStruct((N_COUNTS, ep), i32),
+            jax.ShapeDtypeStruct((e_total,), i32),
+            jax.ShapeDtypeStruct((e_total,), i32),
+            jax.ShapeDtypeStruct((ep, g_local), i32),
+        )
+    )
+
+    def body(me_ref, counts_ref, *outs):
+        t = shard_small_tables(
+            counts_ref[...], me_ref[0], e_total=e_total, ep=ep,
+            shard_stride=shard_stride, tile_m=tile_m,
+        )
+        flat = (
+            *t.kernel_tables, t.expert_rows, t.slab_base, t.visit, t.counts,
+            t.recv_base_e, t.mirror_base_e, t.run_base,
+        )
+        for ref, value in zip(outs, flat):
+            ref[...] = value
+
+    flat = pl.pallas_call(
+        body,
+        out_shape=shapes,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM), pl.BlockSpec()],
+        out_specs=[pl.BlockSpec()] * len(shapes),
+        name="moe_plan_small_tables",
+    )(jnp.asarray(me, i32).reshape(1), rows_by_dest.astype(i32))
+    return SmallTables(
+        kernel_tables=tuple(flat[:5]),
+        expert_rows=flat[5],
+        slab_base=flat[6],
+        visit=flat[7],
+        counts=flat[8],
+        recv_base_e=flat[9],
+        mirror_base_e=flat[10],
+        run_base=flat[11],
+    )

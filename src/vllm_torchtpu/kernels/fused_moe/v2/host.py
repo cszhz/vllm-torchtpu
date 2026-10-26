@@ -1002,10 +1002,13 @@ def local_slab_rows(routing, me, *, shard_stride):
     shard_stride, not to a negative offset, because jax indexing wraps a
     negative index around the destination instead of dropping it.
     """
+    return rebase_slab_rows(routing.slab_row, me, shard_stride)
+
+
+def rebase_slab_rows(slab_row, me, shard_stride):
+    """`local_slab_rows` over a plan's `slab_row` held on its own."""
     base = me * shard_stride
-    return jnp.where(
-        routing.slab_row < base, jnp.int32(shard_stride), routing.slab_row - base
-    )
+    return jnp.where(slab_row < base, jnp.int32(shard_stride), slab_row - base)
 
 
 def shard_token_gather(routing, me, *, shard_stride, rows=None, token_of=None):
@@ -1033,25 +1036,34 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None, token_of=None):
     before any of this; the clip is written so that it would hold on its own.
     """
     T, K = routing.pair_grid
+    row = (
+        local_slab_rows(routing, me, shard_stride=shard_stride)
+        if rows is None
+        else rows
+    )
+    return token_gather_from_rows(
+        row, token_of, n_tokens=T, topk=K, shard_stride=shard_stride
+    )
+
+
+def token_gather_from_rows(rows, token_of, *, n_tokens, topk, shard_stride):
+    """`shard_token_gather` over a plan's slab rows held on their own."""
     # The token number of each routed pair is a counted repeat, not a
     # division: pair i belongs to token i // K, which is the token index
     # broadcast K times. K is the selection width and need not be a power
     # of two, so this is the spelling that removes the division rather
     # than the one that shifts it.
     token_value = (
-        jnp.arange(T, dtype=jnp.int32)
+        jnp.arange(n_tokens, dtype=jnp.int32)
         if token_of is None
         else token_of.astype(jnp.int32)
     )
-    token_of_pair = jnp.broadcast_to(token_value[:, None], (T, K)).reshape(-1)
-    row = (
-        local_slab_rows(routing, me, shard_stride=shard_stride)
-        if rows is None
-        else rows
-    )
-    gather_lo, gather_hi = gather_clamp_bounds(T)
+    token_of_pair = jnp.broadcast_to(
+        token_value[:, None], (n_tokens, topk)
+    ).reshape(-1)
+    gather_lo, gather_hi = gather_clamp_bounds(n_tokens)
     scattered = (
-        jnp.zeros((shard_stride,), jnp.int32).at[row].add(token_of_pair, mode="drop")
+        jnp.zeros((shard_stride,), jnp.int32).at[rows].add(token_of_pair, mode="drop")
     )
     return jnp.clip(scattered, jnp.int32(gather_lo), jnp.int32(gather_hi))
 

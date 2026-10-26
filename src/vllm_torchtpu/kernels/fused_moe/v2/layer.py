@@ -48,7 +48,6 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     expert_group_size,
     expert_visit_list,
     fp4_scale_rows,
-    local_slab_rows,
     pair_block_hist,
     pow2_shift,
     ragged_stride_bound,
@@ -56,8 +55,9 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     shard_count_vector,
     shard_expert_slabs,
     shard_push_tables_in_rows,
-    shard_token_gather,
+    rebase_slab_rows,
     shard_transport_tables_in_blocks,
+    token_gather_from_rows,
     token_gather_window_rows,
     weight_form,
     weight_format_of_dtype,
@@ -67,6 +67,11 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     build_fused_ep_moe_kernel,
     combine_step_tokens,
     rowquant_fp8,
+)
+from vllm_torchtpu.kernels.fused_moe.v2.plan_kernel import (
+    SmallTables,
+    shard_pair_tables,
+    shard_small_tables,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.preprocessing import PreprocessTopology
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
@@ -78,6 +83,11 @@ from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
 # The scoring functions the router can apply to the gate logits. These
 # mirror `layers/adapter/moe_routing._apply_scoring_fn` exactly.
 SCORING_FNS = ("softmax", "sigmoid", "sqrtsoftplus")
+
+# How the routing plan between the dispatch and the expert kernel is built:
+# as the host.py builders' ~170 small XLA ops, or in one pass over the
+# exchanged count table (plan_kernel.py). The tables are identical.
+PLAN_MODES = ("xla", "kernel")
 
 
 def _apply_scoring_fn(logits, scoring_fn):
@@ -473,6 +483,7 @@ def fused_ep_moe_v2(
     preprocess_topology: PreprocessTopology | None = None,
     dispatch="all_gather",
     dispatch_groups=1,
+    plan="xla",
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -671,6 +682,8 @@ def fused_ep_moe_v2(
         raise ValueError('routed is passed exactly when stage == "compute"')
     if dispatch not in DISPATCH_MODES:
         raise ValueError(f"dispatch must be one of {DISPATCH_MODES}; got {dispatch!r}")
+    if plan not in PLAN_MODES:
+        raise ValueError(f"plan must be one of {PLAN_MODES}; got {plan!r}")
     if dispatch in EXCHANGE_DISPATCHES and stage != "fused":
         raise ValueError(
             "the all-to-all dispatch belongs to the fused stage; the split "
@@ -1009,20 +1022,50 @@ def fused_ep_moe_v2(
             tile_m=capacity,
             shard_stride=ragged_stride,
         )
-        if sharded_plan:
+        routing = small = None
+        if plan == "kernel":
+            small = shard_small_tables(
+                rows_by_dest,
+                me,
+                e_total=e_total,
+                ep=ep,
+                shard_stride=ragged_stride,
+                tile_m=capacity,
+                groups=groups,
+                pallas=True,
+            )
+            pos_k, mirror_pos_k, plan_slab_row = shard_pair_tables(
+                gathered.expert_blocks,
+                local_blocks,
+                block_hist,
+                small,
+                me,
+                e_total=e_total,
+                ep=ep,
+                t_local=t_local,
+                topk=topk,
+                block=block,
+                shard_stride=ragged_stride,
+            )
+        elif sharded_plan:
             routing = build_routing_tables_sharded(
                 None, me, gathered=gathered, **plan_kw
             )
         else:
             routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
-        block_tables = shard_transport_tables_in_blocks(
-            routing, me, e_total=e_total, ep=ep
-        )
-        row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
+        if routing is not None:
+            block_tables = shard_transport_tables_in_blocks(
+                routing, me, e_total=e_total, ep=ep
+            )
+            row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
+            kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
+            plan_slab_row = routing.slab_row
+        else:
+            kernel_tables = cast(SmallTables, small).kernel_tables
         # Both slab tables scatter onto this shard's own slab. The rows of
         # the other shards are dropped where they are computed rather than
         # built into a replicated slab and sliced away afterwards.
-        slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
+        slab_row = rebase_slab_rows(plan_slab_row, me, ragged_stride)
         # The two slab scatters and the activation all-gather are offloaded to
         # the SAME SparseCore. Ordering the scatters behind the collective
         # enqueues it 129 us earlier and costs them the cover they had; that
@@ -1055,12 +1098,12 @@ def fused_ep_moe_v2(
                 tokens=None if token_index is None else jnp.repeat(token_index, topk),
             )
         else:
-            token_gather = shard_token_gather(
-                routing,
-                me,
+            token_gather = token_gather_from_rows(
+                slab_row,
+                token_index,
+                n_tokens=T,
+                topk=topk,
                 shard_stride=ragged_stride,
-                rows=slab_row,
-                token_of=token_index,
             )
         if gather_positions is not None:
             # The rows were gathered in another order than the mesh's, so
@@ -1107,7 +1150,12 @@ def fused_ep_moe_v2(
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
-        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
+        if routing is not None:
+            expert_rows, slab_base = shard_expert_slabs(
+                routing, me, e_total=e_total, ep=ep
+            )
+        else:
+            expert_rows, slab_base = small.expert_rows, small.slab_base
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         # The bias tables are per expert and per output channel on every
         # weight format, so they take one layout: [G, N].
@@ -1118,13 +1166,18 @@ def fused_ep_moe_v2(
         # row of the count table rather than its own reduction, so this
         # builder's second value is not read; it leaves the program with
         # the rest of the dead code, and its own test still sees it.
-        # Group-major where the kernel waits per group: its "first visit of
-        # this group" test is the previous visit's group, and only this
-        # order makes that one wait per group.
-        visit, _ = expert_visit_list(expert_rows, g_local, groups=groups)
-        # One pass builds every count the kernel needs, still spread over
-        # the expert-parallel axis; the kernel's scalar core closes them.
-        counts = shard_count_vector(routing, expert_rows, me, e_total=e_total, ep=ep)
+        if routing is not None:
+            # Group-major where the kernel waits per group: its "first visit of
+            # this group" test is the previous visit's group, and only this
+            # order makes that one wait per group.
+            visit, _ = expert_visit_list(expert_rows, g_local, groups=groups)
+            # One pass builds every count the kernel needs, still spread over
+            # the expert-parallel axis; the kernel's scalar core closes them.
+            counts = shard_count_vector(
+                routing, expert_rows, me, e_total=e_total, ep=ep
+            )
+        else:
+            visit, counts = small.visit, small.counts
 
         # The kernel takes four of the seven transport tables and one of the
         # three push tables. The two totals are rows of `counts`, and three
@@ -1134,7 +1187,6 @@ def fused_ep_moe_v2(
         # the kernel derives the rest. Every table shipped is another blocking
         # HBM->SMEM DMA at the head of the kernel, and the prefetch also has to
         # fit in 1 MB of SMEM.
-        kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
         if finish_rows is not None:
             q_g, waited = finish_rows(
                 (kernel_tables, token_gather, expert_rows, slab_base, scale_slab)
@@ -1171,24 +1223,19 @@ def fused_ep_moe_v2(
             arrivals = arrive(arrivals)
 
         # The destination's own table: one arrival row per selection slot.
-        pos = (
-            cast(ShardRoutingTables, routing).pos
-            if sharded_plan
-            else lax.dynamic_slice(
-                cast(RoutingTables, routing).arrival_row,
-                (me * t_local, 0),
-                (t_local, topk),
+        if routing is None:
+            pos, mirror_pos = pos_k, mirror_pos_k
+        elif sharded_plan:
+            pos = cast(ShardRoutingTables, routing).pos
+            mirror_pos = cast(ShardRoutingTables, routing).mirror_pos
+        else:
+            replicated = cast(RoutingTables, routing)
+            pos = lax.dynamic_slice(
+                replicated.arrival_row, (me * t_local, 0), (t_local, topk)
             )
-        )
-        mirror_pos = (
-            cast(ShardRoutingTables, routing).mirror_pos
-            if sharded_plan
-            else lax.dynamic_slice(
-                cast(RoutingTables, routing).mirror_row,
-                (me * t_local, 0),
-                (t_local, topk),
+            mirror_pos = lax.dynamic_slice(
+                replicated.mirror_row, (me * t_local, 0), (t_local, topk)
             )
-        )
         combined = _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
         )
@@ -1582,6 +1629,7 @@ def fused_ep_moe_v2(
         mesh_ep_ranks,
         token_layout,
         bool(sharded_plan),
+        plan,
         x.dtype,
         w1.dtype,
         w2.dtype,
