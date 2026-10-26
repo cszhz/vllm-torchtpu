@@ -65,7 +65,11 @@ ulimit -c 0
 
 config="${K3_DSPARK_PD_CONFIG:-kimi-k3-pruned75-dspark-tp8-ep-1p1d}"
 remote_dspark=0
-if [[ "$config" == kimi-k3-pruned75-dspark-tp8-ep-remote ]]; then
+remote_planned=0
+if [[ "$config" == kimi-k3-pruned75-dspark-tp8-ep-remote-planned ]]; then
+    remote_planned=1
+fi
+if [[ "$config" == kimi-k3-pruned75-dspark-tp8-ep-remote ]] || ((remote_planned)); then
     remote_dspark=1
     peer=decode
     [[ "$role" == prefill ]] || peer=prefill
@@ -177,13 +181,20 @@ else
     warmup_prompts="${K3_DSPARK_PD_WARMUP_PROMPTS:-$num_prompts}"
     remote_batch_size="$concurrency"
     remote_bypass_requests=0
-    if ((remote_dspark && concurrency > 1)); then
+    remote_admission_delay="${VLLM_TPU_REMOTE_DSPARK_ADMISSION_DELAY_S:-0.05}"
+    if ((remote_planned)); then
+        # Typed scheduling must progress without an HTTP batch rendezvous,
+        # bypass requests or artificial delay hiding the original C2 cycle.
+        remote_batch_size=1
+        remote_admission_delay=0
+    elif ((remote_dspark && concurrency > 1)); then
         remote_batch_size=$((concurrency - 1))
         remote_bypass_requests=1
     fi
     VLLM_TPU_REMOTE_DSPARK_SHADOW="$remote_dspark" \
       VLLM_TPU_REMOTE_DSPARK_BATCH_SIZE="$remote_batch_size" \
       VLLM_TPU_REMOTE_DSPARK_BYPASS_REQUESTS="$remote_bypass_requests" \
+      VLLM_TPU_REMOTE_DSPARK_ADMISSION_DELAY_S="$remote_admission_delay" \
       VLLM_TPU_REMOTE_DSPARK_VERIFICATION_PATH="$verification_path" \
       python3 examples/disagg/toy_proxy_server.py \
         --host 0.0.0.0 --port 8050 \
@@ -198,6 +209,95 @@ else
         }
         sleep 2
     done
+
+    wait_remote_verifications() {
+        python3 - "$verification_path" "$1" <<'PY'
+import json
+import sys
+import time
+
+path, expected = sys.argv[1], int(sys.argv[2])
+deadline = time.monotonic() + 60
+records = []
+while time.monotonic() < deadline:
+    try:
+        with open(path) as verification_file:
+            records = [json.loads(line) for line in verification_file if line.strip()]
+    except FileNotFoundError:
+        records = []
+    if len(records) >= expected:
+        break
+    time.sleep(0.1)
+if len(records) != expected:
+    raise RuntimeError(
+        f"remote DSpark recorded {len(records)} verifications; expected {expected}"
+    )
+failures = [record for record in records if record.get("status") != "complete"]
+if failures:
+    raise RuntimeError(f"remote DSpark output verification failed: {failures}")
+PY
+    }
+
+    if [[ -n "${K3_DSPARK_PD_NATURAL_BASELINE_JSON:-}" ]]; then
+        python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+import urllib.request
+
+baseline = json.loads(os.environ["K3_DSPARK_PD_NATURAL_BASELINE_JSON"])
+records = baseline["records"]
+assert len(records) == int(os.environ["K3_DSPARK_PD_NUM_PROMPTS"])
+destination = Path(os.environ["ARTIFACT_LOCAL_DIR"]) / "results" / "natural-remote.json"
+results = []
+for record in records:
+    body = record["request"]
+    assert body["temperature"] == 0 and body["ignore_eos"]
+    assert body["return_token_ids"] and not body["stream"]
+    request = urllib.request.Request(
+        "http://127.0.0.1:8050/v1/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=600) as response:
+        raw = response.read().decode()
+        status = response.status
+    result = json.loads(raw)
+    choice, = result["choices"]
+    expected, = record["response"]["choices"]
+    comparison = {
+        "prompt_text": record["prompt_text"], "request": body,
+        "http_status": status, "raw_response": raw, "response": result,
+        "token_ids_equal": choice.get("token_ids") == expected["token_ids"],
+        "text_equal": choice["text"] == expected["text"],
+        "shape_valid": (
+            status == 200 and choice["finish_reason"] == "length"
+            and len(choice.get("token_ids") or []) == body["max_tokens"]
+            and choice.get("prompt_token_ids") == body["prompt"]
+            and result["usage"]["prompt_tokens"] == len(body["prompt"])
+            and result["usage"]["completion_tokens"] == body["max_tokens"]
+        ),
+    }
+    results.append(comparison)
+    destination.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n")
+    print("NATURAL_REMOTE_RECORD " + json.dumps(comparison, ensure_ascii=False), flush=True)
+PY
+        if ((remote_dspark)); then
+            wait_remote_verifications "$num_prompts"
+        fi
+        python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path(os.environ["ARTIFACT_LOCAL_DIR"]) / "results" / "natural-remote.json"
+results = json.loads(path.read_text())
+assert all(r["shape_valid"] and r["token_ids_equal"] and r["text_equal"] for r in results), results
+print("NATURAL_REMOTE_EQUIVALENCE_COMPLETE", flush=True)
+PY
+        touch "$coord/benchmark.done"
+        exit 0
+    fi
 
     if [[ "${K3_DSPARK_PD_DIAGNOSTIC:-0}" == 1 ]]; then
         python3 - <<'PY'
@@ -222,6 +322,9 @@ path = os.path.join(os.environ["ARTIFACT_LOCAL_DIR"], "results", "diagnostic.jso
 with open(path, "wb") as output:
     output.write(result)
 PY
+        if ((remote_dspark)); then
+            wait_remote_verifications 1
+        fi
         touch "$coord/benchmark.done"
         exit 0
     fi
@@ -237,6 +340,7 @@ PY
         --random-range-ratio 0 --max-concurrency "$concurrency" --request-rate inf
         --percentile-metrics "ttft,tpot,itl,e2el" --ignore-eos --temperature 0
         --seed 42
+        --ready-check-timeout-sec 0
     )
     if ((warmup_prompts > 0)); then
         "${bench[@]}" --num-prompts "$warmup_prompts" \
@@ -267,31 +371,7 @@ if completed != expected:
 PY
     if ((remote_dspark)); then
         expected_verifications=$((warmup_prompts + num_prompts))
-        python3 - "$verification_path" "$expected_verifications" <<'PY'
-import json
-import sys
-import time
-
-path, expected = sys.argv[1], int(sys.argv[2])
-deadline = time.monotonic() + 60
-records = []
-while time.monotonic() < deadline:
-    try:
-        with open(path) as verification_file:
-            records = [json.loads(line) for line in verification_file if line.strip()]
-    except FileNotFoundError:
-        records = []
-    if len(records) >= expected:
-        break
-    time.sleep(0.1)
-if len(records) != expected:
-    raise RuntimeError(
-        f"remote DSpark recorded {len(records)} verifications; expected {expected}"
-    )
-failures = [record for record in records if record.get("status") != "complete"]
-if failures:
-    raise RuntimeError(f"remote DSpark output verification failed: {failures}")
-PY
+        wait_remote_verifications "$expected_verifications"
     fi
     if [[ "$capture_profile" == 1 ]]; then
         curl -fsS -X POST http://127.0.0.1:8000/stop_profile >/dev/null
