@@ -184,7 +184,11 @@ def align_up(v, m):
 
 def token_gather_window_rows(tile_m):
     """Int32 rows in one aligned HBM-to-SMEM token-gather window."""
-    return TOKEN_GATHER_TILES_PER_WINDOW * tile_m + TOKEN_GATHER_DMA_ALIGNMENT
+    # Whole HBM int32 tiles: the window is a DMA out of a 128-element-tiled
+    # table, so its length has to be too. A no-op at tile_m 128 (256 rows);
+    # a 32-row decode tile (MOE_FUSED_EP_V2_DECODE_TILE_M) rounds 160 up to 256.
+    rows = TOKEN_GATHER_TILES_PER_WINDOW * tile_m + TOKEN_GATHER_DMA_ALIGNMENT
+    return -(-rows // TOKEN_GATHER_DMA_ALIGNMENT) * TOKEN_GATHER_DMA_ALIGNMENT
 
 
 def token_gather_smem_bytes(tile_m):
