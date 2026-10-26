@@ -24,7 +24,13 @@ from vllm_torchtpu import expert_relayout as rl
 
 pytestmark = pytest.mark.cpu_test
 
-SLOTS, K, N, ROWS = 5, 16, 8, 2  # rows: scale rows per slot
+SLOTS, K, N, ROWS, NS = (
+    5,
+    32,
+    128,
+    2,
+    512,
+)  # a slot = 4 KiB; scale rows: 2 x 512 f32 = 4 KiB
 
 
 def _module(seed):
@@ -38,16 +44,16 @@ def _module(seed):
             requires_grad=False,
         ),
         w2_weight=torch.nn.Parameter(
-            torch.randint(
-                0, 255, (SLOTS, K // 2, N), generator=g, dtype=torch.int32
-            ).to(torch.uint8),
+            torch.randint(0, 255, (SLOTS, 2 * K, N), generator=g, dtype=torch.int32).to(
+                torch.uint8
+            ),
             requires_grad=False,
         ),
         w13_weight_scale=torch.nn.Parameter(
-            torch.randn(SLOTS * ROWS, N, generator=g), requires_grad=False
+            torch.randn(SLOTS * ROWS, NS, generator=g), requires_grad=False
         ),
         w2_weight_scale=torch.nn.Parameter(
-            torch.randn(SLOTS * ROWS, N, generator=g), requires_grad=False
+            torch.randn(SLOTS * ROWS, NS, generator=g), requires_grad=False
         ),
     )
 
@@ -178,19 +184,28 @@ def test_make_transport_falls_back_to_torch_without_tpu_sync(monkeypatch):
     assert type(mv.make_transport("torch")) is mv.TorchTransport
 
 
-def test_ensure_movable_rehomes_views_and_leaves_whole_storages_alone():
-    base = torch.arange(2 * SLOTS * K * N, dtype=torch.int32).to(torch.uint8)
-    view = base.view(2, SLOTS, K, N)[1]  # a slot-major view into a larger storage
-    assert not mv.spans_storage(view)
-    whole = torch.zeros(SLOTS * ROWS, N)
-    assert mv.spans_storage(whole)
-    module = SimpleNamespace(
-        local_num_experts=SLOTS,
-        w13_weight=torch.nn.Parameter(view, requires_grad=False),
-        w13_weight_scale=torch.nn.Parameter(whole, requires_grad=False),
-    )
-    assert mv.ensure_movable(module) == 1
-    assert mv.spans_storage(module.w13_weight.data)
-    torch.testing.assert_close(module.w13_weight.data, view)
-    assert module.w13_weight_scale.data.data_ptr() == whole.data_ptr()  # untouched
-    assert mv.ensure_movable(module) == 0
+def test_regions_are_whole_4k_blocks_of_the_storage():
+    t = torch.zeros((SLOTS, K, N), dtype=torch.uint8)
+    assert mv.slot_region(t, 3) == (3 * 4096, 4096)
+    scale = torch.zeros((SLOTS * ROWS, NS))
+    module = SimpleNamespace(local_num_experts=SLOTS)
+    assert mv.rows_region(scale, module, 2) == (2 * 4096, 4096)
+    view = torch.zeros((2, SLOTS, K, N), dtype=torch.uint8)[1]  # offset view
+    assert mv.slot_region(view, 0) == (SLOTS * 4096, 4096)
+    assert mv.storage_blocks(view).shape == (2 * SLOTS, 32, 128)
+    with pytest.raises(ValueError, match="4 KiB"):
+        mv.slot_region(torch.zeros((SLOTS, 3, 5), dtype=torch.uint8), 1)
+
+
+def test_an_offset_view_is_addressed_through_its_storage():
+    base = torch.randint(0, 255, (2, SLOTS, K, N), dtype=torch.int32).to(torch.uint8)
+    view = base[1]
+    transport = mv.TorchTransport()
+    off, nbytes = mv.slot_region(view, 2)
+    future, host = transport.d2h(view, off, nbytes)
+    assert future.is_ready()
+    torch.testing.assert_close(host.view(K, N), base[1, 2])
+    other = torch.zeros((2, SLOTS, K, N), dtype=torch.uint8)
+    transport.h2d(host, other[0], mv.slot_region(other[0], 4)[0])
+    torch.testing.assert_close(other[0, 4], base[1, 2])
+    assert int(other[1].sum()) == 0 and int(other[0, :4].sum()) == 0

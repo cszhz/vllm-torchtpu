@@ -403,7 +403,7 @@ def test_a_solved_generation_moves_exactly_the_bytes_its_table_names():
     nxt = layouts[0]
     plan = rl.Plan(1, 0, layouts, moves)
     # Each rank's weights: slot s of rank r holds bytes that spell the expert.
-    k, n = 4, 8
+    k, n = 32, 32  # a slot of int32 is one 4 KiB block
 
     def weights(rank):
         w = torch.zeros((active + staging, k, n), dtype=torch.int32)

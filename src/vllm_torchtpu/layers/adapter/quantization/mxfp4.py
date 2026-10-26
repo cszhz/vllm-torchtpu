@@ -801,19 +801,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 persistent=False,
             )
             # The kernel's e_total is this rank's slots times the EP width.
-            if envs.TPU_MOE_EPLB_DYNAMIC:
-                # The dynamic re-layout moves slots between ranks by raw
-                # transfer, which needs each expert tensor to be its own
-                # storage; the quantizer hands back views.
-                from vllm_torchtpu import expert_mover
-
-                rehomed = expert_mover.ensure_movable(layer, sync=synchronize_tensors)
-                if rehomed:
-                    logger.info_once(
-                        "expert relayout: %d expert tensors re-homed into their own "
-                        "storage for the mover",
-                        rehomed,
-                    )
             expert_load.register(
                 layer,
                 physical=layer.w13_weight.shape[0] * layer.moe_config.ep_size,

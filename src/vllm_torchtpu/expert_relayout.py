@@ -742,6 +742,12 @@ def arm(
         min_gain=envs.TPU_MOE_EPLB_MIN_GAIN,
         warmup_steps=envs.TPU_MOE_EPLB_WARMUP_STEPS or None,
     )
+    first = next(iter(kept_modules.values()))
+    try:
+        parts = expert_mover.describe_parts(first)
+    except RuntimeError as e:  # a layer without expert tensors (tests' fakes)
+        parts = str(e)
+    logger.info("expert relayout | first placed layer's tensors: %s", parts)
     logger.info(
         "expert relayout armed | rank %d of %d | groups %s | %d layers | "
         "window %d steps "
