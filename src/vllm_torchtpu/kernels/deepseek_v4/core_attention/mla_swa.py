@@ -25,6 +25,8 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+# Decode batch size used when a step has at most this many decode sequences.
+SMALL_DECODE_SEQ_BATCH = 4
 
 
 def cdiv(a, b):
@@ -925,7 +927,7 @@ def get_physical_layout(
     )
 
 
-def _mla_batched_decode_kernel(
+def _mla_batched_decode_pipeline(
     # Prefetch
     kv_lens_ref,  # [max_num_seqs]
     page_indices_ref,  # [max_num_seqs * pages_per_seq]
@@ -1305,6 +1307,49 @@ def _mla_batched_decode_kernel(
         def _():
             wait_send_bo(last_batch_idx - 1, (last_i - 1) % 2)
             wait_update_kv_cache(last_batch_idx - 1, (last_i - 1) % 2)
+
+
+def _mla_batched_decode_kernel(
+    kv_lens_ref,
+    page_indices_ref,
+    cu_q_lens_ref,
+    start_end_seq_idx_ref,
+    *refs,
+    seq_batch_sz: int,
+    **kwargs,
+):
+    """Runs the decode pipeline at a batch size that fits the decode count.
+
+    Every sequence of a batch costs its DMAs and its share of the batched
+    matmuls whether or not it exists, so a step with only a few decode tokens
+    (a prefill step) runs batches of `SMALL_DECODE_SEQ_BATCH` instead.
+    """
+    *io_refs, bkv_x2, q_x2, o_x2, l_x2, m_x2, sems = refs
+    num_decode_seqs = start_end_seq_idx_ref[1] - start_end_seq_idx_ref[0]
+
+    def run(batch_sz):
+        _mla_batched_decode_pipeline(
+            kv_lens_ref,
+            page_indices_ref,
+            cu_q_lens_ref,
+            start_end_seq_idx_ref,
+            *io_refs,
+            bkv_x2.at[:, :batch_sz],
+            q_x2.at[:, :batch_sz],
+            o_x2.at[:, :batch_sz],
+            l_x2.at[:, :batch_sz],
+            m_x2.at[:, :batch_sz],
+            sems,
+            seq_batch_sz=batch_sz,
+            **kwargs,
+        )
+
+    small = min(SMALL_DECODE_SEQ_BATCH, seq_batch_sz)
+    if small == seq_batch_sz:
+        run(seq_batch_sz)
+        return
+    pl.when(num_decode_seqs <= small)(lambda: run(small))
+    pl.when(num_decode_seqs > small)(lambda: run(seq_batch_sz))
 
 
 def run_mla_batched_decode_kernel(
