@@ -62,6 +62,7 @@ PATCHES = (
     # Environment setup and custom-op registration.
     Patch("vllm_torchtpu.env_override:_patch_jax_pallas_fori_lowering", ("import",)),
     Patch("vllm_torchtpu.kernels.pallas_hbm_pin:install_pallas_hbm_pin", ("import",)),
+    Patch("vllm_torchtpu.kernels.pallas_vmem_tight:install_pallas_vmem_tight", ("import",)),
     # TODO(https://github.com/vllm-project/vllm-torchtpu/pull/1182): Remove
     # this patch once the pinned TorchTPU supports tuple-axis PartitionSpecs
     # in both get_global_shape and get_local_shape.

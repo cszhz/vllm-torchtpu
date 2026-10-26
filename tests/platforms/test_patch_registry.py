@@ -226,6 +226,7 @@ def test_manifest_preserves_lifecycle_dependencies():
     assert stages["import"] == [
         "_patch_jax_pallas_fori_lowering",
         "install_pallas_hbm_pin",
+        "install_pallas_vmem_tight",
     ]
     assert stages["engine_core"] == [
         "_patch_vllm_hybrid_pcp_block_sizes",
