@@ -30,6 +30,8 @@ Because none of these tests dispatch a kernel, they run the same way on any
 TPU generation and on CPU.
 """
 
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -277,3 +279,60 @@ class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
                 NOPE_SPEC,
                 ROPE_SC_SPEC,
             )
+
+    @parameterized.parameters(False, True)
+    def test_split_q_plumbing(self, split_q: bool):
+        """`TPU_MLA_SPARSE_SPLIT_Q` passes `q_pe` separately instead of
+        concatenating `[ql_nope, q_pe]` before the kernel call."""
+        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
+        ql_nope = jnp.ones((4, 2, LKV_DIM), jnp.bfloat16)
+        q_pe = jnp.ones((4, 2, ROPE_DIM), jnp.bfloat16)
+        recorded: dict[str, object] = {}
+
+        def fake_kernel(q, kv_nope, kv_rope, *args, **kwargs):
+            del kv_nope, kv_rope, args
+            recorded["q_shape"] = q.shape
+            recorded["has_q_pe"] = "q_pe" in kwargs
+            if "q_pe" in kwargs:
+                recorded["q_pe_shape"] = kwargs["q_pe"].shape
+            return q[..., :LKV_DIM]
+
+        with (
+            mock.patch.object(
+                attention_interface.envs, "TPU_MLA_SPARSE_SPLIT_Q", split_q
+            ),
+            mock.patch.object(
+                attention_interface,
+                "sparse_mla_ragged_paged_attention",
+                side_effect=fake_kernel,
+            ),
+            mock.patch.object(
+                attention_interface,
+                "update_sparse_mla_kv_cache",
+                side_effect=lambda nope, rope, *a, **kw: (nope, rope),
+            ),
+        ):
+            _, _, out = attention_interface.sparse_mla_attention(
+                ql_nope,
+                q_pe,
+                jnp.zeros((4, LKV_DIM), jnp.float8_e4m3fn),
+                jnp.zeros((4, ROPE_DIM), jnp.float8_e4m3fn),
+                jnp.zeros(NOPE_SPEC.shape, NOPE_SPEC.jax_dtype),
+                jnp.zeros(ROPE_SPEC.shape, ROPE_SPEC.jax_dtype),
+                jnp.zeros((4, 1), jnp.int32),
+                jnp.ones((1,), jnp.int32),
+                jnp.zeros((4,), jnp.int32),
+                jnp.array([0, 4], jnp.int32),
+                jnp.array([0, 0, 1], jnp.int32),
+                mesh,
+                NOPE_SPEC,
+                ROPE_SPEC,
+            )
+
+        self.assertEqual(out.shape, (4, 2, LKV_DIM))
+        self.assertEqual(recorded["has_q_pe"], split_q)
+        if split_q:
+            self.assertEqual(recorded["q_shape"], (4, 2, LKV_DIM))
+            self.assertEqual(recorded["q_pe_shape"], (4, 2, ROPE_DIM))
+        else:
+            self.assertEqual(recorded["q_shape"], (4, 2, LKV_DIM + ROPE_DIM))
