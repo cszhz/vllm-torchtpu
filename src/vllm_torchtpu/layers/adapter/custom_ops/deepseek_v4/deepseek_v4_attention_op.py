@@ -247,16 +247,34 @@ def _attention_hca_rope(
     *,
     head_dim: int,
     q_eps: float,
-    **kwargs,
+    sm_scale: float,
+    sliding_window: int,
+    logical_page_size: int,
+    swa_only: bool,
+    two_caches_same_buffer: bool,
+    hca_num_kv_pages_per_block: tuple[int, int, int],
+    hca_num_queries_per_block: tuple[int, int, int],
+    non_causal_block: bool = False,
+    verify_q_len: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """`_attention_hca` with the q per-head RMSNorm + RoPE and the kv RoPE inside
     (TPU_DSV4_FUSED_HCA_ROPE): in the fused kernel's prologue when it serves the
     step, else the stock rope kernels then `_attention_hca`."""
     from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 
+    kwargs = dict(
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        logical_page_size=logical_page_size,
+        swa_only=swa_only,
+        two_caches_same_buffer=two_caches_same_buffer,
+        hca_num_kv_pages_per_block=hca_num_kv_pages_per_block,
+        hca_num_queries_per_block=hca_num_queries_per_block,
+        non_causal_block=non_causal_block,
+        verify_q_len=verify_q_len,
+    )
     T = q_flat.shape[0]
     H = q_flat.shape[1] // head_dim
-    verify_q_len = kwargs.get("verify_q_len")
     chunk = verify_q_len or 8
     if (
         main_cache_kv.shape[0] != 0
