@@ -411,6 +411,9 @@ class VllmDeepseekV4MLAAttention(
                 ),
                 "csa_gather_no_pad": envs.TPU_DSV4_CSA_GATHER_NO_PAD,
                 "union_dense": envs.TPU_DSV4_CSA_UNION_DENSE,
+                "union_verify": envs.TPU_DSV4_SMLA_UNION_VERIFY,
+                "union_verify_max_tokens": envs.TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS,
+                "union_verify_early": envs.TPU_DSV4_SMLA_UNION_VERIFY_EARLY,
                 "union_dense_min_tokens": envs.TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS,
                 "union_dense_rows_per_token": (
                     envs.TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN

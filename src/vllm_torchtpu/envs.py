@@ -188,6 +188,9 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     TPU_DSV4_CSA_GATHER_NO_PAD: bool = True
     TPU_DSV4_CSA_UNION_DENSE: bool = False
+    TPU_DSV4_SMLA_UNION_VERIFY: bool = False
+    TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS: int = 128
+    TPU_DSV4_SMLA_UNION_VERIFY_EARLY: bool = True
     TPU_DSV4_QNORM_ROPE_FLAT: bool = False
     TPU_DSV4_ROPE_QUANT_FLAT: bool = False
     TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS: int = 512
@@ -1322,6 +1325,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Same keys per token. A step whose union rows exceed ROWS_PER_TOKEN x
     # tokens (where it would not pay) falls back to the sparse path.
     "TPU_DSV4_CSA_UNION_DENSE": env_bool("TPU_DSV4_CSA_UNION_DENSE"),
+    # CSA decode buckets (T <= ..._MAX_TOKENS, a power of 2): cut every request
+    # into windows of <= 8 tokens (a speculative verify window is one) and
+    # attend each window's union of top-k rows once (`csa_window_union`: one
+    # SparseCore call dedups, ranks and gathers the union rows and writes each
+    # token's keep mask; one TensorCore call attends all windows), instead of
+    # gathering and pushing every token's own 1024 rows. Same keys per token;
+    # no context cap, no runtime fallback.
+    "TPU_DSV4_SMLA_UNION_VERIFY": env_bool("TPU_DSV4_SMLA_UNION_VERIFY"),
+    "TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS": env_int(
+        "TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS", 128
+    ),
+    # Issue the union SparseCore call as soon as the top-k exists (it then runs
+    # behind the SWA pass on the TensorCore) instead of after the SWA pass.
+    "TPU_DSV4_SMLA_UNION_VERIFY_EARLY": env_bool(
+        "TPU_DSV4_SMLA_UNION_VERIFY_EARLY", True
+    ),
     "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS": env_int(
         "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS", 512
     ),

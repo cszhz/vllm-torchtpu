@@ -26,7 +26,10 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_union_dense
+from vllm_torchtpu.kernels.deepseek_v4.core_attention import (
+    csa_union_dense,
+    csa_window_union,
+)
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import fused_hca_decode
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import (
     mla_ragged_paged_attention,
@@ -369,6 +372,9 @@ def _attention_csa(
     union_dense_plan_unconditional: bool = False,
     topk_after_q_above: int = 0,
     topk_after_kv: bool = False,
+    union_verify: bool = False,
+    union_verify_max_tokens: int = 128,
+    union_verify_early: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -459,9 +465,36 @@ def _attention_csa(
             ),
             unconditional=union_dense_plan_unconditional and q.shape[1] > 16,
         )
-    extra, swa_output, union_plan = jax.lax.optimization_barrier(
-        (extra, swa_output, union_plan)
+    # Decode buckets: union of each <= 8-token window (`csa_window_union`).
+    # Its SparseCore call needs only the top-k and the compressed cache, so it
+    # is issued here and runs behind the SWA pass -- unless the compressed
+    # cache is the SWA kernel's output buffer.
+    use_union_verify = (
+        union_verify
+        and not use_union_dense
+        and q.shape[0] <= union_verify_max_tokens
     )
+    union_rows = None
+    if use_union_verify and union_verify_early and not two_caches_same_buffer:
+        union_rows = csa_window_union.prepare(
+            extra, main_kv_lens, main_page_indices, main_cu_q_lens,
+            main_distribution, main_cache_kv, main_cache_rope,
+        )  # fmt: skip
+    extra, swa_output, union_plan, union_rows = jax.lax.optimization_barrier(
+        (extra, swa_output, union_plan, union_rows)
+    )
+
+    if use_union_verify:
+        if union_rows is None:
+            union_rows = csa_window_union.prepare(
+                extra, main_kv_lens, main_page_indices, main_cu_q_lens,
+                main_distribution, main_cache_kv, main_cache_rope,
+            )  # fmt: skip
+        output = csa_window_union.attend(
+            q, union_rows, attention_sinks, swa_output, swa_l, swa_m,
+            sm_scale=sm_scale,
+        )  # fmt: skip
+        return output, updated_sw_cache
 
     if use_union_dense:
         output = csa_union_dense.attention(
