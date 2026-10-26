@@ -34,7 +34,7 @@ ROW_QUANT_MIN_TOKENS = 512
 ROW_QUANT_TILE_BYTES = 2 * 1024 * 1024
 ROW_QUANT_MIN_STEPS = 4
 # Rows reduced and quantized together: one fp8 (32, 128) tile high.
-ROW_QUANT_ROW_GROUP = 32
+ROW_QUANT_ROW_GROUP = 64
 # Columns per amax/quantize step inside a row group.
 ROW_QUANT_COL_CHUNK = 512
 
