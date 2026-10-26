@@ -200,6 +200,22 @@ def win128(conc):
     return _region(conc, window_mixed=True, window_mixed_above=128, window_mixed_min_heads=1)
 
 
+def c16cfg(conc):
+    """Proposed c16 env: TPU_DSV4_CSA_WINDOW_MIXED=1, _ABOVE=128, _GROUPS=4 (MIN_HEADS 32, MAX_TOKENS 2048 defaults)."""
+    return _region(conc, window_mixed=True, window_mixed_above=128, window_mixed_min_heads=32, window_mixed_groups=4,
+                   window_mixed_max_tokens=2048)
+
+
+def tp8cfg(conc, groups=1):
+    """Proposed c4/c8 env: _MIXED=1, _ABOVE=128, _MIN_HEADS=16, _MAX_TOKENS=1024 (T2048 stays union-dense)."""
+    return _region(conc, window_mixed=True, window_mixed_above=128, window_mixed_min_heads=16,
+                   window_mixed_groups=groups, window_mixed_max_tokens=1024)
+
+
+def tp8cfg_g4(conc):
+    return tp8cfg(conc, groups=4)
+
+
 def win_g2(conc):
     return _region(conc, window_mixed=True, window_mixed_above=256, window_mixed_min_heads=1, window_mixed_groups=2)
 
@@ -245,4 +261,4 @@ def win_bf16p(conc):
     return _patched(win(conc), cwu, L2_CONFIG=dict(cwu.L2_CONFIG, pv_bf16=True))
 
 
-ARMS = {"win128": win128, "win_l2": win_l2, "win_l1_nog": win_l1_nog, "inc": inc, "win": win, "win_g2": win_g2, "win_g4": win_g4, "sparse": sparse, "win_l1": win_l1, "win_bf16p": win_bf16p}
+ARMS = {"c16cfg": c16cfg, "tp8cfg": tp8cfg, "tp8cfg_g4": tp8cfg_g4, "win128": win128, "win_l2": win_l2, "win_l1_nog": win_l1_nog, "inc": inc, "win": win, "win_g2": win_g2, "win_g4": win_g4, "sparse": sparse, "win_l1": win_l1, "win_bf16p": win_bf16p}
