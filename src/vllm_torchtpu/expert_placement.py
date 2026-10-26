@@ -86,7 +86,13 @@ _GROUP_ATTR = "_tpu_expert_group"
 # process. The fetch-time filter consults the layout only for these, so a model
 # whose MoE method never applied it keeps the default filter.
 _APPLIED_LAYERS: set[tuple[str, int]] = set()
+# (group, layer index) -> the placed layer module, for the dynamic re-layout
+# (its tables to install, its weights to move). Modules live as long as the
+# model; this process holds one model.
+_LAYER_MODULES: dict[tuple[str, int], object] = {}
 _LOCK = threading.Lock()
+# The layer attribute naming its (group, layer index) under the layout.
+LAYOUT_KEY_ATTR = "_tpu_layout_key"
 
 
 @dataclass(frozen=True)
@@ -437,8 +443,10 @@ def apply_to_layer(layer) -> bool:
         persistent=False,
     )
     setattr(layer, _GROUP_ATTR, group_name)
+    setattr(layer, LAYOUT_KEY_ATTR, (group_name, layer_idx))
     with _LOCK:
         _APPLIED_LAYERS.add((group_name, layer_idx))
+        _LAYER_MODULES[(group_name, layer_idx)] = layer
     logger.info_once(
         "Expert layout %s applied (%s group): rank %d of %d, %d placed layers, "
         "%d slots per rank; first placed layer holds %s",
@@ -456,6 +464,38 @@ def apply_to_layer(layer) -> bool:
 def expert_slot_table(layer):
     """The [experts, replicas] i32 slot table of a placed layer, or None."""
     return getattr(layer, EXPERT_SLOT_ATTR, None)
+
+
+def applied_layers() -> dict[tuple[str, int], object]:
+    """(group, layer index) -> placed layer module, for every applied layer."""
+    with _LOCK:
+        return dict(_LAYER_MODULES)
+
+
+def layout_key(layer) -> tuple[str, int] | None:
+    """The (group, layer index) a placed layer follows, or None."""
+    return getattr(layer, LAYOUT_KEY_ATTR, None)
+
+
+def install_table(layer, table) -> None:
+    """Write new slot-table VALUES into a placed layer's table buffer.
+
+    The buffer's shape (experts x replica cap) is a compiled-program input and
+    does not change; the values do, between two steps, once every rank has the
+    experts the new table names in the slots it names (expert_relayout.py).
+    """
+    import torch
+
+    buf = expert_slot_table(layer)
+    if buf is None:
+        raise RuntimeError(f"{getattr(layer, 'layer_name', layer)} has no slot table")
+    new = torch.as_tensor(table, dtype=torch.int32)
+    if tuple(new.shape) != tuple(buf.shape):
+        raise ValueError(
+            f"slot table {tuple(new.shape)} does not match the layer's "
+            f"{tuple(buf.shape)}; the replica cap is fixed at load"
+        )
+    buf.copy_(new.to(buf.device))
 
 
 def physical_experts(layer) -> int | None:

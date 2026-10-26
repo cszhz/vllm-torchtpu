@@ -111,10 +111,13 @@ def rebalance_experts_global(
     num_physical_experts: int,
     num_local_physical_experts: int,
     unique_per_rank: bool = True,
+    max_copies: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Replicate hot experts into the spare slots, then pack every copy.
 
     tokens_per_expert: [num_steps, num_layers, num_logical]
+    max_copies caps the copies of one expert (a dynamic layout's fixed slot
+    table width); None leaves the one-copy-per-rank bound alone.
 
     Returns
       physical_to_logical_map [num_layers, num_physical]
@@ -155,6 +158,9 @@ def rebalance_experts_global(
     # With one copy per rank at most, an expert can have as many copies as
     # there are ranks; the replication loop stops offering it beyond that.
     num_ranks = max(num_physical_experts // max(num_local_physical_experts, 1), 1)
+    copy_cap = num_ranks if max_copies is None else min(num_ranks, int(max_copies))
+    if copy_cap < 1:
+        raise ValueError(f"max_copies must be >= 1; got {max_copies}")
     for i in range(num_redundant_experts):
         score = tokens_per_expert_all_diff / logical_count
         score_added = tokens_per_expert / (logical_count + 1)
@@ -163,8 +169,9 @@ def rebalance_experts_global(
         score.scatter_(-1, indices, score_added.gather(-1, indices))
         values.scatter_(-1, indices, score.max(-1, keepdim=True).values)
         summed = values.sum(0)
-        if unique_per_rank:
-            summed = summed.masked_fill(logical_count >= num_ranks, float("inf"))
+        if unique_per_rank or max_copies is not None:
+            bound = copy_cap if unique_per_rank else int(max_copies)
+            summed = summed.masked_fill(logical_count >= bound, float("inf"))
         redundancy_indices = summed.argmin(-1)  # [num_moe_layers]
 
         physical_index = num_logical_experts + i

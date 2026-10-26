@@ -77,6 +77,22 @@ def commit(layer, updated: torch.Tensor) -> None:
     getattr(layer, LOAD_ATTR).copy_(updated)
 
 
+def snapshot() -> dict[tuple[str, int], np.ndarray]:
+    """Every registered layer's cumulative counts, keyed by its layout
+    (group, layer index), as int64 host arrays. The counts are replicated
+    sums, identical on every rank after the same step, which is what lets
+    the dynamic re-layout solve without a collective (expert_relayout.py)."""
+    from vllm_torchtpu import expert_placement
+
+    out = {}
+    for name, layer, _ in _REGISTERED:
+        key = expert_placement.layout_key(layer)
+        if key is None:
+            continue
+        out[key] = getattr(layer, LOAD_ATTR).cpu().numpy().astype(np.int64)
+    return out
+
+
 def summarize(window: np.ndarray, ep: int) -> dict:
     """Per-layer balance of a [physical] row-count window over `ep` ranks."""
     per_rank = window.reshape(ep, -1).sum(axis=1)
