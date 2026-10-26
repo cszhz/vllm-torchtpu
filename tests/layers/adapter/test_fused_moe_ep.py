@@ -1221,3 +1221,60 @@ def test_forward_passes_the_slot_table_after_the_routing_operands():
         bridge.fused_moe_ep(owner, x, w1, w2, s1, s2, logits, bias, None, table)
     args = op.call_args.args
     assert args[-3] == "rank" and args[-2] is bias and args[-1] is table
+
+
+# ---------------------------------------------------------------------------
+# Routed-row accumulator (layers/adapter/expert_load.py): one more replicated,
+# donated operand and a second output.
+
+
+def test_op_with_the_load_accumulator_donates_it_and_returns_two_outputs():
+    with (
+        patch.object(bridge, "jax_op") as jax_op,
+        patch.dict(bridge._OPS, {}, clear=True),
+    ):
+        jax_op.side_effect = lambda *a, **k: MagicMock(register_fake=lambda f: None)
+        common = ("mesh", 2, True, "silu", None, False, "fp8", None, "softmax", True, 1.0, False)
+        with patch(
+            "vllm_torchtpu.compilation.moe_preprocessing.prepare_moe_preprocessing",
+            return_value=None,
+        ):
+            bridge._build_op(*common, has_expert_slot=True, has_expert_load=True)
+            bridge._build_op(*common, has_expert_slot=True, has_expert_load=False)
+    with_load, without = jax_op.call_args_list
+    # x, w1, w2, w1_scale, w2_scale, gating, rank, score_bias, expert_slot, expert_load
+    assert with_load.kwargs["donate_argnums"] == (9,)
+    assert len(with_load.kwargs["input_partition_specs"]) == 10
+    assert with_load.kwargs["output_partition_specs"] == (
+        bridge.PartitionSpec(bridge.EP_AXIS_NAME),
+        bridge.PartitionSpec(),
+    )
+    assert with_load.args[1].__name__ == "moe_with_score_bias_expert_slot_expert_load"
+    # torch_tpu derives the op schema from the annotations: two outputs here,
+    # one for the placed-only closure.
+    import inspect
+
+    assert inspect.signature(with_load.args[1]).return_annotation == tuple[jnp.ndarray, jnp.ndarray] or (
+        inspect.signature(with_load.args[1]).return_annotation == tuple[bridge.jax.Array, bridge.jax.Array]
+    )
+    assert inspect.signature(without.args[1]).return_annotation is bridge.jax.Array
+    assert without.kwargs["donate_argnums"] is None
+    assert without.kwargs["output_partition_specs"] == bridge.PartitionSpec(bridge.EP_AXIS_NAME)
+
+
+def test_forward_writes_the_returned_accumulator_back():
+    load = torch.zeros(8, dtype=torch.int32)
+    updated = torch.arange(8, dtype=torch.int32)
+    op = MagicMock(return_value=("out", updated))
+    owner = SimpleNamespace(**{bridge.FUSED_MOE_EP_OP_ATTR: op})
+    w1 = torch.zeros(2, 4, 8, dtype=torch.float8_e4m3fn)
+    w2 = torch.zeros(2, 4, 4, dtype=torch.float8_e4m3fn)
+    s1 = torch.ones(2, 1, 1, 8)
+    s2 = torch.ones(2, 1, 1, 4)
+    with patch.object(bridge, "_RANK_BUFFER", "rank"):
+        out = bridge.fused_moe_ep(
+            owner, torch.zeros(3, 4), w1, w2, s1, s2, torch.zeros(3, 4), None, None, None, load
+        )
+    assert out == "out"
+    assert op.call_args.args[-1] is load
+    assert load.tolist() == list(range(8))

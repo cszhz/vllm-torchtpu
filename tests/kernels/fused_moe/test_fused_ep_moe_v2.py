@@ -1237,3 +1237,32 @@ def test_replica_rows_split_evenly_between_the_copies():
         for k in (2, 3):
             held = table[ids[:, k]]
             assert np.all((slots[:, k] == held[:, 0]) | (slots[:, k] == held[:, 1]))
+
+
+def test_expert_load_counts_the_rows_per_physical_slot():
+    """With an accumulator the layer returns it plus this step's rows per
+    physical slot, the same on every shard, and the output is unchanged."""
+    mesh = _mesh()
+    e_total, tokens, topk = 32, 256, 4
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 81, hidden=1024, inter=512, e_total=e_total, rhs_qb=512
+    )
+    x, gating = _make_inputs(mesh, 82, tokens=tokens, hidden=1024, e_total=e_total)
+    hash_ids = _make_hash_ids(mesh, 83, tokens=tokens, topk=topk, e_total=e_total)
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        hash_topk_ids=hash_ids,
+    )
+    plain = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    load = jnp.full((e_total,), 5, jnp.int32)
+    out, updated = fused_ep_moe_v2(x, *weights, *scales, gating, expert_load=load, **common)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(plain))
+    expected = 5 + np.bincount(np.asarray(hash_ids).ravel(), minlength=e_total)
+    np.testing.assert_array_equal(np.asarray(updated), expected)

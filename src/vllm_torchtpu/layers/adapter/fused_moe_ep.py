@@ -53,6 +53,7 @@ from torch_tpu._internal.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu import expert_placement
+from vllm_torchtpu.layers.adapter import expert_load as expert_load_tap
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
@@ -186,6 +187,7 @@ def _build_op(
     token_replica_groups=None,
     logical_intermediate_size: int | None = None,
     has_expert_slot=False,
+    has_expert_load=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -215,6 +217,7 @@ def _build_op(
         token_replica_groups,
         logical_intermediate_size,
         has_expert_slot,
+        has_expert_load,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -331,19 +334,25 @@ def _build_op(
         + ((spec,) if has_hash_ids else ())
         # The slot table is indexed by global expert id too: replicated.
         + ((PartitionSpec(),) if has_expert_slot else ())
+        # The routed-row accumulator is per physical slot and identical on
+        # every shard: replicated, donated, returned as a second output.
+        + ((PartitionSpec(),) if has_expert_load else ())
     )
+    load_argnum = 7 + has_score_bias + has_hash_ids + has_expert_slot
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
     # came back claiming the mesh-wide 16384; `sharded_jax_op`, a local copy of
     # JaxCallable with that one line replaced, was the way around it. Torchtpu
     # takes output_partition_specs itself now, which is the same information
     # without a copy of anyone's source.
-    if has_expert_slot:
+    if has_expert_slot or has_expert_load:
         fn = _operand_fn(
             call,
             ("score_bias",) * has_score_bias
             + ("hash_topk_ids",) * has_hash_ids
-            + ("expert_slot",),
+            + ("expert_slot",) * has_expert_slot
+            + ("expert_load",) * has_expert_load,
+            outputs=2 if has_expert_load else 1,
         )
     elif has_score_bias:
         fn = moe_with_score_bias
@@ -356,16 +365,25 @@ def _build_op(
         fn,
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
-        # [, expert_slot] -- and the single output is sharded on axis 0 like x.
+        # [, expert_slot] [, expert_load] -- and the output is sharded on
+        # axis 0 like x, followed by the updated accumulator when it is taken.
         input_partition_specs=input_specs,
-        output_partition_specs=spec,
+        output_partition_specs=(spec, PartitionSpec()) if has_expert_load else spec,
+        donate_argnums=(load_argnum,) if has_expert_load else None,
     )
 
     # Replaces the fake jax_op installs, which resolves the output aval by
     # running a real `jax.export` every time Dynamo traces the op. This kernel
     # returns the rows it was given, so the answer is known without exporting.
-    def _fake(x, *_args, **_kwargs):
-        return torch.empty_like(x)
+    if has_expert_load:
+
+        def _fake(x, *args, **_kwargs):
+            return torch.empty_like(x), torch.empty_like(args[load_argnum - 1])
+
+    else:
+
+        def _fake(x, *_args, **_kwargs):
+            return torch.empty_like(x)
 
     op.register_fake(_fake)
     _OPS[key] = op
@@ -377,20 +395,26 @@ _OPERAND_DTYPES = {
     "score_bias": jnp.float32,
     "hash_topk_ids": jnp.int32,
     "expert_slot": None,
+    "expert_load": None,
 }
 
 
-def _operand_fn(call, names):
+def _operand_fn(call, names, outputs=1):
     """`call` behind the signature (x, w1, w2, w1_scale, w2_scale, gating,
     rank, *names), every operand annotated jax.Array as torch_tpu requires.
 
     The three fixed-arity functions in _build_op cover the unplaced layers and
-    keep their programs as they were; every combination with a slot table goes
-    through here instead of one more hand-written function per combination.
+    keep their programs as they were; every combination with a slot table or
+    an accumulator goes through here instead of one more hand-written function
+    per combination. `outputs` is how many arrays `call` returns: torch_tpu
+    derives the custom op's schema from the return annotation, so a tuple
+    result has to be declared as one (a single-array annotation makes
+    Dynamo's fake call fail on the two-array result).
     """
     import inspect
 
     fixed = ("x", "w1", "w2", "w1_scale", "w2_scale", "gating", "rank")
+    returns = jax.Array if outputs == 1 else tuple[(jax.Array,) * outputs]
 
     def fn(*operands):
         extra = dict(zip(names, operands[len(fixed) :], strict=True))
@@ -403,9 +427,9 @@ def _operand_fn(call, names):
     param = inspect.Parameter.POSITIONAL_OR_KEYWORD
     fn.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
         [inspect.Parameter(n, param, annotation=jax.Array) for n in fixed + names],
-        return_annotation=jax.Array,
+        return_annotation=returns,
     )
-    fn.__annotations__ = {n: jax.Array for n in fixed + names} | {"return": jax.Array}
+    fn.__annotations__ = {n: jax.Array for n in fixed + names} | {"return": returns}
     fn.__name__ = "moe_with_" + "_".join(names)
     return fn
 
@@ -421,6 +445,7 @@ def fused_moe_ep(
     score_bias: torch.Tensor | None = None,
     hash_ids: torch.Tensor | None = None,
     expert_slot: torch.Tensor | None = None,
+    expert_load: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -433,7 +458,9 @@ def fused_moe_ep(
     `score_bias` is the layer's `e_score_correction_bias`, [global experts]
     f32, and `hash_ids` is `hash_topk_ids_operand`'s [tokens, topk] i32 table
     lookup; `expert_slot` is a placed layer's slot table
-    (`expert_placement.expert_slot_table`). Each must be passed exactly when
+    (`expert_placement.expert_slot_table`); `expert_load` is the layer's
+    routed-row accumulator (`expert_load.operand`), donated to the op and
+    written back here. Each must be passed exactly when
     prebuild saw the corresponding thing on the layer -- prebuild built the
     op's signature around that. Getting it wrong is a torch arity error at the
     first call, not a wrong answer.
@@ -449,8 +476,16 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w1_scale),
             _squeeze_channel_scale_checked(w2_scale),
         )
-    extra = tuple(t for t in (score_bias, hash_ids, expert_slot) if t is not None)
-    return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+    extra = tuple(
+        t for t in (score_bias, hash_ids, expert_slot, expert_load) if t is not None
+    )
+    result = op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+    if expert_load is None:
+        return result
+    out, updated = result
+    # The operand was donated: the buffer holds nothing useful until this.
+    expert_load.copy_(updated)
+    return out
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
@@ -757,6 +792,7 @@ def prebuild_fused_moe_ep(
         token_replica_groups=token_replica_groups,
         logical_intermediate_size=logical_intermediate_size,
         has_expert_slot=placed is not None,
+        has_expert_load=expert_load_tap.enabled(),
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

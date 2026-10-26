@@ -81,6 +81,8 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
+    TPU_MOE_EXPERT_LOAD_LOG_EVERY: int = 0
+    TPU_MOE_EXPERT_LOAD_DIR: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -643,6 +645,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # additional_config.deepseek_v41.expert_layout. Empty: the checkpoint's
     # contiguous blocks.
     "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", ""),
+    # Every N steps, read back the fused EP kernel's per-slot routed row
+    # counts and log each layer's moe_lb (layers/adapter/expert_load.py);
+    # 0 leaves the program unchanged. TPU_MOE_EXPERT_LOAD_DIR also writes
+    # the counts as npz snapshots.
+    "TPU_MOE_EXPERT_LOAD_LOG_EVERY": lambda: int(
+        os.getenv("TPU_MOE_EXPERT_LOAD_LOG_EVERY", "0") or 0
+    ),
+    "TPU_MOE_EXPERT_LOAD_DIR": env_str("TPU_MOE_EXPERT_LOAD_DIR", ""),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(

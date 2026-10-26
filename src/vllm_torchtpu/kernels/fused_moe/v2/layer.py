@@ -300,6 +300,7 @@ def fused_ep_moe_v2(
     score_bias=None,
     hash_topk_ids=None,
     expert_slot=None,
+    expert_load=None,
     routed_scaling_factor=1.0,
     token_replica_groups=None,
     logical_intermediate_size=None,
@@ -393,6 +394,12 @@ def fused_ep_moe_v2(
     selected ids are mapped to slots before dispatch. Each token therefore
     gets the same experts and the same arithmetic, on whichever shard holds
     them. None is the identity: slot e holds expert e.
+
+    expert_load [e_total] i32, replicated, is a routed-row accumulator: with
+    it the layer returns (output, expert_load + this step's rows per physical
+    slot), the counts every shard already holds from the routing exchange.
+    The caller donates the operand and writes the result back (fused stage
+    only). None leaves the program as it is.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -547,6 +554,16 @@ def fused_ep_moe_v2(
             f"{tuple(expert_slot.shape)}"
         )
     replicated = has_expert_slot and expert_slot.shape[1] > 1
+    has_expert_load = expert_load is not None
+    if has_expert_load:
+        if stage != "fused":
+            raise ValueError("expert_load is accumulated by the fused stage only")
+        if expert_load.shape != (e_total,) or expert_load.dtype != jnp.int32:
+            raise ValueError(
+                f"expert_load must be i32 [{e_total}], one count per physical "
+                f"slot; got {jnp.dtype(expert_load.dtype).name}"
+                f"{tuple(expert_load.shape)}"
+            )
     if has_hash_ids:
         if hash_topk_ids.shape != (x.shape[0], topk):
             raise ValueError(
@@ -600,7 +617,17 @@ def fused_ep_moe_v2(
         hash_l = next(operands) if has_hash_ids else None
         score_bias_l = next(operands) if has_score_bias else None
         expert_slot_l = next(operands) if has_expert_slot else None
-        return w1s_l, w2s_l, gate_l, hash_l, score_bias_l, expert_slot_l, operands
+        expert_load_l = next(operands) if has_expert_load else None
+        return (
+            w1s_l,
+            w2s_l,
+            gate_l,
+            hash_l,
+            score_bias_l,
+            expert_slot_l,
+            expert_load_l,
+            operands,
+        )
 
     def quantize_local(x_l, rank_l, gate_l, hash_l):
         """Split this shard's rows out of a replica group and quantize them.
@@ -735,11 +762,19 @@ def fused_ep_moe_v2(
         w2s_l,
         bias_it,
         out_dtype,
+        expert_load_l=None,
     ):
         """Plan, kernel and combine over the gathered rows and payload."""
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
+        )
+        # The step's rows per physical slot, summed over every source rank:
+        # identical on every shard, so the accumulator stays replicated.
+        updated_load = (
+            None
+            if expert_load_l is None
+            else expert_load_l + rows_by_dest.sum(axis=0).astype(jnp.int32)
         )
         gathered = GatheredPairs(
             expert_blocks=pairs_g.reshape(T * topk // block, block),
@@ -910,7 +945,8 @@ def fused_ep_moe_v2(
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
-        return token_layout.restore(combined, ax)
+        out = token_layout.restore(combined, ax)
+        return out if updated_load is None else (out, updated_load)
 
     from vllm_torchtpu.kernels.fused_moe.v2.preprocessing import (
         supports_activation_gather,
@@ -931,9 +967,16 @@ def fused_ep_moe_v2(
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
-        w1s_l, w2s_l, gate_l, hash_l, score_bias_l, expert_slot_l, bias_it = (
-            unpack_operands(scales_gating_biases)
-        )
+        (
+            w1s_l,
+            w2s_l,
+            gate_l,
+            hash_l,
+            score_bias_l,
+            expert_slot_l,
+            expert_load_l,
+            bias_it,
+        ) = unpack_operands(scales_gating_biases)
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
         if use_split_sc:
             from jax.experimental.compute_on import compute_on
@@ -980,12 +1023,13 @@ def fused_ep_moe_v2(
             w2s_l,
             bias_it,
             x_l.dtype,
+            expert_load_l,
         )
 
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """stage="route": the wire rows, router weights and payload."""
         del w1_l, w2_l
-        _, _, gate_l, hash_l, score_bias_l, expert_slot_l, _ = unpack_operands(
+        _, _, gate_l, hash_l, score_bias_l, expert_slot_l, _, _ = unpack_operands(
             scales_gating_biases
         )
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
@@ -1001,7 +1045,7 @@ def fused_ep_moe_v2(
     def compute_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases_routed):
         """stage="compute": the layer from route's outputs, rows gathered."""
         *scales_gating_biases, q_g, topk_weights, packed = scales_gating_biases_routed
-        w1s_l, w2s_l, _, _, _, _, bias_it = unpack_operands(scales_gating_biases)
+        w1s_l, w2s_l, _, _, _, _, _, bias_it = unpack_operands(scales_gating_biases)
         # Every block of q_g carries route's padding rows; drop them so token
         # t sits at row t of the mesh-order layout the kernel indexes.
         q_g = q_g.reshape(ep, t_wire, *q_g.shape[1:])[:, :t_local].reshape(
@@ -1060,9 +1104,10 @@ def fused_ep_moe_v2(
     hash_args = (hash_topk_ids,) if has_hash_ids else ()
     # Replicated for the same reason: it is indexed by global expert id.
     expert_slot_args = (expert_slot,) if has_expert_slot else ()
+    expert_load_args = (expert_load,) if has_expert_load else ()
     in_specs = (
         (P(ax),) * (5 + len(scale_args) + len(hash_args))
-        + (P(),) * (len(score_bias_args) + len(expert_slot_args))
+        + (P(),) * (len(score_bias_args) + len(expert_slot_args) + len(expert_load_args))
         + (P(ax),) * len(bias_args)
     )
     args = (
@@ -1072,6 +1117,7 @@ def fused_ep_moe_v2(
         + hash_args
         + score_bias_args
         + expert_slot_args
+        + expert_load_args
         + bias_args
     )
     if routed is not None:
@@ -1110,13 +1156,14 @@ def fused_ep_moe_v2(
         has_score_bias and cast(jax.Array, score_bias).dtype,
         has_hash_ids and hash_topk_ids.dtype,
         has_expert_slot and tuple(expert_slot.shape),
+        has_expert_load,
         float(routed_scaling_factor),
         stage,
         gather_positions,
         logical_intermediate_size,
     )
     body, out_specs = {
-        "fused": (local_fn, P(ax)),
+        "fused": (local_fn, (P(ax), P()) if has_expert_load else P(ax)),
         "route": (route_fn, (P(ax),) * 3),
         "compute": (compute_fn, P(ax)),
     }[stage]
