@@ -313,14 +313,53 @@ def device_inputs(inp, cache="random", poison=False):
              pages=jnp.asarray(inp["table"].reshape(-1)), cu=jnp.asarray(inp["cu"]), dist=jnp.asarray(inp["dist"]),
              sinks=jnp.asarray(rng.standard_normal(H).astype(np.float32) + (6.0 if inp["cell"].name == "edge-sink" else 0.0)),
              swa_acc=jnp.asarray(rng.standard_normal((T, H, D)).astype(np.float32) * 0.1).astype(jnp.bfloat16),
-             swa_l=jnp.asarray(rng.uniform(0.5, 4.0, (T, H)).astype(np.float32)),
-             swa_m=jnp.asarray(rng.uniform(-1.0, 3.0, (T, H)).astype(np.float32)))
+             swa_l=jnp.asarray(rng.uniform(4.0, 64.0, (T, H)).astype(np.float32)),
+             swa_m=jnp.asarray(rng.uniform(2.0, 8.0, (T, H)).astype(np.float32)))
     return d, deq
 
 
 # ---------------------------------------------------------------------------------------------- oracle + faults
 FAULTS = ("drop_union_row", "mask_leak", "page_shift", "stale_acc", "drop_tail_tile", "no_sink", "causal",
           "cross_request", "no_swa", "pad_token_leak")
+
+
+def _scores(inp, d, deq, t, idx):
+    q = np.asarray(d["q"][t].astype(np.float32), np.float64)
+    i = inp["seq_of"][t]
+    phys = inp["table"][i, idx // PAGE] * PAGE + idx % PAGE
+    return q @ deq[phys].T * SM_SCALE  # [H, k]
+
+
+_HEAVY = {}
+
+
+def _heavy_row(inp, d, deq, w):
+    key = (id(inp), id(d), w)
+    if key not in _HEAVY:
+        tk = inp["tk"]
+        best, row = -1.0, -1
+        for t in range(w * VQ, (w + 1) * VQ):
+            idx = tk[t][tk[t] >= 0]
+            if not idx.size:
+                continue
+            s = _scores(inp, d, deq, t, idx)
+            p = np.exp(s - s.max(1, keepdims=True))
+            p /= p.sum(1, keepdims=True)
+            k = np.unravel_index(np.argmax(p), p.shape)[1]
+            if p.max() > best:
+                best, row = p.max(), int(idx[k])
+        _HEAVY[key] = row
+    return _HEAVY[key]
+
+
+def _leak_row(inp, d, deq, t, idx):
+    tk = inp["tk"]
+    w0 = (t // VQ) * VQ
+    other = np.setdiff1d(np.unique(tk[w0:w0 + VQ][tk[w0:w0 + VQ] >= 0]), idx)
+    if not other.size:
+        return other.astype(idx.dtype)
+    s = _scores(inp, d, deq, t, other)
+    return other[[int(np.argmax(s.max(0)))]].astype(idx.dtype)
 
 
 def oracle(inp, d, deq, fault=None, frng=None):
@@ -340,13 +379,13 @@ def oracle(inp, d, deq, fault=None, frng=None):
         if i < 0:
             continue
         idx = tk[t][tk[t] >= 0]
-        if fault == "drop_union_row" and idx.size > 1 and t % VQ == 3:
-            idx = idx[1:]  # one union row missing for one token of each window
-        if fault == "mask_leak" and t % VQ == 2:  # a row of another token's list leaks into this token's mask
-            w0 = (t // VQ) * VQ
-            other = np.setdiff1d(np.unique(tk[w0:w0 + VQ][tk[w0:w0 + VQ] >= 0]), idx)
-            if other.size:
-                idx = np.concatenate([idx, other[:1]])
+        if fault == "drop_union_row" and i < inp["cell"].R:
+            # a union row missing for every token of the window; the instance is the union row carrying the most
+            # attention weight (a dropped row that carries ~0 weight is below bf16 rounding -> undetectable by design)
+            idx = idx[idx != _heavy_row(inp, d, deq, t // VQ)]
+        if fault == "mask_leak" and i < inp["cell"].R:
+            # this token's mask admits the window-union row (not in its own list) it would score highest
+            idx = np.concatenate([idx, _leak_row(inp, d, deq, t, idx)])
         if fault == "causal" and t % VQ == 6:  # attends the still-open compressed group (pre-fix bound)
             nv = (inp["pos"][t] + 1) // RATIO
             extra = np.arange(nv, inp["pos"][t] // RATIO + 2)
