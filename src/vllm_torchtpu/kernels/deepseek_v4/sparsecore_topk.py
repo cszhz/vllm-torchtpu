@@ -49,6 +49,7 @@ LANES = 16
 NUM_BUCKETS = 256
 # Read once at import: see `sparsecore_topk` (TPU_SC_TOPK_COOP_COND).
 _COOP_COND = __import__("os").environ.get("TPU_SC_TOPK_COOP_COND", "0") == "1"
+_NO_COOP = __import__("os").environ.get("TPU_SC_TOPK_NO_COOP", "0") == "1"
 # Half of a subcore's slice buffer, in 32-bit words (128KB of the 512KB tile
 # memory). Parts up to this long are double-buffered across waves; a longer part
 # (up to twice this) fills the whole buffer and is fetched single-buffered.
@@ -1077,7 +1078,9 @@ def sparsecore_topk(
         scheduling_group_id=scheduling_group_id,
         pad_rows=pad_rows,
     )
-    if n <= BY_LENGTH_SLOT_WORDS:
+    if n <= BY_LENGTH_SLOT_WORDS or _NO_COOP:
+        # _NO_COOP (TPU_SC_TOPK_NO_COOP=1): TIMING PROBE ONLY - rows longer than
+        # the by-length buffer (contexts past ~496k) are left empty.
         return by_length
     is_long = lengths > BY_LENGTH_SLOT_WORDS
 
