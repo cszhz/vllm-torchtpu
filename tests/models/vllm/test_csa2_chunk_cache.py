@@ -26,8 +26,9 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("fp8_index", [False, True])
 def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
-    monkeypatch, split
+    monkeypatch, split, fp8_index
 ):
     blocks, page_size = 4, 32
     specs = {
@@ -40,6 +41,17 @@ def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
             ("main", torch.uint8),
         )
     }
+    if fp8_index:
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import (
+            PackedFP8IndexerSpec,
+        )
+
+        specs["index"] = PackedFP8IndexerSpec(
+            block_size=page_size,
+            num_kv_heads=1,
+            head_size=132,
+            dtype=torch.uint8,
+        )
     swa_layers = frozenset(("swa", "swa_alias"))
     specs = cache_module.budget_native_swa(specs, swa_layers)
     assert cache_module.budget_native_swa(specs, swa_layers) == specs
@@ -87,6 +99,10 @@ def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
         blocks * page_bytes + blocks * specs["main"].num_states * 4
     )
     main = materialized.native_raw_cache["main"]
+    assert set(materialized.scale_pools) == {"main"}
+    if fp8_index:
+        assert materialized.native_raw_cache["index"] is main
+        assert materialized.native_cache_layouts["index"][0][-1] == 132
     main_banks = main if isinstance(main, tuple) else (main,)
     assert all(bank.dtype == torch.int32 for bank in main_banks)
     assert sum(bank.nbytes for bank in main_banks) == blocks * page_size * 1024
