@@ -415,6 +415,9 @@ class VllmDeepseekV4MLAAttention(
                 "union_verify_max_tokens": envs.TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS,
                 "union_verify_above": envs.TPU_DSV4_SMLA_UNION_VERIFY_ABOVE,
                 "union_verify_early": envs.TPU_DSV4_SMLA_UNION_VERIFY_EARLY,
+                "window_mixed": envs.TPU_DSV4_CSA_WINDOW_MIXED,
+                "window_mixed_above": envs.TPU_DSV4_CSA_WINDOW_MIXED_ABOVE,
+                "window_mixed_min_heads": envs.TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS,
                 "union_dense_min_tokens": envs.TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS,
                 "union_dense_rows_per_token": (
                     envs.TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN

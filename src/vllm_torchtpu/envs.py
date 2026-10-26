@@ -198,6 +198,9 @@ if TYPE_CHECKING:
     TPU_DSV4_QNORM_ROPE_FLAT: bool = False
     TPU_DSV4_ROPE_QUANT_FLAT: bool = False
     TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS: int = 512
+    TPU_DSV4_CSA_WINDOW_MIXED: bool = False
+    TPU_DSV4_CSA_WINDOW_MIXED_ABOVE: int = 256
+    TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS: int = 32
     TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
     TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
     TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4: int = 0
@@ -1363,6 +1366,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_SMLA_UNION_VERIFY_EARLY": env_bool(
         "TPU_DSV4_SMLA_UNION_VERIFY_EARLY", True
     ),
+    # CSA buckets of T > ..._ABOVE tokens (a power of 2, above the decode
+    # buckets) with at least ..._MIN_HEADS local heads (32 = TP4): attend each
+    # request's 8-token windows' unions (`csa_window_union`, the decode route's
+    # kernels run in SparseCore waves) instead of union-dense blocks. Same keys
+    # per token; no context cap, no runtime fallback.
+    "TPU_DSV4_CSA_WINDOW_MIXED": env_bool("TPU_DSV4_CSA_WINDOW_MIXED"),
+    "TPU_DSV4_CSA_WINDOW_MIXED_ABOVE": env_int("TPU_DSV4_CSA_WINDOW_MIXED_ABOVE", 256),
+    "TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS": env_int("TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS", 32),
     "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS": env_int(
         "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS", 512
     ),

@@ -94,6 +94,18 @@ def supported(num_tokens: int, max_num_seqs: int) -> bool:
     return num_tokens % 8 == 0 and nw_cap_for(num_tokens, max_num_seqs) <= nc * ns
 
 
+def waves_for(num_tokens: int, max_num_seqs: int, workers: int) -> int:
+    """SparseCore assignment waves: 1 when every window slot has a worker (the
+    decode layout), else ceil(nw_cap / workers) (mixed buckets)."""
+    return cdiv(nw_cap_for(num_tokens, max_num_seqs), workers)
+
+
+def supported_mixed(num_tokens: int, max_num_seqs: int, max_tokens: int = 2048) -> bool:
+    """Trace-time route condition for the mixed-bucket route (waves of windows;
+    the gathered buffer is T x 1024 rows, so T is capped)."""
+    return num_tokens % 8 == 0 and num_tokens <= max_tokens
+
+
 # ----------------------------------------------------------------------------
 # Window metadata (XLA; layer-invariant -> CSE'd once per step in the model).
 
@@ -109,7 +121,7 @@ def window_meta(cu_q_lens, distribution, kv_lens, *, num_tokens, s_cap, lanes=No
     nseq = cu_q_lens.shape[0] - 1
     kv_lens = kv_lens[:nseq]
     nw_cap = nw_cap_for(num_tokens, nseq)
-    assert nw_cap <= workers, (nw_cap, workers)
+    waves = cdiv(nw_cap, workers)
     seq_ids = jnp.arange(nseq, dtype=jnp.int32)
     qlen = cu_q_lens[1:] - cu_q_lens[:-1]
     live = (seq_ids < distribution[2]) & (qlen > 0)
@@ -128,6 +140,11 @@ def window_meta(cu_q_lens, distribution, kv_lens, *, num_tokens, s_cap, lanes=No
     # SparseCore assignment: G = workers // nw subcores per window, worker
     # wid -> (window wid // G, member wid % G); magic = ceil(2^16 / G) lets the
     # kernel divide small counts by G with a multiply and a shift.
+    if waves > 1:
+        arows = _wave_rows(nw, q0, qn, seq_b, S, nw_cap=nw_cap, workers=workers, waves=waves,
+                           L=L, max_team=max_team)
+        row0 = jnp.zeros((1, L), jnp.int32).at[0, 0].set(nw)
+        return jnp.concatenate([row0, wrows, arows], axis=0).reshape(-1)
     G = jnp.maximum(workers // jnp.maximum(nw, 1), 1)
     if max_team is not None:
         G = jnp.minimum(G, max_team)
@@ -146,6 +163,33 @@ def window_meta(cu_q_lens, distribution, kv_lens, *, num_tokens, s_cap, lanes=No
                    jnp.full_like(wid, nw)], axis=1).astype(jnp.int32))
     row0 = jnp.zeros((1, L), jnp.int32).at[0, 0].set(nw)
     return jnp.concatenate([row0, wrows, arows], axis=0).reshape(-1)
+
+
+def _wave_rows(nw, q0, qn, seq_b, S, *, nw_cap, workers, waves, L, max_team=None):
+    """Assignment rows of `waves` waves (i32[waves * workers, L]): wave k takes
+    windows [k * workers, k * workers + n_k), n_k = clip(nw - k * workers, 0,
+    workers), G_k = workers // n_k subcores per window (a short last wave splits
+    its windows over teams, as the decode layout does). Dead assignments get
+    window nw_cap (>= nw: skipped)."""
+    rows = []
+    wid = jnp.arange(workers, dtype=jnp.int32)
+    for k in range(waves):
+        n_k = jnp.clip(nw - k * workers, 0, workers)
+        G = jnp.maximum(workers // jnp.maximum(n_k, 1), 1)
+        if max_team is not None:
+            G = jnp.minimum(G, max_team)
+        loc = wid // G
+        live_w = loc < n_k
+        aw = jnp.where(live_w, k * workers + loc, nw_cap)
+        aj = wid % G
+        magic = (65536 + G - 1) // G
+        wsafe = jnp.minimum(aw, nw_cap - 1)
+        rows.append(jnp.zeros((workers, L), jnp.int32).at[:, :9].set(
+            jnp.stack([aw, aj, jnp.full_like(wid, G), jnp.full_like(wid, magic),
+                       jnp.where(live_w, q0[wsafe], 0), jnp.where(live_w, qn[wsafe], 0),
+                       jnp.where(live_w, seq_b[wsafe], 0), jnp.where(live_w, S[wsafe], 0),
+                       jnp.full_like(wid, nw)], axis=1).astype(jnp.int32)))
+    return jnp.concatenate(rows, axis=0)
 
 
 # ----------------------------------------------------------------------------
@@ -246,6 +290,8 @@ def _union_gather_kernel(
     nbuf: int = NBUF,
     sb_major_T: int = 0,
     nz_shifts: int = 4,
+    waves: int = 1,
+    workers: int = 32,
 ):
     # version 0: as first measured (j-6e9128d7). version 1: top-k / page-table
     # DMAs concurrent with the zero pass, zero pass 8 stores per iteration,
@@ -260,245 +306,257 @@ def _union_gather_kernel(
     wid = lax.axis_index("core") * num_subcores + lax.axis_index("subcore")
     zeros = jnp.zeros((L,), jnp.int32)
     ones = jnp.ones((L,), jnp.int32)
-    if version >= 2:
-        pltpu.sync_copy(meta_hbm.at[pl.ds((1 + nw_cap + wid) * L, L)], metab.at[pl.ds(0, L)])
-        a = metab[pl.ds(0, L)]
-        nw = a[8]
-    else:
-        pltpu.sync_copy(meta_hbm, metab)
-        nw = metab[pl.ds(0, L)][0]
-        a = metab[pl.ds((1 + nw_cap + wid) * L, L)]
-    w, j, G, magic = a[0], a[1], a[2], a[3]
 
-    def div_g(x):  # floor(x / G) for 0 <= x < 2^16 / 32
-        return srl(x * magic, 16)
-
-    @pl.when(w < nw)
-    def _window():
+    def _wave(v):
+        # `waves` > 1 (mixed buckets, more windows than workers): wave v's
+        # assignment rows follow wave v - 1's; waves == 1 is the decode layout.
         if version >= 2:
-            q0, qn, seq, S = a[4], a[5], a[6], a[7]
+            pltpu.sync_copy(meta_hbm.at[pl.ds((1 + nw_cap + v * workers + wid) * L, L)],
+                            metab.at[pl.ds(0, L)])
+            a = metab[pl.ds(0, L)]
+            nw = a[8]
         else:
-            m = metab[pl.ds((1 + w) * L, L)]
-            q0, qn, seq, S = m[0], m[1], m[2], m[3]
-        p_lo = srl(seq * pps, 3) * 8  # 32-byte-aligned superset of the row
-        p_off = seq * pps - p_lo
-        tk_dma = pltpu.make_async_copy(
-            topk_hbm.at[pl.ds(q0 * K, qn * K)], tkb.at[pl.ds(0, qn * K)], sl.at[0])
-        pg_dma = pltpu.make_async_copy(
-            pages_hbm.at[pl.ds(p_lo, pps_dma)], pageb.at[pl.ds(0, pps_dma)], sl.at[1])
-        tk_dma.start()
-        pg_dma.start()
-        if version == 0:
-            tk_dma.wait()
-            pg_dma.wait()
-        nvec = srl(srl(S + 7, WORD_SHIFT) + L - 1, 4)
-        if stop_after == "load":
-            if version >= 1:
+            pltpu.sync_copy(meta_hbm, metab)
+            nw = metab[pl.ds(0, L)][0]
+            a = metab[pl.ds((1 + nw_cap + v * workers + wid) * L, L)]
+        w, j, G, magic = a[0], a[1], a[2], a[3]
+
+        def div_g(x):  # floor(x / G) for 0 <= x < 2^16 / 32
+            return srl(x * magic, 16)
+
+        @pl.when(w < nw)
+        def _window():
+            if version >= 2:
+                q0, qn, seq, S = a[4], a[5], a[6], a[7]
+            else:
+                m = metab[pl.ds((1 + w) * L, L)]
+                q0, qn, seq, S = m[0], m[1], m[2], m[3]
+            p_lo = srl(seq * pps, 3) * 8  # 32-byte-aligned superset of the row
+            p_off = seq * pps - p_lo
+            tk_dma = pltpu.make_async_copy(
+                topk_hbm.at[pl.ds(q0 * K, qn * K)], tkb.at[pl.ds(0, qn * K)], sl.at[0])
+            pg_dma = pltpu.make_async_copy(
+                pages_hbm.at[pl.ds(p_lo, pps_dma)], pageb.at[pl.ds(0, pps_dma)], sl.at[1])
+            tk_dma.start()
+            pg_dma.start()
+            if version == 0:
                 tk_dma.wait()
                 pg_dma.wait()
-            return
+            nvec = srl(srl(S + 7, WORD_SHIFT) + L - 1, 4)
+            if stop_after == "load":
+                if version >= 1:
+                    tk_dma.wait()
+                    pg_dma.wait()
+                return
 
-        # Sequential: zero stores under a parallel_loop are not ordered against
-        # the scatters that follow (csa_union_dense).
-        if version == 0:
-            @pl.loop(0, nvec)
-            def _(i):
-                cnt[pl.ds(i * L, L)] = zeros
-        else:
-            @pl.loop(0, srl(nvec + 7, 3))
-            def _(i):
-                for u in range(8):
-                    cnt[pl.ds((i * 8 + u) * L, L)] = zeros
+            # Sequential: zero stores under a parallel_loop are not ordered against
+            # the scatters that follow (csa_union_dense).
+            if version == 0:
+                @pl.loop(0, nvec)
+                def _(i):
+                    cnt[pl.ds(i * L, L)] = zeros
+            else:
+                @pl.loop(0, srl(nvec + 7, 3))
+                def _(i):
+                    for u in range(8):
+                        cnt[pl.ds((i * 8 + u) * L, L)] = zeros
 
-            tk_dma.wait()
-            pg_dma.wait()
+                tk_dma.wait()
+                pg_dma.wait()
 
-        def ids(t, k):
-            c = tkb[pl.ds(t * K + k, L)]
-            v = (c >= 0) & (c < S)
-            return jnp.where(v, c, 0), v
+            def ids(t, k):
+                c = tkb[pl.ds(t * K + k, L)]
+                v = (c >= 0) & (c < S)
+                return jnp.where(v, c, 0), v
 
-        # Count pass: +1 in row c's nibble. At most WQ tokens select a row and
-        # a token's top-k rows are distinct, so a nibble never overflows.
-        @pl.loop(0, qn)
-        def _(t):
-            @plsc.parallel_loop(0, K, step=L, unroll=unroll)
-            def _(k):
-                c, v = ids(t, k)
-                plsc.addupdate_scatter(
-                    cnt, (srl(c, WORD_SHIFT),), jnp.left_shift(ones, (c & 7) * 4), mask=v
+            # Count pass: +1 in row c's nibble. At most WQ tokens select a row and
+            # a token's top-k rows are distinct, so a nibble never overflows.
+            @pl.loop(0, qn)
+            def _(t):
+                @plsc.parallel_loop(0, K, step=L, unroll=unroll)
+                def _(k):
+                    c, v = ids(t, k)
+                    plsc.addupdate_scatter(
+                        cnt, (srl(c, WORD_SHIFT),), jnp.left_shift(ones, (c & 7) * 4), mask=v
+                    )
+
+            if stop_after == "count":
+                return
+
+            # Prefix pass: per word the nonzero-nibble flags (bit 4i) and the rank
+            # of its first union row; U = total.
+            def prefix(i, carry):
+                x = cnt[pl.ds(i * L, L)]
+                # counts reach WQ = 8 (0b1000): all four nibble bits matter
+                nz = x
+                for sh in range(1, nz_shifts):  # 4 (test-only 3 reproduces the count-8 bug)
+                    nz = nz | srl(x, sh)
+                nz = nz & 0x11111111
+                pc = srl(nz * 0x11111111, 28)
+                cs = plsc.cumsum(pc)
+                base[pl.ds(i * L, L)] = cs - pc + carry
+                cnt[pl.ds(i * L, L)] = nz
+                return carry + cs[L - 1]
+
+            U = plsc.parallel_loop(0, nvec, unroll=2 if version >= 1 else 1, carry=jnp.int32(0))(prefix)
+
+            if stop_after == "prefix":
+                ubuf[...] = jnp.full((L,), U, jnp.int32)
+                pltpu.sync_copy(ubuf, ucnt_out.at[pl.ds(w * L, L)])
+                return
+
+            def rank_of(c, v):
+                wi = srl(c, WORD_SHIFT)
+                nzw = plsc.load_gather(cnt, [wi], mask=v)
+                bw = plsc.load_gather(base, [wi], mask=v)
+                below = nzw & (jnp.left_shift(ones, (c & 7) * 4) - 1)
+                return jnp.where(v, bw + srl(below * 0x11111111, 28), 0)
+
+            # Union rows by rank (every token; duplicates write equal values).
+            @pl.loop(0, qn)
+            def _(t):
+                @plsc.parallel_loop(0, K, step=L, unroll=unroll)
+                def _(k):
+                    c, v = ids(t, k)
+                    r = rank_of(c, v)
+                    pg = plsc.load_gather(pageb, [srl(c, page_shift) + p_off], mask=v)
+                    phys = jnp.left_shift(pg, page_shift) | (c & (page_size - 1))
+                    plsc.store_scatter(urow, [r], phys, mask=v)
+
+            if stop_after == "rank":
+                return
+
+            # Keep bitmasks of this member's tokens t = j, j + G, ...
+            ntok = jnp.where(j < qn, div_g(qn - j + G - 1), 0)
+
+            @pl.loop(0, ntok)
+            def _(kt):
+                t = j + kt * G
+
+                @pl.loop(0, W_WORDS // L)
+                def _(i):
+                    mrow[pl.ds(i * L, L)] = zeros
+
+                @plsc.parallel_loop(0, K, step=L, unroll=unroll)
+                def _(k):
+                    c, v = ids(t, k)
+                    r = rank_of(c, v)
+                    word = jnp.left_shift(srl(r, 12), 7) | (r & (LANES - 1))
+                    bit = srl(r, 7) & 31
+                    plsc.addupdate_scatter(mrow, (word,), jnp.left_shift(ones, bit), mask=v)
+
+                if sb_major_T:  # mask laid out [W / 128, T, 128]: super-block major
+                    for sb in range(W_WORDS // LANES):
+                        pltpu.sync_copy(
+                            mrow.at[pl.ds(sb * LANES, LANES)],
+                            mask_out.at[pl.ds((sb * sb_major_T + q0 + t) * LANES, LANES)],
+                        )
+                else:
+                    pltpu.sync_copy(mrow, mask_out.at[pl.ds((q0 + t) * W_WORDS, W_WORDS)])
+
+            @pl.when(j == 0)
+            def _():
+                ubuf[...] = jnp.full((L,), U, jnp.int32)
+                pltpu.sync_copy(ubuf, ucnt_out.at[pl.ds(w * L, L)])
+
+            if skip_gather:
+                return
+
+            # Pad the last 16-row chunk with distinct real rows of the window.
+            @pl.when(U > 0)
+            def _():
+                u0 = srl(U, 4) * L
+                r = u0 + lax.broadcasted_iota(jnp.int32, (L,), 0)
+                src = jnp.where(r < U, r, lax.rem(r - U, U))
+                urow[pl.ds(u0, L)] = plsc.load_gather(urow, [src])
+
+            # Gather this member's contiguous share of the union's 16-row chunks.
+            nch = srl(U + L - 1, 4)
+            cpm = div_g(nch + G - 1)
+            c0 = jnp.minimum(j * cpm, nch)
+            n = jnp.minimum(c0 + cpm, nch) - c0
+            row0 = q0 * TILE
+
+            def g_descs(i, s):
+                off = pl.multiple_of((c0 + i) * L, L)
+                idx = urow.at[pl.ds(off, L)]
+                return (
+                    pltpu.make_async_copy(nope_hbm.at[idx], gnope.at[s], sg.at[0, s]),
+                    pltpu.make_async_copy(rope_hbm.at[idx], grope.at[s], sg.at[1, s]),
                 )
 
-        if stop_after == "count":
-            return
+            def o_descs(i, s, half=0):
+                r0 = (c0 + i) * L
+                rr = (q0 + srl(r0, 10)) * (TILE // 4) + srl(r0 & (TILE // 2 - 1), 1)
+                return (
+                    pltpu.make_async_copy(
+                        gnope.at[s], nope_out.at[pl.ds(row0 + r0, L)], so.at[0, s]
+                    ),
+                    pltpu.make_async_copy(
+                        rbuf.at[s],
+                        rope_out.at[pl.ds(rr, L // 2), pl.ds(half * 64, 64)],
+                        so.at[1, s],
+                    ),
+                )
 
-        # Prefix pass: per word the nonzero-nibble flags (bit 4i) and the rank
-        # of its first union row; U = total.
-        def prefix(i, carry):
-            x = cnt[pl.ds(i * L, L)]
-            # counts reach WQ = 8 (0b1000): all four nibble bits matter
-            nz = x
-            for sh in range(1, nz_shifts):  # 4 (test-only 3 reproduces the count-8 bug)
-                nz = nz | srl(x, sh)
-            nz = nz & 0x11111111
-            pc = srl(nz * 0x11111111, 28)
-            cs = plsc.cumsum(pc)
-            base[pl.ds(i * L, L)] = cs - pc + carry
-            cnt[pl.ds(i * L, L)] = nz
-            return carry + cs[L - 1]
+            def issue(i, s):
+                for d in g_descs(i, s):
+                    d.start()
 
-        U = plsc.parallel_loop(0, nvec, unroll=2 if version >= 1 else 1, carry=jnp.int32(0))(prefix)
-
-        if stop_after == "prefix":
-            ubuf[...] = jnp.full((L,), U, jnp.int32)
-            pltpu.sync_copy(ubuf, ucnt_out.at[pl.ds(w * L, L)])
-            return
-
-        def rank_of(c, v):
-            wi = srl(c, WORD_SHIFT)
-            nzw = plsc.load_gather(cnt, [wi], mask=v)
-            bw = plsc.load_gather(base, [wi], mask=v)
-            below = nzw & (jnp.left_shift(ones, (c & 7) * 4) - 1)
-            return jnp.where(v, bw + srl(below * 0x11111111, 28), 0)
-
-        # Union rows by rank (every token; duplicates write equal values).
-        @pl.loop(0, qn)
-        def _(t):
-            @plsc.parallel_loop(0, K, step=L, unroll=unroll)
-            def _(k):
-                c, v = ids(t, k)
-                r = rank_of(c, v)
-                pg = plsc.load_gather(pageb, [srl(c, page_shift) + p_off], mask=v)
-                phys = jnp.left_shift(pg, page_shift) | (c & (page_size - 1))
-                plsc.store_scatter(urow, [r], phys, mask=v)
-
-        if stop_after == "rank":
-            return
-
-        # Keep bitmasks of this member's tokens t = j, j + G, ...
-        ntok = jnp.where(j < qn, div_g(qn - j + G - 1), 0)
-
-        @pl.loop(0, ntok)
-        def _(kt):
-            t = j + kt * G
-
-            @pl.loop(0, W_WORDS // L)
-            def _(i):
-                mrow[pl.ds(i * L, L)] = zeros
-
-            @plsc.parallel_loop(0, K, step=L, unroll=unroll)
-            def _(k):
-                c, v = ids(t, k)
-                r = rank_of(c, v)
-                word = jnp.left_shift(srl(r, 12), 7) | (r & (LANES - 1))
-                bit = srl(r, 7) & 31
-                plsc.addupdate_scatter(mrow, (word,), jnp.left_shift(ones, bit), mask=v)
-
-            if sb_major_T:  # mask laid out [W / 128, T, 128]: super-block major
-                for sb in range(W_WORDS // LANES):
-                    pltpu.sync_copy(
-                        mrow.at[pl.ds(sb * LANES, LANES)],
-                        mask_out.at[pl.ds((sb * sb_major_T + q0 + t) * LANES, LANES)],
-                    )
-            else:
-                pltpu.sync_copy(mrow, mask_out.at[pl.ds((q0 + t) * W_WORDS, W_WORDS)])
-
-        @pl.when(j == 0)
-        def _():
-            ubuf[...] = jnp.full((L,), U, jnp.int32)
-            pltpu.sync_copy(ubuf, ucnt_out.at[pl.ds(w * L, L)])
-
-        if skip_gather:
-            return
-
-        # Pad the last 16-row chunk with distinct real rows of the window.
-        @pl.when(U > 0)
-        def _():
-            u0 = srl(U, 4) * L
-            r = u0 + lax.broadcasted_iota(jnp.int32, (L,), 0)
-            src = jnp.where(r < U, r, lax.rem(r - U, U))
-            urow[pl.ds(u0, L)] = plsc.load_gather(urow, [src])
-
-        # Gather this member's contiguous share of the union's 16-row chunks.
-        nch = srl(U + L - 1, 4)
-        cpm = div_g(nch + G - 1)
-        c0 = jnp.minimum(j * cpm, nch)
-        n = jnp.minimum(c0 + cpm, nch) - c0
-        row0 = q0 * TILE
-
-        def g_descs(i, s):
-            off = pl.multiple_of((c0 + i) * L, L)
-            idx = urow.at[pl.ds(off, L)]
-            return (
-                pltpu.make_async_copy(nope_hbm.at[idx], gnope.at[s], sg.at[0, s]),
-                pltpu.make_async_copy(rope_hbm.at[idx], grope.at[s], sg.at[1, s]),
-            )
-
-        def o_descs(i, s, half=0):
-            r0 = (c0 + i) * L
-            rr = (q0 + srl(r0, 10)) * (TILE // 4) + srl(r0 & (TILE // 2 - 1), 1)
-            return (
-                pltpu.make_async_copy(
-                    gnope.at[s], nope_out.at[pl.ds(row0 + r0, L)], so.at[0, s]
-                ),
-                pltpu.make_async_copy(
-                    rbuf.at[s],
-                    rope_out.at[pl.ds(rr, L // 2), pl.ds(half * 64, 64)],
-                    so.at[1, s],
-                ),
-            )
-
-        def issue(i, s):
-            for d in g_descs(i, s):
-                d.start()
-
-        for s in range(nbuf - 1):
-            @pl.when(s < n)
-            def _():
-                issue(s, s)
-
-        def chunk(i, s):
-            for d in g_descs(i, s):
-                d.wait()
-            on, _ = o_descs(i, s)
-            on.start()
-            # bf16 rope rows 2t / 2t + 1 = low / high halves of int32 row t;
-            # cache word k holds values k (low) and k + 32 (high).
-            for t in range(L // 2 if stop_after != "norope" else 0):
-                for hh in range(2):
-                    e = grope[s, 2 * t, pl.ds(16 * hh, 16)]
-                    o = grope[s, 2 * t + 1, pl.ds(16 * hh, 16)]
-                    rbuf[s, t, pl.ds(16 * hh, 16)] = (e & 0xFFFF) | jnp.left_shift(o, 16)
-                    rbuf[s, t, pl.ds(32 + 16 * hh, 16)] = srl(e, 16) | (o & jnp.int32(-65536))
-            half = srl((c0 + i) * L, 9) & 1
-            for hv in range(2):
-                @pl.when(half == hv)
+            for s in range(nbuf - 1):
+                @pl.when(s < n)
                 def _():
-                    o_descs(i, s, hv)[1].start()
+                    issue(s, s)
 
-            ps = (s - 1) % nbuf
-
-            @pl.when(i >= 1)
-            def _():
-                for d in o_descs(i - 1, ps):
+            def chunk(i, s):
+                for d in g_descs(i, s):
                     d.wait()
+                on, _ = o_descs(i, s)
+                on.start()
+                # bf16 rope rows 2t / 2t + 1 = low / high halves of int32 row t;
+                # cache word k holds values k (low) and k + 32 (high).
+                for t in range(L // 2 if stop_after != "norope" else 0):
+                    for hh in range(2):
+                        e = grope[s, 2 * t, pl.ds(16 * hh, 16)]
+                        o = grope[s, 2 * t + 1, pl.ds(16 * hh, 16)]
+                        rbuf[s, t, pl.ds(16 * hh, 16)] = (e & 0xFFFF) | jnp.left_shift(o, 16)
+                        rbuf[s, t, pl.ds(32 + 16 * hh, 16)] = srl(e, 16) | (o & jnp.int32(-65536))
+                half = srl((c0 + i) * L, 9) & 1
+                for hv in range(2):
+                    @pl.when(half == hv)
+                    def _():
+                        o_descs(i, s, hv)[1].start()
 
-            @pl.when(i + nbuf - 1 < n)
-            def _():
-                issue(i + nbuf - 1, ps)
+                ps = (s - 1) % nbuf
 
-        @pl.loop(0, srl(n + nbuf - 1, nbuf.bit_length() - 1))
-        def _(ip):
+                @pl.when(i >= 1)
+                def _():
+                    for d in o_descs(i - 1, ps):
+                        d.wait()
+
+                @pl.when(i + nbuf - 1 < n)
+                def _():
+                    issue(i + nbuf - 1, ps)
+
+            @pl.loop(0, srl(n + nbuf - 1, nbuf.bit_length() - 1))
+            def _(ip):
+                for s in range(nbuf):
+                    @pl.when(ip * nbuf + s < n)
+                    def _():
+                        chunk(ip * nbuf + s, s)
+
             for s in range(nbuf):
-                @pl.when(ip * nbuf + s < n)
+                @pl.when(jnp.logical_and(n > 0, (n - 1) % nbuf == s))
                 def _():
-                    chunk(ip * nbuf + s, s)
+                    for d in o_descs(n - 1, s):
+                        d.wait()
 
-        for s in range(nbuf):
-            @pl.when(jnp.logical_and(n > 0, (n - 1) % nbuf == s))
-            def _():
-                for d in o_descs(n - 1, s):
-                    d.wait()
+    if waves == 1:
+        _wave(0)
+    else:
+        @pl.loop(0, waves)
+        def _(v):
+            _wave(v)
 
 
 @functools.partial(
@@ -532,7 +590,8 @@ def union_gather(
     L, nc, ns = sc_geometry()
     workers = nc * ns
     nw_cap = nw_cap_for(T, max_num_seqs)
-    assert meta.shape == ((1 + nw_cap + workers) * L,), meta.shape
+    waves = cdiv(nw_cap, workers)
+    assert meta.shape == ((1 + nw_cap + waves * workers) * L,), meta.shape
     page_size = cache_kv_nope.shape[1]
     pps = page_indices.shape[0] // max_num_seqs
     s_cap = pps * page_size
@@ -562,6 +621,8 @@ def union_gather(
             nbuf=nbuf,
             sb_major_T=T if mask_sb_major else 0,
             nz_shifts=_nz_shifts,
+            waves=waves,
+            workers=workers,
         ),
         out_type=(
             jax.ShapeDtypeStruct((T * TILE, LANES), jnp.int32),
@@ -633,7 +694,7 @@ def attend(q, rows, attention_sinks, swa_accumution, swa_l, swa_m, *, sm_scale, 
     from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_window_attention
 
     L, nc, ns = sc_geometry()
-    nw_cap = rows["meta"].shape[0] // L - 1 - nc * ns
+    nw_cap = rows["ucnt"].shape[0] // L
     return csa_window_attention.window_attention(
         q, rows["nope_g"], rows["rope_g"], rows["mask"], rows["meta"], rows["ucnt"],
         attention_sinks, swa_accumution, swa_l, swa_m, sm_scale=sm_scale,

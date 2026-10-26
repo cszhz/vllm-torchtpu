@@ -376,6 +376,9 @@ def _attention_csa(
     union_verify_max_tokens: int = 128,
     union_verify_above: int = 0,
     union_verify_early: bool = True,
+    window_mixed: bool = False,
+    window_mixed_above: int = 256,
+    window_mixed_min_heads: int = 32,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -436,8 +439,23 @@ def _attention_csa(
     # First use of the top-k after the SWA pass: the indexer's SparseCore
     # top-k then completes behind the q projection and SWA, which do not need
     # it, instead of stalling the TensorCore before them.
+    # TPU_DSV4_CSA_WINDOW_MIXED: buckets of T > ..._ABOVE tokens (mixed /
+    # prefill) take the union-of-window route of the decode buckets
+    # (`csa_window_union`, 8-token windows, assignment waves over the
+    # SparseCore workers) instead of union-dense: an 8-token window's union is
+    # ~half a 32-token block's (real top-k), the union tile's cost is per query
+    # row (8 x 32 heads = 256 rows per tile at TP4), and there is no context
+    # cap, no count pass and no sparse fallback.
+    use_window_mixed = (
+        window_mixed
+        and q.shape[0] > window_mixed_above
+        and q.shape[0] > union_verify_max_tokens
+        and q.shape[1] >= window_mixed_min_heads
+        and csa_window_union.supported_mixed(q.shape[0], main_cu_q_lens.shape[0] - 1)
+    )
     use_union_dense = (
         union_dense
+        and not use_window_mixed
         and q.shape[0] >= union_dense_min_tokens
         and q.shape[1] <= union_dense_max_heads
     )
@@ -478,6 +496,11 @@ def _attention_csa(
         and csa_window_union.supported(q.shape[0], main_cu_q_lens.shape[0] - 1)
     )
     union_rows = None
+    if use_window_mixed and not two_caches_same_buffer:
+        union_rows = csa_window_union.prepare(
+            extra, main_kv_lens, main_page_indices, main_cu_q_lens,
+            main_distribution, main_cache_kv, main_cache_rope,
+        )  # fmt: skip
     if use_union_verify and union_verify_early and not two_caches_same_buffer:
         union_rows = csa_window_union.prepare(
             extra, main_kv_lens, main_page_indices, main_cu_q_lens,
@@ -487,7 +510,7 @@ def _attention_csa(
         (extra, swa_output, union_plan, union_rows)
     )
 
-    if use_union_verify:
+    if use_union_verify or use_window_mixed:
         if union_rows is None:
             union_rows = csa_window_union.prepare(
                 extra, main_kv_lens, main_page_indices, main_cu_q_lens,
