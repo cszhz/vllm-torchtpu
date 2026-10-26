@@ -201,7 +201,7 @@ steps:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
-              test-cmd: "pytest -sv --timeout=1200 -m 'not nightly and omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=1200 -m 'not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Speculative Decoding (Nightly)"
         key: "unit_tests_spec_decode_nightly"
@@ -286,7 +286,7 @@ steps:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
-              test-cmd: "pytest -sv --timeout=1800 -m 'nightly and omni and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=1800 -m 'nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Omni Multichip (Nightly)"
         key: "unit_tests_omni_multichip_nightly"
@@ -304,4 +304,4 @@ steps:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
-              test-cmd: "pytest -sv --timeout=1800 -m 'nightly and omni and multichip' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=1800 -m 'nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
