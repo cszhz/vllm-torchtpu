@@ -25,16 +25,22 @@ mean device per layer for the contiguous and the solved layout.
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import tile_model as tm  # noqa: E402
-from eplb_policy import rank_lists, rebalance_experts_global  # noqa: E402
+try:
+    from vllm_torchtpu import eplb_tile_model as tm
+    from vllm_torchtpu.eplb_policy import rank_lists, rebalance_experts_global
+except ImportError:  # run from a checkout without the package installed
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+    from vllm_torchtpu import eplb_tile_model as tm  # noqa: E402
+    from vllm_torchtpu.eplb_policy import (  # noqa: E402
+        rank_lists,
+        rebalance_experts_global,
+    )
 
 
 def pooled_rows(counts, pool):
@@ -111,6 +117,21 @@ def main(argv=None):
     ap.add_argument("--slots", type=int, required=True)
     ap.add_argument("--pool", type=int, default=1)
     ap.add_argument("--draft-slots", type=int, default=None)
+    ap.add_argument(
+        "--staging",
+        type=int,
+        default=0,
+        help="spare physical slots per rank behind the active ones, for the "
+        "dynamic re-layout to stage the next generation's experts into",
+    )
+    ap.add_argument("--draft-staging", type=int, default=0)
+    ap.add_argument(
+        "--replica-cap",
+        type=int,
+        default=None,
+        help="fixed width of the slot table (most copies an expert may have); "
+        "unset leaves it at the most copies this layout gives any expert",
+    )
     ap.add_argument("--draft-pool", type=int, default=None)
     ap.add_argument("--min-gain-us", type=float, default=0.0)
     ap.add_argument("--name", default=None)
@@ -131,6 +152,8 @@ def main(argv=None):
         "experts": int(experts),
         "shards": a.shards,
         "slots": a.slots,
+        **({"staging": a.staging} if a.staging else {}),
+        **({"replica_cap": a.replica_cap} if a.replica_cap else {}),
         "layers": target,
         "meta": {
             "name": a.name,
@@ -161,6 +184,8 @@ def main(argv=None):
         doc["draft"] = {
             "experts": int(draft_rows.shape[-1]),
             "slots": a.draft_slots,
+            **({"staging": a.draft_staging} if a.draft_staging else {}),
+            **({"replica_cap": a.replica_cap} if a.replica_cap else {}),
             "layers": draft,
         }
         doc["meta"]["draft_pool"] = draft_pool

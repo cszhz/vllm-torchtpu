@@ -91,12 +91,27 @@ _LOCK = threading.Lock()
 
 @dataclass(frozen=True)
 class Group:
-    """One layout group: a model's MoE layers over `shards` ranks."""
+    """One layout group: a model's MoE layers over `shards` ranks.
+
+    `slots` is the physical slots per rank: the `active` ones the rank lists
+    fill, plus `staging` spare slots a dynamic re-layout stages the next
+    generation's experts into (unreferenced by the table, never routed to,
+    skipped by the kernel's visit list). `replica_cap` fixes the slot table's
+    width so a re-layout can give an expert more copies without changing a
+    shape; None takes the most copies any expert of the layer has.
+    """
 
     experts: int
     shards: int
     slots: int
     layers: dict[int, tuple[tuple[int, ...], ...]]
+    staging: int = 0
+    replica_cap: int | None = None
+
+    @property
+    def active(self) -> int:
+        """Slots per rank the layout fills."""
+        return self.slots - self.staging
 
     @property
     def physical(self) -> int:
@@ -115,6 +130,8 @@ class Group:
             for j, e in enumerate(held):
                 held_at[e].append(r * self.slots + j)
         width = max(len(h) for h in held_at)
+        if self.replica_cap is not None:
+            width = max(width, self.replica_cap)
         return [h + [-1] * (width - len(h)) for h in held_at]
 
     def expert_map(self, layer: int, rank: int) -> list[int]:
@@ -163,6 +180,15 @@ def _parse_group(table: dict, source: str, what: str, shards: int | None) -> Gro
         )
     layers = {}
     slots = int(table["slots"]) if "slots" in table else None
+    staging = int(table.get("staging", 0))
+    replica_cap = table.get("replica_cap")
+    replica_cap = None if replica_cap is None else int(replica_cap)
+    if staging < 0 or (replica_cap is not None and replica_cap < 1):
+        raise ValueError(
+            f"expert layout {source}: {what} staging must be >= 0 and "
+            f"replica_cap >= 1; got {staging} and {replica_cap}"
+        )
+    most_copies = 1
     for key, ranks in table["layers"].items():
         width = len(ranks[0]) if ranks else 0
         if slots is None:
@@ -191,10 +217,29 @@ def _parse_group(table: dict, source: str, what: str, shards: int | None) -> Gro
                 f"expert layout {source}: {what} layer {key} must hold every "
                 f"one of the {experts} experts"
             )
+        copies = [0] * experts
+        for held in ranks:
+            for e in held:
+                copies[e] += 1
+        most_copies = max(most_copies, max(copies))
         layers[int(key)] = ranks
     if slots is None:
         slots = experts // shards
-    return Group(experts=experts, shards=shards, slots=slots, layers=layers)
+    if replica_cap is not None and most_copies > replica_cap:
+        raise ValueError(
+            f"expert layout {source}: {what} gives an expert {most_copies} "
+            f"copies, above replica_cap {replica_cap}"
+        )
+    # `slots` in the table is the active width the rank lists fill; the
+    # physical slots per rank add the staging ones behind them.
+    return Group(
+        experts=experts,
+        shards=shards,
+        slots=slots + staging,
+        layers=layers,
+        staging=staging,
+        replica_cap=replica_cap,
+    )
 
 
 def parse(table: dict, source: str = "<dict>") -> Placement:

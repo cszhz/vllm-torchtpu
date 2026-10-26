@@ -20,7 +20,11 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import tile_model as tm  # noqa: E402
+try:
+    from vllm_torchtpu import eplb_tile_model as tm
+except ImportError:  # run from a checkout without the package installed
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+    from vllm_torchtpu import eplb_tile_model as tm  # noqa: E402
 from solve_layout import pooled_rows  # noqa: E402
 
 

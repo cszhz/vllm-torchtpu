@@ -66,6 +66,34 @@ def test_spare_slots_hold_replicas():
     assert rows[0] == [1, -1]
 
 
+def test_staging_slots_add_physical_slots_behind_the_active_ones():
+    """A dynamic layout keeps `staging` spare slots per rank after the active
+    ones: physical slots grow, the lists and the table's slot ids stay the
+    active width, and the expert map leaves the spares unassigned."""
+    table = _table(layers={"3": [[7, 0, 5, 2], [1, 6, 3, 4]]})
+    table["staging"] = 2
+    table["replica_cap"] = 2
+    g = expert_placement.parse(table).target
+    assert (g.active, g.staging, g.slots, g.physical) == (4, 2, 6, 12)
+    rows = g.slot_table(3)
+    assert rows[7] == [0, -1] and rows[1] == [6, -1]  # rank 1's slots start at 6
+    assert all(len(r) == 2 for r in rows)
+    assert g.expert_map(3, 1) == [-1, 0, -1, 2, 3, -1, 1, -1]
+
+
+def test_replica_cap_bounds_the_copies_and_widens_the_table():
+    table = _table(layers={"3": [[7, 0, 5, 2, 3], [1, 6, 3, 4, 7]]})
+    table["replica_cap"] = 3
+    rows = expert_placement.parse(table).target.slot_table(3)
+    assert rows[3] == [4, 7, -1] and rows[0] == [1, -1, -1]
+    table["replica_cap"] = 1
+    with pytest.raises(ValueError, match="2 copies, above replica_cap 1"):
+        expert_placement.parse(table)
+    table["replica_cap"] = 0
+    with pytest.raises(ValueError, match="replica_cap >= 1"):
+        expert_placement.parse(table)
+
+
 def test_explicit_slots_field_must_match_the_lists():
     table = _table(layers={"3": [[7, 0, 5, 2, 3], [1, 6, 3, 4, 7]]})
     table["slots"] = 5
@@ -249,7 +277,11 @@ def test_shipped_layouts_resolve_by_name_and_parse():
         path = expert_placement.resolve(f[:-5])
         assert path == os.path.join(expert_placement.PLACEMENT_DIR, f)
         with open(path) as fh:
-            expert_placement.parse(json.load(fh), path)
+            parsed = expert_placement.parse(json.load(fh), path)
+        if f.endswith("_s2.json"):
+            assert parsed.target.staging == 2 and parsed.target.slots == 15
+            assert parsed.target.replica_cap == 16 and parsed.draft.staging == 1
+            assert len(parsed.target.slot_table(0)[0]) == 16
     with pytest.raises(FileNotFoundError, match="shipped layout"):
         expert_placement.resolve("no_such_layout")
     assert expert_placement.resolve("/tmp/x.json") == "/tmp/x.json"

@@ -13,10 +13,12 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 import check_layout  # noqa: E402
 import solve_layout  # noqa: E402
-import tile_model as tm  # noqa: E402
-from eplb_policy import (  # noqa: E402
+
+from vllm_torchtpu import eplb_tile_model as tm  # noqa: E402
+from vllm_torchtpu.eplb_policy import (  # noqa: E402
     _batch_greedy_indices,
     rank_lists,
     rebalance_experts_global,
