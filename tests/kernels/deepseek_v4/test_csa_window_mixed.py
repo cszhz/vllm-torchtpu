@@ -39,9 +39,11 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention import (  # noqa: E402
     csa_window_union as WU,
 )
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu", reason="TPU (SparseCore) only"
-)
+@pytest.fixture(autouse=True)
+def _tpu_only():
+    # A fixture, not a module-level skipif: collection must not claim the TPU (tests/conftest.py).
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("TPU (SparseCore) only")
 
 _REAL = os.path.exists(os.path.join(K.DATA, "dp1_kv6144.npz"))
 L1_CELLS = (["m16-r22k", "m16-s470kL1", "m8-r22k"] if _REAL else []) + ["c16m512-dec", "c16m512-pf32k"]
