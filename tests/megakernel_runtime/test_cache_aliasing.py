@@ -38,12 +38,14 @@ from vllm_torchtpu.megakernel import planner  # noqa: E402
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec  # noqa: E402
 from vllm_torchtpu.megakernel.models import qwen35  # noqa: E402
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES  # noqa: E402
+from vllm_torchtpu.megakernel.runtime import (  # noqa: E402
+    verify_compiled_step_ir,
+    verify_pooled_step_hlo,
+)
 from vllm_torchtpu.megakernel_runtime.exported_bridge import (  # noqa: E402
     build_pooled_step_op,
     execute_pooled_step_inplace,
     export_pooled_step,
-    verify_pooled_step_hlo,
-    verify_torchtpu_compiled_step_ir,
 )
 
 
@@ -281,8 +283,8 @@ def test_verify_and_export_pooled_step_hlo() -> None:
     assert exported.input_output_aliases == {2 + len(w_flat_local): 1}
 
 
-def test_verify_torchtpu_compiled_step_ir() -> None:
-    """Verify `verify_torchtpu_compiled_step_ir` on `@main` `jax.buffer_donor`."""
+def test_verify_compiled_step_ir() -> None:
+    """Verify `verify_compiled_step_ir` on `@main` `jax.buffer_donor`."""
     pool_ty = "tensor<64x2x64x4x128xf8E4M3FN>"
     pool_args = ", ".join(
         f"%arg{i}: {pool_ty} {{jax.buffer_donor = true}}" for i in range(15)
@@ -297,7 +299,7 @@ def test_verify_torchtpu_compiled_step_ir() -> None:
         f"  }}\n"
         f"}}\n"
     )
-    ok, msg = verify_torchtpu_compiled_step_ir(
+    ok, msg = verify_compiled_step_ir(
         valid_mlir, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
     )
     assert ok, f"Expected valid StableHLO MLIR to pass: {msg}"
@@ -315,7 +317,7 @@ def test_verify_torchtpu_compiled_step_ir() -> None:
         valid_mlir.replace(pool_args, missing_donor_args)
         + f"\n  func.func private @inlined_jax({inner_alias_args}) -> () {{ return }}\n"
     )
-    ok_bad, msg_bad = verify_torchtpu_compiled_step_ir(
+    ok_bad, msg_bad = verify_compiled_step_ir(
         bad_donor_mlir, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
     )
     assert not ok_bad
@@ -327,11 +329,11 @@ def test_verify_torchtpu_compiled_step_ir() -> None:
         f"%c = stablehlo.dynamic_update_slice %arg0, %arg1, %c0 : "
         f"({pool_ty}, {pool_ty}, tensor<i32>) -> {pool_ty}\n    return",
     )
-    ok_copy, msg_copy = verify_torchtpu_compiled_step_ir(
+    ok_copy, msg_copy = verify_compiled_step_ir(
         bad_copy_mlir, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
     )
     assert not ok_copy
-    assert "unexpected full-pool copy in torch_tpu IR" in msg_copy
+    assert "unexpected full-pool copy in compiled IR" in msg_copy
 
     # Valid HLO text vs empty input_output_alias={} vs HLO text with full-pool copy
     alias_entries = ", ".join(f"{{{{{i}}}, {i + 2}, {{}}}}" for i in range(15))
@@ -342,12 +344,12 @@ def test_verify_torchtpu_compiled_step_ir() -> None:
         f"  ROOT %t = () tuple()\n"
         f"}}\n"
     )
-    ok_hlo, msg_hlo = verify_torchtpu_compiled_step_ir(
+    ok_hlo, msg_hlo = verify_compiled_step_ir(
         valid_hlo, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
     )
     assert ok_hlo, f"Expected valid HLO to pass: {msg_hlo}"
 
-    ok_both, msg_both = verify_torchtpu_compiled_step_ir(
+    ok_both, msg_both = verify_compiled_step_ir(
         valid_mlir,
         num_pages=64,
         page_size=128,
@@ -359,7 +361,7 @@ def test_verify_torchtpu_compiled_step_ir() -> None:
     assert ok_both, f"Expected combined MLIR + post-XLA HLO to pass: {msg_both}"
 
     empty_alias_hlo = valid_hlo.replace(f"{{ {alias_entries} }}", "{}")
-    ok_empty_alias, msg_empty_alias = verify_torchtpu_compiled_step_ir(
+    ok_empty_alias, msg_empty_alias = verify_compiled_step_ir(
         empty_alias_hlo, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
     )
     assert not ok_empty_alias
@@ -369,7 +371,7 @@ def test_verify_torchtpu_compiled_step_ir() -> None:
         "ROOT %t = () tuple()",
         "  %cp = f8e4m3fn[64,2,64,4,128] copy(%p0)\n  ROOT %t = () tuple()",
     )
-    ok_bad_hlo, msg_bad_hlo = verify_torchtpu_compiled_step_ir(
+    ok_bad_hlo, msg_bad_hlo = verify_compiled_step_ir(
         valid_mlir,
         num_pages=64,
         page_size=128,
@@ -379,7 +381,7 @@ def test_verify_torchtpu_compiled_step_ir() -> None:
         hlo_text=bad_hlo,
     )
     assert not ok_bad_hlo
-    assert "unexpected full-pool copy in torch_tpu HLO" in msg_bad_hlo
+    assert "unexpected full-pool copy in compiled HLO" in msg_bad_hlo
 
 
 def test_verify_pooled_step_hlo_compile_on_mock_mesh_is_config_error():
@@ -389,9 +391,7 @@ def test_verify_pooled_step_hlo_compile_on_mock_mesh_is_config_error():
     disables the megakernel on `ValueError` (incompatible KV layout) cannot
     swallow it.
     """
-    from vllm_torchtpu.megakernel_runtime.exported_bridge import (
-        MegakernelConfigError,
-    )
+    from vllm_torchtpu.megakernel import MegakernelConfigError
 
     class _MockDevice:
         id = 0

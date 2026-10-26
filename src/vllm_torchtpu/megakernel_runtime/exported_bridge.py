@@ -23,17 +23,6 @@ Provides:
   pool outputs back into `pools` via `dst.copy_(src)`, preserving `dst.data_ptr()`
   (Raiden pointer identity) and folding into an XLA `input_output_alias` /
   `tf.aliasing_output` under `torch.compile(backend="tpu")`.
-- `verify_pooled_step_hlo`: lowers (or compiles when `mesh` holds real
-  `jax.Device` instances on TPU) the JAX pooled step and validates pool buffer
-  donation (`input_output_alias`) and absence of full-pool copies via
-  `cache.check_pooled_step_hlo`. Under `torch_tpu`'s `_PallasDevice` mesh,
-  `StaticCompiler` owns XLA compilation, so `verify_pooled_step_hlo` checks the
-  lowered HLO while `verify_torchtpu_compiled_step_ir` checks the outer
-  `torch.compile(backend="tpu")` graph.
-- `verify_torchtpu_compiled_step_ir`: inspects the compiled `torch_tpu` forward
-  graph's StableHLO MLIR / HLO (`TpuCompileDebug.stablehlo_forward_text`) to
-  verify that `dst.copy_(src)` on all pools folded into `jax.buffer_donor = true` /
-  `tf.aliasing_output` / `input_output_alias` with zero full-pool copies.
 - `export_pooled_step`: offline inspection/serialization helper that exports the
   StableHLO module and aliasing manifest (`PooledStepExport`) via `jax.export`
   (serving traces directly through `build_pooled_step_op` / `JaxCallable`).
@@ -42,7 +31,6 @@ Provides:
 from __future__ import annotations
 
 import inspect
-import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -55,9 +43,9 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel import cache
-from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.pool.config import cache_exec
+from vllm_torchtpu.megakernel.runtime import build_global_avals
 from vllm_torchtpu.megakernel.spec import ModelSpec
 
 
@@ -146,20 +134,6 @@ class PooledStepExport:
 _OP_COUNTER = 0
 
 
-def _torch_dtype_to_jax(dt: torch.dtype) -> Any:
-    if dt == torch.float8_e4m3fn:
-        return jnp.float8_e4m3fn
-    if dt == torch.bfloat16:
-        return jnp.bfloat16
-    if dt == torch.float32:
-        return jnp.float32
-    if dt == torch.int32:
-        return jnp.int32
-    if dt == torch.int64:
-        return jnp.int64
-    raise TypeError(f"Unsupported torch.dtype for megakernel bridge: {dt}")
-
-
 def _torch_cpu_to_jax(
     t: torch.Tensor, sharding: NamedSharding | None = None
 ) -> jax.Array:
@@ -210,261 +184,6 @@ def make_typed_step_wrapper(
     return ns[fn_name]
 
 
-def _build_global_avals(
-    mesh: jax.sharding.Mesh,
-    spec: ModelSpec,
-    ex: ExecSpec,
-    w_flat: Sequence[torch.Tensor],
-    raw_pools: Sequence[torch.Tensor],
-    *,
-    max_pages_per_seq: int,
-    ckpt_cols: int | None = None,
-) -> list[jax.ShapeDtypeStruct]:
-    """Construct global `jax.ShapeDtypeStruct` descriptors for HLO lowering/export."""
-    r_cnt = int(mesh.devices.size)
-    g: Any = spec.config
-    b_tok = ex.B
-    t_tok = ex.T
-    k_ckpt = int(ckpt_cols) if ckpt_cols is not None else t_tok
-    nseq = ex.NS
-    m_rows = ex.M
-    g_per_att = max(1, int(getattr(g, "att_every", 4)) - 1)
-
-    def _global_sds(t: torch.Tensor) -> jax.ShapeDtypeStruct:
-        dt = _torch_dtype_to_jax(t.dtype)
-        return jax.ShapeDtypeStruct((r_cnt * int(t.shape[0]),) + tuple(t.shape[1:]), dt)
-
-    return [
-        jax.ShapeDtypeStruct((b_tok,), jnp.int32),
-        jax.ShapeDtypeStruct((r_cnt * m_rows, int(g.H)), jnp.bfloat16),
-        *(_global_sds(w) for w in w_flat),
-        *(_global_sds(p) for p in raw_pools),
-        jax.ShapeDtypeStruct((nseq, int(max_pages_per_seq)), jnp.int32),
-        jax.ShapeDtypeStruct((g_per_att, nseq, k_ckpt), jnp.int32),
-        jax.ShapeDtypeStruct((g_per_att, nseq), jnp.int32),
-    ]
-
-
-def verify_pooled_step_hlo(
-    mesh: jax.sharding.Mesh,
-    spec: ModelSpec,
-    ex: ExecSpec,
-    w_flat: Sequence[torch.Tensor],
-    raw_pools: Sequence[torch.Tensor],
-    *,
-    max_pages_per_seq: int,
-    ckpt_cols: int | None = None,
-    compile_hlo: bool | None = None,
-) -> tuple[bool, str]:
-    """Lower or compile `make_flat_pooled_step` and verify pool donation in HLO.
-
-    When `compile_hlo` is `None` (default), compiles post-optimization HLO via
-    JAX when `mesh` contains real `jax.Device` instances on TPU
-    (`jax.default_backend() == "tpu" and not ex.interpret`), and lowers pre-XLA
-    HLO when `mesh` uses `torch_tpu`'s `_PallasDevice` mock devices (where XLA
-    compilation is owned by `torch_tpu` `StaticCompiler` and verified via
-    `verify_torchtpu_compiled_step_ir`). Passing `compile_hlo=True` with a
-    non-`jax.Device` mesh raises `MegakernelConfigError`.
-    """
-    has_real_jax_devices = bool(
-        mesh.devices.size > 0 and isinstance(mesh.devices.flat[0], jax.Device)
-    )
-    if compile_hlo is True and not has_real_jax_devices:
-        dev_type = (
-            type(mesh.devices.flat[0]).__name__ if mesh.devices.size > 0 else "empty"
-        )
-        raise MegakernelConfigError(
-            f"compile_hlo=True requires a Mesh of real jax.Device instances "
-            f"(got {dev_type}); under torch_tpu's _PallasDevice mesh, XLA "
-            f"compilation is performed by StaticCompiler and verified via "
-            f"verify_torchtpu_compiled_step_ir."
-        )
-    if compile_hlo is None:
-        compile_hlo = bool(
-            has_real_jax_devices and jax.default_backend() == "tpu" and not ex.interpret
-        )
-    else:
-        compile_hlo = bool(compile_hlo)
-    step_fn, in_specs, out_specs, donate_argnums = cache.make_flat_pooled_step(
-        mesh, spec, ex, donate_pools=True
-    )
-    in_sh = tuple(NamedSharding(mesh, s) for s in in_specs)
-    out_sh = tuple(NamedSharding(mesh, s) for s in out_specs)
-    avals = _build_global_avals(
-        mesh,
-        spec,
-        ex,
-        w_flat,
-        raw_pools,
-        max_pages_per_seq=max_pages_per_seq,
-        ckpt_cols=ckpt_cols,
-    )
-    j_fn = jax.jit(
-        step_fn,
-        in_shardings=in_sh,
-        out_shardings=out_sh,
-        donate_argnums=donate_argnums,
-        keep_unused=True,
-    )
-    lowered = j_fn.lower(*avals)
-    hlo_text = lowered.compile().as_text() if compile_hlo else lowered.as_text("hlo")
-    num_pages = int(raw_pools[0].shape[0])
-    page_size = int(raw_pools[0].shape[-1])
-    g: Any = spec.config
-    kvh = int(g.nkv(ex.R)) if hasattr(g, "nkv") else 1
-    hd = int(getattr(g, "HD", 256))
-    pb = spec.cache_backend
-    k_names = (
-        pb.kernel_names
-        if pb is not None
-        else ("gather_gdn_states", "scatter_pool_states")
-    )
-    return cache.check_pooled_step_hlo(
-        hlo_text,
-        page_size=page_size,
-        kvh=kvh,
-        hd=hd,
-        min_pool_pages=max(16, num_pages),
-        fused_pool_io=cache_exec(ex).FUSED,
-        kernel_names=k_names,
-    )
-
-
-def verify_torchtpu_compiled_step_ir(
-    ir_text: str,
-    *,
-    num_pages: int,
-    page_size: int = 128,
-    kvh: int = 1,
-    hd: int = 256,
-    num_pools: int = 15,
-    hlo_text: str | None = None,
-) -> tuple[bool, str]:
-    """Verify that a compiled `torch_tpu` forward step donates and aliases all pools.
-
-    Inspects the StableHLO MLIR (`TpuCompileDebug.stablehlo_forward_text`) or
-    HLO text produced by `torch.compile(backend="tpu")` for the outer step graph
-    that invokes `execute_pooled_step_inplace` (`op(...)` + `dst.copy_(src)`).
-
-    Note on `torch_tpu` lowering: `JaxCallable` passes `donate_argnums` to C++
-    `PyCallCustomKernel`, which records `DeferredOpParams::donated_inputs`.
-    During `fx_to_mlir`, `Traversal::BuildMlirModule` collects the `mlir::Value`
-    of every custom-kernel donated input and calls `AnnotateBufferDonations` on
-    matching `@main` parameters (independent of `StaticCompiler`'s explicit
-    `donated_inputs` argument). Same-shape contiguous `dst.copy_(src)` calls are
-    lowered by `CopyTpuToTpu` as buffer-handle rebinds (`GetBuffer(src)`) rather
-    than MLIR copy ops.
-
-    Checks performed:
-    1. Confirms a custom Pallas kernel call op (`stablehlo.custom_call`,
-       `mhlo.custom_call`, or `custom-call(`) is present.
-    2. For StableHLO MLIR, inspects the outer `@main` signature and confirms at
-       least `num_pools` pool arguments carry `jax.buffer_donor = true` (or
-       `tf.aliasing_output = <idx>`), ensuring outer pool inputs are donated
-       rather than passing vacuously on an inlined submodule.
-    3. For HLO text (`ir_text` when it is an `HloModule`, or `hlo_text` when
-       supplied alongside MLIR), confirms `HloModule ... input_output_alias`
-       contains at least `num_pools` alias entries.
-    4. Confirms no `copy`, `copy-start`, `dynamic_update_slice`, or
-       `as_strided_copy_inverse` materializes a full-pool buffer.
-    """
-    if not ir_text or not ir_text.strip():
-        return False, "empty torch_tpu compiled IR"
-
-    has_custom_call = (
-        "stablehlo.custom_call" in ir_text
-        or "mhlo.custom_call" in ir_text
-        or "custom-call(" in ir_text
-    )
-    if not has_custom_call:
-        return False, "missing custom kernel call in torch_tpu compiled IR"
-
-    has_mlir_main = "func.func" in ir_text
-    has_hlo_module = "HloModule" in ir_text
-    if not has_mlir_main and not has_hlo_module:
-        return False, "unrecognized torch_tpu IR format (missing func.func / HloModule)"
-
-    if has_mlir_main:
-        main_match = re.search(
-            r"func\.func\b[^{]*@main\s*\((.*?)\)\s*->", ir_text, re.DOTALL
-        )
-        if main_match is None:
-            return False, "missing func.func @main signature in torch_tpu MLIR"
-        main_params = main_match.group(1)
-        pool_shape_str = f"{num_pages}x{2 * kvh}x{hd // 4}x4x{page_size}xf8E4M3FN"
-        pool_arg_pat = re.compile(
-            rf"%arg\d+\s*:\s*tensor<{pool_shape_str}>(?:\s*(\{{[^}}]*\}}))?"
-        )
-        n_donated_main = 0
-        for m in pool_arg_pat.finditer(main_params):
-            attr = m.group(1) or ""
-            if "jax.buffer_donor = true" in attr or re.search(
-                r"tf\.aliasing_output\s*=\s*\d+", attr
-            ):
-                n_donated_main += 1
-        if n_donated_main < num_pools:
-            return (
-                False,
-                f"expected >= {num_pools} donated pool arguments "
-                f"(jax.buffer_donor = true) on @main in torch_tpu IR, "
-                f"found {n_donated_main}",
-            )
-
-    hlo_sources: list[str] = []
-    if has_hlo_module:
-        hlo_sources.append(ir_text)
-    if hlo_text and hlo_text.strip():
-        hlo_sources.append(hlo_text)
-
-    for hlo_src in hlo_sources:
-        hlo_header = hlo_src.split("ENTRY", 1)[0]
-        if "input_output_alias" not in hlo_header:
-            return False, "missing input_output_alias in torch_tpu HLO header"
-        alias_entries = re.findall(r"(?:\{\d*\}\s*:|\{\{\d*\}\s*,\s*\d+)", hlo_header)
-        if len(alias_entries) < num_pools:
-            return (
-                False,
-                f"expected >= {num_pools} entries in HloModule input_output_alias, "
-                f"found {len(alias_entries)}",
-            )
-
-    mlir_pool_pat = re.compile(rf"\b(\d+)x{2 * kvh}x{hd // 4}x4x{page_size}xf8E4M3FN\b")
-    hlo_pool_suffix = f",{2 * kvh},{hd // 4},4,{page_size}]"
-    copy_ops = (
-        "stablehlo.copy",
-        "mhlo.copy",
-        "copy-start(",
-        "dynamic_update_slice",
-        "dynamic-update-slice(",
-        "as_strided_copy_inverse",
-    )
-    texts_to_scan = [ir_text] + ([hlo_text] if hlo_text and hlo_text.strip() else [])
-    for txt in texts_to_scan:
-        for line in txt.splitlines():
-            if "func.func" in line or "ENTRY" in line or "custom_call" in line:
-                continue
-            is_copy_line = any(op in line for op in copy_ops) or (
-                "= f8e4m3fn[" in line and "copy(" in line
-            )
-            if not is_copy_line:
-                continue
-            for m in mlir_pool_pat.finditer(line):
-                if int(m.group(1)) >= num_pages:
-                    return (
-                        False,
-                        f"unexpected full-pool copy in torch_tpu IR: {line.strip()}",
-                    )
-            if hlo_pool_suffix in line:
-                prefix = line.split(hlo_pool_suffix, 1)[0]
-                dim_str = prefix.rsplit("[", 1)[-1].rsplit(",", 1)[-1].strip()
-                if not dim_str.isdigit() or int(dim_str) >= num_pages:
-                    return (
-                        False,
-                        f"unexpected full-pool copy in torch_tpu HLO: {line.strip()}",
-                    )
-    return True, "ok"
-
-
 def export_pooled_step(
     mesh: jax.sharding.Mesh,
     spec: ModelSpec,
@@ -488,7 +207,7 @@ def export_pooled_step(
     )
     in_sh = tuple(NamedSharding(mesh, s) for s in in_specs)
     out_sh = tuple(NamedSharding(mesh, s) for s in out_specs)
-    avals = _build_global_avals(
+    avals = build_global_avals(
         mesh,
         spec,
         ex,
