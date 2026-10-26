@@ -1411,8 +1411,9 @@ def test_all_to_all_dispatch_keeps_the_load_accumulator(dispatch):
     np.testing.assert_array_equal(np.asarray(updated), expected)
 
 
-@pytest.mark.parametrize("pattern", ["ragged", "empty", "one_source"])
-def test_pallas_exchange_lands_what_the_ragged_all_to_all_lands(pattern):
+@pytest.mark.parametrize("with_payload", [False, True], ids=["rows", "rows+payload"])
+@pytest.mark.parametrize("pattern", ["ragged", "empty", "one_source", "wide"])
+def test_pallas_exchange_lands_what_the_ragged_all_to_all_lands(pattern, with_payload):
     """dispatch.exchange_start / exchange_wait against lax.ragged_all_to_all.
 
     Every shard sends sizes[s, d] rows (at most one receive block, t_local,
@@ -1423,11 +1424,18 @@ def test_pallas_exchange_lands_what_the_ragged_all_to_all_lands(pattern):
     from vllm_torchtpu.kernels.fused_moe.v2.dispatch import (
         exchange_start,
         exchange_wait,
+        payload_wait,
     )
 
     mesh = _mesh()
+    # "wide" is the 2048-row bucket's payload width at DP32 (14848 words),
+    # where a 2-D payload table tiles the source axis and a wait over ep - 1
+    # sources does not compile.
     t_local, lane_blocks = 40, 8
-    rng = np.random.default_rng({"ragged": 3, "empty": 4, "one_source": 5}[pattern])
+    width = 14848 if pattern == "wide" else 384
+    rng = np.random.default_rng(
+        {"ragged": 3, "empty": 4, "one_source": 5, "wide": 6}[pattern]
+    )
     sizes = rng.integers(0, t_local + 1, size=(EP, EP)).astype(np.int32)
     sizes[rng.random((EP, EP)) < 0.25] = 0
     if pattern == "empty":
@@ -1445,8 +1453,12 @@ def test_pallas_exchange_lands_what_the_ragged_all_to_all_lands(pattern):
     rank = jax.device_put(
         jnp.arange(EP, dtype=jnp.int32).reshape(EP, 1), NamedSharding(mesh, P(AXIS))
     )
+    payloads = jax.device_put(
+        jnp.asarray(rng.integers(-(2**31), 2**31 - 1, size=(EP, width)), jnp.int32),
+        NamedSharding(mesh, P(AXIS)),
+    )
 
-    def body(x_l, sizes_l, rank_l):
+    def body(x_l, sizes_l, rank_l, payload_l):
         me = rank_l[0, 0]
         send_sizes = sizes_l[0]
         offsets = jnp.cumsum(send_sizes) - send_sizes
@@ -1460,24 +1472,36 @@ def test_pallas_exchange_lands_what_the_ragged_all_to_all_lands(pattern):
             recv_sizes,
             axis_name=AXIS,
         )
-        recv, send_sem, recv_sem = exchange_start(
-            x_l, send_sizes, offsets, rank_l, t_local=t_local
-        )
         expected = jnp.stack(
             [jnp.sum(send_sizes), jnp.sum(recv_sizes) - recv_sizes[me]]
         )
+        want_table = lax.all_gather(payload_l, AXIS, axis=0, tiled=True)
+        if not with_payload:
+            recv, send_sem, recv_sem = exchange_start(
+                x_l, send_sizes, offsets, rank_l, t_local=t_local
+            )
+            got = exchange_wait(
+                recv, x_l, send_sem, recv_sem, expected, t_local=t_local
+            )
+            return want, got, recv_sizes[None], want_table[None], want_table[None]
+        recv, pbuf, send_sem, recv_sem, precv_sem = exchange_start(
+            x_l, send_sizes, offsets, rank_l, t_local=t_local, payload=payload_l[0]
+        )
+        table = payload_wait(pbuf, precv_sem, width=width)
         got = exchange_wait(recv, x_l, send_sem, recv_sem, expected, t_local=t_local)
-        return want, got, recv_sizes[None]
+        return want, got, recv_sizes[None], want_table[None], table[None]
 
-    want, got, recv_sizes = jax.jit(
+    want, got, recv_sizes, want_table, table = jax.jit(
         jax.shard_map(
             body,
             mesh=mesh,
-            in_specs=(P(AXIS),) * 3,
-            out_specs=(P(AXIS),) * 3,
+            in_specs=(P(AXIS),) * 4,
+            out_specs=(P(AXIS),) * 5,
             check_vma=False,
         )
-    )(x, sizes_g, rank)
+    )(x, sizes_g, rank, payloads)
+    # Every shard holds every shard's payload row, in mesh order.
+    np.testing.assert_array_equal(np.asarray(table), np.asarray(want_table))
     want = np.asarray(want.view(jnp.uint8)).reshape(EP, EP * t_local, -1)
     got = np.asarray(got.view(jnp.uint8)).reshape(EP, EP * t_local, -1)
     recv_sizes = np.asarray(recv_sizes)

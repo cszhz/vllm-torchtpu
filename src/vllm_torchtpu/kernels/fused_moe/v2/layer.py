@@ -24,7 +24,11 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from vllm_torchtpu.kernels.fused_moe.v2.dispatch import exchange_start, exchange_wait
+from vllm_torchtpu.kernels.fused_moe.v2.dispatch import (
+    exchange_start,
+    exchange_wait,
+    payload_wait,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -1148,24 +1152,28 @@ def fused_ep_moe_v2(
         )
         return received, token_index
 
-    def start_rows_pallas(q_l, local_blocks, exchange, rank_l):
-        """Put the wire rows on the wire and return what waits for them.
+    def start_rows_pallas(q_l, local_blocks, packed, rank_l):
+        """Put the routing payload and the wire rows on the wire and return
+        what waits for them.
 
-        The same exchange as exchange_rows_all_to_all, by Pallas DMAs: issued
-        before the routing plan and waited for after it. Returns this shard's
-        index re-read behind the issue -- every plan table reads it, so none
-        can be scheduled ahead of the sends -- the token index, and
-        `finish(tables) -> (rows, tables)`, which waits behind the tables it
-        is handed.
+        The same exchange as exchange_rows_all_to_all, by Pallas DMAs, with
+        this shard's routing payload pushed to every shard by the same issue
+        instead of all-gathered (a 32-step SparseCore ring at DP32, 91 us a
+        layer exposed in front of the plan). Returns the gathered payload
+        table, this shard's index re-read behind the issue -- every plan table
+        reads it, so none can be scheduled ahead of the sends -- the token
+        index, and `finish(tables) -> (rows, tables)`, which waits for the
+        rows behind the tables it is handed.
         """
         send_rows, send_sizes, input_offsets = _all_to_all_send_plan(
             local_blocks, g_local=g_local, ep=ep, t_local=t_local, topk=topk
         )
         send = jnp.take(q_l, send_rows, axis=0)
-        recv, send_sem, recv_sem = exchange_start(
-            send, send_sizes, input_offsets, rank_l, t_local=t_local
+        recv, pbuf, send_sem, recv_sem, precv_sem = exchange_start(
+            send, send_sizes, input_offsets, rank_l, t_local=t_local, payload=packed
         )
         recv, rank_l = lax.optimization_barrier((recv, rank_l))
+        exchange = payload_wait(pbuf, precv_sem, width=layout[-1])
         me = rank_l[0, 0]
         pairs_g, _, _ = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
@@ -1186,7 +1194,7 @@ def fused_ep_moe_v2(
             )
             return rows, tables
 
-        return rank_l, token_index, finish
+        return exchange, rank_l, token_index, finish
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
@@ -1207,9 +1215,8 @@ def fused_ep_moe_v2(
             topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
                 gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
             )
-            exchange = gather_payload(packed)
-            rank_l, token_index, finish_rows = start_rows_pallas(
-                q_l, local_blocks, exchange, rank_l
+            exchange, rank_l, token_index, finish_rows = start_rows_pallas(
+                q_l, local_blocks, packed, rank_l
             )
             q_g = None
         elif dispatch == "all_to_all":

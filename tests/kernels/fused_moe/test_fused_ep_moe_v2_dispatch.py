@@ -166,13 +166,15 @@ def test_the_all_to_all_dispatch_is_refused_off_the_fused_stage(dispatch):
         )
 
 
-def test_the_pallas_exchange_lowers_for_tpu_from_a_host():
-    """The issue/wait pair hands two DMA semaphores from one pallas_call to
-    the next. Lowered for TPU from this host -- the way torch_tpu's jax.export
-    bridge sees it, for an 8-way mesh of v7x cores -- the wait must take both
-    semaphores straight from the issue, and neither call may be marked
+@pytest.mark.parametrize("with_payload", [False, True], ids=["rows", "rows+payload"])
+def test_the_pallas_exchange_lowers_for_tpu_from_a_host(with_payload):
+    """The issue/wait pair hands DMA semaphores from one pallas_call to the
+    next. Lowered for TPU from this host -- the way torch_tpu's jax.export
+    bridge sees it, for an 8-way mesh of v7x cores -- every wait must take its
+    semaphores straight from the issue, and no call may be marked
     side-effecting: the bridge's SPMD partitioner refuses a side-effecting
-    custom call that carries no sharding of its own."""
+    custom call that carries no sharding of its own. With the routing payload
+    on the same issue there is a third call, the payload's wait."""
     import jax
     from jax import export, lax
     from jax.sharding import AbstractMesh, NamedSharding
@@ -181,9 +183,10 @@ def test_the_pallas_exchange_lowers_for_tpu_from_a_host():
     from vllm_torchtpu.kernels.fused_moe.v2.dispatch import (
         exchange_start,
         exchange_wait,
+        payload_wait,
     )
 
-    ep, t_local, sent = 8, 144, 864
+    ep, t_local, sent, width = 8, 144, 864, 1664
     mesh = AbstractMesh(
         (ep,),
         ("d",),
@@ -192,32 +195,58 @@ def test_the_pallas_exchange_lowers_for_tpu_from_a_host():
         ),
     )
 
-    def body(x_l, sizes_l, rank_l):
+    def body(x_l, sizes_l, rank_l, packed_l):
         sizes = sizes_l[0]
         offsets = jnp.cumsum(sizes) - sizes
-        recv, send_sem, recv_sem = exchange_start(
-            x_l, sizes, offsets, rank_l, t_local=t_local
+        if not with_payload:
+            recv, send_sem, recv_sem = exchange_start(
+                x_l, sizes, offsets, rank_l, t_local=t_local
+            )
+            recv, rank_l = lax.optimization_barrier((recv, rank_l))
+            expected = jnp.stack([jnp.sum(sizes), jnp.sum(sizes) - sizes[rank_l[0, 0]]])
+            return exchange_wait(
+                recv, x_l, send_sem, recv_sem, expected, t_local=t_local
+            ), packed_l
+        packed = packed_l[0]
+        recv, pbuf, send_sem, recv_sem, precv_sem = exchange_start(
+            x_l, sizes, offsets, rank_l, t_local=t_local, payload=packed
         )
         recv, rank_l = lax.optimization_barrier((recv, rank_l))
+        table = payload_wait(pbuf, precv_sem, width=width)
         expected = jnp.stack([jnp.sum(sizes), jnp.sum(sizes) - sizes[rank_l[0, 0]]])
-        return exchange_wait(recv, x_l, send_sem, recv_sem, expected, t_local=t_local)
+        rows = exchange_wait(recv, x_l, send_sem, recv_sem, expected, t_local=t_local)
+        return rows, table[rank_l[0, 0]][None]
 
     shard = NamedSharding(mesh, P("d"))
     specs = (
         jax.ShapeDtypeStruct((ep * sent, 40, 128), jnp.float8_e4m3fn, sharding=shard),
         jax.ShapeDtypeStruct((ep, ep), jnp.int32, sharding=shard),
         jax.ShapeDtypeStruct((ep, 1), jnp.int32, sharding=shard),
+        jax.ShapeDtypeStruct((ep, width), jnp.int32, sharding=shard),
     )
     fn = jax.shard_map(
-        body, mesh=mesh, in_specs=(P("d"),) * 3, out_specs=P("d"), check_vma=False
+        body,
+        mesh=mesh,
+        in_specs=(P("d"),) * 4,
+        out_specs=(P("d"), P("d")),
+        check_vma=False,
     )
     with jax.sharding.use_abstract_mesh(mesh):
         module = export.export(jax.jit(fn), platforms=["tpu"])(*specs).mlir_module()
     calls = [line for line in module.splitlines() if "tpu_custom_call" in line]
-    assert len(calls) == 2
+    assert len(calls) == (3 if with_payload else 2)
     assert not any("has_side_effect = true" in line for line in calls)
-    # The start returns (buffer, send sem, recv sem); the wait takes both
+    # The issue returns its buffers then its semaphores; each wait takes its
     # semaphores straight from it.
-    start = re.match(r"\s*(%[\w.]+):3 = ", calls[0])
+    start = re.match(r"\s*(%[\w.]+):(\d+) = ", calls[0])
     assert start is not None, calls[0]
-    assert f"{start.group(1)}#1, {start.group(1)}#2)" in calls[1], calls[1]
+    name, results = start.group(1), int(start.group(2))
+    if not with_payload:
+        assert results == 3
+        assert f"{name}#1, {name}#2)" in calls[1], calls[1]
+    else:
+        # rows, payload table, rows send/recv sems, payload recv sem; the
+        # payload's send sem is the issue's own scratch (drained there).
+        assert results == 5
+        assert f"{name}#1, {name}#4)" in calls[1], calls[1]  # payload wait
+        assert f"{name}#2, {name}#3)" in calls[2], calls[2]  # rows wait
