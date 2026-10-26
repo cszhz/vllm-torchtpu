@@ -1918,6 +1918,7 @@ def fused_ep_moe_v2(
         lane_quant,
         oneshot_gather,
         combine_restore,
+        mixed_plan,
         bool(shared_in_op),
         float(shared_out_scale),
         int(shared_rs_min_rows),
