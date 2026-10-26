@@ -761,10 +761,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("MOE_FUSED_EP_KERNEL_TAIL_BARRIER", "1") or 1)
     ),
     # How fused EP MoE v2 builds the routing plan between the dispatch and
-    # the expert kernel: xla spells it as the ~170 small ops the host.py
-    # builders emit, kernel builds every table the expert kernel takes in one
-    # pass over the exchanged count table (plan_kernel.py). Same tables bit
-    # for bit. Default off until measured at the served widths.
+    # the expert kernel: xla spells it as the small ops the host.py builders
+    # emit, kernel builds the tables that are not per-pair in one Pallas
+    # program (plan_kernel.py). Same tables bit for bit.
+    #
+    # MEASURED SLOWER, do not turn this on: the whole plan goes 49.8 -> 51.4
+    # us a layer at the DP32 C768 per-device shape (the tables it replaces
+    # 18.0 -> 20.3), isolated, bit-exact on device. The kernel's minormost
+    # axis has to be the expert-parallel width -- 32 of 128 lanes -- because
+    # that is the only axis a reshape Mosaic accepts leaves alone, so every
+    # intermediate is four times padded and the prefix sums reduce across
+    # lanes. It stays here for the next attempt, which would put the prefix
+    # sums on the MXU as a triangular matmul instead.
     "MOE_FUSED_EP_PLAN": env_with_choices(
         "MOE_FUSED_EP_PLAN", "xla", ["xla", "kernel"]
     ),
