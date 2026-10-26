@@ -132,12 +132,6 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     page_indices_ref,  # [max_num_seqs * pages_per_seq]
     cu_q_lens_ref,  # [max_num_seqs + 1]
     start_end_seq_idx_ref,  # [2] (start_seq_idx, end_seq_idx)
-    sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-    # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
-    bo_ids_ref,
-    # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset,
-    #     bkv_sem_0_sz, bkv_sem_1_sz)
-    bkv_update_ids_ref,
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
@@ -163,6 +157,13 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     l_ref,  # [step_sz * num_q_heads],
     m_ref,  # [step_sz * num_q_heads],
     acc_ref,  # [bq_sz * num_q_heads, head_dim],
+    # SMEM state carried across grid steps, set in the prologue:
+    sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
+    # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
+    bo_ids_ref,
+    # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset,
+    #     bkv_sem_0_sz, bkv_sem_1_sz)
+    bkv_update_ids_ref,
     *,
     static_q_len: int | None,
     sm_scale: float,
@@ -900,6 +901,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
 
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
+        for ref, init in ((sem_ids_ref, 0), (bo_ids_ref, -1), (bkv_update_ids_ref, -1)):
+            for i in range(ref.shape[0]):
+                ref[i] = jnp.int32(init)
         start_fetch_bq(start_seq_idx, 0, 0)
 
         # Initialize bkv_x2_ref to avoid NaN issues from accessing uninitialized
@@ -1928,6 +1932,9 @@ def mla_sliding_window_ragged_paged_attention(
             l_scratch,
             m_scratch,
             acc_scratch,
+            pltpu.SMEM((3,), jnp.int32),  # sem_ids
+            pltpu.SMEM((4,), jnp.int32),  # bo_ids
+            pltpu.SMEM((6,), jnp.int32),  # bkv_update_ids
         ]
 
         scalar_prefetches = (
@@ -1935,13 +1942,6 @@ def mla_sliding_window_ragged_paged_attention(
             page_indices,
             cu_q_lens,
             jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
-            # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-            jnp.zeros((3,), jnp.int32),
-            # (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
-            jnp.full((4,), -1, jnp.int32),
-            # (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset,
-            #     bkv_sem_0_sz, bkv_sem_1_sz)
-            jnp.full((6,), -1, jnp.int32),
         )
 
         scope_name = (
@@ -1986,10 +1986,10 @@ def mla_sliding_window_ragged_paged_attention(
                     ),
                 ],
                 input_output_aliases={
-                    11: 0,  # Alias output activation with in_output
-                    10: 1,  # Aliasing cache_kv with updated_cache_kv
-                    12: 2,  # Alias l with in_l
-                    13: 3,  # Alias m with in_m
+                    len(scalar_prefetches) + 4: 0,  # Alias output with in_output
+                    len(scalar_prefetches) + 3: 1,  # Alias cache_kv
+                    len(scalar_prefetches) + 5: 2,  # Alias l with in_l
+                    len(scalar_prefetches) + 6: 3,  # Alias m with in_m
                 },
                 name=scope_name,
             )
