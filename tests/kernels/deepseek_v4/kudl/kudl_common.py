@@ -197,4 +197,30 @@ def win_l1(conc):
     return f
 
 
-ARMS = {"inc": inc, "win": win, "sparse": sparse, "win_l1": win_l1}
+def _patched(f, mod, **attrs):
+    """Arm wrapper: module attributes set only while the region traces (jit traces inside the call)."""
+    def g(d, q):
+        old = {k: getattr(mod, k) for k in attrs}
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+        try:
+            return f(d, q)
+        finally:
+            for k, v in old.items():
+                setattr(mod, k, v)
+    return g
+
+
+def win_bf16p(conc):
+    """Candidate + bf16 P into the PV matmul (L2 pv_bf16)."""
+    from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_window_union as cwu
+    return _patched(win(conc), cwu, L2_CONFIG=dict(cwu.L2_CONFIG, pv_bf16=True))
+
+
+def inc_bf16p(conc):
+    """Incumbent + bf16 P in the union-dense kernel (TPU_DSV4_CSA_UNION_DENSE_PV_BF16)."""
+    from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_union_dense as ud
+    return _patched(inc(conc), ud, PV_BF16=True)
+
+
+ARMS = {"inc": inc, "win": win, "sparse": sparse, "win_l1": win_l1, "win_bf16p": win_bf16p, "inc_bf16p": inc_bf16p}
