@@ -194,6 +194,112 @@ def _attention_swa_decode_kernel(
     )
 
 
+# Prefill and mixed calls of more tokens than this read the rows of a
+# `DenseRefs` batch from the paged cache; decode-sized calls never do.
+DENSE_MIN_TOKENS = 256
+
+
+class DenseRefs(NamedTuple):
+    """Batches of one sequence's tokens that all have fewer than top_k valid
+    entries. The indexer then selected every compressed token visible to each
+    of them, in position order (the SparseCore top-k writes a row it keeps
+    whole in column order), so a token's gathered row j is row j of its
+    sequence for every j < kv_len. Such a batch copies those rows once from
+    the paged cache and dequantizes them once, instead of once per token."""
+
+    # SMEM i32[num_tokens]: token t's sequence s, or -(s + 1) when t is in
+    # such a batch.
+    token_seq_ref: Any
+    page_indices_ref: Any  # SMEM i32[max_num_seqs * pages_per_seq]
+    cache_nope_hbm_ref: Any  # int32[total_pages, page_size, 128]
+    cache_rope_hbm_ref: Any  # int32[total_pages, page_size // 4, 128]
+    rope_vmem_ref: Any  # int32[topk // 4, 128], the rows in csa_gather's rope layout
+    kv_vmem_ref: Any  # bf16[topk, head_dim], the batch's dequantized rows
+    pages_per_seq: int
+
+
+def _attention_dense_kernel(
+    kv_lens_ref,
+    start_end_seq_idx_ref,
+    sem_ids_ref,
+    bo_ids_ref,
+    token_seq_ref,
+    page_indices_ref,
+    attention_sinks_ref,
+    q_hbm_ref,
+    cache_kv_nope_hbm_ref,
+    cache_kv_rope_hbm_ref,
+    swa_accumution_hbm_ref,
+    swa_l_hbm_ref,
+    swa_m_hbm_ref,
+    cache_nope_hbm_ref,
+    cache_rope_hbm_ref,
+    o_hbm_ref,
+    *scratch,
+    pages_per_seq: int,
+    **kwargs,
+):
+    """`_attention_kernel` that reads `DenseRefs` batches from the paged cache."""
+    *scratch, rope_vmem_ref, kv_vmem_ref = scratch
+    _attention_kernel(
+        kv_lens_ref,
+        start_end_seq_idx_ref,
+        sem_ids_ref,
+        bo_ids_ref,
+        attention_sinks_ref,
+        q_hbm_ref,
+        cache_kv_nope_hbm_ref,
+        cache_kv_rope_hbm_ref,
+        swa_accumution_hbm_ref,
+        swa_l_hbm_ref,
+        swa_m_hbm_ref,
+        o_hbm_ref,
+        *scratch,
+        dense=DenseRefs(
+            token_seq_ref,
+            page_indices_ref,
+            cache_nope_hbm_ref,
+            cache_rope_hbm_ref,
+            rope_vmem_ref,
+            kv_vmem_ref,
+            pages_per_seq,
+        ),
+        **kwargs,
+    )
+
+
+def _rope_rows_as_gathered(rows: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """The even and odd int32 rows of csa_gather's rope block for top-k
+    entries that are consecutive cache tokens.
+
+    `rows` is int32[topk // 4, 128] in the cache's layout: row i holds tokens
+    4i..4i+3, word k of a token holding its bf16 k (low) and k + 32 (high).
+    csa_gather's row 2i holds tokens (4i, 4i + 1), row 2i + 1 tokens
+    (4i + 2, 4i + 3), word k pairing one bf16 of both, and its lanes 64:128
+    the same for the tokens topk // 2 further on.
+    """
+    words = csa_cache_layout.ROPE_WORDS
+    lane = lax.broadcasted_iota(jnp.int32, rows.shape, 1)
+    # Lanes [0, 64) pair tokens 4i and 4i + 1, lanes [64, 128) 4i + 2 and 4i + 3.
+    pairs = jnp.where(
+        lane % (2 * words) < words,
+        jnp.bitwise_or(
+            jnp.bitwise_and(rows, 0xFFFF),
+            jnp.left_shift(pltpu.roll(rows, rows.shape[1] - words, 1), 16),
+        ),
+        jnp.bitwise_or(
+            lax.shift_right_logical(pltpu.roll(rows, words, 1), 16),
+            jnp.bitwise_and(rows, jnp.int32(-65536)),  # 0xFFFF0000
+        ),
+    )
+    half = rows.shape[0] // 2
+    lower = lane[:half] < 2 * words
+    first, second = pairs[:half], pairs[half:]
+    even = jnp.where(lower, first, pltpu.roll(second, 2 * words, 1))
+    odd = jnp.where(lower, pltpu.roll(first, 2 * words, 1), second)
+    return even, odd
+
+
 def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_seqs]
@@ -225,6 +331,7 @@ def _attention_kernel(
     sm_scale: float,
     batch_size: int = 1,
     swa: SwaDecodeRefs | None = None,
+    dense: DenseRefs | None = None,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
@@ -315,7 +422,7 @@ def _attention_kernel(
         else:
             cp.start()
 
-    def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False):
+    def _fetch_gathered_batch(seq_idx_start, bkv_sem_idx, *, wait=False):
         sem_nope = sems.at[0, bkv_sem_idx]
         sem_rope = sems.at[6, bkv_sem_idx]
 
@@ -343,6 +450,59 @@ def _attention_kernel(
             _async_copy(src=dst_nope, dst=dst_nope, sem=sem_nope, wait=True)
             dst_rope = bkv_rope_vmem_ref
             _async_copy(src=dst_rope, dst=dst_rope, sem=sem_rope, wait=True)
+
+    if dense is not None:
+        # A `DenseRefs` batch's rows land in its slot's first batch entry, in
+        # the cache's own layouts: uint8 nope slabs and bf16-viewed rope rows.
+        dense_nope_hbm_ref = dense.cache_nope_hbm_ref.bitcast(jnp.uint8)
+        dense_rope_hbm_ref = dense.cache_rope_hbm_ref.bitcast(jnp.bfloat16)
+        rows_per_copy = min(dense.cache_nope_hbm_ref.shape[1], bkv_sz)
+        assert bkv_sz % rows_per_copy == 0
+        nope_rows_per_copy = rows_per_copy * csa_cache_layout.SLAB_ROWS
+        rope_rows_per_copy = rows_per_copy // 2
+
+    def is_dense_batch(seq_idx_start):
+        return dense.token_seq_ref[seq_idx_start] < 0
+
+    def _fetch_dense_batch(seq_idx_start, bkv_sem_idx, *, wait=False):
+        """Copy the cache pages holding rows [0, max kv_len) of the batch's
+        sequence; rows past a token's kv_len are masked like gathered ones."""
+        seq = -dense.token_seq_ref[seq_idx_start] - 1
+        max_kv_len = kv_lens_ref[seq_idx_start]
+        for b in range(1, batch_size):
+            max_kv_len = jnp.maximum(max_kv_len, kv_lens_ref[seq_idx_start + b])
+        num_copies = cdiv(max_kv_len, rows_per_copy)
+        for i in range(bkv_sz // rows_per_copy):
+
+            @pl.when(i < num_copies)
+            def _():
+                nope_dst = bkv_nope_x2_ref.at[
+                    bkv_sem_idx, 0, pl.ds(i * nope_rows_per_copy, nope_rows_per_copy)
+                ]
+                rope_dst = bkv_rope_x2_ref.at[
+                    bkv_sem_idx, 0, pl.ds(i * rope_rows_per_copy, rope_rows_per_copy)
+                ]
+                nope_src, rope_src = nope_dst, rope_dst
+                if not wait:
+                    page = dense.page_indices_ref[seq * dense.pages_per_seq + i]
+                    nope_src = dense_nope_hbm_ref.at[page, pl.ds(0, nope_rows_per_copy)]
+                    rope_src = dense_rope_hbm_ref.at[page, pl.ds(0, rope_rows_per_copy)]
+                _async_copy(nope_src, nope_dst, sems.at[0, bkv_sem_idx], wait)
+                _async_copy(rope_src, rope_dst, sems.at[6, bkv_sem_idx], wait)
+
+    def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False):
+        if dense is None:
+            _fetch_gathered_batch(seq_idx_start, bkv_sem_idx, wait=wait)
+            return
+        from_cache = is_dense_batch(seq_idx_start)
+
+        @pl.when(from_cache)
+        def _():
+            _fetch_dense_batch(seq_idx_start, bkv_sem_idx, wait=wait)
+
+        @pl.when(jnp.logical_not(from_cache))
+        def _():
+            _fetch_gathered_batch(seq_idx_start, bkv_sem_idx, wait=wait)
 
     def _fetch_bq_batch(seq_idx_start, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
@@ -469,22 +629,25 @@ def _attention_kernel(
         q = bq_x2_ref.at[bq_sem_idx, batch_idx][...]
         return q
 
-    def load_bkv(bkv_sem_idx, batch_idx, masked):
-        # The gathered NoPE rows as the int32 words csa_gather wrote.
-        words = bkv_nope_x2_ref.bitcast(jnp.int32).at[bkv_sem_idx, batch_idx][...]
+    def join_bkv(words, bkv_rope):
+        """The bf16 [bkv_sz, head_dim] rows of NoPE words and a rope block."""
         bkv_nope = _dequant_dsv4_fp8(words)
 
         # The gathered rope block is [bkv_sz // 2, 2 * rope_dim]: entry i in
         # lanes 0:rope_dim, entry i + bkv_sz // 2 in the upper half (see
         # csa_gather). Mosaic has no [m, 2n] -> [2m, n] shape cast, but the
         # lane slice + row concatenate below is one lane rotate per vreg.
-        bkv_rope = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx][...]
         bkv_rope = bkv_rope.reshape(bkv_sz // 2, -1)
         rope_dim = bkv_rope.shape[-1] // 2
         bkv_rope = jnp.concatenate(
             [bkv_rope[:, :rope_dim], bkv_rope[:, rope_dim:]], axis=0
         )
-        bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+        return jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+
+    def load_bkv(bkv_sem_idx, batch_idx, masked):
+        # The gathered NoPE rows as the int32 words csa_gather wrote.
+        words = bkv_nope_x2_ref.bitcast(jnp.int32).at[bkv_sem_idx, batch_idx][...]
+        bkv = join_bkv(words, bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx][...])
 
         # In vLLM, multiple caches may overlay on the same KV Tensor. For example,
         # compressor state cache write data in bfloat16 / float32 format, certain
@@ -497,6 +660,24 @@ def _attention_kernel(
             k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
             bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
+
+    def build_dense_bkv(bkv_sem_idx):
+        """Dequantize a `DenseRefs` batch's rows into `dense.kv_vmem_ref`,
+        the same rows `load_bkv` builds from a gather of them."""
+        words = bkv_nope_x2_ref.bitcast(jnp.int32).at[bkv_sem_idx, 0][...]
+        rows = bkv_rope_x2_ref.bitcast(jnp.int32).at[bkv_sem_idx, 0][...]
+        even, odd = _rope_rows_as_gathered(rows)
+        half = even.shape[0]
+        dense.rope_vmem_ref[pl.ds(0, half, stride=2), :] = even
+        dense.rope_vmem_ref[pl.ds(1, half, stride=2), :] = odd
+        bkv_rope = dense.rope_vmem_ref.bitcast(jnp.bfloat16)[...]
+        dense.kv_vmem_ref[...] = join_bkv(words, bkv_rope)
+
+    def load_dense_bkv(batch_idx):
+        bkv = dense.kv_vmem_ref[...]
+        kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+        return jnp.where(k_span < kv_len, bkv, 0)
 
     def run_swa_decode(bq_sem_idx):
         """Write the decode tokens' unnormalized SWA state where the HBM
@@ -548,7 +729,7 @@ def _attention_kernel(
         swa_m = bm_x2_ref[bq_sem_idx, batch_idx, :num_q_heads][..., None]
         return swa_acc, swa_l, swa_m
 
-    def process(masked):
+    def process(masked, from_cache=False):
         def get_next_seq_ids(seq_idx, bi_sem_idx):
             next_seq_idx = seq_idx + batch_size
             next_bi_sem_idx = lax.select(bi_sem_idx == 0, 1, 0)
@@ -592,8 +773,14 @@ def _attention_kernel(
         def _wait_send():
             wait_send_bo_batch(bo_sem_idx)
 
+        if from_cache:
+            build_dense_bkv(bi_sem_idx)
+
         for batch_idx in range(batch_size):
-            bkv = load_bkv(bi_sem_idx, batch_idx, masked)
+            if from_cache:
+                bkv = load_dense_bkv(batch_idx)
+            else:
+                bkv = load_bkv(bi_sem_idx, batch_idx, masked)
             bq = load_bq(bi_sem_idx, batch_idx)
 
             swa_acc, swa_l, swa_m = load_swa_output(bi_sem_idx, batch_idx)
@@ -657,7 +844,17 @@ def _attention_kernel(
     def _process_full():
         process(masked=False)
 
-    @pl.when(jnp.logical_not(all_full))
+    gathered = jnp.logical_not(all_full)
+    if dense is not None:
+        # A `DenseRefs` batch has kv_len < bkv_sz throughout, so never all_full.
+        from_cache = is_dense_batch(batch_start_seq_idx)
+        gathered = jnp.logical_and(gathered, jnp.logical_not(from_cache))
+
+        @pl.when(from_cache)
+        def _process_from_cache():
+            process(masked=True, from_cache=True)
+
+    @pl.when(gathered)
     def _process_masked():
         process(masked=True)
 
@@ -675,6 +872,16 @@ def _attention_kernel(
             swa.window.wait_stores(jnp.maximum(num_stores, 0), swa.store_sem)
 
     ### ------- Kernel end ------- ###
+
+
+def _dense_token_seqs(kv_lens, seq_ids, batch_size: int, topk: int):
+    """`DenseRefs.token_seq_ref` for kernel batches of `batch_size` tokens."""
+    seqs = seq_ids.reshape(-1, batch_size)
+    short = (kv_lens < topk).reshape(-1, batch_size)
+    dense = jnp.all(short, axis=1, keepdims=True) & jnp.all(
+        seqs == seqs[:, :1], axis=1, keepdims=True
+    )
+    return jnp.where(dense, -seqs - 1, seqs).reshape(-1).astype(jnp.int32)
 
 
 def prepare_q_inputs(
@@ -847,6 +1054,7 @@ def sparse_ragged_paged_attention(
         num_valid_tokens: jax.Array,  # i32
         kernel_batch_size: int,
         swa_cache: jax.Array | None = None,
+        dense_inputs: tuple[jax.Array, ...] | None = None,
     ):
         batch_size = kernel_batch_size
         end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
@@ -954,6 +1162,21 @@ def sparse_ragged_paged_attention(
                 swa_logical_page_size=swa_logical_page_size,
                 swa_bkv_p=swa_num_kv_pages_per_block,
             )
+        dense_prefetches = ()
+        if dense_inputs is not None:
+            assert swa_cache is None
+            token_seq, dense_page_indices, dense_cache_nope, dense_cache_rope = (
+                dense_inputs
+            )
+            dense_prefetches = (token_seq, dense_page_indices)
+            operands += (dense_cache_nope, dense_cache_rope)
+            in_specs += [pl.BlockSpec(memory_space=pltpu.HBM)] * 2
+            scratch_shapes += [
+                pltpu.VMEM((topk_rows // 4, lanes), jnp.int32),
+                pltpu.VMEM((topk_rows, head_dim), jnp.bfloat16),
+            ]
+            kernel_fn = _attention_dense_kernel
+            swa_kwargs = dict(pages_per_seq=num_page_indices // max_num_seqs)
 
         scalar_prefetches = (
             kv_lens,
@@ -963,6 +1186,7 @@ def sparse_ragged_paged_attention(
             # seq_idx_start of the in-flight bo DMA per bo sem; -1 = none.
             jnp.full((2,), -1, jnp.int32),
             *swa_prefetches,
+            *dense_prefetches,
         )
         input_output_aliases = {len(scalar_prefetches) + 1: 0}  # q with output
         if swa_cache is not None:
@@ -972,6 +1196,7 @@ def sparse_ragged_paged_attention(
         scope_name = (
             f"SparseMLA-p_{gathered_topk}-bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
             f"{'-swa_d' if swa_cache is not None else ''}"
+            f"{'-dense' if dense_inputs is not None else ''}"
         )
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
@@ -1012,6 +1237,17 @@ def sparse_ragged_paged_attention(
     topk = topk_indices.shape[-1]
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
     swa_cache = None if swa_decode is None else swa_decode.cache_kv
+    dense_inputs = None
+    if (
+        swa_cache is None
+        and q.shape[0] > DENSE_MIN_TOKENS
+        and q.shape[0] % gather_and_attention_chunk_size == 0
+        and gather_and_attention_chunk_size % attention_kernel_batch_size == 0
+    ):
+        token_seq = _dense_token_seqs(
+            kv_lens, seq_ids_segment[: q.shape[0]], attention_kernel_batch_size, topk
+        )
+        dense_inputs = (token_seq, page_indices, cache_kv_nope, cache_kv_rope)
 
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
@@ -1078,6 +1314,7 @@ def sparse_ragged_paged_attention(
             num_valid_tokens=cu_q_lens[distribution[2]],
             kernel_batch_size=kernel_batch_size,
             swa_cache=swa_cache,
+            dense_inputs=dense_inputs,
         )
         if swa_cache is not None:
             q, swa_cache = q
