@@ -19,10 +19,12 @@ invisible in correctness and expensive in prefill, where one sequence spans
 many tiles. This runs both paths over the same 4096-token prefill at
 production geometry and compares outputs, final states, and time.
 
-TPU only. Timings print (use `-s`); the ratio is the assertion.
+Kernel comparisons require TPU. The environment-isolation regression is CPU-only.
+Timings print (use `-s`); the ratio is the assertion.
 """
 
 import functools
+import inspect
 import time
 
 import jax
@@ -36,8 +38,6 @@ from vllm_torchtpu.kernels.gdn.v3 import wrapper
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.kernels.qwen4_exp.gdn_input import compact_qkv_input
 from vllm_torchtpu.layers.core import gdn_attention
-
-pytestmark = pytest.mark.tpu_test
 
 # Measured 1.043-1.049x over five runs; a per-tile decode lands near 2.2x.
 # Arms are timed best-of-N because each is only ~7.5 ms.
@@ -75,6 +75,7 @@ BENCH_DISTRIBUTION = np.array([0, 1, 1], dtype=np.int32)
 BENCH_SEQ_LENS = np.array([BENCH_NUM_TOKENS + 1], dtype=np.int32)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("ssm_dtype", [jnp.bfloat16, jnp.float32])
 def test_prepared_pooled_prefill_then_decode(ssm_dtype, monkeypatch):
     """Compare prepared and ordinary input through the real pooled bridge."""
@@ -82,8 +83,9 @@ def test_prepared_pooled_prefill_then_decode(ssm_dtype, monkeypatch):
 
     from vllm_torchtpu import envs
 
-    monkeypatch.setattr(vllm_envs, "VLLM_KV_CACHE_LAYOUT", "NHD")
-    monkeypatch.setattr(envs, "TPU_GDN_CONV_QK_PAIR_LAYOUT", False)
+    # setattr would restore a lazy attribute as a permanent module value.
+    monkeypatch.setitem(vars(vllm_envs), "VLLM_KV_CACHE_LAYOUT", "NHD")
+    monkeypatch.setitem(vars(envs), "TPU_GDN_CONV_QK_PAIR_LAYOUT", False)
     n_kq, n_v, dim, width = 16, 48, 128, 10240
     block_size, token_bytes, slots = 128, 1024, 3
     layout = derive_pooled_gdn_state_layout(
@@ -190,6 +192,63 @@ def test_prepared_pooled_prefill_then_decode(ssm_dtype, monkeypatch):
             f"pooled prepared parity: ssm={jnp.dtype(ssm_dtype)}, tokens={count}, exact"
         )
         context += count
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("materialized", [False, True])
+def test_prepared_prefill_restores_lazy_environment(monkeypatch, cached, materialized):
+    from vllm import envs as vllm_envs
+    from vllm.config import DeviceConfig, VllmConfig
+    from vllm.config.attention import AttentionConfig
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    from vllm_torchtpu import envs
+
+    missing = object()
+    settings = (
+        (vllm_envs, "VLLM_KV_CACHE_LAYOUT", "HND", "HND"),
+        (envs, "TPU_GDN_CONV_QK_PAIR_LAYOUT", "1", True),
+    )
+    with monkeypatch.context() as state:
+        for module, key, text, value in settings:
+            state.setattr(module, "__getattr__", inspect.unwrap(module.__getattr__))
+            state.setenv(key, text)
+            state.delitem(vars(module), key, raising=False)
+            if materialized:
+                state.setitem(vars(module), key, value)
+        if cached:
+            vllm_envs.enable_envs_cache()
+            envs.enable_envs_cache()
+        before = [vars(module).get(key, missing) for module, key, *_ in settings]
+
+        class SetupComplete(Exception):
+            pass
+
+        def stop_before_arrays(**kwargs):
+            assert vllm_envs.VLLM_KV_CACHE_LAYOUT == "NHD"
+            assert envs.TPU_GDN_CONV_QK_PAIR_LAYOUT is False
+            raise SetupComplete
+
+        with monkeypatch.context() as setup:
+            setup.setitem(
+                globals(), "derive_pooled_gdn_state_layout", stop_before_arrays
+            )
+            with pytest.raises(SetupComplete):
+                test_prepared_pooled_prefill_then_decode(jnp.bfloat16, setup)
+        assert [
+            vars(module).get(key, missing) for module, key, *_ in settings
+        ] == before
+        assert vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND"
+        assert envs.TPU_GDN_CONV_QK_PAIR_LAYOUT is True
+        config = VllmConfig(
+            device_config=DeviceConfig("cpu"),
+            attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
+        )
+        assert (
+            resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]]) is KVCacheLayout.LBHNC
+        )
 
 
 def _benchmark_write_states(pool, recurrent, conv):
@@ -340,6 +399,7 @@ def _time_five_steps(run, make_args):
     return result, best
 
 
+@pytest.mark.tpu_test
 class TestProductionShapeDenseVsUnifiedPool:
     """Production-shape correctness and performance comparison.
 
