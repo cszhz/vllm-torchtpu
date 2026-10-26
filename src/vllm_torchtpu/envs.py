@@ -204,6 +204,8 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS: int = 0
     VLLM_TPU_DSV4_MHC_SMALL_BLOCK: int = 16
     VLLM_TPU_DSV4_MHC_FN_CHUNKS: int = 3
+    TPU_DSV4_MHC_AR_SEAM: bool = False
+    VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS: int = 0
     VLLM_TPU_DSV4_MHC_POST_HEAD: bool = True
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
@@ -1390,6 +1392,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lo third of the fn bytes and MXU pushes is skipped, seam -0.9 us at
     # T=8..32; mix logits move ~3e-6 relative (f64 oracle; 3-chunk 1.2e-7).
     "VLLM_TPU_DSV4_MHC_FN_CHUNKS": env_int("VLLM_TPU_DSV4_MHC_FN_CHUNKS", 3),
+    # DeepSeek-V4 mHC: fuse the small TP all-reduce of the attention output
+    # (wo_b's partial) with the seam that consumes it, one Pallas kernel per
+    # replicated decode bucket up to the small all-reduce's row cap
+    # (kernels/deepseek_v4/mhc/ar_seam_kernel.py). Bit-identical outputs.
+    "TPU_DSV4_MHC_AR_SEAM": env_bool("TPU_DSV4_MHC_AR_SEAM", False),
+    # DeepSeek-V4 mHC: a fused seam of at most this many tokens reserves
+    # 32 MiB of scoped VMEM instead of the 100 MiB default (clamped to 64 MiB),
+    # which made XLA evict the AR output and the neighbours' prefetched
+    # operands around every seam. 0 = off. A power of 2 (gate `T <= cap`).
+    "VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS": env_int(
+        "VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS", 0
+    ),
     # DeepSeek-V4 mHC: fuse the posts that only feed the hc head collapse or
     # DSpark's aux stream mean into one kernel each, so the (T, 4, H) streams
     # are never written (one to three posts per forward).

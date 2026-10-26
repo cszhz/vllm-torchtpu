@@ -24,6 +24,9 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
+# Scoped VMEM for decode-sized seams (see VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS).
+LOW_VMEM_LIMIT_BYTES = 32 * 1024 * 1024
+
 
 def _fused_kernel(
     x_ref,
@@ -289,7 +292,7 @@ def mhc_fused_post_pre(
     *,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
     gates_in_kernel: bool = False,
     gates_max_tokens: int | None = None,
     norm_weight: jax.Array | None = None,
@@ -313,6 +316,19 @@ def mhc_fused_post_pre(
     post2d = post_layer_mix.reshape(-1, hc_mult)
     comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
 
+    if vmem_limit_bytes is None:
+        # A seam of at most VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS rows needs
+        # well under 32 MiB, and the default 100 MiB (clamped to 64 MiB -
+        # 64 KiB) scoped reservation makes XLA evict the neighbours' VMEM
+        # buffers around every call (the all-reduce output it consumes, the
+        # next sublayer's prefetched weights) and stops it prefetching this
+        # call's own operands.
+        cap = envs.VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS
+        vmem_limit_bytes = (
+            LOW_VMEM_LIMIT_BYTES
+            if cap > 0 and x2d.shape[0] <= cap
+            else DEFAULT_VMEM_LIMIT_BYTES
+        )
     if small_block is None:
         small_block = envs.VLLM_TPU_DSV4_MHC_SMALL_BLOCK
     if fn_chunks is None:
