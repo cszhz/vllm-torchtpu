@@ -73,6 +73,9 @@ class FusedHcaMixedTest(parameterized.TestCase):
         self._run(name)
 
     @parameterized.parameters(("ut-two-blocks", dict(kt=256, blk_pages=32)), ("ut-h32-pf", dict(kt=1024)),
+                              ("ut-two-blocks", dict(kt=2048, kt_tail=512, stats128=True, bq=64)),
+                              ("ut-h32-pf", dict(kt=2048, kt_tail=512, stats128=True, bq=32, swa_merge=True)),
+                              ("ut-dec-ver-pf", dict(kt=1024, kt_tail=256, stats128=True, row_split=2)),
                               ("ut-dec-ver-pf", dict(edge_mask_only=False)), ("ut-fresh", dict(bq=8)))
     def test_knobs(self, name, knobs):
         self._run(name, **knobs)
@@ -91,7 +94,8 @@ class FusedHcaMixedTest(parameterized.TestCase):
         co, cswa = jax.jit(lambda d: fused_hca_mixed_attention(
             d["q"], d["kv"], d["swa"], d["seq_lens"], d["swa_bt"], d["cu"], d["dist"], d["hca"],
             (d["positions"] + 1) // MC.RATIO, d["hca_bt"], d["sinks"], sm_scale=MC.C.SM_SCALE,
-            sliding_window=MC.W, logical_page_size=MC.P, chunk=MC.VQ, bq=16))(d)
+            sliding_window=MC.W, logical_page_size=MC.P, chunk=MC.VQ, bq=1024 // 32, kt=2048,
+            kt_tail=512, stats128=True))(d)
         np.testing.assert_array_equal(np.asarray(ro.astype(jnp.float32)), np.asarray(co.astype(jnp.float32)))
         np.testing.assert_array_equal(np.asarray(rswa), np.asarray(cswa))
 

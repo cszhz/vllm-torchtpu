@@ -211,6 +211,8 @@ def _attention_hca(
             chunk=chunk,
             bq=mixed_bq,
             kt=envs.TPU_DSV4_FUSED_HCA_MIXED_KT,
+            kt_tail=envs.TPU_DSV4_FUSED_HCA_MIXED_KT_TAIL,
+            stats128=True,
             blk_pages=envs.TPU_DSV4_FUSED_HCA_BLK_PAGES,
         )
 

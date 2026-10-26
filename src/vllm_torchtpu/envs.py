@@ -180,8 +180,9 @@ if TYPE_CHECKING:
     TPU_DSV4_FUSED_HCA_BLK_PAGES: int = 128
     TPU_DSV4_FUSED_HCA_ROPE: bool = False
     TPU_DSV4_FUSED_HCA_MIXED: bool = False
-    TPU_DSV4_FUSED_HCA_MIXED_KT: int = 512
-    TPU_DSV4_FUSED_HCA_MIXED_Q_ROWS: int = 512
+    TPU_DSV4_FUSED_HCA_MIXED_KT: int = 2048
+    TPU_DSV4_FUSED_HCA_MIXED_KT_TAIL: int = 512
+    TPU_DSV4_FUSED_HCA_MIXED_Q_ROWS: int = 1024
     TPU_DSV4_SWA_SINGLE_PASS: bool = False
     TPU_DSV4_SWA_SINGLE_PASS_MAX_TOKENS: int = 32
     TPU_DSV4_SWA_SINGLE_PASS_BQ: int = 8
@@ -1276,9 +1277,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (fused_hca_mixed) per layer instead of the SWA kernel + MLA-p + MLA-m + hand-off glue; each
     # request's compressed rows are read once into VMEM and reused by all its query blocks.
     "TPU_DSV4_FUSED_HCA_MIXED": env_bool("TPU_DSV4_FUSED_HCA_MIXED"),
-    # ... compressed rows per compute tile, and query rows (tokens x heads) per prefill block.
-    "TPU_DSV4_FUSED_HCA_MIXED_KT": env_positive_int("TPU_DSV4_FUSED_HCA_MIXED_KT", 512),
-    "TPU_DSV4_FUSED_HCA_MIXED_Q_ROWS": env_positive_int("TPU_DSV4_FUSED_HCA_MIXED_Q_ROWS", 512),
+    # ... compressed rows per wide compute tile (where every query row of the block sees them), per
+    # narrow tail / visibility-edge tile, and query rows (tokens x heads) per prefill block.
+    "TPU_DSV4_FUSED_HCA_MIXED_KT": env_positive_int("TPU_DSV4_FUSED_HCA_MIXED_KT", 2048),
+    "TPU_DSV4_FUSED_HCA_MIXED_KT_TAIL": env_positive_int("TPU_DSV4_FUSED_HCA_MIXED_KT_TAIL", 512),
+    "TPU_DSV4_FUSED_HCA_MIXED_Q_ROWS": env_positive_int("TPU_DSV4_FUSED_HCA_MIXED_Q_ROWS", 1024),
     # DSv4 indexer: from this many tokens per bucket on, each TP rank scores
     # only its contiguous 1/TP of every sequence's compressed positions; the
     # ranks exchange their top-k candidates (all-to-all) and merge them (same
