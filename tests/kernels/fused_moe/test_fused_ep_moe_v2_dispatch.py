@@ -42,12 +42,19 @@ def _routing(rng, *, ep, t_local, topk, e_total):
     return sel
 
 
+@pytest.mark.parametrize("form", ["compare", "scatter"])
 @pytest.mark.parametrize(
     "ep,t_local,topk,g_local",
     [(8, 32, 4, 4), (32, 144, 6, 13), (4, 16, 6, 3)],
     ids=["dp8", "dp32-c768-13-slots", "ep4-topk-over-ep"],
 )
-def test_the_plans_agree_with_a_simulated_exchange(ep, t_local, topk, g_local):
+def test_the_plans_agree_with_a_simulated_exchange(
+    ep, t_local, topk, g_local, form, monkeypatch
+):
+    """Both forms of the send plan: the compare-and-count the decode shapes
+    take and the scatter a prefill-sized shard falls back to."""
+    if form == "scatter":
+        monkeypatch.setattr(layer, "SEND_PLAN_COMPARE_MAX", 0)
     rng = np.random.default_rng(ep * 1000 + t_local)
     e_total = ep * g_local
     sel = _routing(rng, ep=ep, t_local=t_local, topk=topk, e_total=e_total)

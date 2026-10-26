@@ -266,6 +266,10 @@ DISPATCH_MODES = ("all_gather", "all_to_all", "pallas_all_to_all")
 # The dispatches that send each row only to the shards that selected it, into
 # the same receive layout, read through the same token index.
 EXCHANGE_DISPATCHES = ("all_to_all", "pallas_all_to_all")
+# The largest [slots, ep * t_local] compare the send plan builds instead of a
+# scatter: the decode shapes (864 x 4608 at DP32 C768, 1728 x 2304 at DP8
+# C384) sit far below it, a 2048-row prefill shard (12288 x 65536) far above.
+SEND_PLAN_COMPARE_MAX = 1 << 23
 
 
 def _all_to_all_send_plan(local_blocks, *, g_local, ep, t_local, topk):
@@ -285,14 +289,24 @@ def _all_to_all_send_plan(local_blocks, *, g_local, ep, t_local, topk):
     send_sizes = jnp.sum(goes, axis=0, dtype=jnp.int32)
     input_offsets = jnp.cumsum(send_sizes, dtype=jnp.int32) - send_sizes
     flat = goes.T.reshape(-1)  # destination-major, rows in order
-    slot = jnp.cumsum(flat.astype(jnp.int32), dtype=jnp.int32) - 1
+    seen = jnp.cumsum(flat.astype(jnp.int32), dtype=jnp.int32)
     s_max = t_local * min(topk, ep)
+    if s_max * ep * t_local <= SEND_PLAN_COMPARE_MAX:
+        # Slot k carries the (k+1)-th flagged position, which is the number of
+        # positions whose running count is still <= k: one compare and count
+        # over [s_max, ep * t_local], where XLA's TPU scatter of the same
+        # table cost 13-16 us a layer at DP32 C768. Slots past the last run
+        # count every position and come out as row 0, the scatter's padding.
+        k = lax.broadcasted_iota(jnp.int32, (s_max, 1), 0)
+        pos = jnp.sum(seen[None, :] <= k, axis=1, dtype=jnp.int32)
+        send_rows = jnp.where(pos < ep * t_local, lax.rem(pos, jnp.int32(t_local)), 0)
+        return send_rows, send_sizes, input_offsets
     row = lax.rem(
         lax.broadcasted_iota(jnp.int32, (ep * t_local,), 0), jnp.int32(t_local)
     )
     send_rows = (
         jnp.zeros((s_max,), jnp.int32)
-        .at[jnp.where(flat, slot, jnp.int32(s_max))]
+        .at[jnp.where(flat, seen - 1, jnp.int32(s_max))]
         .set(row, mode="drop")
     )
     return send_rows, send_sizes, input_offsets
