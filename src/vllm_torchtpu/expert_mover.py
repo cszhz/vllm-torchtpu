@@ -39,6 +39,7 @@ layer's output after the install is the static layout's bit for bit.
 from __future__ import annotations
 
 import ctypes
+import queue
 import threading
 import time
 from typing import Any
@@ -352,6 +353,13 @@ class GlooP2P:
     def recv(self, src: int, tag: int, tensor: torch.Tensor) -> None:
         torch.distributed.recv(tensor, src=self._global(src), group=self.group, tag=tag)
 
+    def irecv(self, src: int, tag: int, tensor: torch.Tensor):
+        """Non-blocking receive into `tensor`; the handle answers
+        `is_completed()` (the exchange thread polls it) and `wait()`."""
+        return torch.distributed.irecv(
+            tensor, src=self._global(src), group=self.group, tag=tag
+        )
+
 
 def make_gloo_group(global_ranks: list[int]):
     """The mover's own process group over the EP ranks (a collective: every
@@ -400,6 +408,32 @@ class _LocalEndpoint:
 
     def recv(self, src, tag, tensor):
         self.exchange._recv(src, self.rank, tag, tensor)
+
+    def irecv(self, src, tag, tensor):
+        return _LocalRecv(self.exchange, src, self.rank, tag, tensor)
+
+
+class _LocalRecv:
+    """A non-blocking receive on the mailbox: completes when the message is
+    there, copying it out."""
+
+    def __init__(self, exchange, src, dst, tag, tensor) -> None:
+        self.exchange, self.key, self.tensor = exchange, (src, dst, tag), tensor
+        self.done = False
+
+    def is_completed(self) -> bool:
+        if not self.done:
+            with self.exchange._cv:
+                msg = self.exchange._box.pop(self.key, None)
+            if msg is not None:
+                self.tensor.copy_(msg)
+                self.done = True
+        return self.done
+
+    def wait(self) -> None:
+        if not self.done:
+            self.exchange._recv(*self.key, self.tensor)
+            self.done = True
 
 
 # ---------------------------------------------------------------------------
@@ -465,16 +499,20 @@ def describe_parts(module, transport=None) -> str:
 
 class SlabMover:
     """Runs a plan's moves for one rank (the `Mover` protocol of
-    expert_relayout.py), in three phases driven by `pump()` from the step
-    hook on the main thread:
+    expert_relayout.py) as one streaming pipeline driven by `pump()` from the
+    runner right after each step's forward is dispatched:
 
-    d2h   issue the source slots' device -> host copies, and the whole-table
-          copies of every scale table a move touches (up to `step_budget_bytes`
-          issues per call); poll them; cut the outgoing payloads;
-    p2p   a thread sends every outgoing payload (non-blocking) and receives
-          every incoming one;
-    h2d   issue the staging slots' host -> device copies, and the patched
-          tables' whole-table copies; poll them; then the generation is staged.
+    * device -> host: the source slots' copies and the whole-table copies of
+      every scale table a move touches are issued under `step_budget_bytes`
+      per pump, tables first; a payload is handed to the exchange thread the
+      pump it lands (a table's outgoing rows are cut from its image);
+    * host -> host: a thread posts every receive up front, sends payloads as
+      they come, and reports arrivals;
+    * host -> device: arrived slots go to their staging slots and arrived
+      rows into their table's image, whose whole-table copy goes back once
+      every patch is in, under the same budget.
+
+    The generation is staged when every leg has drained.
     """
 
     def __init__(
@@ -514,18 +552,28 @@ class SlabMover:
         # Outgoing SLOT copies: (move, part, tensor, slot) -> payload hosts.
         self._out_todo: list = []
         self._out_inflight: list = []  # (future, host, move, part)
-        self._out_ready: list = []  # (move, part, payload)
-        # Outgoing ROWS payloads cut from table images: (move, part, table key).
-        self._out_rows: list = []
+        self._out_sent = 0  # payloads handed to the exchange thread
+        self._out_expected = 0
+        self._sent_total = 0
         # Incoming: (move, part, tensor, kind, slot, payload host).
         self._incoming: list = []
-        # Whole-table images, keyed by (group, layer, part):
-        # {"tensor", "rows", "host", "future", "patches": [(slot, payload)]}
+        self._in_received = 0
+        # Incoming ROWS payloads waiting for their table's image: (index, key).
+        self._rows_waiting: list = []
+        # Whole-table images, keyed by (group, layer, part): {"tensor", "rows",
+        # "host", "future", "ready", "out_rows": [(move, part)], "expected",
+        # "patched"}; a table with incoming rows goes back whole once patched.
         self._tables: dict = {}
         self._tables_todo: list = []
         self._h2d_todo: list = []  # (host, tensor, first)
         self._h2d_inflight: list = []
         self._to_release: list = []  # transport buffers handed back at the end
+        # The exchange thread: payloads in, arrivals (indices into
+        # `_incoming`) out, and "nothing more to send" from the pump.
+        self._send_q: queue.Queue = queue.Queue()
+        self._recv_q: queue.Queue = queue.Queue()
+        self._sends_closed = threading.Event()
+        self._marks: dict[str, float] = {}
 
     # -- Mover protocol
 
@@ -559,7 +607,10 @@ class SlabMover:
                 "rows": rows,
                 "host": None,
                 "future": None,
-                "patches": [],
+                "ready": False,
+                "out_rows": [],
+                "expected": 0,
+                "patched": 0,
             }
             self._tables_todo.append(key)
         return self._tables[key]
@@ -572,8 +623,8 @@ class SlabMover:
                 if kind == SLOT:
                     self._out_todo.append((m, part, tensor, m.src_slot))
                 else:
-                    self._table(m, part, tensor, module)
-                    self._out_rows.append((m, part, (m.group, m.layer, part)))
+                    self._table(m, part, tensor, module)["out_rows"].append((m, part))
+                self._out_expected += 1
         for m in incoming:
             module = modules[(m.group, m.layer)]
             for part, _, tensor, kind in _parts(module):
@@ -581,6 +632,7 @@ class SlabMover:
                     nbytes = self.transport.slice_bytes(tensor)
                 else:
                     table = self._table(m, part, tensor, module)
+                    table["expected"] += 1
                     nbytes = self.transport.slice_bytes(tensor) * table["rows"]
                 self._incoming.append(
                     (
@@ -594,9 +646,20 @@ class SlabMover:
                 )
         self._out_moves = outgoing
         self._in_moves = incoming
-        self._phase = "d2h"
         if not outgoing and not incoming:
+            self._phase = "stream"
             self._finish()
+            return
+        # The host leg streams from the start: receives are posted now and
+        # every payload is sent the step it lands on the host.
+        self._thread_done.clear()
+        self._thread_error = None
+        self._sends_closed.clear()
+        self._thread = threading.Thread(
+            target=self._exchange, name="expert-mover", daemon=True
+        )
+        self._thread.start()
+        self._phase = "stream"
 
     def pump(self) -> None:
         """One bounded slice of device work, from the main thread."""
@@ -631,8 +694,12 @@ class SlabMover:
 
     def settle(self, generation: int) -> None:
         self._staged = generation
-        if self._phase != "p2p":
-            self._phase = "idle"
+        if self._phase == "stream":  # cancelled mid-generation
+            self._sends_closed.set()
+            for host in self._to_release:
+                self.transport.release(host)
+            self._to_release = []
+        self._phase = "idle"
 
     def join(self, timeout: float | None = None) -> None:
         if self._thread is not None:
@@ -643,7 +710,13 @@ class SlabMover:
     def _budget(self) -> float:
         return float("inf") if self.step_budget_bytes == 0 else self.step_budget_bytes
 
-    def _pump_d2h(self) -> None:
+    def _pump_stream(self) -> None:
+        """One step's slice of every leg, under one byte budget: issue D2H
+        (tables first), hand landed payloads to the exchange thread, apply
+        arrived payloads (slots to the H2D queue, rows into their table's
+        image), issue H2D, and finish when every leg has drained."""
+        if self._thread_error is not None:
+            raise RuntimeError(f"host exchange failed: {self._thread_error!r}")
         budget = self._budget()
         while self._tables_todo and budget > 0:
             table = self._tables[self._tables_todo.pop(0)]
@@ -660,84 +733,44 @@ class SlabMover:
         still = []
         for future, host, m, part in self._out_inflight:
             if self.transport.ready(future):
-                self._out_ready.append((m, part, host.reshape(-1)))
+                self._send((m, part, host.reshape(-1)))
             else:
                 still.append((future, host, m, part))
         self._out_inflight = still
-        tables_pending = any(
-            tb["future"] is not None and not self.transport.ready(tb["future"])
-            for tb in self._tables.values()
-        )
-        if self._tables_todo or self._out_todo or self._out_inflight or tables_pending:
-            return
-        # Every image is on the host: cut the outgoing row payloads.
-        for m, part, key in self._out_rows:
-            table = self._tables[key]
-            rows = table["rows"]
+        for key, table in self._tables.items():
+            if table["ready"] or table["future"] is None:
+                continue
+            if not self.transport.ready(table["future"]):
+                continue
+            table["ready"] = True
+            self._marks.setdefault("first_image_s", time.monotonic() - self._t0)
             image = table["host"].reshape(-1)
-            row_bytes = image.numel() // int(table["tensor"].shape[0])
-            a = m.src_slot * rows * row_bytes
-            self._out_ready.append((m, part, image[a : a + rows * row_bytes].clone()))
-        self._thread_done.clear()
-        self._thread_error = None
-        self._thread = threading.Thread(
-            target=self._exchange, name="expert-mover", daemon=True
-        )
-        self._thread.start()
-        self._phase = "p2p"
-
-    def _exchange(self) -> None:
-        """The host-to-host leg, on the mover's thread: CPU memory only."""
-        try:
-            in_flight = []
-            for m, part, payload in self._out_ready:
-                h = self.p2p.send(
-                    m.dst_rank, move_tag(m.group, m.layer, m.dst_slot, part), payload
-                )
-                in_flight.append(h)
-            for m, part, _t, _kind, dst_slot, payload in self._incoming:
-                if self._cancel.is_set():
-                    return
-                self.p2p.recv(
-                    m.src_rank, move_tag(m.group, m.layer, dst_slot, part), payload
-                )
-            for h in in_flight:
-                if h is not None:
-                    h.wait()
-        except BaseException as e:  # noqa: BLE001 - handed to the main thread
-            self._thread_error = e
-        finally:
-            self._thread_done.set()
-
-    def _pump_p2p(self) -> None:
-        if not self._thread_done.is_set():
-            return
-        if self._thread_error is not None:
-            raise RuntimeError(f"host exchange failed: {self._thread_error!r}")
-        if self._cancel.is_set():
-            self._phase = "idle"
-            return
-        patched = set()
-        for m, part, tensor, kind, dst_slot, payload in self._incoming:
+            span = table["rows"] * (image.numel() // int(table["tensor"].shape[0]))
+            for m, part in table["out_rows"]:
+                a = m.src_slot * span
+                self._send((m, part, image[a : a + span].clone()))
+            self._apply_waiting_rows(key)
+        if (
+            not self._sends_closed.is_set()
+            and self._out_sent == self._out_expected
+            and all(tb["ready"] or not tb["out_rows"] for tb in self._tables.values())
+        ):
+            self._marks["d2h_done_s"] = time.monotonic() - self._t0
+            self._sends_closed.set()
+        while True:
+            try:
+                i = self._recv_q.get_nowait()
+            except queue.Empty:
+                break
+            self._in_received += 1
+            self._marks.setdefault("first_arrival_s", time.monotonic() - self._t0)
+            m, part, tensor, kind, dst_slot, payload = self._incoming[i]
             if kind == SLOT:
                 self._h2d_todo.append((payload.reshape(1, -1), tensor, dst_slot))
                 continue
             key = (m.group, m.layer, part)
-            table = self._tables[key]
-            image = table["host"].reshape(-1)
-            rows = table["rows"]
-            row_bytes = image.numel() // int(tensor.shape[0])
-            a = dst_slot * rows * row_bytes
-            image[a : a + rows * row_bytes].copy_(payload)
-            patched.add(key)
-        for key in patched:
-            table = self._tables[key]
-            self._h2d_todo.append((table["host"], table["tensor"], 0))
-        self._phase = "h2d"
-        self._pump_h2d()
-
-    def _pump_h2d(self) -> None:
-        budget = self._budget()
+            self._rows_waiting.append(i)
+            self._apply_waiting_rows(key)
         while self._h2d_todo and budget > 0:
             host, tensor, first = self._h2d_todo.pop(0)
             self._h2d_inflight.append(self.transport.h2d(host, tensor, first))
@@ -745,13 +778,109 @@ class SlabMover:
         self._h2d_inflight = [
             f for f in self._h2d_inflight if not self.transport.ready(f)
         ]
-        if not self._h2d_todo and not self._h2d_inflight:
+        if (
+            self._thread_done.is_set()
+            and self._sends_closed.is_set()
+            and self._in_received == len(self._incoming)
+            and not self._rows_waiting
+            and not self._h2d_todo
+            and not self._h2d_inflight
+        ):
+            if self._thread_error is not None:
+                raise RuntimeError(f"host exchange failed: {self._thread_error!r}")
             self._finish()
+
+    def _send(self, item) -> None:
+        self._marks.setdefault("first_send_s", time.monotonic() - self._t0)
+        self._out_sent += 1
+        self._sent_total += int(item[2].numel())
+        self._send_q.put(item)
+
+    def _sent_bytes(self) -> int:
+        return self._sent_total
+
+    def _apply_waiting_rows(self, key) -> None:
+        """Patch the arrived row payloads of one table into its image once
+        the image is on the host; queue the table's H2D when complete."""
+        table = self._tables[key]
+        if not table["ready"]:
+            return
+        image = table["host"].reshape(-1)
+        span = table["rows"] * (image.numel() // int(table["tensor"].shape[0]))
+        keep = []
+        for i in self._rows_waiting:
+            m, part, _tensor, _kind, dst_slot, payload = self._incoming[i]
+            if (m.group, m.layer, part) != key:
+                keep.append(i)
+                continue
+            a = dst_slot * span
+            image[a : a + span].copy_(payload)
+            table["patched"] += 1
+        self._rows_waiting = keep
+        if table["expected"] and table["patched"] == table["expected"]:
+            table["expected"] = 0  # queued once
+            self._h2d_todo.append((table["host"], table["tensor"], 0))
+
+    def _exchange(self) -> None:
+        """The host-to-host leg on the mover's thread, CPU memory only: every
+        receive is posted up front (non-blocking), payloads are sent as the
+        pump hands them over, arrivals are reported by index. Ends when the
+        pump has closed the sends and every send and receive has completed."""
+        try:
+            recvs = []
+            for i, (m, part, _t, _kind, dst_slot, payload) in enumerate(self._incoming):
+                recvs.append(
+                    (
+                        i,
+                        self.p2p.irecv(
+                            m.src_rank,
+                            move_tag(m.group, m.layer, dst_slot, part),
+                            payload,
+                        ),
+                    )
+                )
+            sends = []
+            while True:
+                if self._cancel.is_set():
+                    return
+                while True:
+                    try:
+                        m, part, payload = self._send_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    h = self.p2p.send(
+                        m.dst_rank,
+                        move_tag(m.group, m.layer, m.dst_slot, part),
+                        payload,
+                    )
+                    if h is not None:
+                        sends.append(h)
+                pending = []
+                for i, h in recvs:
+                    if h.is_completed():
+                        self._recv_q.put(i)
+                    else:
+                        pending.append((i, h))
+                recvs = pending
+                sends = [h for h in sends if not h.is_completed()]
+                if (
+                    self._sends_closed.is_set()
+                    and self._send_q.empty()
+                    and not recvs
+                    and not sends
+                ):
+                    return
+                time.sleep(0.0005)
+        except BaseException as e:  # noqa: BLE001 - handed to the main thread
+            self._thread_error = e
+        finally:
+            self._thread_done.set()
 
     def _finish(self) -> None:
         received = sum(p.numel() for *_, p in self._incoming)
-        sent = sum(p.numel() for _, _, p in self._out_ready)
+        sent = self._sent_bytes()
         seconds = time.monotonic() - self._t0
+        marks = ", ".join(f"{k} {v:.2f}" for k, v in sorted(self._marks.items()))
         self.last_report = {
             "generation": self._gen,
             "incoming": len(self._in_moves),
@@ -767,7 +896,7 @@ class SlabMover:
         logger.info(
             "expert mover | rank %d staged generation %s: %d in / %d out, "
             "%.1f MB received, %.1f MB sent, %d tables re-imaged, %.2f s; "
-            "%d pumps on the step thread, %.0f ms total, %.1f ms max",
+            "%d pumps on the step thread, %.0f ms total, %.1f ms max; marks %s",
             self.rank,
             self._gen,
             len(self._in_moves),
@@ -779,7 +908,9 @@ class SlabMover:
             self._pumps,
             self._pump_s * 1e3,
             self._pump_max_s * 1e3,
+            marks,
         )
+        self.last_report["marks"] = dict(self._marks)
         self._pumps, self._pump_s, self._pump_max_s = 0, 0.0, 0.0
         for host in self._to_release:
             self.transport.release(host)
