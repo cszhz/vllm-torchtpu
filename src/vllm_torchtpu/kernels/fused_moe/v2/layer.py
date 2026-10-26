@@ -1301,8 +1301,8 @@ def fused_ep_moe_v2(
         # op returns a PARTIAL whose sum over the replica group is the layer
         # output, and the next layer's mHC seam op sums it (in its own Pallas
         # call, mhc/ar_seam_kernel.py). The fold path hands over its
-        # pre-all-reduce block untouched -- the same bits the small
-        # all-reduce here would have summed; every other path reduces here
+        # pre-all-reduce block (its first input_rows rows) -- the bits the
+        # small all-reduce here would have summed; every other path reduces here
         # and hands over (output on the group's slot 0, zeros elsewhere),
         # whose sum is the output exactly.
         defer = (
@@ -1358,8 +1358,12 @@ def fused_ep_moe_v2(
             shared_p = lax.dynamic_update_slice_in_dim(
                 shared_p, own + combined, pos * token_layout.local_rows, 0
             )
-            if defer and padded_rows == token_layout.input_rows:
-                return shared_p
+            if defer:
+                # The small all-reduce sums each element over the group in
+                # slot order, independent of the row count, so the first
+                # input_rows rows of the partial sum to exactly these rows of
+                # `out` below (a padded bucket, e.g. 24 rows at TP8, too).
+                return shared_p[: token_layout.input_rows]
             out = small_all_reduce(
                 shared_p,
                 num_cores=width,
