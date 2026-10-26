@@ -685,6 +685,7 @@ class VllmDeepseekV4MLAAttention(
 
         topk_indices = None
         compressor = getattr(self.mla_attn, "compressor", None)
+        paired = False
         if self.indexer is not None:
             indexer_emb = getattr(
                 self.mla_attn,
@@ -694,7 +695,7 @@ class VllmDeepseekV4MLAAttention(
             if envs.TPU_DSV4_COMPRESSOR_PAIR and compressor is not None:
                 # One weight stream for both projections of these tokens; the
                 # two compressor calls below then skip theirs.
-                pair_proj_forward(
+                paired = pair_proj_forward(
                     compressor,
                     self.indexer.compressor,
                     hidden_states,
@@ -710,13 +711,21 @@ class VllmDeepseekV4MLAAttention(
                 topk_indices, q = self.indexer(
                     hidden_states, qr, indexer_weights, positions, indexer_emb,
                     fence=q,
+                    compressor_skip_proj=paired,
                 )
             else:
                 topk_indices = self.indexer(
-                    hidden_states, qr, indexer_weights, positions, indexer_emb
+                    hidden_states,
+                    qr,
+                    indexer_weights,
+                    positions,
+                    indexer_emb,
+                    compressor_skip_proj=paired,
                 )
         if compressor is not None:
-            compressor(hidden_states, positions, self.mla_attn.rotary_emb)
+            compressor(
+                hidden_states, positions, self.mla_attn.rotary_emb, skip_proj=paired
+            )
 
         res = self.forward_mqa(
             q,

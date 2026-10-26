@@ -532,10 +532,13 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         rotary_emb: nn.Module,
         slot_mapping: torch.Tensor | None = None,
         fence: torch.Tensor | None = None,
+        compressor_skip_proj: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """fence (TPU_DSV4_CSA_TOPK_FENCE_Q, token-split path only): a tensor
         this rank's top-k is fenced with before its all-gather; returns
-        (top-k, fence) so the caller uses the fenced copy. Scheduling only."""
+        (top-k, fence) so the caller uses the fenced copy. Scheduling only.
+        compressor_skip_proj (TPU_DSV4_COMPRESSOR_PAIR): the pair op already
+        projected this compressor's tokens."""
         num_tokens = query.shape[0]
         token_split = self._token_split_active(num_tokens)
         if token_split:
@@ -552,7 +555,9 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         if not envs.TPU_DSV4_ROPE_QUANT_FLAT:
             q = q.view(-1, self.n_head, self.head_dim)
 
-        self.compressor(hidden_states, positions, rotary_emb)
+        self.compressor(
+            hidden_states, positions, rotary_emb, skip_proj=compressor_skip_proj
+        )
 
         # No KV cache is bound during the profiling forward; the values are
         # unused, so return correctly-shaped dummies. vLLM binds a numel==0

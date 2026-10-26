@@ -705,9 +705,10 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
+        skip_proj: bool = False,
     ) -> None:
-        # Set by `pair_proj_forward` for exactly the next call of this step.
-        skip = self.__dict__.pop("_skip_proj_next", False)
+        # skip_proj: `pair_proj_forward` already saved this step's state.
+        skip = skip_proj
         prep = self._prepare(hidden_states, positions, rotary_emb)
         if prep is None:
             return
@@ -852,9 +853,10 @@ def pair_proj_forward(
     rotary_b: nn.Module,
 ) -> bool:
     """Saves the state of two compressors of the same tokens (a CSA layer's KV
-    compressor and its indexer's) with one weight-stream call, and marks both
-    so their next `forward` skips the projection. Returns False (nothing
-    marked) when this step does not qualify -- the callers then run as usual.
+    compressor and its indexer's) with one weight-stream call. Returns True
+    when it did -- the caller then runs both compressors with skip_proj=True --
+    and False when this step does not qualify (nothing written). The decision
+    depends only on statics and the token count, so it is trace-stable.
     """
     preps = []
     for comp, rot in ((comp_a, rotary_a), (comp_b, rotary_b)):
@@ -887,6 +889,4 @@ def pair_proj_forward(
     new_a, new_b = op(*args)
     preps[0][1][1].copy_(new_a)
     preps[1][1][1].copy_(new_b)
-    object.__setattr__(comp_a, "_skip_proj_next", True)
-    object.__setattr__(comp_b, "_skip_proj_next", True)
     return True
