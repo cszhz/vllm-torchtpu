@@ -474,7 +474,12 @@ def _pin_hbm(x):
     ms = getattr(getattr(x, "aval", None), "memory_space", None)
     if ms is not None and "hbm" in str(ms).lower():
         return x
-    return pltpu.with_memory_space_constraint(x, pltpu.MemorySpace.HBM)
+    try:
+        return pltpu.with_memory_space_constraint(x, pltpu.MemorySpace.HBM)
+    except TypeError:
+        # Already carries a Pallas HBM memory space this primitive refuses to
+        # re-constrain (seen in the layer: the fused EP kernel's arrivals).
+        return x
 
 
 def descriptors(t_local, topk, recv_rows, gather):
