@@ -60,11 +60,16 @@ FP4_OUTPUT_CHUNK = 256
 # How many tile heights the FFN body is emitted at, where it is emitted at
 # more than one. A tile runs the smallest rung that covers its live rows, so
 # an expert's short tail tile stops computing a full tile_m of rows nothing
-# will commit. Every rung is another copy of the body in the program text --
-# which is why this is a handful of heights and not one per ROWBLK -- and the
-# top rung is always tile_m, so a full tile is unchanged. Overridable per
-# process by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time.
-HEIGHT_RUNGS = 4
+# will commit. Every rung is another copy of the body in the program text,
+# and that copy costs about 6 us a call at the served decode shapes whether
+# it is executed or not -- more than the tail rows it saves there, which is
+# why two heights beat four and why eight is four times the call. The top
+# rung is always tile_m, so a full tile is unchanged. Overridable per process
+# by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time; a count whose
+# rungs cannot tile the height is not an error, it is the ladder off, so at
+# the served tile_m of 128 the only counts that mean anything are 2, 4, 8
+# and 16.
+HEIGHT_RUNGS = 2
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -145,7 +150,9 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     Equally spaced so that a tail tile's rounding-up waste is bounded by one
     step. A tile height must be a whole number of ROWBLK -- it is the unit
     every commit offset is in -- so a tile_m that does not divide into whole
-    ROWBLK steps keeps the single full height it had.
+    ROWBLK steps keeps the single full height it had. The same is true of a
+    count that does not divide it into equal rungs: 3 at tile_m 128 is the
+    ladder off, not an error.
 
     Only a TAIL tile is short, so the rungs pay in proportion to the share of
     tiles that are tails, while their cost -- a copy of the FFN body in the
@@ -153,7 +160,11 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     where a routed expert is expected to fit inside one tile, which is where
     every tile is the tail: `rows_alloc` bounds the shard slab for the case
     of every routed row landing on one shard, so `ep` shards' worth of it is
-    what a shard's `g_local` experts actually expect to hold.
+    what a shard's `g_local` experts actually expect to hold. That is the
+    same predicate `push_from_vmem` selects on, so the ladder exists exactly
+    where the tile ships itself -- the decode buckets -- and a prefill build,
+    whose slab is far bigger than one tile per expert, has a single height
+    whatever this count says.
 
     """
     rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE or HEIGHT_RUNGS

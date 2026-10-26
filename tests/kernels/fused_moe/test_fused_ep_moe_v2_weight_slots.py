@@ -150,9 +150,9 @@ LADDER_ARGS = (TILE_M, ROWS_ALLOC, 8, 8)
 @pytest.mark.parametrize(
     "override,want",
     [
-        (None, tuple(range(128, 513, 128))),
-        ("0", tuple(range(128, 513, 128))),
-        ("2", (256, 512)),
+        (None, (256, 512)),
+        ("0", (256, 512)),
+        ("4", tuple(range(128, 513, 128))),
         ("8", tuple(range(64, 513, 64))),
         ("1", (TILE_M,)),
         ("3", (TILE_M,)),
