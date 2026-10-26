@@ -215,7 +215,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 object.__setattr__(self, "_sp_ops", build_sp_ops())
                 shared = getattr(self.ffn, "shared_experts", None)
                 if (
-                    envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS > 0
+                    (
+                        envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS > 0
+                        or envs.TPU_DSV4_SP_SHARED_TP
+                    )
                     and shared is not None
                     and not shared.arm_tp_slice(
                         get_tensor_model_parallel_rank(),
@@ -223,7 +226,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     )
                 ):
                     raise RuntimeError(
-                        "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: the shared expert's "
+                        "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS / TPU_DSV4_SP_SHARED_TP: "
+                        "the shared expert's "
                         "weight layout cannot be TP-sliced; unset it"
                     )
         return ops

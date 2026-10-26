@@ -207,6 +207,7 @@ if TYPE_CHECKING:
     TPU_DSV4_SEQ_PARALLEL: bool = False
     TPU_NUM_GPU_BLOCKS_OVERRIDE: int = 0
     TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: int = 0
+    TPU_DSV4_SP_SHARED_TP: int = 0
     TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE: int = 0
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = True
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = True
@@ -1412,6 +1413,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # attention, the TP-sharded shared expert, the fused EP's TP-replica op --
     # and only T > it run sequence parallel. 0: every bucket sequence parallel.
     "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS": env_int("TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS", 0),
+    # Under TPU_DSV4_SEQ_PARALLEL: keep only this rank's TP slice of the shared
+    # expert (the full replicated copy, +3.75 GB/rank at TP8, is dropped after
+    # load). The sequence-parallel side all-gathers its rows over the TP group,
+    # runs the TP-sliced gate/up/down and reduce-scatters back onto its rows
+    # (the replicated side of the gate already ran on the slice).
+    # 0 = off (full weight on the SP side); 1 = bf16 row all-gather;
+    # 2 = the rows quantized to fp8 before the all-gather (per-channel weight
+    # scales only; the same per-row quantization the matmul applies after it).
+    "TPU_DSV4_SP_SHARED_TP": env_int("TPU_DSV4_SP_SHARED_TP", 0),
     # Under TPU_DSV4_SEQ_PARALLEL (sequence-parallel side of the gate): for
     # T > this (a power of 2), each TP rank scores and selects the CSA indexer
     # top-k of its own contiguous T / tp rows only (the whole batch's metadata
