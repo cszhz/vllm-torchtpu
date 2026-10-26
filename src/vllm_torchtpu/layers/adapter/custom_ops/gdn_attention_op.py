@@ -104,11 +104,6 @@ def _to_jax_state_dtype(dtype: torch.dtype) -> jnp.dtype:
     )
 
 
-_POOLED_GDN_CONV_JAX_DTYPE = _to_jax_state_dtype(
-    torch_dtype_from_name(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE)
-)
-
-
 def gdn_attention_core_tpu(
     mixed_qkv: jax.Array,
     b: jax.Array,
@@ -204,7 +199,7 @@ def gdn_attention_pooled_core_tpu(
     kernel_size: int,
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
-    conv_state_dtype: jnp.dtype = _POOLED_GDN_CONV_JAX_DTYPE,
+    conv_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
@@ -512,13 +507,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
         if unified_kv_layout_enabled_for_architecture(self.model_config.architecture):
-            # Declare exactly what the pool physically stores. vLLM sizes the
-            # mamba page from the dtype declared HERE and asserts the padded
-            # page covers it, while the block-slot derivation budgets the page
-            # from the same BF16 conv state dtype. Declaring anything
-            # wider is not conservative, it is a contradiction: the two
-            # disagreed once and every hybrid GDN engine failed to start on
-            # that assert.
+            # Allocation and the native view must both follow
+            # DEFAULT_POOLED_GDN_CONV_STATE_DTYPE; a wider declaration alone
+            # disagrees with the bytes budgeted by pooled_gdn_state_dtypes().
             conv_state_dtype = torch_dtype_from_name(
                 DEFAULT_POOLED_GDN_CONV_STATE_DTYPE
             )

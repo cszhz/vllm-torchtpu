@@ -490,7 +490,7 @@ def v3_state_source(
     kernel_size: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     qk_pair_layout: bool = False,
-    conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    conv_state_dtype: jnp.dtype,
 ) -> gdn_v3_config.StateSourcePlan:
     """Static copy-plan letting the fused GDN V3 kernel stream the mamba
     state regions directly between this pool and its double-buffered
@@ -499,8 +499,8 @@ def v3_state_source(
 
     The SSM region is the whole kernel blocks at the start of the manager
     window (one contiguous DMA per slot), viewed in the configured storage
-    dtype. FP32 uses a ``d_v``-wide typed view; BF16 preserves the raw pool
-    ref's full minormost width. The Conv region is ``conv_ntok`` token rows
+    dtype. Both use ``d_v`` lanes; BF16 pairs adjacent rows in uint32 words
+    for the kernel's VMEM load/store. The Conv region is ``conv_ntok`` token rows
     inside a single kernel block, viewed in ``conv_state_dtype`` with the tail rows
     zero-padded.
     Arguments mirror the region geometry computed by the pooled GDN
@@ -586,7 +586,10 @@ def v3_state_source(
     assert conv_dim % lanes == 0, (conv_dim, lanes)
     conv_dtype = jnp.dtype(conv_state_dtype)
     if conv_dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)):
-        raise ValueError(f"unsupported pooled conv state dtype: {conv_dtype}")
+        raise NotImplementedError(
+            f"Unsupported pooled conv state dtype: {conv_dtype}; "
+            "use bfloat16 or float32."
+        )
     conv_rows = (kernel_size - 1) * conv_dim // lanes
     assert conv_rows * conv_dtype.itemsize * lanes <= conv_ntok * tok_bytes, (
         conv_rows,
