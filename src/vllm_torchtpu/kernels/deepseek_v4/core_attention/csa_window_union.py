@@ -717,36 +717,53 @@ def group_meta(cu_q_lens, distribution, kv_lens, *, num_tokens, s_cap, groups, g
 MAX_TILES_MIXED = 8  # tiles per window slot (U <= 8192 = WQ x TOPK)
 
 
-def prepare_grouped(topk_indices, kv_lens, page_indices, cu_q_lens, distribution,
-                    cache_kv_nope, cache_kv_rope, *, groups):
-    """L1 of a grouped mixed step: one SparseCore call per group."""
+def _group_l1(args, g, groups):
+    topk_indices, kv_lens, page_indices, cu_q_lens, distribution, cache_kv_nope, cache_kv_rope = args
     T = topk_indices.shape[0]
     max_num_seqs = cu_q_lens.shape[0] - 1
     pps = page_indices.shape[0] // max_num_seqs
     s_cap = pps * cache_kv_nope.shape[1]
-    out = []
-    for g in range(groups):
-        meta, tslot, nwc = group_meta(cu_q_lens, distribution, kv_lens, num_tokens=T,
-                                      s_cap=s_cap, groups=groups, g=g)
-        nope_g, rope_g, mask, ucnt = union_gather(
-            meta, topk_indices, page_indices, cache_kv_nope, cache_kv_rope,
-            num_tokens=T, max_num_seqs=max_num_seqs, mask_sb_major=MASK_SB_MAJOR,
-            n_tiles=nwc * MAX_TILES_MIXED, nw_cap_override=nwc)
-        out.append(dict(meta=meta, tslot=tslot, nope_g=nope_g, rope_g=rope_g, mask=mask, ucnt=ucnt))
-    return out
+    meta, tslot, nwc = group_meta(cu_q_lens, distribution, kv_lens, num_tokens=T,
+                                  s_cap=s_cap, groups=groups, g=g)
+    nope_g, rope_g, mask, ucnt = union_gather(
+        meta, topk_indices, page_indices, cache_kv_nope, cache_kv_rope,
+        num_tokens=T, max_num_seqs=max_num_seqs, mask_sb_major=MASK_SB_MAJOR,
+        n_tiles=nwc * MAX_TILES_MIXED, nw_cap_override=nwc)
+    return dict(meta=meta, tslot=tslot, nope_g=nope_g, rope_g=rope_g, mask=mask, ucnt=ucnt)
 
 
-def attend_grouped(q, groups_rows, attention_sinks, swa_accumution, swa_l, swa_m, *, sm_scale,
+def prepare_grouped(topk_indices, kv_lens, page_indices, cu_q_lens, distribution,
+                    cache_kv_nope, cache_kv_rope, *, groups):
+    """L1 of group 0 of a grouped mixed step (issued ahead, like `prepare`); the
+    other groups' SparseCore calls are issued by `attend_grouped`, each fenced
+    behind the previous group's attention input so it runs under it (left
+    free, XLA issues every SparseCore call first and the TensorCore waits on
+    all of them before the first attention)."""
+    args = (topk_indices, kv_lens, page_indices, cu_q_lens, distribution, cache_kv_nope,
+            cache_kv_rope)
+    return dict(first=_group_l1(args, 0, groups), args=args, groups=groups)
+
+
+def attend_grouped(q, plan, attention_sinks, swa_accumution, swa_l, swa_m, *, sm_scale,
                    l2_config=None):
     from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_window_attention
 
     L, nc, ns = sc_geometry()
-    for rows in groups_rows:
+    groups, args = plan["groups"], plan["args"]
+    rows = plan["first"]
+    for g in range(groups):
+        nxt = None
+        if g + 1 < groups:
+            # Group g + 1's SparseCore call may start only once group g's
+            # attention can (its input q), so it runs under that attention.
+            q, topk = jax.lax.optimization_barrier((q, args[0]))
+            nxt = _group_l1((topk,) + tuple(args[1:]), g + 1, groups)
         q = csa_window_attention.window_attention(
             q, rows["nope_g"], rows["rope_g"], rows["mask"], rows["meta"], rows["ucnt"],
             attention_sinks, swa_accumution, swa_l, swa_m, sm_scale=sm_scale,
             nw_cap=rows["ucnt"].shape[0] // L, tslot=rows["tslot"],
             **(L2_CONFIG if l2_config is None else l2_config))
+        rows = nxt
     return q
 
 

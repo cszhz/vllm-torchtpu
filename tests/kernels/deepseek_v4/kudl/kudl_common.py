@@ -273,4 +273,4 @@ def win_l2(conc):
     return f
 
 
-ARMS = {"win_l1_nog": win_l1_nog, "inc": inc, "win": win, "win_g2": win_g2, "win_g4": win_g4, "sparse": sparse, "win_l1": win_l1, "win_bf16p": win_bf16p, "inc_bf16p": inc_bf16p}
+ARMS = {"win_l2": win_l2, "win_l1_nog": win_l1_nog, "inc": inc, "win": win, "win_g2": win_g2, "win_g4": win_g4, "sparse": sparse, "win_l1": win_l1, "win_bf16p": win_bf16p, "inc_bf16p": inc_bf16p}
