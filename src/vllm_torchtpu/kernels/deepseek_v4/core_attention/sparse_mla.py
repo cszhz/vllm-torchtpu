@@ -199,6 +199,9 @@ def _attention_swa_decode_kernel(
 DENSE_MIN_TOKENS = 256
 # Tokens of a `DenseRefs` batch per QK / PV matmul over its shared rows.
 DENSE_TOKENS_PER_MATMUL = 1
+# A `DenseRefs` batch attends over its first rows in multiples of this many,
+# enough to cover its longest kv_len.
+DENSE_KV_BLOCK = 256
 
 
 class DenseRefs(NamedTuple):
@@ -377,7 +380,7 @@ def _attention_kernel(
         assert len(kv.shape) == 2
         assert q.shape[0] % num_q_heads == 0
         assert q.shape[1] == head_dim
-        assert kv.shape == (bkv_sz, head_dim)
+        assert kv.shape[1] == head_dim
 
         # Follow FlashAttention-2 forward pass.
         s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
@@ -644,7 +647,7 @@ def _attention_kernel(
         bkv_rope = jnp.concatenate(
             [bkv_rope[:, :rope_dim], bkv_rope[:, rope_dim:]], axis=0
         )
-        return jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+        return jnp.concatenate([bkv_nope, bkv_rope[: words.shape[0]]], axis=-1)
 
     def load_bkv(bkv_sem_idx, batch_idx, masked):
         # The gathered NoPE rows as the int32 words csa_gather wrote.
@@ -663,30 +666,48 @@ def _attention_kernel(
             bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
-    def build_dense_bkv(bkv_sem_idx):
-        """Dequantize a `DenseRefs` batch's rows into `dense.kv_vmem_ref`,
-        the same rows `load_bkv` builds from a gather of them."""
-        words = bkv_nope_x2_ref.bitcast(jnp.int32).at[bkv_sem_idx, 0][...]
+    def build_dense_bkv(bkv_sem_idx, num_rows):
+        """Dequantize a `DenseRefs` batch's first `num_rows` rows into
+        `dense.kv_vmem_ref`, the same rows `load_bkv` builds from a gather."""
+        nope_words = bkv_nope_x2_ref.bitcast(jnp.int32).at[bkv_sem_idx, 0]
+        words = nope_words[pl.ds(0, num_rows)]
         rows = bkv_rope_x2_ref.bitcast(jnp.int32).at[bkv_sem_idx, 0][...]
         even, odd = _rope_rows_as_gathered(rows)
         half = even.shape[0]
         dense.rope_vmem_ref[pl.ds(0, half, stride=2), :] = even
         dense.rope_vmem_ref[pl.ds(1, half, stride=2), :] = odd
         bkv_rope = dense.rope_vmem_ref.bitcast(jnp.bfloat16)[...]
-        dense.kv_vmem_ref[...] = join_bkv(words, bkv_rope)
+        dense.kv_vmem_ref[pl.ds(0, num_rows)] = join_bkv(words, bkv_rope)
 
     def attend_from_cache(bi_sem_idx, bo_sem_idx, attention_sinks):
-        """`process`'s token loop for a `DenseRefs` batch: the tokens share
-        their rows, so each group of DENSE_TOKENS_PER_MATMUL tokens runs one
-        QK and one PV matmul over them, the rows loaded into the MXU once."""
-        build_dense_bkv(bi_sem_idx)
+        """`process`'s token loop for a `DenseRefs` batch, over only the
+        DENSE_KV_BLOCK multiple of rows that covers its longest kv_len: the
+        rows past it are masked for every token, which adds exact zeros to
+        their softmax and PV sums."""
         kv_lens = [kv_lens_ref[batch_start_seq_idx + b] for b in range(batch_size)]
-        bkv = dense.kv_vmem_ref[...]
+        max_kv_len = functools.reduce(jnp.maximum, kv_lens)
+        num_rows = jnp.maximum(cdiv(max_kv_len, DENSE_KV_BLOCK), 1) * DENSE_KV_BLOCK
+        for width in range(DENSE_KV_BLOCK, bkv_sz + 1, DENSE_KV_BLOCK):
+
+            @pl.when(num_rows == width)
+            def _(width=width):
+                attend_rows_from_cache(
+                    bi_sem_idx, bo_sem_idx, attention_sinks, kv_lens, max_kv_len, width
+                )
+
+    def attend_rows_from_cache(
+        bi_sem_idx, bo_sem_idx, attention_sinks, kv_lens, max_kv_len, num_rows
+    ):
+        """The tokens share their rows, so each group of
+        DENSE_TOKENS_PER_MATMUL tokens runs one QK and one PV matmul over
+        them, the rows loaded into the MXU once."""
+        build_dense_bkv(bi_sem_idx, num_rows)
+        bkv = dense.kv_vmem_ref[pl.ds(0, num_rows)]
         # Rows past every token's kv_len may decode to NaN and are zeroed; a
         # row past only some tokens' kv_len is a finite row of the sequence,
         # which their masked scores give probability 0.
         k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        bkv = jnp.where(k_span < functools.reduce(jnp.maximum, kv_lens), bkv, 0)
+        bkv = jnp.where(k_span < max_kv_len, bkv, 0)
         group = min(DENSE_TOKENS_PER_MATMUL, batch_size)
         assert batch_size % group == 0
         for first in range(0, batch_size, group):
