@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB: int = 16
     TPU_MOE_EPLB_MIN_GAIN_US: float = 0.0
     TPU_MOE_EPLB_MAX_BYTES_PER_GEN_MB: int = 0
+    TPU_MOE_EPLB_HANG_DUMP_S: float = 120.0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -722,6 +723,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_MOE_EPLB_MAX_BYTES_PER_GEN_MB": lambda: int(
         os.getenv("TPU_MOE_EPLB_MAX_BYTES_PER_GEN_MB", "0") or 0
+    ),
+    # While a generation stages, dump every thread's stack to stderr if the
+    # process stalls this long (seconds; 0 = off): a hung staging step shows
+    # where it hangs in the server log.
+    "TPU_MOE_EPLB_HANG_DUMP_S": lambda: float(
+        os.getenv("TPU_MOE_EPLB_HANG_DUMP_S", "120") or 0
     ),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.

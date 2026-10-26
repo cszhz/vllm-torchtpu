@@ -43,8 +43,10 @@ See DSV41_EPLB_DYNAMIC_DESIGN.md.
 
 from __future__ import annotations
 
+import faulthandler
 import hashlib
 import json
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -489,6 +491,7 @@ class Controller:
         min_gain_us: float = 0.0,
         max_bytes: int = 0,
         move_bytes: dict[str, int] | None = None,
+        hang_dump_s: float = 0.0,
     ) -> None:
         """groups: name -> dict(experts, active, staging, replica_cap).
         snapshot(): (group, layer) -> cumulative counts [P]. install(module,
@@ -506,6 +509,8 @@ class Controller:
         self.min_gain_us = float(min_gain_us)
         self.max_bytes = int(max_bytes)
         self.move_bytes = dict(move_bytes or {})  # group -> bytes of one slab move
+        self.hang_dump_s = float(hang_dump_s)
+        self._pumped_since_step = False
         self.warmup_steps = (
             self.window_steps if warmup_steps is None else int(warmup_steps)
         )
@@ -547,6 +552,11 @@ class Controller:
             self._collect_solve(step)
         if self.state == STAGING:
             assert self.pending is not None
+            if not self._pumped_since_step:
+                # No forward ran since the last hook (an idle step on this
+                # rank): the mover still gets its slice of work.
+                self.mover.pump()
+            self._pumped_since_step = False
             if self.mover.failed():
                 self._abort(step, "the mover failed")
             elif min_staged >= self.pending.generation:
@@ -558,6 +568,8 @@ class Controller:
             if hash_max == min_hash == self.pending.hash62:
                 self.state = STAGING
                 self._stage_started = time.monotonic()
+                self._pumped_since_step = True
+                self._watchdog(True)
                 self.mover.start(self.pending, self.modules)
                 logger.info("expert relayout | confirmed %s", self.pending.summary())
             elif min_hash == 0:
@@ -578,11 +590,28 @@ class Controller:
         ):
             self._trigger(step)
 
+    def _watchdog(self, on: bool) -> None:
+        """While a generation stages, dump every thread's stack to stderr if
+        the process makes no progress for `hang_dump_s` (a hung step shows
+        where); off again at install or abort."""
+        if self.hang_dump_s <= 0:
+            return
+        try:
+            if on:
+                faulthandler.dump_traceback_later(
+                    self.hang_dump_s, repeat=True, file=sys.stderr
+                )
+            else:
+                faulthandler.cancel_dump_traceback_later()
+        except Exception:  # noqa: BLE001 - diagnostics only
+            pass
+
     def after_dispatch(self) -> None:
         """Called once per step right after the forward's programs are
         dispatched: the mover's device legs are issued here, behind the
         step's launches in the device's in-order queue, never ahead of them."""
         if self.state == STAGING:
+            self._pumped_since_step = True
             self.mover.pump()
 
     # -- pieces
@@ -728,6 +757,7 @@ class Controller:
             )
             self.layouts[key] = layout
         self.generation = plan.generation
+        self._watchdog(False)
         self.mover.settle(self.generation)
         self.stats["installed"] += 1
         self.stats["moves"] += len(plan.moves)
@@ -758,6 +788,7 @@ class Controller:
             self.pending.generation,
             why,
         )
+        self._watchdog(False)
         self.mover.cancel()
         self.mover.settle(self.generation)
         self.pending = None
@@ -882,6 +913,7 @@ def arm(
         min_gain_us=envs.TPU_MOE_EPLB_MIN_GAIN_US,
         max_bytes=int(envs.TPU_MOE_EPLB_MAX_BYTES_PER_GEN_MB) << 20,
         move_bytes=move_bytes,
+        hang_dump_s=envs.TPU_MOE_EPLB_HANG_DUMP_S,
     )
     first = next(iter(kept_modules.values()))
     try:

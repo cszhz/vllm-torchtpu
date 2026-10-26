@@ -851,6 +851,7 @@ class SlabMover:
                     )
                 )
             sends = []
+            idle_since = None
             while True:
                 if self._cancel.is_set():
                     return
@@ -870,6 +871,7 @@ class SlabMover:
                 for i, h in recvs:
                     if h.is_completed():
                         self._recv_q.put(i)
+                        idle_since = None
                     else:
                         pending.append((i, h))
                 recvs = pending
@@ -881,6 +883,18 @@ class SlabMover:
                     and not sends
                 ):
                     return
+                # A backend whose handles only complete inside wait(): once
+                # every send is out, block on the oldest receive for a while.
+                if self._sends_closed.is_set() and self._send_q.empty() and recvs:
+                    if idle_since is None:
+                        idle_since = time.monotonic()
+                    elif time.monotonic() - idle_since > 1.0:
+                        i, h = recvs[0]
+                        h.wait()
+                        self._recv_q.put(i)
+                        recvs = recvs[1:]
+                        idle_since = None
+                        continue
                 time.sleep(0.0005)
         except BaseException as e:  # noqa: BLE001 - handed to the main thread
             self._thread_error = e
