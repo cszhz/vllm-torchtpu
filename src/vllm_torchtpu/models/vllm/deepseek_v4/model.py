@@ -204,6 +204,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 for name, site in (("hc_attn_fn", "attn"), ("hc_ffn_fn", "ffn"))
             }
             object.__setattr__(self, "_seam_ops", seam_ops)
+            self._arm_ar_seam()
             if self.seq_parallel:
                 # Built outside the trace alongside the mHC ops.
                 from vllm_torchtpu.models.vllm.deepseek_v4.seq_parallel import (
@@ -230,6 +231,69 @@ class DeepseekV4DecoderLayer(nn.Module):
         """The fused seam op for the seam that gates ``fn_name``'s sublayer."""
         ops = self.mhc_ops
         return self.__dict__.get("_seam_ops", {}).get(fn_name, ops.fused)
+    def _arm_ar_seam(self) -> None:
+        """TPU_DSV4_MHC_AR_SEAM: build the fused attention-AR + ffn-seam op
+        (outside the trace, with the mHC ops) and hand wo_b's all-reduce to
+        it. Only the served mHC form (in-kernel gates, fused norm, stacked
+        fn) on a TP group the small all-reduce kernel serves."""
+        object.__setattr__(self, "_ar_seam_op", None)
+        opts = self.mhc_opts
+        wo_b = self.attn.wo_b
+        if not (
+            envs.TPU_DSV4_MHC_AR_SEAM
+            and opts.gates_in_kernel
+            and opts.fuse_norm
+            and opts.stacked_fn
+            and not envs.TPU_DSV4_ATTN_INTRA_CHIP_TP
+            and getattr(wo_b, "tp_size", 1) > 1
+        ):
+            return
+        from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+            deepseek_v4_mhc_ar_seam_op as ar_seam,
+        )
+
+        kernel_kw = dict(
+            gates_in_kernel=True,
+            small_block=envs.VLLM_TPU_DSV4_MHC_SMALL_BLOCK,
+            fn_chunks=envs.VLLM_TPU_DSV4_MHC_FN_CHUNKS,
+        )
+        if opts.gates_max_tokens >= 0:
+            kernel_kw["gates_max_tokens"] = opts.gates_max_tokens
+        if opts.token_block:
+            kernel_kw["token_block_size"] = opts.token_block
+        consts = (
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+        )
+        op = ar_seam.get_ar_seam_op(consts, kernel_kw)
+        if op is None or tuple(ar_seam.tp_ranks()) != tuple(
+            get_tp_group().ranks
+        ):
+            return
+        object.__setattr__(self, "_ar_seam_op", op)
+        # The fused op sums wo_b's partial; the replicated path below sums it
+        # itself whenever the op is not taken.
+        wo_b.reduce_results = False
+
+    def _attn_seam(self, positions, x, residual, post_mix, res_mix):
+        """Attention, its TP all-reduce and the ffn seam, as
+        ``mhc_ops.fused(all_reduce(attn(x)), ...)``; one op when armed."""
+        op = self.__dict__.get("_ar_seam_op")
+        fn = (*self._fn3("hc_ffn_fn"), self.hc_ffn_scale, self.hc_ffn_base)
+        norm = self._norm_arg(self.ffn_norm)
+        x_p = self.attn(positions, x)
+        if torch.compiler.is_compiling():
+            from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+                deepseek_v4_mhc_ar_seam_op as ar_seam,
+            )
+
+            rank, peers = ar_seam.rank_peers()
+            return op(x_p, residual, post_mix, res_mix, *fn, *norm, rank, peers)
+        x = tensor_model_parallel_all_reduce(x_p)
+        return self.mhc_ops.fused(x, residual, post_mix, res_mix, *fn, *norm)
 
     def split_hc_fns(self) -> None:
         """Split hc_attn_fn / hc_ffn_fn into the bf16 chunks the mHC ops take.
@@ -334,6 +398,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         x = self._norm(self.attn_norm, x)
+        if self.__dict__.get("_ar_seam_op") is not None and (
+            not self.seq_parallel or SP_GATE["replicated"]
+        ):
+            residual, post_mix, res_mix, x = self._attn_seam(
+                positions, x, residual, post_mix, res_mix
+            )
+            x = self._norm(self.ffn_norm, x)
+            x = self.ffn(x, input_ids)
+            return x, residual, post_mix, res_mix
         if self.seq_parallel and SP_GATE["replicated"]:
             # A bucket TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS keeps replicated: the
             # whole batch on every TP rank, wo_b's partial summed here.

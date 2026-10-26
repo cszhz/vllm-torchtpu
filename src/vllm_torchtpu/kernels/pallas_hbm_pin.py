@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 _MARK = "_torchtpu_hbm_pin_patch"
 _DEFAULT_SKIP = (
     r"^(proj_and_save_state_runs$|fused_ep_moe_v2_|moe_v2_|oneshot_all_gather"
-    r"|small_all_)"
+    r"|small_all_|kseam_)"
 )
 
 
