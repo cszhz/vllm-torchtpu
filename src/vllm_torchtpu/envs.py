@@ -199,6 +199,12 @@ if TYPE_CHECKING:
     TPU_DSV4_QNORM_ROPE_FLAT: bool = False
     TPU_DSV4_ROPE_QUANT_FLAT: bool = False
     TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS: int = 512
+    TPU_DSV4_CSA_WINDOW_MIXED: bool = False
+    TPU_DSV4_CSA_WINDOW_MIXED_ABOVE: int = 256
+    TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS: int = 32
+    TPU_DSV4_CSA_WINDOW_MIXED_GROUPS: int = 1
+    TPU_DSV4_CSA_WINDOW_MIXED_MAX_TOKENS: int = 2048
+    TPU_DSV4_CSA_WINDOW_MIXED_WQ: int = 8
     TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
     TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
     TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4: int = 0
@@ -1370,6 +1376,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ~16.5 us/CSA layer of top-k wait that the base arm hid behind SWA.
     # Scheduling only. 0 = unfenced.
     "TPU_DSV4_SMLA_UNION_VERIFY_FENCE": env_int("TPU_DSV4_SMLA_UNION_VERIFY_FENCE", 0),
+    # CSA buckets of T > ..._ABOVE tokens (a power of 2, above the decode
+    # buckets) with at least ..._MIN_HEADS local heads (32 = TP4): attend each
+    # request's 8-token windows' unions (`csa_window_union`, the decode route's
+    # kernels run in SparseCore waves) instead of union-dense blocks. Same keys
+    # per token; no context cap, no runtime fallback.
+    "TPU_DSV4_CSA_WINDOW_MIXED": env_bool("TPU_DSV4_CSA_WINDOW_MIXED"),
+    "TPU_DSV4_CSA_WINDOW_MIXED_ABOVE": env_int("TPU_DSV4_CSA_WINDOW_MIXED_ABOVE", 256),
+    "TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS": env_int("TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS", 32),
+    # Window groups per step: one SparseCore call per group, so group g + 1's
+    # dedup/gather runs under group g's TensorCore attention (1 = one call).
+    "TPU_DSV4_CSA_WINDOW_MIXED_GROUPS": env_int("TPU_DSV4_CSA_WINDOW_MIXED_GROUPS", 1),
+    # ... and buckets of T <= this many tokens (a power of 2; at TP8 the
+    # union-dense bq-64 kernel stays ahead at T2048 below ~100k-token prefixes).
+    "TPU_DSV4_CSA_WINDOW_MIXED_MAX_TOKENS": env_int("TPU_DSV4_CSA_WINDOW_MIXED_MAX_TOKENS", 2048),
+    # Tokens per window on the mixed route: 8, or 16 (M = 16 x 16 heads = 256
+    # rows per pushed tile at TP8; half the gathered rows of 8-token windows).
+    "TPU_DSV4_CSA_WINDOW_MIXED_WQ": env_int("TPU_DSV4_CSA_WINDOW_MIXED_WQ", 8),
     "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS": env_int(
         "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS", 512
     ),

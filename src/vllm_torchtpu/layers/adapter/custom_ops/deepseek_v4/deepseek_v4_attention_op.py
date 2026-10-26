@@ -338,6 +338,21 @@ def _attention_hca_rope(
     )
 
 
+def _window_mixed_prepare(topk, kv_lens, page_indices, cu_q_lens, distribution,
+                          cache_kv, cache_rope, groups, wq=8):
+    """L1 of the mixed-bucket union-of-window route: one SparseCore call, or one
+    per group (`groups` > 1) so group g + 1's runs under group g's attention.
+    `wq` != 8 (16-token windows) always takes the grouped layout."""
+    if groups > 1 or wq != 8:
+        return csa_window_union.prepare_grouped(
+            topk, kv_lens, page_indices, cu_q_lens, distribution, cache_kv,
+            cache_rope, groups=groups, wq=wq,
+        )  # fmt: skip
+    return csa_window_union.prepare(
+        topk, kv_lens, page_indices, cu_q_lens, distribution, cache_kv, cache_rope,
+    )  # fmt: skip
+
+
 def _attention_csa(
     q: jax.Array,
     new_kv: jax.Array,
@@ -377,6 +392,12 @@ def _attention_csa(
     union_verify_above: int = 0,
     union_verify_early: bool = True,
     union_verify_fence: int = 0,
+    window_mixed: bool = False,
+    window_mixed_above: int = 256,
+    window_mixed_min_heads: int = 32,
+    window_mixed_groups: int = 1,
+    window_mixed_max_tokens: int = 2048,
+    window_mixed_wq: int = 8,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -437,8 +458,24 @@ def _attention_csa(
     # First use of the top-k after the SWA pass: the indexer's SparseCore
     # top-k then completes behind the q projection and SWA, which do not need
     # it, instead of stalling the TensorCore before them.
+    # TPU_DSV4_CSA_WINDOW_MIXED: buckets of T > ..._ABOVE tokens (mixed /
+    # prefill) take the union-of-window route of the decode buckets
+    # (`csa_window_union`, 8-token windows, assignment waves over the
+    # SparseCore workers) instead of union-dense: an 8-token window's union is
+    # ~half a 32-token block's (real top-k), the union tile's cost is per query
+    # row (8 x 32 heads = 256 rows per tile at TP4), and there is no context
+    # cap, no count pass and no sparse fallback.
+    use_window_mixed = (
+        window_mixed
+        and q.shape[0] > window_mixed_above
+        and q.shape[0] <= window_mixed_max_tokens
+        and q.shape[0] > union_verify_max_tokens
+        and q.shape[1] >= window_mixed_min_heads
+        and csa_window_union.supported_mixed(q.shape[0], main_cu_q_lens.shape[0] - 1)
+    )
     use_union_dense = (
         union_dense
+        and not use_window_mixed
         and q.shape[0] >= union_dense_min_tokens
         and q.shape[1] <= union_dense_max_heads
     )
@@ -479,6 +516,12 @@ def _attention_csa(
         and csa_window_union.supported(q.shape[0], main_cu_q_lens.shape[0] - 1)
     )
     union_rows = None
+    if use_window_mixed and not two_caches_same_buffer:
+        union_rows = _window_mixed_prepare(
+            extra, main_kv_lens, main_page_indices, main_cu_q_lens,
+            main_distribution, main_cache_kv, main_cache_rope, window_mixed_groups,
+            window_mixed_wq,
+        )  # fmt: skip
     if use_union_verify and union_verify_early and not two_caches_same_buffer:
         topk_for_union = extra
         if union_verify_fence == 1:
@@ -492,6 +535,25 @@ def _attention_csa(
     extra, swa_output, union_plan, union_rows = jax.lax.optimization_barrier(
         (extra, swa_output, union_plan, union_rows)
     )
+
+    if use_window_mixed:
+        if union_rows is None:
+            union_rows = _window_mixed_prepare(
+                extra, main_kv_lens, main_page_indices, main_cu_q_lens,
+                main_distribution, main_cache_kv, main_cache_rope, window_mixed_groups,
+                window_mixed_wq,
+            )  # fmt: skip
+        if window_mixed_groups > 1 or window_mixed_wq != 8:
+            output = csa_window_union.attend_grouped(
+                q, union_rows, attention_sinks, swa_output, swa_l, swa_m,
+                sm_scale=sm_scale, groups=window_mixed_groups, wq=window_mixed_wq,
+            )  # fmt: skip
+        else:
+            output = csa_window_union.attend(
+                q, union_rows, attention_sinks, swa_output, swa_l, swa_m,
+                sm_scale=sm_scale,
+            )  # fmt: skip
+        return output, updated_sw_cache
 
     if use_union_verify:
         if union_rows is None:
