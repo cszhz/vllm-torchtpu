@@ -74,6 +74,7 @@ def scatter_pair(
     scale_size: int,
     topk: int,
     tokens: jax.Array | None = None,
+    pair_block: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Scatter token IDs and scale bits from nonnegative local slab rows.
 
@@ -83,10 +84,13 @@ def scatter_pair(
     `tokens` [n] i32 replaces pair p's token id p // topk with the caller's
     value -- the row the token's bytes sit at when the dispatch did not land
     them in token order -- so the table comes out remapped with no gather.
+    `pair_block` overrides how many pairs are staged at once; the default is
+    the largest that fits, and a test passes a smaller one to exercise the
+    streaming at a shape that would otherwise run in a single block.
     """
     n = rows.size
     aligned_n, width, subcores = _scratch_shape(n, max(token_size, scale_size))
-    block = _pair_block(aligned_n, width)
+    block = _pair_block(aligned_n, width) if pair_block is None else pair_block
     staged = ((aligned_n + block - 1) // block) * block
     tokens = (
         jnp.arange(n, dtype=jnp.int32) // topk
