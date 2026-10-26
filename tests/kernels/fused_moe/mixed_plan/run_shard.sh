@@ -20,4 +20,9 @@ case $1 in
 10) timeout -s KILL 2400 python3 $D/bench.py --cells mix128 --kinds served,served_pad --arms $A1ARMS --rs 16,96,256 --trace --out $O/p4_128 ;;
 11) timeout -s KILL 2400 python3 $D/bench.py --cells mix256 --kinds served,served_pad --arms $A1ARMS --rs 16,96,256 --trace --out $O/p4_256 ;;
 12) timeout -s KILL 2400 python3 $D/bench.py --cells mix32,mix64,mix128,mix256 --kinds one_shard,uniform --arms plan,a1,a1_rm_s3 --me 0 --rs 16,96,256 --out $O/p4_empty ;;
+# probe 05 (fixed-cost attribution, stage removal arms)
+20) timeout -s KILL 2400 python3 $D/bench.py --cells mix128 --kinds served --arms plan,a1,a1@skip:s1,a1@skip:s2,a1@skip:s3,a1@skip:s1\;s2\;s3,a1@rm_s3 --rs 16,96,256 --out $O/p5_128 ;;
+21) timeout -s KILL 2400 python3 $D/bench.py --cells mix256 --kinds served --arms plan,a1,a1@skip:s1,a1@skip:s2,a1@skip:s3,a1@skip:s1\;s2\;s3,a1@rm_s3 --rs 16,96,256 --out $O/p5_256 ;;
+22) timeout -s KILL 2400 python3 $D/bench.py --cells mix32 --kinds uniform --arms plan,a1,a1@skip:s1,a1@skip:s2,a1@skip:s3,a1@skip:s1\;s2\;s3,a1@rm_s3 --rs 16,96,256 --out $O/p5_32 ;;
+23) timeout -s KILL 2400 python3 $D/bench.py --cells mix128 --kinds served --arms plan,a1,a1@skip:s1,a1@skip:s2,a1@skip:s3,a1@skip:s1\;s2\;s3,a1@rm_s3 --rs 16,96,256 --trace --out $O/p5_128b ;;
 esac

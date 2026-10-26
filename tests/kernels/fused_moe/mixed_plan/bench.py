@@ -165,6 +165,9 @@ def main():
                     arr, scl, w, routes = spec.make_combine_inputs(cell, pairs, me, a.seed)
                     fn = spec.incumbent_combine
                     args = (arr, scl, plan["pos"], plan["mirror_pos"], w, routes)
+                elif arm.startswith("a1@"):  # timing-only: a1 with fault/skip=<arm[3:]> (";" for ",")
+                    fn = lambda e, l, b, m, c=cell, f=arm[3:].replace(";", ","): spec.candidate_plan(c, e, l, b, m, fault=f)
+                    args = pargs
                 elif arm in CANDIDATES:
                     fn = lambda e, l, b, m, c=cell, f=CANDIDATES[arm]: f(c, e, l, b, m)
                     args = pargs
