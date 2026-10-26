@@ -71,12 +71,10 @@ def _poison_vmem(fill):
     )()
 
 
-# The aliased operands are donated so XLA inserts no copies between the
-# poison and the kernel; a copy would overwrite the poisoned VMEM.
-@functools.partial(jax.jit, donate_argnums=(2, 6, 7, 8))
-def _decode(
-    q, new_kv, cache, kv_lens, page_indices, cu_q_lens, in_out, l_sum, m_max, sinks
-):
+# The aliased cache is donated so XLA inserts no copy between the poison and
+# the kernel; a copy would overwrite the poisoned VMEM.
+@functools.partial(jax.jit, donate_argnums=(2,))
+def _decode(q, new_kv, cache, kv_lens, page_indices, cu_q_lens, sinks):
     batch = kv_lens.shape[0]
     return mla_swa.run_mla_batched_decode_kernel(
         q,
@@ -89,9 +87,7 @@ def _decode(
         num_queries_per_block=1,
         start_seq_idx=jnp.array(0),
         end_seq_idx=jnp.array(batch),
-        in_output=in_out,
-        in_l=l_sum,
-        in_m=m_max,
+        num_seqs=jnp.array(batch),
         attention_sinks=sinks,
         sm_scale=HEAD_DIM**-0.5,
         sliding_window=WINDOW,
@@ -125,13 +121,8 @@ class MlaSwaStaleVmemTest(parameterized.TestCase):
         self.sinks = jnp.zeros((HEADS,), jnp.float32)
 
     def _step(self, fill):
-        batch = len(self.kv_lens)
         cache = jnp.copy(self.cache)
-        in_out = jnp.zeros_like(self.q)
-        l_sum = jnp.zeros((batch, 128), jnp.float32)
-        m_max = jnp.zeros((batch, 128), jnp.float32)
-        for a in (cache, in_out, l_sum, m_max):
-            a.block_until_ready()
+        cache.block_until_ready()
         _poison_vmem(fill).block_until_ready()
         kv_lens = jnp.asarray(self.kv_lens, jnp.int32)
         out, _, l_sum, m_max = _decode(
@@ -141,9 +132,6 @@ class MlaSwaStaleVmemTest(parameterized.TestCase):
             kv_lens,
             self.page_indices,
             self.cu_q_lens,
-            in_out,
-            l_sum,
-            m_max,
             self.sinks,
         )
         out = np.asarray(out.astype(jnp.float32))

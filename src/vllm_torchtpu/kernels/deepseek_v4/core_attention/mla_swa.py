@@ -33,6 +33,9 @@ Q_BLOCKS_PER_STEP = 4
 # Rows of one sublane group of the [rows, keys] scores; each holds one query.
 MASK_SUBLANES = 8
 
+# Rows per DMA when the decode pass zero-fills the padding rows of the outputs.
+PAD_ZERO_ROWS = 16
+
 
 def cdiv(a, b):
     assert b != 0
@@ -997,9 +1000,6 @@ def _mla_batched_decode_pipeline(
     new_kv_hbm_ref,  # [max_num_tokens, token_bytes // 128, 128] uint8
     # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
     cache_kv_hbm_ref,
-    in_output_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    in_l_hbm_ref,  # [max_num_tokens, num_l_heads]
-    in_m_hbm_ref,  # [max_num_tokens, num_l_heads]
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
@@ -1022,8 +1022,6 @@ def _mla_batched_decode_pipeline(
     bkv_p: int,
     seq_batch_sz: int,
 ):
-    del in_output_hbm_ref, in_l_hbm_ref, in_m_hbm_ref  # Aliased with out, l, m.
-
     def async_copy(src, dst, sem, wait=False):
         cp = pltpu.make_async_copy(src, dst, sem)
         if wait:
@@ -1367,6 +1365,40 @@ def _mla_batched_decode_pipeline(
             wait_update_kv_cache(last_batch_idx - 1, (last_i - 1) % 2)
 
 
+def _start_padding_zero_fill(pad_start, dst_refs, zero_refs, sem):
+    """Zeroes rows [pad_start, num_tokens) of each dst; returns the wait.
+
+    Each dst is filled from its zero_ref ([PAD_ZERO_ROWS, ...] of zeros). The
+    padding rows belong to no sequence, so no pass of the chain writes them
+    and these DMAs need no ordering against the kernels' own writes.
+    """
+    num_tokens = dst_refs[0].shape[0]
+    num_chunks = cdiv(num_tokens - pad_start, PAD_ZERO_ROWS)
+
+    def copies(i):
+        start = pad_start + i * PAD_ZERO_ROWS
+        sz = jnp.minimum(PAD_ZERO_ROWS, num_tokens - start)
+        return [
+            pltpu.make_async_copy(
+                zero_ref.at[pl.ds(0, sz)], dst_ref.at[pl.ds(start, sz)], sem
+            )
+            for dst_ref, zero_ref in zip(dst_refs, zero_refs)
+        ]
+
+    def start(i, carry):
+        for cp in copies(i):
+            cp.start()
+        return carry
+
+    def wait(i, carry):
+        for cp in copies(i):
+            cp.wait()
+        return carry
+
+    lax.fori_loop(0, num_chunks, start, ())
+    return lambda: lax.fori_loop(0, num_chunks, wait, ())
+
+
 def _mla_batched_decode_kernel(
     kv_lens_ref,
     page_indices_ref,
@@ -1374,6 +1406,7 @@ def _mla_batched_decode_kernel(
     start_end_seq_idx_ref,
     *refs,
     seq_batch_sz: int,
+    zero_pad_output: bool,
     **kwargs,
 ):
     """Runs the decode pipeline at a batch size that fits the decode count.
@@ -1381,8 +1414,31 @@ def _mla_batched_decode_kernel(
     Every sequence of a batch costs its DMAs and its share of the batched
     matmuls whether or not it exists, so a step with only a few decode tokens
     (a prefill step) runs batches of `SMALL_DECODE_SEQ_BATCH` instead.
+
+    This pass heads the chain and creates out, l and m: it zeroes their
+    padding rows (out only when `zero_pad_output`) and leaves every
+    sequence's rows to the pass that owns that sequence.
     """
-    *io_refs, bkv_x2, q_x2, o_x2, l_x2, m_x2, sems = refs
+    if zero_pad_output:
+        *io_refs, bkv_x2, q_x2, o_x2, l_x2, m_x2, sems, pad_sem, zero_lm, zero_o = refs
+        zero_bufs = (zero_lm, zero_o)
+    else:
+        *io_refs, bkv_x2, q_x2, o_x2, l_x2, m_x2, sems, pad_sem, zero_lm = refs
+        zero_bufs = (zero_lm,)
+    o_hbm_ref, _, l_hbm_ref, m_hbm_ref = io_refs[-4:]
+    dst_refs, zero_refs = [l_hbm_ref, m_hbm_ref], [zero_lm, zero_lm]
+    if zero_pad_output:
+        dst_refs, zero_refs = [o_hbm_ref, *dst_refs], [zero_o, *zero_refs]
+    pad_start = cu_q_lens_ref[start_end_seq_idx_ref[2]]
+
+    @pl.when(pad_start < o_hbm_ref.shape[0])
+    def _():
+        for zero_buf in zero_bufs:
+            zero_buf[...] = jnp.zeros(zero_buf.shape, zero_buf.dtype)
+
+    wait_padding_zero_fill = _start_padding_zero_fill(
+        pad_start, dst_refs, zero_refs, pad_sem.at[0]
+    )
     num_decode_seqs = start_end_seq_idx_ref[1] - start_end_seq_idx_ref[0]
 
     def run(batch_sz):
@@ -1405,9 +1461,10 @@ def _mla_batched_decode_kernel(
     small = min(SMALL_DECODE_SEQ_BATCH, seq_batch_sz)
     if small == seq_batch_sz:
         run(seq_batch_sz)
-        return
-    pl.when(num_decode_seqs <= small)(lambda: run(small))
-    pl.when(num_decode_seqs > small)(lambda: run(seq_batch_sz))
+    else:
+        pl.when(num_decode_seqs <= small)(lambda: run(small))
+        pl.when(num_decode_seqs > small)(lambda: run(seq_batch_sz))
+    wait_padding_zero_fill()
 
 
 def run_mla_batched_decode_kernel(
@@ -1422,9 +1479,7 @@ def run_mla_batched_decode_kernel(
     num_queries_per_block: int,
     start_seq_idx: jax.Array,  # i32
     end_seq_idx: jax.Array,  # i32
-    in_output: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
-    in_l: jax.Array,  # [max_num_tokens, num_l_heads]
-    in_m: jax.Array,  # [max_num_tokens, num_l_heads]
+    num_seqs: jax.Array,  # i32, sequences of the whole chain
     attention_sinks: jax.Array,  # float32[num_q_heads]
     *,
     sm_scale: float,
@@ -1434,11 +1489,14 @@ def run_mla_batched_decode_kernel(
     unnormalized_output: bool,
     seq_batch_sz: int = 32,
 ):
-    num_decode_seqs = end_seq_idx - start_seq_idx
+    """Heads the SWA chain: returns fresh out, cache, l and m.
+
+    Runs even without decode sequences, since it zero-fills the padding rows.
+    """
     bkv_p = num_kv_pages_per_block
     bkv_sz = bkv_p * logical_page_size
 
-    grid = (jnp.where(num_decode_seqs > 0, 1, 0),)
+    grid = (1,)
 
     _, num_q_heads, head_dim = q.shape
     max_num_seqs = kv_lens.shape[0]
@@ -1463,7 +1521,7 @@ def run_mla_batched_decode_kernel(
         kv_lens,
         page_indices,
         cu_q_lens,
-        jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
+        jnp.array([start_seq_idx, end_seq_idx, num_seqs], jnp.int32),
     )
 
     in_specs = [
@@ -1471,9 +1529,6 @@ def run_mla_batched_decode_kernel(
         pl.BlockSpec(memory_space=pltpu.HBM),  # q
         pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv
         pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv
-        pl.BlockSpec(memory_space=pltpu.HBM),  # in_output
-        pl.BlockSpec(memory_space=pltpu.HBM),  # in_l
-        pl.BlockSpec(memory_space=pltpu.HBM),  # in_m
     ]
     out_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # out
@@ -1488,10 +1543,7 @@ def run_mla_batched_decode_kernel(
         jax.ShapeDtypeStruct(shape=(q.shape[0], num_l_heads), dtype=jnp.float32),
     ]
     input_output_aliases = {
-        len(scalar_prefetches) + 4: 0,  # Alias in_output with out
         len(scalar_prefetches) + 3: 1,  # Alias cache_kv with updated_cache_kv
-        len(scalar_prefetches) + 5: 2,  # Alias in_l with out_l
-        len(scalar_prefetches) + 6: 3,  # Alias in_m with out_m
     }
 
     # Double buffered VMEM allocations
@@ -1519,6 +1571,7 @@ def run_mla_batched_decode_kernel(
         (2, seq_batch_sz + 4)
     )  # 4 for q, o, l, m; seq_batch_sz for bkv
 
+    zero_pad_output = not unnormalized_output
     scratch_shapes = [
         bkv_batch_x2_vmem,
         q_batch_x2_vmem,
@@ -1526,7 +1579,13 @@ def run_mla_batched_decode_kernel(
         l_batch_x2_vmem,
         m_batch_x2_vmem,
         sems,
+        pltpu.SemaphoreType.DMA((1,)),  # padding zero-fill
+        pltpu.VMEM((PAD_ZERO_ROWS, num_l_heads), jnp.float32),  # zeros for l, m
     ]
+    if zero_pad_output:
+        scratch_shapes.append(
+            pltpu.VMEM((PAD_ZERO_ROWS, num_q_heads, head_dim), q.dtype)
+        )
 
     scope_name = f"SWA-d-bq_1-bkvp_{bkv_p}"
     kernel = jax.named_scope(scope_name)(
@@ -1539,6 +1598,7 @@ def run_mla_batched_decode_kernel(
                 unnormalized_output=unnormalized_output,
                 bkv_p=bkv_p,
                 seq_batch_sz=seq_batch_sz,
+                zero_pad_output=zero_pad_output,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
@@ -1563,9 +1623,6 @@ def run_mla_batched_decode_kernel(
         q,
         new_kv,
         cache_kv,
-        in_output,
-        in_l,
-        in_m,
     )
 
 
@@ -1890,13 +1947,6 @@ def mla_sliding_window_ragged_paged_attention(
             in_m,
         )
 
-    num_l_heads = align_to(num_q_heads, 128)
-    l = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
-    m = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)
-    # output of swa attn is consumed by csa, hca attn, padding tokens'
-    # data won't be used downstream at all, so un-initialized buffer is fine.
-    in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
-
     bkv_sz = num_kv_pages_per_blocks[0] * logical_page_size
     if sliding_window <= bkv_sz:
         output, updated_kv, out_l, out_m = run_mla_batched_decode_kernel(
@@ -1910,9 +1960,7 @@ def mla_sliding_window_ragged_paged_attention(
             num_queries_per_block=num_queries_per_blocks[0],
             start_seq_idx=jnp.array(0),
             end_seq_idx=distribution[0],
-            in_output=in_output,
-            in_l=l,
-            in_m=m,
+            num_seqs=distribution[2],
             attention_sinks=attention_sinks,
             sm_scale=sm_scale,
             sliding_window=sliding_window,
@@ -1922,6 +1970,12 @@ def mla_sliding_window_ragged_paged_attention(
             seq_batch_sz=decode_seq_batch_size,
         )
     else:
+        num_l_heads = align_to(num_q_heads, 128)
+        l = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
+        m = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)
+        # output of swa attn is consumed by csa, hca attn, padding tokens'
+        # data won't be used downstream at all, so un-initialized buffer is fine.
+        in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
         output, updated_kv, out_l, out_m = run_mla_kernel(
             q,
             new_kv,
