@@ -729,11 +729,32 @@ _pair_op_cache: dict = {}
 
 
 def _pair_proj_jax(
-    hidden_states, positions, cos_sin_a, cos_sin_b,
-    w_a, ws_a, ape_a, st_a, qsl_a, kvt_a, dist_a, host_a,
-    w_b, ws_b, ape_b, st_b, qsl_b, kvt_b, dist_b, host_b,
-    *, statics_a, statics_b,
-):
+    hidden_states: jax.Array,
+    positions: jax.Array,
+    cos_sin_a: jax.Array,
+    cos_sin_b: jax.Array,
+    w_a: jax.Array,
+    ws_a: jax.Array,
+    ape_a: jax.Array,
+    st_a: jax.Array,
+    qsl_a: jax.Array,
+    kvt_a: jax.Array,
+    dist_a: jax.Array,
+    host_a: jax.Array,
+    w_b: jax.Array,
+    ws_b: jax.Array,
+    ape_b: jax.Array,
+    st_b: jax.Array,
+    qsl_b: jax.Array,
+    kvt_b: jax.Array,
+    dist_b: jax.Array,
+    host_b: jax.Array,
+    *,
+    statics_a: tuple,
+    statics_b: tuple,
+) -> tuple[jax.Array, jax.Array]:
+    statics_a, statics_b = dict(statics_a), dict(statics_b)
+
     def grp(w, ws, ape, st, qsl, kvt, dist, host, cos_sin, statics):
         separate = statics["separate_state"]
         return dict(
@@ -803,7 +824,9 @@ def _get_pair_op(statics):
         op = pallas.jax_op(
             name,
             functools.partial(
-                _pair_proj_jax, statics_a=statics[0], statics_b=statics[1]
+                _pair_proj_jax,
+                statics_a=tuple(sorted(statics[0].items())),
+                statics_b=tuple(sorted(statics[1].items())),
             ),
             mesh=get_pallas_op_mesh(),
             donate_argnums=(11, 19),
