@@ -161,7 +161,7 @@ def _bind():
     return reader
 
 
-def test_raw_reader_issues_ahead_adopts_when_ready_and_checks_itself(monkeypatch):
+def test_raw_reader_issues_after_dispatch_adopts_at_the_hook_never_waits(monkeypatch):
     monkeypatch.setattr(envs, "TPU_MOE_EXPERT_LOAD_LOG_EVERY", 0)
     monkeypatch.setattr(envs, "TPU_MOE_EPLB_DYNAMIC", True)
     rt, issued = _fake_raw(monkeypatch)
@@ -173,26 +173,36 @@ def test_raw_reader_issues_ahead_adopts_when_ready_and_checks_itself(monkeypatch
     expert_load.schedule(8)
     a._tpu_expert_load.copy_(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
     b._tpu_expert_load.copy_(torch.tensor([5, 6], dtype=torch.int32))
+
+    def step():
+        expert_load.maybe_log(0)  # the hook: adopt
+        expert_load.after_dispatch()  # after the forward: issue
+
     for _ in range(3):
-        expert_load.maybe_log(0)
+        step()
     reader = expert_load._READER
     assert reader.checked and len(issued) == 2  # the bind's own check read
-    expert_load.maybe_log(0)  # step 4: issued four steps ahead of the boundary
+    assert expert_load.snapshot() == {}  # nothing landed: no wait, no counts
+    step()  # step 4: issued after dispatch, four steps ahead of the boundary
     assert len(issued) == 4 and reader.latest is None
     for f in issued:
         f.land()
-    expert_load.maybe_log(0)  # step 5: adopted
+    step()  # step 5: adopted at the hook
     assert reader.latest_step == 5 and reader.stats["ready_steps"] == [1]
     assert reader.latest.tolist() == [[1, 2, 3, 4], [5, 6, 0, 0]]
     for _ in range(3):
-        expert_load.maybe_log(0)  # steps 6..8
-    snap = expert_load.snapshot()  # the boundary takes the adopted read (3 old)
+        step()  # steps 6..8
+    snap = expert_load.snapshot()  # the boundary takes the adopted read
     assert len(issued) == 4 and snap[("target", 0)].tolist() == [1, 2, 3, 4]
-    for _ in range(7):  # steps 9..15: the step-12 read is issued, never lands,
-        expert_load.maybe_log(0)  # so the consumer at 15 waits for it
-    assert len(issued) == 6
-    expert_load.snapshot()
-    assert all(f.done for f in issued)
+    for _ in range(8):  # steps 9..16: the step-12 read never lands
+        step()
+    assert len(issued) == 6 and reader.latest_step == 5
+    assert expert_load.snapshot()[("target", 0)].tolist() == [
+        1,
+        2,
+        3,
+        4,
+    ]  # stale, no wait
 
 
 def test_raw_reader_disagreeing_with_torch_falls_back(monkeypatch):

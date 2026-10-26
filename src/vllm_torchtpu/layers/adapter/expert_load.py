@@ -211,15 +211,6 @@ class _RawReader:
         self._adopt(step)
         return True
 
-    def wait(self, step: int) -> np.ndarray:
-        """The latest counts, issuing and waiting for a read when none is in
-        flight: the trigger path, normally served by a read issued earlier."""
-        if self._futures is None:
-            self.issue(step)
-        self._rt.await_all(self._futures)
-        self._adopt(step)
-        return self.latest
-
 
 _READER: _RawReader | None = None
 _CADENCE: list[int] = []  # step cadences that want a fresh read (controller windows)
@@ -254,23 +245,30 @@ def _compilations() -> int | None:
         return None
 
 
-def _read_all(step: int) -> np.ndarray:
-    """The counts for a consumer that needs them now (a window boundary or a
-    log point): the raw reader's latest adopted read if it is at most two
-    steps old, else a read it issues and waits for; the torch path otherwise."""
+def _read_all(step: int) -> np.ndarray | None:
+    """The counts for a consumer (a window boundary or a log point): the raw
+    reader's latest adopted read, or None when none has landed yet. Never a
+    wait: the hook runs before the step is dispatched, and a read's DMA is
+    chained behind the program that produces the accumulators, which the hook
+    itself has yet to dispatch (waiting there deadlocks the step). The torch
+    path, where the raw reader is unavailable, reads synchronously."""
     reader = _reader()
     if reader is None:
         return _read_all_sync()
+    return reader.latest
+
+
+def after_dispatch() -> None:
+    """Called once per step right after the forward's programs are
+    dispatched: the step's read is issued here, so its DMA queues behind the
+    programs that produce the accumulators (already dispatched) and the
+    transfer's materialization is a no-op; nothing here blocks."""
+    reader = _reader()
+    if reader is None:
+        return
     try:
-        fresh = (
-            reader.latest is not None
-            and reader.latest_step is not None
-            and step - reader.latest_step <= _STALE_STEPS
-            and reader._futures is None
-        )
-        if fresh:
-            return reader.latest
-        return reader.wait(step)
+        if _due_soon(_STATE["steps"]):
+            reader.issue(_STATE["steps"])
     except Exception as e:  # noqa: BLE001 - fall back for good
         logger.warning(
             "expert load | raw readback failed (%s); reading through torch", e
@@ -278,7 +276,6 @@ def _read_all(step: int) -> np.ndarray:
         _STATE["raw_disabled"] = True
         global _READER
         _READER = None
-        return _read_all_sync()
 
 
 def schedule(cadence: int) -> None:
@@ -289,7 +286,6 @@ def schedule(cadence: int) -> None:
 
 
 _AHEAD_STEPS = 4  # a read is issued this many steps before a consumer boundary
-_STALE_STEPS = 6  # and an adopted read this old still serves the boundary
 
 
 def _due_soon(step: int) -> bool:
@@ -308,6 +304,8 @@ def snapshot() -> dict[tuple[str, int], np.ndarray]:
     if not _REGISTERED:
         return {}
     host = _read_all(_STATE["steps"])
+    if host is None:
+        return {}
     out = {}
     for i, (name, layer, _) in enumerate(_REGISTERED):
         key = expert_placement.layout_key(layer)
@@ -353,8 +351,6 @@ def maybe_log(dp_rank: int) -> None:
                     st["issue_ms_max"],
                     _compilations(),
                 )
-            if _due_soon(step):
-                reader.issue(step)
         except Exception as e:  # noqa: BLE001 - fall back for good
             logger.warning(
                 "expert load | raw readback failed (%s); reading through torch", e
@@ -370,6 +366,8 @@ def maybe_log(dp_rank: int) -> None:
     widths = [getattr(layer, LOAD_ATTR).numel() for _, layer, _ in _REGISTERED]
     t0 = time.perf_counter()
     host = _read_all(step)
+    if host is None:
+        return  # no read has landed yet
     read_ms = (time.perf_counter() - t0) * 1e3
     previous = _STATE["previous"]
     window = host if previous is None else host - previous

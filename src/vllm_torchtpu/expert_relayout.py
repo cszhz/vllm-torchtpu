@@ -545,6 +545,7 @@ class Controller:
     # -- per step, after the all-reduce, before the forward
 
     def on_step(self, step: int, reduced: tuple[int, int, int]) -> None:
+        self._watchdog(True)  # re-armed every hook: a dump means a hung step
         hash_max, neg_hash_max, neg_staged_max = (int(v) for v in reduced)
         min_hash = -neg_hash_max
         min_staged = -neg_staged_max
@@ -599,7 +600,7 @@ class Controller:
         try:
             if on:
                 faulthandler.dump_traceback_later(
-                    self.hang_dump_s, repeat=True, file=sys.stderr
+                    self.hang_dump_s, repeat=False, file=sys.stderr
                 )
             else:
                 faulthandler.cancel_dump_traceback_later()
@@ -608,8 +609,12 @@ class Controller:
 
     def after_dispatch(self) -> None:
         """Called once per step right after the forward's programs are
-        dispatched: the mover's device legs are issued here, behind the
-        step's launches in the device's in-order queue, never ahead of them."""
+        dispatched: the tap's read and the mover's device legs are issued
+        here, behind the step's launches in the device's in-order queue,
+        never ahead of them."""
+        from vllm_torchtpu.layers.adapter import expert_load
+
+        expert_load.after_dispatch()
         if self.state == STAGING:
             self._pumped_since_step = True
             self.mover.pump()
@@ -618,6 +623,8 @@ class Controller:
 
     def _trigger(self, step: int) -> None:
         snap = self.snapshot()
+        if not snap:
+            return  # no counts have landed yet; the next boundary will
         self.history.append(snap)
         self.history = self.history[-(self.sub_windows + 1) :]
         if len(self.history) < 2:

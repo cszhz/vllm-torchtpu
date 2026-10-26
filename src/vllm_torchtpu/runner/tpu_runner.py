@@ -3980,6 +3980,8 @@ class TPUModelRunner(GPUModelRunner):
             relayout = getattr(self, "_expert_relayout", None)
             if relayout is not None:
                 relayout.after_dispatch()
+            else:
+                expert_load.after_dispatch()
 
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
