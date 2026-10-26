@@ -1395,6 +1395,14 @@ def test_the_dispatch_is_bit_exact_at_the_served_expert_dims(dispatch):
         x, gating, placed_weights, dispatch=dispatch, **kw, **placed, **common
     )
     np.testing.assert_array_equal(np.asarray(exchanged), np.asarray(gathered))
+    # The SparseCore pair scatter streams its pair arrays only above ~22 000
+    # pairs, so the geometry that newly takes that path is this one and the
+    # toy cases above run the single-block program they always did.
+    scattered = _served(
+        x, gating, placed_weights, dispatch=dispatch, sc_scatter=True, **kw,
+        **placed, **common,
+    )
+    np.testing.assert_array_equal(np.asarray(scattered), np.asarray(gathered))
 
 
 @pytest.mark.parametrize("groups", DISPATCH_GROUPS)
