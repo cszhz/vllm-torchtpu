@@ -77,7 +77,13 @@ background (tpu-sync raw device/host copies plus a gloo group of its own), and
 installs the new slot tables on every rank in the same step. It needs a layout
 with `staging` slots (`dsv41_flash_dp32_c768_s2`: 13 active + 2 staging per
 rank, replica cap 16); `TPU_MOE_EPLB_MIN_GAIN` (0.03) is the tile-model gain a
-layer must clear to be re-laid. Design: `DSV41_EPLB_DYNAMIC_DESIGN.md`.
+layer must clear to be re-laid. The slab mover (`TPU_MOE_EPLB_MOVER`, default
+`raw_transfer`) copies a slot as one major-dimension slice of the weight with
+tpu-sync's raw transfer, straight into the live device buffer, and moves each
+flat scale table whole with the slot's rows patched in the host image. The fp4
+pair dtype needs a tpu-sync with `raw_transfer.major_slice_bytes` (its packed
+sub-byte support); with an older tpu-sync the mover fails the generation and
+the layout stays as it was. Design: `DSV41_EPLB_DYNAMIC_DESIGN.md`.
 
 `ced` deliberately approximates decoder SWA state and is not numerically
 equivalent to a full decoder pass for long prompts. It processes all encoder
