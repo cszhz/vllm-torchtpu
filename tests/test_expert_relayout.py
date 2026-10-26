@@ -597,3 +597,32 @@ def test_a_rank_that_never_publishes_times_the_generation_out():
         c.after_dispatch()
         tap.advance()
     assert c.state == rl.IDLE and c.stats["aborted"] == 1 and installs == []
+
+
+def test_the_floors_drop_small_savings_and_cap_bytes_by_saving_per_byte():
+    """P5: a layer under the absolute gain floor is dropped; under a byte cap
+    the layers with the most saving per byte are kept, in that order."""
+    c = rl.Controller.__new__(rl.Controller)
+    c.min_gain_us, c.max_bytes, c.move_bytes = 10.0, 3 * 100, {"target": 100}
+    c.stats = {}
+    plan = rl.Plan(generation=1, trigger_step=0)
+    lay = _layout()
+    for lid, before, after, moves in (
+        (0, 100.0, 50.0, 2),
+        (1, 100.0, 95.0, 1),
+        (2, 100.0, 60.0, 1),
+        (3, 100.0, 70.0, 2),
+    ):
+        plan.layouts[("target", lid)] = lay
+        plan.predicted[("target", lid)] = (before, after)
+        for i in range(moves):
+            plan.moves.append(rl.Move("target", lid, i, 0, i, 1, 4))
+    out = c._floors(plan)
+    # layer 1 saves 5 us (< 10): dropped. Saving per byte: layer 2 (40/100),
+    # layer 0 (50/200), layer 3 (30/200): the 300-byte cap takes 2 then 0.
+    assert set(out.layouts) == {("target", 0), ("target", 2)}
+    assert (
+        all((m.group, m.layer) in out.layouts for m in out.moves)
+        and len(out.moves) == 3
+    )
+    assert c.stats["floored"] == 2

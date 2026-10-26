@@ -480,6 +480,17 @@ def _slot_count(module) -> int:
     return int(module.local_num_experts)
 
 
+def move_bytes(module, transport) -> int:
+    """Device bytes one slab move of this module costs on the wire: a slot of
+    every slot part plus a slot's rows of every table part."""
+    slots = _slot_count(module)
+    total = 0
+    for _, _name, t, kind in _parts(module):
+        per_slice = transport.slice_bytes(t)
+        total += per_slice if kind == SLOT else per_slice * (int(t.shape[0]) // slots)
+    return int(total)
+
+
 def describe_parts(module, transport=None) -> str:
     """One line per expert tensor: shape, dtype, kind and (with a transport)
     the device bytes of one slot -- logged at arm for the first layer."""

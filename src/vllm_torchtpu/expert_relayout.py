@@ -486,6 +486,9 @@ class Controller:
         warmup_steps: int | None = None,
         timeout_windows: int = 2,
         synchronous_solve: bool = False,
+        min_gain_us: float = 0.0,
+        max_bytes: int = 0,
+        move_bytes: dict[str, int] | None = None,
     ) -> None:
         """groups: name -> dict(experts, active, staging, replica_cap).
         snapshot(): (group, layer) -> cumulative counts [P]. install(module,
@@ -500,6 +503,9 @@ class Controller:
         self.window_steps = max(int(window_steps), 1)
         self.sub_windows = max(int(sub_windows), 1)
         self.min_gain = float(min_gain)
+        self.min_gain_us = float(min_gain_us)
+        self.max_bytes = int(max_bytes)
+        self.move_bytes = dict(move_bytes or {})  # group -> bytes of one slab move
         self.warmup_steps = (
             self.window_steps if warmup_steps is None else int(warmup_steps)
         )
@@ -649,6 +655,10 @@ class Controller:
         """The whole solve over every group, from copies of the window and the
         layouts: safe to run off the main thread."""
         plan = Plan(generation=generation, trigger_step=step)
+        # Then the floors: a layer whose predicted saving is under
+        # `min_gain_us` per step is dropped, and the generation's moves are
+        # capped at `max_bytes` by saving per byte (the plan says what is
+        # worth moving; the mover decides how fast).
         for name, spec in self.groups.items():
             layer_ids = sorted(lid for (g, lid) in layouts if g == name)
             windows = {}
@@ -678,6 +688,33 @@ class Controller:
                 plan.layouts[(name, lid)] = lay
                 plan.predicted[(name, lid)] = predicted[lid]
             plan.moves.extend(moves)
+        return self._floors(plan)
+
+    def _floors(self, plan: Plan) -> Plan:
+        keys = list(plan.layouts)
+        saving = {k: plan.predicted[k][0] - plan.predicted[k][1] for k in keys}
+        drop = {k for k in keys if saving[k] < self.min_gain_us}
+        if self.max_bytes > 0:
+            cost = {
+                k: sum(1 for m in plan.moves if (m.group, m.layer) == k)
+                * self.move_bytes.get(k[0], 0)
+                for k in keys
+            }
+            spent = 0
+            for k in sorted(
+                (k for k in keys if k not in drop),
+                key=lambda k: -(saving[k] / max(cost[k], 1)),
+            ):
+                if spent + cost[k] > self.max_bytes:
+                    drop.add(k)
+                else:
+                    spent += cost[k]
+        if drop:
+            for k in drop:
+                plan.layouts.pop(k, None)
+                plan.predicted.pop(k, None)
+            plan.moves = [m for m in plan.moves if (m.group, m.layer) not in drop]
+            self.stats["floored"] = self.stats.get("floored", 0) + len(drop)
         return plan
 
     def _install(self, step: int) -> None:
@@ -822,6 +859,14 @@ def arm(
         p2p,
         step_budget_bytes=int(envs.TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB) << 20,
     )
+    move_bytes = {}
+    for (gname, _lid), module in kept_modules.items():
+        if gname in move_bytes:
+            continue
+        try:
+            move_bytes[gname] = expert_mover.move_bytes(module, transport)
+        except Exception:  # noqa: BLE001 - a layer without expert tensors (tests' fakes)
+            move_bytes[gname] = 0
     controller = Controller(
         rank=ep_rank,
         groups=groups,
@@ -834,6 +879,9 @@ def arm(
         sub_windows=envs.TPU_MOE_EPLB_SUB_WINDOWS,
         min_gain=envs.TPU_MOE_EPLB_MIN_GAIN,
         warmup_steps=envs.TPU_MOE_EPLB_WARMUP_STEPS or None,
+        min_gain_us=envs.TPU_MOE_EPLB_MIN_GAIN_US,
+        max_bytes=int(envs.TPU_MOE_EPLB_MAX_BYTES_PER_GEN_MB) << 20,
+        move_bytes=move_bytes,
     )
     first = next(iter(kept_modules.values()))
     try:

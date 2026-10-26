@@ -93,6 +93,8 @@ if TYPE_CHECKING:
     TPU_MOE_EPLB_MOVER_HOST_MEMORY: str = "torch"
     TPU_MOE_EPLB_MOVER_SKIP_BUFFER_LOCK: bool = False
     TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB: int = 16
+    TPU_MOE_EPLB_MIN_GAIN_US: float = 0.0
+    TPU_MOE_EPLB_MAX_BYTES_PER_GEN_MB: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -710,6 +712,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # time: 16 MB is ~0.2 ms at pinned_host rates.
     "TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB": lambda: int(
         os.getenv("TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB", "16") or 16
+    ),
+    # Floors on a solved generation: drop a layer whose predicted saving is
+    # under this many microseconds per step (0 = relative gain only), and cap
+    # the generation's moved bytes per rank (MB; 0 = uncapped), keeping the
+    # layers with the most saving per byte.
+    "TPU_MOE_EPLB_MIN_GAIN_US": lambda: float(
+        os.getenv("TPU_MOE_EPLB_MIN_GAIN_US", "0") or 0
+    ),
+    "TPU_MOE_EPLB_MAX_BYTES_PER_GEN_MB": lambda: int(
+        os.getenv("TPU_MOE_EPLB_MAX_BYTES_PER_GEN_MB", "0") or 0
     ),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
