@@ -1977,6 +1977,7 @@ def fused_ep_moe_v2(
         combine_restore,
         mixed_plan,
         mixed_exchange_oneshot,
+        mixed_combine,
         bool(shared_in_op),
         float(shared_out_scale),
         int(shared_rs_min_rows),

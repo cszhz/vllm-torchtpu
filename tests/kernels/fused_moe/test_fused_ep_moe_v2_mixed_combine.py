@@ -37,8 +37,9 @@ def _run(mesh, tokens, seed, monkeypatch, plan_kernel, combine_kernel, calls):
     x, gating = _make_inputs(
         mesh, seed + 1, tokens=tokens, hidden=SHAPE["hidden"], e_total=SHAPE["e_total"]
     )
-    monkeypatch.setenv("TPU_DSV4_EP_MIXED_PLAN_KERNEL", "1" if plan_kernel else "0")
-    monkeypatch.setenv("TPU_DSV4_EP_MIXED_COMBINE_KERNEL", "1" if combine_kernel else "0")
+    # The switches are patched, not set through the environment: envs may cache.
+    monkeypatch.setattr(layer, "_mixed_plan_kernel_enabled", lambda: plan_kernel)
+    monkeypatch.setattr(layer, "_mixed_combine_kernel_enabled", lambda: combine_kernel)
     jax.clear_caches()
     out = fused_ep_moe_v2(
         x, w1, w2, w1_scale, w2_scale, gating, topk=SHAPE["topk"], renormalize=True,
