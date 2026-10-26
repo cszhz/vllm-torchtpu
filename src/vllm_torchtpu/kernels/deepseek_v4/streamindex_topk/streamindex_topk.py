@@ -53,6 +53,7 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 # K-IDXM group maxima: 16 lane tiles (2048 columns) per packed 128-lane gm row.
 GM_TILES = 16
 GM_LEVELS = 4  # log2(GM_TILES)
+GM_F32 = __import__("os").environ.get("TPU_DSV4_GM_INT", "0") != "1"
 # Test-only: TPU_KIDXM_FAULT=gm_bad (positive control: odd tiles' pair max skipped)
 # or gm_flat (the v1 flat roll form, a timing arm).
 _GM_FAULT = __import__("os").environ.get("TPU_KIDXM_FAULT", "")
@@ -288,6 +289,7 @@ def score_pipeline(
     chunk_idx: int = 0,
     verify_bd: bool = False,
     group_max: bool = False,
+    gm_min_kv: int = 0,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K.
 
@@ -981,7 +983,7 @@ def score_pipeline(
             else None
         )
 
-        def score_block(rows):
+        def score_block(rows, with_gm=True):
             """Scores every token block, reducing only its first `rows` rows."""
             chunk_scores = []
             gm_packed = [None] * num_tok_blks
@@ -1009,12 +1011,23 @@ def score_pipeline(
                 tb_scores = []
                 for tb in range(num_tok_blks):
                     acc = reduce_token_block(sts, tb, rows) * scales
-                    if gm_vmem is not None:
+                    if gm_vmem is not None and with_gm:
                         for jj in range(tiles_per_chunk):
                             tile = c * tiles_per_chunk + jj
-                            key = _monotone_key(
-                                pltpu.bitcast(acc[:, jj * 128 : (jj + 1) * 128], jnp.int32)
-                            )
+                            if _GM_FAULT == "gm_zero":  # timing-only removal arm
+                                if tile % GM_TILES == GM_TILES - 1:
+                                    gm_vmem[pl.ds(tb * tok_blk, rows), tile // GM_TILES] = (
+                                        jnp.zeros((rows, 128), jnp.int32))
+                                continue
+                            if GM_F32:
+                                # Max in f32 (the order of the keys for every non-NaN
+                                # score; -0 is canonicalized to +0 at the end so the
+                                # group key is never below a +0 member's key).
+                                key = acc[:, jj * 128 : (jj + 1) * 128]
+                            else:
+                                key = _monotone_key(
+                                    pltpu.bitcast(acc[:, jj * 128 : (jj + 1) * 128], jnp.int32)
+                                )
                             if _GM_FAULT == "gm_flat":
                                 # v1 form: 4 lane rolls per tile + a roll/select pack.
                                 i = tile % GM_TILES
@@ -1044,7 +1057,12 @@ def score_pipeline(
                                                        pltpu.roll(y, w, 1)))
                                 )
                             if stack[-1][0] == GM_LEVELS:
-                                gm_vmem[pl.ds(tb * tok_blk, rows), tile // GM_TILES] = stack.pop()[1]
+                                top = stack.pop()[1]
+                                if GM_F32:
+                                    top = _monotone_key(
+                                        pltpu.bitcast(jnp.where(top == 0, 0.0, top), jnp.int32)
+                                    )
+                                gm_vmem[pl.ds(tb * tok_blk, rows), tile // GM_TILES] = top
                             gm_packed[tb] = stack
                     if scores_rows is None:
                         tb_scores.append(acc)
@@ -1082,8 +1100,15 @@ def score_pipeline(
                 seq_batch_size=seq_batch_size,
                 chunk_idx=chunk_idx,
             )
-            pl.when(valid_rows <= half)(functools.partial(score_block, half))
-            pl.when(valid_rows > half)(functools.partial(score_block, tok_blk))
+            if gm_vmem is not None and gm_min_kv > 0:
+                gm_on = (seq_lens_ref[seq_tile(pl.program_id(0))] >> shift_comp) >= gm_min_kv
+                for vr, vh in ((valid_rows <= half, half), (valid_rows > half, tok_blk)):
+                    pl.when(vr & gm_on)(functools.partial(score_block, vh, True))
+                    pl.when(vr & jnp.logical_not(gm_on))(
+                        functools.partial(score_block, vh, False))
+            else:
+                pl.when(valid_rows <= half)(functools.partial(score_block, half))
+                pl.when(valid_rows > half)(functools.partial(score_block, tok_blk))
         else:
             score_block(tok_blk)
 
@@ -1608,6 +1633,7 @@ def _effective_row_lengths(
         "strict_causal",
         "chunk_sched_groups",
         "group_max",
+        "group_max_min_kv",
     ),
 )
 def streamindex_topk(
@@ -1647,6 +1673,7 @@ def streamindex_topk(
     strict_causal: bool = False,
     chunk_sched_groups: bool = True,
     group_max: bool = False,
+    group_max_min_kv: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1987,6 +2014,7 @@ def streamindex_topk(
                     chunk_idx=chunk_idx,
                     verify_bd=verify_bd and case == MlaCase.PREFILL,
                     group_max=group_max,
+                    gm_min_kv=group_max_min_kv if group_max else 0,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
@@ -2322,7 +2350,9 @@ def streamindex_topk(
             if gm is not None:
                 # K-IDXM: long rows of the blocked (mixed) pass are selected from
                 # their group maxima; every other row as before. Same selection.
-                assert not return_scores and scores.ndim == 3
+                assert not return_scores
+                if scores.ndim == 2:  # sc_flat_scores off: the same bytes, viewed 3D
+                    scores = scores.reshape(scores.shape[0], -1, 128)
                 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk_pf import (
                     sparsecore_topk_pf,
                 )
@@ -2337,6 +2367,7 @@ def streamindex_topk(
                     k,
                     eff_row_lengths[start : start + chunk_len],
                     eligible=eligible,
+                    min_len=max(group_max_min_kv, 16 * k + 16),
                     scheduling_group_id=sc_group,
                     **topk_kwargs,
                 )

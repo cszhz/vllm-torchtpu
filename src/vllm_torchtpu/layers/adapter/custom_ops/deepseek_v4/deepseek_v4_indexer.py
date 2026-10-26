@@ -154,6 +154,7 @@ def _indexer_impl(
             ),
             chunk_sched_groups=envs.TPU_STREAMIDX_CHUNK_SCHED_GROUPS,
             group_max=group_max,
+            group_max_min_kv=envs.TPU_DSV4_INDEXER_GROUP_MAX_MIN_KV if group_max else 0,
             kv_layout=KVLayout.SEQ_ALONG_LANE,
             uniform_q_len=verify_q_len,
             sc_flat_scores=envs.TPU_DSV4_SC_TOPK_FLAT_SCORES,

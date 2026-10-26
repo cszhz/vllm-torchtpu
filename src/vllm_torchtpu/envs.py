@@ -211,6 +211,7 @@ if TYPE_CHECKING:
     TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE: int = 0
     TPU_DSV4_INDEXER_TOKEN_SPLIT_PIECES: int = 1
     TPU_DSV4_INDEXER_GROUP_MAX: bool = False
+    TPU_DSV4_INDEXER_GROUP_MAX_MIN_KV: int = 65536
     TPU_STREAMIDX_CHUNK_SCHED_GROUPS: bool = True
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = True
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = True
@@ -1446,6 +1447,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # those and gathers only the candidate groups (sparsecore_topk_pf) instead
     # of the whole score row. Same selection, same column order.
     "TPU_DSV4_INDEXER_GROUP_MAX": env_bool("TPU_DSV4_INDEXER_GROUP_MAX"),
+    # ... only for sequences with at least this many compressed rows (both the
+    # scorer's group-max work and the SparseCore prefilter; shorter rows keep
+    # the full-row top-k, which is faster there). 0 = every eligible row.
+    "TPU_DSV4_INDEXER_GROUP_MAX_MIN_KV": env_int(
+        "TPU_DSV4_INDEXER_GROUP_MAX_MIN_KV", 65536
+    ),
     # StreamIndex chunked pipeline: annotate consecutive chunks' SparseCore
     # top-k and TensorCore scoring with XLA scheduling groups (1, default), or
     # leave the overlap to the scheduler (0; the annotated form failed to
