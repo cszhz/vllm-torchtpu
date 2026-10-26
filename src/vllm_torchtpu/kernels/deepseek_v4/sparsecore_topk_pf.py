@@ -420,16 +420,9 @@ def sparsecore_topk_pf(
     if eligible is not None:
         long = long & eligible
     pf, overflow = sparsecore_topk_pf_long(scores, gm, jnp.where(long, lens, 0), k=k)
-    rest = sparsecore_topk(scores, k, row_lengths=jnp.where(long, 0, lens), **topk_kwargs)
-    out = jnp.where(long[:, None], pf, rest)
-    bad = long & (overflow != 0)
-    return lax.cond(
-        jnp.any(bad),
-        lambda o: jnp.where(
-            bad[:, None],
-            sparsecore_topk(scores, k, row_lengths=jnp.where(bad, lens, 0), **topk_kwargs),
-            o,
-        ),
-        lambda o: o,
-        out,
-    )
+    # One full-row call, after the prefilter, for every row it did not take: the
+    # short / ineligible rows and any overflow row (no lax.cond: a conditional
+    # around a SparseCore launch costs more than the launch, STRAT-TKD-01).
+    took = long & (overflow == 0)
+    rest = sparsecore_topk(scores, k, row_lengths=jnp.where(took, 0, lens), **topk_kwargs)
+    return jnp.where(took[:, None], pf, rest)
