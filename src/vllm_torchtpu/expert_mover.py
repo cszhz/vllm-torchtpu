@@ -469,7 +469,7 @@ class SlabMover:
     hook on the main thread:
 
     d2h   issue the source slots' device -> host copies, and the whole-table
-          copies of every scale table a move touches (up to `slabs_per_pump`
+          copies of every scale table a move touches (up to `step_budget_bytes`
           issues per call); poll them; cut the outgoing payloads;
     p2p   a thread sends every outgoing payload (non-blocking) and receives
           every incoming one;
@@ -478,12 +478,21 @@ class SlabMover:
     """
 
     def __init__(
-        self, rank: int, transport, p2p, *, generation: int = 0, slabs_per_pump: int = 6
+        self,
+        rank: int,
+        transport,
+        p2p,
+        *,
+        generation: int = 0,
+        step_budget_bytes: int = 16 << 20,
     ):
         self.rank = rank
         self.transport = transport
         self.p2p = p2p
-        self.slabs_per_pump = max(int(slabs_per_pump), 1)
+        # Bytes of DMA one pump may issue (0 = unbounded): the device runs
+        # DMAs and program launches through one in-order queue, so a pump's
+        # copies delay whatever is launched after them by their transfer time.
+        self.step_budget_bytes = max(int(step_budget_bytes), 0)
         self._staged = generation
         self._failed = False
         self._cancel = threading.Event()
@@ -631,20 +640,23 @@ class SlabMover:
 
     # -- phases
 
+    def _budget(self) -> float:
+        return float("inf") if self.step_budget_bytes == 0 else self.step_budget_bytes
+
     def _pump_d2h(self) -> None:
-        budget = self.slabs_per_pump
+        budget = self._budget()
         while self._tables_todo and budget > 0:
             table = self._tables[self._tables_todo.pop(0)]
             t = table["tensor"]
             table["future"], table["host"] = self.transport.d2h(t, 0, int(t.shape[0]))
             self._to_release.append(table["host"])
-            budget -= 1
+            budget -= table["host"].numel()
         while self._out_todo and budget > 0:
             m, part, tensor, slot = self._out_todo.pop(0)
             future, host = self.transport.d2h(tensor, slot, 1)
             self._out_inflight.append((future, host, m, part))
             self._to_release.append(host)
-            budget -= 1
+            budget -= host.numel()
         still = []
         for future, host, m, part in self._out_inflight:
             if self.transport.ready(future):
@@ -725,11 +737,11 @@ class SlabMover:
         self._pump_h2d()
 
     def _pump_h2d(self) -> None:
-        budget = self.slabs_per_pump
+        budget = self._budget()
         while self._h2d_todo and budget > 0:
             host, tensor, first = self._h2d_todo.pop(0)
             self._h2d_inflight.append(self.transport.h2d(host, tensor, first))
-            budget -= 1
+            budget -= host.numel()
         self._h2d_inflight = [
             f for f in self._h2d_inflight if not self.transport.ready(f)
         ]

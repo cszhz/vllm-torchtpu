@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     TPU_MOE_EPLB_MOVER: str = "raw_transfer"
     TPU_MOE_EPLB_MOVER_HOST_MEMORY: str = "torch"
     TPU_MOE_EPLB_MOVER_SKIP_BUFFER_LOCK: bool = False
+    TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB: int = 16
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -702,6 +703,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # this. Measured: the lock costs ~0.14 ms per copy on an idle device.
     "TPU_MOE_EPLB_MOVER_SKIP_BUFFER_LOCK": env_bool(
         "TPU_MOE_EPLB_MOVER_SKIP_BUFFER_LOCK"
+    ),
+    # Bytes of raw DMA the mover issues per step (MB; 0 = unbounded). The
+    # device runs DMAs and program launches through one in-order queue, so a
+    # step's copies delay the launches queued after them by their transfer
+    # time: 16 MB is ~0.2 ms at pinned_host rates.
+    "TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB": lambda: int(
+        os.getenv("TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB", "16") or 16
     ),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.

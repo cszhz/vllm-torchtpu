@@ -541,7 +541,6 @@ class Controller:
             self._collect_solve(step)
         if self.state == STAGING:
             assert self.pending is not None
-            self.mover.pump()
             if self.mover.failed():
                 self._abort(step, "the mover failed")
             elif min_staged >= self.pending.generation:
@@ -572,6 +571,13 @@ class Controller:
             and step % self.window_steps == 0
         ):
             self._trigger(step)
+
+    def after_dispatch(self) -> None:
+        """Called once per step right after the forward's programs are
+        dispatched: the mover's device legs are issued here, behind the
+        step's launches in the device's in-order queue, never ahead of them."""
+        if self.state == STAGING:
+            self.mover.pump()
 
     # -- pieces
 
@@ -764,6 +770,10 @@ def arm(
     if not expert_load.registered_layers():
         logger.error("expert relayout: the load tap registered no layer")
         return None
+    # Counts arrive by an asynchronous read issued ahead of each sub-window.
+    expert_load.schedule(
+        max(envs.TPU_MOE_EPLB_WINDOW_STEPS // max(envs.TPU_MOE_EPLB_SUB_WINDOWS, 1), 1)
+    )
     groups: dict[str, dict] = {}
     layouts: dict[tuple[str, int], LayerLayout] = {}
     kept_modules: dict[tuple[str, int], object] = {}
@@ -806,7 +816,12 @@ def arm(
         list(ep_global_ranks) if ep_global_ranks is not None else list(range(ep_world))
     )
     p2p = expert_mover.GlooP2P(expert_mover.make_gloo_group(ranks), rank_map=ranks)
-    mover = expert_mover.SlabMover(ep_rank, transport, p2p)
+    mover = expert_mover.SlabMover(
+        ep_rank,
+        transport,
+        p2p,
+        step_budget_bytes=int(envs.TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB) << 20,
+    )
     controller = Controller(
         rank=ep_rank,
         groups=groups,

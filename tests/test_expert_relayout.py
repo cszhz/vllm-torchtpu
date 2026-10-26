@@ -299,6 +299,7 @@ def _run(controllers, tap, steps, start=0):
         reduced = tuple(max(f[i] for f in fields) for i in range(3))
         for c in controllers:
             c.on_step(step, reduced)
+            c.after_dispatch()
         tap.advance()
 
 
@@ -593,5 +594,6 @@ def test_a_rank_that_never_publishes_times_the_generation_out():
     # Fake a peer that keeps publishing 0: max is ours, -min is 0.
     for step in range(5, 12):
         c.on_step(step, (c.pending.hash62 if c.pending else 0, 0, 0))
+        c.after_dispatch()
         tap.advance()
     assert c.state == rl.IDLE and c.stats["aborted"] == 1 and installs == []

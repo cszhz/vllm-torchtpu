@@ -3975,6 +3975,11 @@ class TPUModelRunner(GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
                 )
+            # The dynamic expert re-layout's device legs go behind this
+            # step's launches (expert_relayout.py), never ahead of them.
+            relayout = getattr(self, "_expert_relayout", None)
+            if relayout is not None:
+                relayout.after_dispatch()
 
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
