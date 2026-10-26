@@ -27,6 +27,8 @@ pytestmark = pytest.mark.cpu_test
 def _fresh(monkeypatch):
     monkeypatch.setattr(expert_load, "_REGISTERED", [])
     monkeypatch.setattr(expert_load, "_STATE", {"steps": 0, "seq": 0, "previous": None})
+    monkeypatch.setattr(expert_load, "_READER", None)
+    monkeypatch.setattr(expert_load, "_CADENCE", [])
 
 
 def _layer(name):
@@ -80,3 +82,114 @@ def test_readback_every_n_steps_differences_the_windows(monkeypatch, tmp_path):
     expert_load.maybe_log(0)
     snap = np.load(sorted(tmp_path.iterdir())[1])
     assert snap["window"].tolist() == [[1, 0, 5, 0], [0, 0, 0, 0]]
+
+
+def _fake_raw(monkeypatch):
+    """A tpu-sync raw-transfer stand-in: batched D2H copies the (CPU) source
+    tensors' bytes into the destination views when the future lands; buffers
+    are plain host memory."""
+    import ctypes
+    import sys
+    import types
+
+    class Buf:
+        def __init__(self, n):
+            self._mem = (ctypes.c_uint8 * n)()
+            self.size_bytes = n
+
+        @property
+        def data_ptr(self):
+            return ctypes.addressof(self._mem)
+
+    class Future:
+        def __init__(self, pairs):
+            self.pairs, self.done = pairs, False
+
+        def land(self):
+            for src, dst in self.pairs:
+                dst.view(-1).copy_(src.detach().view(torch.uint8).view(-1))
+            self.done = True
+
+    rt = types.SimpleNamespace()
+    rt.major_slice_bytes = lambda t, **kw: t.element_size()
+    rt.RawHostBuffer = Buf
+    rt.PreparedTorchRawTransfer = lambda anchor, buf, **kw: None
+    issued = []
+
+    def batch(srcs, dsts, **kw):
+        f = Future(list(zip(srcs, dsts, strict=True)))
+        issued.append(f)
+        return f
+
+    rt.transfer_d2h_batch_async = batch
+    rt.is_ready = lambda f: f.done
+    rt.await_all = lambda f: f.land()
+    monkeypatch.setitem(sys.modules, "tpu_sync", types.SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "tpu_sync.api", types.SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules, "tpu_sync.api.torch", types.SimpleNamespace(raw_transfer=rt)
+    )
+    monkeypatch.setitem(sys.modules, "tpu_sync.api.torch.raw_transfer", rt)
+    # The CPU guard keeps the suite on the torch path; lift it for these.
+    monkeypatch.setattr(expert_load, "_reader", lambda: expert_load._READER or _bind())
+    return rt, issued
+
+
+def _bind():
+    reader = expert_load._RawReader()
+    reader.bind()
+    expert_load._READER = reader
+    return reader
+
+
+def test_raw_reader_issues_ahead_adopts_when_ready_and_checks_itself(monkeypatch):
+    monkeypatch.setattr(envs, "TPU_MOE_EXPERT_LOAD_LOG_EVERY", 0)
+    monkeypatch.setattr(envs, "TPU_MOE_EPLB_DYNAMIC", True)
+    rt, issued = _fake_raw(monkeypatch)
+    a, b = _layer("model.layers.0.ffn.experts"), _layer("model.layers.1.ffn.experts")
+    expert_load.register(a, physical=4, ep=2)
+    expert_load.register(b, physical=2, ep=2)
+    a._tpu_layout_key = ("target", 0)
+    b._tpu_layout_key = ("draft", 0)
+    expert_load.schedule(8)
+    a._tpu_expert_load.copy_(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    b._tpu_expert_load.copy_(torch.tensor([5, 6], dtype=torch.int32))
+    for _ in range(5):
+        expert_load.maybe_log(0)
+    assert issued == []  # nothing due before step 6 (= 8 - 2)
+    expert_load.maybe_log(0)  # step 6: issued two steps ahead of the boundary
+    assert len(issued) == 1 and expert_load._READER.latest is None
+    issued[0].land()
+    expert_load.maybe_log(0)  # step 7: adopted
+    reader = expert_load._READER
+    assert reader.latest_step == 7
+    assert reader.latest.tolist() == [[1, 2, 3, 4], [5, 6, 0, 0]]
+    assert reader.checked and reader.stats["ready_steps"] == [1]
+    expert_load.maybe_log(0)  # step 8: the boundary takes the adopted read
+    snap = expert_load.snapshot()
+    assert len(issued) == 1 and snap[("target", 0)].tolist() == [1, 2, 3, 4]
+    for _ in range(4):  # steps 9..12: stale and nothing in flight
+        expert_load.maybe_log(0)
+    expert_load.snapshot()
+    assert len(issued) == 2 and issued[1].done
+
+
+def test_raw_reader_disagreeing_with_torch_falls_back(monkeypatch):
+    monkeypatch.setattr(envs, "TPU_MOE_EXPERT_LOAD_LOG_EVERY", 4)
+    monkeypatch.setattr(envs, "TPU_MOE_EPLB_DYNAMIC", False)
+    monkeypatch.setattr(envs, "TPU_MOE_EXPERT_LOAD_DIR", "")
+    rt, issued = _fake_raw(monkeypatch)
+    a = _layer("model.layers.0.ffn.experts")
+    expert_load.register(a, physical=4, ep=2)
+    a._tpu_layout_key = ("target", 0)
+    original = rt.transfer_d2h_batch_async
+
+    def corrupt(srcs, dsts, **kw):
+        f = original(srcs, dsts, **kw)
+        f.pairs = [(torch.full_like(s, 9), d) for s, d in f.pairs]
+        return f
+
+    rt.transfer_d2h_batch_async = corrupt
+    for _ in range(4):  # the read lands wrong bytes at the step-4 log point
+        expert_load.maybe_log(0)
+    assert expert_load._STATE.get("raw_disabled") and expert_load._READER is None

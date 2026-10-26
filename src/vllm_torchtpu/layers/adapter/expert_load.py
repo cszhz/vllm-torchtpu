@@ -84,11 +84,12 @@ def registered_layers() -> int:
     return len(_REGISTERED)
 
 
-def _read_all() -> np.ndarray:
+def _read_all_sync() -> np.ndarray:
     """Every registered layer's accumulator as one [layers, widest] int64 host
-    array (rows zero-padded to the widest: the target's layers and the
-    drafter's have different slot counts). One device -> host transfer rather
-    than one per layer: this runs in the step hook."""
+    array through torch: a stack program and a synchronous `.cpu()`. The
+    fallback where tpu-sync's raw transfer is unavailable (CPU tests) or
+    refused the accumulators, and the reference the async reader checks
+    itself against once."""
     buffers = [getattr(layer, LOAD_ATTR) for _, layer, _ in _REGISTERED]
     width = max(b.numel() for b in buffers)
     if all(b.numel() == width for b in buffers):
@@ -100,6 +101,187 @@ def _read_all() -> np.ndarray:
     return stacked.cpu().numpy().astype(np.int64)
 
 
+class _RawReader:
+    """Reads the accumulators by tpu-sync's batched raw D2H into one pinned
+    `RawHostBuffer`: no device program, no synchronous readback. A read is
+    issued from the step thread (`issue`), the DMA lands while the step runs,
+    and the result is adopted by `poll` a step or two later. The first read
+    is checked against the torch path and the reader disables itself on a
+    mismatch (the raw bytes are the device's physical layout; a 1-D int32
+    array is linear, which is what the check asserts)."""
+
+    def __init__(self) -> None:
+        from tpu_sync.api.torch import raw_transfer
+
+        if not callable(raw_transfer.major_slice_bytes):
+            raise ImportError("tpu-sync raw transfer lacks major_slice_bytes")
+        self._rt = raw_transfer
+        self._srcs: list[torch.Tensor] = []
+        self._dsts: list[torch.Tensor] = []
+        self._views: list[np.ndarray] = []
+        self._buf = None
+        self._future = None
+        self.issued_step: int | None = None
+        self.latest: np.ndarray | None = None
+        self.latest_step: int | None = None
+        self.checked = False
+        self.stats = {
+            "issues": 0,
+            "issue_ms": 0.0,
+            "issue_ms_max": 0.0,
+            "ready_steps": [],
+        }
+
+    def bind(self) -> None:
+        import ctypes
+
+        srcs = [getattr(layer, LOAD_ATTR) for _, layer, _ in _REGISTERED]
+        sizes = []
+        for t in srcs:
+            per = int(self._rt.major_slice_bytes(t))
+            if per != t.element_size():
+                raise ValueError(
+                    f"accumulator of {t.numel()} int32 is not linear on the device "
+                    f"({per} bytes per element)"
+                )
+            sizes.append(per * t.numel())
+        total = sum(sizes)
+        buf = self._rt.RawHostBuffer(total)
+        self._rt.PreparedTorchRawTransfer(srcs[0], buf)  # binds (allocates) the buffer
+        owner = (ctypes.c_uint8 * buf.size_bytes).from_address(buf.data_ptr)
+        flat = torch.frombuffer(owner, dtype=torch.uint8)
+        off = 0
+        self._dsts, self._views = [], []
+        for t, n in zip(srcs, sizes, strict=True):
+            view = flat[off : off + n].view(t.numel(), t.element_size())
+            self._dsts.append(view)
+            self._views.append(view.numpy().view(np.int32).reshape(-1))
+            off += n
+        self._srcs, self._buf = srcs, buf
+
+    def issue(self, step: int) -> None:
+        if self._future is not None:
+            return
+        t0 = time.perf_counter()
+        self._future = self._rt.transfer_d2h_batch_async(
+            self._srcs,
+            self._dsts,
+            src_offsets_major_dim=[0] * len(self._srcs),
+            dst_offsets_major_dim=[0] * len(self._srcs),
+            copy_sizes_major_dim=[t.numel() for t in self._srcs],
+            unsafe_skip_buffer_lock=True,
+        )
+        ms = (time.perf_counter() - t0) * 1e3
+        self.issued_step = step
+        st = self.stats
+        st["issues"] += 1
+        st["issue_ms"] += ms
+        st["issue_ms_max"] = max(st["issue_ms_max"], ms)
+
+    def _adopt(self, step: int) -> None:
+        width = max(v.size for v in self._views)
+        host = np.zeros((len(self._views), width), dtype=np.int64)
+        for i, v in enumerate(self._views):
+            host[i, : v.size] = v
+        self._future = None
+        self.latest, self.latest_step = host, step
+        self.stats["ready_steps"].append(step - (self.issued_step or step))
+        if not self.checked:
+            self.checked = True
+            ref = _read_all_sync()
+            if ref.shape != host.shape or not np.array_equal(ref, host):
+                raise ValueError("raw readback disagrees with the torch readback")
+
+    def poll(self, step: int) -> bool:
+        """Adopt a completed read; True when `latest` changed."""
+        if self._future is None or not self._rt.is_ready(self._future):
+            return False
+        self._adopt(step)
+        return True
+
+    def wait(self, step: int) -> np.ndarray:
+        """The latest counts, issuing and waiting for a read when none is in
+        flight: the trigger path, normally served by a read issued earlier."""
+        if self._future is None:
+            self.issue(step)
+        self._rt.await_all(self._future)
+        self._adopt(step)
+        return self.latest
+
+
+_READER: _RawReader | None = None
+_CADENCE: list[int] = []  # step cadences that want a fresh read (controller windows)
+
+
+def _reader() -> _RawReader | None:
+    """The raw reader once it is bound and self-checked, or None (torch path)."""
+    global _READER
+    if _READER is not None or _STATE.get("raw_disabled"):
+        return _READER
+    if not _REGISTERED or getattr(_REGISTERED[0][1], LOAD_ATTR).device.type == "cpu":
+        _STATE["raw_disabled"] = True
+        return None
+    try:
+        reader = _RawReader()
+        reader.bind()
+    except Exception as e:  # noqa: BLE001 - the torch path stays
+        logger.warning(
+            "expert load | raw readback unavailable (%s); reading through torch", e
+        )
+        _STATE["raw_disabled"] = True
+        return None
+    _READER = reader
+    return reader
+
+
+def _compilations() -> int | None:
+    try:
+        stats = torch.tpu._get_cache_stats()  # type: ignore[attr-defined]
+        return int(stats.get("num_compilations", stats.get("compilations", -1)))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _read_all(step: int) -> np.ndarray:
+    """The counts for a consumer that needs them now (a window boundary or a
+    log point): the raw reader's latest adopted read if it is at most two
+    steps old, else a read it issues and waits for; the torch path otherwise."""
+    reader = _reader()
+    if reader is None:
+        return _read_all_sync()
+    try:
+        fresh = (
+            reader.latest is not None
+            and reader.latest_step is not None
+            and step - reader.latest_step <= 2
+            and reader._future is None
+        )
+        if fresh:
+            return reader.latest
+        return reader.wait(step)
+    except Exception as e:  # noqa: BLE001 - fall back for good
+        logger.warning(
+            "expert load | raw readback failed (%s); reading through torch", e
+        )
+        _STATE["raw_disabled"] = True
+        global _READER
+        _READER = None
+        return _read_all_sync()
+
+
+def schedule(cadence: int) -> None:
+    """A consumer (the dynamic re-layout) wants fresh counts every `cadence`
+    steps: a read is issued two steps ahead of each boundary."""
+    if cadence > 0 and cadence not in _CADENCE:
+        _CADENCE.append(int(cadence))
+
+
+def _due_soon(step: int) -> bool:
+    every = envs.TPU_MOE_EXPERT_LOAD_LOG_EVERY
+    cadences = list(_CADENCE) + ([every] if every > 0 else [])
+    return any((step + 2) % c == 0 for c in cadences)
+
+
 def snapshot() -> dict[tuple[str, int], np.ndarray]:
     """Every registered layer's cumulative counts, keyed by its layout
     (group, layer index), as int64 host arrays. The counts are replicated
@@ -109,7 +291,7 @@ def snapshot() -> dict[tuple[str, int], np.ndarray]:
 
     if not _REGISTERED:
         return {}
-    host = _read_all()
+    host = _read_all(_STATE["steps"])
     out = {}
     for i, (name, layer, _) in enumerate(_REGISTERED):
         key = expert_placement.layout_key(layer)
@@ -133,17 +315,46 @@ def summarize(window: np.ndarray, ep: int) -> dict:
 
 
 def maybe_log(dp_rank: int) -> None:
-    """Called once per runner step on the host; reads back every N steps."""
+    """Called once per runner step on the host, before the step is dispatched:
+    adopts a completed raw read, issues the next one two steps ahead of a
+    consumer's boundary, and logs every N steps."""
     if not _REGISTERED:
         return
     _STATE["steps"] += 1
+    step = _STATE["steps"]
+    reader = _reader()
+    if reader is not None:
+        try:
+            if reader.poll(step):
+                st = reader.stats
+                logger.info(
+                    "expert load | read %d adopted at step %d: issued %d step(s) "
+                    "earlier, issue %.2f ms (max %.2f), compilations %s",
+                    st["issues"],
+                    step,
+                    st["ready_steps"][-1],
+                    st["issue_ms"] / max(st["issues"], 1),
+                    st["issue_ms_max"],
+                    _compilations(),
+                )
+            if _due_soon(step):
+                reader.issue(step)
+        except Exception as e:  # noqa: BLE001 - fall back for good
+            logger.warning(
+                "expert load | raw readback failed (%s); reading through torch", e
+            )
+            _STATE["raw_disabled"] = True
+            global _READER
+            _READER = None
     every = envs.TPU_MOE_EXPERT_LOAD_LOG_EVERY
-    if every <= 0 or _STATE["steps"] % every:
+    if every <= 0 or step % every:
         return
     # One readback for every layer, rows padded to the widest slot count and
     # summarized at their own width.
     widths = [getattr(layer, LOAD_ATTR).numel() for _, layer, _ in _REGISTERED]
-    host = _read_all()
+    t0 = time.perf_counter()
+    host = _read_all(step)
+    read_ms = (time.perf_counter() - t0) * 1e3
     previous = _STATE["previous"]
     window = host if previous is None else host - previous
     _STATE["previous"] = host
@@ -155,10 +366,11 @@ def maybe_log(dp_rank: int) -> None:
     worst = np.argsort(-lbs)[:3]
     if dp_rank == 0:
         logger.info(
-            "expert load | step %d | window %d steps | moe_lb mean %.3f max %.3f "
-            "| worst layers %s | per layer %s",
+            "expert load | step %d | window %d steps | read %.2f ms | moe_lb mean "
+            "%.3f max %.3f | worst layers %s | per layer %s",
             _STATE["steps"],
             every,
+            read_ms,
             lbs.mean(),
             lbs.max(),
             ", ".join(
