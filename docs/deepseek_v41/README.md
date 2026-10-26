@@ -68,6 +68,17 @@ about 140 us of exposed wait per layer); the ragged all-to-all sends each row
 only to the shards it selected (about 4 MB per device at the same point), with
 the same output bit for bit. It enters the compile hash like every knob.
 
+`TPU_MOE_EPLB_DYNAMIC=1` (default off) turns the static layout into a live one:
+every `TPU_MOE_EPLB_WINDOW_STEPS` (512) coordinated steps each rank re-solves
+the layout from the load tap's window (identical on every rank, so no
+collective is needed; the plan's hash rides the per-step DP all-reduce as a
+check), moves the changed experts' slabs into the layout's staging slots in the
+background (tpu-sync raw device/host copies plus a gloo group of its own), and
+installs the new slot tables on every rank in the same step. It needs a layout
+with `staging` slots (`dsv41_flash_dp32_c768_s2`: 13 active + 2 staging per
+rank, replica cap 16); `TPU_MOE_EPLB_MIN_GAIN` (0.03) is the tile-model gain a
+layer must clear to be re-laid. Design: `DSV41_EPLB_DYNAMIC_DESIGN.md`.
+
 `ced` deliberately approximates decoder SWA state and is not numerically
 equivalent to a full decoder pass for long prompts. It processes all encoder
 rows, publishes global KV, and evaluates the decoder prompt tail. Prefix caching

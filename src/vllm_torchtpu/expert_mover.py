@@ -146,26 +146,33 @@ def make_transport(kind: str):
 
 
 class GlooP2P:
-    """Point-to-point tensors over a dedicated gloo group."""
+    """Point-to-point tensors over a dedicated gloo group. `rank_map` turns
+    the plan's EP ranks into the global ranks torch.distributed addresses."""
 
-    def __init__(self, group) -> None:
+    def __init__(self, group, rank_map: list[int] | None = None) -> None:
         self.group = group
+        self.rank_map = rank_map
+
+    def _global(self, rank: int) -> int:
+        return int(self.rank_map[rank]) if self.rank_map is not None else int(rank)
 
     def send(self, dst: int, tag: int, tensor: torch.Tensor):
         """Non-blocking: two ranks sending to each other must not rendezvous
         on blocking sends. Returns the work handle to wait on."""
         return torch.distributed.isend(
-            tensor.contiguous(), dst=dst, group=self.group, tag=tag
+            tensor.contiguous(), dst=self._global(dst), group=self.group, tag=tag
         )
 
     def recv(self, src: int, tag: int, tensor: torch.Tensor) -> None:
-        torch.distributed.recv(tensor, src=src, group=self.group, tag=tag)
+        torch.distributed.recv(tensor, src=self._global(src), group=self.group, tag=tag)
 
 
-def make_gloo_group(world_size: int):
-    """The mover's own process group over every EP rank (a collective: every
+def make_gloo_group(global_ranks: list[int]):
+    """The mover's own process group over the EP ranks (a collective: every
     rank calls it, once, at arm time)."""
-    return torch.distributed.new_group(ranks=list(range(world_size)), backend="gloo")
+    return torch.distributed.new_group(
+        ranks=[int(r) for r in global_ranks], backend="gloo"
+    )
 
 
 class LocalExchange:

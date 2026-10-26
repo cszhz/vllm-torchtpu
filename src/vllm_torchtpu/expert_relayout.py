@@ -579,3 +579,125 @@ class Controller:
         self.mover.settle(self.generation)
         self.pending = None
         self.state = IDLE
+
+
+# ---------------------------------------------------------------------------
+# Arming in a server
+
+
+def arm(
+    *,
+    ep_rank: int,
+    ep_world: int,
+    ep_global_ranks: list[int] | None = None,
+    lockstep: bool = True,
+) -> Controller | None:
+    """Build this rank's controller, or return None with the reason logged.
+
+    Called once per rank at the same point of startup on every rank (after
+    the model is loaded and warmed up): the mover's gloo group is created
+    here, collectively. Needs the dynamic knob, a layout with staging slots
+    applied to at least one layer, the load tap registered, and the DP
+    lockstep (every rank performs the step all-reduce every step).
+    """
+    from vllm_torchtpu import envs, expert_mover, expert_placement
+    from vllm_torchtpu.layers.adapter import expert_load
+
+    if not envs.TPU_MOE_EPLB_DYNAMIC:
+        return None
+    placement = expert_placement.current()
+    modules = expert_placement.applied_layers()
+    if placement is None or not modules:
+        logger.warning(
+            "expert relayout: TPU_MOE_EPLB_DYNAMIC is set but no layer is placed"
+        )
+        return None
+    if not lockstep:
+        logger.error("expert relayout: needs the DP/EP lockstep (DP > 1 with EP)")
+        return None
+    if not expert_load.registered_layers():
+        logger.error("expert relayout: the load tap registered no layer")
+        return None
+    groups: dict[str, dict] = {}
+    layouts: dict[tuple[str, int], LayerLayout] = {}
+    kept_modules: dict[tuple[str, int], object] = {}
+    for (gname, lid), module in sorted(modules.items(), key=lambda kv: kv[0]):
+        group = placement.group(gname)
+        if group is None or group.staging < 1:
+            continue
+        table = expert_placement.expert_slot_table(module)
+        if table is None:
+            continue
+        cap = int(table.shape[1])
+        spec = groups.setdefault(
+            gname,
+            dict(
+                experts=group.experts,
+                active=group.active,
+                staging=group.staging,
+                replica_cap=cap,
+            ),
+        )
+        if spec["replica_cap"] != cap:
+            logger.error(
+                "expert relayout: %s layers disagree on the table width", gname
+            )
+            return None
+        layouts[(gname, lid)] = LayerLayout.from_group(group, lid)
+        kept_modules[(gname, lid)] = module
+    if not groups:
+        logger.warning(
+            "expert relayout: layout %s has no staging slots; nothing to re-lay",
+            expert_placement.configured_value(),
+        )
+        return None
+    transport = expert_mover.make_transport(envs.TPU_MOE_EPLB_MOVER)
+    ranks = (
+        list(ep_global_ranks) if ep_global_ranks is not None else list(range(ep_world))
+    )
+    p2p = expert_mover.GlooP2P(expert_mover.make_gloo_group(ranks), rank_map=ranks)
+    mover = expert_mover.SlabMover(ep_rank, transport, p2p)
+    controller = Controller(
+        rank=ep_rank,
+        groups=groups,
+        layouts=layouts,
+        modules=kept_modules,
+        snapshot=expert_load.snapshot,
+        install=expert_placement.install_table,
+        mover=mover,
+        window_steps=envs.TPU_MOE_EPLB_WINDOW_STEPS,
+        sub_windows=envs.TPU_MOE_EPLB_SUB_WINDOWS,
+        min_gain=envs.TPU_MOE_EPLB_MIN_GAIN,
+        warmup_steps=envs.TPU_MOE_EPLB_WARMUP_STEPS or None,
+    )
+    logger.info(
+        "expert relayout armed | rank %d of %d | groups %s | %d layers | "
+        "window %d steps "
+        "x %d sub-windows | min gain %.0f%% | mover %s",
+        ep_rank,
+        ep_world,
+        {g: (v["active"], v["staging"], v["replica_cap"]) for g, v in groups.items()},
+        len(layouts),
+        controller.window_steps,
+        controller.sub_windows,
+        100 * controller.min_gain,
+        type(transport).__name__,
+    )
+    return controller
+
+
+def arm_for_runner(runner) -> Controller | None:
+    """The server's entry point: the EP group's rank and world, never raising."""
+    try:
+        from vllm.distributed.parallel_state import get_ep_group
+
+        group = get_ep_group()
+        return arm(
+            ep_rank=int(group.rank_in_group),
+            ep_world=int(group.world_size),
+            ep_global_ranks=[int(r) for r in group.ranks],
+            lockstep=bool(runner._dp_lockstep_enabled()),
+        )
+    except Exception:  # noqa: BLE001 - serving goes on with the static layout
+        logger.exception("expert relayout: arming failed; serving the static layout")
+        return None

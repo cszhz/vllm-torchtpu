@@ -52,7 +52,9 @@ _STATE: dict = {"steps": 0, "seq": 0, "previous": None}
 
 
 def enabled() -> bool:
-    return envs.TPU_MOE_EXPERT_LOAD_LOG_EVERY > 0
+    """The accumulator exists when the log asks for it or the dynamic
+    re-layout needs it (expert_relayout.py reads it through snapshot())."""
+    return envs.TPU_MOE_EXPERT_LOAD_LOG_EVERY > 0 or bool(envs.TPU_MOE_EPLB_DYNAMIC)
 
 
 def register(layer, *, physical: int, ep: int) -> None:
@@ -75,6 +77,11 @@ def operand(layer):
 def commit(layer, updated: torch.Tensor) -> None:
     """Write the op's returned accumulator back: the operand was donated."""
     getattr(layer, LOAD_ATTR).copy_(updated)
+
+
+def registered_layers() -> int:
+    """How many layers carry an accumulator in this process."""
+    return len(_REGISTERED)
 
 
 def snapshot() -> dict[tuple[str, int], np.ndarray]:
@@ -112,7 +119,7 @@ def maybe_log(dp_rank: int) -> None:
         return
     _STATE["steps"] += 1
     every = envs.TPU_MOE_EXPERT_LOAD_LOG_EVERY
-    if _STATE["steps"] % every:
+    if every <= 0 or _STATE["steps"] % every:
         return
     # One readback per layer: the target's layers and the drafter's have
     # different slot counts, so the rows are padded to the widest for the

@@ -747,6 +747,11 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_max_reqs: int = 0
         self._draft_proposals_needed: bool = True
         self._dp_step_has_encoder_inputs = False
+        # The coordinated step counter (one per _dp_coordinated_step call,
+        # identical on every rank) and the dynamic expert re-layout
+        # controller the worker arms after warm-up (expert_relayout.py).
+        self._dp_step_index = 0
+        self._expert_relayout = None
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -3538,6 +3543,13 @@ class TPUModelRunner(GPUModelRunner):
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
+        # The last three fields belong to the dynamic expert re-layout
+        # (expert_relayout.py): its plan hash twice (max and -min say whether
+        # every rank solved the same plan) and -staged generation (the max is
+        # -the slowest rank's). Zeros when it is off; the vector's length is
+        # the same on every rank either way.
+        controller = getattr(self, "_expert_relayout", None)
+        relayout = controller.fields() if controller is not None else (0, 0, 0)
         t = torch.tensor(
             [
                 int(local_num_tokens),
@@ -3545,6 +3557,7 @@ class TPUModelRunner(GPUModelRunner):
                 int(local_num_reqs),
                 int(has_encoder_inputs),
                 int(needs_draft_proposals),
+                *(int(v) for v in relayout),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -3552,6 +3565,12 @@ class TPUModelRunner(GPUModelRunner):
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
         )
+        self._dp_step_index = getattr(self, "_dp_step_index", 0) + 1
+        if controller is not None:
+            controller.on_step(
+                self._dp_step_index,
+                (int(t[5].item()), int(t[6].item()), int(t[7].item())),
+            )
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
         # Spec-decode draft forwards size themselves off the step's DP-wide
         # max per-chunk request count (see DFlashProposer), riding this same

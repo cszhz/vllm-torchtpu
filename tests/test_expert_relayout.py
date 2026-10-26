@@ -290,3 +290,90 @@ def test_flat_traffic_never_triggers_a_move():
     cs = [_controller(0, tap, _Mover(), installs)]
     _run(cs, tap, 13)
     assert cs[0].stats["installed"] == 0 and cs[0].stats["skipped"] >= 2
+
+
+# ---------------------------------------------------------------------------
+# Arming in a server
+
+
+def _arm_env(monkeypatch, **over):
+    from vllm_torchtpu import envs
+
+    values = dict(
+        TPU_MOE_EPLB_DYNAMIC=True,
+        TPU_MOE_EPLB_WINDOW_STEPS=16,
+        TPU_MOE_EPLB_SUB_WINDOWS=2,
+        TPU_MOE_EPLB_MIN_GAIN=0.05,
+        TPU_MOE_EPLB_WARMUP_STEPS=0,
+        TPU_MOE_EPLB_MOVER="torch",
+    )
+    values.update(over)
+    for k, v in values.items():
+        monkeypatch.setitem(vars(envs), k, v)
+
+
+def _fake_placed_world(monkeypatch, staging=1):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu import expert_mover, expert_placement
+    from vllm_torchtpu.layers.adapter import expert_load
+
+    group = SimpleNamespace(
+        experts=8,
+        active=4,
+        staging=staging,
+        slots=4 + staging,
+        replica_cap=2,
+        ranks=lambda layer: ((0, 1, 2, 3), (4, 5, 6, 7)),
+    )
+    placement = SimpleNamespace(group=lambda name: group if name == "target" else None)
+    module = SimpleNamespace(
+        layer_name="layers.0.mlp.experts",
+        _tpu_expert_slot=torch.zeros((8, 2), dtype=torch.int32),
+    )
+    monkeypatch.setattr(expert_placement, "current", lambda vllm_config=None: placement)
+    monkeypatch.setattr(
+        expert_placement, "applied_layers", lambda: {("target", 0): module}
+    )
+    monkeypatch.setattr(
+        expert_placement, "configured_value", lambda vllm_config=None: "fake"
+    )
+    monkeypatch.setattr(expert_load, "registered_layers", lambda: 1)
+    monkeypatch.setattr(
+        expert_mover, "make_gloo_group", lambda ranks: ("gloo", tuple(ranks))
+    )
+    return module
+
+
+def test_arm_builds_a_controller_from_the_placed_layers(monkeypatch):
+    _arm_env(monkeypatch)
+    _fake_placed_world(monkeypatch)
+    c = rl.arm(ep_rank=1, ep_world=2, ep_global_ranks=[4, 5])
+    assert c is not None and c.rank == 1 and c.window_steps == 16
+    assert c.groups == {"target": dict(experts=8, active=4, staging=1, replica_cap=2)}
+    assert c.layouts[("target", 0)].held == [
+        [0, 1, 2, 3, rl.FREE],
+        [4, 5, 6, 7, rl.FREE],
+    ]
+    assert c.mover.p2p.group == ("gloo", (4, 5)) and c.mover.p2p._global(1) == 5
+
+
+def test_arm_refuses_without_the_knob_staging_or_lockstep(monkeypatch):
+    _fake_placed_world(monkeypatch)
+    _arm_env(monkeypatch, TPU_MOE_EPLB_DYNAMIC=False)
+    assert rl.arm(ep_rank=0, ep_world=2) is None
+    _arm_env(monkeypatch)
+    assert rl.arm(ep_rank=0, ep_world=2, lockstep=False) is None
+    _fake_placed_world(monkeypatch, staging=0)
+    assert rl.arm(ep_rank=0, ep_world=2) is None
+
+
+def test_the_tap_exists_under_the_dynamic_knob(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import expert_load
+
+    monkeypatch.setitem(vars(envs), "TPU_MOE_EXPERT_LOAD_LOG_EVERY", 0)
+    monkeypatch.setitem(vars(envs), "TPU_MOE_EPLB_DYNAMIC", True)
+    assert expert_load.enabled()
+    monkeypatch.setitem(vars(envs), "TPU_MOE_EPLB_DYNAMIC", False)
+    assert not expert_load.enabled()

@@ -84,6 +84,12 @@ if TYPE_CHECKING:
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_MOE_EXPERT_LOAD_LOG_EVERY: int = 0
     TPU_MOE_EXPERT_LOAD_DIR: str = ""
+    TPU_MOE_EPLB_DYNAMIC: bool = False
+    TPU_MOE_EPLB_WINDOW_STEPS: int = 512
+    TPU_MOE_EPLB_SUB_WINDOWS: int = 4
+    TPU_MOE_EPLB_MIN_GAIN: float = 0.03
+    TPU_MOE_EPLB_WARMUP_STEPS: int = 0
+    TPU_MOE_EPLB_MOVER: str = "raw_transfer"
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -654,6 +660,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("TPU_MOE_EXPERT_LOAD_LOG_EVERY", "0") or 0
     ),
     "TPU_MOE_EXPERT_LOAD_DIR": env_str("TPU_MOE_EXPERT_LOAD_DIR", ""),
+    # Dynamic expert re-layout (EPLB round 2, expert_relayout.py): re-solve the
+    # layout from the load tap every WINDOW_STEPS coordinated steps over the
+    # last SUB_WINDOWS sub-windows, re-lay a layer only when the tile model
+    # predicts at least MIN_GAIN less time on the slowest rank, and move the
+    # experts' slabs between ranks with the MOVER ("raw_transfer": tpu-sync's
+    # raw device<->host copies + a gloo group; "torch": plain copies). Needs a
+    # layout with staging slots (expert_placements/*_s2.json). Default off.
+    "TPU_MOE_EPLB_DYNAMIC": env_bool("TPU_MOE_EPLB_DYNAMIC"),
+    "TPU_MOE_EPLB_WINDOW_STEPS": lambda: int(
+        os.getenv("TPU_MOE_EPLB_WINDOW_STEPS", "512") or 512
+    ),
+    "TPU_MOE_EPLB_SUB_WINDOWS": lambda: int(
+        os.getenv("TPU_MOE_EPLB_SUB_WINDOWS", "4") or 4
+    ),
+    "TPU_MOE_EPLB_MIN_GAIN": lambda: float(
+        os.getenv("TPU_MOE_EPLB_MIN_GAIN", "0.03") or 0.03
+    ),
+    "TPU_MOE_EPLB_WARMUP_STEPS": lambda: int(
+        os.getenv("TPU_MOE_EPLB_WARMUP_STEPS", "0") or 0
+    ),
+    "TPU_MOE_EPLB_MOVER": env_with_choices(
+        "TPU_MOE_EPLB_MOVER", "raw_transfer", ["raw_transfer", "torch"]
+    ),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
