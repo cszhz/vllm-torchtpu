@@ -317,20 +317,31 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 m_curr = s_rowmax
                 cm_ref[...] = m_curr
                 p = jnp.exp(s - m_curr[:, None])
-                pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
-                l_curr = jnp.sum(p, axis=1)
-                cl_ref[...] = l_curr
                 # The block's softmax is complete, so this chunk's output goes
                 # straight to the output buffer instead of through acc_ref.
                 if unnormalized_output:
+                    pv = jnp.einsum(
+                        "nm,md->nd", p, kv, preferred_element_type=jnp.float32
+                    )
+                    l_curr = jnp.sum(p, axis=1)
+                    cl_ref[...] = l_curr
                     out = pv.astype(q_dtype)
                 else:
+                    l_curr = jnp.sum(p, axis=1)
+                    cl_ref[...] = l_curr
                     # Kept as [rows, 1] columns: the exp then runs on the
                     # layout the row reductions produce, with no relayout.
-                    out = finalize_output(
-                        pv,
-                        l_curr[:, None] + jnp.exp(chunk_sinks - m_curr[:, None]),
+                    denom = l_curr[:, None] + jnp.exp(chunk_sinks - m_curr[:, None])
+                    # denom >= l >= every p of its row, so this keeps p as is.
+                    # It makes each row's PV wait for its denominator, so PV
+                    # results are normalized as they pop instead of spilled.
+                    pv = jnp.einsum(
+                        "nm,md->nd",
+                        jnp.where(denom > 0, p, 0.0),
+                        kv,
+                        preferred_element_type=jnp.float32,
                     )
+                    out = finalize_output(pv, denom)
                 bo_x2_ref.at[
                     bo_sem_idx, pl.ds(step_token_off + c * chunk_sz, chunk_sz)
                 ][...] = out.reshape(chunk_sz, num_q_heads, head_dim)
