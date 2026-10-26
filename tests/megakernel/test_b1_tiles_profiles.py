@@ -28,10 +28,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from conftest import EXACT_FLIPS, tile_field, with_tile_fields
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from tests.megakernel.megakernel_fakes import EXACT_FLIPS, tile_field, with_tile_fields
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import profile as profile_mod
 from vllm_torchtpu.megakernel.cache import should_use_pool_gather

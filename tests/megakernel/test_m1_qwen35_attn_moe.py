@@ -23,10 +23,10 @@ import pathlib
 import jax
 import jax.numpy as jnp
 import pytest
-from conftest import with_tile_fields
 from jax.experimental import topologies
 from jax.sharding import Mesh
 
+from tests.megakernel.megakernel_fakes import with_tile_fields
 from vllm_torchtpu.megakernel import kernel
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec

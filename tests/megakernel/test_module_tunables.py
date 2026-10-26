@@ -20,8 +20,8 @@ import re
 from pathlib import Path
 
 import pytest
-from conftest import EXACT_FLIPS, tile_field
 
+from tests.megakernel.megakernel_fakes import EXACT_FLIPS, tile_field
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import exec_spec
 from vllm_torchtpu.megakernel.modules import GDNModule, GQAModule, MoEModule

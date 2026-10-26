@@ -19,14 +19,14 @@ import dataclasses
 
 import jax.numpy as jnp
 import pytest
-from conftest import (
+from jax.experimental.pallas import tpu as pltpu
+
+from tests.megakernel.megakernel_fakes import (
     TINY_TILES,
     FakeGeometry,
     FakeMixerModule,
     make_fake_model_spec,
 )
-from jax.experimental.pallas import tpu as pltpu
-
 from vllm_torchtpu.megakernel import planner, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec

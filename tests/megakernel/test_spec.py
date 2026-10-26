@@ -220,10 +220,10 @@ def test_kernel_per_module_profiling_scopes(monkeypatch):
 
     import jax
     import jax.numpy as jnp
-    from conftest import TINY_TILES, FakeGeometry
     from jax.experimental.pallas import tpu as pltpu
     from jax.sharding import Mesh
 
+    from tests.megakernel.megakernel_fakes import TINY_TILES, FakeGeometry
     from vllm_torchtpu.megakernel import kernel, planner
 
     class _ScopedModule(Module):

@@ -23,7 +23,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from conftest import TINY_TILES, FakeGeometry, FakeMixerModule, MiniCtx
 from jax import lax
 from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
 from jax.experimental import pallas as pl
@@ -31,6 +30,12 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from tests.megakernel.megakernel_fakes import (
+    TINY_TILES,
+    FakeGeometry,
+    FakeMixerModule,
+    MiniCtx,
+)
 from vllm_torchtpu.megakernel import comm, modules, planner, stream, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
