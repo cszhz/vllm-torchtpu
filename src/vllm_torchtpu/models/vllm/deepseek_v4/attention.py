@@ -305,13 +305,7 @@ class VllmDeepseekV4MLAAttention(
     def attn_op(self):
         """The Pallas attention op, built lazily on first forward
         with final runtime geometry."""
-        return self._attn_op_for(False)
-
-    def _attn_op_for(self, rope: bool):
-        """`attn_op`, or with ``rope`` the HCA variant that applies the q/kv RoPEs
-        itself (TPU_DSV4_FUSED_HCA_ROPE; small buckets only)."""
-        sfx = "_rope" if rope else ""
-        op = self.__dict__.get(f"_attn_op_instance{sfx}")
+        op = self.__dict__.get("_attn_op_instance")
         if op is not None:
             return op
 
@@ -319,20 +313,19 @@ class VllmDeepseekV4MLAAttention(
             getattr(getattr(self.mla_attn, "swa_cache_layer", None), "kv_cache", None)
         )
         if swa_tensor is None:
-            prof = self.__dict__.get(f"_attn_op_prof_instance{sfx}")
+            prof = self.__dict__.get("_attn_op_prof_instance")
             if prof is not None:
                 return prof
 
-        op, built_from_real_caches = self._build_attn_op(rope)
+        op, built_from_real_caches = self._build_attn_op()
         object.__setattr__(
             self,
-            (f"_attn_op_instance{sfx}" if built_from_real_caches
-             else f"_attn_op_prof_instance{sfx}"),
+            "_attn_op_instance" if built_from_real_caches else "_attn_op_prof_instance",
             op,
         )
         return op
 
-    def _build_attn_op(self, rope: bool = False):
+    def _build_attn_op(self):
         vllm_context = get_vllm_model_wrapper_context()
         mesh = get_pallas_op_mesh()
 
@@ -437,7 +430,7 @@ class VllmDeepseekV4MLAAttention(
             }
         )
 
-        rope_fused = rope
+        rope_fused = self._hca_rope_fused
         if rope_fused:
             kernel_tuning = dict(
                 kernel_tuning,
@@ -676,9 +669,7 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        # Only the decode buckets the fused kernel serves take the RoPE-in-op
-        # variant; larger steps keep the stock op and rope kernels unchanged.
-        rope_fused = self._hca_rope_fused and qr.shape[0] <= 32
+        rope_fused = self._hca_rope_fused
         if rope_fused:
             # Raw projection + pre-RoPE kv; the attention op applies both RoPEs.
             q = self.wq_b(qr)
@@ -709,7 +700,6 @@ class VllmDeepseekV4MLAAttention(
             positions,
             None,
             topk_indices=topk_indices,
-            rope_fused=rope_fused,
         )
         return res
 
@@ -739,7 +729,6 @@ class VllmDeepseekV4MLAAttention(
         output: torch.Tensor | None,
         *,
         topk_indices: torch.Tensor | None,
-        rope_fused: bool = False,
     ) -> torch.Tensor:
         """Prepare metadata operands and dispatch the Pallas attention op."""
         attn_ctx = get_forward_context().attn_metadata
@@ -848,7 +837,7 @@ class VllmDeepseekV4MLAAttention(
             main_distribution,
             self.attn_sink,
         )
-        if rope_fused:
+        if self._hca_rope_fused:
             operands += (
                 positions.to(torch.int32),
                 self.mla_attn.rotary_emb.cos_sin_cache,
@@ -874,7 +863,7 @@ class VllmDeepseekV4MLAAttention(
                 main_cache_rope = main_cache_kv.clone()
             operands += (main_cache_rope,)
 
-        output, new_sw_cache = self._attn_op_for(rope_fused)(*operands)
+        output, new_sw_cache = self.attn_op(*operands)
 
         if (
             orig_sw_cache is not None

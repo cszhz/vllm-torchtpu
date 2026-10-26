@@ -5639,10 +5639,6 @@ class TPUModelRunner(GPUModelRunner):
                         module.__dict__.pop("_attn_op_instance", None)
                         _ = module.attn_op
                         initialized_count += 1
-                        if getattr(module, "_hca_rope_fused", False):
-                            # TPU_DSV4_FUSED_HCA_ROPE: the small-bucket variant too
-                            module.__dict__.pop("_attn_op_instance_rope", None)
-                            _ = module._attn_op_for(True)
                     if hasattr(module, "_build_compressor_op") and hasattr(
                         module, "compressor_op"
                     ):
