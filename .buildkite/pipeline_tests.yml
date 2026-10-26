@@ -286,7 +286,7 @@ steps:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
-              test-cmd: "pytest -sv --timeout=1800 -m 'nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=1800 -m 'not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Omni Multichip (Nightly)"
         key: "unit_tests_omni_multichip_nightly"
@@ -304,4 +304,4 @@ steps:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
-              test-cmd: "pytest -sv --timeout=1800 -m 'nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=1800 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
