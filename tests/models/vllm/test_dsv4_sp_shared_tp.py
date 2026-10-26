@@ -25,7 +25,14 @@ reduce-scatter) is compared against
     replicated weight on this rank's rows -- and a float64 oracle; the op's
     error against the oracle must stay in the class of ``full``'s and
     ``nosp``'s.
-A positive control hands the op the slices in the wrong TP order and must fail.
+  * ``nosp_dev``: the same replicated layout run on the mesh -- each rank's
+    slice on its group's rows, the bf16 partials reduced by a device psum over
+    the TP group (what the stack's no-SP all-reduce does). The op must match it
+    closely; ``nosp`` (f32 host sum) differs from both by the collective's
+    bf16 reduction, which is reported, not asserted.
+A positive control drops one TP slice (a rank holds its neighbour's slice) and
+must fail. (Permuting the slices across ranks is NOT a fault: the slices'
+partials are summed, so any assignment gives the same sum.)
 
     python3 tests/models/vllm/test_dsv4_sp_shared_tp.py [--time]
 """
@@ -100,7 +107,7 @@ def _rel(a, ref):
     return float(np.linalg.norm(a - ref) / np.linalg.norm(ref))
 
 
-def _run(tp, n_local, mode, pin, wrong_order=False, timing=False):
+def _run(tp, n_local, mode, pin, drop_slice=False, timing=False):
     mesh = _mesh()
     ndev = mesh.devices.size
     groups = [list(range(g * tp, (g + 1) * tp)) for g in range(ndev // tp)]
@@ -110,7 +117,7 @@ def _run(tp, n_local, mode, pin, wrong_order=False, timing=False):
 
     def rank_of(dev):
         r = dev % tp
-        return (tp - 1 - r) if wrong_order else r
+        return (r + 1) % tp if (drop_slice and r == 0) else r
 
     sl = [_slice(w, ws, d, ds, rank_of(dv), tp) for dv in range(ndev)]
     args = [_stack(mesh, [x[dv * n_local : (dv + 1) * n_local] for dv in range(ndev)])]
@@ -136,6 +143,24 @@ def _run(tp, n_local, mode, pin, wrong_order=False, timing=False):
             mlp(xg, *_slice(w, ws, d, ds, r, tp)).astype(jnp.float32) for r in range(tp)
         ]
         nosp[rows] = np.asarray(sum(parts).astype(jnp.bfloat16).astype(jnp.float32))
+    # nosp_dev: the replicated layout on the mesh with a device bf16 psum.
+    def nosp_local(xl, w_l, sc_l, d_l, ds_l):
+        xg = jax.lax.all_gather(xl, AX, axis=0, tiled=True, axis_index_groups=groups)
+        y = jax.lax.psum(mlp(xg, w_l, sc_l, d_l, ds_l), AX, axis_index_groups=groups)
+        i = jax.lax.axis_index(AX) % tp
+        return jax.lax.dynamic_slice_in_dim(y, i * n_local, n_local, 0)
+
+    spec2 = PartitionSpec(AX, None)
+    jnosp = jax.jit(
+        jax.shard_map(
+            nosp_local,
+            mesh=mesh,
+            in_specs=(spec2, spec2, PartitionSpec(AX), spec2, PartitionSpec(AX)),
+            out_specs=spec2,
+            check_vma=False,
+        )
+    )
+    nosp_dev = np.asarray(jnosp(*args).astype(jnp.float32))
     ref = _oracle(np.asarray(x.astype(jnp.float32)), w, ws, d, ds)
     res = dict(
         err_op=_rel(out, ref),
@@ -143,6 +168,10 @@ def _run(tp, n_local, mode, pin, wrong_order=False, timing=False):
         err_nosp=_rel(nosp, ref),
         op_vs_nosp=_rel(out, np.asarray(nosp, np.float64)),
         op_vs_nosp_maxabs=float(np.max(np.abs(out - nosp))),
+        err_nosp_dev=_rel(nosp_dev, ref),
+        op_vs_nosp_dev=_rel(out, np.asarray(nosp_dev, np.float64)),
+        op_vs_nosp_dev_maxabs=float(np.max(np.abs(out - nosp_dev))),
+        nosp_dev_vs_nosp=_rel(nosp_dev, np.asarray(nosp, np.float64)),
         ref_absmax=float(np.max(np.abs(ref))),
     )
     if timing:
@@ -182,16 +211,17 @@ def test_sp_shared_tp_matches_nosp(tp, n_local, mode, pin):
         pytest.skip("needs a TP group of cores")
     r = _run(tp, n_local, mode, pin)
     print(tp, n_local, mode, pin, r)
-    # Same rows, same slices, same bf16 partial sum as the replicated layout.
-    assert r["op_vs_nosp"] < 2e-3, r
+    # Same rows, same slices, same bf16 collective reduction as the replicated
+    # layout run on the mesh.
+    assert r["op_vs_nosp_dev"] < 2e-3, r
     # Error class: no worse than today's SP (full weight) or the no-SP layout.
     assert r["err_op"] <= 1.10 * max(r["err_full"], r["err_nosp"]) + 1e-4, r
 
 
-def test_positive_control_wrong_tp_order_fails():
-    r = _run(8 if jax.device_count() >= 8 else 4, 32, 1, None, wrong_order=True)
-    print("wrong order", r)
-    assert r["op_vs_nosp"] > 0.1, r
+def test_positive_control_dropped_slice_fails():
+    r = _run(8 if jax.device_count() >= 8 else 4, 32, 1, None, drop_slice=True)
+    print("dropped slice", r)
+    assert r["op_vs_nosp_dev"] > 0.1, r
 
 
 if __name__ == "__main__":
@@ -205,13 +235,13 @@ if __name__ == "__main__":
                 if jax.device_count() < tp:
                     continue
                 r = _run(tp, n, mode, pin, timing=a.time)
-                ok = r["op_vs_nosp"] < 2e-3 and r["err_op"] <= 1.10 * max(
+                ok = r["op_vs_nosp_dev"] < 2e-3 and r["err_op"] <= 1.10 * max(
                     r["err_full"], r["err_nosp"]
                 ) + 1e-4
                 bad += not ok
                 print(f"tp{tp} rows{n} mode{mode} pin{pin} {'PASS' if ok else 'FAIL'} {r}")
-    r = _run(8 if jax.device_count() >= 8 else 4, 32, 1, None, wrong_order=True)
-    ok = r["op_vs_nosp"] > 0.1
+    r = _run(8 if jax.device_count() >= 8 else 4, 32, 1, None, drop_slice=True)
+    ok = r["op_vs_nosp_dev"] > 0.1
     bad += not ok
     print(f"positive control {'PASS' if ok else 'FAIL'} {r}")
     sys.exit(1 if bad else 0)
