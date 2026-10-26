@@ -220,6 +220,10 @@ if TYPE_CHECKING:
     TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: int = 0
     TPU_DSV4_SP_SHARED_TP: int = 0
     TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE: int = 0
+    TPU_DSV4_INDEXER_TOKEN_SPLIT_PIECES: int = 1
+    TPU_DSV4_INDEXER_GROUP_MAX: bool = False
+    TPU_DSV4_INDEXER_GROUP_MAX_MIN_KV: int = 65536
+    TPU_STREAMIDX_CHUNK_SCHED_GROUPS: bool = True
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = True
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = True
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
@@ -1473,6 +1477,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 = off.
     "TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE": env_int(
         "TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE", 0
+    ),
+    # Token-split indexer windows (above): cut each rank's window into this
+    # many row pieces (a power of 2), each scored into its own buffer with its
+    # own SparseCore top-k, so piece i's top-k can overlap piece i+1's scoring.
+    # Same selection. 1 = one unpipelined pass.
+    "TPU_DSV4_INDEXER_TOKEN_SPLIT_PIECES": env_int(
+        "TPU_DSV4_INDEXER_TOKEN_SPLIT_PIECES", 1
+    ),
+    # Token-split indexer windows: the mixed scoring pass also writes each
+    # row's 16-column group maxima, and the SparseCore top-k of long rows reads
+    # those and gathers only the candidate groups (sparsecore_topk_pf) instead
+    # of the whole score row. Same selection, same column order.
+    "TPU_DSV4_INDEXER_GROUP_MAX": env_bool("TPU_DSV4_INDEXER_GROUP_MAX"),
+    # ... only for sequences with at least this many compressed rows (both the
+    # scorer's group-max work and the SparseCore prefilter; shorter rows keep
+    # the full-row top-k, which is faster there). 0 = every eligible row.
+    "TPU_DSV4_INDEXER_GROUP_MAX_MIN_KV": env_int(
+        "TPU_DSV4_INDEXER_GROUP_MAX_MIN_KV", 65536
+    ),
+    # StreamIndex chunked pipeline: annotate consecutive chunks' SparseCore
+    # top-k and TensorCore scoring with XLA scheduling groups (1, default), or
+    # leave the overlap to the scheduler (0; the annotated form failed to
+    # compile in served graphs: "annotation groups with gaps").
+    "TPU_STREAMIDX_CHUNK_SCHED_GROUPS": env_bool(
+        "TPU_STREAMIDX_CHUNK_SCHED_GROUPS", default=True
     ),
     # DSpark greedy drafting: shard the Markov head over the vocabulary and
     # exchange per-rank (max, argmax) pairs instead of reading the replicated
