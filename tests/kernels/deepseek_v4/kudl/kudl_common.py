@@ -195,6 +195,11 @@ def win(conc):
     return _region(conc, window_mixed=True, window_mixed_above=256, window_mixed_min_heads=1)
 
 
+def win128(conc):
+    """Candidate with T > 128 (T256 buckets too)."""
+    return _region(conc, window_mixed=True, window_mixed_above=128, window_mixed_min_heads=1)
+
+
 def win_g2(conc):
     return _region(conc, window_mixed=True, window_mixed_above=256, window_mixed_min_heads=1, window_mixed_groups=2)
 
@@ -273,4 +278,4 @@ def win_l2(conc):
     return f
 
 
-ARMS = {"win_l2": win_l2, "win_l1_nog": win_l1_nog, "inc": inc, "win": win, "win_g2": win_g2, "win_g4": win_g4, "sparse": sparse, "win_l1": win_l1, "win_bf16p": win_bf16p, "inc_bf16p": inc_bf16p}
+ARMS = {"win128": win128, "win_l2": win_l2, "win_l1_nog": win_l1_nog, "inc": inc, "win": win, "win_g2": win_g2, "win_g4": win_g4, "sparse": sparse, "win_l1": win_l1, "win_bf16p": win_bf16p, "inc_bf16p": inc_bf16p}
