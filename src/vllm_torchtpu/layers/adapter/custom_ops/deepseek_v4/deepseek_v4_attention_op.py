@@ -394,6 +394,7 @@ def _attention_csa(
     window_mixed_above: int = 256,
     window_mixed_min_heads: int = 32,
     window_mixed_groups: int = 1,
+    window_mixed_max_tokens: int = 2048,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -464,6 +465,7 @@ def _attention_csa(
     use_window_mixed = (
         window_mixed
         and q.shape[0] > window_mixed_above
+        and q.shape[0] <= window_mixed_max_tokens
         and q.shape[0] > union_verify_max_tokens
         and q.shape[1] >= window_mixed_min_heads
         and csa_window_union.supported_mixed(q.shape[0], main_cu_q_lens.shape[0] - 1)
