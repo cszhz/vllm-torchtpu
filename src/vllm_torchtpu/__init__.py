@@ -417,7 +417,9 @@ def _patch_vllm_compile_all_ranges() -> None:
     the host, its owner; every other rank replays the artifact the owner saves
     to vLLM's compile cache instead of tracing and compiling the range again
     (see TpuCompilerAdaptor.compile). Startup then takes about as long as the
-    slowest single range instead of the sum over ranges.
+    slowest single range instead of the sum over ranges. Peer replay needs
+    vLLM's compile cache: with it disabled (VLLM_DISABLE_COMPILE_CACHE=1) the
+    flag is ignored with a warning.
 
     Off, the default, each rank compiles every range itself, starting on a
     different one, and the ranks share only through the Tier-2 cache.
@@ -432,7 +434,16 @@ def _patch_vllm_compile_all_ranges() -> None:
     )
 
     def ranks_per_host() -> int | None:
-        """How many ranks share this host, or None if that is unknown."""
+        """How many ranks share this host, or None if that is unknown.
+
+        Under DP > 1 each DP engine has its own world group, so
+        get_world_group().world_size // nodes counts only that engine's ranks.
+        When that is 1 (TP = PP = 1), the LOCAL_WORLD_SIZE single-rank engines
+        sharing the host split the ranges between them. With more ranks per
+        engine the split stays inside the engine: other DP groups trace the
+        same code, but their collectives run on other devices, which the
+        artifact fingerprint does not see.
+        """
         try:
             from vllm.distributed.parallel_state import (
                 get_node_count,
@@ -445,7 +456,12 @@ def _patch_vllm_compile_all_ranges() -> None:
             return None
         if nodes <= 0 or world_size % nodes:
             return None
-        return world_size // nodes
+        per_host = world_size // nodes
+        if per_host == 1:
+            local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "0") or 0)
+            if local_world > 1:
+                return local_world
+        return per_host
 
     def compile_entry(self, range_entry) -> None:
         self._log_compile_start(range_entry.compile_range)
@@ -507,6 +523,20 @@ def _patch_vllm_compile_all_ranges() -> None:
         )
         local_rank = int(os.environ["LOCAL_RANK"])
         if not envs.TPU_PRECOMPILE_PEER_REPLAY:
+            compile_rotated(self, local_rank)
+            return
+        # Peers hand a compiled range over through vLLM's compile cache
+        # (TpuCompilerAdaptor saves and replays the cache artifact), so with
+        # the cache disabled there is nothing to replay: an owner/waiter split
+        # would only order the work. Treat the combination as invalid.
+        if getattr(self.vllm_backend.compiler_manager, "disable_cache", False):
+            logger.warning_once(
+                "TPU_PRECOMPILE_PEER_REPLAY=1 has no effect while vLLM's "
+                "compile cache is disabled (e.g. VLLM_DISABLE_COMPILE_CACHE=1): "
+                "ranks share compiled ranges through that cache. Every rank "
+                "compiles every range itself; enable the compile cache to "
+                "use peer replay."
+            )
             compile_rotated(self, local_rank)
             return
 

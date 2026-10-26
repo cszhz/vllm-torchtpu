@@ -37,6 +37,9 @@ def compile_all_ranges(monkeypatch):
     monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "1")
     monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", "1")
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
+    # ranks_per_host() also reads LOCAL_WORLD_SIZE; keep a launcher's value
+    # (torchrun, CI) from changing which rank owns which range.
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
     monkeypatch.setattr(
         piecewise_backend, "create_concrete_args", lambda graph, size: [size]
     )
@@ -67,7 +70,13 @@ def _host(monkeypatch, ranks_per_host):
     monkeypatch.setattr(parallel_state, "get_node_count", lambda: 2)
 
 
-def _compile(compile_all_ranges, monkeypatch, local_rank, ranks_per_host=8):
+def _compile(
+    compile_all_ranges,
+    monkeypatch,
+    local_rank,
+    ranks_per_host=8,
+    disable_cache=False,
+):
     """(range end, peer wait in seconds) per compile, in order."""
     _host(monkeypatch, ranks_per_host)
     monkeypatch.setenv("LOCAL_RANK", str(local_rank))
@@ -87,7 +96,9 @@ def _compile(compile_all_ranges, monkeypatch, local_rank, ranks_per_host=8):
             for s in SIZES
         },
         vllm_backend=SimpleNamespace(
-            compiler_manager=SimpleNamespace(compile=compile),
+            compiler_manager=SimpleNamespace(
+                compile=compile, disable_cache=disable_cache
+            ),
             inductor_config={},
             is_encoder=False,
         ),
@@ -182,3 +193,57 @@ def test_peer_replay_off_compiles_every_range_without_waiting(
     for calls in runs:
         assert all(wait == 0.0 for _, wait in calls)
         assert sorted(end for end, _ in calls) == SIZES
+
+
+def test_dp_ranks_use_local_world_size_for_host_splitting(
+    compile_all_ranges, monkeypatch
+):
+    """Under DP > 1 with TP=1, get_world_group().world_size // nodes is 1 per DP
+    engine while LOCAL_WORLD_SIZE reflects all 8 workers sharing the host."""
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    owned = [
+        _owned(_compile(compile_all_ranges, monkeypatch, r, ranks_per_host=1))
+        for r in range(8)
+    ]
+    assert owned == [[4096], [2048], [1024], [512], [256], [128], [64], [32, 16]]
+
+
+def test_multi_rank_engines_do_not_split_across_dp_groups(
+    compile_all_ranges, monkeypatch
+):
+    """With more than one rank per engine (e.g. DP2 x TP4 on one host), ranges
+    are split within the engine only, whatever LOCAL_WORLD_SIZE says."""
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    owned = [
+        _owned(_compile(compile_all_ranges, monkeypatch, r, ranks_per_host=4))
+        for r in range(4)
+    ]
+    assert sorted(end for ends in owned for end in ends) == sorted(SIZES)
+
+
+def test_peer_replay_is_ignored_with_the_compile_cache_disabled(
+    compile_all_ranges, monkeypatch
+):
+    """Peers hand ranges over through vLLM's compile cache, so with the cache
+    disabled TPU_PRECOMPILE_PEER_REPLAY=1 is an invalid combination: it warns
+    and falls back to every rank compiling every range, without waiting."""
+    import vllm_torchtpu
+
+    warnings = []
+
+    class _Logger:
+        def warning_once(self, msg, *args, **kwargs):
+            warnings.append(msg)
+
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(vllm_torchtpu, "logger", _Logger())
+    runs = [
+        _compile(compile_all_ranges, monkeypatch, r, disable_cache=True)
+        for r in range(8)
+    ]
+    for calls in runs:
+        assert all(wait == 0.0 for _, wait in calls)
+        assert sorted(end for end, _ in calls) == SIZES
+    assert warnings and "VLLM_DISABLE_COMPILE_CACHE" in warnings[0]
