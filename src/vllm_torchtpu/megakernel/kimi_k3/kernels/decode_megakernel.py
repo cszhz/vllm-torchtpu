@@ -6578,6 +6578,8 @@ VERIFY_CHUNK = 4  # kdecode P3.a: explicit DCP chunk rows (ring 3) for attention
 def _verify_chunk(rows, heads, sequence_rows):
     if sequence_rows == 4 and heads == 6 and rows >= 16 and rows % VERIFY_CHUNK == 0:
         return VERIFY_CHUNK
+    if sequence_rows == 2:  # explicit keys need one sequence per chunk
+        return 2
     return None
 
 

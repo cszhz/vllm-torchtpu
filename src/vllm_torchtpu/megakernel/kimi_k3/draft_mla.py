@@ -97,10 +97,8 @@ def _batched_fn(
 
         weights = {name: args[i][0] for i, name in enumerate(names)}
         pools = args[count : count + layers]
-        previous = jnp.concatenate(
-            args[count + layers : count + layers + R], axis=0
-        )  # [R, 128]
-        aux, logits, ids, state, decisions = args[count + layers + R :]
+        previous = args[count + layers]  # [R, 128]
+        aux, logits, ids, state, decisions = args[count + layers + 1 :]
         n = verified * k  # the verify's rows
         tokens, positions = ids[:n], ids[n : 2 * n]
         indices = ids[3 * n : 4 * n]
@@ -175,7 +173,7 @@ def _batched_fn(
                 state[control.plan_start + verified * control.FIELDS :],
             )
         )
-        return (*(vectors[j : j + 1] for j in range(R)), *pools, emitted, state)
+        return (vectors, *pools, emitted, state)
 
     return fn
 
@@ -460,7 +458,8 @@ class MlaDsparkDraft:
         (group ``g``'s are the verify's ``g``-th share), group-major as the
         kernel attends them."""
         share = requests // dp
-        per = min(requests, MAX_ROWS // rows_per) // dp
+        # At most 16 requests per fused draft (VMEM).
+        per = min(requests, MAX_ROWS // rows_per, 16) // dp
         return [
             tuple(g * share + first + i for g in range(dp) for i in range(per))
             for first in range(0, share, per)
@@ -492,9 +491,9 @@ class MlaDsparkDraft:
             self.dspark, fused, self._commit, control, names, layers, index, verified, k
         )
         in_specs = (
-            (P(AXIS),) * (count + layers) + (P(),) * R + (P(), P(AXIS), P(), P(), P())
-        )
-        out_specs = (P(),) * R + (P(AXIS),) * layers + (P(), P())
+            (P(AXIS),) * (count + layers) + (P(),) + (P(), P(AXIS), P(), P(), P())
+        )  # The R draft vectors travel stacked: op schemas take at most 64 arguments.
+        out_specs = (P(),) + (P(AXIS),) * layers + (P(), P())
         part = "" if whole else f"_part{index[0]}of{verified}"
         self._ops[key] = register_op(
             f"pallas::k3_dspark_mla_draft_r{R}x{k}{part}",
@@ -505,7 +504,7 @@ class MlaDsparkDraft:
             donate_argnums=tuple(range(count, count + layers)),
             export_key=repr(
                 (
-                    "dspark_mla_batched",
+                    "dspark_mla_batched_stacked",
                     control.key(),
                     index,
                     verified,
@@ -550,23 +549,22 @@ class MlaDsparkDraft:
         new: list[Any] = [None] * verified
         emitted, order = [], []
         for index in self.parts(verified, self.attention_dp, rows_per):
-            R = len(index)
             op = self._build_batched(control, index, verified, rows_per)
             out = op(
                 *self._operands(),
                 *self.pools,
-                *(states[j].vector for j in index),
+                torch.cat([states[j].vector for j in index]),
                 aux,
                 logits,
                 ids,
                 control_state,
                 decisions,
             )
-            vectors, pools = out[:R], out[R : R + layers]
-            part_emitted, control_state = out[R + layers :]
+            stacked, pools = out[0], out[1 : 1 + layers]
+            part_emitted, control_state = out[1 + layers :]
             self._adopt(pools)
-            for j, vector in zip(index, vectors, strict=True):
-                new[j] = _settled(MlaDraftState(vector))
+            for i, j in enumerate(index):
+                new[j] = _settled(MlaDraftState(stacked[i : i + 1]))
             emitted.append(part_emitted)
             order.extend(index)
         tokens = emitted[0] if len(emitted) == 1 else torch.cat(emitted)
@@ -634,7 +632,7 @@ class MlaDsparkDraft:
                         (
                             *operands,
                             *self.pools,
-                            *((vector,) * len(index)),
+                            torch.empty((len(index), 128), dtype=torch.int32),
                             *tail(rows, 4 * rows + requests * control.pages, requests),
                         ),
                         {},

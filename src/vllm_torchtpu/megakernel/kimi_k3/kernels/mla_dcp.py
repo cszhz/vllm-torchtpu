@@ -76,7 +76,8 @@ def chunk_layout(batch: int, heads: int = HEADS_PER_RANK, *, chunk_rows: int | N
     wide = batch <= 16 or batch in (32, 48, 64) and not (batch == 64 and heads == 6)
     rows = chunk_rows if chunk_rows is not None else 8 if wide else 4
     ring = 4 if batch == 32 and heads == HEADS_PER_RANK else 3 if wide or chunk_rows is not None else 2
-    if rows not in (4, 8) or batch % rows or rows > MAX_ROWS or ring not in (2, 3, 4):
+    # Explicit 2-row chunks hold one 2-row (one-draft) sequence.
+    if rows not in ((2, 4, 8) if chunk_rows is not None else (4, 8)) or batch % rows or rows > MAX_ROWS or ring not in (2, 3, 4):
         raise ValueError(f"DCP chunks: {rows} rows must divide the batch {batch} (<= {MAX_ROWS}), ring 2, 3 or 4")
     return rows, ring
 
@@ -942,7 +943,14 @@ class DcpAttention:
                 vectors = jax.lax.dot_general(owner, spread.astype(jnp.bfloat16), (((1, ), (0, )), ((), ())),
                                               preferred_element_type=jnp.float32)  # [group, 128]
                 row = slots * (start + rows - 1) + part
-                ws.send[:, pl.ds(row, 1), pl.ds(0, 128)] = vectors[:, None, :].astype(jnp.bfloat16)
+                if rows == 2:
+                    # Whole-block update: single-row stores fail on 4-row packets.
+                    block = ws.send[:, :, pl.ds(0, 128)]
+                    packet_row = jax.lax.broadcasted_iota(jnp.int32, block.shape, 1)
+                    ws.send[:, :, pl.ds(0, 128)] = jnp.where(
+                        packet_row == row, vectors[:, None, :].astype(jnp.bfloat16), block)
+                else:
+                    ws.send[:, pl.ds(row, 1), pl.ds(0, 128)] = vectors[:, None, :].astype(jnp.bfloat16)
 
     # Profiling: named scopes inside attend (``trace`` their prefix; None: none).
     trace: str | None = None
@@ -1240,8 +1248,10 @@ def _merge_received_keys(received, own_rows, keys, key_valid, group, *, unroll=1
         # row's head slots) hold the others' lse, packet row r at lane r.
         rows = received.shape[1]
         pad = rows - lse_rows
-        vector = (received[:, pad, pl.ds(0, 128)].astype(jnp.float32)
-                  + received[:, pad + 1, pl.ds(0, 128)].astype(jnp.float32))  # [G, 128]
+        # Load the lane block whole, then pick the two rows (a
+        # single-row load fails for the 4-row packets of 2-row sequences).
+        block = received[:, :, pl.ds(0, 128)].astype(jnp.float32)
+        vector = block[:, pad, :] + block[:, pad + 1, :]  # [G, 128]
         row = jax.lax.broadcasted_iota(jnp.int32, (group, rows, 128), 1)
         lane = jax.lax.broadcasted_iota(jnp.int32, (group, rows, 128), 2)
         lse = jnp.sum(jnp.where(lane == row, vector[:, None, :], 0.0), axis=2, keepdims=True)  # [G, rows, 1]

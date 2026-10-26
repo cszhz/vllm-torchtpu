@@ -24,7 +24,7 @@ VOCAB = 163840  # tokens; vocabulary-sharded 5120 per TP rank
 DRAFT_TOKENS = 7  # DSpark: the verify is the anchor and 7 drafts
 SPEC_BATCHES = (1, 2, 4, 8, 16)  # the batched speculation's compiled request counts
 # Attention DP2's compiled request counts: half of each are one group's.
-DP_SPEC_BATCHES = (2, 4, 8, 16, 32)
+DP_SPEC_BATCHES = (2, 4, 8, 16, 32, 64)  # 64: one draft (128 rows)
 MAX_STEP_TOKENS = 8192  # the prefill's largest window
 # Sampling parameters the ops implement (beyond greedy): temperature, top-p,
 # top-k and a per-request seed, on both roles.
@@ -50,11 +50,15 @@ def supports_spec_tokens(batch: int, drafts: int, attention_dp: int = 1) -> bool
     """Widths supported by the single and batched verifier/drafter (under
     attention DP2 three drafts up to 32 requests: a 128-row verify, drafted
     in parts)."""
-    largest = max(DP_SPEC_BATCHES if attention_dp > 1 else SPEC_BATCHES)
-    return drafts == 0 or (
-        1 <= batch <= largest
-        and (drafts == 3 or (batch <= 8 and drafts == DRAFT_TOKENS))
-    )
+    if drafts == 0:
+        return True
+    if drafts == DRAFT_TOKENS:
+        return 1 <= batch <= 8
+    if drafts not in (1, 3):
+        return False
+    # A batched verify holds 128 rows under attention DP2, 64 otherwise.
+    rows = 128 if attention_dp > 1 else 4 * max(SPEC_BATCHES)
+    return 1 <= batch <= rows // (drafts + 1)
 
 
 def spec_tokens_per_batch(config: MegakernelEngineConfig) -> tuple[int, ...] | None:
@@ -198,6 +202,7 @@ def check(config: MegakernelEngineConfig) -> None:
         )
     if config.role == "decode" and config.num_speculative_tokens not in (
         0,
+        1,
         3,
         DRAFT_TOKENS,
     ):

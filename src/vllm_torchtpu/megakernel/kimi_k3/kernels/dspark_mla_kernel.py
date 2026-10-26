@@ -703,9 +703,9 @@ def fused_draft_local(c: MlaDraftConfig, *, requests: int, pages: int, block: in
     ``[R, 128]`` the last vectors; ``positions0`` ``[R]`` each verify's first position;
     ``forced_*`` ``[R]`` (``>= 0``: given); ``tables`` ``[R, pages]``."""
     block = c.block if block is None else block
-    if rows not in (4, ROWS):
-        raise ValueError("the fused MLA draft takes 4 or 8 rows per request")
-    if not 2 <= block <= rows:
+    if rows not in (2, 4, ROWS):
+        raise ValueError("the fused MLA draft takes 2, 4 or 8 rows per request")
+    if not 1 <= block <= rows:
         raise ValueError(f"block must be 2..{rows}")
     R = requests
     T = R * rows

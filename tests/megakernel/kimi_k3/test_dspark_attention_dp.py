@@ -166,17 +166,16 @@ def test_mla_drafting_in_parts_matches_one_call(verified, dp):
             verified,
             rows_per,
         )
-        R = len(index)
         out = fn(
             *pools,
-            *(previous[j : j + 1] for j in index),
+            previous[np.asarray(index)],
             aux,
             logits,
             ids,
             state,
             decisions,
         )
-        return out[:R], out[R : R + 2], out[R + 2], out[R + 3]
+        return list(out[0]), out[1:3], out[3], out[4]
 
     whole = draft(tuple(range(verified)), state, pools)
     vectors, emitted, order = [None] * verified, [], []
@@ -195,7 +194,7 @@ def test_mla_drafting_in_parts_matches_one_call(verified, dp):
         emitted.append(part_emitted)
         order.extend(index)
     assert sorted(order) == list(range(verified))
-    np.testing.assert_array_equal(np.concatenate(vectors), np.concatenate(whole[0]))
+    np.testing.assert_array_equal(np.stack(vectors), np.stack(whole[0]))
     for part_pool, whole_pool in zip(part_pools, whole[1], strict=True):
         np.testing.assert_array_equal(part_pool, whole_pool)
     np.testing.assert_array_equal(np.concatenate(emitted)[np.argsort(order)], whole[2])
@@ -226,3 +225,14 @@ def test_attention_dp2_speculates_up_to_32_requests():
         spec_tokens_per_batch(_config(1, schedule))
     with pytest.raises(NotImplementedError):
         spec_tokens_per_batch(_config(2, ((1, 16, 7),)))
+
+
+def test_attention_dp2_one_draft_up_to_64_requests():
+    schedule = ((1, 20, 3), (21, 64, 1), (65, 128, 0))
+    dense = spec_tokens_per_batch(_config(2, schedule, max_num_seqs=128))
+    assert set(dense[1:21]) == {3} and set(dense[21:65]) == {1}
+    assert set(dense[65:]) == {0}
+    with pytest.raises(NotImplementedError):
+        spec_tokens_per_batch(_config(2, ((1, 64, 3),), max_num_seqs=64))
+    with pytest.raises(NotImplementedError):
+        spec_tokens_per_batch(_config(1, ((1, 64, 1),), max_num_seqs=64))
