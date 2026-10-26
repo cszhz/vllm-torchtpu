@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -144,6 +145,7 @@ class TestVllmGatedDeltaNetAttention:
             pool_block_tokens=manager_block_size,
             qk_pair_layout=False,
             recurrent_state_dtype=jnp.float32,
+            conv_state_dtype=jnp.bfloat16,
         )
         assert plan.stride == manager_block_size // page_size
         assert plan.recurrent.view_dtype == jnp.float32
@@ -1709,3 +1711,39 @@ def test_state_dtype_rejects_unsupported_formats(dtype):
         match="Unsupported state dtype for TPU GDN.*expected float32 or bfloat16",
     ):
         gdn_attention_op._to_jax_state_dtype(dtype)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "_build_v3_pool_state_plan",
+        "run_jax_gdn_attention_pooled_local",
+        "run_jax_gdn_attention_pooled",
+        "run_jax_gdn_attention_pooled_pcp_prefill",
+        "run_jax_gdn_attention_pooled_pcp_prefill_projection",
+    ],
+)
+def test_pooled_entry_requires_explicit_conv_storage(entry):
+    from vllm_torchtpu.layers.core import gdn_attention
+
+    fn = getattr(gdn_attention, entry)
+    sig = inspect.signature(fn)
+    # An omitted storage contract must fail before reading any array or mesh.
+    args = {
+        name: None
+        for name, parameter in sig.parameters.items()
+        if parameter.default is inspect.Parameter.empty and name != "conv_state_dtype"
+    }
+    with pytest.raises(TypeError, match="conv_state_dtype"):
+        fn(**args)
+
+
+def test_pooled_bridge_requires_explicit_conv_storage():
+    fn = gdn_attention_op.gdn_attention_pooled_core_tpu
+    args = {
+        name: None
+        for name, parameter in inspect.signature(fn).parameters.items()
+        if parameter.default is inspect.Parameter.empty and name != "conv_state_dtype"
+    }
+    with pytest.raises(TypeError, match="conv_state_dtype"):
+        fn(**args)

@@ -797,7 +797,7 @@ def _build_v3_pool_state_plan(
     pool_block_tokens: int,
     qk_pair_layout: bool,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
-    conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    conv_state_dtype: jnp.dtype,
 ):
     """Describe this rank's GDN state regions in the unified pool."""
     block_size, payload, lanes = pool_adapters._pool_geometry(pool)
@@ -872,7 +872,7 @@ def run_jax_gdn_attention_pooled_local(
     kernel_size: int,
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
-    conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    conv_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
@@ -955,7 +955,7 @@ def run_jax_gdn_attention_pooled(
     pool_block_tokens: int,
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
-    conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    conv_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
@@ -1109,8 +1109,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
+    *,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
-    conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    conv_state_dtype: jnp.dtype,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Fused QKVZ projection, PCP exchange, and GDN over the unified pool."""
     pcp_axis = "pcp"
@@ -1316,8 +1317,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
+    *,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
-    conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    conv_state_dtype: jnp.dtype,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN PCP prefill over the unified block pool.
 
