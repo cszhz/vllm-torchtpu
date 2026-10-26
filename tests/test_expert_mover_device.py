@@ -114,7 +114,7 @@ def test_a_view_into_a_larger_storage_is_refused_until_rehomed():
         w13_weight=torch.nn.Parameter(view, requires_grad=False),
     )
     assert not mv.spans_storage(view)
-    with pytest.raises(ValueError, match="span"):
+    with pytest.raises(ValueError, match="storage"):
         future, _ = transport.d2h_slot(view, 1)
         future.wait()
     assert mv.ensure_movable(module) == 1

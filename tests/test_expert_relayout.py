@@ -201,7 +201,7 @@ def _controller(rank, tap, mover, installs, **kw):
         window_steps=4,
         sub_windows=2,
         warmup_steps=0,
-        **kw,
+        **{"synchronous_solve": True, **kw},
     )
 
 
@@ -446,3 +446,40 @@ def test_a_solved_generation_moves_exactly_the_bytes_its_table_names():
     for row in nxt.held:
         live = [e for e in row if e != rl.FREE]
         assert len(live) == len(set(live)) == active
+
+
+def test_the_threaded_solve_publishes_when_done_and_peers_wait_for_it():
+    """With the solve on a thread a rank publishes 0 until its plan exists;
+    the others wait (min hash 0) instead of dropping the generation."""
+    import time
+
+    tap = _Tap()
+    installs = []
+    cs = [
+        _controller(0, tap, _Mover(), installs, synchronous_solve=False),
+        _controller(1, tap, _Mover(), installs, synchronous_solve=True),
+    ]
+    _run(cs, tap, 5)  # step 4 triggers both; rank 1 solved inline
+    assert cs[1].state == rl.PENDING
+    assert cs[0].state in (rl.SOLVING, rl.PENDING)
+    for _ in range(200):  # let rank 0's thread finish
+        if cs[0]._solve_thread is None or not cs[0]._solve_thread.is_alive():
+            break
+        time.sleep(0.01)
+    # Rank 1 published its hash while rank 0 published 0: nobody dropped.
+    assert all(c.stats["aborted"] == 0 for c in cs)
+    _run(cs, tap, 4, start=5)
+    assert all(c.generation == 1 for c in cs) and len(installs) == 2
+
+
+def test_a_rank_that_never_publishes_times_the_generation_out():
+    tap = _Tap()
+    installs = []
+    c = _controller(0, tap, _Mover(), installs, timeout_windows=1)
+    _run([c], tap, 5)
+    assert c.state == rl.PENDING
+    # Fake a peer that keeps publishing 0: max is ours, -min is 0.
+    for step in range(5, 12):
+        c.on_step(step, (c.pending.hash62 if c.pending else 0, 0, 0))
+        tap.advance()
+    assert c.state == rl.IDLE and c.stats["aborted"] == 1 and installs == []

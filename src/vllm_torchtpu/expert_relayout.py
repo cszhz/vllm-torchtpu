@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -395,7 +396,7 @@ class NoopMover:
         self._staged = generation
 
 
-IDLE, PENDING, STAGING = "idle", "pending", "staging"
+IDLE, SOLVING, PENDING, STAGING = "idle", "solving", "pending", "staging"
 
 
 class Controller:
@@ -416,6 +417,7 @@ class Controller:
         min_gain: float = 0.03,
         warmup_steps: int | None = None,
         timeout_windows: int = 2,
+        synchronous_solve: bool = False,
     ) -> None:
         """groups: name -> dict(experts, active, staging, replica_cap).
         snapshot(): (group, layer) -> cumulative counts [P]. install(module,
@@ -446,6 +448,14 @@ class Controller:
             "moves": 0,
         }
         self._stage_started: float | None = None
+        # The solve (policy, matching, tile model over every layer) takes
+        # hundreds of milliseconds on the host; it runs on a thread so the
+        # step hook never carries it. Tests may run it inline.
+        self.synchronous_solve = bool(synchronous_solve)
+        self._solve_thread: threading.Thread | None = None
+        self._solve_result: Plan | None = None
+        self._solve_error: BaseException | None = None
+        self._solve_step = 0
 
     # -- the three int64 fields of the per-step all-reduce
 
@@ -459,6 +469,8 @@ class Controller:
         hash_max, neg_hash_max, neg_staged_max = (int(v) for v in reduced)
         min_hash = -neg_hash_max
         min_staged = -neg_staged_max
+        if self.state == SOLVING:
+            self._collect_solve(step)
         if self.state == STAGING:
             assert self.pending is not None
             self.mover.pump()
@@ -475,6 +487,11 @@ class Controller:
                 self._stage_started = time.monotonic()
                 self.mover.start(self.pending, self.modules)
                 logger.info("expert relayout | confirmed %s", self.pending.summary())
+            elif min_hash == 0:
+                # A rank is still solving (it publishes 0 until it has a
+                # plan); wait, within the generation's timeout.
+                if step - self.pending.trigger_step > self.timeout_steps:
+                    self._abort(step, "not every rank published a plan in time")
             else:
                 self._abort(
                     step,
@@ -497,27 +514,85 @@ class Controller:
         if len(self.history) < 2:
             return  # the first snapshot is the baseline
         self.stats["triggers"] += 1
-        plan = Plan(generation=self.generation + 1, trigger_step=step)
+        history = list(self.history)
+        layouts = {k: v.copy() for k, v in self.layouts.items()}
+        generation = self.generation + 1
+        self._solve_result = None
+        self._solve_error = None
+        self._solve_step = step
+        self.state = SOLVING
+        if self.synchronous_solve:
+            try:
+                self._solve_result = self._solve(history, layouts, generation, step)
+            except Exception as e:  # noqa: BLE001 - reported by _collect_solve
+                self._solve_error = e
+            self._collect_solve(step)
+            return
+
+        def run():
+            try:
+                self._solve_result = self._solve(history, layouts, generation, step)
+            except BaseException as e:  # noqa: BLE001 - reported on the main thread
+                self._solve_error = e
+
+        self._solve_thread = threading.Thread(
+            target=run, name="expert-relayout-solve", daemon=True
+        )
+        self._solve_thread.start()
+
+    def _collect_solve(self, step: int) -> None:
+        """Adopt a finished solve: a plan goes PENDING, nothing goes IDLE."""
+        if self._solve_thread is not None and self._solve_thread.is_alive():
+            return
+        self._solve_thread = None
+        if self._solve_error is not None:
+            logger.error(
+                "expert relayout | step %d: the solve failed: %r",
+                step,
+                self._solve_error,
+            )
+            self._solve_error = None
+            self.stats["skipped"] += 1
+            self.state = IDLE
+            return
+        plan = self._solve_result
+        self._solve_result = None
+        if plan is None or not plan.layouts:
+            self.stats["skipped"] += 1
+            logger.info(
+                "expert relayout | step %d: no layer clears the %.0f%% gain gate",
+                step,
+                100 * self.min_gain,
+            )
+            self.state = IDLE
+            return
+        plan.trigger_step = step  # the timeout counts from when the plan exists
+        self.pending = plan
+        self.state = PENDING
+        logger.info("expert relayout | step %d: solved %s", step, plan.summary())
+
+    def _solve(self, history, layouts, generation: int, step: int) -> Plan:
+        """The whole solve over every group, from copies of the window and the
+        layouts: safe to run off the main thread."""
+        plan = Plan(generation=generation, trigger_step=step)
         for name, spec in self.groups.items():
-            layer_ids = sorted(lid for (g, lid) in self.layouts if g == name)
+            layer_ids = sorted(lid for (g, lid) in layouts if g == name)
             windows = {}
             for lid in layer_ids:
                 key = (name, lid)
                 deltas = []
-                for a, b in zip(self.history[:-1], self.history[1:], strict=False):
+                for a, b in zip(history[:-1], history[1:], strict=False):
                     if key in a and key in b:
                         deltas.append(
-                            window_rows(
-                                b[key] - a[key], self.layouts[key], spec["experts"]
-                            )
+                            window_rows(b[key] - a[key], layouts[key], spec["experts"])
                         )
                 if deltas and sum(d.sum() for d in deltas) > 0:
                     windows[lid] = np.stack(deltas)
             if not windows:
                 continue
-            layouts, moves, predicted = solve_group(
+            new_layouts, moves, predicted = solve_group(
                 name,
-                {lid: self.layouts[(name, lid)] for lid in layer_ids},
+                {lid: layouts[(name, lid)] for lid in layer_ids},
                 windows,
                 experts=spec["experts"],
                 active=spec["active"],
@@ -525,21 +600,11 @@ class Controller:
                 replica_cap=spec["replica_cap"],
                 min_gain=self.min_gain,
             )
-            for lid, lay in layouts.items():
+            for lid, lay in new_layouts.items():
                 plan.layouts[(name, lid)] = lay
                 plan.predicted[(name, lid)] = predicted[lid]
             plan.moves.extend(moves)
-        if not plan.layouts:
-            self.stats["skipped"] += 1
-            logger.info(
-                "expert relayout | step %d: no layer clears the %.0f%% gain gate",
-                step,
-                100 * self.min_gain,
-            )
-            return
-        self.pending = plan
-        self.state = PENDING
-        logger.info("expert relayout | step %d: solved %s", step, plan.summary())
+        return plan
 
     def _install(self, step: int) -> None:
         assert self.pending is not None

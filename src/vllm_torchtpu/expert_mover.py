@@ -257,14 +257,19 @@ def spans_storage(t: torch.Tensor) -> bool:
     )
 
 
-def ensure_movable(module) -> int:
+def ensure_movable(module, sync=None) -> int:
     """Give every expert tensor of a placed layer a storage of its own.
 
     The fused path's weight Parameters come out of the quantizer as views
     into larger buffers, which the raw transfer refuses ("Tensor does not
-    span its entire base storage buffer"). Called at load, before compile,
-    under the dynamic knob; copies through a uint8 view (the fp4-pair dtype
-    has no copy of its own on every path). Returns how many were re-homed.
+    span its entire base storage buffer" / "must start at storage offset
+    0"). Called at load, before compile, under the dynamic knob; copies
+    through a uint8 view (the fp4-pair dtype has no copy of its own on every
+    path). `sync(tensors)` runs after each copy so torch_tpu's deferred
+    execution handles one tensor at a time: left to batch, it fused every
+    layer's clones into one program that asked for 17 GB at load. Returns
+    how many were re-homed; a copy that fails is logged and left alone (the
+    mover then fails that generation cleanly instead of the load).
     """
     count = 0
     for name in PARTS:
@@ -274,11 +279,17 @@ def ensure_movable(module) -> int:
         t = param.data if isinstance(param, torch.nn.Parameter) else param
         if spans_storage(t):
             continue
-        fresh = (
-            t.view(torch.uint8).clone().view(t.dtype)
-            if t.dtype != torch.uint8
-            else t.clone()
-        )
+        try:
+            fresh = (
+                t.view(torch.uint8).clone().view(t.dtype)
+                if t.dtype != torch.uint8
+                else t.clone()
+            )
+            if sync is not None:
+                sync([fresh])
+        except Exception:  # noqa: BLE001 - the load goes on with the view
+            logger.exception("expert mover: could not re-home %s", name)
+            continue
         if isinstance(param, torch.nn.Parameter):
             param.data = fresh
         else:

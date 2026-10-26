@@ -807,7 +807,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 # storage; the quantizer hands back views.
                 from vllm_torchtpu import expert_mover
 
-                rehomed = expert_mover.ensure_movable(layer)
+                rehomed = expert_mover.ensure_movable(layer, sync=synchronize_tensors)
                 if rehomed:
                     logger.info_once(
                         "expert relayout: %d expert tensors re-homed into their own "
