@@ -203,6 +203,7 @@ if TYPE_CHECKING:
     TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS: int = 32
     TPU_DSV4_CSA_WINDOW_MIXED_GROUPS: int = 1
     TPU_DSV4_CSA_WINDOW_MIXED_MAX_TOKENS: int = 2048
+    TPU_DSV4_CSA_WINDOW_MIXED_WQ: int = 8
     TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
     TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
     TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4: int = 0
@@ -1382,6 +1383,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ... and buckets of T <= this many tokens (a power of 2; at TP8 the
     # union-dense bq-64 kernel stays ahead at T2048 below ~100k-token prefixes).
     "TPU_DSV4_CSA_WINDOW_MIXED_MAX_TOKENS": env_int("TPU_DSV4_CSA_WINDOW_MIXED_MAX_TOKENS", 2048),
+    # Tokens per window on the mixed route: 8, or 16 (M = 16 x 16 heads = 256
+    # rows per pushed tile at TP8; half the gathered rows of 8-token windows).
+    "TPU_DSV4_CSA_WINDOW_MIXED_WQ": env_int("TPU_DSV4_CSA_WINDOW_MIXED_WQ", 8),
     "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS": env_int(
         "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS", 512
     ),

@@ -123,7 +123,9 @@ def _kernel(
     mask_sb: bool = False,
     tails: tuple = TAIL_ROWS,
     tslot_ref=None,
+    wq: int = WQ,
 ):
+    WQ = wq  # noqa: N806 -- tokens per window (8, or 16 on the mixed route); closures read this
     _, num_q_heads, head_dim = q_hbm_ref.shape
     rows = WQ * num_q_heads
     q_dtype = q_hbm_ref.dtype
@@ -916,7 +918,7 @@ def _kernel_v2(
 @functools.partial(
     jax.jit, static_argnames=("sm_scale", "nw_cap", "version", "pv_bf16", "zero_tail_rows",
                      "vmem_limit_bytes", "probe", "lm_raw", "sub", "hbm_pin", "tails",
-                     "pin_lm")
+                     "pin_lm", "wq")
 )
 def window_attention(
     q: jax.Array,  # [T, actual_heads, D] bf16
@@ -943,12 +945,15 @@ def window_attention(
     tails: tuple = TAIL_ROWS,
     pin_lm: bool = True,
     tslot: jax.Array | None = None,
+    wq: int = WQ,
 ) -> jax.Array:
     """`tslot` (i32[T], grouped mixed steps): window at q0's first gathered tile
     is tslot[q0] (default q0).
 
     Rows of live windows get CSA attention over their union folded with the
     SWA partials and the sink; all other rows return q."""
+    WQ = wq  # noqa: N806
+    assert wq == 8 or (tslot is not None and version == 7), "wq != 8: mixed route (v7, tile slots) only"
     _, actual_heads, actual_dim = q.shape
     q = prepare_q_inputs(q)
     T, H, D = q.shape
@@ -1006,7 +1011,8 @@ def window_attention(
         kernel = functools.partial(_kernel, sm_scale=sm_scale, L=L, version=version,
                                    pv_bf16=pv_bf16, zero_tail_rows=zero_tail_rows,
                                    probe=probe, lm_raw=lm_raw, sub=sub,
-                                   mask_sb=mask.ndim == 3, tails=tuple(tails))
+                                   mask_sb=mask.ndim == 3, tails=tuple(tails),
+                                   **({} if wq == 8 else {"wq": wq}))
         scratch = [
             pltpu.VMEM((ns, TILE, LANES), jnp.int32),
             pltpu.VMEM((ns, TILE // 2, LANES), jnp.bfloat16),

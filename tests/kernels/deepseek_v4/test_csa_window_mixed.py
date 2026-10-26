@@ -139,3 +139,55 @@ def test_positive_control_truncated_union_fails():
         WU.union_gather = orig
     _, ok, _ = C.gate(cand[rows], want, ref_err)
     assert not ok
+
+
+WQ16_CELLS = (["m8-r22k", "m8-r22k-p1m", "m16-s470kL1"] if _REAL else []) + ["c16m512-pf32k"]
+
+
+@pytest.mark.parametrize("name", WQ16_CELLS)
+def test_union_gather_wq16_bit_exact(name):
+    """16-token windows (two nibble count halves): every group's windows bit-exact vs the numpy plan."""
+    inp = K.build_inputs(name)
+    d, _ = C.device_inputs(inp, cache="random")
+    T, ms, s_cap = inp["T"], inp["ms"], inp["pps"] * C.PAGE
+    plan = WU.plan_host(inp["tk"], inp["cu"], inp["dist"], inp["kv_lens"], inp["table"],
+                        C.PAGE, s_cap=s_cap, wq=16)
+    rn, rr, _ = WU.reference_union_gather(d["nope"], d["rope"], plan, T)
+    rn = np.asarray(rn)
+    rr_ = _rope_entries(rr, T * WU.TILE)
+    groups = 2
+    w_base = 0
+    for g in range(groups):
+        meta, tslot, nwc = WU.group_meta(d["cu"], d["dist"], d["kv_lens"], num_tokens=T, s_cap=s_cap,
+                                         groups=groups, g=g, wq=16)
+        ng, rg, mk, uc = WU.union_gather(meta, d["topk"], d["pages"], d["nope"], d["rope"], num_tokens=T,
+                                         max_num_seqs=ms, n_tiles=nwc * 16, nw_cap_override=nwc, wq=16)
+        ng, mk, uc, meta = map(np.asarray, (ng, mk, uc, meta))
+        re_ = _rope_entries(rg, nwc * 16 * WU.TILE)
+        n_g = int(meta[0])
+        for i in range(n_g):
+            q0, qn, _, _ = plan["windows"][w_base + i]
+            U = plan["U"][w_base + i]
+            assert int(uc[i * 16]) == U, (g, i, int(uc[i * 16]), U)
+            r0, s0 = q0 * WU.TILE, i * 16 * WU.TILE
+            np.testing.assert_array_equal(ng[s0:s0 + U], rn[r0:r0 + U])
+            np.testing.assert_array_equal(re_[s0:s0 + U], rr_[r0:r0 + U])
+            np.testing.assert_array_equal(mk[q0:q0 + qn], plan["mask"][q0:q0 + qn])
+        w_base += n_g
+    assert w_base == len(plan["windows"])
+
+
+@pytest.mark.parametrize("arm", ["wq16", "wq16_g4"])
+@pytest.mark.parametrize("name", ["m8-r22k", "m16-r100kL1"] if _REAL else ["c16m512-pf127k"])
+def test_wq16_matches_oracle(name, arm):
+    cell = K.cell_obj(name)
+    inp = K.build_inputs(name)
+    for poison in (False, True):
+        d, deq = C.device_inputs(inp, cache="quant", poison=poison)
+        want, rows = C.oracle(inp, d, deq)
+        inc = np.asarray(jax.jit(K.inc(cell.conc))(d, d["q"]).astype(jnp.float32))
+        cand = np.asarray(jax.jit(K.ARMS[arm](cell.conc))(d, d["q"]).astype(jnp.float32))
+        ref_err, _, _ = C.gate(inc[rows], want)
+        err, ok, tol = C.gate(cand[rows], want, ref_err)
+        assert np.isfinite(cand[rows]).all()
+        assert ok, (name, arm, poison, err, tol, ref_err)

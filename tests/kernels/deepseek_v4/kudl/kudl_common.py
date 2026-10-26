@@ -47,6 +47,7 @@ SPECS = {
     "m8t512-r100k": dict(_C8, T=512, L=505, dump="dp1_kv25600", layer=2, prefix=None),
     "m8t1024-r22k": dict(_C8, T=1024, L=1017, dump="dp1_kv6144", layer=2, prefix=None),
     "m8t1024-r100k": dict(_C8, T=1024, L=1017, dump="dp1_kv25600", layer=2, prefix=None),
+    "m8-r22k-p1m": dict(_C8, dump="dp1_kv6144", layer=2, prefix=None, pps=1025),
     "m8-r22k": dict(_C8, dump="dp1_kv6144", layer=2, prefix=None),
     "m8-r51k": dict(_C8, dump="dp0_kv13312", layer=2, prefix=None),
     "m8-r100k": dict(_C8, dump="dp1_kv25600", layer=2, prefix=None),
@@ -112,7 +113,7 @@ def build_inputs(name, seed=None):
     kv_lens = [st // RATIO for st in seq_tokens]
     kv_lens[-1] = max(kv_lens[-1], int(rows.max()) + 1)  # rc7 indexer: a token may pick its own open block
     need = [-(-max(k + 1, 1) // PAGE) + 1 for k in kv_lens]
-    pps = max(need) + 1
+    pps = max(max(need) + 1, s.get("pps", 0))  # "pps": served table width (max-model-len 1M -> 1024 pages)
     total_pages = sum(need) + 8
     perm = rng.permutation(total_pages - 1).astype(np.int32) + 1
     table = np.zeros((ms, pps), np.int32)
@@ -216,6 +217,19 @@ def tp8cfg_g4(conc):
     return tp8cfg(conc, groups=4)
 
 
+def wq16(conc, groups=1, max_tokens=2048):
+    return _region(conc, window_mixed=True, window_mixed_above=128, window_mixed_min_heads=1,
+                   window_mixed_groups=groups, window_mixed_max_tokens=max_tokens, window_mixed_wq=16)
+
+
+def wq16_g2(conc):
+    return wq16(conc, groups=2)
+
+
+def wq16_g4(conc):
+    return wq16(conc, groups=4)
+
+
 def win_g2(conc):
     return _region(conc, window_mixed=True, window_mixed_above=256, window_mixed_min_heads=1, window_mixed_groups=2)
 
@@ -261,4 +275,4 @@ def win_bf16p(conc):
     return _patched(win(conc), cwu, L2_CONFIG=dict(cwu.L2_CONFIG, pv_bf16=True))
 
 
-ARMS = {"c16cfg": c16cfg, "tp8cfg": tp8cfg, "tp8cfg_g4": tp8cfg_g4, "win128": win128, "win_l2": win_l2, "win_l1_nog": win_l1_nog, "inc": inc, "win": win, "win_g2": win_g2, "win_g4": win_g4, "sparse": sparse, "win_l1": win_l1, "win_bf16p": win_bf16p}
+ARMS = {"wq16": wq16, "wq16_g2": wq16_g2, "wq16_g4": wq16_g4, "c16cfg": c16cfg, "tp8cfg": tp8cfg, "tp8cfg_g4": tp8cfg_g4, "win128": win128, "win_l2": win_l2, "win_l1_nog": win_l1_nog, "inc": inc, "win": win, "win_g2": win_g2, "win_g4": win_g4, "sparse": sparse, "win_l1": win_l1, "win_bf16p": win_bf16p}

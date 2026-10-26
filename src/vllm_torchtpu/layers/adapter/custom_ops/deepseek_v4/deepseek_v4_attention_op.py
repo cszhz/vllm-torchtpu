@@ -339,13 +339,14 @@ def _attention_hca_rope(
 
 
 def _window_mixed_prepare(topk, kv_lens, page_indices, cu_q_lens, distribution,
-                          cache_kv, cache_rope, groups):
+                          cache_kv, cache_rope, groups, wq=8):
     """L1 of the mixed-bucket union-of-window route: one SparseCore call, or one
-    per group (`groups` > 1) so group g + 1's runs under group g's attention."""
-    if groups > 1:
+    per group (`groups` > 1) so group g + 1's runs under group g's attention.
+    `wq` != 8 (16-token windows) always takes the grouped layout."""
+    if groups > 1 or wq != 8:
         return csa_window_union.prepare_grouped(
             topk, kv_lens, page_indices, cu_q_lens, distribution, cache_kv,
-            cache_rope, groups=groups,
+            cache_rope, groups=groups, wq=wq,
         )  # fmt: skip
     return csa_window_union.prepare(
         topk, kv_lens, page_indices, cu_q_lens, distribution, cache_kv, cache_rope,
@@ -395,6 +396,7 @@ def _attention_csa(
     window_mixed_min_heads: int = 32,
     window_mixed_groups: int = 1,
     window_mixed_max_tokens: int = 2048,
+    window_mixed_wq: int = 8,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -517,6 +519,7 @@ def _attention_csa(
         union_rows = _window_mixed_prepare(
             extra, main_kv_lens, main_page_indices, main_cu_q_lens,
             main_distribution, main_cache_kv, main_cache_rope, window_mixed_groups,
+            window_mixed_wq,
         )  # fmt: skip
     if use_union_verify and union_verify_early and not two_caches_same_buffer:
         union_rows = csa_window_union.prepare(
@@ -532,11 +535,12 @@ def _attention_csa(
             union_rows = _window_mixed_prepare(
                 extra, main_kv_lens, main_page_indices, main_cu_q_lens,
                 main_distribution, main_cache_kv, main_cache_rope, window_mixed_groups,
+                window_mixed_wq,
             )  # fmt: skip
-        if window_mixed_groups > 1:
+        if window_mixed_groups > 1 or window_mixed_wq != 8:
             output = csa_window_union.attend_grouped(
                 q, union_rows, attention_sinks, swa_output, swa_l, swa_m,
-                sm_scale=sm_scale, groups=window_mixed_groups,
+                sm_scale=sm_scale, groups=window_mixed_groups, wq=window_mixed_wq,
             )  # fmt: skip
         else:
             output = csa_window_union.attend(

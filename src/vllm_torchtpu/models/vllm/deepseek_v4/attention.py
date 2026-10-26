@@ -420,6 +420,7 @@ class VllmDeepseekV4MLAAttention(
                 "window_mixed_min_heads": envs.TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS,
                 "window_mixed_groups": envs.TPU_DSV4_CSA_WINDOW_MIXED_GROUPS,
                 "window_mixed_max_tokens": envs.TPU_DSV4_CSA_WINDOW_MIXED_MAX_TOKENS,
+                "window_mixed_wq": envs.TPU_DSV4_CSA_WINDOW_MIXED_WQ,
                 "union_dense_min_tokens": envs.TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS,
                 "union_dense_rows_per_token": (
                     envs.TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN
