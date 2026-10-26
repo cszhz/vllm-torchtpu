@@ -41,6 +41,12 @@ SPECS = {
     "m16-s470kL1": dict(_C16, dump="dp1_kv25600", layer=1, prefix=470000),
     # stress (not served-like): uniformly random top-k (the twin's dummy-weight regime; U8 ~ 8k)
     "m16-rand127k": dict(_C16, dump=None, layer=0, prefix=127000),
+    # smaller mixed buckets (no union-dense below 512 tokens: the incumbent is the sparse path)
+    "m16t256-r100k": dict(_C16, T=256, L=235, dump="dp1_kv25600", layer=2, prefix=None),
+    "m8t256-r100k": dict(_C8, T=256, L=249, dump="dp1_kv25600", layer=2, prefix=None),
+    "m8t512-r100k": dict(_C8, T=512, L=505, dump="dp1_kv25600", layer=2, prefix=None),
+    "m8t1024-r22k": dict(_C8, T=1024, L=1017, dump="dp1_kv6144", layer=2, prefix=None),
+    "m8t1024-r100k": dict(_C8, T=1024, L=1017, dump="dp1_kv25600", layer=2, prefix=None),
     "m8-r22k": dict(_C8, dump="dp1_kv6144", layer=2, prefix=None),
     "m8-r51k": dict(_C8, dump="dp0_kv13312", layer=2, prefix=None),
     "m8-r100k": dict(_C8, dump="dp1_kv25600", layer=2, prefix=None),
