@@ -93,6 +93,15 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_dflash_bypass_v2_runner_check", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_config_triton_tpu", _ACTIVE),
     # Weight loading and embeddings.
+    # At import as well: the API-server processes pull the object-storage
+    # config in ModelConfig.__post_init__, before the platform resolves, and
+    # the general plugin that imports this package loads just before that.
+    # Its own module, standard library only: the import stage must not load
+    # torch (which autoloads torch_tpu) or vllm.
+    Patch(
+        "vllm_torchtpu.object_storage_pull_lock:patch_object_storage_pull_lock",
+        ("import", *_ACTIVE),
+    ),
     Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_loader_ep_weight_filter",
         _ACTIVE,

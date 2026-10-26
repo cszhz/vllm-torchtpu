@@ -207,7 +207,10 @@ def test_manifest_preserves_lifecycle_dependencies():
             "model_load",
         )
     }
-    assert stages["import"] == ["_patch_jax_pallas_fori_lowering"]
+    assert stages["import"] == [
+        "_patch_jax_pallas_fori_lowering",
+        "patch_object_storage_pull_lock",
+    ]
     assert stages["engine_core"] == [
         "_patch_vllm_hybrid_pcp_block_sizes",
         "_patch_vllm_dcp_fine_prefix_hits",
