@@ -83,6 +83,11 @@ def main():
                     fns[M] = chained(f, M).lower(d).compile()
                     comp_s[M] = round(time.perf_counter() - t0, 1)
                 ncc = {M: count_custom_calls(fns[M].as_text())[0] for M in (1, max(MS))}
+                try:
+                    ma = fns[1].memory_analysis()
+                    mem = dict(temp_mb=round(ma.temp_size_in_bytes / 2**20, 1), out_mb=round(ma.output_size_in_bytes / 2**20, 1))
+                except Exception as e:  # noqa
+                    mem = dict(err=repr(e)[:100])
                 kn = count_custom_calls(fns[1].as_text())[1]
                 times = {}
                 for M in MS:
@@ -92,7 +97,8 @@ def main():
                 rec = dict(cell=name, arm=arm, T=cell.T, H=cell.heads, R=cell.R, per_call_us=round(slope * 1e6, 2),
                            intercept_us=round(icpt * 1e6, 1), t_us={m: round(times[m] * 1e6, 1) for m in MS},
                            hoist_ratio=round(times[max(MS)] / times[1], 3), compile_s=comp_s, custom_calls=ncc, kernels=kn,
-                           union=drv["union"], union_tiles=drv["union_tiles"], gathered_rows_inc=drv["gathered_rows_incumbent"])
+                           union=drv["union"], union_tiles=drv["union_tiles"], gathered_rows_inc=drv["gathered_rows_incumbent"], mem=mem,
+                           pf_U16=drv.get("pf_U16_mean"))
             except Exception as e:  # noqa
                 rec = dict(cell=name, arm=arm, error=repr(e)[:1500])
                 print("BENCH " + json.dumps(rec), flush=True)

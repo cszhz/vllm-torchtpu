@@ -47,6 +47,12 @@ SPECS = {
     "m8t512-r100k": dict(_C8, T=512, L=505, dump="dp1_kv25600", layer=2, prefix=None),
     "m8t1024-r22k": dict(_C8, T=1024, L=1017, dump="dp1_kv6144", layer=2, prefix=None),
     "m8t1024-r100k": dict(_C8, T=1024, L=1017, dump="dp1_kv25600", layer=2, prefix=None),
+    # U sweep (critical review): each real row keeps (1 - mix) of its picks and replaces the rest with random visible rows
+    "m16-mix25": dict(_C16, dump="dp1_kv25600", layer=1, prefix=None, mix=0.25),
+    "m16-mix50": dict(_C16, dump="dp1_kv25600", layer=1, prefix=None, mix=0.5),
+    "m16-mix75": dict(_C16, dump="dp1_kv25600", layer=1, prefix=None, mix=0.75),
+    "m8-mix50": dict(_C8, dump="dp1_kv25600", layer=1, prefix=None, mix=0.5),
+    "m8-rand127k": dict(_C8, dump=None, layer=0, prefix=127000),
     "m8-r22k-p1m": dict(_C8, dump="dp1_kv6144", layer=2, prefix=None, pps=1025),
     "m8-r22k": dict(_C8, dump="dp1_kv6144", layer=2, prefix=None),
     "m8-r51k": dict(_C8, dump="dp0_kv13312", layer=2, prefix=None),
@@ -90,6 +96,17 @@ def build_inputs(name, seed=None):
         dprefix = dump_kv * RATIO - 2048  # the dump chunk's first token position
         prefix = s["prefix"] if s["prefix"] is not None else dprefix
         rows = _load(s["dump"], s["layer"])[:Lc].astype(np.int64)
+    if s.get("mix"):
+        out = np.full_like(rows, -1)
+        for t in range(Lc):
+            r = rows[t][rows[t] >= 0]
+            nv = int(r.max()) + 1
+            keep = rng.choice(r, size=int(round(r.size * (1 - s["mix"]))), replace=False)
+            pool = np.setdiff1d(np.arange(nv), keep)
+            add = rng.choice(pool, size=min(r.size - keep.size, pool.size), replace=False)
+            r2 = np.concatenate([keep, add])
+            out[t, : r2.size] = r2
+        rows = out
     if prefix != dprefix:
         # One map for every token (a row picked by several tokens stays one row): rows in the recent band (the
         # chunk's own range + RECENT rows before it) shift by the prefix delta (causality and recency kept exactly);
@@ -156,7 +173,7 @@ def drivers(inp):
     if pf:
         a = R * VQ
         rows = tk[a:a + pf[0]]
-        for bq in (8, 32, 64):
+        for bq in (8, 16, 32, 64):
             us = [int(np.unique(b[b >= 0]).size) for b in (rows[i:i + bq] for i in range(0, rows.shape[0], bq))]
             d[f"pf_U{bq}_mean"] = round(float(np.mean(us)), 1)
             d[f"pf_tiles{bq}"] = int(sum(-(-u // TOPK) for u in us))
