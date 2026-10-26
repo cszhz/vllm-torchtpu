@@ -56,6 +56,7 @@ def main():
     import jax
     print(jax.devices()[0], jax.__version__, flush=True)
     out_dir = os.path.dirname(a.out) or "."
+    os.makedirs(out_dir, exist_ok=True)
     fo = open(a.out, "a")
     for name in a.cells.split(","):
         cell = C.CELLS[name]
