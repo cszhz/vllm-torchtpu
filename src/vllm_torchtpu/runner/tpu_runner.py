@@ -5025,8 +5025,19 @@ class TPUModelRunner(GPUModelRunner):
             and state.draft_chunks
             and isinstance(self.drafter, DFlashProposer)
         ):
-            for chunk in state.draft_chunks:
-                self.drafter._update_draft_kv_cache_from_target(chunk)
+            if bool(envs.TPU_RAIDEN_DSV4_ADMISSION):
+                self.drafter.run_dp_dummy_draft(self._dp_step_num_chunks)
+            else:
+                for chunk in state.draft_chunks:
+                    self.drafter._update_draft_kv_cache_from_target(chunk)
+                if self.drafter._dp_lockstep_sharded():
+                    extra_chunks = max(
+                        0, self._dp_step_num_chunks - len(state.draft_chunks)
+                    )
+                    for _ in range(extra_chunks):
+                        self.drafter._dp_dummy_kv_update()
+                    for _ in range(self._dp_step_num_chunks):
+                        self.drafter._dp_dummy_forward()
 
         next_tokens_tpu = None
         copy_state = None

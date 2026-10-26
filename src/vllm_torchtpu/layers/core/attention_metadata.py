@@ -660,6 +660,10 @@ def stage_block_table_uploads(
                 prev_nbpr[:] = cur_nbpr
             offset += row_bucket * cols_g
     else:
+        if not can_cache_bt:
+            runner._block_tables_dirty = True
+            runner._block_tables_append_only = False
+            runner._cached_bt_stage_layout = None
         flat.zero_()
         if ctx.position_ids_override is None:
             offset = 0

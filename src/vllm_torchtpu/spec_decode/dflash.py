@@ -14,6 +14,7 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -571,6 +572,52 @@ class DFlashProposer:
             positions = positions[0]
         positions = positions[:num_tokens]
         draft_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
+
+        if bool(tpu_envs.TPU_RAIDEN_DSV4_ADMISSION) and chunk.draft_lengths is None:
+            for layer_idx, layer in enumerate(self.draft_model.model.layers):
+                swa_layer = getattr(layer.attn, "swa_cache_layer", None)
+                sw_cache = getattr(swa_layer, "kv_cache", None)
+                bt = draft_md_tuple[layer_idx].block_tables
+                if (
+                    isinstance(sw_cache, torch.Tensor)
+                    and sw_cache.numel() > 0
+                    and bt is not None
+                ):
+                    num_pages = sw_cache.shape[0]
+                    blk_ids = bt.reshape(-1).to(torch.int64)
+                    if num_pages > 1:
+                        blk_ids = torch.where(
+                            blk_ids > 0,
+                            ((blk_ids - 1) % (num_pages - 1)) + 1,
+                            0,
+                        )
+                    sw_cache.index_fill_(0, blk_ids, 0)
+            qsl = getattr(chunk, "query_start_loc_np", None)
+            if (
+                qsl is not None
+                and len(qsl) > chunk.num_reqs
+                and int(qsl[chunk.num_reqs]) > chunk.num_reqs
+            ):
+                keep_mask = torch.zeros(
+                    (num_tokens, 1), dtype=aux_hidden.dtype, device=aux_hidden.device
+                )
+                last_idx = [
+                    int(qsl[i + 1]) - 1
+                    for i in range(chunk.num_reqs)
+                    if int(qsl[i + 1]) > int(qsl[i])
+                    and int(qsl[i + 1]) - 1 < num_tokens
+                ]
+                if last_idx:
+                    idx_t = torch.tensor(
+                        last_idx, dtype=torch.int64, device=aux_hidden.device
+                    )
+                    keep_mask.index_fill_(0, idx_t, 1.0)
+                if isinstance(target_hidden, (list, tuple)):
+                    target_hidden = type(target_hidden)(
+                        h * keep_mask for h in target_hidden
+                    )
+                else:
+                    target_hidden = target_hidden * keep_mask
 
         with set_vllm_model_wrapper_context(
             mesh=self.runner.mesh, vllm_config=self.vllm_config

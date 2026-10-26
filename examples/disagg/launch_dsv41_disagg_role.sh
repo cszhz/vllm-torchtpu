@@ -58,8 +58,15 @@ case "${ROLE}" in
     SB_PORT_BASE="${SB_PORT_BASE:-29500}"; DP_MASTER_PORT="${DP_MASTER_PORT:-29530}"
     KV_ROLE=kv_producer
     CED="${CED_PREFILL:-1}"
-    MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
-    COMPILE_SIZES="${COMPILE_SIZES:-[${MAX_NUM_BATCHED_TOKENS}]}"
+    ENABLE_DSPARK="${ENABLE_DSPARK:-0}"
+    DSPARK_TOKENS="${DSPARK_TOKENS:-5}"
+    ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-0}"
+    MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+    if [[ "${MAX_NUM_BATCHED_TOKENS}" == "2048" ]]; then
+      COMPILE_SIZES="${COMPILE_SIZES:-[512, 2048]}"
+    else
+      COMPILE_SIZES="${COMPILE_SIZES:-[512, 2048, ${MAX_NUM_BATCHED_TOKENS}]}"
+    fi
     ;;
   decode)
     PORT="${PORT:-9400}"; CTRL_PORT="${CTRL_PORT:-28000}"
@@ -67,8 +74,15 @@ case "${ROLE}" in
     SB_PORT_BASE="${SB_PORT_BASE:-29510}"; DP_MASTER_PORT="${DP_MASTER_PORT:-29520}"
     KV_ROLE=kv_consumer
     CED=0
+    ENABLE_DSPARK="${ENABLE_DSPARK:-1}"
+    DSPARK_TOKENS="${DSPARK_TOKENS:-5}"
+    ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-${ENABLE_DSPARK}}"
     MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-384}"
-    COMPILE_SIZES="${COMPILE_SIZES:-[16, 64, ${MAX_NUM_BATCHED_TOKENS}]}"
+    if [[ "${ENABLE_DSPARK}" == "1" ]]; then
+      COMPILE_SIZES="${COMPILE_SIZES:-[16, 40, 48, 64, 96, 192, ${MAX_NUM_BATCHED_TOKENS}]}"
+    else
+      COMPILE_SIZES="${COMPILE_SIZES:-[16, 64, ${MAX_NUM_BATCHED_TOKENS}]}"
+    fi
     ;;
   *)
     echo "ERROR: ROLE must be prefill or decode, got ${ROLE}" >&2
@@ -198,6 +212,12 @@ export TPU_KV_TRANSFER_PORT="${KV_TRANSFER_PORT}"
 
 kv_cfg='{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"'"${KV_ROLE}"'","kv_port":'"${KV_PORT}"'}'
 
+if [[ "${ASYNC_SCHEDULING}" == "1" ]]; then
+  async_flag="--async-scheduling"
+else
+  async_flag="--no-async-scheduling"
+fi
+
 args=(
   serve "${MODEL_PATH}"
   --host 0.0.0.0 --port "${PORT}"
@@ -216,13 +236,19 @@ args=(
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --no-disable-hybrid-kv-cache-manager
   --no-enable-prefix-caching
-  --no-async-scheduling
+  "${async_flag}"
   --kv-transfer-config "${kv_cfg}"
   --compilation-config "{\"compile_sizes\": ${COMPILE_SIZES}}"
 )
 
+if [[ "${ENABLE_DSPARK}" == "1" ]]; then
+  export VLLM_SPEC_DECODE_TOKENS="${DSPARK_TOKENS}"
+  args+=(--speculative-config "{\"method\": \"dspark\", \"num_speculative_tokens\": ${DSPARK_TOKENS}}")
+fi
+
 echo "[PD-LAUNCH] role=${ROLE} run_id=${RUN_ID} advertise=${ADVERTISE_HOST}" \
   "port=${PORT} ctrl=${CTRL_PORT} kvt=${KV_TRANSFER_PORT} ced=${CED}" \
+  "dspark=${ENABLE_DSPARK} async=${ASYNC_SCHEDULING}" \
   "mnbt=${MAX_NUM_BATCHED_TOKENS} compile_sizes=${COMPILE_SIZES}"
 printf '[PD-LAUNCH] cmd: vllm'; printf ' %q' "${args[@]}"; echo
 if [[ "${DRY_RUN:-0}" == "1" ]]; then

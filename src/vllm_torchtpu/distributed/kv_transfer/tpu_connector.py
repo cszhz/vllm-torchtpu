@@ -2923,6 +2923,23 @@ class TPURaidenConnectorWorker:
             )
         kv_cache_groups = tuple(runner.kv_cache_config.kv_cache_groups or ())
         raw_tensors = tuple(runner.kv_cache_raw_tensors or ())
+        draft_layer_names = set(
+            getattr(getattr(runner, "drafter", None), "_draft_attn_layer_names", ())
+            or ()
+        )
+        if draft_layer_names:
+            named_kv_caches = {
+                k: v for k, v in named_kv_caches.items() if k not in draft_layer_names
+            }
+            kv_cache_groups = tuple(
+                dataclasses.replace(
+                    g,
+                    layer_names=[
+                        ln for ln in g.layer_names if ln not in draft_layer_names
+                    ],
+                )
+                for g in kv_cache_groups
+            )
 
         manifest = rpm.build_dsv4_pool_manifest(
             named_kv_caches=named_kv_caches,
