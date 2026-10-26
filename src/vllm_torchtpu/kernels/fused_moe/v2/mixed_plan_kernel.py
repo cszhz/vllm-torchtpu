@@ -142,6 +142,8 @@ def _mixed_plan_kernel(
         out_total = jnp.broadcast_to(jnp.sum(aligned_g, axis=0, keepdims=True), (8, ep))
         contrib_off = _mm(out_total, upper_d)[0:1] + _mm(lower_g, aligned_g)
         rb = ROWBLK.bit_length() - 1
+        if fault == "s1_contrib":  # positive control: contribution offsets skip the source term
+            contrib_off = _mm(out_total, upper_d)[0:1] + 0 * contrib_off
         rs_s[...] = jnp.right_shift(run_start_g, rb)
         al_s[...] = jnp.right_shift(aligned_g, rb)
         co_s[...] = jnp.right_shift(contrib_off, rb)
@@ -237,6 +239,8 @@ def _mixed_plan_kernel(
                     oh, lstrict, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
                 ).astype(jnp.int32) + jnp.where(valid_bin, off, 0)
                 rk = jnp.sum(onehot[:, b * block : (b + 1) * block] * pre, axis=0, keepdims=True)
+                if fault == "s2_rank":  # positive control: block offsets dropped from the rank
+                    rk = jnp.sum(onehot[:, b * block : (b + 1) * block] * (pre - jnp.where(valid_bin, off, 0)), axis=0, keepdims=True)
                 lanes = slice(b * block, (b + 1) * block)
                 pos_s[:, lanes] = base_pos[:, lanes] + rk
                 mir_s[:, lanes] = base_mir[:, lanes] + rk

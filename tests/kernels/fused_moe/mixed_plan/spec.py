@@ -455,6 +455,8 @@ CANDIDATE_FAULTS = {
     "sign": dict(fault="sign"),                # signed-byte recombine sign error
     "stale_block": dict(fault="stale_block"),  # last live S3 block left zero
     "dup_nohi": dict(dc_hi=False),             # duplicate ids: high plane dropped
+    "s1_contrib": dict(fault="s1_contrib"),    # S1: contribution offsets without the per-source term
+    "s2_rank": dict(fault="s2_rank"),          # S2: rank without the earlier-block offsets
 }
 
 

@@ -741,6 +741,9 @@ def fused_ep_moe_v2(
     mixed_plan = (
         _mixed_plan_kernel_enabled()
         and sharded_plan
+        # The mesh-order relabel of token_gather (stage="compute" with
+        # gather_positions) has no test on this path; keep the XLA plan there.
+        and gather_positions is None
         and t_local > SMALL_BATCH_LOCAL_TOKENS
         and form.quantized_activations
         and mixed_plan_supported(
