@@ -45,21 +45,134 @@ from vllm_torchtpu.megakernel.exec_spec import ExecSpec  # noqa: E402
 from vllm_torchtpu.megakernel.models import qwen35, qwen35_pool  # noqa: E402
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES  # noqa: E402
 from vllm_torchtpu.megakernel.pool.config import CacheExec, with_cache  # noqa: E402
-from vllm_torchtpu.megakernel_runtime.driver import (  # noqa: E402
-    MegakernelDriver,
+from vllm_torchtpu.megakernel.runtime import (  # noqa: E402
+    DEFAULT_BUCKETS,
+    DEFAULT_VERIFY_BUCKETS,
+    BatchShape,
+    JaxStepMetaOps,
     MKABCalibrator,
+    check_post_mesh_eligibility,
+    check_qsl_uniform,
     explicit_profile_settings,
-    parse_megakernel_config,
+    ir_required_buckets,
+    pack_step_meta,
     parse_mk_buckets,
     parse_mk_verify_buckets,
-    prepare_step_inputs_eager,
-    prepare_step_metadata,
+    parse_runtime_config,
     resolve_driver_profile,
+    resolve_step_positions,
     select_bucket,
+)
+from vllm_torchtpu.megakernel_runtime.driver import (  # noqa: E402
+    MegakernelDriver,
+    TorchStepMetaOps,
+    prepare_step_inputs_eager,
 )
 from vllm_torchtpu.megakernel_runtime.weight_collector import (  # noqa: E402
     WEIGHT_FLIPPED_ATTR,
 )
+
+
+@pytest.fixture(autouse=True)
+def _ensure_driver_logger(monkeypatch: pytest.MonkeyPatch) -> None:
+    import logging
+
+    try:
+        driver_mod.logger._resolve()
+    except ModuleNotFoundError:
+        monkeypatch.setattr(
+            driver_mod.logger, "_logger", logging.getLogger(driver_mod.logger._name)
+        )
+
+
+def _extract_group_mamba_tensors(
+    m_md: Any, fallback_1d: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, bool]:
+    s_raw = getattr(m_md, "mamba_state_indices", None)
+    c_raw = getattr(m_md, "mamba_ckpt_indices", None)
+    roff = getattr(m_md, "mamba_slot_read_offsets", None)
+    if s_raw is not None:
+        s_1d = s_raw[:, 0] if s_raw.ndim == 2 else s_raw.reshape(-1)
+    elif c_raw is not None:
+        s_1d = c_raw[:, 0] if c_raw.ndim == 2 else c_raw.reshape(-1)
+    else:
+        s_1d = fallback_1d
+    use_2d = bool(c_raw is not None and c_raw.ndim == 2)
+    c_2d = (
+        c_raw
+        if use_2d
+        else (c_raw.reshape(-1) if c_raw is not None else s_1d).unsqueeze(1)
+    )
+    r_1d = roff.reshape(-1) if roff is not None else fallback_1d
+    return s_1d, c_2d, r_1d, roff is not None, use_2d
+
+
+def prepare_step_metadata(
+    attn_md: Any,
+    mamba_mds: Any,
+    positions: torch.Tensor | None,
+    num_reqs: int,
+    bucket_t: int,
+    max_pages_per_seq: int,
+    tokens_per_seq: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Test helper building padded `(pos_b, pt_b, ckpt_b, roff_b)` tensors."""
+    if len(mamba_mds) != 3:
+        raise ValueError(f"expected 3 GDN group metadata objects, got {len(mamba_mds)}")
+    T, B = int(tokens_per_seq), int(bucket_t)
+    if B % T != 0:
+        raise ValueError(f"bucket_t={B} must be divisible by tokens_per_seq={T}")
+    bt, dev, active_rows = (
+        attn_md.block_tables,
+        attn_md.block_tables.device,
+        num_reqs * T,
+    )
+    fb_1d = getattr(attn_md, "seq_lens", None)
+    if fb_1d is None:
+        fb_1d = torch.zeros((max(1, num_reqs),), dtype=torch.int32, device=dev)
+    pos_in = resolve_step_positions(
+        positions,
+        fb_1d,
+        num_reqs=num_reqs,
+        tokens_per_seq=T,
+        like=bt,
+        ops=TorchStepMetaOps(),
+    )
+    s0, c0, r0, hr0, uc0 = _extract_group_mamba_tensors(mamba_mds[0], fb_1d)
+    s1, c1, r1, hr1, uc1 = _extract_group_mamba_tensors(mamba_mds[1], fb_1d)
+    s2, c2, r2, hr2, uc2 = _extract_group_mamba_tensors(mamba_mds[2], fb_1d)
+    if bt.ndim == 1:
+        n_rows_bt, m_pg = int(s0.shape[0]), int(max_pages_per_seq)
+        if n_rows_bt > 0 and bt.numel() % n_rows_bt == 0:
+            bt = bt.reshape(n_rows_bt, bt.numel() // n_rows_bt)
+        elif m_pg > 0 and bt.numel() % m_pg == 0:
+            bt = bt.reshape(-1, m_pg)
+        else:
+            raise ValueError(
+                f"1-D block_tables of length {bt.numel()} is not divisible by "
+                f"s0.shape[0]={n_rows_bt} or max_pages_per_seq={max_pages_per_seq}"
+            )
+    dummy_ids = torch.ones((active_rows,), dtype=torch.int32, device=dev)
+    _, pos_b, pt_b, ckpt_b, roff_b = prepare_step_inputs_eager(
+        dummy_ids,
+        pos_in,
+        bt[:num_reqs],
+        s0[:num_reqs],
+        c0[:num_reqs],
+        r0,
+        s1[:num_reqs],
+        c1[:num_reqs],
+        r1,
+        s2[:num_reqs],
+        c2[:num_reqs],
+        r2,
+        B,
+        T,
+        int(max_pages_per_seq),
+        bool(hr0 or hr1 or hr2),
+        bool(uc0 or uc1 or uc2),
+    )
+    return pos_b, pt_b, ckpt_b, roff_b
 
 
 def _cpu_mesh(r: int = 1) -> Mesh:
@@ -355,14 +468,14 @@ def test_bucket_parsing_and_selection() -> None:
         parse_mk_verify_buckets("6")
 
     # Single VLLM_TPU_MEGAKERNEL string forms + additional_config["megakernel"]
-    assert not parse_megakernel_config(raw="")["enabled"]
-    assert not parse_megakernel_config(raw="0")["enabled"]
-    cfg_on = parse_megakernel_config(raw="1")
+    assert not parse_runtime_config("")["enabled"]
+    assert not parse_runtime_config("0")["enabled"]
+    cfg_on = parse_runtime_config("1")
     assert cfg_on["enabled"] and cfg_on["mode"] == ""
-    cfg_tp = parse_megakernel_config(raw="tp")
+    cfg_tp = parse_runtime_config("tp")
     assert cfg_tp["enabled"] and cfg_tp["mode"] == "tp"
-    cfg_kv = parse_megakernel_config(
-        raw="mode=tp,buckets=8:16:32,verify_buckets=4:8,ab=1,stats_period_s=12.5,compile_hlo_check=1,fused_pool_io=0,fused_pool_io_max_b=16,fused_pool_io_min_b_hi=64,pool_gather=0"
+    cfg_kv = parse_runtime_config(
+        "mode=tp,buckets=8:16:32,verify_buckets=4:8,ab=1,stats_period_s=12.5,compile_hlo_check=1,fused_pool_io=0,fused_pool_io_max_b=16,fused_pool_io_min_b_hi=64,pool_gather=0"
     )
     assert cfg_kv["enabled"]
     assert cfg_kv["mode"] == "tp"
@@ -376,11 +489,9 @@ def test_bucket_parsing_and_selection() -> None:
     assert cfg_kv["fused_pool_io_min_b_hi"] == 64
     assert cfg_kv["pool_gather"] is False
 
-    cfg_json = parse_megakernel_config(
-        raw=(
-            '{"mode": "ep", "buckets": [4, 8], "verify_buckets": [4], '
-            '"ab": false, "fused_pool_io": "auto", "pool_gather": true}'
-        )
+    cfg_json = parse_runtime_config(
+        '{"mode": "ep", "buckets": [4, 8], "verify_buckets": [4], '
+        '"ab": false, "fused_pool_io": "auto", "pool_gather": true}'
     )
     assert cfg_json["enabled"]
     assert cfg_json["mode"] == "ep"
@@ -391,27 +502,27 @@ def test_bucket_parsing_and_selection() -> None:
 
     # No named profile: the driver runs the model's default profile; the
     # profile-owned keys keep their split pool I/O defaults.
-    cfg_def = parse_megakernel_config(raw="1")
+    cfg_def = parse_runtime_config("1")
     assert cfg_def["profile"] is None
     assert cfg_def["fused_pool_io"] is False
     assert cfg_def["pool_gather"] is False
     # An empty value means "off", not "auto"
-    cfg_empty = parse_megakernel_config(raw="fused_pool_io=,pool_gather=")
+    cfg_empty = parse_runtime_config("fused_pool_io=,pool_gather=")
     assert cfg_empty["fused_pool_io"] is False
     assert cfg_empty["pool_gather"] is False
     # Named profile selection via VLLM_TPU_MEGAKERNEL; explicit keys win
-    cfg_c30 = parse_megakernel_config(raw="profile=qwen35-candidate30")
+    cfg_c30 = parse_runtime_config("profile=qwen35-candidate30")
     assert cfg_c30["enabled"] and cfg_c30["profile"] == "qwen35-candidate30"
     assert cfg_c30["pool_gather"] == "auto"
     assert cfg_c30["fused_pool_io"] is False
     assert cfg_c30["buckets"] == cfg_def["buckets"]
-    cfg_c30_ov = parse_megakernel_config(
-        raw="profile=qwen35-candidate30,pool_gather=0,fused_pool_io=auto"
+    cfg_c30_ov = parse_runtime_config(
+        "profile=qwen35-candidate30,pool_gather=0,fused_pool_io=auto"
     )
     assert cfg_c30_ov["pool_gather"] is False
     assert cfg_c30_ov["fused_pool_io"] == "auto"
     with pytest.raises(ValueError, match="unknown megakernel profile"):
-        parse_megakernel_config(raw="profile=does-not-exist")
+        parse_runtime_config("profile=does-not-exist")
 
     fake_runner = SimpleNamespace(
         vllm_config=SimpleNamespace(
@@ -420,7 +531,7 @@ def test_bucket_parsing_and_selection() -> None:
             }
         )
     )
-    cfg_runner = parse_megakernel_config(runner=fake_runner, raw="")
+    cfg_runner = driver_mod._collect_runtime_config(fake_runner, raw="")
     assert cfg_runner["enabled"]
     assert cfg_runner["mode"] == "tp"
     assert cfg_runner["buckets"] == (16, 32)
@@ -433,7 +544,7 @@ def test_bucket_parsing_and_selection() -> None:
             additional_config={"megakernel": {"profile": "qwen35-candidate30"}}
         )
     )
-    cfg_runner_c30 = parse_megakernel_config(runner=fake_runner_c30, raw="")
+    cfg_runner_c30 = driver_mod._collect_runtime_config(fake_runner_c30, raw="")
     assert cfg_runner_c30["enabled"]
     assert cfg_runner_c30["profile"] == "qwen35-candidate30"
     assert cfg_runner_c30["pool_gather"] == "auto"
@@ -469,11 +580,11 @@ def test_driver_passes_only_explicit_profile_settings() -> None:
         "pool_gather",
     )
     for raw in ("1", "profile=qwen35-candidate30"):
-        got = explicit_profile_settings(parse_megakernel_config(raw=raw))
+        got = explicit_profile_settings(parse_runtime_config(raw))
         assert got == dict.fromkeys(owned), raw
     got = explicit_profile_settings(
-        parse_megakernel_config(
-            raw="profile=qwen35-candidate30,buckets=8:16,pool_gather=0,"
+        parse_runtime_config(
+            "profile=qwen35-candidate30,buckets=8:16,pool_gather=0,"
             "fused_pool_io_max_b=16"
         )
     )
@@ -528,11 +639,10 @@ def test_resolve_driver_profile_and_fused_ir_rule() -> None:
         resolve_driver_profile("nope", model_name="qwen3_5")
 
     # Eager warmup must still IR-check every fused bucket (donation is required).
-    drv = object.__new__(MegakernelDriver)
-    drv._bucket_fused_io = {(1, 8): False, (1, 16): True, (4, 8): False}
+    fused_io = {(1, 8): False, (1, 16): True, (4, 8): False}
     warmed = [(1, 8), (1, 16), (4, 8)]
-    assert drv._ir_required_buckets(warmed, is_eager=False) == warmed
-    assert drv._ir_required_buckets(warmed, is_eager=True) == [(1, 16)]
+    assert ir_required_buckets(warmed, fused_io, is_eager=False) == warmed
+    assert ir_required_buckets(warmed, fused_io, is_eager=True) == [(1, 16)]
 
 
 def test_ab_calibrator() -> None:
@@ -653,6 +763,53 @@ def test_prepare_step_metadata_decode_and_verify() -> None:
     assert ckpt_small[0].tolist() == [[1, 2, 3, 4], [5, 6, 7, 8]]
     assert roff_small[0].tolist() == [2, 1]
 
+    # 4. `positions=None` (T=1 and T=4), short `positions` (`numel() < num_reqs * T`),
+    #    and 2-D M-RoPE `positions` (`(3, 8)`) synthesize / slice positions properly.
+    pos_none_t1, _, _, _ = prepare_step_metadata(
+        attn_md=attn_md,
+        mamba_mds=mamba_mds,
+        positions=None,
+        num_reqs=2,
+        bucket_t=4,
+        max_pages_per_seq=2,
+        tokens_per_seq=1,
+    )
+    assert pos_none_t1.tolist() == [9, 24, 0, 0]
+
+    pos_none_t4, _, _, _ = prepare_step_metadata(
+        attn_md=attn_md,
+        mamba_mds=mamba_mds,
+        positions=None,
+        num_reqs=2,
+        bucket_t=8,
+        max_pages_per_seq=2,
+        tokens_per_seq=4,
+    )
+    assert pos_none_t4.tolist() == [7, 8, 9, 10, 22, 23, 24, 25]
+
+    pos_short_t4, _, _, _ = prepare_step_metadata(
+        attn_md=attn_md,
+        mamba_mds=mamba_mds,
+        positions=torch.tensor([1, 2], dtype=torch.int32),
+        num_reqs=2,
+        bucket_t=8,
+        max_pages_per_seq=2,
+        tokens_per_seq=4,
+    )
+    assert pos_short_t4.tolist() == [7, 8, 9, 10, 22, 23, 24, 25]
+
+    mrope_row = torch.tensor([9, 10, 11, 12, 24, 25, 26, 27], dtype=torch.int32)
+    pos_mrope_t4, _, _, _ = prepare_step_metadata(
+        attn_md=attn_md,
+        mamba_mds=mamba_mds,
+        positions=torch.stack([mrope_row, mrope_row, mrope_row], dim=0),
+        num_reqs=2,
+        bucket_t=8,
+        max_pages_per_seq=2,
+        tokens_per_seq=4,
+    )
+    assert pos_mrope_t4.tolist() == [9, 10, 11, 12, 24, 25, 26, 27]
+
 
 def test_block_tables_1d_reshape_most_model_len() -> None:
     """Verify 1-D `block_tables` reshapes by `s0.shape[0]` (`target_num_reqs`) first."""
@@ -695,6 +852,400 @@ def test_block_tables_1d_reshape_most_model_len() -> None:
     assert pt_b.shape == (4, max_pages_per_seq)
     assert pt_b[0].tolist() == [100, 101, 0, 0]
     assert pt_b[1].tolist() == [102, 103, 0, 0]
+
+
+def _ref_prepare_step_inputs_eager(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    block_tables: torch.Tensor,
+    s0: torch.Tensor,
+    c0: torch.Tensor,
+    r0: torch.Tensor,
+    s1: torch.Tensor,
+    c1: torch.Tensor,
+    r1: torch.Tensor,
+    s2: torch.Tensor,
+    c2: torch.Tensor,
+    r2: torch.Tensor,
+    bucket_t: int,
+    tokens_per_seq: int,
+    max_pages_per_seq: int,
+    has_roff: bool,
+    use_ckpt_2d: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Reference pre-B6 `prepare_step_inputs_eager` implementation for parity tests."""
+
+    def _sp_1d(x: torch.Tensor, target_len: int) -> torch.Tensor:
+        x1 = x.reshape(-1)
+        n = int(x1.shape[0])
+        if n >= target_len:
+            return x1[:target_len]
+        return torch.nn.functional.pad(x1, (0, target_len - n), value=0)
+
+    def _sp_2d(x: torch.Tensor, target_rows: int, target_cols: int) -> torch.Tensor:
+        r, c = int(x.shape[0]), int(x.shape[1])
+        out = x[: min(r, target_rows), : min(c, target_cols)]
+        pad_r = max(0, target_rows - r)
+        pad_c = max(0, target_cols - c)
+        if pad_r > 0 or pad_c > 0:
+            out = torch.nn.functional.pad(out, (0, pad_c, 0, pad_r), value=0)
+        return out
+
+    T = tokens_per_seq
+    B = bucket_t
+    nseq_bkt = B // T
+
+    bt = block_tables
+    if bt.ndim == 1:
+        n_rows_bt = int(s0.shape[0])
+        if n_rows_bt > 0 and bt.numel() % n_rows_bt == 0:
+            bt = bt.reshape(n_rows_bt, bt.numel() // n_rows_bt)
+        elif max_pages_per_seq > 0 and bt.numel() % max_pages_per_seq == 0:
+            bt = bt.reshape(-1, max_pages_per_seq)
+        else:
+            raise ValueError("invalid 1-D block_tables")
+    pt_b = _sp_2d(bt, nseq_bkt, max_pages_per_seq).to(torch.int32)
+
+    ckpt_rows: list[torch.Tensor] = []
+    roff_rows: list[torch.Tensor] = []
+    for s_raw, c_raw, r_raw in ((s0, c0, r0), (s1, c1, r1), (s2, c2, r2)):
+        s_b = (
+            _sp_1d(s_raw[:, 0], nseq_bkt).to(torch.int32)
+            if s_raw.ndim == 2
+            else _sp_1d(s_raw, nseq_bkt).to(torch.int32)
+        )
+        if has_roff:
+            s_idx = s_b.to(torch.long).clamp(min=0, max=r_raw.numel() - 1)
+            roff_g = r_raw.reshape(-1)[s_idx].to(torch.int32)
+        else:
+            roff_g = torch.zeros_like(s_b)
+
+        if T > 1:
+            if use_ckpt_2d and c_raw.ndim == 2 and c_raw.shape[1] >= T:
+                ckpt_g = _sp_2d(c_raw, nseq_bkt, T).to(torch.int32)
+            else:
+                src_1d = c_raw[:, 0] if c_raw.ndim == 2 else c_raw.reshape(-1)
+                ckpt_1d = _sp_1d(src_1d, nseq_bkt).to(torch.int32)
+                ckpt_g = ckpt_1d.unsqueeze(1).expand(nseq_bkt, T).contiguous()
+                roff_g = torch.where(roff_g < 0, roff_g, torch.zeros_like(roff_g))
+        else:
+            if use_ckpt_2d and has_roff and c_raw.ndim == 2 and c_raw.shape[1] > 1:
+                c_b = _sp_2d(c_raw, nseq_bkt, int(c_raw.shape[1])).to(torch.int32)
+                r_idx = roff_g.to(torch.long).clamp(min=0, max=c_raw.shape[1] - 1)
+                read_col = c_b.gather(1, r_idx.unsqueeze(1))
+            else:
+                read_col = s_b.unsqueeze(1)
+            write_col = s_b.unsqueeze(1)
+            ckpt_g = torch.cat([read_col, write_col], dim=1)
+            roff_g = torch.where(roff_g < 0, roff_g, torch.zeros_like(roff_g))
+
+        active_g = (s_b > 0) & (ckpt_g[:, 0] > 0)
+        ckpt_g = torch.where(active_g.unsqueeze(1), ckpt_g, torch.zeros_like(ckpt_g))
+        roff_g = torch.where(active_g, roff_g, torch.zeros_like(roff_g))
+        ckpt_rows.append(ckpt_g)
+        roff_rows.append(roff_g)
+
+    ckpt_b = torch.stack(ckpt_rows, dim=0)
+    roff_b = torch.stack(roff_rows, dim=0)
+    active_seq = ckpt_b[0, :, 0] > 0
+    active_tok = active_seq.unsqueeze(1).expand(nseq_bkt, T).reshape(B)
+    zero_b = torch.zeros((B,), dtype=torch.int32, device=input_ids.device)
+    ids_b = torch.where(active_tok, _sp_1d(input_ids, B).to(torch.int32), zero_b)
+    pos_1d = positions[0] if positions.ndim == 2 else positions
+    pos_b = torch.where(active_tok, _sp_1d(pos_1d, B).to(torch.int32), zero_b)
+    return ids_b, pos_b, pt_b, ckpt_b, roff_b
+
+
+def test_step_meta_bitwise_parity_base_vs_head_and_jax() -> None:
+    """Verify bitwise parity of `prepare_step_inputs_eager` vs `pack_step_meta`."""
+    torch_ops = TorchStepMetaOps()
+    jax_ops = JaxStepMetaOps()
+    max_pages_per_seq = 4
+    num_req_rows = 6
+
+    s0 = torch.tensor([1, 0, 5, 8, 0, 12], dtype=torch.int32)
+    s1 = torch.tensor([2, 0, 6, 9, 0, 13], dtype=torch.int32)
+    s2 = torch.tensor([3, 0, 7, 10, 0, 14], dtype=torch.int32)
+    c0_2d = torch.tensor(
+        [
+            [1, 2, 3, 4],
+            [0, 0, 0, 0],
+            [5, 6, 7, 8],
+            [0, 9, 10, 11],
+            [15, 16, 17, 18],
+            [12, 13, 14, 15],
+        ],
+        dtype=torch.int32,
+    )
+    c1_2d = c0_2d + 20
+    c1_2d[1] = 0
+    c1_2d[3, 0] = 0
+    c2_2d = c0_2d + 40
+    c2_2d[1] = 0
+    c2_2d[3, 0] = 0
+
+    roff_pos = torch.zeros((32,), dtype=torch.int32)
+    roff_pos[1] = 2
+    roff_pos[5] = 1
+    roff_pos[8] = 3
+    roff_pos[12] = 0
+
+    roff_neg = roff_pos.clone()
+    roff_neg[1] = -1
+    roff_neg[5] = 2
+    roff_neg[8] = -2
+    roff_neg[12] = -1
+
+    bt_2d = torch.arange(
+        10, 10 + num_req_rows * max_pages_per_seq, dtype=torch.int32
+    ).reshape(num_req_rows, max_pages_per_seq)
+    bt_1d_req_blocks = torch.arange(50, 50 + num_req_rows * 2, dtype=torch.int32)
+    bt_1d_max_pages = torch.arange(80, 80 + 5 * max_pages_per_seq, dtype=torch.int32)
+    s0_j, s1_j, s2_j = (
+        jnp.asarray(s0.numpy()),
+        jnp.asarray(s1.numpy()),
+        jnp.asarray(s2.numpy()),
+    )
+    c0_2d_j, c1_2d_j, c2_2d_j = (
+        jnp.asarray(c0_2d.numpy()),
+        jnp.asarray(c1_2d.numpy()),
+        jnp.asarray(c2_2d.numpy()),
+    )
+    r_zero = torch.zeros((1,), dtype=torch.int32)
+    r_zero_j = jnp.zeros((1,), dtype=jnp.int32)
+    roff_pos_j = jnp.asarray(roff_pos.numpy())
+    roff_neg_j = jnp.asarray(roff_neg.numpy())
+    bt_pairs = (
+        (bt_2d, jnp.asarray(bt_2d.numpy())),
+        (bt_1d_req_blocks, jnp.asarray(bt_1d_req_blocks.numpy())),
+        (bt_1d_max_pages, jnp.asarray(bt_1d_max_pages.numpy())),
+    )
+
+    for T in (1, 4):
+        for bucket_t in (4, 8, 16):
+            raw_tok_len = 12
+            ids_in = torch.arange(100, 100 + raw_tok_len, dtype=torch.int32)
+            ids_j = jnp.asarray(ids_in.numpy())
+            pos_1d = torch.arange(200, 200 + raw_tok_len, dtype=torch.int32)
+            pos_mrope = torch.stack([pos_1d, pos_1d, pos_1d], dim=0)
+            for pos_in, pos_j in (
+                (pos_1d, jnp.asarray(pos_1d.numpy())),
+                (pos_mrope, jnp.asarray(pos_mrope.numpy())),
+            ):
+                for bt_in, bt_j in bt_pairs:
+                    for has_roff, r_in, r_j in (
+                        (False, r_zero, r_zero_j),
+                        (True, roff_pos, roff_pos_j),
+                        (True, roff_neg, roff_neg_j),
+                    ):
+                        for use_ckpt_2d, c_set, c_set_j in (
+                            (False, (s0, s1, s2), (s0_j, s1_j, s2_j)),
+                            (True, (c0_2d, c1_2d, c2_2d), (c0_2d_j, c1_2d_j, c2_2d_j)),
+                        ):
+                            c0_in, c1_in, c2_in = c_set
+                            c0_j, c1_j, c2_j = c_set_j
+                            ref_out = _ref_prepare_step_inputs_eager(
+                                ids_in,
+                                pos_in,
+                                bt_in,
+                                s0,
+                                c0_in,
+                                r_in,
+                                s1,
+                                c1_in,
+                                r_in,
+                                s2,
+                                c2_in,
+                                r_in,
+                                bucket_t,
+                                T,
+                                max_pages_per_seq,
+                                has_roff,
+                                use_ckpt_2d,
+                            )
+                            head_out = prepare_step_inputs_eager(
+                                ids_in,
+                                pos_in,
+                                bt_in,
+                                s0,
+                                c0_in,
+                                r_in,
+                                s1,
+                                c1_in,
+                                r_in,
+                                s2,
+                                c2_in,
+                                r_in,
+                                bucket_t,
+                                T,
+                                max_pages_per_seq,
+                                has_roff,
+                                use_ckpt_2d,
+                            )
+                            meta_torch = pack_step_meta(
+                                ids_in,
+                                pos_in,
+                                bt_in,
+                                (
+                                    (s0, c0_in, r_in),
+                                    (s1, c1_in, r_in),
+                                    (s2, c2_in, r_in),
+                                ),
+                                bucket_t=bucket_t,
+                                tokens_per_seq=T,
+                                max_pages_per_seq=max_pages_per_seq,
+                                has_roff=has_roff,
+                                use_ckpt_2d=use_ckpt_2d,
+                                ops=torch_ops,
+                            ).as_tuple()
+                            for r_t, h_t, m_t in zip(
+                                ref_out, head_out, meta_torch, strict=True
+                            ):
+                                assert torch.equal(r_t, h_t)
+                                assert torch.equal(r_t, m_t)
+                            if bucket_t == 8:
+                                meta_jax = pack_step_meta(
+                                    ids_j,
+                                    pos_j,
+                                    bt_j,
+                                    (
+                                        (s0_j, c0_j, r_j),
+                                        (s1_j, c1_j, r_j),
+                                        (s2_j, c2_j, r_j),
+                                    ),
+                                    bucket_t=bucket_t,
+                                    tokens_per_seq=T,
+                                    max_pages_per_seq=max_pages_per_seq,
+                                    has_roff=has_roff,
+                                    use_ckpt_2d=use_ckpt_2d,
+                                    ops=jax_ops,
+                                ).as_tuple()
+                                for r_t, m_j in zip(ref_out, meta_jax, strict=True):
+                                    assert np.array_equal(r_t.numpy(), np.asarray(m_j))
+
+    # Verify Dynamo traces prepare_step_inputs_eager with fullgraph=True, dynamic=False
+    compiled_fn = torch.compile(
+        prepare_step_inputs_eager, backend="eager", fullgraph=True, dynamic=False
+    )
+    comp_out = compiled_fn(
+        torch.arange(10, 18, dtype=torch.int32),
+        torch.arange(20, 28, dtype=torch.int32),
+        bt_2d,
+        s0,
+        c0_2d,
+        roff_neg,
+        s1,
+        c1_2d,
+        roff_neg,
+        s2,
+        c2_2d,
+        roff_neg,
+        8,
+        4,
+        max_pages_per_seq,
+        True,
+        True,
+    )
+    eager_out = _ref_prepare_step_inputs_eager(
+        torch.arange(10, 18, dtype=torch.int32),
+        torch.arange(20, 28, dtype=torch.int32),
+        bt_2d,
+        s0,
+        c0_2d,
+        roff_neg,
+        s1,
+        c1_2d,
+        roff_neg,
+        s2,
+        c2_2d,
+        roff_neg,
+        8,
+        4,
+        max_pages_per_seq,
+        True,
+        True,
+    )
+    for c_t, e_t in zip(comp_out, eager_out, strict=True):
+        assert torch.equal(c_t, e_t)
+
+    # Extra edge cases: int64 inputs, PAD_SLOT_ID = -1 in s/c, slot beyond
+    # r_raw.numel()-1, and 2-D ckpt narrower than T (shape=(6, 2) at T=4).
+    s_edge = torch.tensor([1, -1, 999, 8, -1, 12], dtype=torch.int64)
+    c_narrow = torch.tensor(
+        [[1, 2], [-1, -1], [5, 6], [-1, 9], [15, 16], [12, 13]], dtype=torch.int64
+    )
+    r_edge = roff_neg.to(torch.int64)
+    ids_64 = torch.arange(10, 22, dtype=torch.int64)
+    pos_64 = torch.arange(30, 42, dtype=torch.int64)
+    bt_64 = bt_2d.to(torch.int64)
+    for T_edge, bkt_edge in ((1, 4), (4, 8)):
+        ref_edge = _ref_prepare_step_inputs_eager(
+            ids_64,
+            pos_64,
+            bt_64,
+            s_edge,
+            c_narrow,
+            r_edge,
+            s_edge,
+            c_narrow,
+            r_edge,
+            s_edge,
+            c_narrow,
+            r_edge,
+            bkt_edge,
+            T_edge,
+            max_pages_per_seq,
+            True,
+            True,
+        )
+        head_edge = prepare_step_inputs_eager(
+            ids_64,
+            pos_64,
+            bt_64,
+            s_edge,
+            c_narrow,
+            r_edge,
+            s_edge,
+            c_narrow,
+            r_edge,
+            s_edge,
+            c_narrow,
+            r_edge,
+            bkt_edge,
+            T_edge,
+            max_pages_per_seq,
+            True,
+            True,
+        )
+        jax_edge = pack_step_meta(
+            jnp.asarray(ids_64.numpy()),
+            jnp.asarray(pos_64.numpy()),
+            jnp.asarray(bt_64.numpy()),
+            tuple(
+                (
+                    jnp.asarray(s_edge.numpy()),
+                    jnp.asarray(c_narrow.numpy()),
+                    jnp.asarray(r_edge.numpy()),
+                )
+                for _ in range(3)
+            ),
+            bucket_t=bkt_edge,
+            tokens_per_seq=T_edge,
+            max_pages_per_seq=max_pages_per_seq,
+            has_roff=True,
+            use_ckpt_2d=True,
+            ops=jax_ops,
+        ).as_tuple()
+        for r_t, h_t, j_t in zip(ref_edge, head_edge, jax_edge, strict=True):
+            assert r_t.dtype == torch.int32 and h_t.dtype == torch.int32
+            assert torch.equal(r_t, h_t)
+            assert np.array_equal(r_t.numpy(), np.asarray(j_t))
 
 
 def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
@@ -772,7 +1323,7 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
             bucket_t=2,
         )
     assert driver._torchtpu_ir_error is not None
-    assert not driver._torchtpu_ir_checked
+    assert not driver._torchtpu_ir_checked_buckets
 
     driver._torchtpu_ir_error = None
     inlined_only_ir = (
@@ -799,7 +1350,7 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
             tokens_per_seq=1,
             bucket_t=2,
         )
-    assert not driver._torchtpu_ir_checked
+    assert not driver._torchtpu_ir_checked_buckets
 
     valid_donor_ir = inlined_only_ir.replace(
         "%arg0: tensor<96x2x64x4x128xf8E4M3FN>",
@@ -823,15 +1374,31 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
         tokens_per_seq=1,
         bucket_t=2,
     )
-    assert driver._torchtpu_ir_checked
+    assert driver._torchtpu_ir_checked_buckets == {(1, 2)}
+
+    # Regression for BLOCKER 2: a `pool_gather=True` profile builds T=1 (split)
+    # and T=4 (GPR) buckets cleanly in `bind_caches`.
+    driver_gpr = MegakernelDriver(
+        model=model,
+        mesh=mesh,
+        tp_rank=0,
+        mode="ep",
+        geom=g,
+        base_exec=ex_base,
+        profile=mk.Profile(name="test-gpr", numerics="approx", pool_gather=True),
+        weights=driver.weights,
+        buckets=(2,),
+        verify_buckets=(4,),
+    )
+    driver_gpr.bind_caches(runner_ok)
+    assert driver_gpr._bucket_gpr == {(1, 2): False, (4, 4): True}
+    assert driver_gpr._bucket_fused_io == {(1, 2): False, (4, 4): False}
 
 
 def test_compile_hlo_check_config_errors_are_not_layout_errors() -> None:
     """`compile_hlo_check` misconfiguration fails loudly; layout errors disable MK."""
-    from vllm_torchtpu.megakernel_runtime.driver import check_compile_hlo_mesh
-    from vllm_torchtpu.megakernel_runtime.exported_bridge import (
-        MegakernelConfigError,
-    )
+    from vllm_torchtpu.megakernel import MegakernelConfigError
+    from vllm_torchtpu.megakernel.runtime import check_compile_hlo_mesh
 
     class _MockDevice:
         id = 0
@@ -939,8 +1506,8 @@ def test_driver_validates_profile_before_packing_and_uses_profile_buckets(
     )
     assert (drv2.buckets, drv2.verify_buckets) == ((8,), ())
     drv3 = MegakernelDriver(mesh=_cpu_mesh(1), weights={"w_flat": []}, **kw)
-    assert drv3.buckets == driver_mod._DEFAULT_BUCKETS
-    assert drv3.verify_buckets == driver_mod._DEFAULT_VERIFY_BUCKETS
+    assert drv3.buckets == DEFAULT_BUCKETS
+    assert drv3.verify_buckets == DEFAULT_VERIFY_BUCKETS
 
 
 def test_maybe_create_disables_on_unsupported_tpu_chip(
@@ -951,10 +1518,21 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
     import logging
     import sys
 
+    from tests.megakernel.frozen_utils import dict_to_namespace
+
     g = _tiny_geom(L=4, att_every=4)
     ex_base = _tiny_exec(R=8, B=4, T=1, ctx=256, num_pages=96)
     backbone = make_synthetic_qwen35_backbone(g, ex_base)
+    backbone.layers = list(backbone.layers) * 15
     model = SimpleNamespace(model=backbone)
+    real_hf_cfg = dict_to_namespace(
+        {
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "text_config": qwen35.DEFAULT_HF_CONFIG,
+        }
+    )
+    model_cfg = SimpleNamespace(hf_config=real_hf_cfg)
 
     class _UnsupportedTPUDevice:
         id = 0
@@ -965,6 +1543,7 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
     )
     runner = SimpleNamespace(
         model=model,
+        model_config=model_cfg,
         mesh=v5_mesh,
         _unified_kv_layout=True,
         supports_mm_inputs=False,
@@ -979,11 +1558,12 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
             decode_context_parallel_size=1,
         ),
         _dp_lockstep_enabled=lambda: False,
-        vllm_config=SimpleNamespace(additional_config={"megakernel": True}),
+        vllm_config=SimpleNamespace(
+            model_config=model_cfg, additional_config={"megakernel": True}
+        ),
     )
     fake_vllm_dist = SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0)
     monkeypatch.setitem(sys.modules, "vllm.distributed", fake_vllm_dist)
-    monkeypatch.setattr(MegakernelDriver, "_expected_num_layers", g.L)
     monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 8)
     monkeypatch.setattr(
         driver_mod, "_build_tp_rank_mesh", lambda _r, fallback_mesh=None: fallback_mesh
@@ -999,9 +1579,22 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
         assert MegakernelDriver.maybe_create(runner) is None
     assert "Megakernel disabled: Unsupported TPU" in caplog.text
 
+    # Unresolvable runner returns None from maybe_create; __init__ raises ValueError
+    unresolvable_runner = SimpleNamespace(
+        model=SimpleNamespace(model=SimpleNamespace(layers=[])),
+        vllm_config=SimpleNamespace(additional_config={"megakernel": True}),
+    )
+    assert MegakernelDriver.maybe_create(unresolvable_runner) is None
+    with pytest.raises(ValueError, match="could not resolve ModelDef"):
+        MegakernelDriver(
+            model=SimpleNamespace(model=SimpleNamespace(layers=[])),
+            mesh=_cpu_mesh(1),
+        )
+
 
 def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """`maybe_create` resolves the model default profile's `buckets` and
     `pool_gather`, and disables gracefully when effective bucket lists are empty."""
@@ -1015,6 +1608,7 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     g = _tiny_geom(L=4, att_every=4)
     ex_base = _tiny_exec(R=8, B=4, T=1, ctx=256, num_pages=96)
     backbone = make_synthetic_qwen35_backbone(g, ex_base)
+    backbone.layers = list(backbone.layers) * 15
     model = SimpleNamespace(model=backbone)
     mesh8 = _cpu_mesh(8)
     fake_vllm_dist = SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0)
@@ -1025,8 +1619,7 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
         monkeypatch.setattr(
             driver_mod.logger, "_logger", logging.getLogger(driver_mod.logger._name)
         )
-    monkeypatch.setattr(MegakernelDriver, "_expected_num_layers", g.L)
-    monkeypatch.setattr(driver_mod.Qwen35Megakernel, "_expected_num_layers", g.L)
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 8)
     monkeypatch.setattr(driver_mod, "_build_tp_rank_mesh", lambda *_a, **_k: mesh8)
     monkeypatch.setattr(
@@ -1072,23 +1665,29 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     )
     drv = driver_mod.maybe_create(runner)
     assert drv is not None
-    assert isinstance(drv, driver_mod.Qwen35Megakernel)
+    assert isinstance(drv, driver_mod.MegakernelDriver)
+    assert drv.model_def is qwen35.Qwen35
     assert drv.profile.name == "qwen35-test-default"
     assert drv.profile.pool_gather is None
     assert drv.buckets == (4, 16)
     assert drv.verify_buckets == ()
 
-    # 2. Explicit `buckets=0` on a non-speculative runner disables gracefully.
+    # 2. Explicit `buckets=0` on a non-speculative runner disables gracefully at INFO.
     runner_off = SimpleNamespace(
         model=model,
+        model_config=model_cfg,
         mesh=mesh8,
         _unified_kv_layout=True,
         speculative_config=None,
         vllm_config=SimpleNamespace(
-            additional_config={"megakernel": {"enabled": True, "buckets": []}}
+            model_config=model_cfg,
+            additional_config={"megakernel": {"enabled": True, "buckets": []}},
         ),
     )
-    assert MegakernelDriver.maybe_create(runner_off) is None
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        assert MegakernelDriver.maybe_create(runner_off) is None
+    assert "both bucket lists empty" in caplog.text
 
     # 3. Model default profile with `buckets=()` on a non-speculative runner
     #    disables gracefully before packing weights.
@@ -1101,6 +1700,95 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     )
     register_profile(empty_default, replace=True)
     assert MegakernelDriver.maybe_create(runner) is None
+
+    # 4. Supported TP sizes: default Qwen35.supported_tp_sizes == (8,) rejects tp=4;
+    #    declaring (4, 8) on the model OR (4,) on the profile accepts tp=4.
+    register_profile(custom_default, replace=True)
+    mesh4 = _cpu_mesh(4)
+    monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 4)
+    monkeypatch.setattr(driver_mod, "_build_tp_rank_mesh", lambda *_a, **_k: mesh4)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert MegakernelDriver.maybe_create(runner) is None
+    assert "Megakernel requires 8 TPU devices in mesh, got 4" in caplog.text
+
+    tp4_profile = Profile(
+        name="qwen35-test-tp4",
+        model="qwen3_5",
+        buckets=(4,),
+        supported_tp_sizes=(4,),
+        model_default=True,
+    )
+    register_profile(tp4_profile, replace=True)
+    drv_tp4_prof = MegakernelDriver.maybe_create(runner)
+    assert drv_tp4_prof is not None and drv_tp4_prof.profile.name == "qwen35-test-tp4"
+
+    register_profile(custom_default, replace=True)
+    monkeypatch.setattr(qwen35.Qwen35, "supported_tp_sizes", (4, 8))
+    drv_tp4_model = MegakernelDriver.maybe_create(runner)
+    assert drv_tp4_model is not None and drv_tp4_model.buckets == (4, 16)
+
+    # 5. Table-driven check that every startup code in `check_startup_eligibility`
+    #    and `check_post_mesh_eligibility` maps through `_VLLM_STARTUP_MESSAGES`.
+    from vllm_torchtpu.megakernel.runtime import check_startup_eligibility
+
+    base_st = dict(
+        num_layers=60,
+        expected_num_layers=60,
+        unified_cache_layout=True,
+        tp_size=8,
+        supported_tp_sizes=(8,),
+    )
+    for ov, exp_code, expected_substr in (
+        ({"enabled": False}, "disabled", ""),
+        ({"num_layers": 12}, "layer_count_mismatch", ""),
+        (
+            {"unified_cache_layout": False},
+            "unaligned_cache_layout",
+            "_unified_kv_layout=True",
+        ),
+        ({"multimodal_inputs": True}, "multimodal_inputs", "supports_mm_inputs=True"),
+        ({"lora_enabled": True}, "lora_enabled", "LoRA adapters"),
+        ({"pipeline_parallel": True}, "pipeline_parallel", "single-stage pipeline"),
+        ({"context_parallel": True}, "context_parallel", "PCP/DCP"),
+        ({"dp_lockstep": True}, "dp_lockstep", "EP-DP lockstep"),
+        ({"aux_hidden_states": True}, "aux_hidden_states", "aux_hidden_state_layers"),
+        (
+            {"tp_size": 4},
+            "unsupported_tp_size",
+            "Megakernel requires 8 TPU devices in mesh, got 4",
+        ),
+        (
+            {"supported_tp_sizes": ()},
+            "unsupported_tp_size",
+            "does not declare any supported TPU mesh sizes",
+        ),
+    ):
+        dec = check_startup_eligibility(**{**base_st, **ov})
+        assert not dec.eligible and dec.code == exp_code
+        msg = driver_mod._VLLM_STARTUP_MESSAGES.get(dec.code, dec.message)
+        assert expected_substr in msg
+
+    base_post = dict(
+        tp_size=8,
+        mesh_size=8,
+        device_kind="TPU v7x",
+        bucket_policy=drv.bucket_policy,
+    )
+    for ov, exp_code, expected_substr in (
+        (
+            {"mesh_size": 4},
+            "mesh_size_mismatch",
+            "TP-rank mesh has 4 devices, expected 8",
+        ),
+        ({"device_kind": "TPU v5e"}, "unsupported_tpu_chip", "Unsupported TPU"),
+    ):
+        dec_post = check_post_mesh_eligibility(**{**base_post, **ov})
+        assert not dec_post.eligible and dec_post.code == exp_code
+        msg_post = driver_mod._VLLM_STARTUP_MESSAGES.get(
+            dec_post.code, dec_post.message
+        )
+        assert expected_substr in msg_post
 
 
 def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1245,6 +1933,62 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     comb_dist_cpu.copy_(torch.tensor([0, 0, 2, 2, 2, 2], dtype=torch.int32))
     qsl_np[:3] = [0, 4, 6]
     assert not driver.can_run(ids_8, pos_8, runner=runner)
+
+    #    4d. Regression for BLOCKER 1: 3-element `mamba_request_distribution` /
+    #        `request_distribution` tensors on `mamba_mds[0]` / `attn_md` must never
+    #        trigger `RuntimeError: Boolean value of Tensor with more than one value
+    #        is ambiguous` (neither on the runner fast-path nor on the fallback path).
+    dist_tensor_3 = torch.tensor([1, 1, 1], dtype=torch.int32)
+    mamba_mds[0].mamba_request_distribution = dist_tensor_3
+    attn_md.request_distribution = dist_tensor_3
+    runner._attn_metadata_builder_ctx.num_reqs = 1
+    comb_dist_cpu.copy_(torch.tensor([0, 0, 1, 1, 1, 1], dtype=torch.int32))
+    qsl_np[:2] = [0, 4]
+    assert driver.can_run(ids_4, pos_4, runner=runner)
+    # Also exercise the fallback path (`bctx is None`, `query_start_loc` on `attn_md`)
+    orig_bctx = runner._attn_metadata_builder_ctx
+    runner._attn_metadata_builder_ctx = None
+    attn_md.query_start_loc = torch.tensor([0, 4], dtype=torch.int32)
+    assert driver.can_run(ids_4, pos_4, runner=runner)
+
+    # Exercise the fallback path with a non-CPU (`device="meta"`) 3-element
+    # `mamba_request_distribution` tensor and no runner `qsl`/distribution:
+    # must neither raise `Boolean value of Tensor...` nor sync, and fail closed.
+    meta_dist_3 = torch.empty((3,), dtype=torch.int32, device="meta")
+    mamba_mds[0].mamba_request_distribution = meta_dist_3
+    attn_md.request_distribution = meta_dist_3
+    attn_md.query_start_loc = None
+    assert driver._inspect_step_detail(
+        attn_md, mamba_mds[0], runner=None
+    ) == BatchShape(False, 0, 0, "stock_no_qsl")
+    no_qsl_runner = SimpleNamespace(
+        _attn_metadata_builder_ctx=None,
+        mamba_slot_read_offsets=None,
+        _cached_comb_key=None,
+        _combined_request_distribution_cpu=None,
+        query_start_loc_np=None,
+        query_start_loc_cpu=None,
+    )
+    assert driver._inspect_step_detail(
+        attn_md, mamba_mds[0], runner=no_qsl_runner
+    ) == BatchShape(False, 0, 0, "stock_no_qsl")
+    assert not driver.can_run(ids_4, pos_4, runner=None)
+
+    # With CPU `query_start_loc` and `num_seqs=1` on `attn_md`, the non-CPU `meta`
+    # distribution tensor is ignored without syncing and `fallback_num_seqs` succeeds.
+    attn_md.num_seqs = 1
+    attn_md.query_start_loc = torch.tensor([0, 4], dtype=torch.int32)
+    assert driver._inspect_step_detail(
+        attn_md, mamba_mds[0], runner=None
+    ) == BatchShape(True, 1, 4, "ok")
+    del attn_md.num_seqs
+
+    runner._attn_metadata_builder_ctx = orig_bctx
+    runner._attn_metadata_builder_ctx.num_reqs = 2
+    comb_dist_cpu.copy_(torch.tensor([2, 2, 2, 2, 2, 2], dtype=torch.int32))
+    attn_md.query_start_loc = None
+    mamba_mds[0].mamba_request_distribution = None
+    attn_md.request_distribution = None
 
     # 5. Missing host `query_start_loc` must fail closed (`stock_no_qsl`), never
     #    falling back to `mamba_state_indices.shape[0]` (128) or `ckpt.shape[1]` (4).
@@ -1726,3 +2470,296 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
             p_t.view(torch.uint8).numpy(),
             np.asarray(p_ref).view(np.uint8),
         )
+
+
+def test_megakernel_runtime_package_has_no_model_names_and_no_legacy_exports():
+    """`megakernel_runtime/*.py` has zero model literals and no legacy re-exports."""
+    import ast
+    from pathlib import Path
+
+    import vllm_torchtpu.megakernel_runtime as mkr
+    import vllm_torchtpu.megakernel_runtime.driver as drv_mod
+    import vllm_torchtpu.megakernel_runtime.exported_bridge as eb_mod
+
+    pkg_dir = Path(mkr.__file__).parent
+    py_files = sorted(pkg_dir.glob("*.py"))
+    assert len(py_files) >= 4
+    forbidden_substrings = ("qwen", "llama", "deepseek", "mistral", "gemma")
+
+    for py_path in py_files:
+        src = py_path.read_text(encoding="utf-8")
+        low = src.lower()
+        for sub in forbidden_substrings:
+            assert sub not in low, f"{py_path.name} contains model name {sub!r}"
+        tree = ast.parse(src, filename=str(py_path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                s_low = node.value.lower()
+                for sub in forbidden_substrings:
+                    assert sub not in s_low, (
+                        f"{py_path.name}:{getattr(node, 'lineno', 0)} string literal "
+                        f"{node.value!r} contains model name {sub!r}"
+                    )
+            elif isinstance(node, ast.Name):
+                n_low = node.id.lower()
+                for sub in forbidden_substrings:
+                    assert sub not in n_low, (
+                        f"{py_path.name}:{getattr(node, 'lineno', 0)} identifier "
+                        f"{node.id!r} contains model name {sub!r}"
+                    )
+
+    removed_driver_attrs = (
+        "Qwen35Megakernel",
+        "_MODEL_DRIVER_REGISTRY",
+        "register_megakernel_driver",
+        "resolve_model_def",
+        "_DEFAULT_BUCKETS",
+        "_DEFAULT_VERIFY_BUCKETS",
+        "verify_pooled_step_hlo",
+        "verify_torchtpu_compiled_step_ir",
+        "prepare_step_metadata",
+    )
+    for attr in removed_driver_attrs:
+        assert not hasattr(drv_mod, attr), f"driver.py still defines {attr}"
+        assert not hasattr(mkr, attr), f"megakernel_runtime still exports {attr}"
+
+    for cls_attr in ("_step_mix", "_torchtpu_ir_checked", "_ir_required_buckets"):
+        assert not hasattr(MegakernelDriver, cls_attr), (
+            f"MegakernelDriver still defines {cls_attr}"
+        )
+
+    for attr in (
+        "parse_megakernel_config",
+        "parse_mk_buckets",
+        "parse_mk_verify_buckets",
+        "explicit_profile_settings",
+        "resolve_driver_profile",
+        "select_bucket",
+        "check_compile_hlo_mesh",
+        "MKABCalibrator",
+    ):
+        assert attr not in mkr.__all__, f"megakernel_runtime.__all__ still has {attr}"
+        assert not hasattr(mkr, attr), f"megakernel_runtime still re-exports {attr}"
+        assert not hasattr(drv_mod, attr), f"driver.py still defines {attr}"
+        assert not hasattr(eb_mod, attr), f"exported_bridge.py still defines {attr}"
+
+    for attr in (
+        "_build_global_avals",
+        "verify_pooled_step_hlo",
+        "verify_torchtpu_compiled_step_ir",
+    ):
+        assert not hasattr(eb_mod, attr), f"exported_bridge.py still defines {attr}"
+
+
+def _base_driver_inspect_step_detail_ref(
+    attn_md: Any, m0: Any, runner: Any = None
+) -> BatchShape:
+    """Direct port of base (`ab8db9c5a`) `MegakernelDriver._inspect_step_detail`."""
+    num_reqs: int | None = None
+    if runner is not None:
+        bctx = getattr(runner, "_attn_metadata_builder_ctx", None)
+        if bctx is not None and getattr(bctx, "num_reqs", None) is not None:
+            num_reqs = int(bctx.num_reqs)
+
+        has_runner_roff = getattr(runner, "mamba_slot_read_offsets", None) is not None
+        comb_key = getattr(runner, "_cached_comb_key", None)
+        comb_cpu: Any = getattr(runner, "_combined_request_distribution_cpu", None)
+        if has_runner_roff and isinstance(comb_key, tuple) and len(comb_key) == 3:
+            _, num_windowed, dist_reqs = (
+                int(comb_key[0]),
+                int(comb_key[1]),
+                int(comb_key[2]),
+            )
+            if num_reqs is None:
+                num_reqs = dist_reqs
+            if dist_reqs <= 0 or num_reqs <= 0:
+                return BatchShape(False, 0, 0, "stock_n0")
+            if num_windowed != dist_reqs:
+                return BatchShape(
+                    False,
+                    num_reqs,
+                    0,
+                    "stock_prefill" if num_windowed == 0 else "stock_mixed",
+                )
+        elif (
+            has_runner_roff
+            and comb_cpu is not None
+            and isinstance(comb_cpu, torch.Tensor)
+            and comb_cpu.numel() >= 6
+        ):
+            num_windowed = int(comb_cpu[3].item())
+            dist_reqs = int(comb_cpu[5].item())
+            if num_reqs is None:
+                num_reqs = dist_reqs
+            if dist_reqs <= 0 or num_reqs <= 0:
+                return BatchShape(False, 0, 0, "stock_n0")
+            if num_windowed != dist_reqs:
+                return BatchShape(
+                    False,
+                    num_reqs,
+                    0,
+                    "stock_prefill" if num_windowed == 0 else "stock_mixed",
+                )
+
+        qsl_host = getattr(runner, "query_start_loc_np", None)
+        if qsl_host is None:
+            qsl_host = getattr(runner, "query_start_loc_cpu", None)
+        if qsl_host is not None and num_reqs is not None:
+            bs = check_qsl_uniform(qsl_host, num_reqs)
+            if bs.eligible and not has_runner_roff and bs.tokens_per_seq != 1:
+                return BatchShape(False, bs.num_reqs, 0, "stock_prefill")
+            return bs
+
+    dist: Any = getattr(m0, "mamba_request_distribution", None)
+    if dist is None:
+        dist = getattr(attn_md, "mamba_request_distribution", None)
+    if dist is None:
+        dist = getattr(attn_md, "request_distribution", None)
+    if (
+        dist is not None
+        and isinstance(dist, torch.Tensor)
+        and dist.device.type == "cpu"
+        and dist.numel() >= 3
+    ):
+        d_end = int(dist[0].item())
+        total_reqs = int(dist[2].item())
+        if total_reqs <= 0:
+            return BatchShape(False, 0, 0, "stock_n0")
+        if d_end != total_reqs:
+            return BatchShape(
+                False,
+                total_reqs,
+                0,
+                "stock_prefill" if d_end == 0 else "stock_mixed",
+            )
+        if num_reqs is None:
+            num_reqs = total_reqs
+
+    num_seqs_attr = getattr(attn_md, "__dict__", {}).get("num_seqs")
+    if num_reqs is None and num_seqs_attr is not None:
+        if isinstance(num_seqs_attr, torch.Tensor):
+            if num_seqs_attr.device.type == "cpu":
+                num_reqs = int(num_seqs_attr.item())
+        else:
+            num_reqs = int(num_seqs_attr)
+
+    qsl_md = getattr(attn_md, "__dict__", {}).get("query_start_loc_cpu")
+    if qsl_md is None:
+        qsl_dev: Any = getattr(attn_md, "query_start_loc", None)
+        if (
+            qsl_dev is not None
+            and isinstance(qsl_dev, torch.Tensor)
+            and qsl_dev.device.type == "cpu"
+        ):
+            qsl_md = qsl_dev
+    if qsl_md is not None and num_reqs is not None:
+        return check_qsl_uniform(qsl_md, num_reqs)
+
+    return BatchShape(False, 0, 0, "stock_no_qsl")
+
+
+def test_driver_inspect_step_detail_differential_and_unprepared_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Differential test of `MegakernelDriver._inspect_step_detail` vs base."""
+    qsl_t1 = np.array([0, 1, 2], dtype=np.int32)
+    qsl_t4 = np.array([0, 4, 8], dtype=np.int32)
+    qsl_mix = np.array([0, 1, 5], dtype=np.int32)
+    meta_dist = torch.empty((3,), dtype=torch.int32, device="meta")
+    cpu_dist_ok = torch.tensor([2, 2, 2], dtype=torch.int32)
+    cpu_dist_mix = torch.tensor([1, 2, 2], dtype=torch.int32)
+
+    for nr in (None, 0, 2):
+        for has_roff in (False, True):
+            for comb_key in (None, (0, 2, 2), (0, 1, 2), (0, 0, 0)):
+                for qsl_h in (None, qsl_t1, qsl_t4, qsl_mix):
+                    for m_dist in (None, meta_dist, cpu_dist_ok, cpu_dist_mix):
+                        for ns in (
+                            None,
+                            0,
+                            2,
+                            torch.empty((1,), dtype=torch.int32, device="meta"),
+                        ):
+                            for q_md in (
+                                None,
+                                torch.tensor([0, 1, 2], dtype=torch.int32),
+                                torch.tensor([0, 4, 8], dtype=torch.int32),
+                                torch.empty((3,), dtype=torch.int32, device="meta"),
+                            ):
+                                runner = SimpleNamespace(
+                                    _attn_metadata_builder_ctx=(
+                                        SimpleNamespace(num_reqs=nr)
+                                        if nr is not None
+                                        else None
+                                    ),
+                                    mamba_slot_read_offsets=(
+                                        torch.zeros((8,), dtype=torch.int32)
+                                        if has_roff
+                                        else None
+                                    ),
+                                    _cached_comb_key=comb_key,
+                                    _combined_request_distribution_cpu=None,
+                                    query_start_loc_np=qsl_h,
+                                    query_start_loc_cpu=None,
+                                )
+                                attn_md = SimpleNamespace(query_start_loc=q_md)
+                                if ns is not None:
+                                    attn_md.num_seqs = ns
+                                m0 = SimpleNamespace(mamba_request_distribution=m_dist)
+                                got = MegakernelDriver._inspect_step_detail(
+                                    attn_md, m0, runner=runner
+                                )
+                                exp = _base_driver_inspect_step_detail_ref(
+                                    attn_md, m0, runner=runner
+                                )
+                                assert got == exp
+
+    # Also verify direct `driver(...)` without prior `can_run()` when
+    # `_inspect_step_detail` returns an ineligible shape (`tokens_per_seq=0`)
+    # falls back to `tokens_per_seq = 1` instead of raising `KeyError: (0, ...)`.
+    mesh = _cpu_mesh(1)
+    g = _tiny_geom(L=4, att_every=4)
+    ex_base = _tiny_exec(R=1, B=2, T=1, ctx=256, num_pages=96)
+    backbone = make_synthetic_qwen35_backbone(g, ex_base)
+    model = SimpleNamespace(model=backbone)
+    _allocate_aliased_pools(backbone, g, 96)
+    driver = MegakernelDriver(
+        model=model,
+        mesh=mesh,
+        tp_rank=0,
+        mode="ep",
+        geom=g,
+        base_exec=ex_base,
+        buckets=(2,),
+        verify_buckets=(),
+    )
+    driver.bind_caches(SimpleNamespace(model=model, _unified_kv_layout=True))
+    attn_md_call = SimpleNamespace(
+        block_tables=torch.zeros((4,), dtype=torch.int32),
+        seq_lens=torch.ones((2,), dtype=torch.int32),
+        query_start_loc=None,
+    )
+    m_mds_call = [
+        SimpleNamespace(
+            mamba_state_indices=torch.zeros((2,), dtype=torch.int32),
+            mamba_ckpt_indices=None,
+            mamba_slot_read_offsets=None,
+            mamba_request_distribution=meta_dist,
+        )
+        for _ in range(3)
+    ]
+    md_dict = {driver.attn_layer_name: attn_md_call}
+    for name, m_md in zip(driver.mamba_layer_names, m_mds_call, strict=True):
+        md_dict[name] = m_md
+    monkeypatch.setattr(
+        driver_mod,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=md_dict),
+    )
+    out = driver(
+        torch.zeros((2,), dtype=torch.int32),
+        torch.zeros((2,), dtype=torch.int32),
+        num_tokens=2,
+        runner=None,
+    )
+    assert out.shape == (2, g.H)

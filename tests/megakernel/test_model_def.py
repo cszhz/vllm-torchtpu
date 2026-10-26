@@ -266,32 +266,40 @@ class _DenseMLPModule(MoEModule):
 
 
 def test_core_model_def_modules_have_no_qwen_literals_and_fit_line_budget():
-    """Core `ModelDef` and `weights/` modules have no Qwen names and <= 400 lines."""
+    """Core `ModelDef`, `weights/`, `runtime/` have no Qwen names and <= 400 lines."""
+    from vllm_torchtpu.megakernel import runtime as runtime_pkg
     from vllm_torchtpu.megakernel import weights as weights_pkg
 
     weights_dir = Path(weights_pkg.__file__).parent
     weight_files = sorted(weights_dir.glob("*.py"))
     assert len(weight_files) >= 4
-    core_files = [
-        Path(mod.__file__)
-        for mod in (
-            module,
-            spec,
-            derive,
-            geometry,
-            schedule,
-            reference,
-            validate,
-            model_def,
-        )
-    ] + weight_files
+    runtime_dir = Path(runtime_pkg.__file__).parent
+    runtime_files = sorted(runtime_dir.glob("*.py"))
+    assert len(runtime_files) >= 5
+    core_files = (
+        [
+            Path(mod.__file__)
+            for mod in (
+                module,
+                spec,
+                derive,
+                geometry,
+                schedule,
+                reference,
+                validate,
+                model_def,
+            )
+        ]
+        + weight_files
+        + runtime_files
+    )
     for path in core_files:
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines()
         assert len(lines) <= 400, f"{path.name} has {len(lines)} lines (> 400)"
         assert "fmt: skip" not in text, f"{path.name} contains fmt: skip"
         assert "noqa: E501" not in text, f"{path.name} contains noqa: E501"
-        if path in weight_files:
+        if path in weight_files or path in runtime_files:
             assert "noqa" not in text, f"{path.name} contains noqa"
         low = text.lower()
         assert "qwen" not in low, f"{path.name} must not mention Qwen"
@@ -1206,13 +1214,16 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     assert Qwen35.default_profile() is PROFILE
     assert Qwen35.get_profile("candidate30").name == "qwen35-candidate30"
 
-    # Runtime driver registry is pinned to the 4 serving keys
-    assert set(driver_mod._MODEL_DRIVER_REGISTRY) == {
+    # ModelDef HF architectures and model_type registrations
+    assert Qwen35.hf_architectures == (
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
-        "qwen3_5_moe",
-        "qwen3_5",
-    }
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForCausalLM",
+    )
+    assert Qwen35.hf_model_type == ("qwen3_5_moe", "qwen3_5", "qwen3_5_moe_text")
+    assert Qwen35.supported_tp_sizes == (8,)
+    assert Qwen35.display_name == "Qwen3.5"
 
     # Dense Qwen3.5 config fails closed with "Qwen35 supports MoE checkpoints only"
     dense_cfg = {k: v for k, v in DEFAULT_HF_CONFIG.items() if k != "num_experts"}
@@ -1270,7 +1281,8 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         nested_vlm,
         dict_to_namespace(nested_vlm),
     ):
-        assert driver_mod.Qwen35Megakernel._validate_runner_hf_config(
+        assert Qwen35.validate_hf_config(valid_cfg).eligible
+        assert driver_mod.MegakernelDriver._validate_runner_hf_config(
             _make_runner(valid_cfg)
         )
 
@@ -1287,7 +1299,8 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     for cand_48l in (cfg_48l, dict_to_namespace(cfg_48l)):
         caplog.clear()
         with caplog.at_level(logging.WARNING):
-            assert not driver_mod.Qwen35Megakernel._validate_runner_hf_config(
+            assert not Qwen35.validate_hf_config(cand_48l).eligible
+            assert not driver_mod.MegakernelDriver._validate_runner_hf_config(
                 _make_runner(cand_48l)
             )
             assert driver_mod.maybe_create(_make_runner(cand_48l)) is None
@@ -1340,7 +1353,8 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     ):
         caplog.clear()
         with caplog.at_level(logging.WARNING):
-            assert not driver_mod.Qwen35Megakernel._validate_runner_hf_config(
+            assert not Qwen35.validate_hf_config(dense_cand).eligible
+            assert not driver_mod.MegakernelDriver._validate_runner_hf_config(
                 _make_runner(dense_cand)
             )
             assert driver_mod.maybe_create(_make_runner(dense_cand)) is None
@@ -1372,7 +1386,8 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
             Qwen35.derive_geometry(scaled_cfg)
         caplog.clear()
         with caplog.at_level(logging.WARNING):
-            assert not driver_mod.Qwen35Megakernel._validate_runner_hf_config(
+            assert not Qwen35.validate_hf_config(scaled_cfg).eligible
+            assert not driver_mod.MegakernelDriver._validate_runner_hf_config(
                 _make_runner(scaled_cfg)
             )
             assert driver_mod.maybe_create(_make_runner(scaled_cfg)) is None
@@ -1399,7 +1414,8 @@ def test_validate_runner_hf_config_frozen_qwen35_config_json(
 
     frozen_cfg = frozen_utils.load_frozen_qwen35_config_json()
     for valid_cfg in (frozen_cfg, frozen_utils.dict_to_namespace(frozen_cfg)):
-        assert driver_mod.Qwen35Megakernel._validate_runner_hf_config(
+        assert Qwen35.validate_hf_config(valid_cfg).eligible
+        assert driver_mod.MegakernelDriver._validate_runner_hf_config(
             _make_runner(valid_cfg)
         )
 
