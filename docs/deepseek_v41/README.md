@@ -60,6 +60,14 @@ qualification. `TPU_EXPERT_PLACEMENT=<name|path>` is the harness alias for a
 launcher whose `--additional-config` is fixed; it fills the field in when the
 policy left it out and conflicts with a policy that set a different one.
 
+`MOE_FUSED_EP_DISPATCH=all_to_all` (default `all_gather`) changes how the fused
+EP MoE layer moves the routed rows to the shards that hold their experts. The
+all-gather gives every shard every row, so the bytes received per layer grow
+with the EP width (at DP32 C768, 32 x 144 rows x 5 KB = 23.6 MB per device and
+about 140 us of exposed wait per layer); the ragged all-to-all sends each row
+only to the shards it selected (about 4 MB per device at the same point), with
+the same output bit for bit. It enters the compile hash like every knob.
+
 `ced` deliberately approximates decoder SWA state and is not numerically
 equivalent to a full decoder pass for long prompts. It processes all encoder
 rows, publishes global KV, and evaluates the decoder prompt tail. Prefix caching

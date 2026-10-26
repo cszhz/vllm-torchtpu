@@ -47,16 +47,24 @@ def scatter_pair(
     token_size: int,
     scale_size: int,
     topk: int,
+    tokens: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Scatter token IDs and scale bits from nonnegative local slab rows.
 
     Caller checks scratch capacity with can_scatter_pair.
     Each subcore owns disjoint output rows; duplicate updates add modulo
     int32, and off-shard sentinel rows are dropped. Scale padding is retained.
+    `tokens` [n] i32 replaces pair p's token id p // topk with the caller's
+    value -- the row the token's bytes sit at when the dispatch did not land
+    them in token order -- so the table comes out remapped with no gather.
     """
     n = rows.size
     aligned_n, width, subcores = _scratch_shape(n, max(token_size, scale_size))
-    tokens = jnp.arange(n, dtype=jnp.int32) // topk
+    tokens = (
+        jnp.arange(n, dtype=jnp.int32) // topk
+        if tokens is None
+        else tokens.astype(jnp.int32)
+    )
     padding = aligned_n - n
     rows = jnp.pad(rows, (0, padding), constant_values=max(token_size, scale_size))
     scales = jnp.pad(scales, (0, padding))

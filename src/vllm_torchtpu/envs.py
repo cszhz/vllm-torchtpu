@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_PREPROCESS_BACKEND: str = "native"
+    MOE_FUSED_EP_DISPATCH: str = "all_gather"
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
@@ -690,6 +691,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # across the supported serving shape/topology matrix and becomes default.
     "MOE_FUSED_EP_PREPROCESS_BACKEND": env_with_choices(
         "MOE_FUSED_EP_PREPROCESS_BACKEND", "native", ["native", "topology"]
+    ),
+    # How fused EP MoE v2 moves the routed rows to the shards holding their
+    # experts: all_gather (every shard receives every row; the bytes grow
+    # with the EP width) or all_to_all (a ragged all-to-all carrying each row
+    # only to the shards it selected; the bytes are set by the global batch).
+    # Same output bit for bit. Default off until measured at the served widths.
+    "MOE_FUSED_EP_DISPATCH": env_with_choices(
+        "MOE_FUSED_EP_DISPATCH", "all_gather", ["all_gather", "all_to_all"]
     ),
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for

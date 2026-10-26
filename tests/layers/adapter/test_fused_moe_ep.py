@@ -1143,7 +1143,7 @@ def _placed_layer(slots=5, experts_logical=8, **overrides):
     table[:, 0] = torch.arange(experts_logical)
     table[0, 1] = experts_logical  # expert 0 twice: slots 0 and the spare
     table[1, 1] = experts_logical + slots  # expert 1 twice: the other spare
-    setattr(layer, "_tpu_expert_slot", table)
+    layer._tpu_expert_slot = table
     return layer
 
 
@@ -1172,7 +1172,9 @@ def test_an_unplaced_layer_does_not_declare_the_slot_operand():
 
 @pytest.mark.parametrize("physical", [8, 12])
 def test_a_placed_layer_whose_slots_do_not_match_its_layout_is_refused(physical):
-    with patch.object(bridge.expert_placement, "physical_experts", return_value=physical):
+    with patch.object(
+        bridge.expert_placement, "physical_experts", return_value=physical
+    ):
         assert _prebuild(_placed_layer()) is None
 
 
@@ -1189,7 +1191,20 @@ def test_op_key_tells_placed_and_unplaced_closures_apart():
         patch.dict(bridge._OPS, {}, clear=True),
     ):
         jax_op.side_effect = lambda *a, **k: MagicMock(register_fake=lambda f: None)
-        common = ("mesh", 2, True, "silu", None, False, "fp8", None, "softmax", False, 1.0, False)
+        common = (
+            "mesh",
+            2,
+            True,
+            "silu",
+            None,
+            False,
+            "fp8",
+            None,
+            "softmax",
+            False,
+            1.0,
+            False,
+        )
         with patch(
             "vllm_torchtpu.compilation.moe_preprocessing.prepare_moe_preprocessing",
             return_value=None,
@@ -1234,7 +1249,20 @@ def test_op_with_the_load_accumulator_donates_it_and_returns_two_outputs():
         patch.dict(bridge._OPS, {}, clear=True),
     ):
         jax_op.side_effect = lambda *a, **k: MagicMock(register_fake=lambda f: None)
-        common = ("mesh", 2, True, "silu", None, False, "fp8", None, "softmax", True, 1.0, False)
+        common = (
+            "mesh",
+            2,
+            True,
+            "silu",
+            None,
+            False,
+            "fp8",
+            None,
+            "softmax",
+            True,
+            1.0,
+            False,
+        )
         with patch(
             "vllm_torchtpu.compilation.moe_preprocessing.prepare_moe_preprocessing",
             return_value=None,
@@ -1254,12 +1282,17 @@ def test_op_with_the_load_accumulator_donates_it_and_returns_two_outputs():
     # one for the placed-only closure.
     import inspect
 
-    assert inspect.signature(with_load.args[1]).return_annotation == tuple[jnp.ndarray, jnp.ndarray] or (
-        inspect.signature(with_load.args[1]).return_annotation == tuple[bridge.jax.Array, bridge.jax.Array]
+    assert inspect.signature(with_load.args[1]).return_annotation == tuple[
+        jnp.ndarray, jnp.ndarray
+    ] or (
+        inspect.signature(with_load.args[1]).return_annotation
+        == tuple[bridge.jax.Array, bridge.jax.Array]
     )
     assert inspect.signature(without.args[1]).return_annotation is bridge.jax.Array
     assert without.kwargs["donate_argnums"] is None
-    assert without.kwargs["output_partition_specs"] == bridge.PartitionSpec(bridge.EP_AXIS_NAME)
+    assert without.kwargs["output_partition_specs"] == bridge.PartitionSpec(
+        bridge.EP_AXIS_NAME
+    )
 
 
 def test_forward_writes_the_returned_accumulator_back():
@@ -1273,8 +1306,75 @@ def test_forward_writes_the_returned_accumulator_back():
     s2 = torch.ones(2, 1, 1, 4)
     with patch.object(bridge, "_RANK_BUFFER", "rank"):
         out = bridge.fused_moe_ep(
-            owner, torch.zeros(3, 4), w1, w2, s1, s2, torch.zeros(3, 4), None, None, None, load
+            owner,
+            torch.zeros(3, 4),
+            w1,
+            w2,
+            s1,
+            s2,
+            torch.zeros(3, 4),
+            None,
+            None,
+            None,
+            load,
         )
     assert out == "out"
     assert op.call_args.args[-1] is load
     assert load.tolist() == list(range(8))
+
+
+# ---------------------------------------------------------------------------
+# MOE_FUSED_EP_DISPATCH: how the fused layer moves the routed rows.
+
+
+def test_op_key_tells_the_dispatch_modes_apart():
+    with (
+        patch.object(bridge, "jax_op") as jax_op,
+        patch.dict(bridge._OPS, {}, clear=True),
+    ):
+        jax_op.side_effect = lambda *a, **k: MagicMock(register_fake=lambda f: None)
+        common = (
+            "mesh",
+            2,
+            True,
+            "silu",
+            None,
+            False,
+            "fp8",
+            None,
+            "softmax",
+            False,
+            1.0,
+            False,
+        )
+        with patch(
+            "vllm_torchtpu.compilation.moe_preprocessing.prepare_moe_preprocessing",
+            return_value=None,
+        ):
+            gathered = bridge._build_op(*common)
+            exchanged = bridge._build_op(*common, dispatch="all_to_all")
+            again = bridge._build_op(*common, dispatch="all_to_all")
+    assert gathered is not exchanged and exchanged is again
+
+
+@pytest.mark.parametrize("setting", ["all_gather", "all_to_all"])
+def test_dispatch_knob_reaches_the_built_op(monkeypatch, setting):
+    name = "MOE_FUSED_EP_DISPATCH"
+    monkeypatch.setenv(name, setting)
+    value = envs.environment_variables[name]()
+    assert value == setting
+    monkeypatch.setitem(vars(envs), name, value)
+    calls = []
+
+    def build_op(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "op"
+
+    assert _prebuild(_layer(), build_op=build_op) == "op"
+    assert calls[0][1]["dispatch"] == setting
+
+
+def test_dispatch_knob_refuses_an_unknown_mode(monkeypatch):
+    monkeypatch.setenv("MOE_FUSED_EP_DISPATCH", "broadcast")
+    with pytest.raises(ValueError):
+        envs.environment_variables["MOE_FUSED_EP_DISPATCH"]()

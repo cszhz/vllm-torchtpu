@@ -1128,7 +1128,9 @@ def _placement_slots(rng, e_total, spare, ep=EP):
     return expert_of_slot, table
 
 
-def _placed_fp4_case(mesh, rng, *, e_total, spare, tokens, hidden, inter, topk, routing):
+def _placed_fp4_case(
+    mesh, rng, *, e_total, spare, tokens, hidden, inter, topk, routing
+):
     weights, scales, _ = _make_fp4_weights(
         mesh, 52, hidden=hidden, inter=inter, e_total=e_total, rhs_qb=512
     )
@@ -1141,7 +1143,9 @@ def _placed_fp4_case(mesh, rng, *, e_total, spare, tokens, hidden, inter, topk, 
 
     extra = {}
     if routing == "score_bias":
-        extra["score_bias"] = jnp.asarray(rng.normal(size=(e_total,)).astype(np.float32))
+        extra["score_bias"] = jnp.asarray(
+            rng.normal(size=(e_total,)).astype(np.float32)
+        )
     elif routing == "hash":
         extra["hash_topk_ids"] = _make_hash_ids(
             mesh, 55, tokens=tokens, topk=topk, e_total=e_total
@@ -1177,8 +1181,15 @@ def test_expert_slot_placement_is_bit_exact(routing, spare):
     mesh = _mesh()
     rng = np.random.default_rng(54 + spare)
     x, gating, weights, scales, placed_weights, slot_table, common = _placed_fp4_case(
-        mesh, rng, e_total=32, spare=spare, tokens=256, hidden=1024, inter=512,
-        topk=4, routing=routing,
+        mesh,
+        rng,
+        e_total=32,
+        spare=spare,
+        tokens=256,
+        hidden=1024,
+        inter=512,
+        topk=4,
+        routing=routing,
     )
     identity = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
     placed = fused_ep_moe_v2(
@@ -1198,8 +1209,15 @@ def test_thirteen_slot_layout_is_bit_exact_at_the_dp32_shape():
     mesh = _mesh()
     rng = np.random.default_rng(61)
     x, gating, weights, scales, placed_weights, slot_table, common = _placed_fp4_case(
-        mesh, rng, e_total=96, spare=1, tokens=1152, hidden=1024, inter=512,
-        topk=6, routing="score_bias",
+        mesh,
+        rng,
+        e_total=96,
+        spare=1,
+        tokens=1152,
+        hidden=1024,
+        inter=512,
+        topk=6,
+        routing="score_bias",
     )
     assert slot_table.shape == (96, 2)
     identity = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
@@ -1262,7 +1280,118 @@ def test_expert_load_counts_the_rows_per_physical_slot():
     )
     plain = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
     load = jnp.full((e_total,), 5, jnp.int32)
-    out, updated = fused_ep_moe_v2(x, *weights, *scales, gating, expert_load=load, **common)
+    out, updated = fused_ep_moe_v2(
+        x, *weights, *scales, gating, expert_load=load, **common
+    )
     np.testing.assert_array_equal(np.asarray(out), np.asarray(plain))
     expected = 5 + np.bincount(np.asarray(hash_ids).ravel(), minlength=e_total)
+    np.testing.assert_array_equal(np.asarray(updated), expected)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch: the ragged all-to-all moves each wire row only to the shards whose
+# experts it selected; the kernel computes on the same bytes through a
+# remapped token index, so the output is the all-gather dispatch's bit for bit.
+
+
+@pytest.mark.parametrize("spare", [0, 1])
+@pytest.mark.parametrize("routing", ["topk", "score_bias", "hash"])
+def test_all_to_all_dispatch_is_bit_exact_with_the_all_gather(routing, spare):
+    """On the served fp4 block-512 form, for the plain top-k, bias-corrected
+    top-k and hash selections, under a layout with and without spare slots
+    (the DP32 arm runs the layout and this dispatch together)."""
+    mesh = _mesh()
+    rng = np.random.default_rng(91 + spare)
+    x, gating, _, _, placed_weights, slot_table, common = _placed_fp4_case(
+        mesh,
+        rng,
+        e_total=32,
+        spare=spare,
+        tokens=256,
+        hidden=1024,
+        inter=512,
+        topk=4,
+        routing=routing,
+    )
+    placed = dict(expert_slot=jnp.asarray(slot_table))
+    gathered = fused_ep_moe_v2(x, *placed_weights, gating, **placed, **common)
+    exchanged = fused_ep_moe_v2(
+        x, *placed_weights, gating, dispatch="all_to_all", **placed, **common
+    )
+    np.testing.assert_array_equal(np.asarray(exchanged), np.asarray(gathered))
+
+
+@pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
+def test_all_to_all_dispatch_is_bit_exact_without_a_layout(sharded_plan):
+    mesh = _mesh()
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 93, hidden=1024, inter=512, e_total=32, rhs_qb=512
+    )
+    x, gating = _make_inputs(mesh, 94, tokens=512, hidden=1024, e_total=32)
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=sharded_plan,
+        scoring_fn="sigmoid",
+    )
+    gathered = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    exchanged = fused_ep_moe_v2(
+        x, *weights, *scales, gating, dispatch="all_to_all", **common
+    )
+    np.testing.assert_array_equal(np.asarray(exchanged), np.asarray(gathered))
+
+
+def test_all_to_all_dispatch_is_bit_exact_at_the_dp32_shape():
+    """96 experts over 8 shards with one spare slot each and 1152 tokens:
+    the DP32 C768 per-device geometry, layout and all-to-all together."""
+    mesh = _mesh()
+    rng = np.random.default_rng(95)
+    x, gating, _, _, placed_weights, slot_table, common = _placed_fp4_case(
+        mesh,
+        rng,
+        e_total=96,
+        spare=1,
+        tokens=1152,
+        hidden=1024,
+        inter=512,
+        topk=6,
+        routing="score_bias",
+    )
+    placed = dict(expert_slot=jnp.asarray(slot_table))
+    gathered = fused_ep_moe_v2(x, *placed_weights, gating, **placed, **common)
+    exchanged = fused_ep_moe_v2(
+        x, *placed_weights, gating, dispatch="all_to_all", **placed, **common
+    )
+    np.testing.assert_array_equal(np.asarray(exchanged), np.asarray(gathered))
+
+
+def test_all_to_all_dispatch_keeps_the_load_accumulator():
+    mesh = _mesh()
+    e_total, tokens, topk = 32, 256, 4
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 96, hidden=1024, inter=512, e_total=e_total, rhs_qb=512
+    )
+    x, gating = _make_inputs(mesh, 97, tokens=tokens, hidden=1024, e_total=e_total)
+    hash_ids = _make_hash_ids(mesh, 98, tokens=tokens, topk=topk, e_total=e_total)
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        hash_topk_ids=hash_ids,
+        dispatch="all_to_all",
+    )
+    load = jnp.zeros((e_total,), jnp.int32)
+    _, updated = fused_ep_moe_v2(
+        x, *weights, *scales, gating, expert_load=load, **common
+    )
+    expected = np.bincount(np.asarray(hash_ids).ravel(), minlength=e_total)
     np.testing.assert_array_equal(np.asarray(updated), expected)

@@ -404,6 +404,7 @@ class TpuPlatform(Platform):
         "TPU_MOE_ROUTER_TOPK",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_PREPROCESS_BACKEND",
+        "MOE_FUSED_EP_DISPATCH",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
     ]

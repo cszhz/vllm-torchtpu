@@ -1008,12 +1008,15 @@ def local_slab_rows(routing, me, *, shard_stride):
     )
 
 
-def shard_token_gather(routing, me, *, shard_stride, rows=None):
+def shard_token_gather(routing, me, *, shard_stride, rows=None, token_of=None):
     """The token number each of shard `me`'s slab rows computes, [stride].
 
     `rows` is the destination slab row of each routed pair, which is derived
     here when the caller does not hold it already; passing it in keeps both
-    slab scatters on one index.
+    slab scatters on one index. `token_of` [T] i32 replaces the token number
+    scattered for each token with the caller's value -- the row a token's
+    bytes sit at when the dispatch did not land them in token order -- so
+    the table comes out remapped with no gather of its own.
 
     The scatter runs against this shard's slab alone rather than against the
     replicated ep-wide slab followed by a slice, which built seven eighths
@@ -1035,9 +1038,12 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
     # broadcast K times. K is the selection width and need not be a power
     # of two, so this is the spelling that removes the division rather
     # than the one that shifts it.
-    token_of_pair = jnp.broadcast_to(
-        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)
-    ).reshape(-1)
+    token_value = (
+        jnp.arange(T, dtype=jnp.int32)
+        if token_of is None
+        else token_of.astype(jnp.int32)
+    )
+    token_of_pair = jnp.broadcast_to(token_value[:, None], (T, K)).reshape(-1)
     row = (
         local_slab_rows(routing, me, shard_stride=shard_stride)
         if rows is None

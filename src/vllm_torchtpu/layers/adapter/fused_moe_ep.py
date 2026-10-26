@@ -53,7 +53,6 @@ from torch_tpu._internal.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu import expert_placement
-from vllm_torchtpu.layers.adapter import expert_load as expert_load_tap
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
@@ -66,6 +65,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     U32_SUBLANE_TILE,
     token_gather_smem_bytes,
 )
+from vllm_torchtpu.layers.adapter import expert_load as expert_load_tap
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -188,6 +188,7 @@ def _build_op(
     logical_intermediate_size: int | None = None,
     has_expert_slot=False,
     has_expert_load=False,
+    dispatch="all_gather",
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -218,6 +219,7 @@ def _build_op(
         logical_intermediate_size,
         has_expert_slot,
         has_expert_load,
+        dispatch,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -259,6 +261,7 @@ def _build_op(
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
             logical_intermediate_size=logical_intermediate_size,
+            dispatch=dispatch,
             **bias_kw,
             **routing_kw,
         )
@@ -745,7 +748,10 @@ def prebuild_fused_moe_ep(
         # and holds `slots` physical experts per rank; the kernel's e_total is
         # the physical count, which the layout fixes.
         physical = expert_placement.physical_experts(layer)
-        if local_experts * ep != physical or placed.shape[0] != layer.global_num_experts:
+        if (
+            local_experts * ep != physical
+            or placed.shape[0] != layer.global_num_experts
+        ):
             logger.warning_once(
                 "Fused EP MoE not engaged: the expert layout places %d physical "
                 "slots over %d logical experts, but this rank holds %d over "
@@ -793,12 +799,13 @@ def prebuild_fused_moe_ep(
         logical_intermediate_size=logical_intermediate_size,
         has_expert_slot=placed is not None,
         has_expert_load=expert_load_tap.enabled(),
+        dispatch=envs.MOE_FUSED_EP_DISPATCH,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
-        "token_replica_groups=%s expert_slot=%s",
+        "token_replica_groups=%s expert_slot=%s dispatch=%s",
         hidden,
         inter,
         local_experts,
@@ -816,6 +823,7 @@ def prebuild_fused_moe_ep(
         routed_scale,
         token_replica_groups,
         None if placed is None else tuple(placed.shape),
+        envs.MOE_FUSED_EP_DISPATCH,
     )
     # Two knobs stop applying the moment this arms, and neither would say so on
     # its own: the fused call returns before `apply_monolithic` reaches either

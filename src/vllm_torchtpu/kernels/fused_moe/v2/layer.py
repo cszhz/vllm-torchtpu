@@ -261,6 +261,56 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
     return mesh_block * g_local + topk_idx % g_local
 
 
+DISPATCH_MODES = ("all_gather", "all_to_all")
+
+
+def _all_to_all_send_plan(local_blocks, *, g_local, ep, t_local, topk):
+    """Sender's side of the ragged all-to-all dispatch.
+
+    From this shard's selections (slot ids, e_total for a slot that routes
+    nowhere): the local row each slot of the send buffer carries, in
+    destination-major order with each destination's rows in row order
+    (`send_rows` [t_local * min(topk, ep)]), the rows per destination
+    (`send_sizes` [ep]) and where each destination's run starts
+    (`input_offsets` [ep]). A row goes to a shard once however many of its
+    selections land there. Slots past the last run are padding never sent.
+    """
+    dest = local_blocks.reshape(t_local, topk) // g_local
+    shards = lax.broadcasted_iota(jnp.int32, (1, 1, ep), 2)
+    goes = jnp.any(dest[:, :, None] == shards, axis=1)  # [t_local, ep]
+    send_sizes = jnp.sum(goes, axis=0, dtype=jnp.int32)
+    input_offsets = jnp.cumsum(send_sizes, dtype=jnp.int32) - send_sizes
+    flat = goes.T.reshape(-1)  # destination-major, rows in order
+    slot = jnp.cumsum(flat.astype(jnp.int32), dtype=jnp.int32) - 1
+    s_max = t_local * min(topk, ep)
+    row = lax.rem(
+        lax.broadcasted_iota(jnp.int32, (ep * t_local,), 0), jnp.int32(t_local)
+    )
+    send_rows = (
+        jnp.zeros((s_max,), jnp.int32)
+        .at[jnp.where(flat, slot, jnp.int32(s_max))]
+        .set(row, mode="drop")
+    )
+    return send_rows, send_sizes, input_offsets
+
+
+def _all_to_all_recv_plan(pairs_g, me, *, g_local, ep, t_local, topk):
+    """Receiver's side: (`recv_sizes` [ep], `token_index` [ep * t_local]).
+
+    Shard r's rows land at r * t_local in the order r sent them, so token
+    t = shard r's row i sits at r * t_local + (r's rows before i that come
+    here); `token_index[t]` is that row. A token that does not come here
+    maps to a clamped row no live slab row reads.
+    """
+    dest = pairs_g.reshape(ep, t_local, topk) // g_local
+    comes = jnp.any(dest == me, axis=-1)  # [ep, t_local]
+    recv_sizes = jnp.sum(comes, axis=1, dtype=jnp.int32)
+    before = jnp.cumsum(comes.astype(jnp.int32), axis=1, dtype=jnp.int32) - 1
+    block = lax.broadcasted_iota(jnp.int32, (ep, t_local), 0) * jnp.int32(t_local)
+    token_index = jnp.clip(block + before, 0, ep * t_local - 1).reshape(-1)
+    return recv_sizes, token_index
+
+
 # Local tokens at or above which the activation all-gather is enqueued ahead
 # of the slab scatters. Measured, not chosen: +2.80% at t_local 2048 and
 # -0.01 / -7.81 / -1.92 / -1.94% at 1024 / 256 / 64 / 32, because the scatters
@@ -308,6 +358,7 @@ def fused_ep_moe_v2(
     routed=None,
     gather_positions=None,
     preprocess_topology: PreprocessTopology | None = None,
+    dispatch="all_gather",
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -394,6 +445,17 @@ def fused_ep_moe_v2(
     selected ids are mapped to slots before dispatch. Each token therefore
     gets the same experts and the same arithmetic, on whichever shard holds
     them. None is the identity: slot e holds expert e.
+
+    dispatch names how the wire rows reach the shards whose experts they
+    selected. "all_gather" (the default) gathers every shard's rows onto
+    every shard, so the buffer and the bytes moved grow with the EP width
+    (ep x rows per shard). "all_to_all" sends each row only to the shards it
+    selected, over a ragged all-to-all into a buffer of the same shape with
+    shard r's rows at r * rows per shard in the order sent; the bytes moved
+    are set by the global batch alone (at most rows per shard x topk), and
+    the kernel reads the same bytes through a remapped token index, so its
+    output is the all-gather dispatch's bit for bit. Fused stage only: the
+    split stages gather by construction.
 
     expert_load [e_total] i32, replicated, is a routed-row accumulator: with
     it the layer returns (output, expert_load + this step's rows per physical
@@ -488,6 +550,13 @@ def fused_ep_moe_v2(
         raise ValueError(f"stage must be fused, route or compute; got {stage!r}")
     if (routed is not None) != (stage == "compute"):
         raise ValueError('routed is passed exactly when stage == "compute"')
+    if dispatch not in DISPATCH_MODES:
+        raise ValueError(f"dispatch must be one of {DISPATCH_MODES}; got {dispatch!r}")
+    if dispatch == "all_to_all" and stage != "fused":
+        raise ValueError(
+            "the all-to-all dispatch belongs to the fused stage; the split "
+            "stages hand the gathered rows across their boundary"
+        )
     if gather_positions is not None:
         gather_positions = tuple(int(i) for i in gather_positions)
         if stage != "compute" or tuple(sorted(gather_positions)) != tuple(range(ep)):
@@ -763,8 +832,14 @@ def fused_ep_moe_v2(
         bias_it,
         out_dtype,
         expert_load_l=None,
+        token_index=None,
     ):
-        """Plan, kernel and combine over the gathered rows and payload."""
+        """Plan, kernel and combine over the exchanged rows and payload.
+
+        `token_index` [T] is set by the all-to-all dispatch: the receive
+        buffer's row holding each token, which the kernel's token gather is
+        read through. None means the rows sit in token order (gathered).
+        """
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
@@ -814,22 +889,37 @@ def fused_ep_moe_v2(
         # smaller shape, so it is taken only where the routing plan in front
         # of the collective is longer than the scatters behind it. Same bits
         # either way; only the queue moves.
-        if not use_split_sc and t_local >= AGQ_MIN_LOCAL_TOKENS:
+        if (
+            dispatch == "all_gather"
+            and not use_split_sc
+            and t_local >= AGQ_MIN_LOCAL_TOKENS
+        ):
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
         merged_scale_bits = None
         if use_split_sc:
             from vllm_torchtpu.kernels.fused_moe.v2.scatter import scatter_pair
 
+            # Under the all-to-all the rows arrived out of token order: token
+            # t sits at token_index[t] of the receive buffer. The scatter then
+            # writes each pair's receive row instead of its token number --
+            # the same table with no gather of its own (a take over the
+            # [stride] table cost 124 us per layer at DP32). The plan, the
+            # pushes and the combine stay in token order either way.
             token_gather, merged_scale_bits = scatter_pair(
                 slab_row,
                 jnp.repeat(cast(jax.Array, scale_bits_g), topk),
                 ragged_stride,
                 act_scale_slab_rows(ragged_stride) * HIDDEN_LANE_BLOCK,
                 topk,
+                tokens=None if token_index is None else jnp.repeat(token_index, topk),
             )
         else:
             token_gather = shard_token_gather(
-                routing, me, shard_stride=ragged_stride, rows=slab_row
+                routing,
+                me,
+                shard_stride=ragged_stride,
+                rows=slab_row,
+                token_of=token_index,
             )
         if gather_positions is not None:
             # The rows were gathered in another order than the mesh's, so
@@ -965,6 +1055,62 @@ def fused_ep_moe_v2(
         )
     )
 
+    def gather_payload(packed):
+        """Every shard's routing payload, [ep, width]: the one small all-gather
+        both dispatches make (on the SparseCore where the topology path
+        offloads it)."""
+        if use_split_sc:
+            from jax.experimental.compute_on import compute_on
+
+            return compute_on(
+                lambda p: lax.all_gather(p, ax, axis=0, tiled=True),
+                compute_type="tpu_sparsecore",
+                out_memory_spaces=jax.memory.Space.Device,
+                compiler_options={"sparse_core_config": {"core_ids": [0]}},
+            )(packed).reshape(ep, layout[-1])
+        return lax.all_gather(packed, ax, axis=0, tiled=True).reshape(ep, layout[-1])
+
+    def exchange_rows_all_to_all(q_l, local_blocks, exchange, me):
+        """The wire rows, each on the shards that selected it, by ragged
+        all-to-all.
+
+        Returns the receive buffer -- [T, lane blocks, 128] like the gathered
+        rows, shard r's rows at r * t_local in the order sent -- and the token
+        index that puts token t's row under the kernel's token gather.
+        """
+        send_rows, send_sizes, input_offsets = _all_to_all_send_plan(
+            local_blocks, g_local=g_local, ep=ep, t_local=t_local, topk=topk
+        )
+        # What this shard receives from each is what each sends it: one
+        # [ep]-wide all-gather of the send sizes, so the rows' exchange waits
+        # for 128 bytes per shard rather than for the routing payload, which
+        # only the plan tables need and which keeps gathering meanwhile.
+        sizes_g = lax.all_gather(send_sizes, ax, axis=0, tiled=False)  # [src, dst]
+        recv_sizes = lax.dynamic_index_in_dim(sizes_g, me, axis=1, keepdims=False)
+        pairs_g, _, _ = _unpack_routing_exchange(
+            exchange, layout, t_local, topk, e_total
+        )
+        _, token_index = _all_to_all_recv_plan(
+            pairs_g, me, g_local=g_local, ep=ep, t_local=t_local, topk=topk
+        )
+        # Destination-major: shard d's rows are one run at input_offsets[d].
+        send = jnp.take(q_l, send_rows, axis=0)
+        # Every run this shard sends lands in its own block of the receiver.
+        # A shard never sends another shard more than its t_local rows, so
+        # the blocks cannot overlap and no receive offsets are exchanged.
+        output_offsets = jnp.full((ep,), me * t_local, jnp.int32)
+        empty = jnp.zeros((T, *q_l.shape[1:]), q_l.dtype)
+        received = lax.ragged_all_to_all(
+            send,
+            empty,
+            input_offsets,
+            send_sizes,
+            output_offsets,
+            recv_sizes,
+            axis_name=ax,
+        )
+        return received, token_index
+
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
         (
@@ -978,9 +1124,19 @@ def fused_ep_moe_v2(
             bias_it,
         ) = unpack_operands(scales_gating_biases)
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
-        if use_split_sc:
-            from jax.experimental.compute_on import compute_on
-
+        token_index = None
+        if dispatch == "all_to_all":
+            # Select first: what a shard sends is what it routed, and what it
+            # receives is in the payload, so the rows' exchange waits for the
+            # payload's rather than running ahead of the selection.
+            topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
+                gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
+            )
+            exchange = gather_payload(packed)
+            q_g, token_index = exchange_rows_all_to_all(
+                q_l, local_blocks, exchange, rank_l[0, 0]
+            )
+        elif use_split_sc:
             from vllm_torchtpu.kernels.fused_moe.v2.topology_all_gather import (
                 all_gather,
             )
@@ -995,20 +1151,13 @@ def fused_ep_moe_v2(
                     )
                 )
             with jax.named_scope("moe_metadata_ag"):
-                exchange = compute_on(
-                    lambda p: lax.all_gather(p, ax, axis=0, tiled=True),
-                    compute_type="tpu_sparsecore",
-                    out_memory_spaces=jax.memory.Space.Device,
-                    compiler_options={"sparse_core_config": {"core_ids": [0]}},
-                )(packed).reshape(ep, layout[-1])
+                exchange = gather_payload(packed)
         else:
             q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
             topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
                 gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
             )
-            exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
-                ep, layout[-1]
-            )
+            exchange = gather_payload(packed)
         return compute_local(
             q_g,
             exchange,
@@ -1024,6 +1173,7 @@ def fused_ep_moe_v2(
             bias_it,
             x_l.dtype,
             expert_load_l,
+            token_index=token_index,
         )
 
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -1107,7 +1257,8 @@ def fused_ep_moe_v2(
     expert_load_args = (expert_load,) if has_expert_load else ()
     in_specs = (
         (P(ax),) * (5 + len(scale_args) + len(hash_args))
-        + (P(),) * (len(score_bias_args) + len(expert_slot_args) + len(expert_load_args))
+        + (P(),)
+        * (len(score_bias_args) + len(expert_slot_args) + len(expert_load_args))
         + (P(ax),) * len(bias_args)
     )
     args = (
@@ -1159,6 +1310,7 @@ def fused_ep_moe_v2(
         has_expert_load,
         float(routed_scaling_factor),
         stage,
+        dispatch,
         gather_positions,
         logical_intermediate_size,
     )
