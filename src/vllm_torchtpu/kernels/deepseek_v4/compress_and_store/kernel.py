@@ -33,18 +33,29 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import kv_cache_append
 # the staged lanes in VMEM, and DMAing the batch back to HBM.
 _SAL_MAX_WAVE = 128
 
+# Boundary tokens per grid step. The step's DMA issue and its dependent
+# compute chain are mostly latency, so more tokens per step amortize them.
+TILE_N = 32
+# HCA's window is 16x CSA's; at 16 tokens its double-buffered window block
+# alone overflows scoped VMEM.
+HCA_TILE_N = 4
+# Tokens a cache-row merge (`is_first_mask`) looks across: the 4-token groups
+# `prepare_boundary_batch` aligns rows to, as when a step held 4 tokens.
+MERGE_GROUP = 4
+
 
 def inner_kernel(
     cos_sin_vmem,
     out_vmem,
-    page_buffer_vmem,
+    window_vmem,
+    rope_in_vmem,
     rope_out_vmem,
     positions_ref,
     rms_weight_vmem_ref,
-    window_vmem,
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
+    masked_tiles_ref,
     records_t_ref=None,
     *,
     cfgs: config.Configs,
@@ -56,50 +67,34 @@ def inner_kernel(
     pid = pl.program_id(0)
     global_idx = pid * tile_n
 
-    # Per-token window start = position - window + 1
-    start_list = []
-    for i in range(tile_n):
-        idx = global_idx + i
-        safe_idx = jax.lax.select(idx < cfgs.dims.size_n, idx, 0)
-        start_list.append(positions_ref[safe_idx] - window + 1)
-    start = jnp.stack(start_list)  # (tile_n,)
-
-    window_u8 = window_vmem.bitcast(jnp.uint8).reshape(
-        2, tile_n, window, head_tiles, 4, 128
-    )
-    kv_window_u8 = window_u8.at[0]
-    score_window_u8 = window_u8.at[1]
-
-    compute.gather_from_page_buffer(
-        page_buffer=page_buffer_vmem,
-        positions_ref=positions_ref,
-        kv_window_u8=kv_window_u8,
-        score_window_u8=score_window_u8,
-        global_idx=global_idx,
-        num_tokens=cfgs.dims.size_n,
-        window=window,
-        block_size=cfgs.state_block_size,
-        pages_to_buffer_per_token=cfgs.pages_to_buffer_per_token,
-        field_rows=cfgs.field_rows,
-        state_rows_per_token=cfgs.state_rows_per_token,
-        overlap=cfgs.dims.overlap,
-        is_indexer=cfgs.dims.mode == config.Mode.CSA_INDEXER,
-    )
-
-    kv_val = window_vmem.at[0][...]  # (tile_n, window, head_tiles, 128)
-    scores_val = window_vmem.at[1][...]  # (tile_n, window, head_tiles, 128)
+    kv_val = window_vmem.at[0][...]  # (window, tile_n * head_tiles, 128)
+    scores_val = window_vmem.at[1][...]  # (window, tile_n * head_tiles, 128)
     rms_weight_tiled = rms_weight_vmem_ref[...].astype(jnp.float32)  # (head_tiles, 128)
 
     # --- windowed softmax ---
-    curr_pos = start[:, None] + jnp.arange(window)[None, :]  # (tile_n, window)
-    mask = curr_pos >= 0  # (tile_n, window)
-    mask_float = mask.astype(scores_val.dtype)
-    mask_float_reshaped = mask_float[:, :, None, None]  # (tile_n, window, 1, 1)
-    neg_inf = jnp.array(-jnp.inf, dtype=scores_val.dtype)
-    masked_scores = jnp.where(mask_float_reshaped > 0.5, scores_val, neg_inf)
-    weights = jax.nn.softmax(masked_scores, axis=1)
-    kv_val = jnp.where(mask_float_reshaped > 0.5, kv_val, 0.0)
-    compressed = jnp.sum(weights * kv_val, axis=1)  # (tile_n, head_tiles, 128)
+    def masked_sum():
+        # Window entries before position 0 are masked out. Block row r holds
+        # head tile r % head_tiles of token r // head_tiles.
+        row_shape = kv_val.shape[1:]
+        row_token = jax.lax.broadcasted_iota(jnp.int32, row_shape, 0) // head_tiles
+        start = jnp.zeros(row_shape, jnp.int32)
+        for i in range(tile_n):
+            token_start = positions_ref[global_idx + i] - window + 1
+            start = jnp.where(row_token == i, token_start, start)
+        offset = jax.lax.broadcasted_iota(jnp.int32, kv_val.shape, 0)
+        mask = start[None] + offset >= 0  # (window, tile_n * head_tiles, 128)
+        neg_inf = jnp.array(-jnp.inf, dtype=scores_val.dtype)
+        return _window_sum(
+            jnp.where(mask, kv_val, 0.0), jnp.where(mask, scores_val, neg_inf), 0
+        )
+
+    # A tile whose real tokens all see a full window needs no mask; padding
+    # tokens' results are never stored.
+    compressed = jax.lax.cond(
+        masked_tiles_ref[pid] != 0,
+        masked_sum,
+        lambda: _window_sum(kv_val, scores_val, 0),
+    ).reshape(tile_n, head_tiles, 128)
 
     # --- rms norm ---
     variance = jnp.mean(jnp.square(compressed), axis=(1, 2), keepdims=True)
@@ -170,35 +165,40 @@ def inner_kernel(
                 def _merge_nope():
                     # only applicable to csa-indexer
                     # out_vmem shape: (tile_n, 1, 4, 256)
+                    group = _merge_group(n)
                     slots_val = out_vmem[n, 0]
                     out_vmem[n, 0] = compute.merge_slot_updates(
                         slots_val,
-                        kv_slots,
-                        nope_val_padded,
-                        n,
+                        kv_slots[group],
+                        nope_val_padded[group],
+                        n % MERGE_GROUP,
                     )
 
         else:
             out_vmem[:, 0] = nope_val_padded
         if cfgs.dims.has_rope_cache:
             # RoPE row of 4 tokens, token j in words [32 j, 32 j + 32) (see
-            # `csa_cache_layout`); rope_out_vmem holds each row-writer's row.
-            words = compute.rope_words_tiled(rope_ropped, cfgs.dims.rope_head_dim)
-            rope_lane = config.LANE - cfgs.dims.rope_head_dim
-            kv_slots = []
-            for i in range(tile_n):
-                kv_slots.append(kv_slot_mapping_ref[global_idx + i])
-            kv_slots = jnp.stack(kv_slots)
-            for n in range(tile_n):
-                is_first = is_first_mask_rope_ref[global_idx + n]
-
-                @pl.when(is_first)
-                def _merge_rope():
-                    row = pltpu.bitcast(rope_out_vmem[n], jnp.int32)  # (1, 128)
-                    rope_out_vmem[n] = pltpu.bitcast(
-                        compute.merge_rope_row(row, kv_slots, words, rope_lane, n),
-                        jnp.uint8,
-                    )
+            # `csa_cache_layout`); rope_in_vmem holds each row-writer's row,
+            # merged into rope_out_vmem. Rows of other tokens are computed
+            # too, but not written back (RoPEOutputRef).
+            lanes = config.LANE
+            words = compute.rope_words_tiled(
+                rope_ropped.reshape(tile_n, lanes), cfgs.dims.rope_head_dim
+            )
+            kv_slots = jnp.stack(
+                [kv_slot_mapping_ref[global_idx + i] for i in range(tile_n)]
+            )
+            rows = pltpu.bitcast(rope_in_vmem[...], jnp.int32).reshape(tile_n, lanes)
+            merged = compute.merge_rope_rows(
+                rows,
+                jnp.broadcast_to(kv_slots[:, None], (tile_n, lanes)),
+                words,
+                lanes - cfgs.dims.rope_head_dim,
+                MERGE_GROUP,
+            )
+            rope_out_vmem[...] = pltpu.bitcast(
+                merged.reshape(tile_n, 1, lanes), jnp.uint8
+            )
 
     else:
         # hca: bitcast bf16 -> uint8 and match the output block shape.
@@ -207,13 +207,27 @@ def inner_kernel(
         ).reshape(tile_n, cfgs.record_rows, cfgs.hbm_pack, 128)
 
 
+def _window_sum(kv, scores, axis: int):
+    """Softmax(scores)-weighted sum of kv over the window `axis`."""
+    weights = jax.nn.softmax(scores, axis=axis)
+    return jnp.sum(weights * kv, axis=axis)
+
+
+def _merge_group(n: int) -> slice:
+    """The `MERGE_GROUP` tokens of the step whose rows token `n` merges."""
+    start = n // MERGE_GROUP * MERGE_GROUP
+    return slice(start, start + MERGE_GROUP)
+
+
 def kernel_fn(
     # prefetched inputs (scalar)
-    token_pages_ref,
+    window_runs_ref,
     positions_ref,
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
+    dma_counts_ref,
+    masked_tiles_ref,
     grid_size_ref,
     rms_weight_ref,
     # HBM inputs (dynamic access)
@@ -224,7 +238,6 @@ def kernel_fn(
     # outputs (aliased)
     _out_cache_ref,
     _out_rope_cache_ref,
-    window_scratch_ref,
     *sal_scratch,
     cfgs: config.Configs,
 ):
@@ -252,10 +265,11 @@ def kernel_fn(
         state_cache_ref=state_cache_ref,
         cos_sin_cache_ref=cos_sin_cache_ref,
         positions_ref=positions_ref,
-        token_pages_ref=token_pages_ref,
+        window_runs_ref=window_runs_ref,
         kv_slot_mapping_ref=kv_slot_mapping_ref,
         is_first_mask_ref=is_first_mask_ref,
         is_first_mask_rope_ref=is_first_mask_rope_ref,
+        dma_counts_ref=dma_counts_ref,
     )
     records_t_ref = sal_scratch[0] if cfgs.dims.seq_along_lane else None
 
@@ -273,10 +287,10 @@ def kernel_fn(
             scratches=(
                 positions_ref,
                 rms_weight_ref,
-                window_scratch_ref,
                 kv_slot_mapping_ref,
                 is_first_mask_ref,
                 is_first_mask_rope_ref,
+                masked_tiles_ref,
             )
             + ((records_t_ref,) if records_t_ref is not None else ()),
             allocations=allocations,
@@ -308,6 +322,45 @@ def kernel_fn(
             sems.at[1],
             wave=rmw_ref.shape[0],
         )
+
+
+def _tile_dma_counts(kv_slot_mapping, is_first_mask_rope, cfgs):
+    """Per grid step: [record DMAs, RoPE row DMAs], as `buffered_ref` issues them.
+
+    Lets a step wait for its per-token DMAs by count (`_wait_tokens`).
+    """
+    if cfgs.dims.seq_along_lane:
+        return jnp.zeros((1,), jnp.int32)  # SAL issues no per-token DMAs.
+    valid = (kv_slot_mapping >= 0).reshape(-1, cfgs.tile_sizes.tile_n)
+    rope = valid & is_first_mask_rope.reshape(valid.shape)
+    return jnp.stack([valid.sum(1), rope.sum(1)], 1).astype(jnp.int32).reshape(-1)
+
+
+def _masked_tiles(positions, kv_slot_mapping, cfgs):
+    """Per grid step: whether a real token's window reaches before position 0."""
+    short = (kv_slot_mapping >= 0) & (positions < cfgs.window - 1)
+    return jnp.any(short.reshape(-1, cfgs.tile_sizes.tile_n), axis=1).astype(jnp.int32)
+
+
+def _window_runs(positions, token_to_req_indices, block_table, stride, cfgs):
+    """Every token's window runs as `page << run_offset_bits | offset`.
+
+    Run c covers states `[start + c * run, start + (c + 1) * run)` of the
+    window ending at the token's position. Looked up here so the kernel keeps
+    one SMEM word per run (the full block table does not fit at long context
+    lengths) and spends no scalar work locating it. The clamps only matter for
+    padding tokens, whose output is dropped: they keep its reads in bounds.
+    """
+    block_size, run = cfgs.state_block_size, cfgs.window_run
+    pages = cfgs.pages_to_buffer_per_token
+    runs = jnp.arange(cfgs.window_runs, dtype=positions.dtype) * run
+    run_start = positions[:, None] - cfgs.window + 1 + runs[None, :]
+    block_curr = positions[:, None] // block_size
+    block = run_start // block_size
+    block = jnp.maximum(jnp.clip(block, block_curr - (pages - 1), block_curr), 0)
+    page = block_table[token_to_req_indices[:, None] * stride + block]
+    offset = jnp.minimum(run_start % block_size, block_size - run)
+    return ((page << cfgs.run_offset_bits) | offset).reshape(-1)
 
 
 def _select_mode(head_dim: int, overlap: bool) -> config.Mode:
@@ -404,21 +457,29 @@ def compress_norm_rope_store(
     assert block_table.ndim == 1
     assert block_table.shape[0] % block_table_stride == 0
 
-    num_tokens = positions.shape[0]
     head_dim = rms_weight.shape[0]
+    mode = _select_mode(head_dim, overlap)
+    tile_n = HCA_TILE_N if mode == config.Mode.HCA else TILE_N
+    # Every grid step reads tile_n tokens' scalars; pad so none reads past them.
+    pad = -positions.shape[0] % tile_n
+    if pad:
+        positions = jnp.pad(positions, (0, pad))
+        token_to_req_indices = jnp.pad(token_to_req_indices, (0, pad))
+        kv_slot_mapping = jnp.pad(kv_slot_mapping, (0, pad), constant_values=-1)
+    num_tokens = positions.shape[0]
     rope_head_dim = cos_sin_cache.shape[1] if cos_sin_cache is not None else 0
 
     state_operand = None if state_cache is None or state_cache is cache else state_cache
     state_source = cache if state_operand is None else state_operand
 
     cfgs = config.Configs.make(
-        _select_mode(head_dim, overlap),
+        mode,
         size_n=num_tokens,
         physical_page_size=cache.shape[1],
         state_physical_page_size=state_source.shape[1],
         state_block_size=state_block_size,
         rms_eps=rms_eps,
-        tile_n=4,
+        tile_n=tile_n,
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
@@ -455,33 +516,30 @@ def compress_norm_rope_store(
     else:
         is_first_mask = compute_is_first_mask(
             kv_slot_mapping,
-            cfgs.tile_sizes.tile_n,
+            MERGE_GROUP,
             pack_factor=cfgs.tokens_in_second_minor,
         )
         is_first_mask_rope = compute_is_first_mask(
             kv_slot_mapping,
-            cfgs.tile_sizes.tile_n,
+            MERGE_GROUP,
             # TODO: this is confusing, should probably find a better name for it
             pack_factor=cfgs.hbm_pack,
         )
-    # Look up each token's state pages here so the kernel keeps only those
-    # entries in SMEM; the full block table does not fit at long context lengths.
-    pages_per_token = cfgs.pages_to_buffer_per_token
-    offsets = jnp.arange(1 - pages_per_token, 1, dtype=positions.dtype)
-    window_blocks = jnp.maximum(
-        positions[:, None] // state_block_size + offsets[None, :], 0
+    dma_counts = _tile_dma_counts(kv_slot_mapping, is_first_mask_rope, cfgs)
+    window_runs = _window_runs(
+        positions, token_to_req_indices, block_table, block_table_stride, cfgs
     )
-    rows = token_to_req_indices[:, None] * block_table_stride
-    token_pages = block_table[rows + window_blocks].reshape(-1)
     # Outer pallas_call operands, in call order. Optional operands are passed as
     # None to keep kernel_fn's argument positions fixed; pallas drops the Nones
     # when indexing, so alias indices count only the operands actually present.
     scalar_prefetch = (
-        token_pages,
+        window_runs,
         positions,
         kv_slot_mapping,
         is_first_mask,
         is_first_mask_rope,
+        dma_counts,
+        _masked_tiles(positions, kv_slot_mapping, cfgs),
         grid_size,
     )
     cos_sin_operand = cos_sin_cache if cfgs.dims.has_rope else None
@@ -519,7 +577,7 @@ def compress_norm_rope_store(
         cfgs.dims.has_rope, cfgs.dims.has_rope_cache, len(scalar_prefetch)
     )
 
-    scratch_shapes = [pltpu.VMEM(cfgs.window_shape(), jnp.float32)]
+    scratch_shapes = []
     if seq_along_lane:
         # See kernel_fn: staged records, the run tables of the final store
         # (one slot per token + a sentinel), its read-modify-write tiles.

@@ -76,7 +76,7 @@ class CosSinRef(_BufferedRef):
         def loop_body(i):
             global_idx = pid * tile_n + i
             position = positions_ref[global_idx]
-            compressed_pos = (position // compress_ratio) * compress_ratio
+            compressed_pos = _floor_div(position, compress_ratio) * compress_ratio
 
             src = cos_sin_cache_ref.at[
                 compressed_pos, pl.ds(0, self.window_ref.shape[-1])
@@ -95,9 +95,10 @@ class CosSinRef(_BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PageBufferRef(_BufferedRef):
-    # VMEM block: cfgs.page_buffer_shape()
-    #   (tile_n, pages_to_buffer_per_token, page_size, hbm_pack, LANE) uint8
+class WindowRef(_BufferedRef):
+    # VMEM block: cfgs.window_shape() f32, written through its uint8 view
+    # cfgs.window_bytes_shape(): every token's window of state rows, DMA'd
+    # straight from HBM into the layout the body computes on.
 
     def copy_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
@@ -106,35 +107,92 @@ class PageBufferRef(_BufferedRef):
         sem = self.sem_recvs.at[slot]
         pid = grid_indices[0]
 
-        state_cache_ref, token_pages_ref = src_ref
+        state_ref, window_runs_ref = src_ref
+        cfgs = self.cfgs
+        tile_n = cfgs.tile_sizes.tile_n
+        run = cfgs.window_run
+        runs = cfgs.window_runs
+        bits = cfgs.run_offset_bits
+        window_u8 = _window_bytes(self.window_ref.at[slot], cfgs)
 
-        tile_n = self.cfgs.tile_sizes.tile_n
-        pages_to_buffer_per_token = self.cfgs.pages_to_buffer_per_token
-
-        page_buffer_ref = cast(jax.Ref, self.window_ref.at[slot])
-        global_idx = pid * tile_n
-
-        @pl.loop(0, tile_n * pages_to_buffer_per_token, unroll=True)
-        def loop_body(idx):
-            n = idx // pages_to_buffer_per_token
-            p = idx % pages_to_buffer_per_token
-            idx_n = global_idx + n
-
-            # compress_norm_rope_store looks up each token's window pages,
-            # oldest first.
-            page = token_pages_ref[idx_n * pages_to_buffer_per_token + p]
-
-            src = state_cache_ref.at[page, :, :, :]
-            dest = page_buffer_ref.at[n, p, :, :, :]
-            pltpu.make_async_copy(src, dest, sem).start()
+        for n in range(tile_n):
+            for c in range(runs):
+                code = window_runs_ref[(pid * tile_n + n) * runs + c]
+                page = jax.lax.shift_right_arithmetic(code, jnp.int32(bits))
+                offset = code & jnp.int32((1 << bits) - 1)
+                is_prev = cfgs.dims.overlap and c * run < cfgs.window // 2
+                for field in range(config.N_FIELDS):
+                    src = _state_rows(state_ref, cfgs, page, offset, field, is_prev)
+                    dest = window_u8.at[field, pl.ds(c * run, run), n]
+                    if cfgs.dims.mode == config.Mode.CSA_INDEXER:
+                        dest = dest.at[:, 0]
+                    pltpu.make_async_copy(src, dest, sem).start()
 
     def wait_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        pltpu.make_async_copy(vmem_ref, vmem_ref, sem).wait()
+        window_u8 = _window_bytes(self.window_ref.at[slot], self.cfgs)
+        pltpu.make_async_copy(window_u8, window_u8, sem).wait()
+
+
+def _floor_div(x, d: int):
+    """`x // d` for a static `d`; a shift when `d` is a power of two."""
+    if d & (d - 1) == 0:
+        return jax.lax.shift_right_arithmetic(x, jnp.int32(d.bit_length() - 1))
+    return x // d
+
+
+def _floor_mod(x, d: int):
+    """`x % d` for a static `d`; a mask when `d` is a power of two."""
+    if d & (d - 1) == 0:
+        return x & jnp.int32(d - 1)
+    return x % d
+
+
+def _wait_tokens(buf, sem, count, tile_n: int):
+    """Waits for `count` per-token DMAs of `buf[n]` each, all signalling `sem`.
+
+    The semaphore counts bytes, so `count` is waited for as the sum of its
+    power-of-two parts, one predicated wait each, instead of one per token.
+    """
+    part = 1 << (tile_n.bit_length() - 1)
+    while part:
+
+        @pl.when((count & part) != 0)
+        def _wait(part=part):
+            rows = buf.at[pl.ds(0, part)]
+            pltpu.make_async_copy(rows, rows, sem).wait()
+
+        part >>= 1
+
+
+def _window_bytes(window_ref, cfgs: config.Configs):
+    """uint8 view of one f32 window block (each f32 lane -> 4 byte rows)."""
+    return window_ref.bitcast(jnp.uint8).reshape(cfgs.window_bytes_shape())
+
+
+def _state_rows(state_ref, cfgs: config.Configs, page, offset, field, is_prev):
+    """HBM rows of `field` for `window_run` consecutive states from `offset`.
+
+    Mirrors where `proj_and_save_state` puts a state: HCA/CSA keep one field
+    (half) per `head_tiles` rows, [kv_prev, kv_curr, score_prev, score_curr]
+    when overlapping; the indexer keeps kv and score as one row each, with the
+    prev/curr halves in lanes 0:128 / 128:256.
+    """
+    run, rows = cfgs.window_run, cfgs.state_rows_per_token
+    states = state_ref.at[page, pl.ds(offset * rows, run * rows)]
+    states = states.reshape(run, rows, *state_ref.shape[2:])
+    if cfgs.dims.mode == config.Mode.CSA_INDEXER:
+        lane = 0 if is_prev or not cfgs.dims.overlap else config.LANE
+        return states.at[:, field, :, pl.ds(lane, config.LANE)]
+    field_rows = cfgs.field_rows
+    if cfgs.dims.overlap:
+        row = (2 * field + int(not is_prev)) * field_rows
+    else:
+        row = field * field_rows
+    return states.at[:, pl.ds(row, cfgs.head_tiles)]
 
 
 @jax.tree_util.register_dataclass
@@ -159,7 +217,7 @@ class OutputRef(_BufferedRef):
         # [num_page, kv_block_size / 4, 4, 256]
         page_size = self.cfgs.kv_block_size
 
-        @pl.loop(0, tile_n)
+        @pl.loop(0, tile_n, unroll=True)
         def loop_body(n):
             idx_n = global_idx + n
             kv_slot = kv_slot_mapping_ref[idx_n]
@@ -167,9 +225,11 @@ class OutputRef(_BufferedRef):
 
             @pl.when(valid)
             def _read_nope():
-                p = kv_slot // page_size
+                p = _floor_div(kv_slot, page_size)
                 # we fetch the entire tile (4, 128), with 4 pages per tile
-                s_row = (kv_slot % page_size) // (self.cfgs.tokens_in_second_minor)
+                s_row = _floor_div(
+                    _floor_mod(kv_slot, page_size), self.cfgs.tokens_in_second_minor
+                )
                 src = cache_ref.at[p, s_row, :, :]
                 dest = dest_ref.at[n, 0, :, :]
                 pltpu.make_async_copy(src, dest, sem).start()
@@ -186,7 +246,7 @@ class OutputRef(_BufferedRef):
         global_idx = pid * tile_n
         _, kv_slot_mapping_ref, _ = src_ref
 
-        @pl.loop(0, tile_n)
+        @pl.loop(0, tile_n, unroll=True)
         def loop_body(n):
             idx_n = global_idx + n
             kv_slot = kv_slot_mapping_ref[idx_n]
@@ -217,7 +277,7 @@ class OutputRef(_BufferedRef):
         if self.cfgs.dims.mode == config.Mode.CSA_INDEXER:
             cache_ref, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
 
-            @pl.loop(0, tile_n)
+            @pl.loop(0, tile_n, unroll=True)
             def loop_body(n):
                 idx_n = global_idx + n
                 kv_slot = kv_slot_mapping_ref[idx_n]
@@ -226,27 +286,28 @@ class OutputRef(_BufferedRef):
 
                 @pl.when(valid)
                 def _write_nope():
-                    p = kv_slot // self.cfgs.kv_block_size
-                    s_row = (kv_slot % self.cfgs.kv_block_size) // (
-                        self.cfgs.tokens_in_second_minor
+                    p = _floor_div(kv_slot, self.cfgs.kv_block_size)
+                    s_row = _floor_div(
+                        _floor_mod(kv_slot, self.cfgs.kv_block_size),
+                        self.cfgs.tokens_in_second_minor,
                     )
                     src = src_ref.at[n, 0, :, :]
                     dest = cache_ref.at[p, s_row, :, :]
                     pltpu.make_async_copy(src, dest, sem).start()
         else:
-            cache_ref, kv_slot_mapping_ref = dest_ref
+            cache_ref, kv_slot_mapping_ref, _ = dest_ref
 
             # HCA: [num_pages, kv_block_size * 2, 4, 128] uint8
             # CSA: [num_pages, kv_block_size, 4, 128] uint8
-            @pl.loop(0, tile_n)
+            @pl.loop(0, tile_n, unroll=True)
             def loop_body(n):
                 idx_n = global_idx + n
                 kv_slot = kv_slot_mapping_ref[idx_n]
 
                 @pl.when(kv_slot >= 0)
                 def _write_nope():
-                    p = kv_slot // self.cfgs.physical_page_size
-                    s = kv_slot % self.cfgs.physical_page_size
+                    p = _floor_div(kv_slot, self.cfgs.physical_page_size)
+                    s = _floor_mod(kv_slot, self.cfgs.physical_page_size)
 
                     @pl.loop(0, self.cfgs.record_rows, unroll=True)
                     def write_loop(o):
@@ -271,7 +332,7 @@ class OutputRef(_BufferedRef):
         if is_indexer:
             _, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
 
-            @pl.loop(0, tile_n)
+            @pl.loop(0, tile_n, unroll=True)
             def loop_body(n):
                 idx_n = global_idx + n
                 kv_slot = kv_slot_mapping_ref[idx_n]
@@ -286,35 +347,26 @@ class OutputRef(_BufferedRef):
                         sem,
                     ).wait()
         else:
-            _, kv_slot_mapping_ref = dest_ref
-
-            @pl.loop(0, tile_n)
-            def loop_body(n):
-                idx_n = global_idx + n
-                kv_slot = kv_slot_mapping_ref[idx_n]
-
-                @pl.when(kv_slot >= 0)
-                def _wait_nope():
-                    @pl.loop(0, self.cfgs.record_rows, unroll=True)
-                    def wait_loop(o):
-                        pltpu.make_async_copy(
-                            vmem_ref.at[n, o, :, :],
-                            vmem_ref.at[n, o, :, :],
-                            sem,
-                        ).wait()
+            _, _, dma_counts_ref = dest_ref
+            # copy_out wrote one record per token with a valid slot.
+            _wait_tokens(vmem_ref, sem, dma_counts_ref[2 * pid], tile_n)
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class RoPEOutputRef(_BufferedRef):
+class RoPEInputRef(_BufferedRef):
     # VMEM block: cfgs.rope_output_shape() -> (tile_n, 4, LANE) uint8, each
-    # token's whole 4-token RoPE row, read-modify-written.
-    # Only used for CSA (has_rope_cache=True).
+    # row-writer's current 4-token RoPE row, which the body merges into
+    # RoPEOutputRef. Only used for CSA (has_rope_cache=True).
+    #
+    # Reads and writes use separate buffers: emit_pipeline issues step k+1's
+    # copy_in before it waits on step k-1's copy_out, and with one
+    # INPUT_OUTPUT buffer both use the same slot.
 
     def copy_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
-        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref = src_ref
+        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref, _ = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         dest_ref = cast(jax.Ref, self.window_ref.at[slot])
@@ -323,7 +375,7 @@ class RoPEOutputRef(_BufferedRef):
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
 
-        @pl.loop(0, tile_n)
+        @pl.loop(0, tile_n, unroll=True)
         def loop_body(n):
             idx_n = global_idx + n
             kv_slot = kv_slot_mapping_ref[idx_n]
@@ -334,9 +386,9 @@ class RoPEOutputRef(_BufferedRef):
             def _read_rope():
                 # divide by 4 because we pack 4 pages into 1 tile
                 # layout: [num_page, kv_block_size / 4, 4, 256]
-                rope_slot = kv_slot // 4
-                rope_p = rope_slot // self.cfgs.rope_page_size
-                s_row = rope_slot % self.cfgs.rope_page_size
+                rope_slot = _floor_div(kv_slot, 4)
+                rope_p = _floor_div(rope_slot, self.cfgs.rope_page_size)
+                s_row = _floor_mod(rope_slot, self.cfgs.rope_page_size)
                 src = rope_cache_ref.at[rope_p, s_row, :, :]
                 dest = dest_ref.at[n, :, :]
                 pltpu.make_async_copy(src, dest, sem).start()
@@ -348,30 +400,22 @@ class RoPEOutputRef(_BufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         pid = grid_indices[0]
+        *_, dma_counts_ref = src_ref
+        _wait_tokens(
+            vmem_ref, sem, dma_counts_ref[2 * pid + 1], self.cfgs.tile_sizes.tile_n
+        )
 
-        tile_n = self.cfgs.tile_sizes.tile_n
-        global_idx = pid * tile_n
-        _, kv_slot_mapping_ref, is_first_mask_ref = src_ref
 
-        @pl.loop(0, tile_n)
-        def loop_body(n):
-            idx_n = global_idx + n
-            kv_slot = kv_slot_mapping_ref[idx_n]
-            is_first = is_first_mask_ref[idx_n]
-            valid = kv_slot >= 0
-
-            @pl.when(valid & is_first)
-            def _wait_rope():
-                pltpu.make_async_copy(
-                    vmem_ref.at[n, :, :],
-                    vmem_ref.at[n, :, :],
-                    sem,
-                ).wait()
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class RoPEOutputRef(_BufferedRef):
+    # VMEM block: cfgs.rope_output_shape() -> (tile_n, 4, LANE) uint8, each
+    # row-writer's merged RoPE row (see RoPEInputRef).
 
     def copy_out(self, dest_ref, grid_indices):
         assert self.sem_sends is not None
         assert self.window_ref is not None
-        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
+        rope_cache_ref, kv_slot_mapping_ref, is_first_mask_ref, _ = dest_ref
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
 
@@ -381,7 +425,7 @@ class RoPEOutputRef(_BufferedRef):
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
 
-        @pl.loop(0, tile_n)
+        @pl.loop(0, tile_n, unroll=True)
         def loop_body(n):
             idx_n = global_idx + n
             kv_slot = kv_slot_mapping_ref[idx_n]
@@ -390,9 +434,9 @@ class RoPEOutputRef(_BufferedRef):
 
             @pl.when(valid & is_first)
             def _write_rope():
-                rope_slot = kv_slot // 4
-                rope_p = rope_slot // self.cfgs.rope_page_size
-                s_row = rope_slot % self.cfgs.rope_page_size
+                rope_slot = _floor_div(kv_slot, 4)
+                rope_p = _floor_div(rope_slot, self.cfgs.rope_page_size)
+                s_row = _floor_mod(rope_slot, self.cfgs.rope_page_size)
                 src_rope = src_ref.at[n, :, :]
                 dest_rope = rope_cache_ref.at[rope_p, s_row, :, :]
                 pltpu.make_async_copy(src_rope, dest_rope, sem).start()
@@ -404,26 +448,10 @@ class RoPEOutputRef(_BufferedRef):
         sem = self.sem_sends.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         pid = grid_indices[0]
-
-        tile_n = self.cfgs.tile_sizes.tile_n
-        global_idx = pid * tile_n
-
-        _, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
-
-        @pl.loop(0, tile_n)
-        def loop_body(n):
-            idx_n = global_idx + n
-            kv_slot = kv_slot_mapping_ref[idx_n]
-            is_first = is_first_mask_ref[idx_n]
-            valid = kv_slot >= 0
-
-            @pl.when(valid & is_first)
-            def _wait_rope():
-                pltpu.make_async_copy(
-                    vmem_ref.at[n, :, :],
-                    vmem_ref.at[n, :, :],
-                    sem,
-                ).wait()
+        *_, dma_counts_ref = dest_ref
+        _wait_tokens(
+            vmem_ref, sem, dma_counts_ref[2 * pid + 1], self.cfgs.tile_sizes.tile_n
+        )
 
 
 def create_allocs_and_specs(
@@ -434,17 +462,31 @@ def create_allocs_and_specs(
     state_cache_ref,
     cos_sin_cache_ref,
     positions_ref,
-    token_pages_ref,
+    window_runs_ref,
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
+    dma_counts_ref,
 ) -> tuple[
-    tuple[CosSinRef | None, OutputRef, PageBufferRef, RoPEOutputRef | None],
-    tuple[pl.BlockSpec | None, pl.BlockSpec, pl.BlockSpec, pl.BlockSpec | None],
+    tuple[
+        CosSinRef | None,
+        OutputRef,
+        WindowRef,
+        RoPEInputRef | None,
+        RoPEOutputRef | None,
+    ],
+    tuple[
+        pl.BlockSpec | None,
+        pl.BlockSpec,
+        pl.BlockSpec,
+        pl.BlockSpec | None,
+        pl.BlockSpec | None,
+    ],
     tuple[
         tuple[Any, ...] | None,
         tuple[Any, ...],
         tuple[Any, ...],
+        tuple[Any, ...] | None,
         tuple[Any, ...] | None,
     ],
 ]:
@@ -498,25 +540,25 @@ def create_allocs_and_specs(
     if is_indexer and not cfgs.dims.seq_along_lane:
         output_args = (cache_ref, kv_slot_mapping_ref, is_first_mask_ref)
     else:
-        output_args = (cache_ref, kv_slot_mapping_ref)
+        output_args = (cache_ref, kv_slot_mapping_ref, dma_counts_ref)
 
-    # page_buffer
-    page_buffer_spec = pl.BlockSpec(
-        block_shape=cfgs.page_buffer_shape(),
+    # window
+    window_spec = pl.BlockSpec(
+        block_shape=cfgs.window_shape(),
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0, 0, 0),
+        index_map=lambda i: (0, 0, i, 0),
     )
-    page_buffer_alloc = PageBufferRef.create(
-        spec=page_buffer_spec,
-        dtype_or_type=jnp.uint8,
+    window_alloc = WindowRef.create(
+        spec=window_spec,
+        dtype_or_type=jnp.float32,
         buffer_type=pltpu.BufferType.INPUT,
         buffer_count=2,
         use_lookahead=False,
         cfgs=cfgs,
     )
-    page_buffer_args = (
+    window_args = (
         cache_ref if state_cache_ref is None else state_cache_ref,
-        token_pages_ref,
+        window_runs_ref,
     )
 
     # rope
@@ -526,20 +568,33 @@ def create_allocs_and_specs(
             memory_space=pltpu.VMEM,
             index_map=lambda i: (i, 0, 0),
         )
-        rope_alloc = RoPEOutputRef.create(
+        rope_in_alloc = RoPEInputRef.create(
             spec=rope_spec,
             dtype_or_type=jnp.uint8,
-            buffer_type=pltpu.BufferType.INPUT_OUTPUT,
+            buffer_type=pltpu.BufferType.INPUT,
             buffer_count=2,
             use_lookahead=False,
             cfgs=cfgs,
         )
-        rope_args = (rope_cache_ref, kv_slot_mapping_ref, is_first_mask_rope_ref)
+        rope_out_alloc = RoPEOutputRef.create(
+            spec=rope_spec,
+            dtype_or_type=jnp.uint8,
+            buffer_type=pltpu.BufferType.OUTPUT,
+            buffer_count=2,
+            use_lookahead=False,
+            cfgs=cfgs,
+        )
+        rope_args = (
+            rope_cache_ref,
+            kv_slot_mapping_ref,
+            is_first_mask_rope_ref,
+            dma_counts_ref,
+        )
     else:
-        rope_alloc = rope_spec = rope_args = None
+        rope_in_alloc = rope_out_alloc = rope_spec = rope_args = None
 
     return (
-        (cos_sin_alloc, output_alloc, page_buffer_alloc, rope_alloc),
-        (cos_sin_spec, output_spec, page_buffer_spec, rope_spec),
-        (cos_sin_args, output_args, page_buffer_args, rope_args),
+        (cos_sin_alloc, output_alloc, window_alloc, rope_in_alloc, rope_out_alloc),
+        (cos_sin_spec, output_spec, window_spec, rope_spec, rope_spec),
+        (cos_sin_args, output_args, window_args, rope_args, rope_args),
     )
