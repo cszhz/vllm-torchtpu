@@ -74,7 +74,7 @@ class FusedHcaDecodeTest(parameterized.TestCase):
 
     @parameterized.parameters(*CELLS)
     def test_cell(self, name):
-        self._run(name, blk_pages=64, swa_u8=False)
+        self._run(name, blk_pages=128, swa_u8=False)
 
     @parameterized.parameters(("ver2-boundary", 32), ("mix-c16", 128), ("mix-ver-tail", 2))
     def test_block_sizes(self, name, blk_pages):
@@ -82,7 +82,7 @@ class FusedHcaDecodeTest(parameterized.TestCase):
 
     @parameterized.parameters("mix-dec-ver", "ver4-h32")
     def test_u8_swa_cache(self, name):
-        self._run(name, blk_pages=64, swa_u8=True)
+        self._run(name, blk_pages=128, swa_u8=True)
 
 
 if __name__ == "__main__":

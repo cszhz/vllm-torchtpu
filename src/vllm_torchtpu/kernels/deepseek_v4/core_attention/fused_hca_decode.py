@@ -75,16 +75,18 @@ class Config:
     max_req: int
     hca_ppr: int  # HCA page-table row length
     num_hca_pages: int
-    blk_pages: int = 64  # HCA pages per KV block
-    slots: int = 2  # HCA ring depth: blocks in flight = slots - 1 ahead of the one consumed
+    blk_pages: int = 128  # HCA pages per KV block
+    slots: int = 3  # HCA ring depth: blocks in flight = slots - 1 ahead of the one consumed
     trim: bool = True  # issue only the live pages of a request's last block (else clamp + re-read)
     coalesce: bool = False  # one DMA per run of consecutive physical pages
+    issue_chunk: int = 16  # >0: trimmed issue as unrolled chunks of this many pages (tail clamped within a chunk)
     scale_fold: bool = False  # exp2 with sm_scale*log2e folded (changes rounding)
     tail_mask_only: bool = False  # mask only the block holding the visibility edge
     # timing-only removal arms (wrong numbers by construction)
     no_hca_dma: bool = False
     no_hca_compute: bool = False
     no_softmax: bool = False
+    no_swa_compute: bool = False
 
     @property
     def rows(self) -> int:
@@ -207,6 +209,14 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_pt_ref, hca_pt_
             return jnp.clip(cdiv(nc, HP) - b * BP, 0, BP)
         return jnp.int32(BP)
 
+    CH = cfg.issue_chunk
+
+    def issued_pages(nc, b):
+        nl = live_pages(nc, b)
+        if cfg.trim and CH:
+            return jnp.minimum(cdiv(nl, CH) * CH, BP)
+        return nl
+
     def page_copy(page, p, slot):
         pltpu.make_async_copy(hca2d.at[pl.ds(pl.multiple_of(page * ROWS, ROWS), ROWS)],
                               kv_buf.at[slot, pl.ds(p * ROWS, ROWS)], sems.at[3 + slot]).start()
@@ -221,6 +231,13 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_pt_ref, hca_pt_
                 page_copy(jnp.clip(hca_pt_ref[base + jnp.minimum(p, last)], 0, n_pages_hbm - 1), p, slot)
             return
         nl = live_pages(nc, b)
+        if CH:
+            for c in range(cdiv(BP, CH)):
+                @pl.when(c * CH < nl)
+                def _(c=c):
+                    for p in range(c * CH, min((c + 1) * CH, BP)):
+                        page_copy(hca_pt_ref[base + jnp.minimum(p, nl - 1)], p, slot)
+            return
         if cfg.coalesce:
             def run_dma(p0, ln):
                 pg0 = hca_pt_ref[base + p0]
@@ -258,7 +275,7 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_pt_ref, hca_pt_
     def hca_wait(nc, b, slot):
         if cfg.no_hca_dma:
             return
-        nl = live_pages(nc, b)
+        nl = issued_pages(nc, b)
         blk = kv_buf.at[slot, pl.ds(0, nl * ROWS)]
 
         @pl.when(nl > 0)
@@ -344,7 +361,12 @@ def _kernel(cfg: Config, dist_ref, seq_ref, cu_ref, ext_ref, swa_pt_ref, hca_pt_
         cached = (j < n_cached) & (qpos - (s0 + j) < W)
         kt = j - W
         fresh = (j >= W) & (kt >= cu_r) & (kt < cu_r + qlen) & (pf + kt - cu_r <= qpos)
-        update(q, kv, cached | fresh, first=True)
+        if cfg.no_swa_compute:
+            m_scr[...] = jnp.full(m_scr.shape, -1e30, jnp.float32)
+            l_scr[...] = jnp.zeros(l_scr.shape, jnp.float32)
+            acc_scr[...] = jnp.zeros(acc_scr.shape, jnp.float32)
+        else:
+            update(q, kv, cached | fresh, first=True)
 
         # --- compressed rows, through the ring
         nc = vreq_nc(r, k)
@@ -450,7 +472,7 @@ def fused_hca_attention(
     sliding_window: int,
     logical_page_size: int,
     chunk: int = 7,
-    blk_pages: int = 64,
+    blk_pages: int = 128,
     interpret: bool = False,
     **knobs,
 ):
