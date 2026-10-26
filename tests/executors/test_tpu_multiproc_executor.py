@@ -12,17 +12,178 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import multiprocessing
+import signal
+from collections import deque
+from queue import Queue
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.config import CacheConfig
-from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import core as engine_core_module
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
+from vllm.v1.outputs import DraftTokenIds
 
+from vllm_torchtpu.core.remote_draft_scheduler import (
+    RemoteDraftConsumerScheduler,
+    RemoteDraftScheduler,
+)
 from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
 
 # Sentinel returned by the parent get_kv_cache_specs; the override plumbing must
 # pass this through unchanged.
 _SPECS = [{"layer": MagicMock()}]
+
+
+def _blocked_cpu_worker(ready, ignore_sigterm):
+    if ignore_sigterm:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    ready.set()
+    signal.pause()
+
+
+@pytest.mark.parametrize("ignore_sigterm", [False, True])
+def test_engine_fatal_rpc_error_tears_down_blocked_child(monkeypatch, ignore_sigterm):
+    """Actual fatal-loop envelope and executor teardown with a real CPU child.
+
+    Model construction, engine I/O and RPC failure are explicit stand-ins.
+    Forked child only signals readiness and blocks in the OS; no torch/device work.
+    """
+    from vllm import envs
+
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    child = context.Process(target=_blocked_cpu_worker, args=(ready, ignore_sigterm))
+    child.start()
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    response_queue, broadcast_queue = MagicMock(), MagicMock()
+    executor.workers = [
+        SimpleNamespace(
+            proc=child, death_writer=None, worker_response_mq=response_queue
+        )
+    ]
+    executor.rpc_broadcast_mq = broadcast_queue
+    executor.response_mqs = []
+    executor.shutting_down = False
+    core = SimpleNamespace(
+        run_busy_loop=MagicMock(side_effect=RuntimeError("injected fatal RPC")),
+        _send_engine_dead=MagicMock(),
+        shutdown=executor.shutdown,
+    )
+    config = SimpleNamespace(
+        logging_config=None,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            numa_bind=False,
+            reconfigure_for_independent_dp_rank=MagicMock(),
+        ),
+    )
+    entrypoint = engine_core_module.EngineCoreProc.run_engine_core
+    monkeypatch.setattr(
+        engine_core_module, "EngineCoreProc", MagicMock(return_value=core)
+    )
+    for name in (
+        "maybe_register_config_serialize_by_value",
+        "set_process_title",
+        "maybe_init_worker_tracer",
+        "decorate_logs",
+        "SignalCallback",
+    ):
+        monkeypatch.setattr(engine_core_module, name, MagicMock())
+    monkeypatch.setattr(envs, "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", 0)
+    # Preserve pytest's own signal handlers while exercising the fatal envelope.
+    monkeypatch.setattr(engine_core_module.signal, "signal", MagicMock())
+    try:
+        assert ready.wait(10), "CPU child failed to start"
+        with pytest.raises(RuntimeError, match="injected fatal RPC"):
+            entrypoint(vllm_config=config)
+        child.join(timeout=5)
+        assert not child.is_alive()
+        assert child.exitcode == (
+            -signal.SIGKILL if ignore_sigterm else -signal.SIGTERM
+        )
+        core._send_engine_dead.assert_called_once_with()
+        assert executor.shutting_down
+        assert executor.rpc_broadcast_mq is None
+        response_queue.shutdown.assert_called_once_with()
+        broadcast_queue.shutdown.assert_called_once_with()
+        executor.shutdown()
+        response_queue.shutdown.assert_called_once_with()
+        broadcast_queue.shutdown.assert_called_once_with()
+    finally:
+        if child.is_alive():
+            child.kill()
+        child.join(timeout=5)
+        child.close()
+
+
+@pytest.mark.parametrize(
+    "scheduler_cls", [RemoteDraftScheduler, RemoteDraftConsumerScheduler]
+)
+@pytest.mark.parametrize("failing_rank", [None, 0, 1])
+def test_remote_draft_rpc_reports_every_rank(scheduler_cls, failing_rank):
+    """Real WorkerProc dispatch/response handling; CPU queues replace IPC only."""
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    executor.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(get_scheduler_cls=lambda: scheduler_cls)
+    )
+    executor.output_rank = 0
+    executor.is_failed = False
+    executor.futures_queue = deque()
+    result = DraftTokenIds(["A"], [[1, 2]])
+
+    class ResponseQueue:
+        def __init__(self):
+            self.queue = Queue()
+
+        def enqueue(self, value):
+            self.queue.put(value)
+
+        def dequeue(self, timeout):
+            return self.queue.get(timeout=timeout)
+
+    workers = []
+    executor.response_mqs = []
+    for rank in range(2):
+
+        def take(rank=rank):
+            if rank == failing_rank:
+                raise RuntimeError(f"injected rank {rank} proposal failure")
+            return result if rank == executor.output_rank else None
+
+        worker = WorkerProc.__new__(WorkerProc)
+        worker.rank = rank
+        worker.worker = SimpleNamespace(take_draft_token_ids=take)
+        worker.use_async_scheduling = False
+        worker.worker_response_mq = ResponseQueue()
+        workers.append(worker)
+        executor.response_mqs.append(worker.worker_response_mq)
+
+    class BroadcastQueue:
+        def enqueue(self, request):
+            for worker in workers:
+                worker._execute_worker_rpc(request)
+
+    executor.rpc_broadcast_mq = BroadcastQueue()
+    if failing_rank is None:
+        assert executor.take_draft_token_ids() is result
+        assert all(mq.queue.empty() for mq in executor.response_mqs)
+    else:
+        with pytest.raises(RuntimeError, match=f"injected rank {failing_rank}"):
+            executor.take_draft_token_ids()
+
+
+def test_unplanned_draft_rpc_keeps_upstream_reply_contract():
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    executor.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(get_scheduler_cls=lambda: Scheduler)
+    )
+    executor.output_rank = 1
+    executor.collective_rpc = MagicMock(return_value=None)
+    assert executor.take_draft_token_ids() is None
+    assert executor.collective_rpc.call_args.kwargs["unique_reply_rank"] == 1
 
 
 def _make_executor(engine_override, worker_overrides, pipeline_parallel_size=1):

@@ -608,6 +608,14 @@ class TPUWorker(WorkerBase):
             override_tokens=setting if setting > 0 else None,
         )
 
+    def shutdown(self) -> None:
+        runner = self.__dict__.get("model_runner")
+        try:
+            if runner is not None:
+                runner.close_remote_draft_channels()
+        finally:
+            super().shutdown()
+
     def execute_model(self, scheduler_output):
         return self.model_runner.execute_model(scheduler_output)
 

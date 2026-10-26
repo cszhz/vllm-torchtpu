@@ -105,6 +105,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.spec_decode.remote_draft_control import GENERATION_KEY
 from vllm_torchtpu.spec_decode.remote_dspark import (
     is_remote_dspark_request,
     publish_remote_dspark_handoff,
@@ -2211,6 +2212,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if delay_free_blocks:
                 self._stage3_early_sends[req_id] = int(params["uuid"])
                 if remote_dspark:
+                    assert request.kv_transfer_params is not None
+                    request.kv_transfer_params[GENERATION_KEY] = int(params["uuid"])
                     # Register pointers ahead, but expose them to the proxy
                     # only after every producer rank has materialized its KV.
                     publish_remote_dspark_handoff(

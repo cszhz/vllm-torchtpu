@@ -7350,6 +7350,7 @@ class TestPipelineParallelRegisterAhead:
 
         send = meta.reqs_to_send["remote"]
         assert send.uuid == 777
+        assert req.kv_transfer_params["_remote_dspark_generation"] == send.uuid
         assert send.num_tokens == self.PROMPT - 1
         publish.assert_called_once()
         published_req_id, published_params = publish.call_args.args

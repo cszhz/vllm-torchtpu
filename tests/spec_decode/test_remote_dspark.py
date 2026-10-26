@@ -14,6 +14,7 @@
 
 import socket
 import threading
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,6 +27,9 @@ from vllm_torchtpu.spec_decode.remote_dspark import (
     RemoteDraftPipeline,
     RemoteDraftProtocolError,
     RemoteDSparkTransport,
+    RemoteTensorLayout,
+    RemoteTensorSpec,
+    RemoteTensorTransfer,
     RequestPhase,
     VerifyFeedback,
     complete_remote_dspark_handoff,
@@ -116,7 +120,9 @@ def test_remote_dspark_handoff_is_atomic_and_consumed_once(tmp_path) -> None:
     path = remote_dspark_handoff_path(request_id, tmp_path)
     assert path.parent == tmp_path
     assert "/" not in path.name
-    assert take_remote_dspark_handoff(request_id, tmp_path) == params
+    assert take_remote_dspark_handoff(request_id, tmp_path) == (
+        mark_remote_dspark_request(params)
+    )
     assert take_remote_dspark_handoff(request_id, tmp_path) is None
 
 
@@ -126,7 +132,9 @@ def test_remote_dspark_handoff_waits_for_prefill_completion(tmp_path) -> None:
     assert take_remote_dspark_handoff("request", tmp_path) is None
 
     complete_remote_dspark_handoff("request", tmp_path)
-    assert take_remote_dspark_handoff("request", tmp_path) == params
+    assert take_remote_dspark_handoff("request", tmp_path) == (
+        mark_remote_dspark_request(params)
+    )
 
 
 def test_remote_dspark_handoff_maps_internal_id_to_proxy_id(tmp_path) -> None:
@@ -141,7 +149,9 @@ def test_remote_dspark_handoff_maps_internal_id_to_proxy_id(tmp_path) -> None:
     assert take_remote_dspark_handoff("external", tmp_path) is None
 
     complete_remote_dspark_handoff(params["req_id"], tmp_path)
-    assert take_remote_dspark_handoff("external", tmp_path) == params
+    assert take_remote_dspark_handoff("external", tmp_path) == (
+        mark_remote_dspark_request(params)
+    )
     assert take_remote_dspark_handoff(params["req_id"], tmp_path) is None
 
 
@@ -260,7 +270,29 @@ def test_packed_tensor_rows_rejects_invalid_live_count():
         PackedTensorRows.from_tensor(tensor, live_rows=3)
 
 
-def test_tpu_sync_feedback_reuses_native_channel(monkeypatch):
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_tpu_sync_feedback_reuses_native_channel(monkeypatch, bounded, deferred):
+    class _DeferredTensor:
+        """CPU stand-in for a TPU tensor whose new values are still deferred."""
+
+        device = SimpleNamespace(type="tpu")
+
+        def __init__(self, value):
+            self.value = value
+            self.buffer = torch.zeros_like(value)
+            self.shape, self.dtype, self.ndim = value.shape, value.dtype, value.ndim
+
+        def contiguous(self):
+            return self
+
+    def materialize(tensors, *, wait):
+        assert deferred and wait
+        for tensor in tensors:
+            tensor.buffer.copy_(tensor.value)
+
+    monkeypatch.setattr(remote_dspark_module, "synchronize_tensors", materialize)
+
     class _FakeWeightSynchronizer:
         def __init__(
             self,
@@ -281,6 +313,8 @@ def test_tpu_sync_feedback_reuses_native_channel(monkeypatch):
             assert len(peers) == 1
             receiver = receivers[peers[0]]
             for source, destination in zip(self.tensors, receiver.tensors, strict=True):
+                if isinstance(source, _DeferredTensor):
+                    source = source.buffer
                 destination.copy_(source)
 
         def h2d(self) -> None:
@@ -344,6 +378,10 @@ def test_tpu_sync_feedback_reuses_native_channel(monkeypatch):
     )
     accept_thread.join(timeout=5)
     assert not accept_thread.is_alive()
+    if bounded:
+        layout = RemoteTensorLayout((6,), 4, 2, torch.bfloat16, 1)
+        producer[0].configure_tensor_layout(layout)
+        consumer.configure_tensor_layout(layout)
 
     def receive_one(feedback: list[dict]) -> None:
         feedback.append(producer[0].recv_feedback())
@@ -356,7 +394,9 @@ def test_tpu_sync_feedback_reuses_native_channel(monkeypatch):
         second = first + 50
         transfer = consumer.send_tensor_rows(
             channel=0,
-            tensors=[first, second],
+            tensors=[_DeferredTensor(t) for t in (first, second)]
+            if deferred
+            else [first, second],
             live_rows=2,
         )
         consumer.send_feedback(
@@ -376,6 +416,54 @@ def test_tpu_sync_feedback_reuses_native_channel(monkeypatch):
     receiver = next(sync for sync in synchronizers if sync.endpoint is not None)
     assert sender.bind_count == 1
     assert receiver.h2d_count == 2
+
+
+@pytest.mark.parametrize("bad", ["channel", "rows", "width", "dtype", "layers"])
+def test_compiled_tensor_bounds_reject_before_receiver_allocation(monkeypatch, bad):
+    layout = RemoteTensorLayout((1, 8), 4, 2, torch.bfloat16, 2)
+    spec = RemoteTensorSpec((8, 4), torch.bfloat16)
+    specs, channel = (spec, spec), 0
+    if bad == "channel":
+        channel = 2
+    elif bad == "rows":
+        specs = (RemoteTensorSpec((7, 4), torch.bfloat16),) * 2
+    elif bad == "width":
+        specs = (RemoteTensorSpec((8, 5), torch.bfloat16),) * 2
+    elif bad == "dtype":
+        specs = (RemoteTensorSpec((8, 4), torch.float32),) * 2
+    else:
+        specs = (spec,)
+    transport = object.__new__(RemoteDSparkTransport)
+    transport.role, transport._round_id = "producer", 0
+    transport._tensor_layout, transport._tensor_receivers = layout, {}
+
+    def forbidden_allocation(*args):
+        pytest.fail("invalid aux metadata reached tensor allocation")
+
+    monkeypatch.setattr(RemoteTensorSpec, "allocate", forbidden_allocation)
+    with pytest.raises(RemoteDraftProtocolError, match="compiled aux layout"):
+        transport._handle_tensor_setup(
+            {"round_id": 0, "transfer": RemoteTensorTransfer(channel, specs, 1)}
+        )
+    assert not transport._tensor_receivers
+    assert layout.max_tensor_bytes == 2 * (1 + 8) * 4 * 2 * 2
+
+
+def test_compiled_tensor_bounds_reject_sender_before_setup(monkeypatch):
+    transport = object.__new__(RemoteDSparkTransport)
+    transport.role = "consumer"
+    transport._tensor_layout = RemoteTensorLayout((1, 8), 4, 2, torch.bfloat16, 2)
+
+    def forbidden_send(*args):
+        pytest.fail("invalid aux metadata reached setup handshake")
+
+    monkeypatch.setattr(transport, "_send", forbidden_send)
+    with pytest.raises(RemoteDraftProtocolError, match="compiled aux layout"):
+        transport.send_tensor_rows(
+            channel=0,
+            tensors=[torch.zeros(7, 4, dtype=torch.bfloat16)] * 2,
+            live_rows=1,
+        )
 
 
 def test_only_output_rank_owns_remote_proposals():

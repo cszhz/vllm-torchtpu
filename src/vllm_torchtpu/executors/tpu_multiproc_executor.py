@@ -18,13 +18,28 @@ shape so each shape gets its own 60-second shm_broadcast window (~4s per shape)
 instead of all 14 shapes sharing a single window and timing out.
 """
 
+from vllm import envs
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.outputs import DraftTokenIds
 
+from vllm_torchtpu.core.remote_draft_scheduler import (
+    remote_draft_scheduler_role,
+)
 from vllm_torchtpu.executors.kv_block_override import reconcile_num_gpu_blocks_override
 
 
 class TpuMultiprocExecutor(MultiprocExecutor):
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if remote_draft_scheduler_role(self.vllm_config.scheduler_config) is None:
+            return super().take_draft_token_ids()
+        # Unique replies suppress exceptions from every non-output worker.
+        outputs = self.collective_rpc(
+            "take_draft_token_ids",
+            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+        )
+        return outputs[self.output_rank]
+
     def _init_executor(self) -> None:
         # EngineCore does not run platform patch setup before spawning workers.
         from vllm_torchtpu import _patch_multiproc_worker_global_rank_env

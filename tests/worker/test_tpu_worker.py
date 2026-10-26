@@ -47,6 +47,14 @@ def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(monke
     assert os.environ["WORLD_SIZE"] == "8"
 
 
+def test_remote_channel_shutdown_handles_partial_worker_initialization():
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.shutdown()
+    worker.model_runner = MagicMock()
+    worker.shutdown()
+    worker.model_runner.close_remote_draft_channels.assert_called_once_with()
+
+
 def _make_vllm_config(profiler_torch_dir=None):
     """Build a minimal mock VllmConfig for TPUWorker.__init__."""
     cfg = MagicMock()

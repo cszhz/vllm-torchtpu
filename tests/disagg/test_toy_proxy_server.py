@@ -16,6 +16,10 @@ import asyncio
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 
 def _load_toy_proxy_server():
@@ -44,6 +48,41 @@ _record_remote_draft_verification = _toy_proxy_server._record_remote_draft_verif
 send_remote_dspark_request_to_prefill = (
     _toy_proxy_server.send_remote_dspark_request_to_prefill
 )
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_client_pool_limits_and_cleanup_after_error(monkeypatch, fresh):
+    proxy = _toy_proxy_server
+    monkeypatch.setenv("PROXY_FRESH_CONNECTIONS", str(int(fresh)))
+    monkeypatch.setattr(
+        proxy,
+        "global_args",
+        SimpleNamespace(
+            prefiller_instances=[("localhost", 8000)],
+            decoder_instances=[("localhost", 8001)],
+            decode_routing="round_robin",
+        ),
+        raising=False,
+    )
+    clients = []
+
+    def create_client(**kwargs):
+        assert kwargs["limits"].max_keepalive_connections == (0 if fresh else None)
+        client = SimpleNamespace(aclose=AsyncMock())
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", create_client)
+
+    async def run():
+        with pytest.raises(RuntimeError, match="request failed"):
+            async with proxy.lifespan(SimpleNamespace(state=SimpleNamespace())):
+                raise RuntimeError("request failed")
+
+    asyncio.run(run())
+    assert len(clients) == 2
+    for client in clients:
+        client.aclose.assert_awaited_once()
 
 
 def test_remote_draft_admission_barrier_releases_complete_waves() -> None:
@@ -98,19 +137,22 @@ def test_remote_dspark_uses_one_long_lived_raiden_request(monkeypatch) -> None:
             return object()
 
         monkeypatch.setattr(_toy_proxy_server, "_post_with_retries", post)
-        body = {"max_tokens": 32, "stream": True}
+        body = {"max_tokens": 32, "stream": True, "stop": ["boundary"]}
         await send_remote_dspark_request_to_prefill(
             {}, "/v1/completions", body, "request"
         )
+        assert body["stop"] == ["boundary"]
         return requests
 
     (producer,) = asyncio.run(run())
     assert producer["max_tokens"] == 33
     assert producer["stream"] is False
+    assert "stop" not in producer
     assert producer["kv_transfer_params"] == {
         "do_remote_decode": True,
         "do_remote_prefill": False,
         "_remote_dspark": True,
+        "_remote_dspark_control_request_id": "request",
     }
 
 

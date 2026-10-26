@@ -181,10 +181,23 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.spec_decode.remote_draft_control import (
+    RemoteDraftConsumerLifecycle,
+    RemoteDraftConsumerOutput,
+    RemoteDraftPlan,
+    RemoteDraftPlanSender,
+    RemoteDraftQuery,
+    RemoteDraftSchedulerOutput,
+    RemoteQueryKind,
+    proposal_contexts_for_plan,
+)
 from vllm_torchtpu.spec_decode.remote_dspark import (
     PackedTensorRows,
     RemoteDeviceTensorRows,
+    RemoteDraftProposalContext,
+    RemoteDraftProtocolError,
     RemoteDSparkTransport,
+    RemoteTensorLayout,
     RemoteTensorTransfer,
     complete_remote_dspark_handoff,
     is_remote_draft_proposal_rank,
@@ -1033,9 +1046,18 @@ class TPUModelRunner(GPUModelRunner):
             raise ValueError(
                 "VLLM_TPU_REMOTE_DSPARK_ROLE must be producer, consumer, or empty"
             )
+        planned_remote = self._validate_remote_draft_scheduler_role()
         self._remote_dspark_transport: RemoteDSparkTransport | None = None
         self._remote_dspark_proposal_rank = False
         self._remote_dspark_source_request_ids: dict[str, str] = {}
+        self._remote_dspark_generations: dict[str, int] = {}
+        self._remote_dspark_request_rounds: dict[str, int] = {}
+        self._remote_dspark_plan_sequence = 0
+        self._remote_dspark_plan_sender: RemoteDraftPlanSender | None = None
+        self._remote_dspark_lifecycle: RemoteDraftConsumerLifecycle | None = None
+        self._remote_dspark_proposal_contexts: (
+            tuple[RemoteDraftProposalContext, ...] | None
+        ) = None
         self._remote_dspark_awaiting_feedback = False
         if self._remote_dspark_role:
             if speculative_config is None or speculative_config.method != "dspark":
@@ -1054,6 +1076,18 @@ class TPUModelRunner(GPUModelRunner):
                 timeout_s=envs.VLLM_TPU_REMOTE_DSPARK_TIMEOUT_S,
                 device=self.device,
             )
+            if self._remote_dspark_role == "consumer" and planned_remote:
+                parallel = self.parallel_config
+                control_port = envs.VLLM_TPU_REMOTE_DSPARK_PORT + parallel.world_size
+                self._remote_dspark_plan_sender = RemoteDraftPlanSender(
+                    f"tcp://{envs.VLLM_TPU_REMOTE_DSPARK_PRODUCER_HOST}:{control_port}",
+                    self._profiler_rank,
+                    envs.VLLM_TPU_REMOTE_DSPARK_TIMEOUT_S,
+                )
+                if self._remote_dspark_proposal_rank:
+                    self._remote_dspark_lifecycle = RemoteDraftConsumerLifecycle(
+                        self.scheduler_config.max_num_seqs
+                    )
             logger.info(
                 "Remote DSpark worker channels: rank=%d proposal=%s feedback=true",
                 self._profiler_rank,
@@ -3605,13 +3639,18 @@ class TPUModelRunner(GPUModelRunner):
         to num_reqs_most_model_len requests, which can exceed
         num_reqs_max_model_len, so no batch-level clamp is a safe substitute.
         """
-        if scheduler_output.total_num_scheduled_tokens == 0:
-            return 0, 0
+        ends = self._input_chunk_ends(scheduler_output)
+        starts = [0, *ends[:-1]]
+        return len(ends), max(
+            (end - start for start, end in zip(starts, ends)), default=0
+        )
 
+    def _input_chunk_ends(self, scheduler_output: "SchedulerOutput") -> list[int]:
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            return []
         num_reqs = self.input_batch.num_reqs
         start_index = 0
-        num_chunks = 0
-        max_chunk_reqs = 0
+        ends = []
         while start_index < num_reqs:
             use_max_model_len = self.most_model_len is None
             for i in range(start_index, num_reqs):
@@ -3631,10 +3670,9 @@ class TPUModelRunner(GPUModelRunner):
                 assert self.num_reqs_most_model_len is not None
                 chunk_reqs = self.num_reqs_most_model_len
             this_chunk_reqs = min(chunk_reqs, num_reqs - start_index)
-            max_chunk_reqs = max(max_chunk_reqs, this_chunk_reqs)
             start_index += this_chunk_reqs
-            num_chunks += 1
-        return num_chunks, max_chunk_reqs
+            ends.append(start_index)
+        return ends
 
     def _dp_coordinated_step(
         self,
@@ -3762,6 +3800,97 @@ class TPUModelRunner(GPUModelRunner):
             device="cpu",
         )
 
+    def _validate_remote_draft_scheduler_role(self) -> bool:
+        from vllm.v1.executor.abstract import Executor
+        from vllm.v1.executor.uniproc_executor import UniProcExecutor
+
+        from vllm_torchtpu.core.remote_draft_scheduler import (
+            remote_draft_scheduler_role,
+        )
+        from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
+
+        role = remote_draft_scheduler_role(self.scheduler_config)
+        if role is None:
+            return False
+        if self._remote_dspark_role != role:
+            raise ValueError(
+                f"planned remote Draft scheduler requires worker role {role!r}, "
+                f"got {self._remote_dspark_role!r}"
+            )
+        if (
+            self.scheduler_config.async_scheduling
+            or self.parallel_config.pipeline_parallel_size != 1
+            or self.parallel_config.data_parallel_size != 1
+            or self.parallel_config.prefill_context_parallel_size != 1
+            or self.parallel_config.decode_context_parallel_size != 1
+            or self.parallel_config.nnodes != 1
+        ):
+            raise NotImplementedError("planned remote Draft requires sync TP-only 1P1D")
+        executor_cls = Executor.get_class(self.vllm_config)
+        if not (
+            issubclass(executor_cls, TpuMultiprocExecutor)
+            or (
+                self.parallel_config.tensor_parallel_size == 1
+                and issubclass(executor_cls, UniProcExecutor)
+            )
+        ):
+            raise NotImplementedError(
+                "planned remote Draft requires TpuMultiprocExecutor for all-rank "
+                "proposal responses, or UniProcExecutor at TP=1"
+            )
+        return True
+
+    def _configure_remote_draft_tensor_layout(self) -> None:
+        assert self.speculative_config is not None
+        assert self._remote_dspark_transport is not None
+        draft_config = normalize_draft_config(
+            self.speculative_config.draft_model_config.hf_config
+        )
+        self._remote_dspark_transport.configure_tensor_layout(
+            RemoteTensorLayout(
+                tuple(self.num_tokens_paddings),
+                self.model_config.get_hidden_size(),
+                len(draft_config["target_layer_ids"]),
+                self._hidden_states_dtype,
+                self.scheduler_config.max_num_seqs,
+            )
+        )
+
+    def _align_remote_draft_input_batch(self, plan: RemoteDraftPlan) -> None:
+        expected = [query.request_id for query in plan.queries]
+        actual = list(self.input_batch.req_ids[: self.input_batch.num_reqs])
+        if len(actual) != len(expected) or set(actual) != set(expected):
+            raise RemoteDraftProtocolError(
+                "P persistent batch membership differs from D execution plan"
+            )
+        for index, request_id in enumerate(expected):
+            current = self.input_batch.req_id_to_index[request_id]
+            if current != index:
+                self.input_batch.swap_states(index, current)
+
+    def _validate_remote_draft_layout(
+        self, scheduler_output: RemoteDraftSchedulerOutput
+    ) -> None:
+        plan = scheduler_output.remote_draft_plan
+        assert plan is not None
+        request_ids = cast(
+            list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
+        )
+        lengths = [
+            scheduler_output.num_scheduled_tokens[req_id] for req_id in request_ids
+        ]
+        positions = [
+            position
+            for index, length in enumerate(lengths)
+            for position in range(
+                int(self.input_batch.num_computed_tokens_cpu[index]),
+                int(self.input_batch.num_computed_tokens_cpu[index]) + length,
+            )
+        ]
+        plan.validate_layout(
+            request_ids, positions, lengths, self._input_chunk_ends(scheduler_output)
+        )
+
     def _clear_finished_remote_dspark_batch(
         self, scheduler_output: "SchedulerOutput"
     ) -> None:
@@ -3787,6 +3916,11 @@ class TPUModelRunner(GPUModelRunner):
                 and tokens
                 and all(token == -1 for token in tokens)
             ):
+                if isinstance(scheduler_output, RemoteDraftConsumerOutput):
+                    raise RemoteDraftProtocolError(
+                        "planned D scheduler emitted bootstrap placeholders after "
+                        "token accounting"
+                    )
                 del scheduler_output.scheduled_spec_decode_tokens[req_id]
                 scheduler_output.num_scheduled_tokens[req_id] -= len(tokens)
                 scheduler_output.total_num_scheduled_tokens -= len(tokens)
@@ -3803,6 +3937,24 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if isinstance(scheduler_output, RemoteDraftConsumerOutput):
+            sender = self._remote_dspark_plan_sender
+            if sender is None:
+                raise RuntimeError("planned D scheduler requires a readiness publisher")
+            if scheduler_output.remote_draft_terminals:
+                if self._remote_dspark_lifecycle is not None:
+                    self._remote_dspark_lifecycle.finish(
+                        scheduler_output.remote_draft_terminals
+                    )
+                sender.send(
+                    RemoteDraftPlan(
+                        self._remote_dspark_plan_sequence,
+                        (),
+                        (),
+                        scheduler_output.remote_draft_terminals,
+                    )
+                )
+                self._remote_dspark_plan_sequence += 1
         if self._remote_dspark_role:
             self._clear_finished_remote_dspark_batch(scheduler_output)
         if self._remote_dspark_role == "consumer":
@@ -3824,6 +3976,8 @@ class TPUModelRunner(GPUModelRunner):
         if self._remote_dspark_role == "consumer":
             for req_id in scheduler_output.finished_req_ids:
                 self._remote_dspark_source_request_ids.pop(req_id, None)
+                self._remote_dspark_generations.pop(req_id, None)
+                self._remote_dspark_request_rounds.pop(req_id, None)
             metadata = cast(
                 TPUConnectorMetadata | None, scheduler_output.kv_connector_metadata
             )
@@ -3833,6 +3987,14 @@ class TPUModelRunner(GPUModelRunner):
                     if not isinstance(source_req_id, str):
                         raise RuntimeError("remote DSpark requires a Raiden source ID")
                     self._remote_dspark_source_request_ids[req_id] = source_req_id
+                    if self._remote_dspark_plan_sender is not None:
+                        generation = load.uuid
+                        previous = self._remote_dspark_generations.get(req_id)
+                        if previous is not None and previous != generation:
+                            raise RuntimeError(
+                                "live remote Draft request generation changed"
+                            )
+                        self._remote_dspark_generations[req_id] = generation
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
@@ -3863,9 +4025,20 @@ class TPUModelRunner(GPUModelRunner):
                         f"num_prompt_tokens={num_prompt}. "
                         "Set SamplingParams(max_tokens=1) at the service entry."
                     )
+        planned_remote_step = isinstance(scheduler_output, RemoteDraftSchedulerOutput)
+        remote_plan = (
+            scheduler_output.remote_draft_plan if planned_remote_step else None
+        )
+        if remote_plan is not None:
+            if self._remote_dspark_role != "producer":
+                raise RuntimeError("only a remote Draft producer may execute a D plan")
+            self._align_remote_draft_input_batch(remote_plan)
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output
         )
+        if remote_plan is not None:
+            assert isinstance(scheduler_output, RemoteDraftSchedulerOutput)
+            self._validate_remote_draft_layout(scheduler_output)
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output
         )
@@ -3878,12 +4051,29 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_num_chunks = target_num_chunks
 
         remote_feedback: dict[str, Any] | None = None
-        if (
-            self._remote_dspark_role == "producer"
-            and self._remote_dspark_awaiting_feedback
+        if self._remote_dspark_role == "producer" and (
+            remote_plan is not None
+            or (not planned_remote_step and self._remote_dspark_awaiting_feedback)
         ):
             assert self._remote_dspark_transport is not None
+            if remote_plan is not None:
+                self._configure_remote_draft_tensor_layout()
             remote_feedback = self._remote_dspark_transport.recv_feedback()
+            if remote_plan is not None:
+                if remote_feedback.get("execution_plan") != remote_plan:
+                    raise RemoteDraftProtocolError(
+                        "feedback generation/round/layout differs from D plan"
+                    )
+                token_rows = [
+                    [int(token) for token in row if token >= 0]
+                    for packed in remote_feedback["next_tokens_per_chunk"]
+                    for row in packed.tensor.reshape(
+                        packed.tensor.shape[0], -1
+                    ).tolist()
+                ]
+                self._remote_dspark_proposal_contexts = proposal_contexts_for_plan(
+                    remote_plan, token_rows
+                )
             self._remote_dspark_awaiting_feedback = False
             if self._profiler_rank == 0:
                 logger.info(
@@ -4192,6 +4382,7 @@ class TPUModelRunner(GPUModelRunner):
                 # The next stage continues this chunk; logits and sampling
                 # happen on the last stage.
                 assert self._pp_wave is not None
+                assert isinstance(hidden_states, IntermediateTensors)
                 self._pp_wave.end_forward(
                     self._pp_outgoing_tensors(hidden_states.tensors, num_tokens_padded),
                     num_tokens_padded,
@@ -4417,6 +4608,16 @@ class TPUModelRunner(GPUModelRunner):
         )
         return gate_unfinished(pooler_output, finished_np)
 
+    def close_remote_draft_channels(self) -> None:
+        sender, self._remote_dspark_plan_sender = self._remote_dspark_plan_sender, None
+        transport, self._remote_dspark_transport = self._remote_dspark_transport, None
+        try:
+            if sender is not None:
+                sender.close()
+        finally:
+            if transport is not None:
+                transport.close()
+
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self.spec_decode_manager is None:
             return None
@@ -4425,7 +4626,14 @@ class TPUModelRunner(GPUModelRunner):
             if not self._remote_dspark_proposal_rank:
                 return None
             assert transport is not None
-            producer_request_ids, token_ids = transport.recv_proposal()
+            if self._remote_dspark_lifecycle is not None:
+                producer_request_ids, token_ids = transport.recv_proposal(
+                    contexts=self._remote_dspark_lifecycle.proposal_contexts()
+                )
+            else:
+                producer_request_ids, token_ids = transport.recv_proposal()
+            if self._remote_dspark_lifecycle is not None:
+                self._remote_dspark_lifecycle.receive(producer_request_ids, token_ids)
             consumer_request_ids = list(
                 self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
@@ -4448,8 +4656,74 @@ class TPUModelRunner(GPUModelRunner):
             and drafts is not None
         ):
             assert transport is not None
-            transport.send_proposal(drafts.req_ids, drafts.draft_token_ids)
+            if self._remote_dspark_proposal_contexts is not None:
+                transport.send_proposal(
+                    drafts.req_ids,
+                    drafts.draft_token_ids,
+                    contexts=self._remote_dspark_proposal_contexts,
+                )
+                self._remote_dspark_proposal_contexts = None
+            else:
+                transport.send_proposal(drafts.req_ids, drafts.draft_token_ids)
         return drafts
+
+    def _publish_remote_draft_plan(
+        self,
+        request_ids: list[str],
+        draft_chunks: list[DraftChunkInputs],
+        token_rows: list[list[int]],
+    ) -> RemoteDraftPlan:
+        sender = self._remote_dspark_plan_sender
+        assert sender is not None
+        queries = []
+        chunk_ends = []
+        for chunk in draft_chunks:
+            if chunk.start_index != len(queries):
+                raise RuntimeError(
+                    "remote Draft chunks must cover consecutive request rows"
+                )
+            for local_index in range(chunk.num_reqs):
+                index = chunk.start_index + local_index
+                req_id = request_ids[index]
+                source_id = self._remote_dspark_source_request_ids[req_id]
+                generation = self._remote_dspark_generations[req_id]
+                round_id = self._remote_dspark_request_rounds.get(req_id, 0)
+                num_tokens = int(
+                    chunk.query_start_loc_np[local_index + 1]
+                    - chunk.query_start_loc_np[local_index]
+                )
+                queries.append(
+                    RemoteDraftQuery(
+                        request_id=source_id,
+                        generation=generation,
+                        round_id=round_id,
+                        position=int(self.input_batch.num_computed_tokens_cpu[index]),
+                        num_tokens=num_tokens,
+                        kind=(
+                            RemoteQueryKind.BOOTSTRAP
+                            if round_id == 0
+                            else RemoteQueryKind.VERIFY
+                        ),
+                    )
+                )
+            chunk_ends.append(len(queries))
+        if len(queries) != len(request_ids):
+            raise RuntimeError(
+                "remote Draft plan did not cover the actual D request batch"
+            )
+        plan = RemoteDraftPlan(
+            self._remote_dspark_plan_sequence, tuple(queries), tuple(chunk_ends)
+        )
+        if self._remote_dspark_lifecycle is not None:
+            self._remote_dspark_lifecycle.begin(plan, token_rows)
+        # Publish before the first send_tensor_rows can wait for setup ACK.
+        sender.send(plan)
+        self._remote_dspark_plan_sequence += 1
+        for req_id in request_ids:
+            self._remote_dspark_request_rounds[req_id] = (
+                self._remote_dspark_request_rounds.get(req_id, 0) + 1
+            )
+        return plan
 
     def _send_remote_dspark_feedback(
         self,
@@ -4462,6 +4736,21 @@ class TPUModelRunner(GPUModelRunner):
         feedback_request_ids = remote_dspark_source_ids(
             request_ids, self._remote_dspark_source_request_ids
         )
+        packed_next_tokens = [
+            PackedTensorRows.from_tensor(tensor, chunk.num_reqs)
+            for tensor, chunk in zip(next_tokens_per_chunk, draft_chunks, strict=True)
+        ]
+        execution_plan = None
+        if self._remote_dspark_plan_sender is not None:
+            self._configure_remote_draft_tensor_layout()
+            token_rows = [
+                [int(token) for token in row if token >= 0]
+                for packed in packed_next_tokens
+                for row in packed.tensor.reshape(packed.tensor.shape[0], -1).tolist()
+            ]
+            execution_plan = self._publish_remote_draft_plan(
+                request_ids, draft_chunks, token_rows
+            )
         aux_hidden_states: list[PackedTensorRows | RemoteTensorTransfer] = []
         for chunk_index, chunk in enumerate(draft_chunks):
             aux = chunk.aux_hidden_states
@@ -4486,10 +4775,6 @@ class TPUModelRunner(GPUModelRunner):
                 aux_hidden_states.append(
                     PackedTensorRows.from_tensors(typed_tensors, live_tokens)
                 )
-        packed_next_tokens = [
-            PackedTensorRows.from_tensor(tensor, chunk.num_reqs)
-            for tensor, chunk in zip(next_tokens_per_chunk, draft_chunks, strict=True)
-        ]
         if self._profiler_rank == 0:
             packed_tensors = aux_hidden_states + packed_next_tokens
             backend = (
@@ -4510,6 +4795,7 @@ class TPUModelRunner(GPUModelRunner):
                 "request_ids": feedback_request_ids,
                 "next_tokens_per_chunk": packed_next_tokens,
                 "aux_hidden_states": aux_hidden_states,
+                "execution_plan": execution_plan,
             }
         )
 
@@ -5256,6 +5542,25 @@ class TPUModelRunner(GPUModelRunner):
                         return_device=is_async,
                         device_seed=device_seed,
                     )
+
+        if (
+            isinstance(scheduler_output, RemoteDraftSchedulerOutput)
+            and scheduler_output.remote_draft_plan is not None
+        ):
+            if (
+                is_async
+                or not isinstance(self.drafter, DFlashProposer)
+                or not self._is_async_drafter
+                or not combined_selected_tokens
+                or not state.remote_next_tokens_per_chunk
+            ):
+                raise NotImplementedError(
+                    "planned remote Draft consumption requires sync DFlash drafting"
+                )
+            # Sync DFlash.propose materializes every chunk's draft logits on
+            # CPU on every TP rank. Join those consumption fences before rank0
+            # may publish a proposal and let D overwrite the shared aux buffers.
+            torch.distributed.barrier(group=get_tp_group().cpu_group)
 
         if self._is_dspark_pd_producer and not state.remote_next_tokens_per_chunk:
             assert isinstance(self.drafter, DFlashProposer)

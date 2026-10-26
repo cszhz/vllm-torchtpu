@@ -460,9 +460,10 @@ async def lifespan(app: FastAPI):
     # 4.0 buys a second of margin; raise VLLM_HTTP_TIMEOUT_KEEP_ALIVE on the
     # backends if you want longer-lived connections.
     keepalive_expiry = _env_float("PROXY_KEEPALIVE_EXPIRY_S", 4.0)
+    fresh_connections = os.getenv("PROXY_FRESH_CONNECTIONS", "0") == "1"
     limits = httpx.Limits(
         max_connections=None,
-        max_keepalive_connections=None,
+        max_keepalive_connections=0 if fresh_connections else None,
         keepalive_expiry=keepalive_expiry,
     )
 
@@ -512,14 +513,11 @@ async def lifespan(app: FastAPI):
         f"(decode routing: {global_args.decode_routing})."
     )
 
-    yield
-
-    # Shutdown: Close all clients
-    for client_info in app.state.prefill_clients:
-        await client_info["client"].aclose()
-
-    for client_info in app.state.decode_clients:
-        await client_info["client"].aclose()
+    try:
+        yield
+    finally:
+        for client_info in app.state.prefill_clients + app.state.decode_clients:
+            await client_info["client"].aclose()
 
 
 # Update FastAPI app initialization to use lifespan
@@ -639,6 +637,9 @@ async def send_remote_dspark_request_to_prefill(
     """Run one P request that publishes Target KV and keeps Draft KV alive."""
     producer_data = req_data.copy()
     producer_data["stream"] = False
+    # P's private boundary token must not make its detokenizer abort Draft;
+    # the original request on D remains responsible for stop strings.
+    producer_data.pop("stop", None)
     producer_data["kv_transfer_params"] = mark_remote_dspark_request(
         {
             "do_remote_decode": True,

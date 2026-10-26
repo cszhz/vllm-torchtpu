@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import errno
 import hashlib
 import json
 import math
@@ -33,6 +34,7 @@ import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -77,7 +79,7 @@ def publish_remote_dspark_handoff(
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     payload = {
         "request_id": control_request_id or request_id,
-        "kv_transfer_params": kv_transfer_params,
+        "kv_transfer_params": mark_remote_dspark_request(kv_transfer_params),
     }
     try:
         temporary.write_text(json.dumps(payload), encoding="utf-8")
@@ -276,6 +278,52 @@ class RemoteTensorTransfer:
 
 
 @dataclasses.dataclass(frozen=True)
+class RemoteTensorLayout:
+    row_buckets: tuple[int, ...]
+    hidden_size: int
+    num_layers: int
+    dtype: torch.dtype
+    max_channels: int
+
+    def __post_init__(self) -> None:
+        if (
+            not self.row_buckets
+            or any(rows <= 0 for rows in self.row_buckets)
+            or len(set(self.row_buckets)) != len(self.row_buckets)
+            or min(self.hidden_size, self.num_layers, self.max_channels) <= 0
+        ):
+            raise ValueError("remote tensor layout requires positive finite dimensions")
+
+    @property
+    def max_tensor_bytes(self) -> int:
+        return (
+            self.max_channels
+            * sum(self.row_buckets)
+            * self.hidden_size
+            * self.num_layers
+            * self.dtype.itemsize
+        )
+
+    def validate(self, transfer: RemoteTensorTransfer) -> None:
+        if (
+            transfer.channel >= self.max_channels
+            or len(transfer.specs) != self.num_layers
+            or any(
+                spec.dtype != self.dtype
+                or len(spec.shape) != 2
+                or spec.shape[0] not in self.row_buckets
+                or spec.shape[1] != self.hidden_size
+                for spec in transfer.specs
+            )
+            or len({spec.shape[0] for spec in transfer.specs}) != 1
+        ):
+            raise RemoteDraftProtocolError(
+                "remote tensor transfer exceeds compiled aux layout; check "
+                "P/D compile buckets, chunk capacity, target layers and model dtype"
+            )
+
+
+@dataclasses.dataclass(frozen=True)
 class RemoteDeviceTensorRows:
     """P-side tensors populated in place by TPU Sync."""
 
@@ -372,6 +420,27 @@ class PackedTensorRows:
         return list(self.restore(device).unbind(dim=1))
 
 
+@dataclasses.dataclass(frozen=True)
+class RemoteDraftProposalContext:
+    request_id: str
+    generation: int
+    round_id: int
+    kv_version: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.request_id, str)
+            or not self.request_id
+            or any(
+                type(value) is not int or value < 0
+                for value in (self.generation, self.round_id, self.kv_version)
+            )
+        ):
+            raise RemoteDraftProtocolError(
+                "proposal requires canonical request context"
+            )
+
+
 class RemoteDSparkTransport:
     """One full-duplex TCP stream between matching P/D tensor-parallel ranks.
 
@@ -407,6 +476,7 @@ class RemoteDSparkTransport:
         self._producer_host = producer_host
         self._round_id = 0
         self._proposal_outstanding = False
+        self._tensor_layout: RemoteTensorLayout | None = None
         self._tensor_senders: dict[
             tuple[int, tuple[RemoteTensorSpec, ...]], _SenderTensorChannel
         ] = {}
@@ -475,10 +545,26 @@ class RemoteDSparkTransport:
                 f"remote DSpark handshake mismatch on rank {self.rank}: {peer!r}"
             )
 
-    def send_proposal(self, request_ids: list[str], token_ids: list[list[int]]) -> None:
+    def send_proposal(
+        self,
+        request_ids: list[str],
+        token_ids: list[list[int]],
+        *,
+        contexts: tuple[RemoteDraftProposalContext, ...] | None = None,
+    ) -> None:
         if self.role != "producer":
             raise RemoteDraftProtocolError("only the producer sends proposals")
+        if contexts is not None and (
+            [context.request_id for context in contexts] != request_ids
+            or len(set(request_ids)) != len(request_ids)
+            or len(token_ids) != len(request_ids)
+        ):
+            raise RemoteDraftProtocolError("proposal context differs from token rows")
         if self._proposal_outstanding:
+            if contexts is not None:
+                raise RemoteDraftProtocolError(
+                    "planned proposal requires the next execution feedback first"
+                )
             if self.rank == 0:
                 logger.info(
                     "Remote DSpark abandoning terminal proposal: round=%d",
@@ -498,19 +584,51 @@ class RemoteDSparkTransport:
                 "round_id": self._round_id,
                 "request_ids": request_ids,
                 "token_ids": token_ids,
+                "contexts": contexts,
             }
         )
         self._proposal_outstanding = True
 
-    def recv_proposal(self) -> tuple[list[str], list[list[int]]]:
+    def recv_proposal(
+        self, *, contexts: tuple[RemoteDraftProposalContext, ...] | None = None
+    ) -> tuple[list[str], list[list[int]]]:
         if self.role != "consumer":
             raise RemoteDraftProtocolError("only the consumer receives proposals")
         message = self._recv()
+        wire_contexts = message.get("contexts")
+        if contexts is not None:
+            if (
+                not isinstance(wire_contexts, tuple)
+                or not all(
+                    isinstance(context, RemoteDraftProposalContext)
+                    for context in wire_contexts
+                )
+                or len(wire_contexts) != len(contexts)
+                or len({context.request_id for context in wire_contexts})
+                != len(wire_contexts)
+                or {context.request_id: context for context in wire_contexts}
+                != {context.request_id: context for context in contexts}
+                or [context.request_id for context in wire_contexts]
+                != message.get("request_ids")
+                or len(message.get("token_ids", ())) != len(wire_contexts)
+            ):
+                raise RemoteDraftProtocolError(
+                    "proposal request generation/round/frontier differs from D work"
+                )
+        elif wire_contexts is not None:
+            raise RemoteDraftProtocolError(
+                "planned proposal requires D context validation"
+            )
         round_id = message.get("round_id")
         if (
             message.get("kind") != "proposal"
             or not isinstance(round_id, int)
-            or round_id not in (self._round_id, self._round_id + 1)
+            or round_id
+            not in (
+                (self._round_id,)
+                if contexts is not None
+                else (self._round_id, self._round_id + 1)
+            )
         ):
             raise RemoteDraftProtocolError(
                 f"remote DSpark rank {self.rank} expected proposal round "
@@ -544,6 +662,11 @@ class RemoteDSparkTransport:
         self._send({"kind": "feedback", "round_id": self._round_id, **payload})
         self._round_id += 1
 
+    def configure_tensor_layout(self, layout: RemoteTensorLayout) -> None:
+        if self._tensor_layout is not None and self._tensor_layout != layout:
+            raise RemoteDraftProtocolError("live remote tensor layout changed")
+        self._tensor_layout = layout
+
     def send_tensor_rows(
         self,
         *,
@@ -561,6 +684,11 @@ class RemoteDSparkTransport:
             raise ValueError("remote tensor layers must reside on one device")
         contiguous = tuple(tensor.contiguous() for tensor in tensors)
         transfer = RemoteTensorTransfer.from_tensors(channel, contiguous, live_rows)
+        if self._tensor_layout is not None:
+            self._tensor_layout.validate(transfer)
+        if device.type == "tpu":
+            # Native binding must see buffers for the current deferred graph.
+            synchronize_tensors(contiguous, wait=True)
         key = (transfer.channel, transfer.specs)
         sender = self._tensor_senders.get(key)
         if sender is None:
@@ -653,6 +781,8 @@ class RemoteDSparkTransport:
             raise RemoteDraftProtocolError(
                 f"remote DSpark rank {self.rank} received invalid TPU Sync setup"
             )
+        if self._tensor_layout is not None:
+            self._tensor_layout.validate(transfer)
         key = (transfer.channel, transfer.specs)
         receiver = self._tensor_receivers.get(key)
         if receiver is None:
@@ -722,6 +852,17 @@ class RemoteDSparkTransport:
                 )
             chunks.extend(chunk)
         return bytes(chunks)
+
+    def close(self) -> None:
+        if self._stream.fileno() < 0:
+            return
+        try:
+            self._stream.shutdown(socket.SHUT_RDWR)
+        except OSError as error:
+            if error.errno not in (errno.ENOTCONN, errno.EBADF):
+                raise
+        finally:
+            self._stream.close()
 
 
 class RequestPhase(StrEnum):
@@ -826,10 +967,31 @@ class RemoteDraftPipeline:
         self._requests[request_id] = _RequestState(round_id=0, kv_version=kv_version)
         self._draft_ready.append(request_id)
 
-    def claim_draft_batch(self, limit: int) -> tuple[DraftWork, ...]:
+    def claim_draft_batch(
+        self, limit: int, *, request_ids: tuple[str, ...] | None = None
+    ) -> tuple[DraftWork, ...]:
         if limit <= 0:
             raise ValueError("limit must be positive")
         available = self.max_inflight_proposals - self._reserved_slots
+        if request_ids is not None:
+            if (
+                len(set(request_ids)) != len(request_ids)
+                or len(request_ids) > min(limit, available)
+                or any(
+                    request_id not in self._draft_ready for request_id in request_ids
+                )
+            ):
+                raise RemoteDraftProtocolError(
+                    "planned draft requests exceed ready work or proposal capacity"
+                )
+            selected = set(request_ids)
+            self._draft_ready = collections.deque(
+                [
+                    *request_ids,
+                    *(req for req in self._draft_ready if req not in selected),
+                ]
+            )
+            limit = len(request_ids)
         count = min(limit, available, len(self._draft_ready))
         work: list[DraftWork] = []
         for _ in range(count):
@@ -931,6 +1093,22 @@ class RemoteDraftPipeline:
             raise RemoteDraftProtocolError(
                 f"request {request_id!r} is not registered"
             ) from exc
+
+    def retire(self, request_id: str) -> None:
+        state = self._state(request_id)
+        if state.phase not in (RequestPhase.CANCELLED, RequestPhase.FINISHED):
+            raise RemoteDraftProtocolError(
+                "only terminal proposal state can be retired"
+            )
+        del self._requests[request_id]
+        self._draft_ready = collections.deque(
+            queued for queued in self._draft_ready if queued != request_id
+        )
+        self._verify_ready = collections.deque(
+            proposal
+            for proposal in self._verify_ready
+            if proposal.request_id != request_id
+        )
 
     @staticmethod
     def _expect_phase(

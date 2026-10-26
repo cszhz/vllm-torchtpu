@@ -267,6 +267,221 @@ def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     assert real_runner.num_reqs_most_model_len is None
 
 
+def test_zero_token_remote_terminal_publishes_before_finished_maps_are_cleared(
+    monkeypatch,
+):
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.request import RequestStatus
+
+    from vllm_torchtpu.spec_decode.remote_draft_control import (
+        RemoteDraftConsumerLifecycle,
+        RemoteDraftConsumerOutput,
+        RemoteDraftPlan,
+        RemoteDraftQuery,
+        RemoteDraftTerminal,
+        RemoteQueryKind,
+    )
+
+    lifecycle = RemoteDraftConsumerLifecycle(1)
+    lifecycle.begin(
+        RemoteDraftPlan(
+            0, (RemoteDraftQuery("a", 7, 0, 3, 1, RemoteQueryKind.BOOTSTRAP),), (1,)
+        ),
+        [[20]],
+    )
+    lifecycle.receive(["a"], [[21, 22]])
+    terminal = RemoteDraftTerminal("a", 7, int(RequestStatus.FINISHED_LENGTH_CAPPED))
+    output = RemoteDraftConsumerOutput(
+        **vars(SchedulerOutput.make_empty()), remote_draft_terminals=(terminal,)
+    )
+    output.finished_req_ids = {"d-a"}
+    runner = object.__new__(TPUModelRunner)
+    runner._pp_wave = None
+    runner.execute_model_state = None
+    runner._remote_dspark_role = "consumer"
+    runner._remote_dspark_lifecycle = lifecycle
+    runner._remote_dspark_plan_sequence = 1
+    runner._remote_dspark_source_request_ids = {"d-a": "a"}
+    runner._remote_dspark_generations = {"d-a": 7}
+    runner._remote_dspark_request_rounds = {"d-a": 1}
+    runner._remote_dspark_awaiting_feedback = True
+    runner.input_batch = SimpleNamespace(req_ids=["d-a"], num_reqs=1)
+    runner.scheduler_config = SimpleNamespace(async_scheduling=False)
+    # Device/cache state updates are outside this zero-token control regression.
+    runner._update_states = MagicMock()
+
+    def publish(plan):
+        assert plan == RemoteDraftPlan(1, (), (), (terminal,))
+        assert runner._remote_dspark_source_request_ids == {"d-a": "a"}
+        assert lifecycle._pipeline.inflight_proposals == 0
+
+    runner._remote_dspark_plan_sender = MagicMock()
+    runner._remote_dspark_plan_sender.send.side_effect = publish
+    monkeypatch.setattr(tpu_runner, "has_kv_transfer_group", lambda: False)
+    assert runner.execute_model(output) is tpu_runner.EMPTY_MODEL_RUNNER_OUTPUT
+    runner._remote_dspark_plan_sender.send.assert_called_once()
+    runner._update_states.assert_called_once_with(output)
+    assert not runner._remote_dspark_source_request_ids
+    assert not runner._remote_dspark_generations
+    assert not runner._remote_dspark_request_rounds
+    assert not runner._remote_dspark_awaiting_feedback
+
+
+def test_planned_execute_rejects_feedback_from_another_generation_before_forward():
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    from vllm_torchtpu.spec_decode.remote_draft_control import (
+        RemoteDraftPlan,
+        RemoteDraftQuery,
+        RemoteDraftSchedulerOutput,
+        RemoteQueryKind,
+    )
+    from vllm_torchtpu.spec_decode.remote_dspark import RemoteDraftProtocolError
+
+    plan = RemoteDraftPlan(
+        0, (RemoteDraftQuery("a", 7, 0, 3, 1, RemoteQueryKind.BOOTSTRAP),), (1,)
+    )
+    stale_plan = RemoteDraftPlan(
+        0, (RemoteDraftQuery("a", 6, 0, 3, 1, RemoteQueryKind.BOOTSTRAP),), (1,)
+    )
+    output = RemoteDraftSchedulerOutput(
+        **vars(SchedulerOutput.make_empty()), remote_draft_plan=plan
+    )
+    output.num_scheduled_tokens = {"a": 1}
+    output.total_num_scheduled_tokens = 1
+    runner = object.__new__(TPUModelRunner)
+    runner._pp_wave = None
+    runner.execute_model_state = None
+    runner._remote_dspark_role = "producer"
+    runner._remote_dspark_awaiting_feedback = True
+    runner._remote_dspark_proposal_contexts = None
+    runner._mtp_prefill_only = False
+    runner.scheduler_config = SimpleNamespace(async_scheduling=False)
+    runner.input_batch = SimpleNamespace(
+        req_ids=["a"],
+        req_id_to_index={"a": 0},
+        num_reqs=1,
+        num_computed_tokens_cpu=np.array([3]),
+    )
+    runner.most_model_len = None
+    runner.num_reqs_max_model_len = 1
+    # Cache/device setup and DP collectives are explicit CPU stand-ins.
+    runner._update_states = MagicMock()
+    runner._reorder_batch_for_rpa = MagicMock(return_value=(1, 0))
+    runner._dp_coordinated_step = MagicMock(return_value=(1, 1))
+    runner._remote_dspark_transport = MagicMock()
+    runner._configure_remote_draft_tensor_layout = MagicMock()
+    runner._remote_dspark_transport.recv_feedback.return_value = {
+        "execution_plan": stale_plan
+    }
+    with pytest.raises(RemoteDraftProtocolError, match="differs from D plan"):
+        runner.execute_model(output)
+    runner._remote_dspark_transport.recv_feedback.assert_called_once_with()
+    assert runner._remote_dspark_proposal_contexts is None
+    assert runner.execute_model_state is None
+    assert output.num_scheduled_tokens == {"a": 1}
+
+
+@pytest.mark.parametrize("role", ["producer", "consumer"])
+@pytest.mark.parametrize("selector", ["class", "path", "subclass"])
+def test_planned_worker_resolves_scheduler_types_and_rejects_wrong_role(role, selector):
+    from vllm_torchtpu.core.remote_draft_scheduler import (
+        RemoteDraftConsumerScheduler,
+        RemoteDraftScheduler,
+    )
+    from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
+
+    scheduler_cls = (
+        RemoteDraftScheduler if role == "producer" else RemoteDraftConsumerScheduler
+    )
+    if selector == "path":
+        scheduler_cls = f"{scheduler_cls.__module__}.{scheduler_cls.__qualname__}"
+    elif selector == "subclass":
+        scheduler_cls = type("CustomRemoteScheduler", (scheduler_cls,), {})
+    runner = object.__new__(TPUModelRunner)
+    runner.scheduler_config = SchedulerConfig(
+        max_model_len=128,
+        is_encoder_decoder=False,
+        scheduler_cls=scheduler_cls,
+        async_scheduling=False,
+    )
+    runner.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        tensor_parallel_size=8,
+        nnodes=1,
+        distributed_executor_backend=TpuMultiprocExecutor,
+    )
+    runner.vllm_config = SimpleNamespace(parallel_config=runner.parallel_config)
+    runner._remote_dspark_role = role
+    assert runner._validate_remote_draft_scheduler_role()
+    for wrong in ("", "consumer" if role == "producer" else "producer"):
+        runner._remote_dspark_role = wrong
+        with pytest.raises(ValueError, match="requires worker role"):
+            runner._validate_remote_draft_scheduler_role()
+    runner._remote_dspark_role = role
+    runner.parallel_config.data_parallel_size = 2
+    with pytest.raises(NotImplementedError, match="sync TP-only"):
+        runner._validate_remote_draft_scheduler_role()
+    runner.parallel_config.data_parallel_size = 1
+    for field in (
+        "prefill_context_parallel_size",
+        "decode_context_parallel_size",
+        "nnodes",
+    ):
+        setattr(runner.parallel_config, field, 2)
+        with pytest.raises(NotImplementedError, match="sync TP-only"):
+            runner._validate_remote_draft_scheduler_role()
+        setattr(runner.parallel_config, field, 1)
+    for backend in ("mp", "external_launcher", "uni"):
+        runner.parallel_config.distributed_executor_backend = backend
+        with pytest.raises(NotImplementedError, match="all-rank proposal"):
+            runner._validate_remote_draft_scheduler_role()
+    runner.parallel_config.tensor_parallel_size = 1
+    runner.parallel_config.distributed_executor_backend = "uni"
+    assert runner._validate_remote_draft_scheduler_role()
+
+
+def test_worker_derives_remote_tensor_bounds_from_compile_and_model_layout():
+    from transformers import PretrainedConfig
+
+    from vllm_torchtpu.spec_decode.remote_dspark import RemoteTensorLayout
+
+    runner = object.__new__(TPUModelRunner)
+    runner.speculative_config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(
+            hf_config=PretrainedConfig(
+                dflash_config={"mask_token_id": 0, "target_layer_ids": [1, 3]}
+            )
+        )
+    )
+    runner.num_tokens_paddings = [1, 8]
+    runner.model_config = SimpleNamespace(get_hidden_size=lambda: 16)
+    runner._hidden_states_dtype = torch.bfloat16
+    runner.scheduler_config = SimpleNamespace(max_num_seqs=4)
+    runner._remote_dspark_transport = MagicMock()
+    runner._configure_remote_draft_tensor_layout()
+    runner._remote_dspark_transport.configure_tensor_layout.assert_called_once_with(
+        RemoteTensorLayout((1, 8), 16, 2, torch.bfloat16, 4)
+    )
+
+
+def test_remote_channel_close_is_idempotent_and_closes_socket_on_sender_error():
+    runner = object.__new__(TPUModelRunner)
+    sender, transport = MagicMock(), MagicMock()
+    runner._remote_dspark_plan_sender = sender
+    runner._remote_dspark_transport = transport
+    sender.close.side_effect = RuntimeError("sender close failed")
+    with pytest.raises(RuntimeError, match="sender close failed"):
+        runner.close_remote_draft_channels()
+    transport.close.assert_called_once_with()
+    runner.close_remote_draft_channels()
+    sender.close.assert_called_once_with()
+    transport.close.assert_called_once_with()
+
+
 def test_may_reinitialize_input_batch_requires_kernel_block_sizes():
     # Without them, split groups would hand manager block ids to the kernels.
     runner = object.__new__(TPUModelRunner)
@@ -3205,6 +3420,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
                 mamba_state_indices_list=None,
                 pooler_output_list=[],
                 top_tokens=False,
+                remote_next_tokens_per_chunk=[],
             ),
             input_batch=SimpleNamespace(
                 max_num_logprobs=None,
@@ -3231,6 +3447,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             scheduler_config=SimpleNamespace(async_scheduling=False),
             _is_async_drafter=False,
             _is_dspark_pd_producer=False,
+            _remote_dspark_role="",
             _fence_spec_kv_under_token_copy=False,
             is_pooling_model=False,
             drafter=SimpleNamespace(),
@@ -3261,6 +3478,7 @@ def test_remote_dspark_feedback_preserves_source_id_on_all_ranks(proposal_rank):
     runner = SimpleNamespace(
         _remote_dspark_transport=transport,
         _profiler_rank=1,
+        _remote_dspark_plan_sender=None,
         _remote_dspark_proposal_rank=proposal_rank,
         _remote_dspark_source_request_ids={"consumer-id": "producer-id"},
     )
@@ -3286,6 +3504,7 @@ def test_remote_dspark_proposal_rows_follow_source_ids_after_reordering():
     runner = SimpleNamespace(
         spec_decode_manager=object(),
         _remote_dspark_transport=transport,
+        _remote_dspark_lifecycle=None,
         _remote_dspark_role="consumer",
         _remote_dspark_proposal_rank=True,
         _remote_dspark_source_request_ids={
@@ -3297,6 +3516,90 @@ def test_remote_dspark_proposal_rows_follow_source_ids_after_reordering():
     drafts = TPUModelRunner.take_draft_token_ids(runner)
     assert drafts.req_ids == ["consumer-b", "consumer-a"]
     assert drafts.draft_token_ids == [[21], [11]]
+
+
+def test_remote_draft_plan_reorders_persistent_input_batch_rows():
+    from vllm import SamplingParams
+    from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+
+    from vllm_torchtpu.spec_decode.remote_draft_control import (
+        RemoteDraftPlan,
+        RemoteDraftQuery,
+        RemoteQueryKind,
+    )
+
+    batch = InputBatch(4, 128, 8, torch.device("cpu"), 256, [16], [8])
+    params = SamplingParams(max_tokens=8, temperature=0)
+    params.update_from_generation_config({}, 2)
+    for req_id, prompt, computed, block in [
+        ("a", [1, 2, 3], 4, 2),
+        ("b", [4, 5, 6], 5, 3),
+    ]:
+        batch.add_request(
+            CachedRequestState(
+                req_id, prompt, [], params, None, ([block],), computed, [10, 11, 12]
+            )
+        )
+    runner = SimpleNamespace(input_batch=batch)
+    plan = RemoteDraftPlan(
+        0,
+        (
+            RemoteDraftQuery("b", 7, 1, 5, 3, RemoteQueryKind.VERIFY),
+            RemoteDraftQuery("a", 7, 1, 4, 3, RemoteQueryKind.VERIFY),
+        ),
+        (2,),
+    )
+    TPUModelRunner._align_remote_draft_input_batch(runner, plan)
+    assert batch.req_ids == ["b", "a"]
+    assert batch.req_id_to_index == {"b": 0, "a": 1}
+    assert batch.num_computed_tokens_cpu[:2].tolist() == [5, 4]
+    assert batch.token_ids_cpu[0, :3].tolist() == [4, 5, 6]
+    assert batch.token_ids_cpu[1, :3].tolist() == [1, 2, 3]
+
+
+@pytest.mark.parametrize("bad_order", [False, True])
+def test_remote_draft_plan_validates_post_rpa_positions_and_chunks(bad_order):
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    from vllm_torchtpu.spec_decode.remote_draft_control import (
+        RemoteDraftPlan,
+        RemoteDraftQuery,
+        RemoteDraftSchedulerOutput,
+        RemoteQueryKind,
+    )
+    from vllm_torchtpu.spec_decode.remote_dspark import RemoteDraftProtocolError
+
+    plan = RemoteDraftPlan(
+        0,
+        (
+            RemoteDraftQuery("b", 7, 0, 3, 1, RemoteQueryKind.BOOTSTRAP),
+            RemoteDraftQuery("a", 7, 1, 4, 3, RemoteQueryKind.VERIFY),
+        ),
+        (1, 2),
+    )
+    output = RemoteDraftSchedulerOutput(
+        **vars(SchedulerOutput.make_empty()), remote_draft_plan=plan
+    )
+    output.num_scheduled_tokens = {"b": 1, "a": 3}
+    output.total_num_scheduled_tokens = 4
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            req_ids=["a", "b"] if bad_order else ["b", "a"],
+            num_reqs=2,
+            num_computed_tokens_cpu=np.array([3, 4]),
+        ),
+        most_model_len=None,
+        num_reqs_max_model_len=1,
+    )
+    runner._input_chunk_ends = lambda scheduled: TPUModelRunner._input_chunk_ends(
+        runner, scheduled
+    )
+    if bad_order:
+        with pytest.raises(RemoteDraftProtocolError, match="layout differs"):
+            TPUModelRunner._validate_remote_draft_layout(runner, output)
+    else:
+        TPUModelRunner._validate_remote_draft_layout(runner, output)
+        assert TPUModelRunner._count_input_chunks(runner, output) == (2, 1)
 
 
 def test_remote_dspark_bootstrap_removes_reserved_speculative_slots():
