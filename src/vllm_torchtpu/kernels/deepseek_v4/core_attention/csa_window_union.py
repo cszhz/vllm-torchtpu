@@ -245,6 +245,7 @@ def _union_gather_kernel(
     version: int = 0,
     nbuf: int = NBUF,
     sb_major_T: int = 0,
+    nz_shifts: int = 4,
 ):
     # version 0: as first measured (j-6e9128d7). version 1: top-k / page-table
     # DMAs concurrent with the zero pass, zero pass 8 stores per iteration,
@@ -336,7 +337,10 @@ def _union_gather_kernel(
         def prefix(i, carry):
             x = cnt[pl.ds(i * L, L)]
             # counts reach WQ = 8 (0b1000): all four nibble bits matter
-            nz = (x | srl(x, 1) | srl(x, 2) | srl(x, 3)) & 0x11111111
+            nz = x
+            for sh in range(1, nz_shifts):  # 4 (test-only 3 reproduces the count-8 bug)
+                nz = nz | srl(x, sh)
+            nz = nz & 0x11111111
             pc = srl(nz * 0x11111111, 28)
             cs = plsc.cumsum(pc)
             base[pl.ds(i * L, L)] = cs - pc + carry
@@ -500,7 +504,7 @@ def _union_gather_kernel(
 @functools.partial(
     jax.jit,
     static_argnames=("num_tokens", "max_num_seqs", "skip_gather", "stop_after", "version",
-                     "mask_sb_major"),
+                     "mask_sb_major", "_nz_shifts"),
 )
 def union_gather(
     meta: jax.Array,
@@ -515,6 +519,7 @@ def union_gather(
     stop_after: str | None = None,
     version: int = 2,
     mask_sb_major: bool = False,
+    _nz_shifts: int = 4,
 ):
     """L1. Returns nope_g, rope_g, mask i32[T, W_WORDS], ucnt (module docstring).
 
@@ -556,6 +561,7 @@ def union_gather(
             version=version,
             nbuf=nbuf,
             sb_major_T=T if mask_sb_major else 0,
+            nz_shifts=_nz_shifts,
         ),
         out_type=(
             jax.ShapeDtypeStruct((T * TILE, LANES), jnp.int32),

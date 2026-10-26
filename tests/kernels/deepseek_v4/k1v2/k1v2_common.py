@@ -126,6 +126,12 @@ def _cells():
     cells["edge-maxb"] = Cell("edge-maxb", 16, 32, 4, (300000, 1000000, 20000, 140000), (2480, 4096, 1500, 3100))
     cells["edge-sink"] = Cell("edge-sink", 16, 16, 2, (122880,) * 2, (1808,) * 2)  # sinks +6: sink-dominant softmax
     cells["edge-maxb8"] = Cell("edge-maxb8", 8, 64, 8, (90112,) * 8, (1776,) * 8)  # 8 windows (served mns 8 at c8)
+    # v1.2: >= 8-token NON-verify requests in decode buckets (short prefills / chunk tails), cut into 8-token windows by the union
+    # path; at short context every token takes all valid rows, so most union rows are selected by all 8 tokens (count 8).
+    cells["pfw-c8T16-short"] = Cell("pfw-c8T16-short", 8, 16, 0, (), (), prefill=(16, 1500, 4500))
+    cells["pfw-c16T32-short"] = Cell("pfw-c16T32-short", 16, 32, 1, (CTX[16][1],), (_q(16, CTX[16][1], 0.5),),
+                                     prefill=(24, 3000, 4500))
+    cells["pfw-c8T32-mid"] = Cell("pfw-c8T32-mid", 8, 32, 0, (), (), prefill=(32, 31700, 1200))
     return cells
 
 
@@ -320,7 +326,7 @@ def device_inputs(inp, cache="random", poison=False):
 
 # ---------------------------------------------------------------------------------------------- oracle + faults
 FAULTS = ("drop_union_row", "mask_leak", "page_shift", "stale_acc", "drop_tail_tile", "no_sink", "causal",
-          "cross_request", "no_swa", "pad_token_leak")
+          "cross_request", "no_swa", "pad_token_leak", "drop_window8_row")
 
 
 def _scores(inp, d, deq, t, idx):
@@ -362,6 +368,33 @@ def _leak_row(inp, d, deq, t, idx):
     return other[[int(np.argmax(s.max(0)))]].astype(idx.dtype)
 
 
+_HEAVY8 = {}
+
+
+def _heavy_common_row(inp, d, deq, t0, t1):
+    """The row every token of [t0, t1) selects that carries the most attention weight (v1.2 fault drop_window8_row)."""
+    key = (id(inp), id(d), t0, t1)
+    if key not in _HEAVY8:
+        tk = inp["tk"]
+        common = None
+        for t in range(t0, t1):
+            v = set(tk[t][tk[t] >= 0].tolist())
+            common = v if common is None else common & v
+        best, row = -1.0, -1
+        if common:
+            cand = np.array(sorted(common))
+            for t in range(t0, t1):
+                idx = tk[t][tk[t] >= 0]
+                s = _scores(inp, d, deq, t, idx)
+                p = np.exp(s - s.max(1, keepdims=True))
+                p /= p.sum(1, keepdims=True)
+                pc = p[:, np.isin(idx, cand)]
+                if pc.size and pc.max() > best:
+                    best, row = pc.max(), int(idx[np.isin(idx, cand)][np.unravel_index(np.argmax(pc), pc.shape)[1]])
+        _HEAVY8[key] = row
+    return _HEAVY8[key]
+
+
 def oracle(inp, d, deq, fault=None, frng=None):
     """float64 reference over valid rows -> (out [n, H, D], rows). `fault` builds the output a buggy kernel of that class
     would produce (judged by the same gate as a candidate -> catch rate)."""
@@ -383,6 +416,13 @@ def oracle(inp, d, deq, fault=None, frng=None):
             # a union row missing for every token of the window; the instance is the union row carrying the most
             # attention weight (a dropped row that carries ~0 weight is below bf16 rounding -> undetectable by design)
             idx = idx[idx != _heavy_row(inp, d, deq, t // VQ)]
+        if fault == "drop_window8_row" and i == inp["cell"].R and inp["cell"].prefill:
+            # an 8-token window of a non-verify request loses the heaviest row all its 8 tokens select (the count-8 class)
+            s0 = int(inp["cu"][i])
+            w0 = s0 + ((t - s0) // 8) * 8
+            w1 = min(w0 + 8, int(inp["cu"][i + 1]))
+            if w1 - w0 == 8:
+                idx = idx[idx != _heavy_common_row(inp, d, deq, w0, w1)]
         if fault == "mask_leak" and i < inp["cell"].R:
             # this token's mask admits the window-union row (not in its own list) it would score highest
             idx = np.concatenate([idx, _leak_row(inp, d, deq, t, idx)])

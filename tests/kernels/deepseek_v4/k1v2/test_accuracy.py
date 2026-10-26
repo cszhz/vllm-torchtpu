@@ -14,10 +14,12 @@ import k1v2_common as C
 
 ACC_CELLS = ["c4T8-mid", "c8T16-mid", "c8T32-first", "c16T16-mid", "c16T32-u90", "c16T8-last", "c8T32-ragged",
              "c16T32-ragged", "c16m512-dec", "c16m512-pf32k", "edge-short", "edge-tiny", "edge-pageb", "edge-maxb", "edge-sink",
-             "edge-maxb8"]
+             "edge-maxb8", "pfw-c8T16-short", "pfw-c16T32-short", "pfw-c8T32-mid"]
 
 
 def cls(name):
+    if name.startswith("pfw"):
+        return "prefill-window"
     if name.startswith("edge"):
         return "edge"
     if "m512" in name:
@@ -90,7 +92,7 @@ def main():
                                                      tol=round(tol, 6), caught=not ok)), flush=True)
         print(json.dumps(dict(cell=name, seconds=round(time.time() - t0, 1))), flush=True)
     for (fl, c), (n, m) in sorted(catch.items()):
-        print("CATCH " + json.dumps(dict(fault=fl, cls=c, caught=n, of=m, blind=(c in ("production", "ragged", "mixed") and n < m))), flush=True)
+        print("CATCH " + json.dumps(dict(fault=fl, cls=c, caught=n, of=m, blind=(c in ("production", "ragged", "mixed", "prefill-window") and n < m))), flush=True)
     bad = [s for s in summary if not s.get("ok")]
     print("ACC_SUMMARY " + json.dumps(dict(n=len(summary), bad=[(b["cell"], b["arm"], b.get("poison"), b.get("err_max_rel"), b.get("error", "")[:200]) for b in bad])), flush=True)
 
