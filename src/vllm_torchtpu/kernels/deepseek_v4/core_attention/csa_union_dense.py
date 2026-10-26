@@ -56,9 +56,6 @@ TILE = 1024  # union rows per KV tile (== csa_gather top_k period)
 META = 6  # q_start, q_len, tile0, n_tiles, union_size, seq
 # Debug: TPU_DSV4_CSA_UNION_DENSE_CHECKS=1 compiles the kernels with bounds checks.
 _CHECKS = bool(int(os.environ.get("TPU_DSV4_CSA_UNION_DENSE_CHECKS", "0") or 0))
-# P pushed to the PV matmul as bf16 (the MXU rounds an f32 operand at DEFAULT
-# precision to bf16 anyway; a bf16 operand halves the pushed passes).
-PV_BF16 = bool(int(os.environ.get("TPU_DSV4_CSA_UNION_DENSE_PV_BF16", "0") or 0))
 
 
 def cdiv(a, b):
@@ -167,7 +164,6 @@ def _kernel(
     sm_scale: float,
     bq_sz: int,
     tile: int,
-    pv_bf16: bool = False,
 ):
     _, num_q_heads, head_dim = q_hbm_ref.shape
     rows = bq_sz * num_q_heads
@@ -257,8 +253,7 @@ def _kernel(
         m_curr = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
         m_ref[...] = m_curr
         p = jnp.exp(s - lanes(m_curr, tile))
-        pv = jnp.einsum("nm,md->nd", p.astype(kv.dtype) if pv_bf16 else p, kv,
-                        preferred_element_type=jnp.float32)
+        pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
         exp_m_diff = jnp.exp(m_prev - m_curr)
         l_ref[...] = exp_m_diff * l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
         acc_ref[...] = lanes(exp_m_diff, head_dim) * acc_ref[...] + pv
@@ -325,7 +320,7 @@ def _kernel(
 
 
 @functools.partial(
-    jax.jit, static_argnames=("sm_scale", "bq", "tile", "vmem_limit_bytes", "pv_bf16")
+    jax.jit, static_argnames=("sm_scale", "bq", "tile", "vmem_limit_bytes")
 )
 def union_dense_attention(
     q: jax.Array,  # [T, actual_heads, D]
@@ -343,7 +338,6 @@ def union_dense_attention(
     bq: int,
     tile: int = TILE,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
-    pv_bf16: bool = False,
 ) -> jax.Array:
     """Rows of the planned blocks get CSA attention; all other rows return q."""
     _, actual_heads, actual_dim = q.shape
@@ -384,7 +378,7 @@ def union_dense_attention(
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     scope = f"CsaUnionDense-bq_{bq}-t_{tile}"
     out = pl.pallas_call(
-        functools.partial(_kernel, sm_scale=sm_scale, bq_sz=bq, tile=tile, pv_bf16=pv_bf16),
+        functools.partial(_kernel, sm_scale=sm_scale, bq_sz=bq, tile=tile),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(prefetch),
             in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] + [hbm] * 7,
@@ -988,7 +982,7 @@ def attention(
             ).astype(jnp.int32)
             q = union_dense_attention(
                 q, nope_g, rope_g, mask, meta, plan["total_blocks"], attention_sinks,
-                swa_accumution, swa_l, swa_m, sm_scale=sm_scale, bq=bq, pv_bf16=PV_BF16,
+                swa_accumution, swa_l, swa_m, sm_scale=sm_scale, bq=bq,
             )  # fmt: skip
         del blk_ids
         return q
