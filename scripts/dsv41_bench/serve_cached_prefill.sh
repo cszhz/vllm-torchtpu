@@ -15,6 +15,10 @@ export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-0}"
 export RUNAI_STREAMER_MEMORY_LIMIT=34359738368 TPU_SHARDED_LOAD_SYNC_EVERY=512
 export VLLM_ENGINE_READY_TIMEOUT_S=7200 TORCHINDUCTOR_AUTOGRAD_CACHE=0 TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
 export LIBTPU_INIT_ARGS='--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0 --xla_tpu_dvfs_p_state=7'
+# Flag experiments ride along without editing this file; the harness records them.
+if [[ -n "${DSV41_EXTRA_LIBTPU_ARGS:-}" ]]; then
+  export LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS $DSV41_EXTRA_LIBTPU_ARGS"
+fi
 if [[ "${MOE_FUSED_EP_PREPROCESS_BACKEND:-native}" == topology ]]; then
   export LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS --xla_mosaic_unsafe_allow_multicore_remote_dma=true"
 fi
