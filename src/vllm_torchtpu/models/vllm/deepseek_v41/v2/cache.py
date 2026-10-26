@@ -118,10 +118,14 @@ def budget_native_swa(
         word_bytes + sum(swa_bytes.values()),
         max(spec.page_size_bytes for spec in specs.values()),
     )
-    return {
-        name: replace(spec, page_size_padded=page_bytes)
-        for name, spec in attention_specs.items()
-    }
+    padded: dict[str, KVCacheSpec] = {}
+    for name, spec in attention_specs.items():
+        spec = replace(spec)
+        # Preserve record counts: specialized specs recompute padding in
+        # __post_init__, while this extra budget only separates typed owners.
+        object.__setattr__(spec, "page_size_padded", page_bytes)
+        padded[name] = spec
+    return padded
 
 
 def _materialize_native_swa(
@@ -130,9 +134,13 @@ def _materialize_native_swa(
     """Split each allocator region into typed owners without unbudgeted HBM."""
     from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
 
-    fp8_layers = {name for name, view in views.items() if view.dtype == torch.uint8}
+    fp8_layers = {
+        name
+        for name, view in views.items()
+        if view.dtype == torch.uint8 and view.shape[-1] == ROW_BYTES
+    }
     if csa2_layers.intersection(views) != fp8_layers:
-        raise ValueError("Native SWA allocation requires CSA2 for all FP8 consumers")
+        raise ValueError("Native SWA requires CSA2 for all main FP8 consumers")
     regions = layer_to_pool_index(config)
     groups: dict[tuple, list[str]] = {}
     for name, view in views.items():
