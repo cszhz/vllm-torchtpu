@@ -5,7 +5,8 @@
 Clock (M1/M2): every (arm, cell, M) callable is built + compiled BEFORE timing. M calls are UNROLLED in one jit
 (served-like: the layer-invariant index glue is CSE'd once per program, STRAT-DSV4-02), chained q <- previous output
 (no call is loop-invariant). Per call = least-squares slope over M in MS (rep 0 held out, median of REPS).
-Hoist guards: T(M_hi)/T(1) and the program's custom-call count (expected to scale with M) printed.
+Hoist guards: T(M_hi)/T(1) and the program's custom-call count (expected to scale with M) printed; the top-k is passed
+through an optimization_barrier with the chained q each call so the gather path cannot be CSE'd across calls.
 --profile: jax.profiler trace at M=1 and M=12 -> per-layer DEVICE time = (dev12 - dev1)/11 from tools/devtime.py
 (the decision clock: K-HCA measured the wall slope noisy at +-2 us on a ~1 ms harness intercept).
 Drivers (M6): gathered rows (incumbent), union rows/tiles, bytes, per cell -- printed from the same inputs.
@@ -26,7 +27,11 @@ def chained(f, M):
     def run(d):
         q = d["q"]
         for _ in range(M):
-            q = f(d, q).astype(q.dtype)
+            # M2: the per-layer top-k must be a distinct value per call (as in the served model, where every CSA layer
+            # has its own indexer output); otherwise XLA CSEs the gather path (page ids, SC gather, union plan) once
+            # per program and the chain times the attention kernel alone (j-c694e3a0: 1 custom call per inc call).
+            q, topk = jax.lax.optimization_barrier((q, d["topk"]))
+            q = f(dict(d, topk=topk), q).astype(q.dtype)
         return q
     return jax.jit(run)
 
