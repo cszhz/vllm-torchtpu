@@ -376,6 +376,7 @@ def _attention_csa(
     union_verify_max_tokens: int = 128,
     union_verify_above: int = 0,
     union_verify_early: bool = True,
+    union_verify_fence: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
@@ -479,8 +480,13 @@ def _attention_csa(
     )
     union_rows = None
     if use_union_verify and union_verify_early and not two_caches_same_buffer:
+        topk_for_union = extra
+        if union_verify_fence == 1:
+            topk_for_union, _ = jax.lax.optimization_barrier((extra, q))
+        elif union_verify_fence >= 2:
+            topk_for_union, _, _ = jax.lax.optimization_barrier((extra, q, new_kv))
         union_rows = csa_window_union.prepare(
-            extra, main_kv_lens, main_page_indices, main_cu_q_lens,
+            topk_for_union, main_kv_lens, main_page_indices, main_cu_q_lens,
             main_distribution, main_cache_kv, main_cache_rope,
         )  # fmt: skip
     extra, swa_output, union_plan, union_rows = jax.lax.optimization_barrier(

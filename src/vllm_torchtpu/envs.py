@@ -195,6 +195,7 @@ if TYPE_CHECKING:
     TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS: int = 128
     TPU_DSV4_SMLA_UNION_VERIFY_ABOVE: int = 0
     TPU_DSV4_SMLA_UNION_VERIFY_EARLY: bool = True
+    TPU_DSV4_SMLA_UNION_VERIFY_FENCE: int = 0
     TPU_DSV4_QNORM_ROPE_FLAT: bool = False
     TPU_DSV4_ROPE_QUANT_FLAT: bool = False
     TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS: int = 512
@@ -1363,6 +1364,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_SMLA_UNION_VERIFY_EARLY": env_bool(
         "TPU_DSV4_SMLA_UNION_VERIFY_EARLY", True
     ),
+    # ... and issue that SparseCore call only once the attention op's q (1) or
+    # q and roped kv (2) exist. Unfenced, XLA starts it -- and so waits on the
+    # indexer top-k -- before the q projection: served c16 T32 exposed
+    # ~16.5 us/CSA layer of top-k wait that the base arm hid behind SWA.
+    # Scheduling only. 0 = unfenced.
+    "TPU_DSV4_SMLA_UNION_VERIFY_FENCE": env_int("TPU_DSV4_SMLA_UNION_VERIFY_FENCE", 0),
     "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS": env_int(
         "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS", 512
     ),
