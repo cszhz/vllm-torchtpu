@@ -47,6 +47,8 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 LANES = 16
 NUM_BUCKETS = 256
+# Read once at import: see `sparsecore_topk` (TPU_SC_TOPK_COOP_COND).
+_COOP_COND = __import__("os").environ.get("TPU_SC_TOPK_COOP_COND", "0") == "1"
 # Half of a subcore's slice buffer, in 32-bit words (128KB of the 512KB tile
 # memory). Parts up to this long are double-buffered across waves; a longer part
 # (up to twice this) fills the whole buffer and is fetched single-buffered.
@@ -1078,17 +1080,33 @@ def sparsecore_topk(
     if n <= BY_LENGTH_SLOT_WORDS:
         return by_length
     is_long = lengths > BY_LENGTH_SLOT_WORDS
+
     # Rows it does not own are never read, so it need not write them either.
-    cooperative = _sc_topk_direct(
-        words,
-        k,
-        jnp.where(is_long, lengths, 0),
-        p=p,
-        write_empty=False,
-        return_scores=return_scores,
-        scheduling_group_id=scheduling_group_id,
-        pad_rows=pad_rows,
-    )
+    def _coop(_):
+        return _sc_topk_direct(
+            words,
+            k,
+            jnp.where(is_long, lengths, 0),
+            p=p,
+            write_empty=False,
+            return_scores=return_scores,
+            scheduling_group_id=scheduling_group_id,
+            pad_rows=pad_rows,
+        )
+
+    if _COOP_COND:
+        # TPU_SC_TOPK_COOP_COND: launch the cooperative kernel only when some
+        # row is longer than the by-length buffer (contexts past ~496k). An
+        # empty launch still costs its call (~5-9 us) and swaps the SparseCore
+        # program (overlay reload) between the two kernels on every call.
+        cooperative = lax.cond(
+            jnp.any(is_long),
+            _coop,
+            lambda _: jax.tree.map(jnp.zeros_like, by_length),
+            None,
+        )
+    else:
+        cooperative = _coop(None)
     return jax.tree.map(
         lambda c, s: jnp.where(is_long[:, None], c, s), cooperative, by_length
     )
