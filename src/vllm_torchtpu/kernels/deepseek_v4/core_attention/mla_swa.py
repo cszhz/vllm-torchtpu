@@ -27,6 +27,9 @@ from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 # Decode batch size used when a step has at most this many decode sequences.
 SMALL_DECODE_SEQ_BATCH = 4
+# bq blocks computed per loop step of the prefill/mixed kernel when each reads
+# a single bkv block.
+Q_BLOCKS_PER_STEP = 4
 
 
 def cdiv(a, b):
@@ -142,14 +145,14 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     l_hbm_ref,  # [max_num_tokens, num_l_heads]
     m_hbm_ref,  # [max_num_tokens, num_l_heads]
     # Scratch
-    bkv_x2_ref,  # [2, bkv_sz, token_bytes // 128, 128] uint8
-    bq_x2_ref,  # [2, bq_sz, num_q_heads, head_dim]
-    bo_x2_ref,  # [2, bq_sz, num_q_heads, head_dim]
-    bl_x2_ref,  # [2, bq_sz, num_l_heads]
-    bm_x2_ref,  # [2, bq_sz, num_l_heads]
+    bkv_x2_ref,  # [2, kv_span, token_bytes // 128, 128] uint8
+    bq_x2_ref,  # [2, step_sz, num_q_heads, head_dim]
+    bo_x2_ref,  # [2, step_sz, num_q_heads, head_dim]
+    bl_x2_ref,  # [2, step_sz, num_l_heads]
+    bm_x2_ref,  # [2, step_sz, num_l_heads]
     sems,  # [6, 2]
-    l_ref,  # [bq_sz * num_q_heads],
-    m_ref,  # [bq_sz * num_q_heads],
+    l_ref,  # [step_sz * num_q_heads],
+    m_ref,  # [step_sz * num_q_heads],
     acc_ref,  # [bq_sz * num_q_heads, head_dim],
     *,
     static_q_len: int | None,
@@ -161,6 +164,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     q_compute_block_size: int | None,
     bkv_p,
     bq_sz,
+    q_blocks_per_step,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert sliding_window > 0
@@ -194,6 +198,12 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     # need
     max_bkv_blocks = cdiv(bq_sz + sliding_window - 1, bkv_sz)
     single_bkv_block = max_bkv_blocks == 1
+    # One loop step computes `q_blocks_per_step` consecutive bq blocks, each
+    # against its own bkv_sz keys, from one q fetch and one fetch of the keys
+    # all of them read (`kv_span`).
+    assert q_blocks_per_step == 1 or single_bkv_block
+    step_sz = q_blocks_per_step * bq_sz
+    kv_span = bkv_sz + (q_blocks_per_step - 1) * bq_sz
 
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
@@ -220,6 +230,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         bkv_idx,
         start_offset,
         bo_sem_idx,
+        step_token_off=0,
     ):
         assert len(q.shape) == 2
         assert len(kv.shape) == 2
@@ -259,8 +270,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             qc = q[
                 start_row : start_row + chunk_size
             ]  # [chunk_sz * num_q_heads, head_dim]
-            cl_ref = l_ref.at[start_row : start_row + chunk_size]
-            cm_ref = m_ref.at[start_row : start_row + chunk_size]
+            step_row = step_token_off * num_q_heads + start_row
+            cl_ref = l_ref.at[step_row : step_row + chunk_size]
+            cm_ref = m_ref.at[step_row : step_row + chunk_size]
             cacc_ref = acc_ref.at[start_row : start_row + chunk_size]
 
             # Follow FlashAttention-2 forward pass.
@@ -310,9 +322,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                         pv,
                         l_curr[:, None] + jnp.exp(chunk_sinks - m_curr[:, None]),
                     )
-                bo_x2_ref.at[bo_sem_idx, pl.ds(c * chunk_sz, chunk_sz)][...] = (
-                    out.reshape(chunk_sz, num_q_heads, head_dim)
-                )
+                bo_x2_ref.at[
+                    bo_sem_idx, pl.ds(step_token_off + c * chunk_sz, chunk_sz)
+                ][...] = out.reshape(chunk_sz, num_q_heads, head_dim)
             else:
                 m_prev = load_with_init(cm_ref, jnp.finfo(jnp.float32).min)
                 m_curr = jnp.maximum(m_prev, s_rowmax)
@@ -390,8 +402,8 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         kv_left_frm_new = kv_left - kv_left_frm_cache
 
-        bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
-        bkv_sz_frm_new = jnp.minimum(bkv_sz - bkv_sz_frm_cache, kv_left_frm_new)
+        bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, kv_span)
+        bkv_sz_frm_new = jnp.minimum(kv_span - bkv_sz_frm_cache, kv_left_frm_new)
         page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
         new_kv_len_start = q_end - kv_left_frm_new
@@ -404,11 +416,11 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
             # utilize static for loop instead of dynamic for loop.
             #
-            # The window is not page-aligned, so it spans bkv_p + 1 source pages: a
-            # partial head page (starting at `page_off`), bkv_p - 1 full pages, and a
-            # partial tail page contributing `page_off` tokens. When page_off == 0
-            # the tail copy degenerates to size 0.
-            for i in range(bkv_p + 1):
+            # The window is not page-aligned, so it spans up to one more source
+            # page than it covers: a partial head page (starting at `page_off`),
+            # full pages, and a partial tail page. Copies past the window's valid
+            # tokens degenerate to size 0.
+            for i in range(cdiv(kv_span, page_size) + 1):
                 if i == 0:
                     # Head page: skip the first `page_off` tokens of the page.
                     in_page_off = page_off
@@ -537,9 +549,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         sem = sems.at[1, bq_sem_idx]
         bq_vmem_ref = bq_x2_ref.at[bq_sem_idx]
 
-        q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+        q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * step_sz
         q_end = cu_q_lens_ref[seq_idx + 1]
-        sz = jnp.minimum(bq_sz, q_end - q_len_start)
+        sz = jnp.minimum(step_sz, q_end - q_len_start)
 
         _async_copy(
             q_hbm_ref.at[pl.ds(q_len_start, sz)],
@@ -551,9 +563,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     def _send_bo(seq_idx, bo_idx, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
         vmem_ref = bo_x2_ref.at[bo_sem_idx]
-        q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
+        q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * step_sz
         q_end = cu_q_lens_ref[seq_idx + 1]
-        sz = jnp.minimum(bq_sz, q_end - q_len_start)
+        sz = jnp.minimum(step_sz, q_end - q_len_start)
 
         _async_copy(
             vmem_ref.at[pl.ds(0, sz)],
@@ -565,9 +577,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     def _send_l(seq_idx, bo_idx, bo_sem_idx, *, wait=False):
         sem = sems.at[4, bo_sem_idx]
         vmem_ref = bl_x2_ref.at[bo_sem_idx]
-        q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
+        q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * step_sz
         q_end = cu_q_lens_ref[seq_idx + 1]
-        sz = jnp.minimum(bq_sz, q_end - q_len_start)
+        sz = jnp.minimum(step_sz, q_end - q_len_start)
 
         _async_copy(
             vmem_ref.at[pl.ds(0, sz)],
@@ -579,9 +591,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     def _send_m(seq_idx, bo_idx, bo_sem_idx, *, wait=False):
         sem = sems.at[5, bo_sem_idx]
         vmem_ref = bm_x2_ref.at[bo_sem_idx]
-        q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
+        q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * step_sz
         q_end = cu_q_lens_ref[seq_idx + 1]
-        sz = jnp.minimum(bq_sz, q_end - q_len_start)
+        sz = jnp.minimum(step_sz, q_end - q_len_start)
 
         _async_copy(
             vmem_ref.at[pl.ds(0, sz)],
@@ -637,11 +649,15 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             bkv_update_ids_ref[bkv_sem_idx + 4] = 0
             _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, wait=True)
 
-    def load_bq(bq_sem_idx):
-        return bq_x2_ref.at[bq_sem_idx][...].reshape(bq_sz * num_q_heads, head_dim)
+    def load_bq(bq_sem_idx, block_in_step):
+        rows = pl.ds(block_in_step * bq_sz, bq_sz)
+        return bq_x2_ref.at[bq_sem_idx, rows][...].reshape(
+            bq_sz * num_q_heads, head_dim
+        )
 
-    def load_bkv(bkv_sem_idx, bkv_idx, start_offset):
-        bkv_u8 = bkv_x2_ref.at[bkv_sem_idx][...]
+    def load_bkv(bkv_sem_idx, key_off):
+        # `key_off`: where this bq block's bkv_sz keys start in the fetched span.
+        bkv_u8 = bkv_x2_ref.at[bkv_sem_idx, pl.ds(key_off, bkv_sz)][...]
         # [bkv_sz, slots_per_token * kv_packing, lkv_dim] -> [bkv_sz, token_bytes]
         # bkv_u8: [bkv_sz, slots_per_token * kv_packing, lkv_dim] uint8. The bytes
         # were stored (see `prepare_kv_inputs`) so that each pair of consecutive
@@ -652,10 +668,12 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         return bkv
 
     def process():
+        # Loop steps, each of q_blocks_per_step bq blocks; `bq_idx` below counts
+        # steps, which are bq blocks when q_blocks_per_step == 1.
         if static_q_len is None:
-            num_bq = jnp.maximum(1, cdiv(q_len, bq_sz))
+            num_bq = jnp.maximum(1, cdiv(q_len, step_sz))
         else:
-            num_bq = jnp.maximum(1, cdiv(static_q_len, bq_sz))
+            num_bq = jnp.maximum(1, cdiv(static_q_len, step_sz))
 
         def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx):
             next_bq_idx = bq_idx + 1
@@ -673,7 +691,8 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             #
             # _start_offset only depends on (seq_idx, bq_idx), so it is constant for
             # the whole current bq block. Compute it once here.
-            cur_start_offset = _start_offset(seq_idx, bq_idx)
+            first_block = bq_idx * q_blocks_per_step
+            cur_start_offset = _start_offset(seq_idx, first_block)
             start_bkv_idx = 0
             if single_bkv_block:
                 end_bkv_idx = 1
@@ -727,7 +746,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                     sem_ids_ref[1] = next_bkv_sem_idx
                     # The next block may belong to a different (seq, bq), so it needs
                     # its own start offset.
-                    next_start_offset = _start_offset(next_seq_idx, next_bq_idx)
+                    next_start_offset = _start_offset(
+                        next_seq_idx, next_bq_idx * q_blocks_per_step
+                    )
                     start_fetch_bkv(
                         next_seq_idx,
                         next_bkv_idx,
@@ -743,8 +764,8 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 # Start updating bkv to kv cache if applicable.
                 # Ensure only the query chunk corresponding to the exact new KV tokens
                 # writes them to HBM to avoid duplicated writes.
-                q_pos_start = kv_len - q_len + bq_idx * bq_sz
-                q_pos_end = jnp.minimum(kv_len - q_len + (bq_idx + 1) * bq_sz, kv_len)
+                q_pos_start = kv_len - q_len + bq_idx * step_sz
+                q_pos_end = jnp.minimum(kv_len - q_len + (bq_idx + 1) * step_sz, kv_len)
                 write_start = jnp.maximum(offset, q_pos_start)
                 write_end = jnp.minimum(offset + update_sz, q_pos_end)
                 actual_update_sz = jnp.maximum(0, write_end - write_start)
@@ -764,22 +785,23 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 # because the score of invalid Q.K^T pairs are masked (to be zero) in
                 # flash attention, so that the invalid kv entries
                 # (as long as they are not NaN or inf) won't affect to the output.
-                bkv = load_bkv(
-                    bkv_sem_idx,
-                    bkv_idx,
-                    cur_start_offset,
-                )
-
-                bq = load_bq(bq_sem_idx)
-
-                flash_attention(
-                    bq,
-                    bkv,
-                    bq_idx=bq_idx,
-                    bkv_idx=bkv_idx,
-                    start_offset=cur_start_offset,
-                    bo_sem_idx=bo_sem_idx,
-                )
+                for h in range(q_blocks_per_step):
+                    # Each bq block reads the same bkv_sz keys from the same
+                    # first key as when it is its own step.
+                    key_off = (
+                        0
+                        if h == 0
+                        else _start_offset(seq_idx, first_block + h) - cur_start_offset
+                    )
+                    flash_attention(
+                        load_bq(bq_sem_idx, h),
+                        load_bkv(bkv_sem_idx, key_off),
+                        bq_idx=first_block + h,
+                        bkv_idx=bkv_idx,
+                        start_offset=cur_start_offset + key_off,
+                        bo_sem_idx=bo_sem_idx,
+                        step_token_off=h * bq_sz,
+                    )
 
             # Wait for the previous send from this bo slot before anything is
             # stored into it.
@@ -814,12 +836,12 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                     bq_sz, num_q_heads, head_dim
                 )
             if num_q_heads % 128 == 0:
-                bl_x2_ref.at[bo_sem_idx][...] = l_ref[...].reshape(bq_sz, num_q_heads)
-                bm_x2_ref.at[bo_sem_idx][...] = m_ref[...].reshape(bq_sz, num_q_heads)
+                bl_x2_ref.at[bo_sem_idx][...] = l_ref[...].reshape(step_sz, num_q_heads)
+                bm_x2_ref.at[bo_sem_idx][...] = m_ref[...].reshape(step_sz, num_q_heads)
             else:
                 # if num_q_heads can't be divided by 128, the reshape can't compile,
                 # so we need to loop through and copy row by row.
-                for i in range(bq_sz):
+                for i in range(step_sz):
                     start = i * num_q_heads
                     end = start + num_q_heads
                     bl_x2_ref.at[bo_sem_idx, i][:num_q_heads] = l_ref[start:end]
@@ -1686,6 +1708,15 @@ def mla_sliding_window_ragged_paged_attention(
             bq_sz = num_queries_per_block
         bkv_sz = bkv_p * logical_page_size
         grid = (end_seq_idx - start_seq_idx,)
+        single_bkv_block = cdiv(bq_sz + sliding_window - 1, bkv_sz) == 1
+        q_blocks_per_step = (
+            Q_BLOCKS_PER_STEP
+            if single_bkv_block
+            and (static_q_len is None or static_q_len > bq_sz)
+            else 1
+        )
+        step_sz = q_blocks_per_step * bq_sz
+        kv_span = bkv_sz + (q_blocks_per_step - 1) * bq_sz
 
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.VMEM),  # attention_sinks
@@ -1705,12 +1736,12 @@ def mla_sliding_window_ragged_paged_attention(
         ]
 
         bkv_double_buf = pltpu.VMEM(
-            (2, bkv_sz, slots_per_token * kv_packing, lkv_dim),
+            (2, kv_span, slots_per_token * kv_packing, lkv_dim),
             jnp.uint8,
         )
 
         bq_double_bufq = pltpu.VMEM(
-            (2, bq_sz, num_q_heads, head_dim),
+            (2, step_sz, num_q_heads, head_dim),
             q.dtype,
         )
 
@@ -1718,13 +1749,13 @@ def mla_sliding_window_ragged_paged_attention(
 
         num_l_heads = align_to(num_q_heads, 128)
         bl_double_buf = pltpu.VMEM(
-            (2, bq_sz, num_l_heads),
+            (2, step_sz, num_l_heads),
             jnp.float32,
         )
         bm_double_buf = bl_double_buf
 
         l_scratch = pltpu.VMEM(
-            (bq_sz * num_q_heads,),
+            (step_sz * num_q_heads,),
             jnp.float32,
         )
         m_scratch = l_scratch
@@ -1774,6 +1805,7 @@ def mla_sliding_window_ragged_paged_attention(
                     sliding_window=sliding_window,
                     static_q_len=static_q_len,
                     bq_sz=bq_sz,
+                    q_blocks_per_step=q_blocks_per_step,
                     bkv_p=bkv_p,
                     logical_page_size=logical_page_size,
                     unnormalized_output=unnormalized_output,
