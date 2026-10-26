@@ -630,6 +630,20 @@ def fused_ep_moe_v2(
         row_alignment=U32_SUBLANE_TILE,
     )
     t_local = token_layout.local_rows
+    # MOE_FUSED_EP_V2_DECODE_TILE_M: decode builds at a short tile height
+    # (single rung); see envs.py. A per-build choice, so the prefill and mixed
+    # buckets keep the caller's capacity.
+    from vllm_torchtpu import envs
+
+    decode_tile = envs.MOE_FUSED_EP_V2_DECODE_TILE_M
+    if (
+        decode_tile
+        and stage == "fused"
+        and t_local <= envs.MOE_FUSED_EP_V2_DECODE_TILE_MAX_LOCAL_TOKENS
+        and decode_tile < capacity
+        and capacity % decode_tile == 0
+    ):
+        capacity = decode_tile
     # (form, chunks, skip_device_barrier) of the small collectives over the
     # replica groups (TPU_SMALL_ALL_REDUCE_PAIRS / ..._SKIP_DEVICE_BARRIER).
     small_ar_form = small_all_reduce_group_form(

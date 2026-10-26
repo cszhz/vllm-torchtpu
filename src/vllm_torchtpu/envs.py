@@ -106,6 +106,8 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_DECODE_TILE_M: int = 0
+    MOE_FUSED_EP_V2_DECODE_TILE_MAX_LOCAL_TOKENS: int = 16
     MOE_FUSED_EP_V2_MERGED_EXCHANGE: bool = True
     MOE_FUSED_EP_V2_ONEHOT_SCATTER: bool = True
     MOE_FUSED_EP_V2_PALLAS_PLAN: bool = True
@@ -998,6 +1000,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel.
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
+    ),
+    # Tile height (= capacity) of fused EP MoE v2's decode builds: a fused
+    # call with t_local <= MOE_FUSED_EP_V2_DECODE_TILE_MAX_LOCAL_TOKENS builds
+    # at this height instead of the adapter's 128, with a single rung. At
+    # decode every expert holds a few rows, so the 32-row tile computes what
+    # the ladder's short rung computes today, while the program text drops
+    # the 128-row FFN body copies; in a 61-layer program that text evicted
+    # the next op's code from the TensorCore's instruction overlay (the
+    # decode combine paid a ~4.6 us overlay load per layer). Per-row
+    # arithmetic is unchanged, so the output bits are. Zero is off.
+    "MOE_FUSED_EP_V2_DECODE_TILE_M": env_nonnegative_int("MOE_FUSED_EP_V2_DECODE_TILE_M", 0),
+    "MOE_FUSED_EP_V2_DECODE_TILE_MAX_LOCAL_TOKENS": env_nonnegative_int(
+        "MOE_FUSED_EP_V2_DECODE_TILE_MAX_LOCAL_TOKENS", 16
     ),
     # Restore fused EP MoE v2's all-pairs barrier after the transport drain.
     # The kernel's double head barrier is sufficient on its own; the trailing

@@ -175,6 +175,10 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     LOW_RUNG_ALIGN rows and at least LOW_RUNG_MIN) when that is below the
     half-tile, since at decode almost every expert is a single short tile.
     """
+    # A tile no taller than the shortest measured rung is its own short rung
+    # (MOE_FUSED_EP_V2_DECODE_TILE_M builds): one body, no ladder.
+    if tile_m <= LOW_RUNG_MIN:
+        return (tile_m,)
     rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE or HEIGHT_RUNGS
     step = tile_m // rungs
     if (
