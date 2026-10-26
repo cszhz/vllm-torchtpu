@@ -7,7 +7,8 @@ The kernel's own oracle test (tests/kernels/fused_moe/mixed_plan/) checks
 every operand against a first-principles numpy re-derivation with a fault
 control; this one checks the layer wiring: the operands reach the fused EP
 kernel and the combine in the right order, and the switch engages only at
-mixed buckets.
+mixed buckets. The switch is patched rather than set through the
+environment: vllm_torchtpu.envs may cache a value once read in-process.
 """
 
 import jax
@@ -53,11 +54,11 @@ def test_mixed_plan_kernel_is_bit_exact_in_the_layer(tokens, monkeypatch):
         return real(*a, **k)
 
     monkeypatch.setattr(layer, "build_mixed_plan", spy)
-    monkeypatch.setenv("TPU_DSV4_EP_MIXED_PLAN_KERNEL", "0")
+    monkeypatch.setattr(layer, "_mixed_plan_kernel_enabled", lambda: False)
     jax.clear_caches()
     want = np.asarray(fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common))
     assert not calls
-    monkeypatch.setenv("TPU_DSV4_EP_MIXED_PLAN_KERNEL", "1")
+    monkeypatch.setattr(layer, "_mixed_plan_kernel_enabled", lambda: True)
     jax.clear_caches()
     got = np.asarray(fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common))
     assert calls, "the mixed plan kernel did not engage"
@@ -74,7 +75,7 @@ def test_mixed_plan_kernel_does_not_engage_at_decode_buckets(monkeypatch):
     x, gating = _make_inputs(mesh, 33, tokens=64, hidden=SHAPE["hidden"], e_total=SHAPE["e_total"])
     calls = []
     monkeypatch.setattr(layer, "build_mixed_plan", lambda *a, **k: calls.append(1))
-    monkeypatch.setenv("TPU_DSV4_EP_MIXED_PLAN_KERNEL", "1")
+    monkeypatch.setattr(layer, "_mixed_plan_kernel_enabled", lambda: True)
     jax.clear_caches()
     fused_ep_moe_v2(
         x, w1, w2, w1_scale, w2_scale, gating, topk=SHAPE["topk"], renormalize=True,
