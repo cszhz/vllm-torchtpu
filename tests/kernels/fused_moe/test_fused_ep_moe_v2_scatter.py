@@ -24,6 +24,20 @@ from vllm_torchtpu.kernels.fused_moe.v2.scatter import (
 CASES = [(27648, 28288, 28416), (6912, 7168, 7296), (1024, 1152, 1280)]
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _require_a_sparsecore():
+    """Skip the module off the chip.
+
+    A fixture rather than a `skipif`, for the reason
+    `test_fused_ep_moe_v2.py::_require_eight_devices` gives: a `skipif` is
+    evaluated during collection, and asking jax for a backend there builds
+    the PJRT client in the pytest parent, which libtpu's process-exclusive
+    lock then denies to every spawned worker in the same run.
+    """
+    if jax.default_backend() != "tpu":
+        pytest.skip("the pair scatter is a SparseCore kernel")
+
+
 def _reference(rows, scales, tokens, token_size, scale_size, n, topk):
     tok = np.zeros(token_size, np.int32)
     scl = np.zeros(scale_size, np.int32)
