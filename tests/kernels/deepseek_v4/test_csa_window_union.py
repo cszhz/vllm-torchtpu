@@ -30,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "k1v2"))
+sys.path.insert(0, os.environ.get("K1V2_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "k1v2")))
 import k1v2_common as C  # noqa: E402
 
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import (  # noqa: E402

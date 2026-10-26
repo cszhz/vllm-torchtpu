@@ -33,6 +33,13 @@ basic block as this tile's QK / softmax / PV (`_kernel_v2`).
 then reach the MXU).
 `version=3`: v1 with tiles taken in pairs, both tiles' QK / softmax / PV in one
 basic block (an odd last tile runs alone).
+`version=4`: v1 with a narrow tail tile: a last tile of <= 128 / 256 / 512
+valid rows DMAs and attends only that many rows (static body per size).
+`version=5`: v4 with each tile (and narrow tail) done in column sub-tiles of
+`sub` rows (dequant, QK, mask, online softmax, bf16 PV per sub-tile).
+`hbm_pin`: constrain the HBM operands to HBM (no XLA VMEM staging copies).
+`version=6`: v4's narrow tail DMA + every tile in column sub-tiles of `sub`
+rows under one fori_loop body (trip = ceil(valid / sub)), bf16 P per sub-tile.
 `lm_raw`: SWA l / m DMA'd as [qn, H] rows and lane-broadcast in the kernel
 (no XLA per-row broadcast in front of the call).
 `pv_bf16`: P pushed as bf16 (default f32 P x bf16 KV, as SparseMLA / union-dense).
@@ -58,6 +65,7 @@ LANES = 128
 TILE = 1024  # union rows per KV tile (the gathered buffer's period)
 WQ = 8  # tokens per window
 MAX_TILES = 8  # union tiles per window (U <= 8192)
+TAIL_ROWS = (128, 256, 512)  # v4 narrow tail-tile bodies (static row counts)
 WORD_BITS = 32
 SUPER_BLOCK = WORD_BITS * LANES  # 4096 ranks per 128-word mask column
 DEFAULT_VMEM_LIMIT_BYTES = 48 * 1024 * 1024  # <= 64 MiB physical (v7x)
@@ -107,6 +115,8 @@ def _kernel(
     zero_tail_rows: bool,
     probe: str = "",
     lm_raw: bool = False,
+    sub: int = 256,
+    mask_sb: bool = False,
 ):
     _, num_q_heads, head_dim = q_hbm_ref.shape
     rows = WQ * num_q_heads
@@ -135,10 +145,13 @@ def _kernel(
         else:
             cp.start()
 
-    def fetch_tile(q0, qn, j, slot, *, wait=False):
-        """Union tile j of the window at q0 (gathered tile q0 + j) + its mask words."""
-        nope_v = nope_x2_ref.at[slot]
-        rope_v = rope_x2_ref.at[slot]
+    def fetch_tile(q0, qn, j, slot, *, wait=False, n=TILE):
+        """Union tile j of the window at q0 (gathered tile q0 + j) + its mask
+        words. n < TILE (<= TILE / 2): a narrow tail -- nope rows [0, n) and
+        rope bf16 rows [0, n) (ranks i < TILE / 2 live in lanes 0:64)."""
+        nr = half if n == TILE else n
+        nope_v = nope_x2_ref.at[slot, pl.ds(0, n)]
+        rope_v = rope_x2_ref.at[slot, pl.ds(0, nr)]
         mask_v = mask_x2_ref.at[slot, pl.ds(0, qn), 0, pl.ds(0, LANES)]
         if wait:
             copy(nope_v, nope_v, sems.at[0, slot], True)
@@ -146,14 +159,14 @@ def _kernel(
             copy(mask_v, mask_v, sems.at[2, slot], True)
             return
         g = q0 + j
-        copy(nope_hbm_ref.at[pl.ds(g * TILE, TILE)], nope_v, sems.at[0, slot], False)
-        copy(rope_hbm_ref.at[pl.ds(g * half, half)], rope_v, sems.at[1, slot], False)
-        copy(
-            mask_hbm_ref.at[pl.ds(q0, qn), j // blocks_per_super, pl.ds(0, LANES)],
-            mask_v,
-            sems.at[2, slot],
-            False,
-        )
+        copy(nope_hbm_ref.at[pl.ds(g * TILE, n)], nope_v, sems.at[0, slot], False)
+        copy(rope_hbm_ref.at[pl.ds(g * half, nr)], rope_v, sems.at[1, slot], False)
+        col = j // blocks_per_super
+        if mask_sb:  # super-block-major [W / 128, T, 128] (L1 mask_sb_major=True)
+            msrc = mask_hbm_ref.at[col, pl.ds(q0, qn), pl.ds(0, LANES)]
+        else:  # [T, W / 128, 128]
+            msrc = mask_hbm_ref.at[pl.ds(q0, qn), col, pl.ds(0, LANES)]
+        copy(msrc, mask_v, sems.at[2, slot], False)
 
     def fetch_q_swa(q0, qn, qs, *, wait=False):
         hs, hn = q0 * num_q_heads, qn * num_q_heads
@@ -221,6 +234,100 @@ def _kernel(
         ]
         return jnp.concatenate(planes, axis=1) != 0  # [WQ, TILE]
 
+    def tail_cases(valid):
+        """(n, predicate) per tile body: narrow tails 128 / 256 / 512, else full."""
+        out, lo = [], 0
+        for n in TAIL_ROWS:
+            out.append((n, jnp.logical_and(valid > lo, valid <= n)))
+            lo = n
+        out.append((TILE, valid > lo))
+        return out
+
+    def fetch_any(q0, qn, j, slot, U, *, wait=False):
+        if version not in (4, 5, 6):
+            fetch_tile(q0, qn, j, slot, wait=wait)
+            return
+        for n, pred in tail_cases(U - j * TILE):
+            @pl.when(pred)
+            def _():
+                fetch_tile(q0, qn, j, slot, wait=wait, n=n)
+
+    def load_tile_narrow(slot, n, valid):
+        nope = _dequant_dsv4_fp8_sub_rows(nope_x2_ref[slot, pl.ds(0, n)])
+        r = pltpu.roll(rope_x2_ref[slot, pl.ds(0, n)], rope_dim, 1)  # rank i -> lanes 64:
+        lane = lax.broadcasted_iota(jnp.int32, r.shape, 1)
+        r = jnp.where(lane < rope_dim, nope[-1], r)
+        kv = jnp.concatenate([*nope[:-1], r], axis=-1)  # [n, 512]
+        row = lax.broadcasted_iota(jnp.int32, kv.shape, 0)
+        return jnp.where(row < valid, kv, jnp.zeros_like(kv))  # unwritten rows
+
+    def load_mask_narrow(slot, j, n):
+        words = mask_x2_ref[slot][:, 0, :]
+        base = (j % blocks_per_super) * bits_per_block
+        planes = [
+            jnp.bitwise_and(lax.shift_right_logical(words, base + t), 1)
+            for t in range(n // LANES)
+        ]
+        return (jnp.concatenate(planes, axis=1) if len(planes) > 1 else planes[0]) != 0
+
+    def flash_sub(q, slot, j, valid, n):
+        """v5: the n-row tile in column sub-tiles of `sub` rows: per sub-tile
+        dequant -> QK ([M, sub] scores) -> mask -> online softmax -> bf16 PV,
+        so each sub-tile's working set stays near the vreg file."""
+        words = mask_x2_ref[slot][:, 0, :]  # [WQ, 128]
+        base = (j % blocks_per_super) * bits_per_block
+        sb = min(sub, n)
+        for k in range(n // sb):
+            r0 = k * sb
+            nope = _dequant_dsv4_fp8_sub_rows(nope_x2_ref[slot, pl.ds(r0, sb)])
+            r = rope_x2_ref[slot, pl.ds(r0 % half, sb)]
+            if r0 < half:  # ranks < TILE / 2 sit in lanes 0:64 of the pair rows
+                r = pltpu.roll(r, rope_dim, 1)
+            lane = lax.broadcasted_iota(jnp.int32, r.shape, 1)
+            r = jnp.where(lane < rope_dim, nope[-1], r)
+            kv = jnp.concatenate([*nope[:-1], r], axis=-1)  # [sb, 512]
+            row = lax.broadcasted_iota(jnp.int32, kv.shape, 0) + r0
+            kv = jnp.where(row < valid, kv, jnp.zeros_like(kv))  # unwritten rows
+            planes = [
+                jnp.bitwise_and(lax.shift_right_logical(words, base + t), 1)
+                for t in range(r0 // LANES, (r0 + sb) // LANES)
+            ]
+            keep = (jnp.concatenate(planes, axis=1) if len(planes) > 1 else planes[0]) != 0
+            flash(q, kv, keep, bf16_p=True)
+
+    def flash_loop(q, slot, j, valid):
+        """v6: the tile's valid rows in column sub-tiles of `sub` rows under a
+        fori_loop (one body for full and tail tiles; trip = ceil(valid / sub)):
+        per sub-tile dequant -> QK -> mask -> online softmax -> bf16 PV."""
+        words = mask_x2_ref[slot][:, 0, :]  # [WQ, 128]
+        base = (j % blocks_per_super) * bits_per_block
+        nsub = (jnp.minimum(valid, TILE) + sub - 1) // sub
+
+        def body(k, _):
+            r0 = pl.multiple_of(k * sub, sub)
+            nope = _dequant_dsv4_fp8_sub_rows(nope_x2_ref[slot, pl.ds(r0, sub)])
+            hr = pl.multiple_of(r0 % half, sub) if sub < half else 0
+            r = rope_x2_ref[slot, pl.ds(hr, min(sub, half))]
+            if sub > half:  # sub == TILE: both pair halves
+                r = jnp.concatenate([pltpu.roll(r, rope_dim, 1), r], axis=0)
+            else:  # ranks < TILE / 2 sit in lanes 0:64 of the pair rows
+                r = jnp.where(r0 < half, pltpu.roll(r, rope_dim, 1), r)
+            lane = lax.broadcasted_iota(jnp.int32, r.shape, 1)
+            r = jnp.where(lane < rope_dim, nope[-1], r)
+            kv = jnp.concatenate([*nope[:-1], r], axis=-1)  # [sub, 512]
+            row = lax.broadcasted_iota(jnp.int32, kv.shape, 0) + r0
+            kv = jnp.where(row < valid, kv, jnp.zeros_like(kv))  # unwritten rows
+            b0 = base + r0 // LANES
+            planes = [
+                jnp.bitwise_and(lax.shift_right_logical(words, b0 + t), 1)
+                for t in range(sub // LANES)
+            ]
+            keep = (jnp.concatenate(planes, axis=1) if len(planes) > 1 else planes[0]) != 0
+            flash(q, kv, keep, bf16_p=True)
+            return 0
+
+        lax.fori_loop(0, nsub, body, 0, unroll=False)
+
     def lanes(x, n):
         return jnp.concatenate([x] * (n // LANES), axis=1) if n != LANES else x
 
@@ -235,7 +342,7 @@ def _kernel(
             cols.append(jnp.sum(jnp.where(sub == lan, b, 0.0), axis=1, keepdims=True))
         return jnp.broadcast_to(jnp.concatenate(cols, axis=0), (rows, LANES))
 
-    def flash(q, kv, keep):
+    def flash(q, kv, keep, bf16_p=False):
         # `probe` (timing-only removal arms; wrong results): noqk / nomask /
         # nosoftmax / nopv drop that stage.
         if "noqk" in probe:
@@ -243,10 +350,11 @@ def _kernel(
         else:
             s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
         s *= sm_scale
+        width = kv.shape[0]
         if "nomask" not in probe:
-            s3 = s.reshape(WQ, num_q_heads, TILE)
+            s3 = s.reshape(WQ, num_q_heads, width)
             s3 = jnp.where(keep[:, None, :], s3, jnp.finfo(jnp.float32).min)
-            s = s3.reshape(rows, TILE)
+            s = s3.reshape(rows, width)
         m_prev = m_ref[...]
         if "nosoftmax" in probe:
             m_curr = m_prev
@@ -254,14 +362,14 @@ def _kernel(
             psum = l_ref[...]
         else:
             m_curr = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
-            p = jnp.exp(s - lanes(m_curr, TILE))
+            p = jnp.exp(s - lanes(m_curr, width))
             psum = jnp.sum(p, axis=1, keepdims=True)
         m_ref[...] = m_curr
         if "nopv" in probe:
             pv = p[:, :head_dim] + q[:, :].astype(jnp.float32)
         else:
-            pv = jnp.einsum("nm,md->nd", p.astype(kv.dtype) if pv_bf16 else p, kv,
-                            preferred_element_type=jnp.float32)  # fmt: skip
+            pv = jnp.einsum("nm,md->nd", p.astype(kv.dtype) if (pv_bf16 or bf16_p) else p,
+                            kv, preferred_element_type=jnp.float32)  # fmt: skip
         exp_m_diff = jnp.exp(m_prev - m_curr)
         l_ref[...] = exp_m_diff * l_ref[...] + psum
         acc_ref[...] = lanes(exp_m_diff, head_dim) * acc_ref[...] + pv
@@ -274,7 +382,7 @@ def _kernel(
     st_ref[_BO_QN + 1] = 0
     st_ref[_PENDING] = -1
 
-    if version == 1:
+    if version in (1, 3, 4, 5, 6):  # window 0's q / SWA (later windows: prefetched)
         @pl.when(nw > 0)
         def _():
             q0, qn, _, _ = win(0)
@@ -282,7 +390,7 @@ def _kernel(
 
     def window_body(w, _):
         q0, qn, U, nt = win(w)
-        qs = (w % 2) if version in (1, 3) else 0
+        qs = (w % 2) if version in (1, 3, 4, 5, 6) else 0
         if version == 0:
             fetch_q_swa(q0, qn, qs)
 
@@ -290,13 +398,13 @@ def _kernel(
         # prefetched it.
         @pl.when(jnp.logical_and(nt > 0, st_ref[_PENDING] != w))
         def _():
-            fetch_tile(q0, qn, 0, st_ref[_KV_SLOT])
+            fetch_any(q0, qn, 0, st_ref[_KV_SLOT], U)
             if version == 3:
                 @pl.when(nt > 1)
                 def _():
                     fetch_tile(q0, qn, 1, st_ref[_KV_SLOT] + 1)
 
-        if version in (1, 3):
+        if version in (1, 3, 4, 5, 6):
             @pl.when(w + 1 < nw)
             def _():
                 q0n, qnn, _, _ = win(w + 1)
@@ -317,27 +425,53 @@ def _kernel(
 
             @pl.when(j + 1 < nt)
             def _():
-                fetch_tile(q0, qn, j + 1, nslot)
+                fetch_any(q0, qn, j + 1, nslot, U)
 
             # Last tile: start the next window's tile 0 (flattened stream).
             @pl.when(jnp.logical_and(j + 1 == nt, w + 1 < nw))
             def _():
-                q0n, qnn, _, ntn = win(w + 1)
+                q0n, qnn, Un, ntn = win(w + 1)
 
                 @pl.when(ntn > 0)
                 def _():
-                    fetch_tile(q0n, qnn, 0, nslot)
+                    fetch_any(q0n, qnn, 0, nslot, Un)
                     st_ref[_PENDING] = w + 1
 
-            fetch_tile(q0, qn, j, slot, wait=True)
+            fetch_any(q0, qn, j, slot, U, wait=True)
             valid = U - j * TILE
 
-            if zero_tail_rows:
-                @pl.when(valid < TILE)
-                def _():
-                    zero_tail(slot, valid)
+            if version == 6:
+                flash_loop(load_bq(qs), slot, j, valid)
 
-            flash(load_bq(qs), load_tile(slot), load_mask(slot, j))
+            if version == 5:
+                for n, pred in tail_cases(valid):
+                    @pl.when(pred)
+                    def _():
+                        flash_sub(load_bq(qs), slot, j, valid, n)
+
+            if version == 4:
+                for n, pred in tail_cases(valid):
+                    if n == TILE:
+                        continue
+
+                    @pl.when(pred)
+                    def _():
+                        flash(load_bq(qs), load_tile_narrow(slot, n, valid),
+                              load_mask_narrow(slot, j, n))  # fmt: skip
+
+            def full_tile():
+                if zero_tail_rows:
+                    @pl.when(valid < TILE)
+                    def _():
+                        zero_tail(slot, valid)
+
+                flash(load_bq(qs), load_tile(slot), load_mask(slot, j))
+
+            if version == 4:
+                pl.when(valid > TAIL_ROWS[-1])(full_tile)
+            elif version not in (5, 6):
+                full_tile()
+
             st_ref[_KV_SLOT] = nslot
             return 0
 
@@ -681,13 +815,13 @@ def _kernel_v2(
 
 @functools.partial(
     jax.jit, static_argnames=("sm_scale", "nw_cap", "version", "pv_bf16", "zero_tail_rows",
-                     "vmem_limit_bytes", "probe", "lm_raw")
+                     "vmem_limit_bytes", "probe", "lm_raw", "sub", "hbm_pin")
 )
 def window_attention(
     q: jax.Array,  # [T, actual_heads, D] bf16
     nope_g: jax.Array,  # i32[T * TILE, 128]
     rope_g: jax.Array,  # i32[T * TILE // 4, 128]
-    mask: jax.Array,  # i32[T, W]
+    mask: jax.Array,  # i32[T, W], or super-block-major i32[W / 128, T, 128]
     meta: jax.Array,  # i32[(1 + nw_cap + workers) * L]
     ucnt: jax.Array,  # i32[nw_cap * L]
     attention_sinks: jax.Array,  # f32[actual_heads]
@@ -703,6 +837,8 @@ def window_attention(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     probe: str = "",
     lm_raw: bool = False,
+    sub: int = 256,
+    hbm_pin: bool = False,
 ) -> jax.Array:
     """Rows of live windows get CSA attention over their union folded with the
     SWA partials and the sink; all other rows return q."""
@@ -714,7 +850,10 @@ def window_attention(
     assert ucnt.shape[0] == nw_cap * L and meta.shape[0] >= (1 + nw_cap) * L
     assert nope_g.shape == (T * TILE, LANES), nope_g.shape
     assert rope_g.shape == (T * TILE // 4, LANES), rope_g.shape
-    assert mask.shape[0] == T and mask.shape[1] % LANES == 0
+    if mask.ndim == 3:  # super-block-major [W / 128, T, 128]
+        assert mask.shape[1] == T and mask.shape[2] == LANES and version != 2, mask.shape
+    else:
+        assert mask.shape[0] == T and mask.shape[1] % LANES == 0
     swa_l_raw, swa_m_raw = swa_l.astype(jnp.float32), swa_m.astype(jnp.float32)
     assert not lm_raw or swa_l.shape == (T, H), (swa_l.shape, T, H)
     swa_acc, swa_l, swa_m = prepare_swa_inputs(swa_acc, swa_l, swa_m)
@@ -727,7 +866,7 @@ def window_attention(
     sinks = jnp.pad(attention_sinks, (0, H - actual_heads),
                     constant_values=jnp.finfo(attention_sinks.dtype).min)  # fmt: skip
     sinks = jnp.broadcast_to(jnp.tile(sinks, WQ)[:, None], (rows, LANES)).astype(jnp.float32)
-    nq = 2 if version in (1, 3) else 1
+    nq = 2 if version in (1, 3, 4, 5, 6) else 1
     ns = 4 if version == 3 else 2  # raw tile slots
     assert not (lm_raw and version == 2), "lm_raw: v0 / v1 only"
     lm_shape = (nq, WQ, H) if lm_raw else (nq, rows, LANES)
@@ -755,7 +894,8 @@ def window_attention(
     else:
         kernel = functools.partial(_kernel, sm_scale=sm_scale, L=L, version=version,
                                    pv_bf16=pv_bf16, zero_tail_rows=zero_tail_rows,
-                                   probe=probe, lm_raw=lm_raw)
+                                   probe=probe, lm_raw=lm_raw, sub=sub,
+                                   mask_sb=mask.ndim == 3)
         scratch = [
             pltpu.VMEM((ns, TILE, LANES), jnp.int32),
             pltpu.VMEM((ns, TILE // 2, LANES), jnp.bfloat16),
@@ -776,6 +916,12 @@ def window_attention(
                         pltpu.VMEM((rows, TILE), jnp.float32)]
     prefetch = (meta.astype(jnp.int32), ucnt.astype(jnp.int32))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+
+    def pin(x):
+        # The HBM BlockSpec only types the ref inside the kernel; without the
+        # constraint XLA may stage the operand in VMEM with a copy-start/done
+        # pair in front of the call (pallas_hbm_pin.py).
+        return pltpu.with_memory_space_constraint(x, pltpu.HBM) if hbm_pin else x
     out = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -795,12 +941,14 @@ def window_attention(
     )(
         *prefetch,
         sinks,
-        q,
-        nope_g,
-        rope_g,
-        mask.reshape(T, -1, LANES),
-        swa_acc,
-        swa_l_raw if lm_raw else per_row(swa_l),
-        swa_m_raw if lm_raw else per_row(swa_m),
+        *map(pin, (
+            q,
+            nope_g,
+            rope_g,
+            mask if mask.ndim == 3 else mask.reshape(T, -1, LANES),
+            swa_acc,
+            swa_l_raw if lm_raw else per_row(swa_l),
+            swa_m_raw if lm_raw else per_row(swa_m),
+        )),
     )
     return prepare_outputs(out, actual_heads, actual_dim)

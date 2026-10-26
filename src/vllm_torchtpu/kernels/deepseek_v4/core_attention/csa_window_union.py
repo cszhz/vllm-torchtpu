@@ -90,7 +90,7 @@ def nw_cap_for(num_tokens: int, max_num_seqs: int) -> int:
 
 
 def window_meta(cu_q_lens, distribution, kv_lens, *, num_tokens, s_cap, lanes=None,
-                workers=None):
+                workers=None, max_team=None):
     """meta i32[(1 + nw_cap + workers) * L] (see the module docstring)."""
     if lanes is None or workers is None:
         L, nc, ns = sc_geometry()
@@ -118,6 +118,8 @@ def window_meta(cu_q_lens, distribution, kv_lens, *, num_tokens, s_cap, lanes=No
     # wid -> (window wid // G, member wid % G); magic = ceil(2^16 / G) lets the
     # kernel divide small counts by G with a multiply and a shift.
     G = jnp.maximum(workers // jnp.maximum(nw, 1), 1)
+    if max_team is not None:
+        G = jnp.minimum(G, max_team)
     wid = jnp.arange(workers, dtype=jnp.int32)
     aw = wid // G
     aj = wid % G
@@ -231,6 +233,7 @@ def _union_gather_kernel(
     stop_after: str | None = None,
     version: int = 0,
     nbuf: int = NBUF,
+    sb_major_T: int = 0,
 ):
     # version 0: as first measured (j-6e9128d7). version 1: top-k / page-table
     # DMAs concurrent with the zero pass, zero pass 8 stores per iteration,
@@ -375,7 +378,14 @@ def _union_gather_kernel(
                 bit = srl(r, 7) & 31
                 plsc.addupdate_scatter(mrow, (word,), jnp.left_shift(ones, bit), mask=v)
 
-            pltpu.sync_copy(mrow, mask_out.at[pl.ds((q0 + t) * W_WORDS, W_WORDS)])
+            if sb_major_T:  # mask laid out [W / 128, T, 128]: super-block major
+                for sb in range(W_WORDS // LANES):
+                    pltpu.sync_copy(
+                        mrow.at[pl.ds(sb * LANES, LANES)],
+                        mask_out.at[pl.ds((sb * sb_major_T + q0 + t) * LANES, LANES)],
+                    )
+            else:
+                pltpu.sync_copy(mrow, mask_out.at[pl.ds((q0 + t) * W_WORDS, W_WORDS)])
 
         @pl.when(j == 0)
         def _():
@@ -477,7 +487,8 @@ def _union_gather_kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("num_tokens", "max_num_seqs", "skip_gather", "stop_after", "version"),
+    static_argnames=("num_tokens", "max_num_seqs", "skip_gather", "stop_after", "version",
+                     "mask_sb_major"),
 )
 def union_gather(
     meta: jax.Array,
@@ -491,6 +502,7 @@ def union_gather(
     skip_gather: bool = False,
     stop_after: str | None = None,
     version: int = 2,
+    mask_sb_major: bool = False,
 ):
     """L1. Returns nope_g, rope_g, mask i32[T, W_WORDS], ucnt (module docstring).
 
@@ -531,6 +543,7 @@ def union_gather(
             stop_after=stop_after,
             version=version,
             nbuf=nbuf,
+            sb_major_T=T if mask_sb_major else 0,
         ),
         out_type=(
             jax.ShapeDtypeStruct((T * TILE, LANES), jnp.int32),
@@ -562,6 +575,10 @@ def union_gather(
         mesh=mesh,
         name="sc_csa_window_union_gather",
     )(meta, topk_indices.reshape(-1), page_indices, nope, rope)
+    if mask_sb_major:
+        # A 128-lane int32 array's (8, 128) tiling is row-major, so this view
+        # is free for T % 8 == 0: mask[sb, t] = words [128 sb, 128 sb + 128).
+        return nope_g, rope_g, mask.reshape(W_WORDS // LANES, T, LANES), ucnt
     return nope_g, rope_g, mask.reshape(T, W_WORDS), ucnt
 
 
@@ -570,7 +587,7 @@ def union_gather(
 
 
 def prepare(topk_indices, kv_lens, page_indices, cu_q_lens, distribution,
-            cache_kv_nope, cache_kv_rope):
+            cache_kv_nope, cache_kv_rope, *, mask_sb_major=False):
     """L1 for one CSA layer: window meta (layer-invariant XLA) + the SparseCore
     union/gather call. Needs no q and no SWA output, so the caller can issue it
     ahead of the SWA pass."""
@@ -581,11 +598,11 @@ def prepare(topk_indices, kv_lens, page_indices, cu_q_lens, distribution,
     meta = window_meta(cu_q_lens, distribution, kv_lens, num_tokens=T, s_cap=s_cap)
     nope_g, rope_g, mask, ucnt = union_gather(
         meta, topk_indices, page_indices, cache_kv_nope, cache_kv_rope,
-        num_tokens=T, max_num_seqs=max_num_seqs)
+        num_tokens=T, max_num_seqs=max_num_seqs, mask_sb_major=mask_sb_major)
     return dict(meta=meta, nope_g=nope_g, rope_g=rope_g, mask=mask, ucnt=ucnt)
 
 
-def attend(q, rows, attention_sinks, swa_accumution, swa_l, swa_m, *, sm_scale, l2_version=1):
+def attend(q, rows, attention_sinks, swa_accumution, swa_l, swa_m, *, sm_scale, l2_version=3):
     """L2: every live window's tokens attend its union rows (+ SWA partials,
     sink); rows outside every window return q."""
     from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_window_attention

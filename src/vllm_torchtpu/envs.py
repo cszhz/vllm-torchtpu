@@ -190,6 +190,7 @@ if TYPE_CHECKING:
     TPU_DSV4_CSA_UNION_DENSE: bool = False
     TPU_DSV4_SMLA_UNION_VERIFY: bool = False
     TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS: int = 128
+    TPU_DSV4_SMLA_UNION_VERIFY_ABOVE: int = 0
     TPU_DSV4_SMLA_UNION_VERIFY_EARLY: bool = True
     TPU_DSV4_QNORM_ROPE_FLAT: bool = False
     TPU_DSV4_ROPE_QUANT_FLAT: bool = False
@@ -1336,6 +1337,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS": env_int(
         "TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS", 128
     ),
+    # ... and only buckets of T > this many tokens (a power of 2; 0 = all).
+    "TPU_DSV4_SMLA_UNION_VERIFY_ABOVE": env_int("TPU_DSV4_SMLA_UNION_VERIFY_ABOVE", 0),
     # Issue the union SparseCore call as soon as the top-k exists (it then runs
     # behind the SWA pass on the TensorCore) instead of after the SWA pass.
     "TPU_DSV4_SMLA_UNION_VERIFY_EARLY": env_bool(

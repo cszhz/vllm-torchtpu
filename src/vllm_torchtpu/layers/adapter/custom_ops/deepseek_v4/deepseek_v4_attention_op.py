@@ -374,6 +374,7 @@ def _attention_csa(
     topk_after_kv: bool = False,
     union_verify: bool = False,
     union_verify_max_tokens: int = 128,
+    union_verify_above: int = 0,
     union_verify_early: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
@@ -473,6 +474,7 @@ def _attention_csa(
         union_verify
         and not use_union_dense
         and q.shape[0] <= union_verify_max_tokens
+        and q.shape[0] > union_verify_above
     )
     union_rows = None
     if use_union_verify and union_verify_early and not two_caches_same_buffer:
