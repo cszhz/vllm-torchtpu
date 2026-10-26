@@ -17,7 +17,12 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest, parameterized
 
-from vllm_torchtpu.kernels.deepseek_v4.rope import qnorm_rope, rope, rope_quant
+from vllm_torchtpu.kernels.deepseek_v4.rope import (
+    knorm_rope_quant_pack,
+    qnorm_rope,
+    rope,
+    rope_quant,
+)
 
 # DeepSeek-V4-Flash: head_dim 512, qk_rope_head_dim 64, 64 attention heads.
 HEAD_DIM = 512
@@ -227,6 +232,67 @@ class QNormRopeTest(parameterized.TestCase):
             inverse=False,
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+def knorm_rope_quant_pack_ref_impl(x, weight, positions, cos_sin_cache, eps):
+    """Reference for the fused Index-K producer kernel.
+
+    Reproduces the eager chain ``k_norm`` (weighted RMSNorm -> bf16) -> RoPE
+    (-> bf16) -> ``quantize_index_rows`` -> ``write_fp8_records`` pack, returning
+    the ``[tokens, 32]`` int32 words and the ``[tokens]`` fp32 power-of-two
+    scale. ``x`` is the single-head ``wk(latent)`` output, ``[tokens, 128]``.
+    """
+    xf = jnp.asarray(x).astype(jnp.float32)
+    rms = jax.lax.rsqrt(jnp.mean(xf * xf, axis=-1, keepdims=True) + eps)
+    # k_norm applies its weight and returns bf16; RoPE then consumes that bf16.
+    y = (xf * rms * jnp.asarray(weight).astype(jnp.float32)).astype(jnp.bfloat16)
+    y = rope_ref_impl(y, positions, cos_sin_cache).astype(jnp.bfloat16)
+
+    # quantize_index_rows: amax over D128, clamped, E4M3 power-of-two scale.
+    yf = y.astype(jnp.float32)
+    amax = jnp.maximum(jnp.abs(yf).max(axis=-1), 1e-4)
+    exponent = jnp.ceil(jnp.log2(amax / 448.0)).astype(jnp.int32)
+    scales = jax.lax.bitcast_convert_type(
+        (exponent + 127).astype(jnp.uint32) << 23, jnp.float32
+    )
+    q = (yf / scales[:, None]).astype(jnp.float8_e4m3fn)
+
+    bits = jax.lax.bitcast_convert_type(q, jnp.uint8).astype(jnp.uint32)
+    bits = bits.reshape(-1, 32, 4)
+    words = bits[:, :, 0] | (bits[:, :, 1] << 8)
+    words |= (bits[:, :, 2] << 16) | (bits[:, :, 3] << 24)
+    return words.astype(jnp.int32), scales
+
+
+class KNormRopeQuantPackTest(parameterized.TestCase):
+    """Fused k_norm -> RoPE -> fp8 quant -> pack Index-K producer kernel."""
+
+    @parameterized.product(num_tokens=(8, 64, 256))
+    def test_matches_reference(self, num_tokens):
+        head_dim = 128
+        seed = 0
+        max_position = 4096
+        eps = 1e-6
+        rng = np.random.default_rng(seed)
+        x = rng.normal(size=(num_tokens, head_dim)).astype(jnp.bfloat16)
+        weight = rng.normal(size=(head_dim,)).astype(jnp.bfloat16)
+        positions = rng.integers(0, max_position, size=(num_tokens,)).astype(np.int32)
+        cos_sin_cache = make_cos_sin_cache(max_position, ROTARY_DIM, seed)
+
+        words_expected, scales_expected = knorm_rope_quant_pack_ref_impl(
+            x, weight, positions, cos_sin_cache, eps
+        )
+        words, scales = knorm_rope_quant_pack(
+            jnp.asarray(x),
+            jnp.asarray(positions),
+            jnp.asarray(cos_sin_cache),
+            jnp.asarray(weight),
+            eps=eps,
+        )
+        # The scale is a power of two, so it must match to the bit; the packed
+        # fp8 words must be byte-for-byte identical to the eager pack.
+        np.testing.assert_array_equal(np.asarray(scales), np.asarray(scales_expected))
+        np.testing.assert_array_equal(np.asarray(words), np.asarray(words_expected))
 
 
 if __name__ == "__main__":

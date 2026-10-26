@@ -94,28 +94,22 @@ def _record_addresses(records: jax.Array, layout: PackedFP8Layout):
     return base, safe % layout.page_size, valid
 
 
-def write_fp8_records(
+def write_packed_records(
     banks: tuple[jax.Array, ...],
     records: jax.Array,
-    keys: jax.Array,
+    values: jax.Array,
     layout: PackedFP8Layout,
 ) -> tuple[jax.Array, ...]:
-    """Quantize only new keys and update their columns; valid slots are unique."""
+    """Scatter already-packed ``[count, PAGE_ROWS]`` int32 records into pages.
+
+    ``values`` holds the 32 packed FP8 word columns plus the FP32 scale bits in
+    column 32 -- exactly the record layout ``write_fp8_records`` builds. Keeping
+    the quantize/pack step out of here lets a fused producer kernel emit the
+    same ``values`` and reuse this scatter unchanged. Valid slots are unique.
+    """
     layout.validate(tuple(bank.shape[0] for bank in banks))
-    if keys.shape != (records.size, PAGE_RECORDS) or records.ndim != 1:
-        raise ValueError("Expected one logical record slot per D128 key")
-    quantized, scales, _ = quantize_index_rows(keys)
-    bits = jax.lax.bitcast_convert_type(quantized, jnp.uint8).astype(jnp.uint32)
-    bits = bits.reshape(-1, 32, 4)
-    words = bits[:, :, 0] | (bits[:, :, 1] << 8)
-    words |= (bits[:, :, 2] << 16) | (bits[:, :, 3] << 24)
-    values = jnp.concatenate(
-        (
-            words.astype(jnp.int32),
-            jax.lax.bitcast_convert_type(scales, jnp.int32)[:, None],
-        ),
-        axis=1,
-    )
+    if values.shape != (records.size, PAGE_ROWS) or records.ndim != 1:
+        raise ValueError("Expected one packed [PAGE_ROWS] record per slot")
     base, columns, valid = _record_addresses(records, layout)
     if jax.default_backend() == "tpu":
         return write_packed_pages(
@@ -139,6 +133,35 @@ def write_fp8_records(
         updated.append(bank.at[local, words % PAGE_RECORDS].set(values, mode="drop"))
         offset += bank.shape[0]
     return tuple(updated)
+
+
+def pack_fp8_records(keys: jax.Array) -> jax.Array:
+    """Quantize D128 keys to the ``[count, PAGE_ROWS]`` int32 record layout."""
+    quantized, scales, _ = quantize_index_rows(keys)
+    bits = jax.lax.bitcast_convert_type(quantized, jnp.uint8).astype(jnp.uint32)
+    bits = bits.reshape(-1, 32, 4)
+    words = bits[:, :, 0] | (bits[:, :, 1] << 8)
+    words |= (bits[:, :, 2] << 16) | (bits[:, :, 3] << 24)
+    return jnp.concatenate(
+        (
+            words.astype(jnp.int32),
+            jax.lax.bitcast_convert_type(scales, jnp.int32)[:, None],
+        ),
+        axis=1,
+    )
+
+
+def write_fp8_records(
+    banks: tuple[jax.Array, ...],
+    records: jax.Array,
+    keys: jax.Array,
+    layout: PackedFP8Layout,
+) -> tuple[jax.Array, ...]:
+    """Quantize only new keys and update their columns; valid slots are unique."""
+    layout.validate(tuple(bank.shape[0] for bank in banks))
+    if keys.shape != (records.size, PAGE_RECORDS) or records.ndim != 1:
+        raise ValueError("Expected one logical record slot per D128 key")
+    return write_packed_records(banks, records, pack_fp8_records(keys), layout)
 
 
 def read_fp8_records(

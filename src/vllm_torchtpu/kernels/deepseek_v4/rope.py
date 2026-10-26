@@ -584,6 +584,132 @@ def qnorm_rope(
     )(positions, x, cos_sin_cache)
 
 
+def _knorm_rope_quant_pack_body(
+    x_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    weight_ref: jax.Ref,
+    words_ref: jax.Ref,
+    scale_ref: jax.Ref,
+    *,
+    rotary_dim: int,
+    eps: float,
+    inverse: bool,
+    qmax: float,
+) -> None:
+    """Fused Index-K producer for one ``(tile_n, head_dim)`` chunk.
+
+    Weighted RMSNorm (``k_norm``) -> DeepSeek-V4 RoPE -> power-of-two E4M3
+    quantization -> little-endian bit-pack of four FP8 channels per int32 word.
+    The output matches ``quantize_index_rows`` + the ``write_fp8_records``
+    pack: word ``w`` holds channels ``4w..4w+3`` in bytes ``0..3``, and the
+    separate ``scale_ref`` holds the per-row FP32 power-of-two scale.
+    """
+    x = x_ref[...].astype(jnp.float32)
+    rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+    y = x * rms * weight_ref[...].astype(jnp.float32)
+    # The eager path is ``k_norm`` (RMSNorm -> bf16) then a standalone RoPE
+    # kernel, so the norm result is rounded to bf16 before rotation. Reproduce
+    # that round here; the only remaining divergence from eager is the RoPE
+    # primitive itself, which this file's other kernels already treat as equal.
+    y = y.astype(jnp.bfloat16).astype(jnp.float32)
+
+    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
+    y = y * cos + _rotate_gptj(y) * sin
+
+    # Match a standalone RoPE output (rounded to BF16) followed by the Indexer
+    # quantizer: amax over the whole D128 row, clamped, E4M3 power-of-two scale.
+    y = y.astype(jnp.bfloat16).astype(jnp.float32)
+    amax = jnp.maximum(jnp.max(jnp.abs(y), axis=-1, keepdims=True), 1e-4)
+    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / qmax)))
+    q = (y / scale).astype(jnp.float8_e4m3fn)
+
+    # Pack four consecutive FP8 channels into each int32 word, little-endian.
+    nwords = words_ref.shape[-1]
+    u = jax.lax.bitcast_convert_type(q, jnp.uint8).astype(jnp.uint32)
+    base = jnp.arange(nwords) * 4
+    words = (
+        _lane_gather(u, base)
+        | (_lane_gather(u, base + 1) << 8)
+        | (_lane_gather(u, base + 2) << 16)
+        | (_lane_gather(u, base + 3) << 24)
+    )
+    words_ref[...] = words.astype(jnp.int32)
+    scale_ref[...] = scale.reshape(scale_ref.shape)
+
+
+@functools.partial(jax.jit, static_argnames=("eps", "inverse", "name"))
+def knorm_rope_quant_pack(
+    x: jax.Array,  # [num_tokens, head_dim] bf16, head_dim == LANE
+    positions: jax.Array,  # [num_tokens] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    weight: jax.Array,  # [head_dim] k_norm weight
+    *,
+    eps: float = 1e-6,
+    inverse: bool = False,
+    name: str = "knorm_rope_quant_pack",
+) -> tuple[jax.Array, jax.Array]:
+    """Fused Index-K producer: ``k_norm`` -> RoPE -> E4M3 quant -> bit-pack.
+
+    Returns packed ``words`` ``[num_tokens, head_dim // 4]`` int32 and the
+    per-row FP32 ``scales`` ``[num_tokens]``. The caller bit-casts ``scales``
+    and concatenates them as the 33rd word before the paged scatter, so this
+    reproduces ``quantize_index_rows`` + ``write_fp8_records``'s record layout
+    without the intermediate RoPE/quant HBM round trips.
+    """
+    assert x.ndim == 2, "Index-K is single-head MQA: expected [tokens, head_dim]"
+    assert positions.ndim == 1 and positions.shape[0] == x.shape[0]
+    assert cos_sin_cache.ndim == 2 and weight.ndim == 1
+    num_tokens, head_dim = x.shape
+    assert head_dim == LANE, "Packed FP8 Index-K requires head_dim == 128"
+    rotary_dim = cos_sin_cache.shape[1]
+    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
+    nwords = head_dim // 4
+
+    if num_tokens == 0:
+        return (
+            jnp.zeros((0, nwords), jnp.int32),
+            jnp.zeros((0,), jnp.float32),
+        )
+
+    # Gather per-token cos/sin rows up front; the kernel tiles them by token.
+    cos_sin = cos_sin_cache[positions].astype(cos_sin_cache.dtype)
+    weight2d = weight.reshape(1, head_dim)
+    tile_n = largest_divisor(num_tokens, cap=64)
+    num_tiles = num_tokens // tile_n
+
+    kernel = functools.partial(
+        _knorm_rope_quant_pack_body,
+        rotary_dim=rotary_dim,
+        eps=eps,
+        inverse=inverse,
+        qmax=dtype_max(jnp.float8_e4m3fn),
+    )
+
+    words, scales = pl.pallas_call(
+        kernel,
+        grid=(num_tiles,),
+        in_specs=[
+            pl.BlockSpec((tile_n, head_dim), lambda i: (i, 0)),
+            pl.BlockSpec((tile_n, rotary_dim), lambda i: (i, 0)),
+            pl.BlockSpec((1, head_dim), lambda i: (0, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((tile_n, nwords), lambda i: (i, 0)),
+            pl.BlockSpec((tile_n, 1), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((num_tokens, nwords), jnp.int32),
+            jax.ShapeDtypeStruct((num_tokens, 1), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(x, cos_sin, weight2d)
+    return words, scales.reshape(num_tokens)
+
+
 @functools.partial(
     jax.jit, static_argnames=("inverse", "quant_dtype", "power_of_two", "name")
 )
