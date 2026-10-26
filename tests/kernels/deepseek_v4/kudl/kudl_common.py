@@ -275,4 +275,31 @@ def win_bf16p(conc):
     return _patched(win(conc), cwu, L2_CONFIG=dict(cwu.L2_CONFIG, pv_bf16=True))
 
 
+def win_l1_nog(conc):
+    """Removal arm: the SparseCore call without the row gather (dedup, ranks, masks only)."""
+    import jax.numpy as jnp
+    from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_window_union as cwu
+
+    def f(d, q):
+        T = d["topk"].shape[0]
+        ms = d["cu"].shape[0] - 1
+        pps = d["pages"].shape[0] // ms
+        meta = cwu.window_meta(d["cu"], d["dist"], d["kv_lens"], num_tokens=T, s_cap=pps * PAGE)
+        r = cwu.union_gather(meta, d["topk"], d["pages"], d["nope"], d["rope"], num_tokens=T, max_num_seqs=ms,
+                             skip_gather=True)
+        s = (r[2].reshape(-1)[0] + r[3][0]).astype(jnp.float32)
+        return q + (s * 0).astype(q.dtype)
+    return f
+
+
+def win_l2(conc):
+    """Component: the TensorCore call alone on precomputed L1 outputs (L1 hoisted: top-k not barriered per call)."""
+    from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_window_union as cwu
+
+    def f(d, q):
+        r = cwu.prepare(d["topk0"], d["kv_lens"], d["pages"], d["cu"], d["dist"], d["nope"], d["rope"])
+        return cwu.attend(q, r, d["sinks"], d["swa_acc"], d["swa_l"], d["swa_m"], sm_scale=C.SM_SCALE)
+    return f
+
+
 ARMS = {"wq16": wq16, "wq16_g2": wq16_g2, "wq16_g4": wq16_g4, "c16cfg": c16cfg, "tp8cfg": tp8cfg, "tp8cfg_g4": tp8cfg_g4, "win128": win128, "win_l2": win_l2, "win_l1_nog": win_l1_nog, "inc": inc, "win": win, "win_g2": win_g2, "win_g4": win_g4, "sparse": sparse, "win_l1": win_l1, "win_bf16p": win_bf16p}
