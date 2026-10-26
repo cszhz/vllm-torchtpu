@@ -31,6 +31,8 @@
 #   RECIPE_DRAFTS                 dspark, dspark_dp2: drafts
 #   RECIPE_ACCEPTANCE             dspark, dspark_dp2: synthetic acceptance length
 #   RECIPE_DRAFTS_PER_BATCH_SIZE  dspark_mixed, dspark_dp2: drafts by decode batch size
+#   RECIPE_ACCEPTANCE_LENGTHS     dspark_dp2: synthetic acceptance length per draft
+#                                 width, JSON (optional; default {RECIPE_DRAFTS: RECIPE_ACCEPTANCE})
 #   RECIPE_PREFILL                long: the prefill of the points without
 #                                 speculation, on a DSpark point (oct16); optional
 #   RECIPE_OFFLOAD_BYTES          host KV store size, all ranks; optional
@@ -481,7 +483,7 @@ else
   # acceptance length.
   if [ "$_dp2" = 1 ]; then
     _loader_dp=',"attention_dp":2'
-    _lengths=$(printf '{"%s":%s}' "$RECIPE_DRAFTS" "$RECIPE_ACCEPTANCE")
+    _lengths=${RECIPE_ACCEPTANCE_LENGTHS:-$(printf '{"%s":%s}' "$RECIPE_DRAFTS" "$RECIPE_ACCEPTANCE")}
   else
     _loader_dp=''
     _lengths='{"3":2.87,"7":3.78}'
