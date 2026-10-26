@@ -52,6 +52,12 @@ DeepSeek-V4 long-context outputs lose coherence when shrunk chunks end off its
 multiple, so a chunk whose context alone exceeds ``W`` still advances. A chunk
 the cap shrank counts as progress for the anti-starvation rule above.
 
+The cap only protects decodes, so it applies only while some DP rank decodes:
+this rank, in the step being scheduled, or another rank, in the last step the
+runner reported (``TPUModelRunner`` adds the highest and the lowest decoding
+rank to the DP metadata all-reduce it already runs). While no rank decodes,
+prefill chunks are not shrunk.
+
 Under KV pressure upstream preempts ``running[-1]``, which is the longest
 non-stalled prefill chunk, so a long prompt can be preempted repeatedly.
 
@@ -66,6 +72,8 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
+from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu import envs
@@ -91,6 +99,10 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._hold_backoff: dict[str, tuple[int, int]] = {}
         self.attn_work_cap = envs.VLLM_TPU_SRPT_ATTN_WORK_CAP
         self.attn_tile_tokens = max(envs.VLLM_TPU_SRPT_ATTN_TILE_TOKENS, 1)
+        # Whether another DP rank decoded in the last step the runner reported,
+        # and whether the cap applies to the step being scheduled.
+        self._other_rank_decoding = False
+        self._attn_cap_on = False
         # Attention work and whether a prefill chunk was scheduled so far in
         # this step's Scheduler.schedule(), and the requests the cap shrank.
         self._in_schedule = False
@@ -98,6 +110,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._attn_prefill_scheduled = False
         self._attn_capped: set[str] = set()
         self._attn_steps = 0
+        self._attn_cap_on_steps = 0
         self._attn_capped_chunks = 0
         logger.info(
             "SrptPrefillScheduler active (max_consecutive_holds=%d, "
@@ -108,6 +121,12 @@ class SrptPrefillScheduler(AsyncScheduler):
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # The cap only protects decodes: it applies while this rank decodes in
+        # this step or another rank decoded in the last reported step.
+        self._attn_cap_on = bool(self.attn_work_cap) and (
+            self._other_rank_decoding
+            or any(not r.is_prefill_chunk for r in self.running)
+        )
         held: list[Request] = []
         target = None
         prefilling: list[Request] = []
@@ -154,15 +173,30 @@ class SrptPrefillScheduler(AsyncScheduler):
             self._record_hold_outcome(target)
         if self.attn_work_cap:
             self._attn_steps += 1
+            self._attn_cap_on_steps += self._attn_cap_on
             self._attn_capped_chunks += len(self._attn_capped)
             if self._attn_steps % _ATTN_CAP_LOG_EVERY == 0:
                 logger.info(
                     "SrptPrefillScheduler attention work cap: steps=%d "
-                    "capped_chunks=%d",
+                    "cap_on_steps=%d capped_chunks=%d",
                     self._attn_steps,
+                    self._attn_cap_on_steps,
                     self._attn_capped_chunks,
                 )
         return output
+
+    def update_from_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> dict[int, EngineCoreOutputs]:
+        # TPUModelRunner sets this on the outputs of the steps it runs; the
+        # shared empty output of a step without tokens lacks it, so the last
+        # report stands.
+        decoding = getattr(model_runner_output, "other_rank_decoding", None)
+        if decoding is not None:
+            self._other_rank_decoding = decoding
+        return super().update_from_output(scheduler_output, model_runner_output)
 
     def _attn_cap_tokens(
         self, context: int, num_new_tokens: int, work: float, prefill_scheduled: bool
@@ -194,7 +228,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         # Scheduler.schedule() calls this on every request it is about to
         # schedule, in both queues, after its token budget limits, so it is
         # where the step's attention work is tracked and capped.
-        if not (self._in_schedule and self.attn_work_cap):
+        if not (self._in_schedule and self._attn_cap_on):
             return super()._reserve_prefill_lookahead(
                 request, num_computed_tokens, num_new_tokens
             )
@@ -323,7 +357,7 @@ class SrptPrefillScheduler(AsyncScheduler):
                 - self.num_sampled_tokens_per_step,
             )
             prefill = r.num_computed_tokens < r.num_prompt_tokens
-            if self.attn_work_cap and prefill and n > 0:
+            if self._attn_cap_on and prefill and n > 0:
                 n = self._attn_cap_tokens(
                     r.num_computed_tokens, n, work, prefill_scheduled
                 )
@@ -388,7 +422,7 @@ class SrptPrefillScheduler(AsyncScheduler):
             alloc, left, work, prefill_scheduled = self._plan_running(kept, lptt)
             need = min(target_remaining, lptt) if lptt > 0 else target_remaining
             admit = min(need, left)
-            if self.attn_work_cap and admit > 0:
+            if self._attn_cap_on and admit > 0:
                 admit = self._attn_cap_tokens(
                     hit_tokens, admit, work, prefill_scheduled
                 )

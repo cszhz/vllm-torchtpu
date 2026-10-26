@@ -1139,8 +1139,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
     ),
     # SrptPrefillScheduler: cap on a step's attention work, sum of
-    # n * (context + n / 2) over its scheduled chunks; prefill chunks are shrunk
-    # to stay under it (0 disables).
+    # n * (context + n / 2) over its scheduled chunks; while some DP rank
+    # decodes, prefill chunks are shrunk to stay under it (0 disables).
     "VLLM_TPU_SRPT_ATTN_WORK_CAP": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_WORK_CAP", 0
     ),

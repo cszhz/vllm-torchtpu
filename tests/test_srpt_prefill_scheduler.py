@@ -525,7 +525,7 @@ def test_env_vars_are_read_and_skip_the_compile_cache(shared_model_config, monke
 
 def _capped_long_prefill(shared_model_config, first_chunk: int = 128, **kwargs):
     """A scheduler with `long` (512 tokens) running its prefill after one
-    uncapped chunk of `first_chunk` tokens."""
+    uncapped chunk of `first_chunk` tokens, while another DP rank decodes."""
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
         num_blocks=64,
@@ -534,6 +534,7 @@ def _capped_long_prefill(shared_model_config, first_chunk: int = 128, **kwargs):
     )
     req_long = _running_long_prefill(scheduler, hasher, num_tokens=512)
     assert req_long.num_computed_tokens == first_chunk
+    scheduler._other_rank_decoding = True
     return scheduler, hasher, req_long
 
 
@@ -584,6 +585,7 @@ def test_attn_work_cap_skips_later_chunk_without_room_for_a_tile(
     # 32 tokens of `a` after 64 cost 32 * (64 + 16) = 2560; the 40 left fit
     # no tile of `b`.
     scheduler.attn_work_cap = 2600
+    scheduler._other_rank_decoding = True
     assert scheduler.schedule().num_scheduled_tokens == {"a": 32}
 
 
@@ -608,6 +610,7 @@ def test_attn_work_cap_no_hold_once_target_reaches_next_tile(shared_model_config
     # but take `warm` (32 tokens to go) from 16 to the tile at 32, so `a` is
     # not held for it.
     scheduler.attn_work_cap = 3200
+    scheduler._other_rank_decoding = True
     scheduler.add_request(
         _make_real_request("warm", 48, hasher, seed=3, shared_prefix=shared_prefix)
     )
@@ -625,6 +628,35 @@ def test_attn_capped_chunk_counts_as_progress(shared_model_config):
     # `long` is not stalled, so it can still be held for a shorter request.
     scheduler.add_request(_make_real_request("short", 16, hasher, seed=2))
     assert scheduler.schedule().num_scheduled_tokens == {"short": 16}
+
+
+def test_attn_work_cap_applies_only_while_some_rank_decodes(
+    shared_model_config, monkeypatch
+):
+    scheduler, _, _ = _capped_long_prefill(shared_model_config)
+    scheduler.attn_work_cap = 1
+    # Only the decode report is under test, not upstream's output handling.
+    monkeypatch.setattr(AsyncScheduler, "update_from_output", lambda *args: {})
+    # No rank decodes: the chunk takes the whole budget.
+    scheduler.update_from_output(None, SimpleNamespace(other_rank_decoding=False))
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 128}
+    # Another rank decoded in the last reported step: the chunk is capped.
+    scheduler.update_from_output(None, SimpleNamespace(other_rank_decoding=True))
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 32}
+    # The shared empty output of a step without tokens carries no report.
+    scheduler.update_from_output(None, SimpleNamespace())
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 32}
+
+
+def test_attn_work_cap_applies_while_this_rank_decodes(shared_model_config):
+    scheduler, hasher, _ = _capped_long_prefill(shared_model_config)
+    scheduler._other_rank_decoding = False
+    scheduler.attn_work_cap = 1
+    # `long` is held so `dec` is admitted; `dec` then decodes.
+    scheduler.add_request(_make_real_request("dec", 16, hasher, seed=2))
+    assert scheduler.schedule().num_scheduled_tokens == {"dec": 16}
+    # Uncapped, `long` would take the 127 tokens the decode leaves.
+    assert scheduler.schedule().num_scheduled_tokens == {"dec": 1, "long": 32}
 
 
 def test_upstream_routes_both_queues_through_the_chunk_hook():
