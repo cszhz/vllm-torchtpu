@@ -1484,10 +1484,11 @@ def test_pallas_exchange_lands_what_the_ragged_all_to_all_lands(pattern, with_pa
                 recv, x_l, send_sem, recv_sem, expected, t_local=t_local
             )
             return want, got, recv_sizes[None], want_table[None], want_table[None]
-        recv, pbuf, send_sem, recv_sem, precv_sem = exchange_start(
+        recv, pbuf, send_sem, recv_sem, precv_sem, *undrained = exchange_start(
             x_l, send_sizes, offsets, rank_l, t_local=t_local, payload=payload_l[0]
         )
-        table = payload_wait(pbuf, precv_sem, width=width)
+        psend_sem, src = undrained if undrained else (None, None)
+        table = payload_wait(pbuf, precv_sem, width=width, psend_sem=psend_sem, src=src)
         got = exchange_wait(recv, x_l, send_sem, recv_sem, expected, t_local=t_local)
         return want, got, recv_sizes[None], want_table[None], table[None]
 

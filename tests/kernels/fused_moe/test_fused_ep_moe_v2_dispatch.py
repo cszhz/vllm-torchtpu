@@ -166,8 +166,20 @@ def test_the_all_to_all_dispatch_is_refused_off_the_fused_stage(dispatch):
         )
 
 
+@pytest.mark.parametrize(
+    "issue_env",
+    [
+        {},
+        {"MOE_FUSED_EP_DISPATCH_BARRIER_ROUNDS": "1"},
+        {"MOE_FUSED_EP_DISPATCH_ORDER": "farthest"},
+        {"MOE_FUSED_EP_DISPATCH_PAYLOAD_DRAIN": "wait"},
+    ],
+    ids=["shipped", "barrier1", "farthest", "drain-in-wait"],
+)
 @pytest.mark.parametrize("with_payload", [False, True], ids=["rows", "rows+payload"])
-def test_the_pallas_exchange_lowers_for_tpu_from_a_host(with_payload):
+def test_the_pallas_exchange_lowers_for_tpu_from_a_host(
+    with_payload, issue_env, monkeypatch
+):
     """The issue/wait pair hands DMA semaphores from one pallas_call to the
     next. Lowered for TPU from this host -- the way torch_tpu's jax.export
     bridge sees it, for an 8-way mesh of v7x cores -- every wait must take its
@@ -185,6 +197,10 @@ def test_the_pallas_exchange_lowers_for_tpu_from_a_host(with_payload):
         exchange_wait,
         payload_wait,
     )
+
+    for name, value in issue_env.items():
+        monkeypatch.setenv(name, value)
+    drain_in_wait = issue_env.get("MOE_FUSED_EP_DISPATCH_PAYLOAD_DRAIN") == "wait"
 
     ep, t_local, sent, width = 8, 144, 864, 1664
     mesh = AbstractMesh(
@@ -208,11 +224,12 @@ def test_the_pallas_exchange_lowers_for_tpu_from_a_host(with_payload):
                 recv, x_l, send_sem, recv_sem, expected, t_local=t_local
             ), packed_l
         packed = packed_l[0]
-        recv, pbuf, send_sem, recv_sem, precv_sem = exchange_start(
+        recv, pbuf, send_sem, recv_sem, precv_sem, *undrained = exchange_start(
             x_l, sizes, offsets, rank_l, t_local=t_local, payload=packed
         )
         recv, rank_l = lax.optimization_barrier((recv, rank_l))
-        table = payload_wait(pbuf, precv_sem, width=width)
+        psend_sem, src = undrained if undrained else (None, None)
+        table = payload_wait(pbuf, precv_sem, width=width, psend_sem=psend_sem, src=src)
         expected = jnp.stack([jnp.sum(sizes), jnp.sum(sizes) - sizes[rank_l[0, 0]]])
         rows = exchange_wait(recv, x_l, send_sem, recv_sem, expected, t_local=t_local)
         return rows, table[rank_l[0, 0]][None]
@@ -244,9 +261,15 @@ def test_the_pallas_exchange_lowers_for_tpu_from_a_host(with_payload):
     if not with_payload:
         assert results == 3
         assert f"{name}#1, {name}#2)" in calls[1], calls[1]
-    else:
+    elif not drain_in_wait:
         # rows, payload table, rows send/recv sems, payload recv sem; the
         # payload's send sem is the issue's own scratch (drained there).
         assert results == 5
         assert f"{name}#1, {name}#4)" in calls[1], calls[1]  # payload wait
+        assert f"{name}#2, {name}#3)" in calls[2], calls[2]  # rows wait
+    else:
+        # One more: the payload's send semaphore, which the payload wait
+        # drains, holding the source block alive as its second operand.
+        assert results == 6
+        assert f"{name}#1, " in calls[1] and f"{name}#4, {name}#5)" in calls[1]
         assert f"{name}#2, {name}#3)" in calls[2], calls[2]  # rows wait

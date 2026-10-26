@@ -55,6 +55,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import _all_pairs_barrier, _rows_wait
 
 # The barrier semaphore belongs to a collective id, and the fused kernel's
@@ -63,35 +64,63 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import _all_pairs_barrier, _rows_
 # the kernel's never add into one semaphore.
 COLLECTIVE_ID = 1
 
+
+def issue_config():
+    """(barrier rounds, destination order, where the payload sends drain).
+
+    Read where the kernels are built, so the build cache and the kernel's name
+    carry it and two settings cannot share a compiled program.
+    """
+    return (
+        max(1, int(envs.MOE_FUSED_EP_DISPATCH_BARRIER_ROUNDS)),
+        envs.MOE_FUSED_EP_DISPATCH_ORDER,
+        envs.MOE_FUSED_EP_DISPATCH_PAYLOAD_DRAIN,
+    )
+
+
 _SMEM = pl.BlockSpec(memory_space=pltpu.MemorySpace.SMEM)
 _HBM = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
 _SEMAPHORE = pl.BlockSpec(memory_space=pltpu.MemorySpace.SEMAPHORE)
 
 
-def _build_start(ep, t_local, send_rows, row_shape, dtype, width):
+def _start_sems(width, drain):
+    """How many DMA semaphores the issue returns: send, receive, the payload's
+    receive, and the payload's send where the issue does not drain it."""
+    return 2 + (1 if width else 0) + (1 if width and drain == "wait" else 0)
+
+
+def _build_start(ep, t_local, send_rows, row_shape, dtype, width, cfg):
     """The issuing pallas_call for one geometry; width > 0 adds the payload."""
+    rounds, order, drain = cfg
+    sems = _start_sems(width, drain)
+    # "stagger" walks me, me + 1, ...; "farthest" starts half the mesh away,
+    # which at DP32 is across the z links. Either way the own-destination step
+    # is known at trace time, so the local copy needs no predicate.
+    skew = 0 if order == "stagger" else ep // 2
+    own_k = (ep - skew) % ep
 
     def kernel(sizes_sm, offsets_sm, rank_sm, send_hbm, *refs):
         if width:
             packed_hbm, recv_hbm, pbuf_hbm = refs[:3]
-            # psend_sem is scratch: the payload's sends are drained here.
-            send_sem, recv_sem, precv_sem, psend_sem = refs[3:]
+            send_sem, recv_sem, precv_sem = refs[3:6]
+            # Scratch where the issue drains the payload's sends itself;
+            # an output where the payload wait does.
+            psend_sem = refs[6]
         else:
             recv_hbm, send_sem, recv_sem = refs
         # Peers write into this shard's receive buffers, which are this call's
         # outputs and so exist from this call on: nobody sends until every
         # shard has entered.
-        _all_pairs_barrier(ep)
+        _all_pairs_barrier(ep, rounds)
         me = rank_sm[0, 0]
-        # Step k sends to shard me + k, so step 0 is this shard's own copy and
-        # no destination takes every source's first DMA at once. The payload
-        # goes first: every peer's routing plan waits for it, and a DMA queue
-        # retires in order.
+        # Step k sends to shard me + skew + k, so no destination takes every
+        # source's first DMA at once. The payload goes first: every peer's
+        # routing plan waits for it, and a DMA queue retires in order.
         if width:
             for k in range(ep):
-                d = lax.rem(me + k, jnp.int32(ep))
+                d = lax.rem(me + skew + k, jnp.int32(ep))
                 dst = pbuf_hbm.at[pl.ds(me, 1)]
-                if k == 0:
+                if k == own_k:
                     # Its own row counts as an arrival: the payload wait must
                     # cover it, or the plan can read row me before it lands.
                     pltpu.make_async_copy(packed_hbm, dst, precv_sem).start()
@@ -104,18 +133,19 @@ def _build_start(ep, t_local, send_rows, row_shape, dtype, width):
                         device_id=(d,),
                         device_id_type=pl.DeviceIdType.MESH,
                     ).start()
-            # The payload has left before the first row is issued: its source
-            # is free when this call returns, and no more than one batch of
-            # remote DMAs is ever in flight from here.
-            _rows_wait(psend_sem, pbuf_hbm, ep - 1)
+            if drain == "issue":
+                # The payload has left before the first row is issued: its
+                # source is free when this call returns, and no more than one
+                # batch of remote DMAs is ever in flight from here.
+                _rows_wait(psend_sem, pbuf_hbm, ep - 1)
         # A zero-length DMA must never issue, so every row copy is predicated
         # on its length.
         for k in range(ep):
-            d = lax.rem(me + k, jnp.int32(ep))
+            d = lax.rem(me + skew + k, jnp.int32(ep))
             rows = sizes_sm[d]
             src = send_hbm.at[pl.ds(offsets_sm[d], rows)]
             dst = recv_hbm.at[pl.ds(me * t_local, rows)]
-            if k == 0:
+            if k == own_k:
                 # Its own run needs no fabric; the copy signals the send
                 # semaphore, which the wait counts it against.
                 @pl.when(rows > 0)
@@ -140,15 +170,18 @@ def _build_start(ep, t_local, send_rows, row_shape, dtype, width):
     if width:
         out_shape.append(jax.ShapeDtypeStruct(_table_shape(ep, width), jnp.int32))
         out_specs.append(_HBM)
-    sems = 3 if width else 2
+    scratch = [pltpu.SemaphoreType.DMA] if width and drain == "issue" else []
     return pl.pallas_call(
         kernel,
         out_shape=(*out_shape, *(pltpu.SemaphoreType.DMA(()) for _ in range(sems))),
         in_specs=[_SMEM, _SMEM, _SMEM, _HBM] + ([_HBM] if width else []),
         out_specs=(*out_specs, *(_SEMAPHORE for _ in range(sems))),
-        scratch_shapes=[pltpu.SemaphoreType.DMA] if width else [],
+        scratch_shapes=scratch,
         compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
-        name=f"fused_ep_dispatch_start_ep{ep}_t{t_local}_s{send_rows}_p{width}",
+        name=(
+            f"fused_ep_dispatch_start_ep{ep}_t{t_local}_s{send_rows}_p{width}"
+            f"_b{rounds}_{order}_{drain}"
+        ),
     )
 
 
@@ -166,21 +199,37 @@ def _table_shape(ep, width):
     return (ep, _padded_width(width) // 1024, 8, 128)
 
 
-def _build_payload_wait(ep, width):
-    """Wait for the other shards' payload rows; returns the payload table."""
+def _build_payload_wait(ep, width, drain):
+    """Wait for the other shards' payload rows; returns the payload table.
 
-    def kernel(pbuf_in, precv_sem, pbuf_hbm):
+    With `drain == "wait"` this also drains the payload's own sends, which the
+    issue then does not: the rows go on the wire that much earlier, and the
+    payload's source buffer is held alive by being an operand here. The table
+    has the same byte geometry as the source block, so one ref sizes both
+    waits.
+    """
+
+    def kernel(pbuf_in, *refs):
+        if drain == "wait":
+            src_in, precv_sem, psend_sem, pbuf_hbm = refs
+            del src_in  # held alive for the sends reading it
+        else:
+            precv_sem, pbuf_hbm = refs
         del pbuf_in  # aliased
         # Every shard's row, this one's own copy included.
         _rows_wait(precv_sem, pbuf_hbm, ep)
+        if drain == "wait":
+            _rows_wait(psend_sem, pbuf_hbm, ep - 1)
 
+    in_specs = [_HBM] + ([_HBM] if drain == "wait" else [])
+    in_specs += [_SEMAPHORE] * (2 if drain == "wait" else 1)
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct(_table_shape(ep, width), jnp.int32),
-        in_specs=[_HBM, _SEMAPHORE],
+        in_specs=in_specs,
         out_specs=_HBM,
         input_output_aliases={0: 0},
-        name=f"fused_ep_dispatch_payload_wait_ep{ep}_p{width}",
+        name=f"fused_ep_dispatch_payload_wait_ep{ep}_p{width}_{drain}",
     )
 
 
@@ -229,13 +278,14 @@ def _builds(ep, t_local, send, width):
         tuple(send.shape[1:]),
         jnp.dtype(send.dtype),
         width,
+        issue_config(),
     )
     built = _BUILDS.get(key)
     if built is None:
         with _BUILDS_LOCK:
             built = _BUILDS.get(key)
             if built is None:
-                built = (_build_start(*key), _build_wait(*key[:-1], 0))
+                built = (_build_start(*key), _build_wait(*key[:-2], 0))
                 _BUILDS[key] = built
     return built
 
@@ -243,7 +293,9 @@ def _builds(ep, t_local, send, width):
 def exchange_start(send, sizes, offsets, rank, *, t_local, payload=None):
     """Issue the exchange; returns (receive buffer, send sem, recv sem), or
     with `payload` (receive buffer, payload table, send sem, recv sem,
-    payload recv sem).
+    payload recv sem [, payload send sem]). The last is returned only where
+    `MOE_FUSED_EP_DISPATCH_PAYLOAD_DRAIN=wait` leaves the payload's sends for
+    `payload_wait` to drain.
 
     send [S, ...] is this shard's rows, destination-major: shard d's run is
     sizes[d] rows from offsets[d]. Every run lands in shard d's receive
@@ -257,14 +309,20 @@ def exchange_start(send, sizes, offsets, rank, *, t_local, payload=None):
     ep = sizes.shape[0]
     width = 0 if payload is None else payload.shape[-1]
     start, _ = _builds(ep, t_local, send, width)
-    extra = () if payload is None else (_payload_block(payload),)
-    return start(
+    block = None if payload is None else _payload_block(payload)
+    extra = () if block is None else (block,)
+    out = start(
         sizes.astype(jnp.int32),
         offsets.astype(jnp.int32),
         rank.astype(jnp.int32),
         send,
         *extra,
     )
+    if width and issue_config()[2] == "wait":
+        # The source block goes back to the caller so `payload_wait`, which
+        # drains the sends reading it, can hold the very same buffer alive.
+        return (*out, block)
+    return out
 
 
 def _payload_block(payload):
@@ -277,16 +335,24 @@ def _payload_block(payload):
 _PAYLOAD_WAITS = {}
 
 
-def payload_wait(pbuf, precv_sem, *, width):
-    """Wait for every shard's payload row; returns the [ep, width] table."""
+def payload_wait(pbuf, precv_sem, *, width, psend_sem=None, src=None):
+    """Wait for every shard's payload row; returns the [ep, width] table.
+
+    `psend_sem` and `src` are `exchange_start`'s last two results where the
+    issue left the payload's sends undrained; both must be given together.
+    """
+    if (psend_sem is None) != (src is None):
+        raise ValueError("payload_wait takes psend_sem and src together")
+    drain = "wait" if psend_sem is not None else "issue"
     ep = pbuf.shape[0]
-    wait = _PAYLOAD_WAITS.get((ep, width))
+    wait = _PAYLOAD_WAITS.get((ep, width, drain))
     if wait is None:
         with _BUILDS_LOCK:
             wait = _PAYLOAD_WAITS.setdefault(
-                (ep, width), _build_payload_wait(ep, width)
+                (ep, width, drain), _build_payload_wait(ep, width, drain)
             )
-    return wait(pbuf, precv_sem).reshape(ep, -1)[:, :width]
+    args = (pbuf, precv_sem) if drain == "issue" else (pbuf, src, precv_sem, psend_sem)
+    return wait(*args).reshape(ep, -1)[:, :width]
 
 
 def exchange_wait(recv, send, send_sem, recv_sem, expected, *, t_local):

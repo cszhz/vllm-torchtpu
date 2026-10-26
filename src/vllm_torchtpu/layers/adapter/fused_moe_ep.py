@@ -60,6 +60,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_rank_order,
     ep_token_replica_groups,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.dispatch import issue_config
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     PACK4,
     U32_SUBLANE_TILE,
@@ -805,7 +806,7 @@ def prebuild_fused_moe_ep(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
-        "token_replica_groups=%s expert_slot=%s dispatch=%s",
+        "token_replica_groups=%s expert_slot=%s dispatch=%s issue=%s",
         hidden,
         inter,
         local_experts,
@@ -824,6 +825,7 @@ def prebuild_fused_moe_ep(
         token_replica_groups,
         None if placed is None else tuple(placed.shape),
         envs.MOE_FUSED_EP_DISPATCH,
+        issue_config(),
     )
     # Two knobs stop applying the moment this arms, and neither would say so on
     # its own: the fused call returns before `apply_monolithic` reaches either

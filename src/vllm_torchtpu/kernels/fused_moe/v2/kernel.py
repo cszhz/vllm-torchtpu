@@ -494,8 +494,18 @@ def expert_ffn_int8(
     return acc2, None
 
 
-def _all_pairs_barrier(ep):
-    """Barrier over every shard: transport peers are not only neighbours."""
+def _all_pairs_barrier(ep, rounds=2):
+    """Barrier over every shard: transport peers are not only neighbours.
+
+    One round is sufficient for what callers need -- that every shard has
+    ENTERED this call before any shard writes into a peer's buffer. Let c_r be
+    the barriers shard r has entered; each shard's semaphore counts sum_r c_r,
+    and passing the k-th barrier consumes ep of them. Take the first shard in
+    the whole mesh to pass its k-th: at that instant no shard has passed its
+    k-th, so none has entered its (k+1)-th, so c_r <= k for every r, and
+    sum_r c_r >= k * ep forces c_r = k for every r. A second round proves
+    nothing more; `rounds` is a knob only until the one-round form is measured.
+    """
     barrier_sem = pltpu.get_barrier_semaphore()
     for i in range(ep):
         pl.semaphore_signal(
@@ -506,16 +516,18 @@ def _all_pairs_barrier(ep):
         )
     pl.semaphore_wait(barrier_sem, ep)
 
-    @functools.partial(pl.run_scoped, second=pltpu.SemaphoreType.REGULAR)
-    def _(second):
-        for i in range(ep):
-            pl.semaphore_signal(
-                second,
-                inc=1,
-                device_id=(jnp.int32(i),),
-                device_id_type=pl.DeviceIdType.MESH,
-            )
-        pl.semaphore_wait(second, ep)
+    for _ in range(rounds - 1):
+
+        @functools.partial(pl.run_scoped, second=pltpu.SemaphoreType.REGULAR)
+        def _(second):
+            for i in range(ep):
+                pl.semaphore_signal(
+                    second,
+                    inc=1,
+                    device_id=(jnp.int32(i),),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+            pl.semaphore_wait(second, ep)
 
 
 def _slot_copy(src, vm, sems, slot):

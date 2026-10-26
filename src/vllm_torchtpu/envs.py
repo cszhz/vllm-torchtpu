@@ -79,6 +79,9 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_PREPROCESS_BACKEND: str = "native"
     MOE_FUSED_EP_DISPATCH: str = "all_gather"
+    MOE_FUSED_EP_DISPATCH_BARRIER_ROUNDS: int = 2
+    MOE_FUSED_EP_DISPATCH_ORDER: str = "stagger"
+    MOE_FUSED_EP_DISPATCH_PAYLOAD_DRAIN: str = "issue"
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
@@ -703,6 +706,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MOE_FUSED_EP_DISPATCH",
         "all_gather",
         ["all_gather", "all_to_all", "pallas_all_to_all"],
+    ),
+    # Rounds of the all-pairs barrier the pallas_all_to_all issue kernel runs
+    # before it sends. One is sufficient: with every shard signalling every
+    # shard and waiting for `ep`, the first shard to pass its k-th barrier can
+    # only do so once every shard has entered its k-th (no shard has passed
+    # barrier k yet, so none has entered k + 1, so every count is at most k and
+    # the sum of ep counts reaching k * ep forces all of them to k) -- which is
+    # the property the barrier exists for, that a peer's receive buffer exists
+    # from the moment it enters. Two is the shipped default until measured.
+    "MOE_FUSED_EP_DISPATCH_BARRIER_ROUNDS": lambda: int(
+        os.getenv("MOE_FUSED_EP_DISPATCH_BARRIER_ROUNDS", "2") or 2
+    ),
+    # The order the issue kernel walks its destinations: "stagger" sends to
+    # shard me + k (so step 0 is the local copy), "farthest" starts half the
+    # mesh away, which at DP32 is the other side of the z links.
+    "MOE_FUSED_EP_DISPATCH_ORDER": env_with_choices(
+        "MOE_FUSED_EP_DISPATCH_ORDER",
+        "stagger",
+        ["stagger", "farthest"],
+    ),
+    # Where the routing payload's own sends are drained: in the issue, before
+    # the first row DMA (the shipped order, which keeps one batch of remote
+    # DMAs in flight), or in the wait, which issues the rows that much earlier
+    # at the cost of 2 (ep - 1) descriptors in flight.
+    "MOE_FUSED_EP_DISPATCH_PAYLOAD_DRAIN": env_with_choices(
+        "MOE_FUSED_EP_DISPATCH_PAYLOAD_DRAIN",
+        "issue",
+        ["issue", "wait"],
     ),
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for

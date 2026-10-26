@@ -27,6 +27,7 @@ from jax import lax
 from vllm_torchtpu.kernels.fused_moe.v2.dispatch import (
     exchange_start,
     exchange_wait,
+    issue_config,
     payload_wait,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
@@ -1169,11 +1170,17 @@ def fused_ep_moe_v2(
             local_blocks, g_local=g_local, ep=ep, t_local=t_local, topk=topk
         )
         send = jnp.take(q_l, send_rows, axis=0)
-        recv, pbuf, send_sem, recv_sem, precv_sem = exchange_start(
+        recv, pbuf, send_sem, recv_sem, precv_sem, *undrained = exchange_start(
             send, send_sizes, input_offsets, rank_l, t_local=t_local, payload=packed
         )
         recv, rank_l = lax.optimization_barrier((recv, rank_l))
-        exchange = payload_wait(pbuf, precv_sem, width=layout[-1])
+        # With the payload's sends left undrained by the issue (so the rows go
+        # on the wire earlier), the issue hands back their semaphore and the
+        # source block, and this wait drains them.
+        psend_sem, src = undrained if undrained else (None, None)
+        exchange = payload_wait(
+            pbuf, precv_sem, width=layout[-1], psend_sem=psend_sem, src=src
+        )
         me = rank_l[0, 0]
         pairs_g, _, _ = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
@@ -1406,6 +1413,9 @@ def fused_ep_moe_v2(
         float(routed_scaling_factor),
         stage,
         dispatch,
+        # The issue kernel's knobs change the program, and a cached shard_map
+        # would keep serving the one built under the previous setting.
+        issue_config() if dispatch == "pallas_all_to_all" else None,
         gather_positions,
         logical_intermediate_size,
     )
