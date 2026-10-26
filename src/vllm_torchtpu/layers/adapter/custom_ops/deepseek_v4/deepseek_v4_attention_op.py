@@ -31,6 +31,7 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention import (
     csa_window_union,
 )
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import fused_hca_decode
+from vllm_torchtpu.kernels.deepseek_v4.core_attention import fused_hca_mixed
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import (
     mla_ragged_paged_attention,
 )
@@ -178,6 +179,38 @@ def _attention_hca(
             sliding_window=sliding_window,
             logical_page_size=logical_page_size,
             chunk=chunk,
+            blk_pages=envs.TPU_DSV4_FUSED_HCA_BLK_PAGES,
+        )
+
+    mixed_bq = max(8, envs.TPU_DSV4_FUSED_HCA_MIXED_Q_ROWS // max(q.shape[1], 1))
+    if envs.TPU_DSV4_FUSED_HCA_MIXED and fused_hca_mixed.supported(
+        tokens=q.shape[0],
+        heads=q.shape[1],
+        chunk=chunk,
+        bq=mixed_bq,
+        two_caches_same_buffer=two_caches_same_buffer,
+        swa_only=swa_only,
+        non_causal_block=non_causal_block,
+    ):
+        # Static gate (T > 32 bucket; T <= 32 stays on fused_hca_decode above).
+        return fused_hca_mixed.fused_hca_mixed_attention(
+            q,
+            new_kv,
+            sw_cache,
+            swa_kv_lens,
+            swa_page_indices,
+            swa_cu_q_lens,
+            swa_distribution,
+            main_cache_kv,
+            extra,
+            main_page_indices,
+            attention_sinks,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            logical_page_size=logical_page_size,
+            chunk=chunk,
+            bq=mixed_bq,
+            kt=envs.TPU_DSV4_FUSED_HCA_MIXED_KT,
             blk_pages=envs.TPU_DSV4_FUSED_HCA_BLK_PAGES,
         )
 
