@@ -1056,8 +1056,25 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None, token_of=None):
     return jnp.clip(scattered, jnp.int32(gather_lo), jnp.int32(gather_hi))
 
 
-def expert_visit_list(rows, g_local):
-    """The local experts to visit, and how many, from rows [g_local] i32."""
+def expert_group_size(g_local, groups):
+    """Local experts per dispatch group: the groups partition the slots in
+    ascending order, the last one short where `groups` does not divide."""
+    if groups < 1 or groups > g_local:
+        raise ValueError(
+            f"{groups} dispatch groups over {g_local} local experts: a group "
+            "is a nonempty run of consecutive local slots"
+        )
+    return -(-g_local // groups)
+
+
+def expert_visit_list(rows, g_local, groups=0):
+    """The local experts to visit, and how many, from rows [g_local] i32.
+
+    With `groups`, the visited experts come out group-major -- every expert
+    of group 0, then of group 1 -- which is what the in-kernel grouped
+    dispatch's arrival waits need: a group is waited for once, at its first
+    visit, and never again. Inside a group the order is the ungrouped one.
+    """
     # visit[:n_visit] = the local expert indices with rows > 0, most rows
     # first; the tail is never visited. Ties break by ascending index. The
     # visit order does not change the output, only the weight refill order.
@@ -1065,6 +1082,29 @@ def expert_visit_list(rows, g_local):
     n_visit = mask.sum().astype(jnp.int32).reshape(1)
     order = jnp.arange(g_local, dtype=jnp.int32)
     rows_i = rows.astype(jnp.int32)
+    if groups:
+        # Three keys ranked lexicographically rather than one packed word:
+        # empty last, then the group, then the ungrouped key below. Packing
+        # them would need a factor above the row count, which has no bound
+        # here. Each compare is one g_local-square, as the single key's is.
+        grp = jnp.minimum(order // expert_group_size(g_local, groups), groups - 1)
+        empty = (~mask).astype(jnp.int32)
+        key = order - rows_i * g_local
+
+        def before(a, b):
+            return (a[None, :] < b[:, None]).astype(jnp.int32)
+
+        def same(a, b):
+            return (a[None, :] == b[:, None]).astype(jnp.int32)
+
+        lt = before(empty, empty) + same(empty, empty) * (
+            before(grp, grp) + same(grp, grp) * before(key, key)
+        )
+        rank = jnp.sum(lt, axis=1)
+        perm = jnp.sum(
+            jnp.where(rank[None, :] == order[:, None], order[None, :], 0), axis=1
+        )
+        return jnp.minimum(perm, jnp.int32(g_local - 1)).astype(jnp.int32), n_visit
     # One key, ranked once. The negated row count is the high factor of the
     # word and the index the low one, so the packed integer compares exactly
     # as the (rows descending, index ascending) pair does: every index is

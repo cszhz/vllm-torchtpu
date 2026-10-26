@@ -613,8 +613,20 @@ def _build_fused_ep_moe_kernel(
     has_w2_bias=False,
     pad_scale_rows=False,
     logical_intermediate_size=None,
+    dispatch_groups=0,
 ):
     """Build the pallas_call and the function that invokes it.
+
+    `dispatch_groups` turns on the in-kernel grouped dispatch wait: the row
+    exchange is issued before the routing plan as usual, but nothing waits
+    for it outside, and instead this kernel waits for one expert group's
+    arrivals at a time, at the first visit of an expert in that group and in
+    front of the token gather that reads them. Group g's rows therefore fly
+    while group g - 1 computes. It takes two more operands: `disp_rows`
+    [groups] i32, the rows due here per group (this shard's own run
+    included), and the [groups] arrival semaphore `exchange_start` returned.
+    The visit list must be group-major (`host.expert_visit_list(groups=)`),
+    or a group would be waited for more than once and the kernel would hang.
 
     `pad_scale_rows` takes the four-bit scale tables as [G, rows, N] with
     rows = host.fp4_scale_rows(K, rhs_qb, padded=True): K / rhs_qb blocks
@@ -633,6 +645,12 @@ def _build_fused_ep_moe_kernel(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
         )
     barrier_rounds, tail_barrier = kernel_barrier_config()
+    # Checked here rather than at the first use: the wait schedule's whole
+    # soundness is "one group, one wait, in visit order", and a group that is
+    # not a run of local slots has no such order.
+    group_size = (
+        host.expert_group_size(g_local, dispatch_groups) if dispatch_groups else 0
+    )
     # The kernel fetches lhs rows by index from the ungathered token buffer
     # [tokens, lane blocks, 128], using the token-gather table, and ships
     # results over an all-to-all carrying unweighted rows; it returns
@@ -903,6 +921,8 @@ def _build_fused_ep_moe_kernel(
         # This shard's expert-parallel index, as data rather than
         # `lax.axis_index` -- see N_RANK_TABLES.
         rank_sm = next(it)
+        # Rows due here per dispatch group, this shard's own run included.
+        disp_rows_sm = next(it) if dispatch_groups else None
 
         def count(row):
             """Close one count's reduction on the scalar core.
@@ -938,6 +958,10 @@ def _build_fused_ep_moe_kernel(
         # same [G, N] layout as the per-channel weight scales beside them.
         w1b_hbm = next(it) if has_w1_bias else None
         w2b_hbm = next(it) if has_w2_bias else None
+        # The dispatch's arrival semaphore, one element per group, handed
+        # over by `dispatch.exchange_start`: peers signal element g when
+        # their run for group g lands here.
+        disp_sems = next(it) if dispatch_groups else None
         if rhs_packed4:
             # Packed-u32 weight stream: the four-bit [G, K, N] refs viewed as
             # [G, K//8, N] uint32, so the DMA moves half the bytes. This is
@@ -1364,6 +1388,25 @@ def _build_fused_ep_moe_kernel(
             def _():
                 _rows_wait(send_scl_sems.at[parity], cscl_hbm, subs)
 
+        def wait_dispatch_group(e, visit_i):
+            """Wait for expert `e`'s dispatch group, at its first visit.
+
+            A group with no arriving rows waits for none: either nothing was
+            routed into it, or every row it needs travelled with a lower
+            group, which the ascending wait order has already covered.
+            """
+            assert disp_sems is not None and disp_rows_sm is not None
+            group = lax.div(e, jnp.int32(group_size))
+            previous = visit_sm[jnp.maximum(visit_i - 1, 0)]
+            first = jnp.logical_or(
+                visit_i == 0, lax.div(previous, jnp.int32(group_size)) != group
+            )
+            arriving = disp_rows_sm[group]
+
+            @pl.when(jnp.logical_and(first, arriving > 0))
+            def _():
+                _rows_wait(disp_sems.at[group], lhs_hbm, arriving)
+
         def prime_expert(e, lhs_slot, wslot, window_started, visit_i):
             """Prime expert ``e``'s metadata and first activation tile.
 
@@ -1373,7 +1416,15 @@ def _build_fused_ep_moe_kernel(
             start is what ``window_started`` reports, and then only the wait
             is owed. The window is a bare HBM round trip, and issued here it
             is the one arrival at an expert's head with nothing behind it.
+
+            Under the in-kernel grouped dispatch this is also where the
+            rows themselves are waited for, once per group: the visit list
+            is group-major, so a visit whose group differs from the
+            previous visit's is that group's first, and the wait sits in
+            front of every read of an arrival row.
             """
+            if dispatch_groups:
+                wait_dispatch_group(e, visit_i)
             rows = expert_rows_sm[e]
             slab_base = expert_base_sm[e]
 
@@ -2020,6 +2071,7 @@ def _build_fused_ep_moe_kernel(
             _all_pairs_barrier(ep, barrier_rounds)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    semaphore = pl.BlockSpec(memory_space=pltpu.MemorySpace.SEMAPHORE)
     # The VMEM buffers come from the same list the VMEM accounting sums, in
     # the order the kernel body unpacks them: lhs_vm, w1_vm, w2_vm, the scale
     # tables where the format has them, the bias tables each build asked for,
@@ -2146,6 +2198,7 @@ def _build_fused_ep_moe_kernel(
             f"{format_tag}"
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
+            f"{f'_dg{dispatch_groups}' if dispatch_groups else ''}"
             f"_g{g_local}_c{capacity}_nb{nbuf}"
             f"{'' if barrier_rounds == 2 else f'_b{barrier_rounds}'}"
             f"{'' if tail_barrier else '_notail'}"
@@ -2153,8 +2206,8 @@ def _build_fused_ep_moe_kernel(
         return pl.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=N_PREFETCH,
-                in_specs=[hbm] * n_inputs,
+                num_scalar_prefetch=N_PREFETCH + int(bool(dispatch_groups)),
+                in_specs=[hbm] * n_inputs + ([semaphore] if dispatch_groups else []),
                 out_specs=[hbm] * len(out_shape),
                 scratch_shapes=tuple(scratch),
                 grid=(),
@@ -2187,6 +2240,8 @@ def _build_fused_ep_moe_kernel(
         visit,
         counts,
         rank,
+        disp_rows=None,
+        disp_sems=None,
     ):
         """The served ragged transport form; returns arrivals and scales."""
         # tables = the block-unit transport tuple and the row-unit push
@@ -2238,6 +2293,18 @@ def _build_fused_ep_moe_kernel(
             (w1s.astype(jnp.float32), w2s.astype(jnp.float32)) if has_scales else ()
         )
         biases = tuple(b.astype(jnp.float32) for b in (w1b, w2b) if b is not None)
+        if (disp_rows is None) == bool(dispatch_groups) or (
+            disp_sems is None
+        ) == bool(dispatch_groups):
+            raise ValueError(
+                f"the kernel was built with dispatch_groups={dispatch_groups}, "
+                "which wants both the per-group arrival counts and the "
+                f"arrival semaphore and nothing else; got "
+                f"disp_rows={disp_rows is not None} "
+                f"disp_sems={disp_sems is not None}"
+            )
+        group_args = () if disp_rows is None else (disp_rows.astype(jnp.int32),)
+        sem_args = () if disp_sems is None else (disp_sems,)
         call = make_call(recv_rows)
         res = call(
             *tables,
@@ -2246,6 +2313,7 @@ def _build_fused_ep_moe_kernel(
             visit.astype(jnp.int32),
             counts.astype(jnp.int32),
             rank.astype(jnp.int32),
+            *group_args,
             token_gather.astype(jnp.int32),
             act_q_gathered.reshape(-1, lane_blocks, HIDDEN_LANE_BLOCK),
             *act_scale_arg,
@@ -2253,6 +2321,7 @@ def _build_fused_ep_moe_kernel(
             w2,
             *scale_args,
             *biases,
+            *sem_args,
         )
         recv, rscl, _contrib, _contrib_scl = res
         return recv, rscl

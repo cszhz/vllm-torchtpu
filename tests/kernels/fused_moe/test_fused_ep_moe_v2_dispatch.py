@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.fused_moe.v2 import layer
+from vllm_torchtpu.kernels.fused_moe.v2 import host, layer
 
 pytestmark = pytest.mark.cpu_test
 
@@ -119,6 +119,145 @@ def test_the_plans_agree_with_a_simulated_exchange(
     # Fewer rows than the gather's T per shard, and never more than the bound.
     assert recv_sizes.sum(axis=1).max() < T
     assert send_sizes.sum(axis=1).max() <= t_local * min(topk, ep)
+
+
+@pytest.mark.parametrize("form", ["compare", "scatter"])
+@pytest.mark.parametrize("groups", [1, 2, 4, 13])
+@pytest.mark.parametrize(
+    "ep,t_local,topk,g_local",
+    [(8, 32, 4, 4), (32, 144, 6, 13), (4, 16, 6, 3)],
+    ids=["dp8", "dp32-c768-13-slots", "ep4-topk-over-ep"],
+)
+def test_the_grouped_plans_agree_with_a_simulated_exchange(
+    ep, t_local, topk, g_local, groups, form, monkeypatch
+):
+    """The in-kernel dispatch's plans: same rows and same bytes as the
+    ungrouped pair, ordered (destination, group, row)-major, and a row that
+    several of a destination's groups want delivered with the lowest of
+    them."""
+    if groups > g_local:
+        pytest.skip("a group is a nonempty run of local slots")
+    if form == "scatter":
+        monkeypatch.setattr(layer, "SEND_PLAN_COMPARE_MAX", 0)
+    rng = np.random.default_rng(ep * 1000 + t_local + groups)
+    e_total = ep * g_local
+    sel = _routing(rng, ep=ep, t_local=t_local, topk=topk, e_total=e_total)
+    pairs_g = jnp.asarray(sel.reshape(ep, t_local * topk))
+    kw = dict(g_local=g_local, ep=ep, t_local=t_local, topk=topk, groups=groups)
+    sends = [
+        tuple(
+            np.asarray(a)
+            for a in layer._all_to_all_send_plan_grouped(
+                jnp.asarray(sel[s].reshape(-1)), **kw
+            )
+        )
+        for s in range(ep)
+    ]
+    recvs = [
+        tuple(
+            np.asarray(a)
+            for a in layer._all_to_all_recv_plan_grouped(pairs_g, d, **kw)
+        )
+        for d in range(ep)
+    ]
+    spg = -(-g_local // groups)
+    dest = sel // g_local
+    grp = np.minimum((sel % g_local) // spg, groups - 1)
+    # The group a (row, destination) pair travels in: the lowest of the
+    # destination's groups that selected it, `groups` where it goes nowhere.
+    gmin = np.where(dest[:, :, :, None] == np.arange(ep), grp[:, :, :, None], groups)
+    gmin = gmin.min(axis=2)  # [src, row, dst]
+    goes = gmin < groups
+    send_sizes = np.stack([s[1] for s in sends])  # [src, dst, g]
+    recv_sizes = np.stack([r[0] for r in recvs])  # [dst, src, g]
+    np.testing.assert_array_equal(
+        send_sizes, (gmin[:, :, :, None] == np.arange(groups)).sum(axis=1)
+    )
+    # The collective's precondition, per group: what d expects from s is
+    # what s sends d, run for run.
+    np.testing.assert_array_equal(recv_sizes, send_sizes.transpose(1, 0, 2))
+    # Same bytes as the ungrouped plan: a row still goes to a destination
+    # once, however many of its groups wanted it.
+    np.testing.assert_array_equal(send_sizes.sum(axis=2), goes.sum(axis=1))
+    for s in range(ep):
+        send_rows, sizes, offsets = sends[s]
+        np.testing.assert_array_equal(
+            offsets.reshape(-1), np.cumsum(sizes) - sizes.reshape(-1)
+        )
+        for d in range(ep):
+            for g in range(groups):
+                lo = offsets[d, g]
+                run = send_rows[lo : lo + sizes[d, g]]
+                np.testing.assert_array_equal(run, np.flatnonzero(gmin[s, :, d] == g))
+    # The exchange itself: token (s, i) carries the value s * t_local + i,
+    # and source s's whole contribution still lands in block s.
+    T = ep * t_local
+    buffers = np.full((ep, T), -1)
+    for s in range(ep):
+        send_rows, sizes, offsets = sends[s]
+        base = offsets[:, 0]
+        for d in range(ep):
+            n = sizes[d].sum()
+            run = send_rows[base[d] : base[d] + n]
+            buffers[d, s * t_local : s * t_local + n] = s * t_local + run
+    for d in range(ep):
+        _, token_index = recvs[d]
+        assert token_index.shape == (T,)
+        assert token_index.min() >= 0 and token_index.max() < T
+        for s in range(ep):
+            for i in np.flatnonzero(goes[s, :, d]):
+                assert buffers[d, token_index[s * t_local + i]] == s * t_local + i
+
+
+@pytest.mark.parametrize(
+    "ep,t_local,topk,g_local",
+    [(8, 32, 4, 4), (32, 144, 6, 13)],
+    ids=["dp8", "dp32-c768-13-slots"],
+)
+@pytest.mark.parametrize("groups", [1, 2, 4, 13])
+def test_a_group_is_waited_for_before_any_of_its_rows_are_read(
+    ep, t_local, topk, g_local, groups
+):
+    """The kernel's wait schedule is sound: the visits come out group-major,
+    so each group is waited for exactly once, and every arriving row is
+    waited for by the group that is visited no later than the expert reading
+    it."""
+    if groups > g_local:
+        pytest.skip("a group is a nonempty run of local slots")
+    rng = np.random.default_rng(7 * ep + groups)
+    e_total = ep * g_local
+    sel = _routing(rng, ep=ep, t_local=t_local, topk=topk, e_total=e_total)
+    pairs_g = jnp.asarray(sel.reshape(ep, t_local * topk))
+    spg = -(-g_local // groups)
+    for me in range(ep):
+        recv_sizes, _ = layer._all_to_all_recv_plan_grouped(
+            pairs_g, me, g_local=g_local, ep=ep, t_local=t_local, topk=topk,
+            groups=groups,
+        )
+        arriving = np.asarray(recv_sizes).sum(axis=0)  # [groups]
+        rows = np.zeros(g_local, np.int32)
+        for e in range(g_local):
+            rows[e] = (sel[:, :, :] == me * g_local + e).any(axis=2).sum()
+        visit, n_visit = host.expert_visit_list(
+            jnp.asarray(rows), g_local, groups=groups
+        )
+        visit, n_visit = np.asarray(visit), int(np.asarray(n_visit)[0])
+        visited = visit[:n_visit]
+        # Every nonempty expert once, group-major.
+        np.testing.assert_array_equal(sorted(visited), np.flatnonzero(rows))
+        np.testing.assert_array_equal(
+            np.minimum(visited // spg, groups - 1),
+            sorted(np.minimum(visited // spg, groups - 1)),
+        )
+        # A group with rows on the wire has a visit to wait at, and the
+        # kernel's "first visit of this group" predicate fires once per group.
+        fires = np.minimum(visited // spg, groups - 1)
+        for g in range(groups):
+            if arriving[g]:
+                assert (fires == g).sum() >= 1
+        assert len(set(fires)) == len(
+            [g for g in range(groups) if (fires == g).any()]
+        )
 
 
 @pytest.mark.parametrize("dispatch", ["all_to_all", "pallas_all_to_all"])

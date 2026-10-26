@@ -1295,7 +1295,10 @@ def test_expert_load_counts_the_rows_per_physical_slot():
 # Both exchanges -- XLA's ragged all-to-all and the Pallas issue/wait pair --
 # fill the same receive layout and are held to that.
 
-EXCHANGES = ("all_to_all", "pallas_all_to_all")
+EXCHANGES = ("all_to_all", "pallas_all_to_all", "in_kernel")
+# The in-kernel dispatch's group counts, swept at the DP32 shape alone: a
+# group is a run of consecutive local slots, so 13 is one expert each there.
+DISPATCH_GROUPS = (1, 2, 4, 13)
 
 
 def _served(x, gating, weights, **kw):
@@ -1356,6 +1359,74 @@ def test_all_to_all_dispatch_is_bit_exact_without_a_layout(sharded_plan, dispatc
     )
     gathered = _served(x, gating, (*weights, *scales), **common)
     exchanged = _served(x, gating, (*weights, *scales), dispatch=dispatch, **common)
+    np.testing.assert_array_equal(np.asarray(exchanged), np.asarray(gathered))
+
+
+@pytest.mark.parametrize("dispatch", EXCHANGES)
+def test_the_dispatch_is_bit_exact_at_the_served_expert_dims(dispatch):
+    """The DP32 geometry at the SERVED expert dims: hidden 5120, inter 2560.
+
+    Every other case here runs hidden 1024 / inter 512, where a wire row is
+    1.25 KB and the kernel's buffers are small. That shape cannot see a
+    buffer-assignment hazard: the in-kernel dispatch shipped 42/42 green
+    there while corrupting 1128 of 1152 rows at these dims, because XLA
+    rematerialized the 4.4 MB send buffer under the in-flight DMAs and only
+    bothers to when the kernel around it is big enough to want the space
+    (same rows at inter 512: 22 rows wrong; same inter at hidden 2048:
+    none). One case at the dims that are served is what closes that gap.
+    """
+    mesh = _mesh()
+    rng = np.random.default_rng(95)
+    x, gating, _, _, placed_weights, slot_table, common = _placed_fp4_case(
+        mesh,
+        rng,
+        e_total=96,
+        spare=1,
+        tokens=1152,
+        hidden=5120,
+        inter=2560,
+        topk=6,
+        routing="score_bias",
+    )
+    placed = dict(expert_slot=jnp.asarray(slot_table))
+    gathered = _served(x, gating, placed_weights, **placed, **common)
+    kw = {"dispatch_groups": 13} if dispatch == "in_kernel" else {}
+    exchanged = _served(
+        x, gating, placed_weights, dispatch=dispatch, **kw, **placed, **common
+    )
+    np.testing.assert_array_equal(np.asarray(exchanged), np.asarray(gathered))
+
+
+@pytest.mark.parametrize("groups", DISPATCH_GROUPS)
+def test_the_in_kernel_dispatch_is_bit_exact_at_every_group_count(groups):
+    """The DP32 C768 per-device geometry (96 experts over 8 shards with one
+    spare slot each, 13 local slots, 1152 tokens) at every group count: the
+    rows are waited for inside the kernel one group at a time, and the
+    output is still the all-gather's bit for bit."""
+    mesh = _mesh()
+    rng = np.random.default_rng(95)
+    x, gating, _, _, placed_weights, slot_table, common = _placed_fp4_case(
+        mesh,
+        rng,
+        e_total=96,
+        spare=1,
+        tokens=1152,
+        hidden=1024,
+        inter=512,
+        topk=6,
+        routing="score_bias",
+    )
+    placed = dict(expert_slot=jnp.asarray(slot_table))
+    gathered = _served(x, gating, placed_weights, **placed, **common)
+    exchanged = _served(
+        x,
+        gating,
+        placed_weights,
+        dispatch="in_kernel",
+        dispatch_groups=groups,
+        **placed,
+        **common,
+    )
     np.testing.assert_array_equal(np.asarray(exchanged), np.asarray(gathered))
 
 

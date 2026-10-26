@@ -83,16 +83,19 @@ _HBM = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
 _SEMAPHORE = pl.BlockSpec(memory_space=pltpu.MemorySpace.SEMAPHORE)
 
 
-def _start_sems(width, drain):
-    """How many DMA semaphores the issue returns: send, receive, the payload's
-    receive, and the payload's send where the issue does not drain it."""
-    return 2 + (1 if width else 0) + (1 if width and drain == "wait" else 0)
+def _build_start(ep, t_local, send_rows, row_shape, dtype, width, cfg, groups=0):
+    """The issuing pallas_call for one geometry; width > 0 adds the payload.
 
-
-def _build_start(ep, t_local, send_rows, row_shape, dtype, width, cfg):
-    """The issuing pallas_call for one geometry; width > 0 adds the payload."""
+    With `groups`, `sizes` and `offsets` are [ep, groups] and each
+    destination takes one DMA per expert group rather than one in all, in
+    group-major order: every destination's group 0 is on the wire before any
+    group 1, which is the order the receivers wait in. Run (d, g) signals
+    `recv_sems[g]` at the destination, so a receiver can wait for one group
+    without counting a faster source's later groups. This shard's own run
+    rides the arrival semaphore too (a local copy signals on completion, so
+    the receiver's own wait is also what frees the send buffer's rows).
+    """
     rounds, order, drain = cfg
-    sems = _start_sems(width, drain)
     # "stagger" walks me, me + 1, ...; "farthest" starts half the mesh away,
     # which at DP32 is across the z links. Either way the own-destination step
     # is known at trace time, so the local copy needs no predicate.
@@ -100,14 +103,20 @@ def _build_start(ep, t_local, send_rows, row_shape, dtype, width, cfg):
     own_k = (ep - skew) % ep
 
     def kernel(sizes_sm, offsets_sm, rank_sm, send_hbm, *refs):
-        if width:
-            packed_hbm, recv_hbm, pbuf_hbm = refs[:3]
-            send_sem, recv_sem, precv_sem = refs[3:6]
-            # Scratch where the issue drains the payload's sends itself;
-            # an output where the payload wait does.
-            psend_sem = refs[6]
-        else:
-            recv_hbm, send_sem, recv_sem = refs
+        # Inputs, then outputs, then scratch: the payload's send semaphore is
+        # last either way, as a scratch where the issue drains it itself and
+        # as an output where the payload wait does.
+        it = iter(refs)
+        packed_hbm = next(it) if width else None
+        recv_hbm = next(it)
+        pbuf_hbm = next(it) if width else None
+        if groups:
+            # The send buffer, aliased in and straight back out, written by
+            # nobody: see the lifetime note on the output list below.
+            next(it)
+        send_sem, recv_sem = next(it), next(it)
+        precv_sem = next(it) if width else None
+        psend_sem = next(it) if width else None
         # Peers write into this shard's receive buffers, which are this call's
         # outputs and so exist from this call on: nobody sends until every
         # shard has entered.
@@ -140,6 +149,12 @@ def _build_start(ep, t_local, send_rows, row_shape, dtype, width, cfg):
                 _rows_wait(psend_sem, pbuf_hbm, ep - 1)
         # A zero-length DMA must never issue, so every row copy is predicated
         # on its length.
+        if groups:
+            _issue_grouped(
+                ep, t_local, groups, skew, own_k, sizes_sm, offsets_sm, me,
+                send_hbm, recv_hbm, send_sem, recv_sem,
+            )
+            return
         for k in range(ep):
             d = lax.rem(me + skew + k, jnp.int32(ep))
             rows = sizes_sm[d]
@@ -170,19 +185,86 @@ def _build_start(ep, t_local, send_rows, row_shape, dtype, width, cfg):
     if width:
         out_shape.append(jax.ShapeDtypeStruct(_table_shape(ep, width), jnp.int32))
         out_specs.append(_HBM)
+    aliases = {}
+    if groups:
+        # The send buffer comes straight back out, aliased. Taking it as an
+        # operand of whatever waits for the sends is not enough to keep it
+        # where the DMAs are reading it: with the grouped dispatch nothing
+        # waits for them until after the expert kernel, and over a live range
+        # that long XLA will rematerialize or copy the 4.4 MB `jnp.take` that
+        # produced it and recycle the address underneath the in-flight
+        # transfers. Measured at the served expert dims: 1128 of 1152 output
+        # rows wrong, identically on every repeat, and clean as soon as the
+        # sends are waited for before the kernel. A donated custom-call
+        # result cannot be rematerialized, so this states the requirement
+        # where XLA can see it.
+        aliases[3] = len(out_shape)
+        out_shape.append(jax.ShapeDtypeStruct((send_rows, *row_shape), dtype))
+        out_specs.append(_HBM)
+    # send, receive, the payload's receive where there is a payload, and the
+    # payload's send where the payload wait drains it. The arrival semaphore
+    # is per group, so that a wait for one group cannot be satisfied by
+    # another group's bytes.
+    sem_shapes = [(), (groups,) if groups else ()]
+    if width:
+        sem_shapes.append(())
+        if drain == "wait":
+            sem_shapes.append(())
     scratch = [pltpu.SemaphoreType.DMA] if width and drain == "issue" else []
     return pl.pallas_call(
         kernel,
-        out_shape=(*out_shape, *(pltpu.SemaphoreType.DMA(()) for _ in range(sems))),
+        out_shape=(*out_shape, *(pltpu.SemaphoreType.DMA(s) for s in sem_shapes)),
         in_specs=[_SMEM, _SMEM, _SMEM, _HBM] + ([_HBM] if width else []),
-        out_specs=(*out_specs, *(_SEMAPHORE for _ in range(sems))),
+        out_specs=(*out_specs, *(_SEMAPHORE for _ in sem_shapes)),
         scratch_shapes=scratch,
+        input_output_aliases=aliases,
         compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
         name=(
             f"fused_ep_dispatch_start_ep{ep}_t{t_local}_s{send_rows}_p{width}"
-            f"_b{rounds}_{order}_{drain}"
+            f"_g{groups}_b{rounds}_{order}_{drain}"
         ),
     )
+
+
+def _issue_grouped(
+    ep, t_local, groups, skew, own_k, sizes_sm, offsets_sm, me, send_hbm,
+    recv_hbm, send_sem, recv_sems,
+):
+    """One DMA per (destination, group), group-major, destinations staggered.
+
+    At most `ep * groups` descriptors leave one call, and they are issued
+    group by group so that no receiver's group g waits behind another
+    receiver's group g + 1.
+    """
+    for g in range(groups):
+        for k in range(ep):
+            d = lax.rem(me + skew + k, jnp.int32(ep))
+            rows = sizes_sm[d, g]
+            src = send_hbm.at[pl.ds(offsets_sm[d, g], rows)]
+            # The destination keeps this shard's fixed block; inside it the
+            # group runs sit at the prefix sums of what this shard sends it,
+            # which is this run's offset less the destination's first.
+            dst = recv_hbm.at[
+                pl.ds(me * t_local + offsets_sm[d, g] - offsets_sm[d, 0], rows)
+            ]
+            if k == own_k:
+
+                @pl.when(rows > 0)
+                def _(src=src, dst=dst, g=g):
+                    pltpu.make_async_copy(src, dst, recv_sems.at[g]).start()
+
+            else:
+
+                @pl.when(rows > 0)
+                def _(src=src, dst=dst, d=d, g=g):
+                    pltpu.make_async_remote_copy(
+                        src_ref=src,
+                        dst_ref=dst,
+                        send_sem=send_sem,
+                        recv_sem=recv_sems.at[g],
+                        device_id=(d,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
 
 
 def _padded_width(width):
@@ -270,7 +352,7 @@ _BUILDS = {}
 _BUILDS_LOCK = threading.Lock()
 
 
-def _builds(ep, t_local, send, width):
+def _builds(ep, t_local, send, width, groups=0):
     key = (
         ep,
         t_local,
@@ -279,23 +361,31 @@ def _builds(ep, t_local, send, width):
         jnp.dtype(send.dtype),
         width,
         issue_config(),
+        groups,
     )
     built = _BUILDS.get(key)
     if built is None:
         with _BUILDS_LOCK:
             built = _BUILDS.get(key)
             if built is None:
-                built = (_build_start(*key), _build_wait(*key[:-2], 0))
+                built = (_build_start(*key), _build_wait(*key[:-3], 0))
                 _BUILDS[key] = built
     return built
 
 
-def exchange_start(send, sizes, offsets, rank, *, t_local, payload=None):
+def exchange_start(send, sizes, offsets, rank, *, t_local, payload=None, groups=0):
     """Issue the exchange; returns (receive buffer, send sem, recv sem), or
     with `payload` (receive buffer, payload table, send sem, recv sem,
     payload recv sem [, payload send sem]). The last is returned only where
     `MOE_FUSED_EP_DISPATCH_PAYLOAD_DRAIN=wait` leaves the payload's sends for
     `payload_wait` to drain.
+
+    With `groups`, `sizes` and `offsets` are [ep, groups], the send buffer
+    comes back out aliased after the receive buffer (hand THAT to
+    `send_drain`, not the operand) and the returned arrival semaphore is a
+    [groups] array: run (d, g) signals element g at the destination, which is
+    what lets a receiver wait for one expert group's rows without a faster
+    source's later rows satisfying the wait.
 
     send [S, ...] is this shard's rows, destination-major: shard d's run is
     sizes[d] rows from offsets[d]. Every run lands in shard d's receive
@@ -308,7 +398,7 @@ def exchange_start(send, sizes, offsets, rank, *, t_local, payload=None):
     """
     ep = sizes.shape[0]
     width = 0 if payload is None else payload.shape[-1]
-    start, _ = _builds(ep, t_local, send, width)
+    start, _ = _builds(ep, t_local, send, width, groups)
     block = None if payload is None else _payload_block(payload)
     extra = () if block is None else (block,)
     out = start(
@@ -353,6 +443,52 @@ def payload_wait(pbuf, precv_sem, *, width, psend_sem=None, src=None):
             )
     args = (pbuf, precv_sem) if drain == "issue" else (pbuf, src, precv_sem, psend_sem)
     return wait(*args).reshape(ep, -1)[:, :width]
+
+
+_SEND_DRAINS = {}
+
+
+def send_drain(keep, send, send_sem, expected):
+    """Wait out the exchange's own sends, behind whatever `keep` depends on.
+
+    The in-kernel dispatch has no `exchange_wait`: the receiver's waits moved
+    into the expert kernel, and its own run rides the arrival semaphore. What
+    is left is the SENDER's obligation -- the send buffer must outlive the
+    DMAs reading it -- and this is where it is discharged. `keep` is the
+    expert kernel's arrival buffer, taken and returned unchanged (aliased):
+    it is what orders this call after the kernel and keeps the combine, which
+    reads the result, from being scheduled in front of it.
+
+    `expected` [1] i32 is the rows this shard sends to OTHER shards. It must
+    be exact: short returns under in-flight DMAs, long never returns.
+    """
+    key = (keep.shape, jnp.dtype(keep.dtype), send.shape, jnp.dtype(send.dtype))
+    built = _SEND_DRAINS.get(key)
+    if built is None:
+        with _BUILDS_LOCK:
+            built = _SEND_DRAINS.setdefault(key, _build_send_drain(*key))
+    return built(expected.astype(jnp.int32), keep, send, send_sem)
+
+
+def _build_send_drain(keep_shape, keep_dtype, send_shape, send_dtype):
+    del send_shape, send_dtype
+
+    def kernel(expected_sm, keep_in, send_hbm, send_sem, keep_hbm):
+        del keep_in, keep_hbm  # aliased; this call only waits
+        sent = expected_sm[0]
+
+        @pl.when(sent > 0)
+        def _():
+            _rows_wait(send_sem, send_hbm, sent)
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(keep_shape, keep_dtype),
+        in_specs=[_SMEM, _HBM, _HBM, _SEMAPHORE],
+        out_specs=_HBM,
+        input_output_aliases={1: 0},
+        name="fused_ep_dispatch_send_drain",
+    )
 
 
 def exchange_wait(recv, send, send_sem, recv_sem, expected, *, t_local):

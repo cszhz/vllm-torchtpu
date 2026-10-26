@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PREPROCESS_BACKEND: str = "native"
     MOE_FUSED_EP_DISPATCH: str = "all_gather"
     MOE_FUSED_EP_DISPATCH_BARRIER_ROUNDS: int = 2
+    MOE_FUSED_EP_DISPATCH_GROUPS: int = 1
     MOE_FUSED_EP_DISPATCH_ORDER: str = "stagger"
     MOE_FUSED_EP_DISPATCH_PAYLOAD_DRAIN: str = "issue"
     MOE_FUSED_EP_KERNEL_BARRIER_ROUNDS: int = 2
@@ -700,14 +701,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # How fused EP MoE v2 moves the routed rows to the shards holding their
     # experts: all_gather (every shard receives every row; the bytes grow
     # with the EP width), all_to_all (a ragged all-to-all carrying each row
-    # only to the shards it selected; the bytes are set by the global batch)
-    # or pallas_all_to_all (the same exchange issued before the routing plan
-    # and waited for after it, so it runs under the plan). Same output bit for
+    # only to the shards it selected; the bytes are set by the global batch),
+    # pallas_all_to_all (the same exchange issued before the routing plan and
+    # waited for after it, so it runs under the plan) or in_kernel (issued the
+    # same way, but waited for inside the expert kernel one expert group at a
+    # time, so it runs under the kernel's own compute). Same output bit for
     # bit. Default off until measured at the served widths.
     "MOE_FUSED_EP_DISPATCH": env_with_choices(
         "MOE_FUSED_EP_DISPATCH",
         "all_gather",
-        ["all_gather", "all_to_all", "pallas_all_to_all"],
+        ["all_gather", "all_to_all", "pallas_all_to_all", "in_kernel"],
+    ),
+    # Expert groups the in_kernel dispatch splits each destination's run
+    # into, and so the number of arrival waits inside the kernel. Group 0's
+    # rows have only the routing plan to fly under, so the floor is set by
+    # the exchange divided by this against the plan's own length; the rest
+    # fly under the previous group's compute. Ignored by every other mode.
+    "MOE_FUSED_EP_DISPATCH_GROUPS": lambda: int(
+        os.getenv("MOE_FUSED_EP_DISPATCH_GROUPS", "1")
     ),
     # Rounds of the all-pairs barrier the pallas_all_to_all issue kernel runs
     # before it sends. One is sufficient: with every shard signalling every

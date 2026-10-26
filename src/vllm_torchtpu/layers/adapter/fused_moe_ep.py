@@ -190,6 +190,7 @@ def _build_op(
     has_expert_slot=False,
     has_expert_load=False,
     dispatch="all_gather",
+    dispatch_groups=1,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -221,6 +222,7 @@ def _build_op(
         has_expert_slot,
         has_expert_load,
         dispatch,
+        dispatch_groups,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -263,6 +265,7 @@ def _build_op(
             token_replica_groups=token_replica_groups,
             logical_intermediate_size=logical_intermediate_size,
             dispatch=dispatch,
+            dispatch_groups=dispatch_groups,
             **bias_kw,
             **routing_kw,
         )
@@ -801,12 +804,13 @@ def prebuild_fused_moe_ep(
         has_expert_slot=placed is not None,
         has_expert_load=expert_load_tap.enabled(),
         dispatch=envs.MOE_FUSED_EP_DISPATCH,
+        dispatch_groups=envs.MOE_FUSED_EP_DISPATCH_GROUPS,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
-        "token_replica_groups=%s expert_slot=%s dispatch=%s issue=%s",
+        "token_replica_groups=%s expert_slot=%s dispatch=%s/%d issue=%s",
         hidden,
         inter,
         local_experts,
@@ -825,6 +829,7 @@ def prebuild_fused_moe_ep(
         token_replica_groups,
         None if placed is None else tuple(placed.shape),
         envs.MOE_FUSED_EP_DISPATCH,
+        envs.MOE_FUSED_EP_DISPATCH_GROUPS,
         issue_config(),
     )
     # Two knobs stop applying the moment this arms, and neither would say so on

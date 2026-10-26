@@ -29,6 +29,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.dispatch import (
     exchange_wait,
     issue_config,
     payload_wait,
+    send_drain,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
@@ -44,6 +45,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     align_up,
     build_routing_tables,
     build_routing_tables_sharded,
+    expert_group_size,
     expert_visit_list,
     fp4_scale_rows,
     local_slab_rows,
@@ -267,10 +269,10 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
     return mesh_block * g_local + topk_idx % g_local
 
 
-DISPATCH_MODES = ("all_gather", "all_to_all", "pallas_all_to_all")
+DISPATCH_MODES = ("all_gather", "all_to_all", "pallas_all_to_all", "in_kernel")
 # The dispatches that send each row only to the shards that selected it, into
 # the same receive layout, read through the same token index.
-EXCHANGE_DISPATCHES = ("all_to_all", "pallas_all_to_all")
+EXCHANGE_DISPATCHES = ("all_to_all", "pallas_all_to_all", "in_kernel")
 # The largest [slots, ep * t_local] compare the send plan builds instead of a
 # scatter: the decode shapes (864 x 4608 at DP32 C768, 1728 x 2304 at DP8
 # C384) sit far below it, a 2048-row prefill shard (12288 x 65536) far above.
@@ -315,6 +317,94 @@ def _all_to_all_send_plan(local_blocks, *, g_local, ep, t_local, topk):
         .set(row, mode="drop")
     )
     return send_rows, send_sizes, input_offsets
+
+
+def _group_of_pair(sel, *, g_local, groups):
+    """The dispatch group each selected slot falls in, from its slot id.
+
+    A slot that routes nowhere carries the sentinel `e_total`; its group is
+    meaningless and every caller masks it off before it is read.
+    """
+    spg = expert_group_size(g_local, groups)
+    return jnp.minimum(lax.rem(sel, jnp.int32(g_local)) // spg, groups - 1)
+
+
+def _all_to_all_send_plan_grouped(
+    local_blocks, *, g_local, ep, t_local, topk, groups
+):
+    """Sender's side with each destination's run split by expert group.
+
+    Same rows and same bytes as `_all_to_all_send_plan`, ordered
+    (destination, group, row)-major instead of (destination, row)-major, so
+    that the receiver can wait for one group at a time. A row goes to a
+    destination once, in the run of the LOWEST group of that destination's
+    experts that selected it: the receiver waits for the groups in ascending
+    order, so a row delivered with an earlier group has landed before any
+    later group computes on it.
+
+    Returns (`send_rows` [t_local * min(topk, ep)], `send_sizes` [ep, groups],
+    `input_offsets` [ep, groups]).
+    """
+    sel = local_blocks.reshape(t_local, topk)
+    dest = sel // g_local
+    grp = _group_of_pair(sel, g_local=g_local, groups=groups)
+    shards = lax.broadcasted_iota(jnp.int32, (1, 1, ep), 2)
+    at_dest = dest[:, :, None] == shards  # [t_local, topk, ep]
+    # groups = "this row does not go to this destination at all".
+    gmin = jnp.min(jnp.where(at_dest, grp[:, :, None], groups), axis=1)
+    goes = gmin < groups  # [t_local, ep]
+    runs = gmin[:, :, None] == lax.broadcasted_iota(
+        jnp.int32, (1, 1, groups), 2
+    )  # [t_local, ep, groups]
+    send_sizes = jnp.sum(runs, axis=0, dtype=jnp.int32)  # [ep, groups]
+    flat_sizes = send_sizes.reshape(-1)
+    input_offsets = (jnp.cumsum(flat_sizes, dtype=jnp.int32) - flat_sizes).reshape(
+        ep, groups
+    )
+    before = jnp.cumsum(runs.astype(jnp.int32), axis=0, dtype=jnp.int32) - 1
+    # Exactly one group matches per (row, destination) the row goes to, so
+    # the sum picks that run's slot and nothing else contributes.
+    slot = jnp.sum(
+        jnp.where(runs, input_offsets[None, :, :] + before, 0), axis=2
+    )  # [t_local, ep]
+    s_max = t_local * min(topk, ep)
+    at = jnp.where(goes, slot, s_max).reshape(-1)  # [t_local * ep]
+    row = lax.broadcasted_iota(jnp.int32, (t_local, ep), 0).reshape(-1)
+    if s_max * ep * t_local <= SEND_PLAN_COMPARE_MAX:
+        # Slot k carries the one (row, destination) pair placed there, which
+        # is one equality compare over [s_max, ep * t_local] -- the same
+        # table the ungrouped plan's compare-and-count walks. Slots past the
+        # last run match nothing and come out as row 0, the scatter's padding.
+        k = lax.broadcasted_iota(jnp.int32, (s_max, 1), 0)
+        send_rows = jnp.sum(
+            jnp.where(at[None, :] == k, row[None, :], 0), axis=1, dtype=jnp.int32
+        )
+    else:
+        send_rows = jnp.zeros((s_max,), jnp.int32).at[at].set(row, mode="drop")
+    return send_rows, send_sizes, input_offsets
+
+
+def _all_to_all_recv_plan_grouped(
+    pairs_g, me, *, g_local, ep, t_local, topk, groups
+):
+    """Receiver's side of the grouped exchange.
+
+    Returns (`recv_sizes` [ep, groups], `token_index` [ep * t_local]). Source
+    s's rows still start at s * t_local; inside that block the group runs
+    follow one another in group order, which is how the sender packed them.
+    """
+    sel = pairs_g.reshape(ep, t_local, topk)
+    grp = _group_of_pair(sel, g_local=g_local, groups=groups)
+    at_me = sel // g_local == me  # [ep, t_local, topk]
+    gmin = jnp.min(jnp.where(at_me, grp, groups), axis=-1)  # [ep, t_local]
+    runs = gmin[:, :, None] == lax.broadcasted_iota(jnp.int32, (1, 1, groups), 2)
+    recv_sizes = jnp.sum(runs, axis=1, dtype=jnp.int32)  # [ep, groups]
+    within = jnp.cumsum(recv_sizes, axis=1, dtype=jnp.int32) - recv_sizes
+    before = jnp.cumsum(runs.astype(jnp.int32), axis=1, dtype=jnp.int32) - 1
+    pos = jnp.sum(jnp.where(runs, within[:, None, :] + before, 0), axis=2)
+    block = lax.broadcasted_iota(jnp.int32, (ep, t_local), 0) * jnp.int32(t_local)
+    token_index = jnp.clip(block + pos, 0, ep * t_local - 1).reshape(-1)
+    return recv_sizes, token_index
 
 
 def _all_to_all_recv_plan(pairs_g, me, *, g_local, ep, t_local, topk):
@@ -382,6 +472,7 @@ def fused_ep_moe_v2(
     gather_positions=None,
     preprocess_topology: PreprocessTopology | None = None,
     dispatch="all_gather",
+    dispatch_groups=1,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -585,6 +676,14 @@ def fused_ep_moe_v2(
             "the all-to-all dispatch belongs to the fused stage; the split "
             "stages hand the gathered rows across their boundary"
         )
+    # Only the in-kernel dispatch has groups; a group count on a mode that
+    # cannot act on it is a silently ignored serving flag, which is how an
+    # A/B measures the arm it did not mean to.
+    if dispatch != "in_kernel" and dispatch_groups != 1:
+        raise ValueError(
+            f"dispatch_groups={dispatch_groups} is a property of the "
+            f"in_kernel dispatch; dispatch={dispatch!r} has no groups"
+        )
     if gather_positions is not None:
         gather_positions = tuple(int(i) for i in gather_positions)
         if stage != "compute" or tuple(sorted(gather_positions)) != tuple(range(ep)):
@@ -593,6 +692,11 @@ def fused_ep_moe_v2(
                 f"range({ep}) on the compute stage; got {gather_positions}"
             )
     g_local = e_total // ep
+    # Nonzero only where the kernel waits for the rows itself, which is what
+    # the kernel's build parameter of the same name means.
+    groups = int(dispatch_groups) if dispatch == "in_kernel" else 0
+    if groups:
+        expert_group_size(g_local, groups)  # refuses a group that is not a run
     # Global experts the router scores; without a layout, one slot each.
     e_router = gating.shape[1] if expert_slot is not None else e_total
     if T % ep or gating.shape != (T, e_router):
@@ -686,6 +790,7 @@ def fused_ep_moe_v2(
         has_w2_bias=has_w2_bias,
         pad_scale_rows=pad_scale_rows,
         logical_intermediate_size=logical_intermediate_size,
+        dispatch_groups=groups,
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -862,6 +967,9 @@ def fused_ep_moe_v2(
         expert_load_l=None,
         token_index=None,
         finish_rows=None,
+        disp_rows=None,
+        disp_sems=None,
+        arrive=None,
     ):
         """Plan, kernel and combine over the exchanged rows and payload.
 
@@ -1010,7 +1118,10 @@ def fused_ep_moe_v2(
         # row of the count table rather than its own reduction, so this
         # builder's second value is not read; it leaves the program with
         # the rest of the dead code, and its own test still sees it.
-        visit, _ = expert_visit_list(expert_rows, g_local)
+        # Group-major where the kernel waits per group: its "first visit of
+        # this group" test is the previous visit's group, and only this
+        # order makes that one wait per group.
+        visit, _ = expert_visit_list(expert_rows, g_local, groups=groups)
         # One pass builds every count the kernel needs, still spread over
         # the expert-parallel axis; the kernel's scalar core closes them.
         counts = shard_count_vector(routing, expert_rows, me, e_total=e_total, ep=ep)
@@ -1050,7 +1161,14 @@ def fused_ep_moe_v2(
             visit=visit,
             counts=counts,
             rank=rank_l,
+            disp_rows=disp_rows,
+            disp_sems=disp_sems,
         )
+        if arrive is not None:
+            # This shard's own sends are the last thing the exchange owes:
+            # drained here, behind the kernel that consumed the arrivals, so
+            # the send buffer outlives the DMAs reading it.
+            arrivals = arrive(arrivals)
 
         # The destination's own table: one arrival row per selection slot.
         pos = (
@@ -1203,6 +1321,56 @@ def fused_ep_moe_v2(
 
         return exchange, rank_l, token_index, finish
 
+    def start_rows_in_kernel(q_l, local_blocks, packed, rank_l):
+        """The same exchange again, with nobody waiting for the rows outside.
+
+        The rows go out in G runs per destination, each signalling that
+        group's arrival semaphore at the receiver; the expert kernel takes
+        the semaphore and the per-group counts and waits for one group at a
+        time, so the exchange flies under the kernel's own compute rather
+        than under the routing plan alone. Returns the gathered payload, this
+        shard's index re-read behind the issue, the token index, and
+        `arrive`, which carries the kernel's operands and the obligation to
+        drain this shard's sends afterwards.
+        """
+        send_rows, send_sizes, input_offsets = _all_to_all_send_plan_grouped(
+            local_blocks, g_local=g_local, ep=ep, t_local=t_local, topk=topk,
+            groups=groups,
+        )
+        # `sent_rows` is the send buffer handed back out of the issue; the
+        # drain must hold THAT, not the operand (dispatch.py).
+        recv, pbuf, sent_rows, send_sem, recv_sems, precv_sem = exchange_start(
+            jnp.take(q_l, send_rows, axis=0),
+            send_sizes,
+            input_offsets,
+            rank_l,
+            t_local=t_local,
+            payload=packed,
+            groups=groups,
+        )
+        recv, rank_l = lax.optimization_barrier((recv, rank_l))
+        exchange = payload_wait(pbuf, precv_sem, width=layout[-1])
+        me = rank_l[0, 0]
+        pairs_g, _, _ = _unpack_routing_exchange(
+            exchange, layout, t_local, topk, e_total
+        )
+        recv_sizes, token_index = _all_to_all_recv_plan_grouped(
+            pairs_g, me, g_local=g_local, ep=ep, t_local=t_local, topk=topk,
+            groups=groups,
+        )
+        # What the kernel's per-group waits count: every source's run for
+        # that group, this shard's own included (its local copy signals the
+        # arrival semaphore, not the send one). Built from the same payload
+        # the plan is, so a wait can be neither short nor long.
+        disp_rows = jnp.sum(recv_sizes, axis=0, dtype=jnp.int32)
+        # What the drain owes: the rows that left on the fabric.
+        sent = (jnp.sum(send_sizes) - jnp.sum(send_sizes[me])).reshape(1)
+
+        def arrive(arrivals):
+            return send_drain(arrivals, sent_rows, send_sem, sent)
+
+        return exchange, rank_l, token_index, recv, disp_rows, recv_sems, arrive
+
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
         (
@@ -1218,7 +1386,21 @@ def fused_ep_moe_v2(
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
         token_index = None
         finish_rows = None
-        if dispatch == "pallas_all_to_all":
+        disp_rows = disp_sems = arrive = None
+        if dispatch == "in_kernel":
+            topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
+                gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
+            )
+            (
+                exchange,
+                rank_l,
+                token_index,
+                q_g,
+                disp_rows,
+                disp_sems,
+                arrive,
+            ) = start_rows_in_kernel(q_l, local_blocks, packed, rank_l)
+        elif dispatch == "pallas_all_to_all":
             topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
                 gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
             )
@@ -1276,6 +1458,9 @@ def fused_ep_moe_v2(
             expert_load_l,
             token_index=token_index,
             finish_rows=finish_rows,
+            disp_rows=disp_rows,
+            disp_sems=disp_sems,
+            arrive=arrive,
         )
 
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -1415,7 +1600,8 @@ def fused_ep_moe_v2(
         dispatch,
         # The issue kernel's knobs change the program, and a cached shard_map
         # would keep serving the one built under the previous setting.
-        issue_config() if dispatch == "pallas_all_to_all" else None,
+        issue_config() if dispatch in ("pallas_all_to_all", "in_kernel") else None,
+        groups,
         gather_positions,
         logical_intermediate_size,
     )
@@ -1436,7 +1622,7 @@ def fused_ep_moe_v2(
                     out_specs=out_specs,
                     check_vma=False,
                 )
-                if dispatch == "pallas_all_to_all":
+                if dispatch in ("pallas_all_to_all", "in_kernel"):
                     # The exchange hands two DMA semaphores from one kernel to
                     # the next, which only works inside one program; an eager
                     # shard_map compiles every primitive as its own, and a
