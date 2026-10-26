@@ -52,7 +52,7 @@ def _whole(inp):
     return streamindex_topk(**inp, **_kw())
 
 
-def _window(inp, rank, tp):
+def _window(inp, rank, tp, extra=()):
     T = inp["q"].shape[0]
     w = T // tp
     off = (rank * w).astype(jnp.int32)
@@ -70,11 +70,11 @@ def _window(inp, rank, tp):
         distribution=dist_w,
         row_window=(inp["seq_lens"], inp["cu_q_lens"], inp["distribution"], off),
         row_window_tokens=T,
-        **_kw(),
+        **{**_kw(), **dict(extra)},
     )
 
 
-_window_jit = jax.jit(_window, static_argnums=(2,))
+_window_jit = jax.jit(_window, static_argnums=(2, 3))
 
 CASES = {
     # c16 TP4 mnbt 512: 2 verify windows + a ~495-token chunk at 31.7k / 127k;
@@ -102,12 +102,12 @@ CASES = {
 }
 
 
-def run_case(name, time_it=False, iters=20):
+def run_case(name, time_it=False, iters=20, extra=()):
     seqs, T = CASES[name]
     inp = _case(seqs, T)
     ref = np.asarray(_whole(inp))
     got = np.concatenate(
-        [np.asarray(_window_jit(inp, jnp.int32(r), TP)) for r in range(TP)]
+        [np.asarray(_window_jit(inp, jnp.int32(r), TP, extra)) for r in range(TP)]
     )
     n_tok = int(np.asarray(inp["cu_q_lens"])[len(seqs)])
     bad_rows = np.any(ref[:n_tok] != got[:n_tok], axis=1)
@@ -138,6 +138,23 @@ def run_case(name, time_it=False, iters=20):
 @pytest.mark.parametrize("name", list(CASES))
 def test_token_windows_match_whole(name):
     assert run_case(name)["mismatch_rows"] == 0
+
+
+# K-IDXM: the same windows cut into pipelined row pieces (annotated or not), and
+# the group-max SparseCore prefilter: identical rows, identical column order.
+VARIANTS = {
+    "pieces4": (("chunk_tokens", 512 // TP // 4),),
+    "pieces4_ng": (("chunk_tokens", 512 // TP // 4), ("chunk_sched_groups", False)),
+    "group_max": (("group_max", True),),
+    "group_max_pieces4": (("group_max", True), ("chunk_tokens", 512 // TP // 4),
+                          ("chunk_sched_groups", False)),
+}
+
+
+@pytest.mark.parametrize("variant", list(VARIANTS))
+@pytest.mark.parametrize("name", list(CASES))
+def test_token_windows_variants_match_whole(name, variant):
+    assert run_case(name, extra=VARIANTS[variant])["mismatch_rows"] == 0
 
 
 if __name__ == "__main__":
