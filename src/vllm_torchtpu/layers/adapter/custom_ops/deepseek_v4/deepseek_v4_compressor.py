@@ -117,6 +117,7 @@ def _run_compressor(
         prefill_block_min_tokens=envs.TPU_DSV4_COMPRESSOR_PREFILL_BLOCK_MIN_TOKENS,
         proj_stream_max_tokens=envs.TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS,
         proj_stream_cfg=envs.TPU_DSV4_COMPRESSOR_PROJ_STREAM_CFG,
+        proj_stream_min_width=envs.TPU_DSV4_COMPRESSOR_PROJ_STREAM_MIN_WIDTH,
         # bf16 weights carry a placeholder scale that is never read.
         wkv_scale=wkv_scale if wkv_wgate.dtype == jnp.float8_e4m3fn else None,
     )

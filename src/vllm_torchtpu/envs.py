@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     TPU_DSV4_COMPRESSOR_PROJ_STREAM_CFG: tuple[int, int, int] = (3584, 2, 1)
     TPU_DSV4_COMPRESSOR_FP8: bool = False
     TPU_DSV4_COMPRESSOR_PAIR: bool = False
+    TPU_DSV4_COMPRESSOR_PROJ_STREAM_MIN_WIDTH: int = 0
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_SMALL_ALL_REDUCE: bool = True
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
@@ -1104,6 +1105,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (same tokens) in one weight-stream call, for steps the stream serves
     # (TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS).
     "TPU_DSV4_COMPRESSOR_PAIR": env_bool("TPU_DSV4_COMPRESSOR_PAIR"),
+    # Stream only compressor projections whose state is at least this wide
+    # (CSA KV 2048, HCA 1024, indexer 512); narrower ones keep the pipeline
+    # kernel. 0 = all.
+    "TPU_DSV4_COMPRESSOR_PROJ_STREAM_MIN_WIDTH": env_nonnegative_int(
+        "TPU_DSV4_COMPRESSOR_PROJ_STREAM_MIN_WIDTH", 0
+    ),
     # CSA: query tokens per gather + attention chunk of the sparse attention
     # (sparse_ragged_paged_attention). Steps of at most 128 tokens keep 32.
     "TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE": env_positive_int(

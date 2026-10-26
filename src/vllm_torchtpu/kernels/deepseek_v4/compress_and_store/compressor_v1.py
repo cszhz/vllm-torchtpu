@@ -231,7 +231,7 @@ def prepare_boundary_batch(
 def _proj(
     hidden_states, wkv_wgate, wkv_scale, ape, positions, slot_mapping, target,
     compress_ratio, head_dim, runs_min_tokens, runs_indexer, runs_tile_n, tile_k,
-    stream_max_tokens, stream_cfg,
+    stream_max_tokens, stream_cfg, stream_min_width=0,
 ):
     return proj_kernel.proj_and_save_state(
         hidden_states=hidden_states,
@@ -249,6 +249,7 @@ def _proj(
         wkv_scale=wkv_scale,
         stream_max_tokens=stream_max_tokens,
         stream_cfg=tuple(stream_cfg),
+        stream_min_width=stream_min_width,
     )
 
 
@@ -335,6 +336,7 @@ def compressor_forward(
     proj_tile_k: int = 3584,  # k tile cap of the projection (3584 = 2 k steps)
     proj_stream_max_tokens: int = 0,  # weight-stream kernel for calls <= this
     proj_stream_cfg: tuple[int, int, int] = (3584, 2, 1),
+    proj_stream_min_width: int = 0,
     wkv_scale: jax.Array | None = None,  # per-column scale of fp8 wkv_wgate
     skip_proj: bool = False,  # state already saved (`pair_proj`)
     prefill_block: int = 0,  # see `prefill_block`; 0 disables
@@ -371,7 +373,7 @@ def compressor_forward(
             hidden_states, wkv_wgate, wkv_scale, ape, positions, slot_mapping_slots,
             cache if shares_buffer else state_cache, compress_ratio, head_dim,
             proj_runs_min_tokens, proj_runs_indexer, proj_runs_tile_n, proj_tile_k,
-            proj_stream_max_tokens, proj_stream_cfg,
+            proj_stream_max_tokens, proj_stream_cfg, proj_stream_min_width,
         )
     if shares_buffer:
         cache = updated_state

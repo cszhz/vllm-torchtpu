@@ -826,6 +826,7 @@ def _select_tile_k(size_k: int, cap: int = 3584, align: int = 128) -> int:
         "tile_k_cap",
         "stream_max_tokens",
         "stream_cfg",
+        "stream_min_width",
     ],
 )
 def proj_and_save_state(
@@ -843,6 +844,7 @@ def proj_and_save_state(
     wkv_scale: jax.Array | None = None,  # [2 * state_width] f32, fp8 weights only
     stream_max_tokens: int = 0,
     stream_cfg: tuple[int, int, int] = (3584, 2, 1),  # (k tile, ring slots, DMAs/tile)
+    stream_min_width: int = 0,  # stream only projections at least this wide
 ) -> jax.Array:
     """Projects hidden states and saves them to the KV cache in HBM.
 
@@ -883,7 +885,9 @@ def proj_and_save_state(
             hbm_pin=True,
             interpret=interpret,
         )
-    if 0 < num_tokens <= stream_max_tokens:
+    if 0 < num_tokens <= stream_max_tokens and (
+        state_dim >= stream_min_width or wkv_scale is not None  # fp8: stream only
+    ):
         return _proj_and_save_state_stream(
             hidden_states, wkv_wgate, wkv_scale, ape, positions, slot_mapping,
             cache, compress_ratio=compress_ratio, t=stream_cfg[0],
