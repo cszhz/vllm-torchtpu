@@ -102,28 +102,39 @@ def _fake_raw(monkeypatch):
             return ctypes.addressof(self._mem)
 
     class Future:
-        def __init__(self, pairs):
-            self.pairs, self.done = pairs, False
+        def __init__(self, src, buf):
+            self.src, self.buf, self.done = src, buf, False
 
         def land(self):
-            for src, dst in self.pairs:
-                dst.view(-1).copy_(src.detach().view(torch.uint8).view(-1))
+            n = self.src.numel() * self.src.element_size()
+            ctypes.memmove(
+                self.buf.data_ptr, self.src.detach().contiguous().data_ptr(), n
+            )
             self.done = True
+
+    class Prepared:
+        def __init__(self, tensor, buf, skip=True):
+            self.tensor, self.buf = tensor, buf
+            self.physical_size_bytes = (
+                tensor.numel() * tensor.element_size() * 2
+            )  # padded
+
+        def d2h_async(self):
+            f = Future(self.tensor, self.buf)
+            issued.append(f)
+            return f
 
     rt = types.SimpleNamespace()
     rt.major_slice_bytes = lambda t, **kw: t.element_size()
     rt.RawHostBuffer = Buf
-    rt.PreparedTorchRawTransfer = lambda anchor, buf, **kw: None
+    rt.PreparedTorchRawTransfer = Prepared
     issued = []
 
-    def batch(srcs, dsts, **kw):
-        f = Future(list(zip(srcs, dsts, strict=True)))
-        issued.append(f)
-        return f
+    def _all(fs):
+        return fs if isinstance(fs, list) else [fs]
 
-    rt.transfer_d2h_batch_async = batch
-    rt.is_ready = lambda f: f.done
-    rt.await_all = lambda f: f.land()
+    rt.is_ready = lambda fs: all(f.done for f in _all(fs))
+    rt.await_all = lambda fs: [f.land() for f in _all(fs) if not f.done]
     monkeypatch.setitem(sys.modules, "tpu_sync", types.SimpleNamespace())
     monkeypatch.setitem(sys.modules, "tpu_sync.api", types.SimpleNamespace())
     monkeypatch.setitem(
@@ -154,24 +165,29 @@ def test_raw_reader_issues_ahead_adopts_when_ready_and_checks_itself(monkeypatch
     expert_load.schedule(8)
     a._tpu_expert_load.copy_(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
     b._tpu_expert_load.copy_(torch.tensor([5, 6], dtype=torch.int32))
-    for _ in range(5):
+    for _ in range(3):
         expert_load.maybe_log(0)
-    assert issued == []  # nothing due before step 6 (= 8 - 2)
-    expert_load.maybe_log(0)  # step 6: issued two steps ahead of the boundary
-    assert len(issued) == 1 and expert_load._READER.latest is None
-    issued[0].land()
-    expert_load.maybe_log(0)  # step 7: adopted
+    assert issued == []  # nothing due before step 4 (= 8 - 4)
+    expert_load.maybe_log(0)  # step 4: issued four steps ahead of the boundary
+    assert (
+        len(issued) == 2 and expert_load._READER.latest is None
+    )  # one per accumulator
+    for f in issued:
+        f.land()
+    expert_load.maybe_log(0)  # step 5: adopted
     reader = expert_load._READER
-    assert reader.latest_step == 7
+    assert reader.latest_step == 5
     assert reader.latest.tolist() == [[1, 2, 3, 4], [5, 6, 0, 0]]
     assert reader.checked and reader.stats["ready_steps"] == [1]
-    expert_load.maybe_log(0)  # step 8: the boundary takes the adopted read
-    snap = expert_load.snapshot()
-    assert len(issued) == 1 and snap[("target", 0)].tolist() == [1, 2, 3, 4]
-    for _ in range(4):  # steps 9..12: stale and nothing in flight
-        expert_load.maybe_log(0)
+    for _ in range(3):
+        expert_load.maybe_log(0)  # steps 6..8
+    snap = expert_load.snapshot()  # the boundary takes the adopted read (3 old)
+    assert len(issued) == 2 and snap[("target", 0)].tolist() == [1, 2, 3, 4]
+    for _ in range(7):  # steps 9..15: the step-12 read landed? no: unlanded, so
+        expert_load.maybe_log(0)  # the next consumer waits for it
+    assert len(issued) == 4
     expert_load.snapshot()
-    assert len(issued) == 2 and issued[1].done
+    assert all(f.done for f in issued)
 
 
 def test_raw_reader_disagreeing_with_torch_falls_back(monkeypatch):
@@ -182,14 +198,13 @@ def test_raw_reader_disagreeing_with_torch_falls_back(monkeypatch):
     a = _layer("model.layers.0.ffn.experts")
     expert_load.register(a, physical=4, ep=2)
     a._tpu_layout_key = ("target", 0)
-    original = rt.transfer_d2h_batch_async
+    original = rt.PreparedTorchRawTransfer
 
-    def corrupt(srcs, dsts, **kw):
-        f = original(srcs, dsts, **kw)
-        f.pairs = [(torch.full_like(s, 9), d) for s, d in f.pairs]
-        return f
+    class Corrupt(original):
+        def __init__(self, tensor, buf, skip=True):
+            super().__init__(torch.full_like(tensor, 9), buf, skip)
 
-    rt.transfer_d2h_batch_async = corrupt
+    rt.PreparedTorchRawTransfer = Corrupt
     for _ in range(4):  # the read lands wrong bytes at the step-4 log point
         expert_load.maybe_log(0)
     assert expert_load._STATE.get("raw_disabled") and expert_load._READER is None

@@ -102,13 +102,18 @@ def _read_all_sync() -> np.ndarray:
 
 
 class _RawReader:
-    """Reads the accumulators by tpu-sync's batched raw D2H into one pinned
-    `RawHostBuffer`: no device program, no synchronous readback. A read is
-    issued from the step thread (`issue`), the DMA lands while the step runs,
-    and the result is adopted by `poll` a step or two later. The first read
-    is checked against the torch path and the reader disables itself on a
-    mismatch (the raw bytes are the device's physical layout; a 1-D int32
-    array is linear, which is what the check asserts)."""
+    """Reads the accumulators by tpu-sync's whole-buffer raw D2H into pinned
+    `RawHostBuffer`s: no device program, no synchronous readback. Each
+    accumulator gets its own host buffer of its physical size and a
+    `PreparedTorchRawTransfer` rebound per read (the operand is donated, so
+    the device buffer behind the tensor is new every step); the sliced
+    transfer forms cannot address a 1-D array (its device shape is
+    lane-padded, so a logical-size copy counts as partial, which rank < 3
+    refuses). A read is issued from the step thread (`issue`), the DMA lands
+    while the step runs, and the result is adopted by `poll` a step or two
+    later. The first read is checked against the torch path and the reader
+    disables itself on a mismatch (the raw bytes are the device's physical
+    layout: a 1-D int32 array is linear with padding at the end)."""
 
     def __init__(self) -> None:
         from tpu_sync.api.torch import raw_transfer
@@ -117,10 +122,10 @@ class _RawReader:
             raise ImportError("tpu-sync raw transfer lacks major_slice_bytes")
         self._rt = raw_transfer
         self._srcs: list[torch.Tensor] = []
-        self._dsts: list[torch.Tensor] = []
+        self._bufs: list = []
         self._views: list[np.ndarray] = []
-        self._buf = None
-        self._future = None
+        self._prepared: list = []
+        self._futures: list | None = None
         self.issued_step: int | None = None
         self.latest: np.ndarray | None = None
         self.latest_step: int | None = None
@@ -136,41 +141,34 @@ class _RawReader:
         import ctypes
 
         srcs = [getattr(layer, LOAD_ATTR) for _, layer, _ in _REGISTERED]
-        sizes = []
+        self._bufs, self._views = [], []
         for t in srcs:
-            per = int(self._rt.major_slice_bytes(t))
-            if per != t.element_size():
-                raise ValueError(
-                    f"accumulator of {t.numel()} int32 is not linear on the device "
-                    f"({per} bytes per element)"
-                )
-            sizes.append(per * t.numel())
-        total = sum(sizes)
-        buf = self._rt.RawHostBuffer(total)
-        self._rt.PreparedTorchRawTransfer(srcs[0], buf)  # binds (allocates) the buffer
-        owner = (ctypes.c_uint8 * buf.size_bytes).from_address(buf.data_ptr)
-        flat = torch.frombuffer(owner, dtype=torch.uint8)
-        off = 0
-        self._dsts, self._views = [], []
-        for t, n in zip(srcs, sizes, strict=True):
-            view = flat[off : off + n].view(t.numel(), t.element_size())
-            self._dsts.append(view)
-            self._views.append(view.numpy().view(np.int32).reshape(-1))
-            off += n
-        self._srcs, self._buf = srcs, buf
+            # The physical size is lane-padded (and may be sublane-padded);
+            # the buffer is sized by the first binding's answer.
+            guess = max(t.numel(), 1024) * t.element_size() * 8
+            buf = self._rt.RawHostBuffer(guess)
+            prepared = self._rt.PreparedTorchRawTransfer(t, buf, True)
+            physical = int(prepared.physical_size_bytes)
+            if physical < t.numel() * t.element_size():
+                raise ValueError("accumulator physical size below its logical size")
+            owner = (ctypes.c_uint8 * buf.size_bytes).from_address(buf.data_ptr)
+            flat = torch.frombuffer(owner, dtype=torch.uint8)[
+                : t.numel() * t.element_size()
+            ]
+            self._bufs.append(buf)
+            self._views.append(flat.numpy().view(np.int32).reshape(-1))
+        self._srcs = srcs
 
     def issue(self, step: int) -> None:
-        if self._future is not None:
+        if self._futures is not None:
             return
         t0 = time.perf_counter()
-        self._future = self._rt.transfer_d2h_batch_async(
-            self._srcs,
-            self._dsts,
-            src_offsets_major_dim=[0] * len(self._srcs),
-            dst_offsets_major_dim=[0] * len(self._srcs),
-            copy_sizes_major_dim=[t.numel() for t in self._srcs],
-            unsafe_skip_buffer_lock=True,
-        )
+        prepared, futures = [], []
+        for t, buf in zip(self._srcs, self._bufs, strict=True):
+            pt = self._rt.PreparedTorchRawTransfer(t, buf, True)
+            prepared.append(pt)
+            futures.append(pt.d2h_async())
+        self._prepared, self._futures = prepared, futures
         ms = (time.perf_counter() - t0) * 1e3
         self.issued_step = step
         st = self.stats
@@ -183,7 +181,7 @@ class _RawReader:
         host = np.zeros((len(self._views), width), dtype=np.int64)
         for i, v in enumerate(self._views):
             host[i, : v.size] = v
-        self._future = None
+        self._futures, self._prepared = None, []
         self.latest, self.latest_step = host, step
         self.stats["ready_steps"].append(step - (self.issued_step or step))
         if not self.checked:
@@ -194,7 +192,7 @@ class _RawReader:
 
     def poll(self, step: int) -> bool:
         """Adopt a completed read; True when `latest` changed."""
-        if self._future is None or not self._rt.is_ready(self._future):
+        if self._futures is None or not self._rt.is_ready(self._futures):
             return False
         self._adopt(step)
         return True
@@ -202,9 +200,9 @@ class _RawReader:
     def wait(self, step: int) -> np.ndarray:
         """The latest counts, issuing and waiting for a read when none is in
         flight: the trigger path, normally served by a read issued earlier."""
-        if self._future is None:
+        if self._futures is None:
             self.issue(step)
-        self._rt.await_all(self._future)
+        self._rt.await_all(self._futures)
         self._adopt(step)
         return self.latest
 
@@ -253,8 +251,8 @@ def _read_all(step: int) -> np.ndarray:
         fresh = (
             reader.latest is not None
             and reader.latest_step is not None
-            and step - reader.latest_step <= 2
-            and reader._future is None
+            and step - reader.latest_step <= _STALE_STEPS
+            and reader._futures is None
         )
         if fresh:
             return reader.latest
@@ -271,15 +269,19 @@ def _read_all(step: int) -> np.ndarray:
 
 def schedule(cadence: int) -> None:
     """A consumer (the dynamic re-layout) wants fresh counts every `cadence`
-    steps: a read is issued two steps ahead of each boundary."""
+    steps: a read is issued `_AHEAD_STEPS` ahead of each boundary."""
     if cadence > 0 and cadence not in _CADENCE:
         _CADENCE.append(int(cadence))
+
+
+_AHEAD_STEPS = 4  # a read is issued this many steps before a consumer boundary
+_STALE_STEPS = 6  # and an adopted read this old still serves the boundary
 
 
 def _due_soon(step: int) -> bool:
     every = envs.TPU_MOE_EXPERT_LOAD_LOG_EVERY
     cadences = list(_CADENCE) + ([every] if every > 0 else [])
-    return any((step + 2) % c == 0 for c in cadences)
+    return any((step + _AHEAD_STEPS) % c == 0 for c in cadences)
 
 
 def snapshot() -> dict[tuple[str, int], np.ndarray]:
