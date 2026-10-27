@@ -1084,7 +1084,8 @@ def _dense_batches(
     topk_indices, seq_ids, num_valid_tokens, batch_size: int, chunk_size: int
 ):
     """`DenseRefs.token_seq_ref` and `DenseRefs.batch_rows_ref` for kernel
-    batches of `batch_size` tokens in calls of `chunk_size` tokens.
+    batches of `batch_size` tokens in calls of `chunk_size` tokens, and each
+    batch's own rows, the ones its tokens selected an entry in.
 
     A batch of valid tokens of one sequence reads the cache when its rows fit
     in DENSE_MAX_ROWS. Its rows cover every entry selected by a batch of the
@@ -1095,22 +1096,26 @@ def _dense_batches(
     seqs = seq_ids.reshape(num_batches, batch_size)
     valid = (jnp.arange(num_tokens) < num_valid_tokens).reshape(seqs.shape)
     single = jnp.all(valid, axis=1) & jnp.all(seqs == seqs[:, :1], axis=1)
-    rows = (jnp.max(topk_indices, axis=1) + 1).reshape(seqs.shape).max(axis=1)
+    own_rows = (jnp.max(topk_indices, axis=1) + 1).reshape(seqs.shape).max(axis=1)
     batch = jnp.arange(num_batches)
     call = batch // (chunk_size // batch_size)
     same = (
         (seqs[:, :1] == seqs[:, 0]) & (call[:, None] == call) & single[:, None] & single
     )
-    rows = jnp.max(jnp.where(same, rows, 0), axis=1)
+    rows = jnp.max(jnp.where(same, own_rows, 0), axis=1)
     dense = single & (rows > 0) & (rows <= DENSE_MAX_ROWS)
     token_seq = jnp.where(dense[:, None], -seqs - 1, seqs).reshape(-1)
-    return token_seq.astype(jnp.int32), rows.astype(jnp.int32)
+    return (
+        token_seq.astype(jnp.int32),
+        rows.astype(jnp.int32),
+        own_rows.astype(jnp.int32),
+    )
 
 
 def _dense_blocks(topk_indices, batch_rows, batch_size: int, max_rows: int):
     """`DenseRefs.block_list_ref` and `DenseRefs.num_blocks_ref`: each batch
-    attends the DENSE_KV_BLOCK-row blocks of its `batch_rows` that one of its
-    tokens selected an entry in, or all of them without
+    attends the DENSE_KV_BLOCK-row blocks of its own `batch_rows` that one of
+    its tokens selected an entry in, or all of them without
     DENSE_SKIP_EMPTY_BLOCKS. Leaving out a block nobody selected is exact: it
     would add probability 0 to every token."""
     num_blocks = max_rows // DENSE_KV_BLOCK
@@ -1531,7 +1536,7 @@ def sparse_ragged_paged_attention(
         and q.shape[0] % gather_and_attention_chunk_size == 0
         and gather_and_attention_chunk_size % attention_kernel_batch_size == 0
     ):
-        token_seq, batch_rows = _dense_batches(
+        token_seq, batch_rows, own_rows = _dense_batches(
             topk_indices,
             seq_ids_segment[: q.shape[0]],
             cu_q_lens[distribution[2]],
@@ -1540,7 +1545,7 @@ def sparse_ragged_paged_attention(
         )
         block_list, num_blocks = _dense_blocks(
             topk_indices,
-            batch_rows,
+            own_rows,
             attention_kernel_batch_size,
             pages_per_seq * page_size,
         )
