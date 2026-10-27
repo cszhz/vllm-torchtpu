@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_candidate_cache import (
+    candidate_membership,
     gather_candidate_keys,
     prepare_candidates,
     resolve_candidate_blocks,
@@ -225,6 +226,15 @@ def main():
             dimensions,
         )
         np.testing.assert_array_equal(np.asarray(actual), expected)
+    actual = measure(
+        "membership_histogram",
+        functools.partial(candidate_membership, blocks=args.width // args.block),
+        (candidates, prepared.block_ids),
+        root,
+        args.repeats,
+        dimensions,
+    )
+    np.testing.assert_array_equal(np.asarray(actual), expected)
     # Replay the real gather with resolved physical IDs from the same union.
     offsets = np.asarray(prepared.offsets)
     reps = np.minimum(offsets[:-1], tokens - 1)
@@ -240,7 +250,10 @@ def main():
     gathered = measure(
         "gather",
         functools.partial(
-            gather_candidate_keys, block=min(args.block, args.page_size), layout=layout
+            candidate_membership,
+            gather_candidate_keys,
+            block=min(args.block, args.page_size),
+            layout=layout,
         ),
         (banks, physical, prepared.offsets),
         root,

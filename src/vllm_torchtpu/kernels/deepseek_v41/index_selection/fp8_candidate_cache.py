@@ -101,12 +101,7 @@ def prepare_candidates(
         page_size=layout.page_size,
     )
     canonical = canonical[groups]
-    sorted_candidates = jnp.sort(candidates, axis=1)
-    slots = jax.vmap(jnp.searchsorted)(sorted_candidates, canonical)
-    membership = (canonical >= 0) & (
-        jnp.take_along_axis(sorted_candidates, jnp.minimum(slots, count - 1), axis=1)
-        == canonical
-    )
+    membership = candidate_membership(candidates, canonical, pl.cdiv(width, block))
     fragment = min(block, layout.page_size)
     per_page = PAGE_RECORDS // fragment
     padded = (physical.shape[1] + per_page - 1) // per_page * per_page
@@ -134,6 +129,89 @@ def prepare_candidates(
         (requests >= 0) & (requests < pages.shape[0]),
         membership,
     )
+
+
+def candidate_membership(candidates, canonical, blocks):
+    """Test per-query union membership using a SparseCore presence histogram.
+
+    A batched binary search lowers to dependent TensorCore gathers, making
+    metadata preparation dominate the layer. Each subcore instead builds a
+    private histogram and reads the union's flags from local VMEM.
+    """
+    rows, count = candidates.shape
+    columns = canonical.shape[1]
+    padded_count = pl.cdiv(count, 128) * 128
+    padded_columns = pl.cdiv(columns, 128) * 128
+    histogram_width = pl.cdiv(blocks, 128) * 128
+    scratch_words = histogram_width + padded_count + 2 * padded_columns
+    if jax.default_backend() != "tpu" or (
+        scratch_words * 4 > plsc.get_sparse_core_info().vmem_capacity_bytes // 2
+    ):
+        ordered = jnp.sort(candidates, axis=1)
+        slots = jax.vmap(lambda a, v: jnp.searchsorted(a, v, method="sort"))(
+            ordered, canonical
+        )
+        found = jnp.take_along_axis(ordered, jnp.minimum(slots, count - 1), axis=1)
+        return (canonical >= 0) & (canonical < blocks) & (found == canonical)
+
+    info = plsc.get_sparse_core_info()
+    lanes, units = info.num_lanes, info.num_cores * info.num_subcores
+    candidates = jnp.pad(
+        candidates, ((0, 0), (0, padded_count - count)), constant_values=-1
+    )
+    canonical = jnp.pad(
+        canonical, ((0, 0), (0, padded_columns - columns)), constant_values=-1
+    )
+    mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
+
+    @pl.kernel(
+        out_type=jax.ShapeDtypeStruct(canonical.shape, jnp.int32),
+        scratch_types=(
+            pltpu.VMEM((histogram_width,), jnp.int32),
+            pltpu.VMEM((padded_count,), jnp.int32),
+            pltpu.VMEM((padded_columns,), jnp.int32),
+            pltpu.VMEM((padded_columns,), jnp.int32),
+            pltpu.SemaphoreType.DMA((3,)),
+        ),
+        mesh=mesh,
+        compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
+        name="paged_mqa_candidate_membership",
+    )
+    def membership(src, unions, out, hist, ids, union_ids, flags, sem):
+        unit = lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
+
+        @pl.loop(unit, rows, step=units)
+        def row(row_id):
+            read_ids = pltpu.async_copy(src.at[row_id], ids, sem.at[0])
+            read_union = pltpu.async_copy(unions.at[row_id], union_ids, sem.at[1])
+
+            @plsc.parallel_loop(0, histogram_width, lanes, unroll=128 // lanes)
+            def clear(i):
+                hist[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
+
+            read_ids.wait()
+
+            @plsc.parallel_loop(0, padded_count, lanes, unroll=128 // lanes)
+            def scatter(i):
+                keys = ids[pl.ds(i, lanes)]
+                inc, valid = plsc.scan_count(keys, mask=(keys >= 0) & (keys < blocks))
+                plsc.addupdate_scatter(
+                    hist, [jnp.clip(keys, 0, blocks - 1)], inc, mask=valid
+                )
+
+            read_union.wait()
+
+            @plsc.parallel_loop(0, padded_columns, lanes, unroll=128 // lanes)
+            def lookup(i):
+                keys = union_ids[pl.ds(i, lanes)]
+                present = plsc.load_gather(hist, [jnp.clip(keys, 0, blocks - 1)])
+                flags[pl.ds(i, lanes)] = (
+                    (keys >= 0) & (keys < blocks) & (present != 0)
+                ).astype(jnp.int32)
+
+            pltpu.async_copy(flags, out.at[row_id], sem.at[2]).wait()
+
+    return membership(candidates, canonical)[:, :columns] != 0
 
 
 def canonical_candidate_blocks(
