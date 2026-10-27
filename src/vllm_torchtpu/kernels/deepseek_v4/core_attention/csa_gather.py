@@ -14,7 +14,7 @@
 
 import dataclasses
 import functools
-from typing import Any, cast
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -51,6 +51,8 @@ class TopkLookup:
     pages_per_seq: int
     num_seqs: int
     total_pages: int
+    # Entries of the selection mask written for each skipped token (0: none).
+    select_rows: int = 0
 
 
 def _lookup_rows(
@@ -121,6 +123,39 @@ def _valid_steps(topk_ref, *, top_k, num_lanes, step_entries):
     return pl.cdiv(kv_len, step_entries)
 
 
+def _write_selection(topk_ref, select_vmem_ref, out_hbm_ref, sem, *, top_k, num_lanes):
+    """Writes the token's selection mask to `out_hbm_ref`: 1 at each of its
+    top-k entries, 0 at every other compressed token, entry x at word
+    (x // 128, x % 128)."""
+    words = csa_cache_layout.ROW_WORDS
+    num_rows = select_vmem_ref.shape[0] * words
+    vectors_per_row = words // num_lanes
+
+    @plsc.parallel_loop(0, num_rows // num_lanes, unroll=LOOKUP_UNROLL)
+    def _(v):
+        row, col = v // vectors_per_row, (v % vectors_per_row) * num_lanes
+        select_vmem_ref[row, pl.ds(col, num_lanes)] = jnp.zeros((num_lanes,), jnp.int32)
+
+    @plsc.parallel_loop(0, top_k // num_lanes, unroll=LOOKUP_UNROLL)
+    def _(v):
+        k = v * num_lanes
+        x = topk_ref[0, k // words, 0, pl.ds(k % words, num_lanes)]
+        x_safe = jnp.clip(x, 0, num_rows - 1)
+        plsc.store_scatter(
+            select_vmem_ref,
+            [
+                lax.shift_right_logical(x_safe, words.bit_length() - 1),
+                x_safe & (words - 1),
+            ],
+            jnp.ones((num_lanes,), jnp.int32),
+            mask=(x >= 0) & (x < num_rows),
+        )
+
+    copy = pltpu.make_async_copy(select_vmem_ref, out_hbm_ref, sem)
+    copy.start()
+    copy.wait()
+
+
 def _topk_row_spec(lookup, top_k, num_cores, core_index):
     """Block `b` of subcore `core_index`: its token's top-k row, as
     `top_k // 128` segments of 128 entries. A subcore past the chunk's end
@@ -153,6 +188,10 @@ def main_kernel(
     if lookup is None:
         nope_out_hbm_ref, rope_out_hbm_ref, nope_sem = refs
     else:
+        if lookup.select_rows:
+            # The selection mask output follows the gathers; its buffer comes last.
+            select_out_hbm_ref, select_vmem_ref = refs[4], refs[-1]
+            refs = refs[:4] + refs[5:-1]
         (
             seq_ids_hbm_ref,
             page_table_hbm_ref,
@@ -340,7 +379,21 @@ def main_kernel(
             # from the paged cache itself (see `csa_gather_topk`).
             local = jnp.minimum(b * num_cores + core_index, lookup.num_tokens - 1)
             token = jnp.full((num_simd_lanes,), lookup.token_start + local, jnp.int32)
-            run &= plsc.load_gather(seq_vmem_ref, [token])[0] >= 0
+            skipped = plsc.load_gather(seq_vmem_ref, [token])[0] < 0
+            run &= jnp.logical_not(skipped)
+            if lookup.select_rows:
+
+                @pl.when(skipped & (b * num_cores + core_index < lookup.num_tokens))
+                def _write_select():
+                    words = select_vmem_ref.shape[0]
+                    _write_selection(
+                        in_ref,
+                        select_vmem_ref,
+                        select_out_hbm_ref.at[pl.ds(local * words, words)],
+                        lookup_sem.at[2],
+                        top_k=top_k,
+                        num_lanes=num_simd_lanes,
+                    )
 
         @pl.when(run)
         def _run_gather():
@@ -451,7 +504,14 @@ def csa_gather(
 
 
 @functools.partial(
-    jax.jit, static_argnames=("token_start", "num_tokens", "top_k", "pages_per_seq")
+    jax.jit,
+    static_argnames=(
+        "token_start",
+        "num_tokens",
+        "top_k",
+        "pages_per_seq",
+        "select_rows",
+    ),
 )
 def csa_gather_topk(
     nope_cache: jax.Array,
@@ -465,7 +525,8 @@ def csa_gather_topk(
     num_tokens: int,
     top_k: int,
     pages_per_seq: int,
-) -> tuple[jax.Array, jax.Array]:
+    select_rows: int = 0,
+) -> tuple[jax.Array, ...]:
     """`csa_gather` of tokens `[token_start, token_start + num_tokens)`, given
     their top-k entries rather than cache rows.
 
@@ -480,6 +541,10 @@ def csa_gather_topk(
         negative is skipped, its rows left unwritten.
       page_indices: (num_seqs * pages_per_seq,) int32 page table.
       num_valid_indices: entries of the chunk to gather, as in `csa_gather`.
+      select_rows: if nonzero (a multiple of 128), also return the skipped
+        tokens' selection masks, int32 (num_tokens * select_rows // 128, 128):
+        token t's rows [t, t + 1) * select_rows // 128 hold 1 at each of its
+        top-k entries x (word x of the flattened rows) and 0 elsewhere.
 
     Returns:
       `csa_gather`'s outputs for the chunk's `num_tokens * top_k` entries.
@@ -512,6 +577,7 @@ def csa_gather_topk(
         pages_per_seq=pages_per_seq,
         num_seqs=page_indices.shape[0] // pages_per_seq,
         total_pages=nope_cache.shape[0],
+        select_rows=select_rows,
     )
     return _launch(
         nope_cache,
@@ -535,8 +601,9 @@ def _launch(
     top_k: int,
     lookup: TopkLookup | None = None,
     lookup_inputs: tuple[jax.Array, ...] = (),
-) -> tuple[jax.Array, jax.Array]:
-    """Runs `main_kernel` over `inputs` and returns its two outputs."""
+) -> tuple[jax.Array, ...]:
+    """Runs `main_kernel` over `inputs` and returns its outputs: the two
+    gathers, then `csa_gather_topk`'s selection mask if it asks for one."""
     # Free reshapes: a 128-lane int32 array's T(8,128) tiling is byte-identical
     # to row-major, and the kernel takes its operands untiled
     # (`use_tc_tiling_on_sc=False`), so token t's rope is words
@@ -559,20 +626,48 @@ def _launch(
     scratch_types = [pltpu.SemaphoreType.DMA((num_streams,))]
     if lookup is not None:
         seq_ids, page_indices = lookup_inputs
+        select_rows = lookup.select_rows
         scratch_types += [
             pltpu.VMEM((top_k,), jnp.int32),  # the token's cache rows
             pltpu.VMEM(seq_ids.shape, jnp.int32),
             pltpu.VMEM(page_indices.shape, jnp.int32),
-            pltpu.SemaphoreType.DMA((2,)),
+            # seq_ids, page table (, selection mask) copies
+            pltpu.SemaphoreType.DMA((3 if select_rows else 2,)),
         ]
+        if select_rows:
+            assert select_rows % csa_cache_layout.ROW_WORDS == 0
+            scratch_types.append(
+                pltpu.VMEM(
+                    (
+                        select_rows // csa_cache_layout.ROW_WORDS,
+                        csa_cache_layout.ROW_WORDS,
+                    ),
+                    jnp.int32,
+                )
+            )
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
         num_subcores=sc_info.num_subcores,
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    nope_out, rope_out = cast(
-        Any,
+    out_type = [
+        jax.ShapeDtypeStruct((out_rows, csa_cache_layout.ROW_WORDS), jnp.int32),
+        jax.ShapeDtypeStruct((out_rows // 4, csa_cache_layout.ROW_WORDS), jnp.int32),
+    ]
+    if lookup is not None and lookup.select_rows:
+        out_type.append(
+            jax.ShapeDtypeStruct(
+                (
+                    lookup.num_tokens
+                    * lookup.select_rows
+                    // csa_cache_layout.ROW_WORDS,
+                    csa_cache_layout.ROW_WORDS,
+                ),
+                jnp.int32,
+            )
+        )
+    return tuple(
         pl.kernel(
             functools.partial(
                 main_kernel,
@@ -583,12 +678,7 @@ def _launch(
                 top_k=top_k,
                 lookup=lookup,
             ),
-            out_type=(
-                jax.ShapeDtypeStruct((out_rows, csa_cache_layout.ROW_WORDS), jnp.int32),
-                jax.ShapeDtypeStruct(
-                    (out_rows // 4, csa_cache_layout.ROW_WORDS), jnp.int32
-                ),
-            ),
+            out_type=tuple(out_type),
             scratch_types=tuple(scratch_types),
             compiler_params=pltpu.CompilerParams(
                 use_tc_tiling_on_sc=False,
@@ -597,6 +687,5 @@ def _launch(
             ),
             mesh=vector_mesh,
             name="sc_csa_gather" if lookup is None else "sc_csa_gather_topk",
-        )(nope_cache, rope_cache, *inputs, valid_indices, *lookup_inputs),
+        )(nope_cache, rope_cache, *inputs, valid_indices, *lookup_inputs)
     )  # pyrefly: ignore[not-iterable]
-    return nope_out, rope_out
