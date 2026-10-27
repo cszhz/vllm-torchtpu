@@ -5845,6 +5845,18 @@ def make_dense_ffn_sp(mesh, *, seq_len):
 # SparseCore row movement does not lower inside a dynamic JAX loop.
 
 
+def _route_update(result, route, layer):
+    """A MoE call's output, and ``route`` [32, 92, 56] with the call's local
+    expert counts at MoE layer ``layer`` (when the MoE returns counts)."""
+    if not isinstance(result, tuple):
+        return result, route
+    out, counts = result
+    if route is None:
+        return out, route
+    return out, jax.lax.dynamic_update_slice(
+        route, counts[:, None, :].astype(route.dtype), (0, jnp.asarray(layer, jnp.int32).reshape(()), 0))
+
+
 def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, mla_flash_tile=256):
     """One runtime-indexed group at layers 4g..4g+3 (g = 1..22) over a
     packed window: three KDA layers and one MLA layer, each followed by its
@@ -5882,7 +5894,7 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
         return jnp.asarray([value], jnp.int32)
 
     def run(prefix, blocks, common, kda_families, mla_families,
-            moe_families, kda_state, mla_state, length, group, segment_desc, arena):
+            moe_families, kda_state, mla_state, length, group, segment_desc, arena, route=None):
         base = group[0] * 4
         kda_states = tuple(kda_state)
         if len(kda_states) != len(kda_outputs):
@@ -5930,14 +5942,16 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
                 choose(common["ffn_norm"], index),
                 scalar(index // 12 + 1),
             )
-            prefix = moe(
+            prefix, route = _route_update(moe(
                 ffn_input, after_attention, moe_families,
                 length, scalar(index - 1),
-            )
+            ), route, index - 1)
+        if route is not None:
+            return prefix, blocks, kda_states, mla_cache, tap, route
         return prefix, blocks, kda_states, mla_cache, tap
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,) * len(kda_outputs), (sharding,), sharding,
+        sharding, sharding, (sharding,) * len(kda_outputs), (sharding,), sharding, *((sharding,) if _config().prefill_route_counts else ()),
     ))
 
 
@@ -5954,24 +5968,26 @@ def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
     sharding = NamedSharding(mesh, P("k3_sp"))
 
     def run(prefix, blocks, common, kda_families, mla_families,
-            moe_families, kda_state, mla_state, length, pair, segment_desc, arena):
+            moe_families, kda_state, mla_state, length, pair, segment_desc, arena, route=None):
         first = jnp.asarray([2 * pair[0] + 1], jnp.int32)
         second = first + 1
         arenas = arena.split()
-        middle, blocks, kda_state, mla_state, _ = group4(
+        middle, blocks, kda_state, mla_state, _, *r1 = group4(
             prefix, blocks, common, kda_families, mla_families,
             moe_families, kda_state, mla_state, length, first,
-            segment_desc, arenas[0],
+            segment_desc, arenas[0], route,
         )
-        prefix, blocks, kda_state, mla_state, tap = group4(
+        prefix, blocks, kda_state, mla_state, tap, *r2 = group4(
             middle, blocks, common, kda_families, mla_families,
             moe_families, kda_state, mla_state, length, second,
-            segment_desc, arenas[1],
+            segment_desc, arenas[1], r1[0] if r1 else None,
         )
+        if r2:
+            return prefix, blocks, kda_state, mla_state, middle, tap, r2[0]
         return prefix, blocks, kda_state, mla_state, middle, tap
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,) * 4, (sharding,), sharding, sharding,
+        sharding, sharding, (sharding,) * 4, (sharding,), sharding, sharding, *((sharding,) if _config().prefill_route_counts else ()),
     ))
 
 
@@ -5992,7 +6008,7 @@ def make_final_mla_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, 
     moe = make_indexed_moe_sp_ring(mesh, seq_len=seq_len)
 
     def run(prefix, blocks, common, mla_families, moe_families,
-            mla_state, length, segment_desc, arena):
+            mla_state, length, segment_desc, arena, route=None):
         if len(mla_state) != 1:
             raise ValueError("mla_state is (latents,)")
         attn_res = common["attn_res"][:, 92]
@@ -6013,14 +6029,16 @@ def make_final_mla_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, 
             after_attention, blocks, common["mlp_res"][:, 92],
             common["ffn_norm"][:, 92], active,
         )
-        prefix = moe(
+        prefix, route = _route_update(moe(
             ffn_input, after_attention, moe_families,
             length, jnp.asarray([91], jnp.int32),
-        )
+        ), route, 91)
+        if route is not None:
+            return prefix, blocks, mla_cache, route
         return prefix, blocks, mla_cache
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,),
+        sharding, sharding, (sharding,), *((sharding,) if _config().prefill_route_counts else ()),
     ))
 
 
@@ -6085,7 +6103,7 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
     kda_outputs = (3, 4, 6, 7)  # rec, hist, rec_at, hist_at in the KDA op's result
 
     def run(hidden, common, kda_families, mla_families, moe_families,
-            kda_state, mla_state, length, segment_desc, arena):
+            kda_state, mla_state, length, segment_desc, arena, route=None):
         kda_state = tuple(kda_state)
         if len(kda_state) != len(kda_outputs):
             raise ValueError("kda_state is (rec, hist, rec_at, hist_at)")
@@ -6118,7 +6136,7 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
         )
 
         def body(index, carry):
-            prefix, blocks, kda_states, mla_cache, tap = carry
+            prefix, blocks, kda_states, mla_cache, tap, route = carry
             if tap_layer is not None:
                 tap = jnp.where(index == tap_layer, prefix, tap)
             blocks = jax.lax.cond(
@@ -6162,24 +6180,25 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
                 choose(common["ffn_norm"], index),
                 active(index // 12 + 1),
             )
-            prefix = moe(
+            prefix, route = _route_update(moe(
                 ffn_input, after_attention, moe_families,
                 length, active(index - 1),
-            )
-            return prefix, blocks, kda_states, mla_cache, tap
+            ), route, index - 1)
+            return prefix, blocks, kda_states, mla_cache, tap, route
 
         result = jax.lax.fori_loop(
             1, depth, body,
-            (prefix, blocks, kda_states, tuple(mla_state), prefix if tap_layer is not None else None),
+            (prefix, blocks, kda_states, tuple(mla_state), prefix if tap_layer is not None else None, route),
             unroll=unroll,
         )
+        extra = (result[5],) if route is not None else ()
         if tap_layer is not None:
-            return (result[0], result[1], result[2], result[3], result[4])
-        return (result[0], result[1], result[2], result[3])
+            return (result[0], result[1], result[2], result[3], result[4], *extra)
+        return (result[0], result[1], result[2], result[3], *extra)
 
     return jax.jit(run, out_shardings=(
         sharding, sharding, (sharding,) * len(kda_outputs), (sharding,),
-        *((sharding,) if tap_layer is not None else ()),
+        *((sharding,) if tap_layer is not None else ()), *((sharding,) if _config().prefill_route_counts else ()),
     ))
 
 
