@@ -18,8 +18,12 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 import jax
+import numpy as np
 import torch
 from vllm.distributed import get_pcp_group
+from vllm.model_executor.layers.mamba.checkpoint import (
+    compute_mamba_prefill_checkpoints,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import (
@@ -32,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_torchtpu.kernels.gdn.v3.config import PREFILL_CKPT_ALIGNMENT
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
@@ -68,6 +73,8 @@ def attention_block_table_width(
         "mamba_slot_read_offsets",
         "mamba_ckpt_indices",
         "mamba_request_distribution",
+        "mamba_prefill_ckpt_offsets",
+        "mamba_prefill_ckpt_blocks",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -119,6 +126,15 @@ class AttentionMetadata:
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | torch.Tensor | None = None
+    # (max_num_seqs,) int32 each — vLLM prefill checkpoint for the unified
+    # GDN pool (`MambaSpec.num_prefill_checkpoint_blocks`): the token offset
+    # from the request's query start whose state must also be exported
+    # (0 = none) and the pool block receiving it (0 = none). The kernel
+    # writes that state on the tile ending at the offset, so the scheduler
+    # can run the last prefill chunk to the prompt end without a tail
+    # split. None unless `TPU_GDN_PREFILL_CHECKPOINT` declared the blocks.
+    mamba_prefill_ckpt_offsets: jax.Array | torch.Tensor | None = None
+    mamba_prefill_ckpt_blocks: jax.Array | torch.Tensor | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -164,6 +180,12 @@ class AttentionMetadataBuilderContext:
     # read-offset scatter can address every group's state block (groups
     # allocate distinct blocks, unlike the compact pool's shared slots).
     unified_mamba_state_indices: list[torch.Tensor] | None = None
+    # Host copies of this chunk's `seq_lens[:num_reqs]` and
+    # `query_start_loc[:num_reqs + 1]` (request-major, global under PCP).
+    # Only the unified-pool prefill checkpoint derivation reads them; the
+    # main runner walk sets them, dummy and draft walks leave them None.
+    seq_lens_cpu: np.ndarray | None = None
+    query_start_loc_cpu: np.ndarray | None = None
     sequence_layout_descriptor: SequenceLayoutDescriptor = (
         DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
     )
@@ -330,6 +352,67 @@ def zeros_h2d_source(
     return buf
 
 
+def mamba_prefill_checkpoint_rows(
+    seq_lens: np.ndarray,
+    query_start_loc: np.ndarray,
+    block_table: torch.Tensor,
+    *,
+    hash_block_size: int,
+    mamba_block_size: int,
+    cache_hit_alignment_tokens: int,
+    checkpoint_alignment: int,
+    drop_eagle_block: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-request prefill checkpoint (offset, block) for the GDN kernel.
+
+    Mirrors upstream `MambaPrefillCheckpointBuilder` on host arrays: the
+    offset is query-relative and the block is the manager's checkpoint
+    column `cdiv(seq_len, B) - 2` of `block_table` (rows are this chunk's
+    requests). Requests without a checkpoint get `(0, 0)`; the kernel keys
+    "none" off the zero offset.
+
+    The kernels export the state on the tile ending at the offset, which
+    exists for any query start as long as the offset is a multiple of
+    `checkpoint_alignment` (upstream's rule guarantees it). The scheduler
+    has already committed to the checkpoint block, so an offset off that
+    grid is an error rather than a silent skip.
+    """
+    num_reqs = len(seq_lens)
+    query_lens = np.diff(query_start_loc[: num_reqs + 1])
+    offsets, cols = compute_mamba_prefill_checkpoints(
+        seq_lens.tolist(),
+        query_lens.tolist(),
+        hash_block_size=hash_block_size,
+        mamba_block_size=mamba_block_size,
+        checkpoint_alignment=checkpoint_alignment,
+        drop_eagle_block=drop_eagle_block,
+        cache_hit_alignment_tokens=cache_hit_alignment_tokens,
+    )
+    offsets_np = np.asarray(offsets, dtype=np.int32)
+    cols_np = np.asarray(cols, dtype=np.int64)
+    blocks_np = np.zeros(num_reqs, dtype=np.int32)
+    rows = np.nonzero(offsets_np > 0)[0]
+    if rows.size:
+        blocks_np[rows] = block_table[rows, cols_np[rows]].numpy()
+        # Upstream exporters skip a checkpoint whose column holds the null
+        # block (the manager nulled or never allocated it); the kernel keys
+        # "none" off the offset, so drop it here, before the block-major id
+        # mapping in the op, under which manager block 0 is no longer 0.
+        null_rows = rows[blocks_np[rows] == 0]
+        offsets_np[null_rows] = 0
+        rows = rows[blocks_np[rows] != 0]
+    misaligned = rows[offsets_np[rows] % checkpoint_alignment != 0]
+    if misaligned.size:
+        raise ValueError(
+            "GDN prefill checkpoint offsets must be multiples of "
+            f"{checkpoint_alignment}; requests {misaligned.tolist()} have "
+            f"offsets {offsets_np[misaligned].tolist()} (seq_lens "
+            f"{seq_lens[misaligned].tolist()}, query starts "
+            f"{query_start_loc[misaligned].tolist()})."
+        )
+    return offsets_np, blocks_np
+
+
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
     """Single shared metadata builder for every TPU attention group."""
 
@@ -349,6 +432,14 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             self.target_block_size *= cp_world_size
         # Only mamba/GDN layers consume physical state slot ids; attention
         # groups leave AttentionMetadata.mamba_state_indices None.
+
+        # Prefill checkpoints exist only where the GDN op declared them on
+        # the spec (`TPU_GDN_PREFILL_CHECKPOINT`, align mode, unified pool).
+        self.mamba_prefill_ckpt = (
+            self.is_mamba_group
+            and cast(MambaSpec, kv_cache_spec).num_prefill_checkpoint_blocks > 0
+            and vllm_config.cache_config.mamba_cache_mode == "align"
+        )
 
     def _mamba_row_plan(
         self, ctx: AttentionMetadataBuilderContext, target_num_blocks: int
@@ -437,6 +528,70 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                     block_table_obj.max_num_blocks_per_req,
                 )
         return block_table_obj, target_num_blocks
+
+    def _build_mamba_prefill_ckpt(
+        self,
+        ctx: AttentionMetadataBuilderContext,
+        block_table_obj: Any,
+        target_num_reqs: int,
+        target_num_blocks: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Device `(offsets, blocks)` of this chunk's prefill checkpoints.
+
+        Derived on the host from the chunk's `seq_lens` / `query_start_loc`
+        and the CPU block table (the same source the staged upload packs), so
+        it is independent of whether the block tables were staged. Dummy and
+        draft walks carry no host arrays and get all-zero tensors; a real
+        walk without them cannot honor a checkpoint the scheduler already
+        committed to, so it fails loudly instead. Offsets are query-relative
+        under PCP too: every rank walks the full request-major sequence.
+        """
+        runner = self.runner
+        cache_config = self.vllm_config.cache_config
+        # One recycled host buffer, two device views (offsets, blocks).
+        flat = zeros_h2d_source(runner, 2 * target_num_reqs)
+        host = flat.view(2, target_num_reqs)
+        is_real_walk = ctx.position_ids_override is None
+        if is_real_walk and ctx.seq_lens_cpu is None:
+            raise NotImplementedError(
+                "GDN prefill checkpoints need the chunk's host seq_lens / "
+                "query_start_loc (AttentionMetadataBuilderContext.seq_lens_cpu); "
+                "this walk did not provide them. Unset "
+                "TPU_GDN_PREFILL_CHECKPOINT for this configuration."
+            )
+        # Resolved by the engine core once the KV cache config is final;
+        # None only for the profiling walk, which has no checkpoints.
+        hash_block_size = cache_config.hash_block_size
+        cache_hit_alignment_tokens = cache_config.cache_hit_alignment_tokens
+        if (
+            is_real_walk
+            and ctx.num_reqs > 0
+            and hash_block_size is not None
+            and cache_hit_alignment_tokens is not None
+        ):
+            assert ctx.seq_lens_cpu is not None
+            assert ctx.query_start_loc_cpu is not None
+            speculative_config = self.vllm_config.speculative_config
+            offsets, blocks = mamba_prefill_checkpoint_rows(
+                ctx.seq_lens_cpu[: ctx.num_reqs],
+                ctx.query_start_loc_cpu[: ctx.num_reqs + 1],
+                block_table_obj.get_cpu_tensor()[
+                    ctx.start_index : ctx.start_index + ctx.num_reqs,
+                    :target_num_blocks,
+                ],
+                hash_block_size=hash_block_size,
+                mamba_block_size=self.target_block_size,
+                cache_hit_alignment_tokens=cache_hit_alignment_tokens,
+                checkpoint_alignment=PREFILL_CKPT_ALIGNMENT,
+                drop_eagle_block=(
+                    speculative_config is not None
+                    and speculative_config.use_eagle_block_drop()
+                ),
+            )
+            host[0, : ctx.num_reqs] = torch.from_numpy(offsets)
+            host[1, : ctx.num_reqs] = torch.from_numpy(blocks)
+        device = stage_h2d_upload(runner, flat).view(2, target_num_reqs)
+        return device[0], device[1]
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         runner = self.runner
@@ -543,6 +698,15 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
 
+        mamba_prefill_ckpt_offsets = None
+        mamba_prefill_ckpt_blocks = None
+        if self.mamba_prefill_ckpt and runner._unified_kv_layout:
+            mamba_prefill_ckpt_offsets, mamba_prefill_ckpt_blocks = (
+                self._build_mamba_prefill_ckpt(
+                    ctx, block_table_obj, target_num_reqs, target_num_blocks
+                )
+            )
+
         return AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
@@ -553,6 +717,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
+            mamba_prefill_ckpt_offsets=mamba_prefill_ckpt_offsets,
+            mamba_prefill_ckpt_blocks=mamba_prefill_ckpt_blocks,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,

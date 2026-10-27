@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
+    TPU_GDN_PREFILL_CHECKPOINT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -450,6 +451,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool(
         "TPU_ENABLE_GDN_DYNAMIC_TILING", default=False
     ),
+    # Declare vLLM's Mamba prefill-checkpoint blocks for the GDN unified pool
+    # (align mode): the last prefill chunk runs to the prompt end and the GDN
+    # v3 kernel also exports the state at the prompt's last hash-block
+    # boundary, instead of the scheduler splitting a one-block tail chunk.
+    "TPU_GDN_PREFILL_CHECKPOINT": env_bool("TPU_GDN_PREFILL_CHECKPOINT", default=False),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.

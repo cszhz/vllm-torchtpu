@@ -842,6 +842,13 @@ class TPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        # Adopt the engine core's prefix-cache granularity (as gpu_worker
+        # does): the Mamba prefill checkpoint derivation reads it from the
+        # worker's config.
+        self.cache_config.hash_block_size = kv_cache_config.hash_block_size
+        self.cache_config.cache_hit_alignment_tokens = (
+            kv_cache_config.cache_hit_alignment_tokens
+        )
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 

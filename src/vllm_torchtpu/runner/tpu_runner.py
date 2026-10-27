@@ -3406,6 +3406,10 @@ class TPUModelRunner(GPUModelRunner):
                 if self._unified_kv_layout and self.mamba_slot_read_offsets is not None
                 else None
             ),
+            # Host views for the unified-pool prefill checkpoint derivation;
+            # filled above for exactly this chunk's requests.
+            seq_lens_cpu=self.seq_lens_np[:num_reqs],
+            query_start_loc_cpu=self.query_start_loc_np[: num_reqs + 1],
             sequence_layout_descriptor=layout_plan.descriptor,
         )
         slot_mappings = self.empty_slot_mappings
