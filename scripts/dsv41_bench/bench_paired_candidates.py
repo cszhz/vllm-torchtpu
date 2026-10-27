@@ -26,9 +26,31 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_candidate_cache impo
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
     PackedFP8Layout,
-    write_fp8_records,
+    quantize_index_rows,
+    read_fp8_records,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import _score_prepared
+
+
+def pack_fixture(keys, layout):
+    """Initialize pages without the incremental writer's SMEM index limit."""
+    values, scales, _ = quantize_index_rows(keys)
+    bits = jax.lax.bitcast_convert_type(values, jnp.uint8).astype(jnp.uint32)
+    bits = bits.reshape(-1, 32, 4)
+    words = bits[..., 0] | (bits[..., 1] << 8)
+    words |= (bits[..., 2] << 16) | (bits[..., 3] << 24)
+    records = jnp.concatenate(
+        (
+            words.astype(jnp.int32),
+            jax.lax.bitcast_convert_type(scales, jnp.int32)[:, None],
+        ),
+        axis=1,
+    )
+    pages = records.reshape(layout.pages, layout.page_size, 33).transpose(0, 2, 1)
+    pages = pages.reshape(layout.pages, -1)
+    return jnp.pad(
+        pages, ((0, 0), (0, layout.page_rows * 128 - pages.shape[1]))
+    ).reshape(-1, 128)
 
 
 def membership(candidates, canonical, *, method):
@@ -143,16 +165,22 @@ def main():
             )
             candidate_rows.append(np.concatenate((common, extra)))
     candidates = jnp.asarray(np.array(candidate_rows), jnp.int32)
-    pool = jnp.zeros((layout.pages * layout.page_rows, 128), jnp.int32)
     # Generate on device to keep host memory bounded. Split at a page boundary.
     keys = jax.random.normal(
         jax.random.key(826), (layout.pages * layout.page_size, 128), jnp.bfloat16
     )
+    pool = jax.jit(functools.partial(pack_fixture, layout=layout))(keys)
     banks = tuple(jnp.split(pool, 2))
-    banks = jax.jit(functools.partial(write_fp8_records, layout=layout))(
-        banks, jnp.arange(keys.shape[0], dtype=jnp.int32), keys
-    )
     jax.block_until_ready(banks)
+    probes = jnp.asarray(
+        [0, args.page_size - 1, args.page_size, keys.shape[0] // 2, keys.shape[0] - 1],
+        jnp.int32,
+    )
+    values, scales, _ = quantize_index_rows(keys[probes])
+    np.testing.assert_array_equal(
+        np.asarray(read_fp8_records(banks, probes, layout)),
+        np.asarray((values.astype(jnp.float32) * scales[:, None]).astype(jnp.bfloat16)),
+    )
     del pool, keys
     q = jax.random.normal(jax.random.key(827), (tokens, 32, 128)).astype(
         jnp.float8_e4m3fn
