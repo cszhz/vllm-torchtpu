@@ -53,9 +53,10 @@ DENSE_PROJ_SUB_N = 512
 # Kept small so XLA can leave the fp8 activation in VMEM, where act_quant_rows
 # wrote it; with 48 MiB it moves the K=8192 activation to HBM first.
 DENSE_PROJ_VMEM_LIMIT_BYTES = 24 * 1024 * 1024
-# With a fused epilogue every grid step ends in a VPU tail on its last chunk
-# with no MXU work to hide under, so the weight tile is wider (fewer steps).
-DENSE_PROJ_EPILOGUE_W_TILE_BYTES = 4 * 1024 * 1024
+# fp8 weight bytes per grid step with a fused epilogue. The epilogue is
+# pipelined across steps, so a step boundary costs little and a narrower tile
+# shortens the first weight fetch and the last output writeback, both exposed.
+DENSE_PROJ_EPILOGUE_W_TILE_BYTES = 2 * 1024 * 1024
 DENSE_PROJ_EPILOGUE_VMEM_LIMIT_BYTES = 40 * 1024 * 1024
 # Rows per dot in the epilogue-fused kernel: a chunk's epilogue can start on
 # its first rows while the MXU computes the rest.
