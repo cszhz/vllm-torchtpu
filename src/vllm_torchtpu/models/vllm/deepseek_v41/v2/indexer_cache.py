@@ -117,7 +117,10 @@ class PackedFP8IndexerSpec(MLAAttentionSpec):
         )
         super().__post_init__()
         size = max(self.alignment or 1, self.real_page_size_bytes)
-        object.__setattr__(self, "page_size_padded", 1 << (size - 1).bit_length())
+        minimum = 1 << (size - 1).bit_length()
+        # replace() reruns this; keep larger padding such as the SWA budget.
+        if (self.page_size_padded or 0) < minimum:
+            object.__setattr__(self, "page_size_padded", minimum)
 
     @classmethod
     def merge(cls, specs):
