@@ -164,6 +164,13 @@ def _cpu_proxy(m: Any, memo: dict | None = None) -> Any:
 # `VLLM_TPU_MEGAKERNEL=...,nodonate=1`: the GDN pool is not donated to the segment op; it
 # writes a fresh pool that `_run` copies back into the live cache (bisecting a served hang).
 NO_DONATE = False
+# Largest whole-step bucket: its VMEM plan fits up to 64 rows (`wholestep_tiles`).
+WHOLE_MAX_ROWS = 64
+# Model steps after warmup (verify steps; any step once disabled) by which a `whole=1`
+# server must have made a whole-step call.
+WHOLE_SELF_CHECK_STEPS = 200
+STEP_MIX_EVERY = 5000  # steps between periodic step-mix log lines
+STEP_MIX_INTERVAL_S = float(os.environ.get("VLLM_TPU_MK_STEP_MIX_INTERVAL_S", "10") or 0)
 
 _UNSET = object()
 
@@ -563,6 +570,18 @@ class Qwen38SegmentDriver:
         self.sync = False  # `sync=1`: wait for the first calls' outputs and log it (bisecting)
         self.warm = False  # `warm=1`: host barriers around the first (compiling) call
         self.noaot = False  # `noaot=1`: no AOT serialization / compile cache for the segment program
+        # `whole=1`: layers 3..46 in one whole-step call (`Qwen4ExpWholeStepModel`) on steps
+        # whose every request's context is <= `wholecap=N` tokens (others: segment program).
+        self.whole = False
+        self.whole_cap = 32768
+        self.whole_hold = "buffer"  # `wholehold=param|list|buffer`: how the operands are held
+        # `wholerows=N`: whole-step only up to N rows (its in-kernel indexer / attention run row
+        # by row, ~0.25 ms per row: it loses to the segment / stock path at high concurrency).
+        self.whole_max_rows = 16
+        self.whole_above = "stock"  # `wholeabove=stock|seg`: steps above `wholerows`
+        self.whole_program = None
+        self.whole_calls = 0
+        self.whole_dry = False  # `wholedry=1`: decide and count as whole=1, run stock (AL control)
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -625,6 +644,41 @@ class Qwen38SegmentDriver:
         drv.sync = _parse_flag(raw, "sync", False)
         drv.warm = _parse_flag(raw, "warm", False)
         drv.noaot = _parse_flag(raw, "noaot", False)
+        drv.whole = _parse_flag(raw, "whole", False)
+        drv.whole_dry = _parse_flag(raw, "wholedry", False)
+        cap = _parse_int(raw, "wholecap")
+        if cap is not None:
+            drv.whole_cap = cap
+        if _parse_flag(raw, "wholeshard", False):
+            from . import qwen38_wholestep_call
+
+            qwen38_wholestep_call.SHARD_INDEX = True
+        if _parse_flag(raw, "wholeunion", False):
+            from . import qwen38_wholestep_call
+
+            qwen38_wholestep_call.UNION_ATTN = True
+        if _parse_flag(raw, "wholephys", False):
+            from . import qwen38_wholestep_call
+
+            qwen38_wholestep_call.UNION_PHYS = True
+        if _parse_flag(raw, "wholeloop", False):
+            from . import qwen38_wholestep_call
+
+            qwen38_wholestep_call.LOOP_REQUESTS = True
+        every = _parse_int(raw, "wholestats")
+        if every:
+            from . import qwen38_wholestep_call
+
+            qwen38_wholestep_call.UNION_STATS_EVERY = every
+        rows_max = _parse_int(raw, "wholerows")
+        if rows_max is not None:
+            drv.whole_max_rows = rows_max
+        for part in raw.split(","):
+            if part.startswith("wholeabove="):
+                drv.whole_above = part[len("wholeabove=") :]
+        for part in raw.split(","):
+            if part.startswith("wholehold="):
+                drv.whole_hold = part[len("wholehold=") :]
         global NO_DONATE
         NO_DONATE = _parse_flag(raw, "nodonate", False)
         if not _parse_flag(raw, "replay", False):
@@ -677,7 +731,9 @@ class Qwen38SegmentDriver:
 
         stack = contextlib.ExitStack()
         stack.enter_context(set_model_tag(tag))
-        cfg = getattr(self, "cfg", None) or runner.vllm_config
+        cfg = (getattr(self, "whole_cfg", None) if tag == "model_mk_whole" else None) or (
+            getattr(self, "cfg", None) or runner.vllm_config
+        )
         stack.enter_context(set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=cfg))
         stack.enter_context(set_current_vllm_config(cfg))
         if getattr(self, "noaot", False):
@@ -724,6 +780,8 @@ class Qwen38SegmentDriver:
                 backbone=runner.model.model,
                 segments=self.segments,
             )
+        if self.whole:
+            self._attach_whole(runner)
         if self.mtp:
             self._attach_mtp_tail(runner)
         if self.check_left > 0:
@@ -1088,6 +1146,95 @@ class Qwen38SegmentDriver:
             mixed = bb.hyper_connection_mixer.mix(h)[0]
         return (mixed, h) if bb.emit_mtp_hidden else mixed
 
+
+    def _attach_whole(self, runner: Any) -> None:
+        """The whole-step program (its own compiled class); on failure it stays off."""
+        from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpWholeStepModel
+
+        from .qwen38_wholestep import Qwen38WholeStep
+
+        try:
+            attn = next(l.self_attn for l in self.segments.layers if l.layer_type == "full_attention")
+            budget = int(attn.token_topk) // int(attn.compress_ratio)
+            max_groups = -(-self.whole_cap // 4 // 1024) * 1024
+            # vLLM compiles a module for every compile size on its first call: the whole-step
+            # program compiles only the buckets it can serve (w04 j-05391f11: the 96-row bucket
+            # of the segment driver ran out of VMEM, 67.9 of 63 MiB, and disabled the MK).
+            buckets = tuple(b for b in self.buckets if b <= min(WHOLE_MAX_ROWS, self.whole_max_rows))
+            if not buckets:
+                raise ValueError(f"no whole-step bucket <= {self.whole_max_rows} rows in {self.buckets}")
+            import copy
+
+            self.whole_cfg = copy.copy(self.cfg)
+            cc = copy.copy(self.cfg.compilation_config)
+            cc.compile_sizes = list(buckets)
+            object.__setattr__(self.whole_cfg, "compilation_config", cc)
+            whole = Qwen38WholeStep(
+                runner.model, self.g, self.mesh, buckets, budget=budget, max_groups=max_groups,
+                hold=self.whole_hold,
+            )
+            whole.bind_pool(self.segments.pool, self.segments.layout)
+            self.whole_module = whole
+            with self._contexts(runner, "model_mk_whole"):
+                self.whole_program = Qwen4ExpWholeStepModel(
+                    vllm_config=self.whole_cfg,
+                    prefix="model_mk_whole",
+                    backbone=runner.model.model,
+                    segments=self.segments,
+                    whole=whole,
+                )
+            logger.info(
+                "Qwen3.8 whole-step megakernel attached: layers 3..46, context cap %d, rows <= %d, "
+                "budget %d, max_groups %d, %d operands, hold %s", self.whole_cap, self.whole_max_rows,
+                budget, max_groups, whole.n_w, self.whole_hold,
+            )
+        except Exception:
+            logger.exception("Qwen3.8 whole-step: setup failed; segment program only")
+            self.whole_program = None
+
+    def _whole_self_check(self, runner: Any) -> None:
+        """Loud error if `whole=1` but no whole-step call ran in the first model steps after
+        warmup: a silent fall-back to stock (w06g / w07g served GSM8K on stock after the MK
+        failed at its first call) then shows within minutes instead of at the end of a run."""
+        if getattr(self, "_whole_checked", False) or not getattr(runner, "warmup_done", False):
+            return
+        if not hasattr(self, "_whole_check_base"):
+            self._whole_check_base, self._whole_check_steps = self.whole_calls, 0
+        self._whole_check_steps += 1
+        if self._whole_check_steps < WHOLE_SELF_CHECK_STEPS:
+            return
+        self._whole_checked = True
+        served = self.whole_calls - self._whole_check_base
+        if self.whole_dry:  # no whole-step call by design; report the would-be count instead
+            logger.info(
+                "Qwen3.8 whole-step self-check (wholedry): %d whole-step calls (expected 0), %d "
+                "dry whole-eligible steps so far; step mix %s",
+                served, sum(v for k, v in self.stats.items() if k.startswith("dry_whole_b")),
+                dict(sorted(self.stats.items())),
+            )
+        elif served == 0:
+            logger.error(
+                "Qwen3.8 whole-step SELF-CHECK FAILED: whole=1 but no whole-step call in the "
+                "first %d steps after warmup (megakernel %s); step mix %s",
+                WHOLE_SELF_CHECK_STEPS,
+                "disabled" if self.whole_program is None else "on, nothing eligible",
+                dict(sorted(self.stats.items())),
+            )
+        else:
+            logger.info(
+                "Qwen3.8 whole-step self-check: %d whole-step calls in the first %d verify steps",
+                served, WHOLE_SELF_CHECK_STEPS,
+            )
+
+    def _whole_eligible(self, runner: Any, n_req: int, rows: int) -> bool:
+        if self.whole_program is None or rows > min(WHOLE_MAX_ROWS, self.whole_max_rows):
+            return False
+        try:
+            ctx = runner.input_batch.num_computed_tokens_cpu[:n_req]
+            return int(ctx.max()) + T_VERIFY <= self.whole_cap
+        except Exception:
+            return False
+
     def _attach_mtp_tail(self, runner: Any) -> None:
         """Route the MTP draft layer's post-attention half to the tail kernel.
 
@@ -1205,11 +1352,32 @@ class Qwen38SegmentDriver:
         except Exception as exc:
             logger.info("qwen38 megakernel gdn meta: unavailable (%s)", exc)
 
+    def _count(self, key: str, n: int) -> None:
+        """Add `n` to a counter logged with the step mix without counting a step (drafted
+        tokens per path, for attributing accepted tokens to whole-step vs stock steps)."""
+        self.counters = getattr(self, "counters", {})
+        self.counters[key] = self.counters.get(key, 0) + n
+
     def _note(self, key: str) -> None:
         self.stats[key] = self.stats.get(key, 0) + 1
         n = sum(self.stats.values())
-        if n & (n - 1) == 0 and n >= 64:
+        # Powers of two early, then every STEP_MIX_EVERY steps, so the mix can be joined in
+        # time to the serving metrics (AL windows) over a whole run.
+        if (n & (n - 1) == 0 and n >= 64) or n % STEP_MIX_EVERY == 0:
             logger.info("qwen38 megakernel step mix: %s", dict(sorted(self.stats.items())))
+        if STEP_MIX_INTERVAL_S:
+            import time
+
+            now = time.monotonic()
+            if now - getattr(self, "_mix_t", 0.0) >= STEP_MIX_INTERVAL_S:
+                # Cumulative counts on a wall-clock cadence matching vLLM's spec-decode metrics
+                # interval: differencing both per window attributes accepted / drafted tokens to
+                # whole-step vs stock steps (tools: whole_path_al.py).
+                self._mix_t = now
+                logger.info(
+                    "qwen38 megakernel step mix (timed): %s counters %s",
+                    dict(sorted(self.stats.items())), dict(getattr(self, "counters", {})),
+                )
 
     def try_forward(
         self,
@@ -1220,12 +1388,14 @@ class Qwen38SegmentDriver:
         intermediate_tensors: Any,
         model_kwargs: Any = None,
     ) -> tuple[bool, Any]:
-        if self.program is None or inputs_embeds is not None or intermediate_tensors is not None:
+        if inputs_embeds is not None or intermediate_tensors is not None:
             # Counted like every other stock route, so a bypass shows in the mix.
-            self._note(
-                "stock_noprogram" if self.program is None
-                else ("stock_embeds" if inputs_embeds is not None else "stock_intermediate")
-            )
+            self._note("stock_embeds" if inputs_embeds is not None else "stock_intermediate")
+            return False, None
+        if self.program is None:  # disabled (it failed): the self-check still counts steps
+            self._note("stock_noprogram")
+            if self.whole:
+                self._whole_self_check(runner)
             return False, None
         self.seq += 1
         ok, n_req, t_seq, reason = MegakernelDriver._inspect_step_detail(None, None, runner)
@@ -1233,8 +1403,29 @@ class Qwen38SegmentDriver:
         if not ok or t_seq != T_VERIFY:
             self._note(reason if not ok else f"stock_t{t_seq}")
             return False, None
+        if self.whole:
+            self._whole_self_check(runner)
         if rows not in self.buckets or n_req * T_VERIFY > rows:
             self._note(f"stock_rows{rows}_n{n_req}")
+            return False, None
+        if (
+            self.whole_program is not None
+            and self.whole_above == "stock"
+            and not self._whole_eligible(runner, n_req, rows)
+        ):
+            # Above `wholerows` or past `wholecap`: stock, not the segment program, which only
+            # compiles (all its buckets, mid-serving) on its first call (w05 j-84f89805: a c1
+            # AgentX request past the 32K cap started that compile and the sampler RPC timed out).
+            above = rows > min(WHOLE_MAX_ROWS, self.whole_max_rows)
+            self._note(f"stock_above_whole_b{rows}" if above else "stock_whole_ctx")
+            self._count("drafts_stock", n_req * (T_VERIFY - 1))
+            return False, None
+        if self.whole_dry and self.whole_program is not None:
+            # `wholedry=1`: the same eligibility decision and per-path draft counters, but the
+            # whole-step-eligible steps run stock too: the stock acceptance of exactly the
+            # requests whole-step would serve (per-path AL control).
+            self._note(f"dry_whole_b{rows}")
+            self._count("drafts_whole", n_req * (T_VERIFY - 1))
             return False, None
         self._note(f"mk_b{rows}")
         self.mk_calls += 1
@@ -1284,6 +1475,16 @@ class Qwen38SegmentDriver:
         try:
             if self.check_left > 0 and self.shadow is not None:
                 out = self._shadow_step(runner, input_ids, positions, kw)
+            elif self._whole_eligible(runner, n_req, rows):
+                self.whole_calls += 1
+                self._count("drafts_whole", n_req * (T_VERIFY - 1))
+                self._note(f"whole_b{rows}")
+                with self._contexts(runner, "model_mk_whole"):
+                    out = self.whole_program(input_ids=input_ids, positions=positions, **kw)
+                from . import qwen38_wholestep_call as wsc
+
+                if wsc.union_stats_on() and self.whole_calls % wsc.UNION_STATS_EVERY == 0:
+                    self.whole_module.log_union_stats(self.whole_calls)
             else:
                 with self._serve_contexts(runner):
                     out = self.program(input_ids=input_ids, positions=positions, **kw)
@@ -1291,7 +1492,7 @@ class Qwen38SegmentDriver:
             # Fail closed: one failure disables the megakernel for this server;
             # this step and all later ones run the stock model.
             logger.exception("Qwen3.8 megakernel failed; disabling it, stock path from now on")
-            self.program = self.shadow = None
+            self.program = self.shadow = self.whole_program = None
             return False, None
         if isinstance(out, (list, tuple)):
             out = tuple(out)
