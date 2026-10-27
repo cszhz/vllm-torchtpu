@@ -980,6 +980,7 @@ def _build_fused_ep_moe_kernel(
 
         def w1_chunk_copy(expert, slot, c):
             """Gate/up column chunk `c` of `expert`, into weight slot `slot`."""
+            assert w1c_sems is not None
             cols = pl.ds(c * W1_STREAM_CHUNK, W1_STREAM_CHUNK)
             return pltpu.make_async_copy(
                 w1_hbm.at[expert, :, cols], w1_vm.at[slot, :, cols], w1c_sems.at[c]
@@ -987,6 +988,7 @@ def _build_fused_ep_moe_kernel(
 
         def w2_chunk_copy(expert, slot, c):
             """Down column chunk `c` of `expert`, into weight slot `slot`."""
+            assert w2c_sems is not None
             cols = pl.ds(c * W2_STREAM_CHUNK, W2_STREAM_CHUNK)
             return pltpu.make_async_copy(
                 w2_hbm.at[expert, :, cols], w2_vm.at[slot, :, cols], w2c_sems.at[c]

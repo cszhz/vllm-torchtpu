@@ -520,6 +520,7 @@ def fused_ep_moe_v2(
         w2s_l = next(operands) if form.has_scales else None
         if scales_expert_second_minor:
             # A bitcast for a table already laid out expert-minor; see above.
+            assert w1s_l is not None and w2s_l is not None
             w1s_l = jnp.transpose(w1s_l, (1, 0, 2))
             w2s_l = jnp.transpose(w2s_l, (1, 0, 2))
         gate_l = next(operands)
