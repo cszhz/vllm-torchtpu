@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Analytical TPU serving roofline, step floor, and mesh/SLO solver."""
+"""Analytical TPU serving roofline, step floor, mesh solver, and knob registry."""
 
 from __future__ import annotations
 
@@ -33,6 +33,15 @@ from .modules import (
     experts_touched,
     pass_costs,
 )
+from .registry import (
+    KNOBS,
+    PENDING_ENV_KEYS,
+    THRESHOLD_KEY_RE,
+    Knob,
+    default_envs_path,
+    env_keys,
+    threshold_env_keys,
+)
 from .serving import ConcurrencyRow, plan
 from .solver import (
     SCENARIO_PRESETS,
@@ -49,15 +58,19 @@ from .step import StepFloor, spec_cycle_floor, step_floor
 
 __all__ = [
     "CHIPS",
+    "KNOBS",
     "LAYER_FAMILIES",
+    "PENDING_ENV_KEYS",
     "SCENARIO_PRESETS",
     "SLO_TIERS",
+    "THRESHOLD_KEY_RE",
     "TOPOLOGIES",
     "ChipSpec",
     "Collective",
     "CollectiveTable",
     "ConcurrencyRow",
     "Dtypes",
+    "Knob",
     "ModelGeometry",
     "ModuleCost",
     "Parallel",
@@ -69,7 +82,9 @@ __all__ = [
     "StepShape",
     "TrafficScenario",
     "build_scenario",
+    "default_envs_path",
     "dtypes_from_hf_config",
+    "env_keys",
     "ep_busiest_experts",
     "experts_touched",
     "from_hf_config",
@@ -81,5 +96,6 @@ __all__ = [
     "spec_cycle_floor",
     "step_floor",
     "submesh_for_group",
+    "threshold_env_keys",
     "torus_collective_s",
 ]
