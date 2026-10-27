@@ -355,6 +355,114 @@ class CorrectnessTest(parameterized.TestCase):
         print(f"Max Diff Out: {np.max(diff_out)}")
         np.testing.assert_allclose(out_base, out_agent, rtol=0.1, atol=0.1)
 
+    @parameterized.named_parameters(
+        # Every chunk is one sequence's: all take the shared-KV path.
+        ("chunk_aligned", (256, 256)),
+        # The chunk holding the sequence boundary keeps the gather path.
+        ("chunk_mixed", (320, 192)),
+    )
+    def test_shared_kv_prefill(self, seq_lens):
+        """Early-prefill tokens whose top-k is every candidate, at a page size
+        and batch that compile the shared-KV path."""
+        topk = 512
+        num_heads = 64
+        head_dim = 512
+        page_size = 256
+        rng = np.random.default_rng(0)
+
+        num_seqs = len(seq_lens)
+        new_kv_lens = jnp.array(seq_lens, jnp.int32)
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
+        total_tokens = int(cu_q_lens[-1])
+        assert total_tokens >= sparse_mla.SHARED_KV_MIN_TOKENS
+
+        # Token t of a sequence starting at compressed row `first` sees
+        # min(first + t // 4, topk) rows, the first ones none at all.
+        firsts = (0, 300)
+        topk_indices, kv_lens = [], []
+        for n, first in zip(seq_lens, firsts):
+            for t in range(n):
+                kv_len_t = min(first + t // 4, topk)
+                row = np.full(topk, -1, np.int32)
+                row[:kv_len_t] = rng.permutation(kv_len_t)
+                topk_indices.append(row)
+            kv_lens.append(min(first + (n - 1) // 4, topk))
+        topk_indices = jnp.array(np.stack(topk_indices))
+        kv_lens = jnp.array(kv_lens, jnp.int32)
+
+        pages_per_seq = 9
+        page_indices = jnp.array(
+            rng.permutation(num_seqs * pages_per_seq), dtype=jnp.int32
+        )
+        cache_kv_base, cache_kv_nope, cache_kv_rope = create_cache(
+            rng, num_seqs * pages_per_seq, page_size, head_dim, jnp.bfloat16
+        )
+        distribution = jnp.array([0, num_seqs, num_seqs], dtype=jnp.int32)
+        attention_sinks = generate_attention_sinks(rng, num_heads)
+        q = gen_random(rng, (total_tokens, num_heads, head_dim), jnp.bfloat16)
+        swa_accumution = gen_random(
+            rng, (total_tokens, num_heads, head_dim), jnp.bfloat16
+        )
+        swa_l = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
+        swa_m = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
+
+        out_base = ref_implementation(
+            q,
+            cache_kv_base,
+            kv_lens,
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            sm_scale=head_dim**-0.5,
+        )
+        out_agent = sparse_mla.sparse_ragged_paged_attention(
+            q,
+            cache_kv_nope,
+            cache_kv_rope,
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            sm_scale=head_dim**-0.5,
+            attention_kernel_batch_size=16,
+            gather_and_attention_chunk_size=128,
+        )
+        np.testing.assert_allclose(
+            np.asarray(out_base, np.float32),
+            np.asarray(out_agent, np.float32),
+            rtol=0.02,
+            atol=0.02,
+        )
+
+    def test_selects_leading_rows(self):
+        topk_indices = jnp.array(
+            [
+                [2, 0, 1, -1],  # every candidate, shuffled
+                [0, 1, 1, -1],  # duplicate
+                [0, 2, -1, -1],  # skips row 1
+                [-1, -1, -1, -1],  # no candidates
+                [1, -1, 0, -1],  # padding not a suffix
+                [3, 1, 2, 0],
+            ],
+            jnp.int32,
+        )
+        kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+        np.testing.assert_array_equal(
+            sparse_mla._selects_leading_rows(topk_indices, kv_lens),
+            [True, False, False, True, False, True],
+        )
+
 
 if __name__ == "__main__":
     absltest.main()
