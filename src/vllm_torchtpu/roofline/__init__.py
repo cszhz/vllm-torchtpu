@@ -11,10 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Analytical TPU serving roofline, step floor, mesh solver, and knob registry."""
+"""Analytical TPU serving roofline, step floor, solver, registry, and bucket scorer."""
 
 from __future__ import annotations
 
+from .buckets import (
+    DEFAULT_SGLANG_BUCKETS,
+    DEFAULT_VLLM_BUCKETS,
+    BucketRegimePlan,
+    BucketRegimeRow,
+    BucketThresholdBand,
+    bucket_step_shape,
+    megakernel_scratchpad_bytes,
+    parse_bucket_overrides,
+    recommend_bucket_regimes,
+    validate_zero_reshard_regimes,
+)
 from .chips import CHIPS, TOPOLOGIES, ChipSpec, SliceTopology
 from .collectives import (
     Collective,
@@ -58,6 +70,8 @@ from .step import StepFloor, spec_cycle_floor, step_floor
 
 __all__ = [
     "CHIPS",
+    "DEFAULT_SGLANG_BUCKETS",
+    "DEFAULT_VLLM_BUCKETS",
     "KNOBS",
     "LAYER_FAMILIES",
     "PENDING_ENV_KEYS",
@@ -65,6 +79,9 @@ __all__ = [
     "SLO_TIERS",
     "THRESHOLD_KEY_RE",
     "TOPOLOGIES",
+    "BucketRegimePlan",
+    "BucketRegimeRow",
+    "BucketThresholdBand",
     "ChipSpec",
     "Collective",
     "CollectiveTable",
@@ -81,6 +98,7 @@ __all__ = [
     "StepFloor",
     "StepShape",
     "TrafficScenario",
+    "bucket_step_shape",
     "build_scenario",
     "default_envs_path",
     "dtypes_from_hf_config",
@@ -90,12 +108,16 @@ __all__ = [
     "from_hf_config",
     "hbm_footprint_per_core_bytes",
     "load_hf_config",
+    "megakernel_scratchpad_bytes",
+    "parse_bucket_overrides",
     "pass_costs",
     "plan",
+    "recommend_bucket_regimes",
     "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",
     "submesh_for_group",
     "threshold_env_keys",
     "torus_collective_s",
+    "validate_zero_reshard_regimes",
 ]
