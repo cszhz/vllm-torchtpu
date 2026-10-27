@@ -18,7 +18,13 @@ import numpy as np
 import pytest
 from absl.testing import absltest, parameterized
 
-from vllm_torchtpu.kernels.deepseek_v4.rope import qnorm_rope, rope, rope_quant
+from vllm_torchtpu.kernels.deepseek_v4.rope import (
+    project_qnorm_rope,
+    qnorm_rope,
+    rope,
+    rope_quant,
+)
+from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 pytestmark = pytest.mark.tpu_test
 
@@ -230,6 +236,36 @@ class QNormRopeTest(parameterized.TestCase):
             inverse=False,
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+class ProjectQNormRopeTest(parameterized.TestCase):
+    """wq_b with qnorm_rope fused into its matmul epilogue."""
+
+    @parameterized.product(num_tokens=(256, 512, 1024))
+    def test_bit_exact_vs_unfused(self, num_tokens):
+        """Same bits as golden's XLA fp8 dot followed by ``qnorm_rope``."""
+        q_lora_rank, max_position, eps = 1024, 4096, 1e-6
+        rng = np.random.default_rng(num_tokens)
+        x = jnp.asarray(
+            rng.normal(size=(num_tokens, q_lora_rank)) * 4, dtype=jnp.bfloat16
+        )
+        w = rng.normal(size=(q_lora_rank, NUM_HEADS * HEAD_DIM)) * 64
+        w_q = jnp.asarray(np.clip(w, -448, 448), dtype=jnp.float8_e4m3fn)
+        w_scale = jnp.asarray(
+            rng.uniform(1e-3, 1e-2, size=(NUM_HEADS * HEAD_DIM,)), dtype=jnp.float32
+        )
+        positions = jnp.asarray(
+            rng.integers(0, max_position, size=(num_tokens,)), dtype=jnp.int32
+        )
+        cos_sin_cache = jnp.asarray(make_cos_sin_cache(max_position, ROTARY_DIM))
+
+        q = xla_quantized_matmul(x, w_q, w_scale)
+        q = q.reshape(num_tokens, NUM_HEADS, HEAD_DIM)
+        expected = qnorm_rope(q, positions, cos_sin_cache, eps=eps)
+        actual = project_qnorm_rope(
+            x, w_q, w_scale, positions, cos_sin_cache, head_dim=HEAD_DIM, eps=eps
+        )
+        assert_bits_equal(actual, expected)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,15 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    DENSE_PROJ_SUB_M,
+    DENSE_PROJ_SUB_N,
+    DenseProjEpilogue,
+    dense_proj_matmul,
+    dense_proj_matmul_applies,
+    quantize_tensor,
+    xla_quantized_matmul,
+)
 from vllm_torchtpu.layers.core.quantization import dtype_max
 from vllm_torchtpu.utils import largest_divisor
 
@@ -28,6 +37,10 @@ from vllm_torchtpu.utils import largest_divisor
 LANE = 128
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+
+# Tokens per RMSNorm + RoPE step in project_qnorm_rope's matmul epilogue, and
+# per cos/sin lane expansion on its first grid step.
+QNORM_EPILOGUE_ROWS = 32
 
 
 @jax.tree_util.register_dataclass
@@ -312,19 +325,25 @@ def _qnorm_rope_body(
     rotation ``_rope_body`` applies.
     """
     x = x_ref[...].astype(jnp.float32)
+    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
+    assert x.ndim == 3
+    y = _qnorm_rope_rows(x, cos[:, None, :], sin[:, None, :], eps=eps)
+    out_ref[...] = y.astype(out_dtype)
+
+
+def _qnorm_rope_rows(
+    x: jax.Array, cos: jax.Array, sin: jax.Array, *, eps: float
+) -> jax.Array:
+    """RMSNorm (no weight) of each ``head_dim`` row of f32 ``x``, then RoPE on
+    its last lane block with ``cos``/``sin`` from ``_cos_sin_lanes``."""
     rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
     y = x * rms
 
     # Only the last lane block holds roped channels; the rest of the row passes
     # through with nothing but the norm applied.
     tail = y[..., -LANE:]
-    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
-    assert tail.ndim == 3
-    cos = cos[:, None, :]
-    sin = sin[:, None, :]
     roped = tail * cos + _rotate_gptj(tail) * sin
-
-    out_ref[...] = jnp.concatenate([y[..., :-LANE], roped], axis=-1).astype(out_dtype)
+    return jnp.concatenate([y[..., :-LANE], roped], axis=-1)
 
 
 def _qnorm_rope_kernel(
@@ -576,6 +595,78 @@ def qnorm_rope(
         ),
         name=name,
     )(positions, x, cos_sin_cache)
+
+
+def _qnorm_rope_epilogue(
+    positions: jax.Array, cos_sin_cache: jax.Array, *, eps: float
+) -> DenseProjEpilogue:
+    """qnorm_rope as dense_proj_matmul's epilogue, one head per output chunk."""
+    num_tokens = positions.shape[0]
+    rotary_dim = cos_sin_cache.shape[1]
+    rows = largest_divisor(num_tokens, cap=QNORM_EPILOGUE_ROWS)
+
+    def init(operand_refs, scratch_refs):
+        (cos_sin_ref,) = operand_refs
+        cos_ref, sin_ref = scratch_refs
+        for r in range(0, num_tokens, rows):
+            cos, sin = _cos_sin_lanes(
+                cos_sin_ref[pl.ds(r, rows), :], rotary_dim=rotary_dim, inverse=False
+            )
+            cos_ref[pl.ds(r, rows), :] = cos
+            sin_ref[pl.ds(r, rows), :] = sin
+
+    def block(y, row0, operand_refs, scratch_refs):
+        del operand_refs
+        cos_ref, sin_ref = scratch_refs
+        cos = cos_ref[pl.ds(row0, rows), :]
+        sin = sin_ref[pl.ds(row0, rows), :]
+        return _qnorm_rope_rows(y.astype(jnp.float32), cos, sin, eps=eps).astype(
+            y.dtype
+        )
+
+    return DenseProjEpilogue(
+        operands=(cos_sin_cache[positions],),
+        scratch_shapes=(
+            pltpu.VMEM((num_tokens, LANE), jnp.float32),
+            pltpu.VMEM((num_tokens, LANE), jnp.float32),
+        ),
+        rows=rows,
+        init=init,
+        block=block,
+    )
+
+
+def project_qnorm_rope(
+    x: jax.Array,  # [num_tokens, q_lora_rank] bf16
+    w_q: jax.Array,  # [q_lora_rank, num_heads * head_dim] fp8
+    w_scale: jax.Array,  # [num_heads * head_dim]
+    positions: jax.Array,  # [num_tokens] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    head_dim: int,
+    eps: float,
+) -> jax.Array:
+    """The per-channel fp8 wq_b projection followed by ``qnorm_rope``.
+
+    Where dense_proj_matmul runs the projection, qnorm_rope's arithmetic runs in
+    its epilogue on each head while the head is still in VMEM, so q is written
+    to HBM once, already normed and roped. Otherwise this is the two ops back
+    to back. Returns ``[num_tokens, num_heads, head_dim]``.
+    """
+    num_tokens = x.shape[0]
+    q_shape = (num_tokens, w_q.shape[1] // head_dim, head_dim)
+    if not dense_proj_matmul_applies(x, w_q, w_scale):
+        q = xla_quantized_matmul(x, w_q, w_scale)
+        return qnorm_rope(q.reshape(q_shape), positions, cos_sin_cache, eps=eps)
+    x_q, x_scale = quantize_tensor(x, w_q.dtype)
+    # One head per epilogue chunk, and all tokens in one row chunk: the cos/sin
+    # scratch for more tokens does not fit next to the matmul's tiles.
+    if head_dim != DENSE_PROJ_SUB_N or num_tokens > DENSE_PROJ_SUB_M:
+        q = dense_proj_matmul(x_q, x_scale, w_q, w_scale, x.dtype)
+        return qnorm_rope(q.reshape(q_shape), positions, cos_sin_cache, eps=eps)
+    epilogue = _qnorm_rope_epilogue(positions, cos_sin_cache, eps=eps)
+    q = dense_proj_matmul(x_q, x_scale, w_q, w_scale, x.dtype, epilogue=epilogue)
+    return q.reshape(q_shape)
 
 
 @functools.partial(jax.jit, static_argnames=("inverse", "quant_dtype", "name"))
