@@ -5141,7 +5141,9 @@ def _attention_splits(rows, sequence_rows):
     group rows (None: one call)."""
     count = _config().mla_dp_split
     sequences = rows // sequence_rows
-    if count <= 1 or sequence_rows == 1 or sequences < count:
+    # Only verifies on the explicit 4-row chunks (_verify_chunk), so every
+    # sub-call keeps the whole call's chunk geometry.
+    if count <= 1 or sequences < count or _verify_chunk(rows, 6, sequence_rows) is None:
         return None
     bounds = [sequences * part // count * sequence_rows for part in range(count + 1)]
     return tuple((bounds[part], bounds[part + 1] - bounds[part], sequence_rows) for part in range(count))
@@ -5211,9 +5213,18 @@ def mla_dcp_shards(
             base_row = cache.table_row
             cache = dataclasses.replace(
                 cache, table_row=lambda row: (row + first if base_row is None else base_row(row + first)))
-        return mla_dcp.DcpAttention(cache, dcp[1], _OffsetRows(position_ref, first), count,
-                                    skip=_config().dcp_skip, heads=3 * shards, sequence_rows=split_rows,
-                                    chunk_rows=_verify_chunk(count, 3 * shards, split_rows))
+        if len(splits) == 1:
+            chunk_rows = _verify_chunk(count, 3 * shards, split_rows)
+        else:
+            # Sub-calls keep the whole call's chunk geometry: the workspace was
+            # laid out for it.
+            chunk_rows = _verify_chunk(rows, 3 * shards, sequence_rows)
+        attention = mla_dcp.DcpAttention(cache, dcp[1], _OffsetRows(position_ref, first), count,
+                                         skip=_config().dcp_skip, heads=3 * shards, sequence_rows=split_rows,
+                                         chunk_rows=chunk_rows)
+        if len(splits) > 1:
+            attention.force_chunked = mla_dcp.chunked(rows)
+        return attention
 
     dcp_attention = split_attention(0)
     dcp_attention.prime()
