@@ -53,6 +53,8 @@ class TopkLookup:
     total_pages: int
     # Entries of the selection mask written for each skipped token (0: none).
     select_rows: int = 0
+    # False: write only the selection masks, gather no rows.
+    gather: bool = True
 
 
 def _lookup_rows(
@@ -370,11 +372,15 @@ def main_kernel(
         gather_steps = num_steps
         if lookup is not None:
             run &= b * num_cores + core_index < lookup.num_tokens
-            # The rows past the token's last step are left unwritten.
-            gather_steps = _valid_steps(
-                in_ref, top_k=top_k, num_lanes=num_simd_lanes, step_entries=step_entries
-            )
-            run &= gather_steps > 0
+            if lookup.gather:
+                # The rows past the token's last step are left unwritten.
+                gather_steps = _valid_steps(
+                    in_ref,
+                    top_k=top_k,
+                    num_lanes=num_simd_lanes,
+                    step_entries=step_entries,
+                )
+                run &= gather_steps > 0
             # A negative sequence marks a token whose consumer reads its rows
             # from the paged cache itself (see `csa_gather_topk`).
             local = jnp.minimum(b * num_cores + core_index, lookup.num_tokens - 1)
@@ -394,6 +400,9 @@ def main_kernel(
                         top_k=top_k,
                         num_lanes=num_simd_lanes,
                     )
+
+            if not lookup.gather:
+                run = False
 
         @pl.when(run)
         def _run_gather():
@@ -511,6 +520,7 @@ def csa_gather(
         "top_k",
         "pages_per_seq",
         "select_rows",
+        "gather",
     ),
 )
 def csa_gather_topk(
@@ -526,6 +536,7 @@ def csa_gather_topk(
     top_k: int,
     pages_per_seq: int,
     select_rows: int = 0,
+    gather: bool = True,
 ) -> tuple[jax.Array, ...]:
     """`csa_gather` of tokens `[token_start, token_start + num_tokens)`, given
     their top-k entries rather than cache rows.
@@ -545,6 +556,8 @@ def csa_gather_topk(
         tokens' selection masks, int32 (num_tokens * select_rows // 128, 128):
         token t's rows [t, t + 1) * select_rows // 128 hold 1 at each of its
         top-k entries x (word x of the flattened rows) and 0 elsewhere.
+      gather: False writes only the selection masks; the two gather outputs
+        are then unwritten placeholders of one 128-entry block.
 
     Returns:
       `csa_gather`'s outputs for the chunk's `num_tokens * top_k` entries.
@@ -578,13 +591,15 @@ def csa_gather_topk(
         num_seqs=page_indices.shape[0] // pages_per_seq,
         total_pages=nope_cache.shape[0],
         select_rows=select_rows,
+        gather=gather,
     )
+    assert gather or select_rows, "a mask-only launch needs select_rows"
     return _launch(
         nope_cache,
         rope_cache,
         (topk_tiles,),
         num_valid_indices,
-        out_rows=num_tokens * top_k,
+        out_rows=num_tokens * top_k if gather else csa_cache_layout.ROW_WORDS,
         top_k=top_k,
         lookup=lookup,
         lookup_inputs=(seq_ids, page_indices),
