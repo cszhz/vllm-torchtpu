@@ -142,6 +142,9 @@ PATCHES = (
         refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
     ),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
+    # Out-of-tree FP32 rotary embedding (CUDA numerics). Must be registered
+    # before any RotaryEmbedding is constructed at model load.
+    Patch("vllm_torchtpu.layers.adapter.rotary_embedding", _ACTIVE),
     # Platform runtime configuration.
     # Diffusion workers rely on DEFER_AND_FUSE too.
     Patch(
@@ -220,6 +223,11 @@ PATCHES = (
     ),
     Patch(
         "vllm_torchtpu.omni.patches:_patch_ltx2_vocoder_cpu_init",
+        ("diffusion_model_load",),
+        od_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.omni.patches:_patch_ltx2_split_rope",
         ("diffusion_model_load",),
         od_config=True,
     ),

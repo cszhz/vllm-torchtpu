@@ -285,6 +285,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_wan_fused_qk_norm_rope",
         "_patch_wan_fresh_timestep",
         "_patch_ltx2_vocoder_cpu_init",
+        "_patch_ltx2_split_rope",
     ]
     assert [p.target for p in reg.PATCHES if p.od_config] == [
         p.target for p in reg.PATCHES if "diffusion_model_load" in p.stages
