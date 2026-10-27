@@ -138,6 +138,20 @@ def dot_stacked_chunks(x: jax.Array, fn_stack: jax.Array, n_out: int) -> jax.Arr
     return acc
 
 
+def sqrsum_on_mxu(x: jax.Array, x_rows: jax.Array) -> jax.Array:
+    """sum(x * x, -1) as the diagonal of the Gram block x @ x_rows.T.
+
+    ``x_rows`` holds the same rows as ``x`` (e.g. the VMEM block ``x`` was
+    stored to). bf16 products are exact and the MXU accumulates in f32, so
+    only the summation order differs from a VPU sum of squares.
+    """
+    dn = (((1,), (1,)), ((), ()))
+    gram = jax.lax.dot_general(x, x_rows, dn, preferred_element_type=jnp.float32)
+    row = jax.lax.broadcasted_iota(jnp.int32, gram.shape, 0)
+    col = jax.lax.broadcasted_iota(jnp.int32, gram.shape, 1)
+    return jnp.sum(jnp.where(row == col, gram, 0.0), axis=-1, keepdims=True)
+
+
 def mhc_pre_gates(
     mixes: jax.Array,
     sqrsum: jax.Array,

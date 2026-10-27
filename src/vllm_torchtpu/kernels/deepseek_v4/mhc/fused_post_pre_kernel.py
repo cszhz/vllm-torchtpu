@@ -88,8 +88,11 @@ def _fused_kernel(
 
     g_bf = jnp.concatenate(streams_bf, axis=1)  # (tb, hc_mult * hidden_size)
     acc = utils.dot_stacked_chunks(g_bf, fn_stack_ref[...], hb_ref.shape[1])
-    gf = g_bf.astype(jnp.float32)  # f32 for the squared sum + collapse
-    sqr = jnp.sum(gf * gf, axis=-1, keepdims=True)
+    # The squared sum rides on the otherwise idle MXU instead of the VPU.
+    sqr = utils.sqrsum_on_mxu(g_bf, newres_ref[...])
+    # The collapse re-reads the stored streams: holding the packed GEMM
+    # operand live past both dots would spill ~3 MiB more scoped VMEM.
+    gf = newres_ref[...].astype(jnp.float32)
 
     m, h = hc_mult, hidden_size
     mixes = acc * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
