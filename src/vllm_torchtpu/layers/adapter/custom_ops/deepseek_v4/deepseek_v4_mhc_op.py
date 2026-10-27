@@ -126,6 +126,34 @@ def _mhc_post_head_jax(
     )
 
 
+def _mhc_post_head_rows_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    hc_fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    query_start_loc: jax.Array,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+) -> jax.Array:
+    """``_mhc_post_head_jax`` on the rows the runner samples (prefill buckets)."""
+    return post_kernel.mhc_post_head_rows(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        query_start_loc,
+        rms_eps,
+        hc_eps,
+    )
+
+
 def _mhc_fused_post_pre_jax(
     x: jax.Array,
     residual: jax.Array,
@@ -288,6 +316,39 @@ def get_mhc_post_head_op(rms_eps: float, hc_eps: float):
                 P(),  # hc_fn
                 P(),  # hc_scale
                 P(),  # hc_base
+            ),
+        )
+        op.register_fake(_fake_mhc_post_head)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
+def get_mhc_post_head_rows_op(rms_eps: float, hc_eps: float):
+    """``get_mhc_post_head_op`` that also takes the batch's query_start_loc.
+
+    From ``post_kernel.POST_HEAD_ROWS_MIN_TOKENS`` tokens up it writes only the
+    rows the runner samples (and their tile windows); the rest are undefined.
+    Same outside-the-trace requirement as ``get_mhc_ops``.
+    """
+    op_name = (
+        "pallas::deepseek_v4_mhc_post_head_rows_v1"
+        f"_r{_name_float(rms_eps)}_e{_name_float(hc_eps)}"
+    )
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(_mhc_post_head_rows_jax, rms_eps=rms_eps, hc_eps=hc_eps),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(ATTN_DATA_AXIS, None, None),  # residual
+                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+                P(),  # hc_fn
+                P(),  # hc_scale
+                P(),  # hc_base
+                P(),  # query_start_loc
             ),
         )
         op.register_fake(_fake_mhc_post_head)

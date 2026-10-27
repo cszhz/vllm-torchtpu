@@ -643,5 +643,46 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         )
 
 
+@pytest.mark.tpu_test
+class MhcPostHeadRowsPallasTpuTest(parameterized.TestCase):
+    """Sampled-rows post + hc_head kernel vs the full-T kernel. Needs TPU."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.parameters(
+        dict(num_tokens=512, query_lens=[3, 100, 1, 1, 200, 7]),
+        dict(num_tokens=512, query_lens=[1] * 40 + [300]),
+        dict(num_tokens=1024, query_lens=[5] * 200 + [24]),
+        dict(num_tokens=1024, query_lens=[]),
+    )
+    def test_sampled_rows_match_full_kernel(self, num_tokens, query_lens):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import post_kernel
+
+        hidden_size = 256
+        rng = np.random.default_rng(11)
+        x, res, plm, crm = _make_post_inputs(rng, num_tokens, hidden_size)
+        hc_fn = jnp.asarray(
+            rng.standard_normal((HC_MULT, HC_MULT * hidden_size), dtype=np.float32)
+            * 0.02
+        )
+        hc_scale = jnp.asarray([0.8], jnp.float32)
+        hc_base = jnp.asarray(0.5 * rng.standard_normal(HC_MULT), jnp.float32)
+        qsl = np.zeros(257, np.int32)
+        qsl[1 : len(query_lens) + 1] = np.cumsum(query_lens)
+        qsl[len(query_lens) + 1 :] = qsl[len(query_lens)]
+        args = (x, res, plm, crm, hc_fn, hc_scale, hc_base)
+
+        want = post_kernel.mhc_post_head(*args, RMS_EPS, HC_PRE_EPS)
+        got = post_kernel.mhc_post_head_rows(
+            *args, jnp.asarray(qsl), RMS_EPS, HC_PRE_EPS
+        )
+
+        rows = np.clip(qsl[1:] - 1, 0, num_tokens - 1)
+        np.testing.assert_array_equal(_to_np(got)[rows], _to_np(want)[rows])
+
+
 if __name__ == "__main__":
     absltest.main()

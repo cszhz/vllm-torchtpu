@@ -30,6 +30,14 @@ POST_VMEM_LIMIT_BYTES = 24 * 1024 * 1024
 POST_HEAD_TOKEN_BLOCK = 128
 POST_HEAD_VMEM_LIMIT_BYTES = 32 * 1024 * 1024
 
+# Token buckets from this size up run the post + hc_head on the sampled rows
+# only (each request's last token); smaller buckets are decode-like, where
+# nearly every row is sampled, and keep the full-T kernel.
+POST_HEAD_ROWS_MIN_TOKENS = 512
+# Gathered rows per step of the sampled-rows kernel. Equal to the full-T
+# kernel's token block, so a row goes through the same block computation.
+POST_HEAD_ROW_BLOCK = 128
+
 
 def _post_kernel(x_ref, res_ref, post_ref, comb_ref, out_ref, *, hc_mult, hidden_size):
     """One token block of the unrolled stream recombine."""
@@ -76,6 +84,39 @@ def _post_head_kernel(
     def _():
         utils.stack_fn_chunks_into(fn_ref, fn_stack_ref)
 
+    out = _post_head_block(
+        x_ref,
+        res_ref,
+        post_ref,
+        comb_ref,
+        sc_ref,
+        hb_ref,
+        streams_scr,
+        fn_stack_ref,
+        hc_mult=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+    )
+    out_ref[...] = out.astype(out_ref.dtype)
+
+
+def _post_head_block(
+    x_ref,
+    res_ref,
+    post_ref,
+    comb_ref,
+    sc_ref,
+    hb_ref,
+    streams_scr,
+    fn_stack_ref,
+    *,
+    hc_mult,
+    hidden_size,
+    rms_eps,
+    hc_eps,
+):
+    """The recombine and hc_head collapse of one block of rows; f32 result."""
     m, h = hc_mult, hidden_size
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
@@ -100,7 +141,126 @@ def _post_head_kernel(
         out = out + pre_mix[:, i : i + 1] * streams_scr[:, i * h : (i + 1) * h].astype(
             jnp.float32
         )
-    out_ref[...] = out.astype(out_ref.dtype)
+    return out
+
+
+def _post_head_rows_kernel(
+    qsl_ref,
+    x_hbm,
+    res_hbm,
+    post_hbm,
+    comb_hbm,
+    fn_ref,
+    sc_ref,
+    hb_ref,
+    out_hbm,
+    x_buf,
+    res_buf,
+    post_buf,
+    comb_buf,
+    streams_scr,
+    fn_stack_ref,
+    out_buf,
+    win_smem,
+    sems,
+    *,
+    hc_mult,
+    hidden_size,
+    rms_eps,
+    hc_eps,
+):
+    """``_post_head_kernel`` on the row windows that hold the sampled rows.
+
+    The runner samples row ``query_start_loc[r + 1] - 1`` for every request
+    slot ``r``. The array is non-decreasing and its padding slots repeat the
+    total, so the distinct rows are those of the slots up to the first one
+    that reaches the total. Each is computed with the rest of its
+    tile-aligned window of ``SUBLANE`` rows (a DMA cannot address a single
+    bf16 row of a tiled buffer); rows outside those windows are not written.
+    """
+    utils.stack_fn_chunks_into(fn_ref, fn_stack_ref)
+    win = utils.SUBLANE
+    rb = x_buf.shape[0]
+    wins_per_group = rb // win
+    num_tokens = out_hbm.shape[0]
+    num_slots = qsl_ref.shape[0] - 1
+    total = qsl_ref[num_slots]
+
+    def before_total(r):
+        nxt = qsl_ref[jnp.minimum(r + 1, num_slots)]
+        return jnp.logical_and(r < num_slots, nxt < total)
+
+    num_rows = jax.lax.while_loop(before_total, lambda r: r + 1, jnp.int32(0)) + 1
+
+    def scan(r, carry):
+        # The rows ascend, so a window repeats only right after itself.
+        num_wins, prev = carry
+        w = jnp.clip(qsl_ref[r + 1] - 1, 0, num_tokens - 1) // win
+        win_smem[num_wins] = w
+        return num_wins + (w != prev).astype(jnp.int32), w
+
+    num_wins, _ = jax.lax.fori_loop(0, num_rows, scan, (jnp.int32(0), jnp.int32(-1)))
+
+    def rows_at(buf, k):
+        return buf.at[pl.ds(pl.multiple_of(k * win, win), win)]
+
+    def wait_rows(buf, rows, sem):
+        # Semaphores count bytes, so one wait covers every window on it.
+        pltpu.make_async_copy(
+            buf.at[pl.ds(0, rows)], buf.at[pl.ds(0, rows)], sem
+        ).wait()
+
+    def group(g, carry):
+        first = g * wins_per_group
+        live = jnp.minimum(wins_per_group, num_wins - first)
+
+        def fetch(k, c):
+            w = win_smem[first + k]
+            for src, dst in (
+                (x_hbm, x_buf),
+                (res_hbm, res_buf),
+                (post_hbm, post_buf),
+                (comb_hbm, comb_buf),
+            ):
+                pltpu.make_async_copy(
+                    rows_at(src, w), rows_at(dst, k), sems.at[0]
+                ).start()
+            return c
+
+        jax.lax.fori_loop(0, live, fetch, 0)
+        for buf in (x_buf, res_buf, post_buf, comb_buf):
+            wait_rows(buf, live * win, sems.at[0])
+
+        # Slots past `live` hold stale rows; every op below is row-wise, and
+        # those rows are never written back.
+        out = _post_head_block(
+            x_buf,
+            res_buf,
+            post_buf,
+            comb_buf,
+            sc_ref,
+            hb_ref,
+            streams_scr,
+            fn_stack_ref,
+            hc_mult=hc_mult,
+            hidden_size=hidden_size,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+        )
+        out_buf[...] = out.astype(out_buf.dtype)
+
+        def store(k, c):
+            w = win_smem[first + k]
+            pltpu.make_async_copy(
+                rows_at(out_buf, k), rows_at(out_hbm, w), sems.at[1]
+            ).start()
+            return c
+
+        jax.lax.fori_loop(0, live, store, 0)
+        wait_rows(out_buf, live * win, sems.at[1])
+        return carry
+
+    jax.lax.fori_loop(0, pl.cdiv(num_wins, wins_per_group), group, 0)
 
 
 @functools.partial(jax.jit, static_argnames=("token_block_size", "vmem_limit_bytes"))
@@ -334,6 +494,149 @@ def mhc_post_head(
         hc_fn,
         hc_scale,
         hc_base,
+        rms_eps,
+        hc_eps,
+    )
+    return out2d.reshape(*outer_shape, hidden_size)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "rms_eps",
+        "hc_eps",
+        "min_tokens",
+        "row_block",
+        "vmem_limit_bytes",
+    ),
+)
+def mhc_post_head_rows_2d(
+    x: jax.Array,
+    res2d: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    hc_fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    query_start_loc: jax.Array,
+    rms_eps: float,
+    hc_eps: float,
+    *,
+    min_tokens: int = POST_HEAD_ROWS_MIN_TOKENS,
+    row_block: int = POST_HEAD_ROW_BLOCK,
+    vmem_limit_bytes: int = POST_HEAD_VMEM_LIMIT_BYTES,
+) -> jax.Array:
+    """``mhc_post_head_2d`` computed only on the rows the runner samples.
+
+    Args as ``mhc_post_head_2d``, plus:
+        query_start_loc: (num_slots + 1,), int32 — the batch's request
+            starts; the runner samples row ``query_start_loc[r + 1] - 1``.
+
+    Returns:
+        (num_tokens, hidden_size) in ``res2d.dtype``. From ``min_tokens``
+        tokens up only the windows holding the sampled rows are written; the
+        others are undefined. Below it, or when the token count is not a
+        multiple of ``utils.SUBLANE``, every row is computed.
+    """
+    num_tokens = res2d.shape[0]
+    if num_tokens < min_tokens or num_tokens % utils.SUBLANE:
+        return mhc_post_head_2d(
+            x,
+            res2d,
+            post_layer_mix,
+            comb_res_mix,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+        )
+    assert res2d.dtype == jnp.bfloat16, res2d.dtype
+    assert hc_fn.dtype == jnp.float32, hc_fn.dtype
+    assert query_start_loc.dtype == jnp.int32, query_start_loc.dtype
+
+    hc_mult = comb_res_mix.shape[-1]
+    hidden_size = res2d.shape[-1] // hc_mult
+    hc_hidden = hc_mult * hidden_size
+    assert hc_fn.shape == (hc_mult, hc_hidden), (hc_fn.shape, res2d.shape)
+
+    x2d = x.reshape(-1, hidden_size).astype(jnp.bfloat16)
+    post2d = post_layer_mix.reshape(-1, hc_mult)
+    comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
+    sc2d = hc_scale.reshape(1, 1).astype(jnp.float32)
+    hb2d = hc_base.reshape(1, hc_mult).astype(jnp.float32)
+    rb = min(row_block, num_tokens)
+    assert rb % utils.SUBLANE == 0, rb
+    num_slots = query_start_loc.shape[0] - 1
+
+    hbm = pl.BlockSpec(memory_space=pl.ANY)
+    out = pl.pallas_call(
+        functools.partial(
+            _post_head_rows_kernel,
+            hc_mult=hc_mult,
+            hidden_size=hidden_size,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1,),
+            in_specs=[
+                hbm,
+                hbm,
+                hbm,
+                hbm,
+                pl.BlockSpec((hc_mult, hc_hidden), lambda i, qsl: (0, 0)),
+                pl.BlockSpec((1, 1), lambda i, qsl: (0, 0)),
+                pl.BlockSpec((1, hc_mult), lambda i, qsl: (0, 0)),
+            ],
+            out_specs=hbm,
+            scratch_shapes=[
+                pltpu.VMEM((rb, hidden_size), jnp.bfloat16),
+                pltpu.VMEM((rb, hc_hidden), jnp.bfloat16),
+                pltpu.VMEM((rb, hc_mult), jnp.float32),
+                pltpu.VMEM((rb, hc_mult * hc_mult), jnp.float32),
+                pltpu.VMEM((rb, hc_hidden), jnp.bfloat16),
+                pltpu.VMEM((3 * hc_mult, hc_hidden), jnp.bfloat16),
+                pltpu.VMEM((rb, hidden_size), res2d.dtype),
+                pltpu.SMEM((num_slots,), jnp.int32),
+                pltpu.SemaphoreType.DMA((2,)),
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, hidden_size), res2d.dtype),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+    )(query_start_loc, x2d, res2d, post2d, comb2d, hc_fn, sc2d, hb2d)
+    return out
+
+
+def mhc_post_head_rows(
+    x: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    hc_fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    query_start_loc: jax.Array,
+    rms_eps: float,
+    hc_eps: float,
+) -> jax.Array:
+    """``mhc_post_head`` on the sampled rows; see ``mhc_post_head_rows_2d``."""
+    outer_shape = residual.shape[:-2]
+    hc_mult, hidden_size = residual.shape[-2:]
+    out2d = mhc_post_head_rows_2d(
+        x.reshape(-1, hidden_size),
+        residual.reshape(-1, hc_mult * hidden_size),
+        post_layer_mix.reshape(-1, hc_mult),
+        comb_res_mix.reshape(-1, hc_mult, hc_mult),
+        hc_fn,
+        hc_scale,
+        hc_base,
+        query_start_loc,
         rms_eps,
         hc_eps,
     )
