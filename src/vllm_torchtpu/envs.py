@@ -109,6 +109,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_RPA_BKV: int = 256
     VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE: bool = False
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
+    VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES: int = 0
     VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS: int = 0
@@ -620,6 +621,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TPU_QSA_DECODE_RPA_LANES": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_RPA_LANES", 8
+    ),
+    # Qwen4-exp QSA decode/verify attention with the compact schedule: query
+    # rows per RPA call (0 keeps the 64-row SMEM bound of the per-page
+    # schedule). Larger steps otherwise run as a scan of 64-row calls.
+    "VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES": env_nonnegative_int(
+        "VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES", 0
     ),
     # Qwen4-exp QSA prefill: build the per-query selection bitset with a
     # compare-and-accumulate Pallas kernel. Off falls back to the vmapped
