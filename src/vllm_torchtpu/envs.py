@@ -197,6 +197,7 @@ if TYPE_CHECKING:
     TPU_STATIC_DECODE_INPUTS: bool = False
     TPU_STATIC_DECODE_INPUTS_VERIFY: bool = False
     TPU_STATIC_DECODE_INPUTS_VERIFY_CORRUPT: str = ""
+    TPU_DRAFT_STEP0_IN_LOOP: bool = False
 
 
 def env_with_choices(
@@ -1156,6 +1157,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STATIC_DECODE_INPUTS_VERIFY_CORRUPT": env_str(
         "TPU_STATIC_DECODE_INPUTS_VERIFY_CORRUPT", ""
     ),
+    "TPU_DRAFT_STEP0_IN_LOOP": env_bool("TPU_DRAFT_STEP0_IN_LOOP", default=False),
 }
 
 
