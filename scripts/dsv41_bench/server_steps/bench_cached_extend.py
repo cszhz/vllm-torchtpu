@@ -449,7 +449,11 @@ def client_main(argv: list[str]) -> None:
             time.sleep(0.1)
         raise ValueError("Timed out waiting for complete per-request server metrics")
 
+    last_wave = {}
+
     def wave(inputs: list, outputs: int) -> list:
+        observations = [None] * len(inputs)
+        last_wave.clear()
         barrier = threading.Barrier(len(inputs) + 1)
 
         def request(index: int) -> dict:
@@ -462,12 +466,14 @@ def client_main(argv: list[str]) -> None:
                 "stream": False,
             }
             barrier.wait(timeout=120)
+            request_start = time.monotonic_ns()
             response = requests.post(
                 args.base_url + "/v1/completions",
                 json=payload,
                 headers={"X-data-parallel-rank": str(index % scenario.dp_size)},
                 timeout=3600,
             )
+            request_end = time.monotonic_ns()
             response.raise_for_status()
             result = response.json()
             usage = result["usage"]
@@ -476,6 +482,11 @@ def client_main(argv: list[str]) -> None:
                 or usage["completion_tokens"] != outputs
             ):
                 raise ValueError(f"Incomplete request {index}: {usage}")
+            observations[index] = {
+                "request_index": index,
+                "start_ns": request_start,
+                "end_ns": request_end,
+            }
             return result
 
         # Freeze scheduling while HTTP handlers enqueue this wave. The settling
@@ -488,8 +499,33 @@ def client_main(argv: list[str]) -> None:
                 barrier.wait(timeout=120)
                 time.sleep(args.admission_settle_seconds)
             finally:
+                resume_start = time.monotonic_ns()
                 post("/resume", {})
-            return [future.result() for future in futures]
+                resume_end = time.monotonic_ns()
+            results = [future.result() for future in futures]
+            last_wave.update(
+                {
+                    "resume_start_ns": resume_start,
+                    "resume_end_ns": resume_end,
+                    "requests": observations,
+                    "admission_settle_seconds": args.admission_settle_seconds,
+                    "client_seconds_including_admission_pause": [
+                        (r["end_ns"] - r["start_ns"]) / 1e9 for r in observations
+                    ],
+                    "completion_seconds_from_resume_start": [
+                        (r["end_ns"] - resume_start) / 1e9 for r in observations
+                    ],
+                    "completion_seconds_from_resume_end": [
+                        (r["end_ns"] - resume_end) / 1e9 for r in observations
+                    ],
+                    "note": (
+                        "Non-streaming client completion; includes intentional "
+                        "admission pause. Resume-relative time is diagnostic, "
+                        "not standard TTFT."
+                    ),
+                }
+            )
+            return results
 
     for round_id in range(1 if args.profile_only else 0, args.rounds + 1):
         label = "warmup" if round_id == 0 else f"round-{round_id}"
@@ -540,7 +576,14 @@ def client_main(argv: list[str]) -> None:
         )
         after = wait_metrics(before)
         (args.out / f"{label}-responses.json").write_text(json.dumps(responses))
-        delta = {k: after[k] - before.get(k, 0) for k in after if k.endswith("_total")}
+        (args.out / f"{label}-client-timing.json").write_text(
+            json.dumps(last_wave, indent=2)
+        )
+        delta = {
+            k: after[k] - before.get(k, 0)
+            for k in after
+            if k.endswith(("_total", "_sum", "_count"))
+        }
         (args.out / f"{label}-metrics.json").write_text(json.dumps(delta, indent=2))
         if (
             "vllm:num_preemptions_total" not in delta
@@ -558,6 +601,16 @@ def client_main(argv: list[str]) -> None:
         report["warmup"] = round_id == 0
         report["profiled"] = profiling
         report["audit_wall_interval_ns"] = [measurement_start_ns, measurement_end_ns]
+        report["request_latency_metrics"] = {
+            k[:-4]: {
+                "sum_seconds": v,
+                "count": delta[k[:-4] + "_count"],
+                "mean_seconds": v / delta[k[:-4] + "_count"],
+            }
+            for k, v in delta.items()
+            if k.endswith("_seconds_sum") and delta.get(k[:-4] + "_count", 0) > 0
+        }
+        report["client_timing_file"] = f"{label}-client-timing.json"
         (args.out / f"{label}-summary.json").write_text(json.dumps(report, indent=2))
         print(
             json.dumps(
