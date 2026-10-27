@@ -41,6 +41,10 @@ SWA_FOLDED_QUERIES_PER_BLOCK = 128
 SWA_EXACT_WINDOW = 1
 # Row alignment of a q chunk's key window there: one bf16 sublane tile.
 EXACT_WINDOW_ROW_ALIGN = 16
+# Queries per q chunk of the exact-window kernels, unnormalized output (CSA
+# layers) and normalized output (SWA layers).
+SWA_EXACT_Q_COMPUTE_BLOCK_SIZE = 32
+SWA_EXACT_NORMALIZED_Q_COMPUTE_BLOCK_SIZE = 64
 
 
 def cdiv(a, b):
@@ -2471,7 +2475,13 @@ def mla_sliding_window_ragged_paged_attention(
             and hca is None
             and not non_causal_block
         )
+        q_chunk_sz = q_compute_block_size
         if exact_window:
+            q_chunk_sz = (
+                SWA_EXACT_Q_COMPUTE_BLOCK_SIZE
+                if unnormalized_output
+                else SWA_EXACT_NORMALIZED_Q_COMPUTE_BLOCK_SIZE
+            )
             bkv_buf_sz = exact_window_kv_rows(bq_sz, sliding_window)
         else:
             bkv_buf_sz = bkv_sz + bq_sz - bq_view_sz
@@ -2594,7 +2604,7 @@ def mla_sliding_window_ragged_paged_attention(
                     logical_page_size=logical_page_size,
                     unnormalized_output=unnormalized_output,
                     non_causal_block=non_causal_block,
-                    q_compute_block_size=q_compute_block_size,
+                    q_compute_block_size=q_chunk_sz,
                     **hca_kwargs,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
