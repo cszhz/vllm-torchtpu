@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    replace_as,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
@@ -199,10 +200,44 @@ def test_native_swa_budget_preserves_packed_indexer_padding():
 
 
 @pytest.mark.cpu_test
+def test_packed_indexer_default_padding_is_divisible_for_compact_swa():
+    """Normalize upstream 512-byte padding before MLA page unification."""
+    upstream = MLAAttentionSpec(
+        block_size=512,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=2,
+        alignment=512,
+        page_size_padded=33792,
+    )
+    specs = {
+        "main": MLAAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+        ),
+        "indexer": replace_as(upstream, PackedFP8IndexerSpec),
+        "swa": CompactSWASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+            max_num_seqs=1,
+            max_in_flight_tokens=128,
+        ),
+    }
+
+    assert specs["indexer"].page_size_bytes == 65536
+    unified = cache_module.unify_kv_cache_spec_page_size(specs)
+    assert {spec.page_size_bytes for spec in unified.values()} == {65536}
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("split", [False, True])
-def test_native_swa_allocation_with_packed_fp8_indexer(
-    monkeypatch, split, vllm_config_context
-):
+def test_native_swa_allocation_with_packed_fp8_indexer(monkeypatch, split):
     blocks, page_bytes = 4, 32768
     specs = {
         "main": MLAAttentionSpec(

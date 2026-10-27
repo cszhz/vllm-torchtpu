@@ -124,10 +124,16 @@ def budget_native_swa(
         word_bytes + sum(swa_bytes.values()),
         max(spec.page_size_bytes for spec in specs.values()),
     )
-    return {
-        name: replace(spec, page_size_padded=page_bytes)
-        for name, spec in attention_specs.items()
-    }
+    budgeted_specs = {}
+    for name, spec in attention_specs.items():
+        budgeted = replace(spec, page_size_padded=page_bytes)
+        # PackedFP8IndexerSpec normalizes unbudgeted pages to a power of two
+        # in __post_init__. Re-apply the explicit shared-owner budget after
+        # reconstruction so this path can use a composite, non-power-of-two
+        # page without changing the indexer's default compact-SWA geometry.
+        object.__setattr__(budgeted, "page_size_padded", page_bytes)
+        budgeted_specs[name] = budgeted
+    return budgeted_specs
 
 
 def _materialize_native_swa(

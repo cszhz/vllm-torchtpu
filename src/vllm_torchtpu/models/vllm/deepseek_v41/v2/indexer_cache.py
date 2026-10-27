@@ -110,21 +110,14 @@ class PackedFP8IndexerSpec(MLAAttentionSpec):
     """Keep 132-byte records compatible with hybrid power-of-two pages."""
 
     def __post_init__(self):
-        requested_page_size = self.page_size_padded
         record_bytes = 1 << (self.state_content_size_bytes - 1).bit_length()
         min_states = max(1, (self.alignment or 1) // record_bytes)
         object.__setattr__(
             self, "block_size", max(self.block_size, min_states * self.tokens_per_state)
         )
         super().__post_init__()
-        if requested_page_size is None:
-            size = max(self.alignment or 1, self.real_page_size_bytes)
-            requested_page_size = 1 << (size - 1).bit_length()
-        if requested_page_size < self.real_page_size_bytes:
-            raise ValueError(
-                "Packed FP8 indexer page padding is smaller than its record data"
-            )
-        object.__setattr__(self, "page_size_padded", requested_page_size)
+        size = max(self.alignment or 1, self.real_page_size_bytes)
+        object.__setattr__(self, "page_size_padded", 1 << (size - 1).bit_length())
 
     @classmethod
     def merge(cls, specs):
