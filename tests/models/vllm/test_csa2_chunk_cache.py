@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+from vllm.v1.core.kv_cache_utils import (
+    create_kv_cache_group_specs,
+    get_kv_cache_configs,
+)
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheConfig,
@@ -173,7 +176,7 @@ def test_native_swa_budget_preserves_packed_indexer_padding():
     """Keep the shared page budget on PackedFP8IndexerSpec reconstruction."""
     specs = {
         "main": MLAAttentionSpec(
-            block_size=64,
+            block_size=128,
             num_kv_heads=1,
             head_size=512,
             dtype=torch.uint8,
@@ -195,8 +198,13 @@ def test_native_swa_budget_preserves_packed_indexer_padding():
     }
     budgeted = cache_module.budget_native_swa(specs, frozenset(("swa",)))
 
-    assert budgeted["indexer"].page_size_bytes == 65536
-    assert {spec.page_size_bytes for spec in budgeted.values()} == {65536}
+    assert budgeted["indexer"].page_size_bytes == 98304
+    assert {spec.page_size_bytes for spec in budgeted.values()} == {98304}
+    groups = create_kv_cache_group_specs(
+        {"indexer.0": budgeted["indexer"], "indexer.1": budgeted["indexer"]},
+        [["indexer.0", "indexer.1"]],
+    )
+    assert groups[0].kv_cache_spec.page_size_bytes == 98304
 
 
 @pytest.mark.cpu_test
