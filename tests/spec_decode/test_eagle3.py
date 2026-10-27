@@ -534,6 +534,87 @@ def test_prepare_draft_inputs_all_layout_keeps_device_seed_gathers(device, monke
     assert gather_indices.cpu()[2:].eq(0).all()
 
 
+def _eager_seed_input_ids(widths):
+    """Eager twin of the compiled _draft_seed_input_ids; records index widths."""
+
+    def seed(input_ids, last_token_indices, next_token_ids):
+        widths.append(last_token_indices.shape[0])
+        shifted = torch.cat((input_ids[1:], input_ids[-1:]), dim=0)
+        return shifted.index_put(
+            (last_token_indices,), next_token_ids.to(input_ids.dtype)
+        )
+
+    return seed
+
+
+@pytest.mark.parametrize("discard", [False, True])
+def test_prepare_draft_inputs_device_seed_scatters_at_the_seed_bucket(discard):
+    """A bucket-padded device seed scatters at the bucket width, not at
+    num_reqs, with the same draft input as the exact-width seed."""
+    device = torch.device("cpu")
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    requests = {"r1": SimpleNamespace(num_computed_tokens=0, get_token_id=lambda i: 77)}
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
+        device=device,
+        requests=requests,
+        num_tokens_paddings=[16, 32],
+        _dp_lockstep_enabled=lambda: False,
+    )
+
+    def run(seed):
+        chunk = _make_chunk(
+            input_ids=torch.tensor([10, 11, 20, 21, 22, 0], dtype=torch.int32),
+            position_ids=torch.arange(6, dtype=torch.int32),
+            query_start_loc_np=np.array([0, 2, 5], dtype=np.int32),
+            start_index=0,
+            num_reqs=2,
+            device=device,
+        )
+        widths = []
+        proposer._draft_seed_input_ids = _eager_seed_input_ids(widths)
+        out = proposer._prepare_draft_inputs(
+            chunk,
+            sampled_token_ids=None,
+            discard_sampled_tokens_req_indices=[1] if discard else [],
+            num_rejected_tokens_np=None,
+            scheduler_output=SimpleNamespace(num_scheduled_tokens={"r1": 3}),
+            device_seed=seed,
+        )
+        return out, widths
+
+    exact, exact_widths = run(torch.tensor([101, 202], dtype=torch.int32))
+    # The sampler's bucket: two real rows, then a garbage tail.
+    padded, padded_widths = run(torch.tensor([101, 202, -1, 9], dtype=torch.int32))
+    assert exact_widths == [2] and padded_widths == [4]
+    last = 77 if discard else 202
+    expected = torch.tensor([11, 101, 21, 22, last, 0], dtype=torch.int32)
+    torch.testing.assert_close(padded[0], expected)
+    torch.testing.assert_close(exact[0], expected)
+    torch.testing.assert_close(padded[2], exact[2])
+
+
+def test_precompile_draft_gather_positions_covers_token_by_loop_buckets():
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_rows = True
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        num_tokens_paddings=[16, 32, 64, 128],
+        max_num_reqs=24,
+        uses_mrope=False,
+        _precompile_timed=lambda _name: contextlib.nullcontext(),
+    )
+    seen = []
+    proposer._draft_gather_positions = lambda pos, idx: seen.append(
+        (pos.shape[0], idx.shape[0])
+    ) or pos.index_select(0, idx)
+    proposer._precompile_draft_gather_positions()
+    # Loop buckets stop at pad(max_num_reqs=24) = 32.
+    assert seen == [
+        (16, 16), (32, 16), (32, 32), (64, 16), (64, 32), (128, 16), (128, 32)
+    ]
+
+
 def test_propose_delegates_carry_aggregation_after_gather():
     device = torch.device("cpu")
     proposer = _make_proposer(draft_tp=1, method="mtp")

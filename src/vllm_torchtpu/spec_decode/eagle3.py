@@ -1715,8 +1715,10 @@ class Eagle3Proposer:
                 seed token is gathered from it on-device instead of from the
                 host ``sampled_token_ids`` list (which the async path lacks).
             device_seed: prefill / non-spec async bootstrap only —
-                ``[total_reqs]`` device tensor of the just-sampled tokens
-                (sliced ``[start:start+num_reqs]`` per chunk).
+                ``[>=total_reqs]`` device tensor of the just-sampled tokens
+                (sliced ``[start:start+num_reqs]`` per chunk). A first chunk
+                keeps the whole width, which the runner pads to the sampler's
+                request bucket.
 
         Returns:
             input_ids: [padded_chunk_tokens] shifted + bonus-patched
@@ -1868,7 +1870,16 @@ class Eagle3Proposer:
             # num_rejected_np is zeros) and last_token_indices = qsl_end-1 (set
             # above) is the last prompt position -- the correct prefill seed.
             num_rejected_out = num_rejected_np
-            next_token_ids = device_seed[start : start + num_reqs].to(torch.int32)
+            # A first chunk scatters at the seed's full width (the sampler's
+            # request bucket) so the seed program is keyed on that bucket and
+            # not on num_reqs, as on the async path. The rows past num_reqs
+            # repeat the last request's index and token (built below, after the
+            # discard override), so they rewrite that slot with its own value.
+            seed_width = device_seed.shape[0]
+            pad_seed = start == 0 and seed_width <= chunk.input_ids.shape[0]
+            if not pad_seed:
+                seed_width = num_reqs
+            next_token_ids = device_seed[start : start + seed_width].to(torch.int32)
             # Partial-prefill (discard) reqs: override seed from host req_state.
             ov_i = [i for i in range(num_reqs) if (start + i) in discard_set]
             if ov_i:
@@ -1883,6 +1894,14 @@ class Eagle3Proposer:
                 next_token_ids[
                     torch.tensor(ov_i, dtype=torch.long, device=runner.device)
                 ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
+            if seed_width > num_reqs:
+                rows_np = np.minimum(np.arange(seed_width), num_reqs - 1)
+                last_token_indices = torch.from_numpy(
+                    last_token_indices_np[rows_np]
+                ).to(runner.device)
+                next_token_ids = next_token_ids.index_select(
+                    0, torch.from_numpy(rows_np).to(runner.device)
+                )
         else:
             assert sampled_token_ids is not None
             num_rejected_out = num_rejected_np
@@ -1929,8 +1948,8 @@ class Eagle3Proposer:
             gather_indices = last_token_indices
         else:
             # Async: the seed scatter runs at the sampler's padded request
-            # width (bucket-shaped, see above). Bootstrap: it stays real
-            # [num_reqs]. Pad just the returned gather index.
+            # width (bucket-shaped, see above). Bootstrap: the seed's width
+            # (see the device_seed branch). Pad just the returned gather index.
             draft_input_ids = self._draft_seed_input_ids(
                 chunk.input_ids, last_token_indices, next_token_ids
             )
@@ -2345,16 +2364,17 @@ class Eagle3Proposer:
 
         Warms the wrappers across their bucket shapes so they don't recompile on
         the first real propose(): combine_hidden_states (token-count buckets),
-        seed_input_ids ((token, index) buckets), and the lm-head/argmax
-        compute_logits (num_reqs buckets). The draft forward and the per-step
-        fused propose/verify programs are warmed by a real-path lifecycle
-        warmup, not here (a zeros-precompile of those emits programs that never
-        match the runtime eager fusion).
+        seed_input_ids and gather_positions ((token, index) buckets), and the
+        lm-head/argmax compute_logits (num_reqs buckets). The draft forward and
+        the per-step fused propose/verify programs are warmed by a real-path
+        lifecycle warmup, not here (a zeros-precompile of those emits programs
+        that never match the runtime eager fusion).
         """
         if self.runner.enforce_eager:
             return
         self._precompile_combine_hidden_states()
         self._precompile_draft_seed()
+        self._precompile_draft_gather_positions()
         self._precompile_compute_logits()
 
     def _draft_hidden_size(self) -> int:
@@ -2518,6 +2538,29 @@ class Eagle3Proposer:
                     lti = torch.zeros(p, dtype=torch.int64).to(runner.device)
                     nti = torch.zeros(p, dtype=torch.int32).to(runner.device)
                     out = self._draft_seed_input_ids(ids, lti, nti)
+                    synchronize_tensors(out)
+
+    def _precompile_draft_gather_positions(self) -> None:
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+        if not self._draft_rows:
+            return  # only a row-selected step 0 gathers positions on their own
+        runner = self.runner
+        # positions length = first-pass token bucket T; index length = the loop
+        # bucket p = pad(num_reqs) <= T, bounded by pad(max_num_reqs).
+        max_loop_bucket = _get_padded_token_len(
+            runner.num_tokens_paddings, runner.max_num_reqs
+        )
+        loop_buckets = [t for t in runner.num_tokens_paddings if t <= max_loop_bucket]
+        with runner._precompile_timed("drafter gather_positions"):
+            for T in runner.num_tokens_paddings:
+                shape = (3, T) if runner.uses_mrope else (T,)
+                positions = torch.zeros(shape, dtype=torch.int32).to(runner.device)
+                for p in loop_buckets:
+                    if p > T:
+                        continue
+                    indices = torch.zeros(p, dtype=torch.int64).to(runner.device)
+                    out = self._draft_gather_positions(positions, indices)
                     synchronize_tensors(out)
 
     def _precompile_compute_logits(self) -> None:

@@ -4966,6 +4966,11 @@ class TPUModelRunner(GPUModelRunner):
                     # One bucketed tensor per chunk; the drafter masks the
                     # padded tail on device (no exact-count slice here).
                     device_seed = [sel.view(-1) for sel in combined_selected_tokens]
+                elif len(combined_selected_tokens) == 1 and not self._mtp_prefill_only:
+                    # One sampled chunk: hand over its request-bucket width so
+                    # the drafter's seed programs key on the bucket, not on the
+                    # request count (it pads the tail with the last request).
+                    device_seed = combined_selected_tokens[0].view(-1)
                 else:
                     flat_seed = torch.cat(
                         [
