@@ -54,13 +54,13 @@ def _fused_kernel(
     # leaving VMEM headroom for the pipeline to prefetch the next block.
     # bf16 -> f32 casts are exact, so results are unchanged.
     x_bf = x_ref[...]  # (tb, hidden) bf16
-    if res_ref.shape[1] == hidden_size:
-        # One stream standing for hc_mult identical ones (the chain's start).
-        old_bf = [res_ref[...]] * hc_mult
-    else:
-        old_bf = [
+    old_bf = (
+        [res_ref[...]] * hc_mult
+        if res_ref.shape[1] == hidden_size
+        else [
             res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
         ]
+    )
 
     streams_bf = []
     for j in range(hc_mult):
@@ -130,9 +130,7 @@ def fused_post_pre_mixes(
 
     Args:
         x2d: (num_tokens, hidden_size), bfloat16 — sublayer output.
-        res2d: (num_tokens, hc_mult * hidden_size), bfloat16 — old streams;
-            or (num_tokens, hidden_size) when they are hc_mult copies of
-            one stream.
+        res2d: (num_tokens, hc_mult * hidden_size), bfloat16 — old streams.
         post2d: (num_tokens, hc_mult), float32.
         comb2d: (num_tokens, hc_mult * hc_mult), float32, row-major (i, j).
         fn: (hc_mult3, hc_mult * hidden_size), float32 — next sublayer's
@@ -168,8 +166,10 @@ def fused_post_pre_mixes(
     hc_mult = hc_hidden // hidden_size
     assert hc_mult * (hc_mult + 2) == hc_mult3, (fn.shape, x2d.shape)
     res_width = res2d.shape[1]
-    assert res2d.shape[0] == num_tokens
-    assert res_width in (hc_hidden, hidden_size), (fn.shape, res2d.shape)
+    assert res2d.shape[0] == num_tokens and res_width in (hc_hidden, hidden_size), (
+        fn.shape,
+        res2d.shape,
+    )
     assert gemm_precision in ("highest", "default"), gemm_precision
 
     # This kernel keeps a fixed block: its default (32) already fits the
@@ -249,9 +249,6 @@ def mhc_fused_post_pre(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Fused seam op: Pallas post+GEMM+collapse kernel, XLA gates epilogue.
-
-    ``residual`` is (..., hc_mult, hidden_size), or (..., hidden_size) when
-    its hc_mult streams are copies of one stream (the chain's first seam).
     Returns (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur).
     """
     assert residual.dtype == jnp.bfloat16
