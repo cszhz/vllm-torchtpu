@@ -590,5 +590,63 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         )
 
 
+@pytest.mark.tpu_test
+class MhcSingleStreamTpuTest(parameterized.TestCase):
+    """Layer 0 on the one embedding stream vs hc_mult repeated copies.
+
+    Bit-identical in interpret mode; on TPU the one-stream block is tiled
+    differently, so the f32 gates may move by an ulp. The seam's new residual
+    only recombines identical values: exact. Needs TPU hardware.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.product(num_tokens=[8, 17, 128])
+    def test_pre_and_fused(self, num_tokens):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import (
+            fused_post_pre_kernel,
+            pre_kernel,
+        )
+
+        rng = np.random.default_rng(15)
+        _, fn, hc_scale, hc_base = _make_pre_inputs(rng, num_tokens, 7168)
+        fn, sc, hb = jnp.asarray(fn), jnp.asarray(hc_scale), jnp.asarray(hc_base)
+        x1 = jnp.asarray(
+            rng.standard_normal((num_tokens, 7168), dtype=np.float32)
+        ).astype(jnp.bfloat16)
+        rep = jnp.repeat(x1[:, None, :], HC_MULT, axis=1)
+        gates = (RMS_EPS, HC_PRE_EPS, HC_SINKHORN_EPS, HC_POST_MULT_VALUE, 20)
+
+        def check(got, want, kinds):
+            for g, w, kind in zip(got, want, kinds):
+                self.assertEqual(g.shape, w.shape)
+                g, w = _to_np(g), _to_np(w)
+                if kind == "exact":
+                    np.testing.assert_array_equal(g, w)
+                elif kind == "f32":
+                    np.testing.assert_allclose(g, w, rtol=1e-5, atol=1e-7)
+                else:
+                    np.testing.assert_allclose(g, w, rtol=BF16_RTOL, atol=BF16_ATOL)
+                    self.assertLessEqual(np.mean(g != w), 1e-3)
+
+        want = pre_kernel.mhc_pre(rep, fn, sc, hb, *gates)
+        got = pre_kernel.mhc_pre_single_stream(x1, fn, sc, hb, *gates)
+        check(got, want, ("f32", "f32", "bf16"))
+
+        sub = jnp.asarray(
+            rng.standard_normal((num_tokens, 7168), dtype=np.float32)
+        ).astype(jnp.bfloat16)
+        fused = fused_post_pre_kernel.mhc_fused_post_pre
+        args = (want[0], want[1], fn, sc, hb, *gates)
+        check(
+            fused(sub, x1, *args),
+            fused(sub, rep, *args),
+            ("exact", "f32", "f32", "bf16"),
+        )
+
+
 if __name__ == "__main__":
     absltest.main()
