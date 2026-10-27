@@ -38,6 +38,21 @@ ROW_QUANT_ROW_GROUP = 64
 # Columns per amax/quantize step inside a row group.
 ROW_QUANT_COL_CHUNK = 512
 
+# Prefill fp8 linears whose (K, N) weight is listed here run dense_proj_matmul
+# instead of XLA's dot fusion: attention wq_b and wo_b.
+DENSE_PROJ_MIN_TOKENS = 512
+DENSE_PROJ_SHAPES = ((1024, 32768), (8192, 4096))
+# fp8 weight bytes per grid step (one column tile, double-buffered).
+DENSE_PROJ_W_TILE_BYTES = 2 * 1024 * 1024
+# Rows and columns of each dot + scale epilogue chunk inside a column tile.
+# At K=8192 a 256-column chunk makes Mosaic split K into two MRB passes added
+# on the VPU, which reorders the f32 sums; 512 keeps K in one accumulation.
+DENSE_PROJ_SUB_M = 1024
+DENSE_PROJ_SUB_N = 512
+# Kept small so XLA can leave the fp8 activation in VMEM, where act_quant_rows
+# wrote it; with 48 MiB it moves the K=8192 activation to HBM first.
+DENSE_PROJ_VMEM_LIMIT_BYTES = 24 * 1024 * 1024
+
 
 def unfold_args(
     conditions: tuple[jax.Array | bool, ...],
@@ -440,3 +455,107 @@ def quantize_block(data, axis, target_dtype):
     else:
         data_q = jnp.round(data / scale).astype(target_dtype)
     return data_q, scale
+
+
+def dense_proj_matmul_applies(x: jax.Array, w_q: jax.Array, w_scale: jax.Array) -> bool:
+    """Whether the per-channel fp8 linear x @ w_q runs dense_proj_matmul."""
+    return (
+        x.ndim == 2
+        and x.dtype == jnp.bfloat16
+        and w_scale.ndim == 1
+        and w_q.dtype == jnp.float8_e4m3fn
+        and x.shape[0] >= DENSE_PROJ_MIN_TOKENS
+        and x.shape[0] % min(DENSE_PROJ_SUB_M, x.shape[0]) == 0
+        and tuple(w_q.shape) in DENSE_PROJ_SHAPES
+    )
+
+
+def _dense_proj_tile_n(k: int, n: int) -> int:
+    """Widest multiple of DENSE_PROJ_SUB_N dividing n whose fp8 weight tile
+    fits DENSE_PROJ_W_TILE_BYTES (at least one sub-column)."""
+    tile_n = max(DENSE_PROJ_SUB_N, min(n, DENSE_PROJ_W_TILE_BYTES // k))
+    tile_n -= tile_n % DENSE_PROJ_SUB_N
+    while n % tile_n:
+        tile_n -= DENSE_PROJ_SUB_N
+    return tile_n
+
+
+def _dense_proj_kernel(
+    x_scale_ref,  # (1, m) f32, lane-dense
+    w_scale_ref,  # (1, n) f32
+    x_ref,  # (m, k) fp8, whole in VMEM, where its producer already wrote it
+    w_ref,  # (k, tile_n) fp8, streamed
+    out_ref,  # (m, tile_n) bf16, streamed
+    x_scale_lanes_ref,  # (m, 128) f32 scratch: each row's scale on every lane
+):
+    m, tile_n = out_ref.shape
+    lanes = x_scale_lanes_ref.shape[1]
+    sub_m, sub_n = min(DENSE_PROJ_SUB_M, m), DENSE_PROJ_SUB_N
+
+    @pl.when(pl.program_id(0) == 0)
+    def _():
+        x_scale_lanes_ref[...] = jnp.broadcast_to(
+            jnp.transpose(x_scale_ref[...]), x_scale_lanes_ref.shape
+        )
+
+    for r in range(m // sub_m):
+        rows = pl.ds(r * sub_m, sub_m)
+        x_scale = x_scale_lanes_ref[rows, :]
+        for c in range(tile_n // sub_n):
+            # K stays whole in one dot, as in XLA's fusion, so the f32 sums match.
+            acc = jax.lax.dot_general(
+                x_ref[rows, :],
+                w_ref[:, pl.ds(c * sub_n, sub_n)],
+                dimension_numbers=(((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            # xla_quantized_matmul's epilogue order: x scale, then w scale. One
+            # 128-lane column at a time, so the lane-broadcast x scale is reused.
+            for j in range(sub_n // lanes):
+                col = c * sub_n + j * lanes
+                n0 = pl.multiple_of(pl.program_id(0) * tile_n + col, lanes)
+                out = acc[:, j * lanes : (j + 1) * lanes] * x_scale
+                out = out * w_scale_ref[:, pl.ds(n0, lanes)]
+                out_ref[rows, pl.ds(col, lanes)] = out.astype(out_ref.dtype)
+
+
+def dense_proj_matmul(
+    x_q: jax.Array,  # [m, k] fp8
+    x_scale: jax.Array,  # [m, 1] f32
+    w_q: jax.Array,  # [k, n] fp8
+    w_scale: jax.Array,  # [n]
+    out_dtype: jnp.dtype,
+) -> jax.Array:
+    """The dot + scale epilogue of xla_quantized_matmul as a Pallas kernel.
+
+    The activation is read in place from VMEM; weight column tiles stream in
+    and output tiles stream out while the MXU works on the tile between them.
+    K is never split and the epilogue keeps XLA's order, so the result is
+    bit-identical to xla_quantized_matmul.
+    """
+    m, k = x_q.shape
+    n = w_q.shape[1]
+    tile_n = _dense_proj_tile_n(k, n)
+    return pl.pallas_call(
+        _dense_proj_kernel,
+        grid=(n // tile_n,),
+        in_specs=[
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec((k, tile_n), lambda j: (0, j)),
+        ],
+        out_specs=pl.BlockSpec((m, tile_n), lambda j: (0, j)),
+        out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
+        scratch_shapes=[pltpu.VMEM((m, 128), jnp.float32)],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=DENSE_PROJ_VMEM_LIMIT_BYTES,
+        ),
+        name="dense_proj_matmul",
+    )(
+        x_scale.reshape(1, m),
+        w_scale.astype(jnp.float32).reshape(1, n),
+        x_q,
+        w_q,
+    )
