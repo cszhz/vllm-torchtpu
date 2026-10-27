@@ -84,8 +84,7 @@ def measure(name, fn, inputs, root, repeats, dimensions):
         dimensions,
         variant=name,
         latency_ms=statistics.median(samples),
-        min_ms=min(samples),
-        max_ms=max(samples),
+        sample_statistics={"min_ms": min(samples), "max_ms": max(samples)},
         samples_ms=samples,
         compile_time_s=compile_seconds,
     )
