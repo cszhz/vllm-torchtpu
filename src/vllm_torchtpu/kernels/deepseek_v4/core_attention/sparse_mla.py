@@ -1593,7 +1593,7 @@ def sparse_ragged_paged_attention(
             cache_kv_rope,
         )
 
-    gather_lists = None
+    chunks = range(num_chunks)
     if dense_inputs is not None:
         # One SparseCore launch writes every cache-read token's selection
         # mask and one kernel launch attends all their batches, so a sequence's
@@ -1635,20 +1635,47 @@ def sparse_ragged_paged_attention(
                 jnp.sum(from_cache, dtype=jnp.int32),
             ),
         )
-        # The chunks' gather launches attend only the other batches.
+        # The other batches (decode tokens, sequence boundaries, padding) get
+        # one SparseCore gather and one launch: the gather runs under the
+        # launch above, which a call of this size keeps long since its decode
+        # tokens are bounded by the number of sequences.
         gathered_batches = jnp.logical_not(from_cache) & (
             jnp.arange(from_cache.shape[0]) * batch_size < num_valid_tokens
         )
-        per_chunk = jnp.sum(
-            gathered_batches.reshape(num_chunks, -1), axis=1, dtype=jnp.int32
+        gathered = csa_gather.csa_gather_topk(
+            cache_kv_nope,
+            cache_kv_rope,
+            topk_indices,
+            token_seq,
+            page_indices,
+            align_to(num_valid_tokens, batch_size) * topk,
+            token_start=0,
+            num_tokens=q.shape[0],
+            top_k=topk,
+            pages_per_seq=pages_per_seq,
         )
-        gather_lists = (
-            _batch_starts(gathered_batches, batch_size),
-            jnp.cumsum(per_chunk) - per_chunk,
-            per_chunk,
+        q = run_mla_kernel(
+            q,
+            gathered[0].reshape(q.shape[0], topk, -1),
+            gathered[1].reshape(q.shape[0], topk // 4, -1),
+            kv_lens,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            start_seq_idx=0,
+            end_seq_idx=q.shape[0],
+            num_valid_tokens=num_valid_tokens,
+            kernel_batch_size=batch_size,
+            batch_list=(
+                _batch_starts(gathered_batches, batch_size),
+                0,
+                jnp.sum(gathered_batches, dtype=jnp.int32),
+            ),
         )
+        chunks = ()
 
-    for i in range(num_chunks):
+    for i in chunks:
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
         chunk_size = end_pos - start_pos
@@ -1688,8 +1715,7 @@ def sparse_ragged_paged_attention(
             cache_kv_nope,
             cache_kv_rope,
             topk_indices,
-            # The SparseMLA kernel reads a `DenseRefs` batch's rows itself.
-            seq_ids_segment if dense_inputs is None else dense_inputs[0],
+            seq_ids_segment,
             page_indices,
             num_valid_indices,
             token_start=start_pos,
@@ -1715,9 +1741,6 @@ def sparse_ragged_paged_attention(
             num_valid_tokens=cu_q_lens[distribution[2]],
             kernel_batch_size=kernel_batch_size,
             swa_cache=swa_cache,
-            batch_list=None
-            if gather_lists is None
-            else (gather_lists[0], gather_lists[1][i], gather_lists[2][i]),
         )
         if swa_cache is not None:
             q, swa_cache = q
