@@ -40,7 +40,7 @@ Target modules and diff lines:
    - paged_indexer_jax, select_indexer_jax, initialize_indexer, paged_indexer
 """
 
-from dataclasses import astuple
+from dataclasses import astuple, replace
 from functools import partial
 from types import SimpleNamespace
 
@@ -1004,7 +1004,18 @@ def test_fp8_indexer_bank_sequence_roundtrip(monkeypatch, bank_count, page_size)
 
 
 @pytest.mark.cpu_test
-def test_fp8_indexer_multitile_compilation(monkeypatch):
+@pytest.mark.parametrize(
+    "tokens,width,budget_rows,key_tile,context_length",
+    [
+        (64, 16384, 24, None, 1024),
+        (64, 16384, 16, 4096, 4096),
+        (96, 32768, 24, 4096, 4096),
+        (64, 16384, 16, 4096, 4097),
+    ],
+)
+def test_fp8_indexer_multitile_compilation(
+    monkeypatch, tokens, width, budget_rows, key_tile, context_length
+):
     if jax.default_backend() != "tpu":
         pytest.skip("SparseCore selection requires TPU")
     from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
@@ -1012,8 +1023,15 @@ def test_fp8_indexer_multitile_compilation(monkeypatch):
     )
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import fp8_indexer
 
-    tokens, width = 64, 16384
-    monkeypatch.setattr(v2_kernels, "_INDEX_UNTILED_SCORE_ELEMENTS", 24 * width)
+    monkeypatch.setattr(
+        v2_kernels, "_INDEX_UNTILED_SCORE_ELEMENTS", budget_rows * width
+    )
+    if key_tile is not None:
+        monkeypatch.setattr(
+            fp8_indexer,
+            "PACKED_FP8_MQA_CONFIG",
+            replace(fp8_indexer.PACKED_FP8_MQA_CONFIG, key_tile=key_tile),
+        )
     layout = PackedFP8Layout(2)
     page = jnp.concatenate(
         (
@@ -1021,7 +1039,8 @@ def test_fp8_indexer_multitile_compilation(monkeypatch):
             jnp.ones((1, 128), jnp.float32).view(jnp.int32),
         )
     )
-    lengths = jnp.arange(tokens, dtype=jnp.int32) % 5 * 256
+    lengths = jnp.arange(tokens, dtype=jnp.int32) % 5 * (context_length // 4)
+    lengths = lengths.at[-1].set(context_length)
 
     def select(q, banks, pages, weights, lengths, requests):
         return fp8_indexer.select_indexer_jax(
@@ -1048,7 +1067,9 @@ def test_fp8_indexer_multitile_compilation(monkeypatch):
         jnp.broadcast_to(jnp.arange(2)[:, None], (2, width // 128)),
         jnp.ones((tokens, 32), jnp.float32),
         lengths,
-        jnp.tile(jnp.array([1, 0], jnp.int32), tokens // 2),
+        jnp.repeat(jnp.array([0, 1], jnp.int32), tokens // 2)
+        if key_tile is not None
+        else jnp.tile(jnp.array([1, 0], jnp.int32), tokens // 2),
     )
     expected = jnp.where(jnp.arange(512) < lengths[:, None], jnp.arange(512), -1)
     np.testing.assert_array_equal(actual, expected)

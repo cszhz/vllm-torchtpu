@@ -370,7 +370,7 @@ def _select_request_blocks(scores, first_lengths, last_lengths, count, unordered
     return jnp.where(values > -jnp.inf, indices, -1).astype(jnp.int32)
 
 
-def select_indexer_jax(
+def _select_indexer_jax(
     q: jax.Array,
     banks: tuple[jax.Array, ...],
     page_table: jax.Array,
@@ -386,6 +386,8 @@ def select_indexer_jax(
     candidate_filter: bool,
     unordered: bool,
     score_width: int,
+    *,
+    prefill_chunk_rows: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     layout = PackedFP8Layout(*layout_args)
     tokens, width = q.shape[0], score_width
@@ -448,7 +450,7 @@ def select_indexer_jax(
         constant_values=-1,
     )
 
-    rows = min(
+    rows = prefill_chunk_rows or min(
         max(tokens, query_tile),
         max(query_tile, attention_kernels._INDEX_UNTILED_SCORE_ELEMENTS // capacity),
     )
@@ -478,13 +480,14 @@ def select_indexer_jax(
     )
 
     def block(start, rows, inputs, *, score_only=False, group=None, publication=None):
+        shared_inputs = score_only and prefill_chunk_rows is None
         queries, row_weights, row_lengths, row_candidates, owners = (
             inputs
-            if score_only
+            if shared_inputs
             else tuple(jax.lax.dynamic_slice_in_dim(x, start, rows) for x in inputs)
         )
         offsets = (
-            query_offsets if score_only else jnp.clip(query_offsets - start, 0, rows)
+            query_offsets if shared_inputs else jnp.clip(query_offsets - start, 0, rows)
         )
         pool = banks[0] if len(banks) == 1 else banks
 
@@ -504,8 +507,9 @@ def select_indexer_jax(
             q_scale=jnp.ones_like(row_weights, dtype=jnp.float32),
             query_size=query_tile,
             cache_layout=layout,
-            query_start=start if score_only else 0,
+            query_start=start if shared_inputs else 0,
             query_count=rows,
+            reuse_keys=prefill_chunk_rows is not None,
         )
         if score_only:
             return (
@@ -591,7 +595,7 @@ def select_indexer_jax(
 
     short = jnp.minimum(batch_max.max(), width) <= topk
 
-    chunk_rows = PACKED_FP8_INDEXER_QUERY_ROWS.get(
+    chunk_rows = prefill_chunk_rows or PACKED_FP8_INDEXER_QUERY_ROWS.get(
         (tokens, width, candidates.shape[1], topk, block_size, len(banks))
     )
     if not stream_select or chunk_rows is None or chunk_rows > rows or padded != tokens:
@@ -671,10 +675,15 @@ def select_indexer_jax(
         return selected, candidates
 
     # Already grouped requests need neither sorting nor output reordering.
-    # Preserve complete six-query groups: moving between the four-row and
-    # two-row head reductions can change BF16 rounding.
+    # Decode preserves complete six-query groups. Prefill chunks instead match
+    # the serial score-buffer boundaries, including groups cut by that boundary.
+    # Both keep the same four-row/two-row head reduction and BF16 rounding.
     grouped = jnp.all(inputs[-1][1:] >= inputs[-1][:-1])
-    complete = jnp.all(counts % query_tile == 0)
+    complete = (
+        jnp.bool_(True)
+        if prefill_chunk_rows is not None
+        else jnp.all(counts % query_tile == 0)
+    )
     if publish_shared:
         # Ordered causal lengths let offsets identify both representatives and
         # final visibility; irregular or masked leading queries use exact routing.
@@ -683,6 +692,73 @@ def select_indexer_jax(
             (inputs[-1][1:] != inputs[-1][:-1]) | (inputs[2][1:] >= inputs[2][:-1])
         )
     return jax.lax.cond(grouped & complete & ~short, select_pipelined, select_serial)
+
+
+def select_indexer_jax(
+    q: jax.Array,
+    banks: tuple[jax.Array, ...],
+    page_table: jax.Array,
+    weights: jax.Array,
+    lengths: jax.Array,
+    candidates: jax.Array,
+    requests: jax.Array,
+    batch_max: jax.Array,
+    layout_args: tuple[int, ...],
+    topk: int,
+    block_size: int,
+    candidate_write: bool,
+    candidate_filter: bool,
+    unordered: bool,
+    score_width: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Select exact FP8 scores with a bounded, overlapped prefill working set."""
+    arguments = (
+        q,
+        banks,
+        page_table,
+        weights,
+        lengths,
+        candidates,
+        requests,
+        batch_max,
+        layout_args,
+        topk,
+        block_size,
+        candidate_write,
+        candidate_filter,
+        unordered,
+    )
+    layout = PackedFP8Layout(*layout_args)
+    width = paged_mqa_key_tile(
+        score_width, layout.page_size, PACKED_FP8_MQA_CONFIG.key_tile
+    )
+    capacity = (score_width + width - 1) // width * width
+    chunk = max(
+        PACKED_FP8_MQA_CONFIG.query_tile,
+        attention_kernels._INDEX_UNTILED_SCORE_ELEMENTS // max(capacity, 1),
+    )
+    if (
+        width >= score_width
+        or chunk >= q.shape[0]
+        or q.shape[0] % chunk
+        or candidate_write
+        or candidate_filter
+        or not unordered
+        or topk > width
+        or jax.default_backend() != "tpu"
+    ):
+        return _select_indexer_jax(*arguments, score_width)
+
+    # Preserve the existing score-buffer row boundaries, but use one retained
+    # K tile when it covers every live key. Longer contexts keep the old path.
+    live = (requests >= 0) & (requests < page_table.shape[0])
+    longest = jnp.where(live, lengths, 0).max()
+    grouped = jnp.all(requests[1:] >= requests[:-1])
+    return jax.lax.cond(
+        grouped & (longest <= width),
+        lambda: _select_indexer_jax(*arguments, width, prefill_chunk_rows=chunk),
+        lambda: _select_indexer_jax(*arguments, score_width),
+    )
 
 
 def _prepare(

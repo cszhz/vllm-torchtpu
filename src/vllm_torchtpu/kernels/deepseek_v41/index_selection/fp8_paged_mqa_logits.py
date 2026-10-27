@@ -123,7 +123,17 @@ def _dma_rows(src, dst, sem, count, wait=False, src_start=0, dst_start=0):
 
 
 def _kernel(
-    offsets, lengths, query_start, inputs, out, scratch, *, config, info, layout
+    offsets,
+    lengths,
+    query_start,
+    inputs,
+    out,
+    scratch,
+    *,
+    config,
+    info,
+    layout,
+    reuse_keys,
 ):
     mxu_size, sublanes = info.mxu_column_size, info.num_sublanes
     q, weights, pool, table = inputs
@@ -202,7 +212,7 @@ def _kernel(
         farthest = next_query(lookahead)
 
         def key_slot(tile):
-            return (key_base + tile) & (config.key_buffers - 1)
+            return 0 if reuse_keys else (key_base + tile) & (config.key_buffers - 1)
 
         def output_slot(tile):
             return 2 * q_slot + (tile & 1)
@@ -230,13 +240,23 @@ def _kernel(
             lambda: load_table(lookahead, (page_slot + 2) & 3, wait=True)
         )
         release_outputs(q_slot)
-        for i in range(2):
-
-            @pl.when((i >= ready) & (i < tile_count + next_tiles + ahead_tiles))
-            def prefill(i=i):
-                target, owner = tile_source(i)
+        if reuse_keys:
+            # A complete K tile stays resident across query groups of one request.
+            # In this mode ready identifies the retained tile's request owner.
+            @pl.when((tile_count > 0) & (ready != query.page_row))
+            def fill_keys():
                 for page in range(tile_pages):
-                    load_page(target, page, owner, key_slot(i))
+                    load_page(0, page, page_slot, 0)
+                src = keys.at[0]
+                pltpu.make_async_copy(src, src, read_sem.at[0]).wait()
+        else:
+            for i in range(2):
+
+                @pl.when((i >= ready) & (i < tile_count + next_tiles + ahead_tiles))
+                def prefill(i=i):
+                    target, owner = tile_source(i)
+                    for page in range(tile_pages):
+                        load_page(target, page, owner, key_slot(i))
 
         copy_queries(query, q_slot, wait=True)
 
@@ -375,18 +395,22 @@ def _kernel(
 
         def step_tile(tile, _):
             src = keys.at[key_slot(tile)]
-            pltpu.make_async_copy(src, src, read_sem.at[key_slot(tile)]).wait()
+            if not reuse_keys:
+                pltpu.make_async_copy(src, src, read_sem.at[key_slot(tile)]).wait()
             pl.when(tile >= 2)(lambda: publish(tile - 2, wait=True))
             pending = tile + 2 < tile_count + next_tiles + ahead_tiles
             encoded = page_record(tile, 0, page_slot)
             full = ((tile + 1) * key_tile <= minimum_length) & ((encoded & 4) != 0)
 
             def emit(full):
-                lax.cond(
-                    pending,
-                    lambda: emit_tile(tile, prefetch=True, full=full),
-                    lambda: emit_tile(tile, prefetch=False, full=full),
-                )
+                if reuse_keys:
+                    emit_tile(tile, prefetch=False, full=full)
+                else:
+                    lax.cond(
+                        pending,
+                        lambda: emit_tile(tile, prefetch=True, full=full),
+                        lambda: emit_tile(tile, prefetch=False, full=full),
+                    )
 
             lax.cond(full, lambda: emit(True), lambda: emit(False))
             publish(tile)
@@ -420,7 +444,9 @@ def _kernel(
             (next_tiles, ahead_tiles, live_tiles(farthest)),
             step + 1,
             key_slot(tile_count),
-            jnp.minimum(2, next_tiles + ahead_tiles),
+            jnp.where(tile_count > 0, query.page_row, ready)
+            if reuse_keys
+            else jnp.minimum(2, next_tiles + ahead_tiles),
         )
 
     zero = jnp.int32(0)
@@ -439,13 +465,27 @@ def _kernel(
     lax.while_loop(
         lambda state: state[0].start < end,
         query_block,
-        (*initial, tuple(live_tiles(q) for q in initial), zero, zero, zero),
+        (
+            *initial,
+            tuple(live_tiles(q) for q in initial),
+            zero,
+            zero,
+            jnp.int32(-1) if reuse_keys else zero,
+        ),
     )
     release_outputs(0)
     release_outputs(1)
 
 
-@jax.jit(static_argnames=("cache_layout", "max_model_len", "query_size", "query_count"))
+@jax.jit(
+    static_argnames=(
+        "cache_layout",
+        "max_model_len",
+        "query_size",
+        "query_count",
+        "reuse_keys",
+    )
+)
 def fp8_paged_mqa_logits(
     q: jax.Array,
     kv_cache: jax.Array | tuple[jax.Array, jax.Array],
@@ -460,6 +500,7 @@ def fp8_paged_mqa_logits(
     cache_layout: PackedFP8Layout | None = None,
     query_start: jax.Array | int = 0,
     query_count: int | None = None,
+    reuse_keys: bool = False,
 ) -> jax.Array:
     """Return FP32 scores for the query window, with invalid positions set to -inf.
 
@@ -476,6 +517,8 @@ def fp8_paged_mqa_logits(
         cache_layout: Shared cache placement; None means tightly packed pages.
         query_start: First query to read from the full input arrays and offsets.
         query_count: Output rows; defaults to the full query batch.
+        reuse_keys: Keep a single complete K tile resident across query groups
+            belonging to the same request. Multi-tile outputs retain prefetching.
     """
     tokens, heads, dim = q.shape
     tokens = tokens if query_count is None else query_count
@@ -543,6 +586,7 @@ def fp8_paged_mqa_logits(
                 cache_layout=layout,
                 query_start=query_start,
                 query_count=query_count,
+                reuse_keys=reuse_keys,
             )
             return lax.dynamic_update_slice_in_dim(output, values, start, axis=1)
 
@@ -570,7 +614,13 @@ def fp8_paged_mqa_logits(
     hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
     inputs = (q, weights * q_scale, banks, table)
     return pl.pallas_call(
-        partial(_kernel, config=config, info=info, layout=layout),
+        partial(
+            _kernel,
+            config=config,
+            info=info,
+            layout=layout,
+            reuse_keys=reuse_keys and width == config.key_tile,
+        ),
         out_shape=jax.ShapeDtypeStruct((tokens, width), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,

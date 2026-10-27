@@ -75,7 +75,10 @@ def _pack_fp8_cache(kv_cache, layout):
 
 
 @pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (2, 4)])
-def test_fp8_paged_mqa_logits_vllm_accuracy(batch_size, next_n, record_property):
+@pytest.mark.parametrize("reuse_keys", [True, False])
+def test_fp8_paged_mqa_logits_vllm_accuracy(
+    batch_size, next_n, reuse_keys, record_property
+):
     if jax.default_backend() != "tpu":
         pytest.skip("Requires the TPU paged MQA kernel")
     torch.manual_seed(0)
@@ -119,8 +122,9 @@ def test_fp8_paged_mqa_logits_vllm_accuracy(batch_size, next_n, record_property)
         query_start_loc=jnp.arange(batch_size + 1, dtype=jnp.int32) * next_n,
         max_model_len=width,
         q_scale=jnp.ones(weights.shape, dtype=jnp.float32),
-        query_size=next_n,
+        query_size=min(next_n, 2),
         cache_layout=layout,
+        reuse_keys=reuse_keys,
     )
     logits = torch.from_numpy(np.asarray(actual).copy())
     ref_logits = _ref_paged_mqa_logits(
