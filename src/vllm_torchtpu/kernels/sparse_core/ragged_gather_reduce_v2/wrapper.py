@@ -45,7 +45,7 @@ def _preprocess_scalar_data(
     valid_rows_mask: jax.Array,
     cfg: config.Config,
 ) -> tuple[memory_ref.IndexRef, jax.Array]:
-    """Compacts each row partition's valid source rows and plans their scatters.
+    """Compacts the valid source rows and splits them evenly over row partitions.
 
     Args:
       indices: Indices for gather.
@@ -54,57 +54,58 @@ def _preprocess_scalar_data(
 
     Returns:
       The kernel's index refs: ``sorted_by_validity``, each compacted row's
-        source position (valid rows first within each row partition, in order);
-        ``scatter_meta``, per compacted row ``2 * destination + same_as_prev``,
-        where the destination is the output row for the last row of a reduce
-        group and the garbage row otherwise; ``partition_bounds``, the
-        [start, end) range of compacted rows each row partition reduces (starts
-        in the first ``num_simd_lanes`` words, ends in the next).
+        source position (all valid rows first, in order); ``scatter_meta``, per
+        compacted row ``2 * destination + same_as_prev``, where the destination
+        is the output row for the last row of a reduce group and the garbage
+        row otherwise; ``partition_bounds``, the [start, end) range of
+        compacted rows each row partition reduces (starts in the first
+        ``num_simd_lanes`` words, ends in the next).
       mask: per output group, whether the group has any valid source row.
     """
     num_simd_lanes = cfg.sc_info.num_lanes
     num_row_partitions = cfg.num_row_partitions
-    partition_size = cfg.row_partition_size
-    valid_rows_mask_2d = valid_rows_mask.reshape(num_row_partitions, -1)
+    group_size = cfg.reduce_group_size
+    num_rows = valid_rows_mask.shape[0]
 
     # Stable sort of a boolean key is a stable partition: valid rows keep their
     # relative order and move ahead of the invalid ones.
-    sorted_by_validity = jnp.argsort(
-        ~valid_rows_mask_2d, descending=False, stable=True, axis=-1
-    )
-    partition_base = jnp.arange(num_row_partitions, dtype=jnp.int32) * partition_size
-    sorted_by_validity = sorted_by_validity.astype(jnp.int32) + partition_base[:, None]
-    num_valid = jnp.sum(valid_rows_mask_2d, axis=-1).astype(jnp.int32)
+    sorted_by_validity = jnp.argsort(~valid_rows_mask, stable=True).astype(jnp.int32)
+    num_valid = jnp.sum(valid_rows_mask, dtype=jnp.int32)
 
-    dst = sorted_by_validity // cfg.reduce_group_size
-    slot = jnp.arange(partition_size, dtype=jnp.int32)[None, :]
-    no_group = jnp.full((num_row_partitions, 1), -1, jnp.int32)
-    next_dst = jnp.concatenate([dst[:, 1:], no_group], axis=1)
-    prev_dst = jnp.concatenate([no_group, dst[:, :-1]], axis=1)
-    is_final = (slot < num_valid[:, None]) & (
-        (slot + 1 >= num_valid[:, None]) | (next_dst != dst)
-    )
-    garbage_dst = cfg.padded_input_size // cfg.reduce_group_size
+    dst = sorted_by_validity // group_size
+    slot = jnp.arange(num_rows, dtype=jnp.int32)
+    no_group = jnp.full((1,), -1, jnp.int32)
+    next_dst = jnp.concatenate([dst[1:], no_group])
+    prev_dst = jnp.concatenate([no_group, dst[:-1]])
+    is_final = (slot < num_valid) & ((slot + 1 >= num_valid) | (next_dst != dst))
+    garbage_dst = cfg.padded_input_size // group_size
     scatter_meta = jnp.where(is_final, dst, garbage_dst) * 2 + (prev_dst == dst)
 
-    tail = cfg.compacted_size - cfg.padded_input_size
+    # Split the valid rows evenly, each boundary moved back to the first row of
+    # the reduce group it falls in, so no group straddles two partitions.
+    targets = jnp.arange(num_row_partitions + 1, dtype=jnp.int32) * num_valid
+    targets = targets // num_row_partitions
+    target_group = dst[jnp.minimum(targets, num_rows - 1)]
+    rows_before_group = jnp.sum(
+        valid_rows_mask[None, :] & (slot[None, :] < target_group[:, None] * group_size),
+        axis=1,
+        dtype=jnp.int32,
+    )
+    bounds = jnp.where(targets < num_valid, rows_before_group, num_valid)
+
+    tail = cfg.compacted_size - num_rows
     # Rows past a partition's end are gathered but never written; keep their
     # source positions inside the (unpadded) index and weight arrays.
     sorted_by_validity = jnp.pad(
-        jnp.minimum(sorted_by_validity.reshape(-1), cfg.input_size - 1), (0, tail)
+        jnp.minimum(sorted_by_validity, cfg.input_size - 1), (0, tail)
     )
-    scatter_meta = jnp.pad(
-        scatter_meta.reshape(-1), (0, tail), constant_values=garbage_dst * 2
-    )
+    scatter_meta = jnp.pad(scatter_meta, (0, tail), constant_values=garbage_dst * 2)
 
     lane_pad = (0, num_simd_lanes - num_row_partitions)
     partition_bounds = jnp.concatenate(
-        [
-            jnp.pad(partition_base, lane_pad),
-            jnp.pad(partition_base + num_valid, lane_pad),
-        ]
+        [jnp.pad(bounds[:-1], lane_pad), jnp.pad(bounds[1:], lane_pad)]
     )
-    mask = jnp.any(valid_rows_mask.reshape(-1, cfg.reduce_group_size), axis=-1)
+    mask = jnp.any(valid_rows_mask.reshape(-1, group_size), axis=-1)
     scalar = memory_ref.IndexRef(
         partition_bounds=partition_bounds,
         indices=indices,
