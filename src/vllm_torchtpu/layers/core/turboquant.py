@@ -19,8 +19,10 @@ https://docs.vllm.ai/en/latest/api/vllm/model_executor/layers/quantization/turbo
 
 * **MSE keys (`4bit_nc`, `k3v4_nc`, `3bit_nc`):** `k / ||k||` is rotated by an
   orthonormal Walsh-Hadamard matrix `H` and quantized to 3- or 4-bit Lloyd-Max
-  centroids (`||k||` stored as `bf16`). Because `q . k == (q H) . (k H)`,
-  queries are pre-rotated once (`q @ H`) instead of inverse-rotating keys.
+  centroids (`_nc` presets fold the norm correction in at store time, saving
+  `||k|| * rsqrt(sum(c^2) + 1e-16)` as `bf16` instead of raw `||k||`). Because
+  `q . k == (q H) . (k H)`, queries are pre-rotated once (`q @ H`) instead of
+  inverse-rotating keys.
 * **FP8 keys (`k8v4`):** Unrotated `float8_e4m3fn` bytes.
 * **Values:** Per-token asymmetric 3- or 4-bit uniform quantization with `bf16`
   `(v_scale, v_zero)` metadata.
@@ -88,6 +90,18 @@ class TQLayout:
     norm_correction: bool  # True for `*_nc` presets; renormalizes centroid vectors.
     slot_size_aligned: int  # Even-aligned bytes per (token, head) slot.
 
+    def __post_init__(self) -> None:
+        if self.head_dim < _WORD_SIZE or self.head_dim % _WORD_SIZE != 0:
+            raise ValueError(
+                f"TurboQuant head_dim must be a positive multiple of {_WORD_SIZE}, "
+                f"got {self.head_dim}"
+            )
+        if not self.is_key_fp8 and (self.head_dim & (self.head_dim - 1)):
+            raise ValueError(
+                "TurboQuant MSE key presets require power-of-two "
+                f"head_dim >= {_WORD_SIZE}, got {self.head_dim}"
+            )
+
     @classmethod
     def from_tq_config(cls, tq_config: Any) -> TQLayout:
         return cls(
@@ -103,6 +117,18 @@ class TQLayout:
         return self.key_bits == 8
 
     @property
+    def supported_page_sizes(self) -> tuple[int, ...]:
+        return (16, 32, 64) if self.is_key_fp8 else (16, 64)
+
+    def validate_page_size(self, page_size: int) -> None:
+        if page_size not in self.supported_page_sizes:
+            raise ValueError(
+                f"Unsupported TurboQuant page_size={page_size} for "
+                f"key_bits={self.key_bits}; supported page sizes are "
+                f"{self.supported_page_sizes}"
+            )
+
+    @property
     def key_mse_bytes(self) -> int:
         return math.ceil(self.head_dim * self.key_bits / 8)
 
@@ -112,17 +138,19 @@ class TQLayout:
 
     def page_words_128(self, page_size: int) -> int:
         """Number of 128-byte words needed to store `page_size` slots per head."""
+        self.validate_page_size(page_size)
         raw_words = math.ceil(page_size * self.slot_size_aligned / _WORD_SIZE)
         return ((raw_words + _SUBLANE_WORDS - 1) // _SUBLANE_WORDS) * _SUBLANE_WORDS
 
     def page_size_from_words_128(self, page_words: int) -> int:
         """Recovers `page_size` (slots per page) from `page_words_128(page_size)`."""
-        for candidate in (16, 32, 64, 128, 256, 512):
+        for candidate in self.supported_page_sizes:
             if self.page_words_128(candidate) == page_words:
                 return candidate
-        return (
-            (page_words * _WORD_SIZE) // self.slot_size_aligned // _SUBLANE_WORDS
-        ) * _SUBLANE_WORDS
+        raise ValueError(
+            f"Cannot recover supported page_size {self.supported_page_sizes} "
+            f"from page_words={page_words} (slot_size_aligned={self.slot_size_aligned})"
+        )
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -180,6 +208,7 @@ def rotate(inputs: jax.Array, hadamard: jax.Array) -> jax.Array:
 
 def _plane_word_counts(page_size: int, layout: TQLayout) -> tuple[int, int, int]:
     """Number of 128-byte words per head for `(k_plane, v_plane, meta_plane)`."""
+    layout.validate_page_size(page_size)
     k_bytes = layout.head_dim if layout.is_key_fp8 else layout.key_mse_bytes
     k_words = (page_size * k_bytes) // _WORD_SIZE
     v_words = (page_size * layout.value_data_bytes) // _WORD_SIZE
@@ -683,20 +712,13 @@ def tq_ragged_paged_attention(
 ) -> tuple[jax.Array, jax.Array]:
     """Ragged paged attention over a compressed TurboQuant `uint8` KV cache.
 
-    When `rpa_fn` is the Pallas RPA v3 kernel (`ragged_paged_attention`), the
-    kernel fetches compressed `uint8` pages directly into VMEM (`btq_x2_ref`),
-    updates touched pages in VREGs, dequantizes active pages in VREGs on the
-    fly, and DMAs updated pages back to HBM. When `rpa_fn` is a reference
-    callable such as `ref_ragged_paged_attention` (CPU/TPU unit tests), the same
-    `_pack_new_tq_tokens_128`, `_update_tq_page_vreg`, and
-    `_dequant_tq_page_vreg` functions are executed via `vmap`.
+    Executes `_pack_new_tq_tokens_128`, `_update_tq_page_vreg`, and
+    `_dequant_tq_page_vreg` via `vmap` and delegates attention to `rpa_fn`
+    (e.g. `ref_ragged_paged_attention`).
 
     Returns `(new_kv_cache, outputs)`.
     """
-    from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
-        merge_kv,
-        ragged_paged_attention,
-    )
+    from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import merge_kv
 
     assert kv_cache.ndim == 4 and kv_cache.shape[3] == _WORD_SIZE, kv_cache.shape
     page_size = layout.page_size_from_words_128(kv_cache.shape[2])
@@ -720,36 +742,11 @@ def tq_ragged_paged_attention(
 
     dequant_fn = functools.partial(_dequant_tq_page_vreg, layout=layout, tables=tables)
     tq_new_kv = None
-    update_fn = None
     if not skip_kv_update:
         nk_u, nv_i, n_meta = _quantize_kv_components(
             keys, values, layout, tables, rotated_key=k_rot
         )
         tq_new_kv = _pack_new_tq_tokens_128(nk_u, nv_i, n_meta, page_size, layout)
-        update_fn = functools.partial(_update_tq_page_vreg, layout=layout)
-
-    # Production passes the fused Pallas `ragged_paged_attention` kernel (which
-    # accepts the `tq_*` VMEM hooks); CPU unit tests pass `ref_ragged_paged_attention`.
-    if rpa_fn is ragged_paged_attention:
-        outputs, kv_cache = rpa_fn(
-            q_in,
-            k_in,
-            values.astype(compute_dtype),
-            kv_cache,
-            kv_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
-            sm_scale=sm_scale,
-            sliding_window=sliding_window,
-            soft_cap=soft_cap,
-            skip_kv_update=skip_kv_update,
-            tq_page_size=page_size,
-            tq_dequant_page_fn=dequant_fn,
-            tq_new_kv=tq_new_kv,
-            tq_update_page_fn=update_fn,
-        )
-        return kv_cache, outputs
 
     if not skip_kv_update:
         max_num_seqs = kv_lens.shape[0]

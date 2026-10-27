@@ -33,6 +33,11 @@ from vllm_torchtpu.layers.core import turboquant as tq
 PRESETS = sorted(TQ_PRESETS)
 
 
+def _bf16_round_np(x: np.ndarray) -> np.ndarray:
+    u32 = np.asarray(x, dtype=np.float32).view(np.uint32)
+    return (((u32 + 0x7FFF + ((u32 >> 16) & 1)) >> 16) << 16).view(np.float32)
+
+
 def _layout_and_tables(preset: str, head_dim: int):
     cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim)
     layout = tq.TQLayout.from_tq_config(cfg)
@@ -40,10 +45,45 @@ def _layout_and_tables(preset: str, head_dim: int):
     return layout, tq.make_tables(layout, centroids)
 
 
+def test_tq_layout_validation():
+    """TQLayout rejects unsupported head_dim and page_size values with ValueError."""
+    fp8_layout, _ = _layout_and_tables("turboquant_k8v4", 128)
+    mse_layout, _ = _layout_and_tables("turboquant_4bit_nc", 128)
+
+    assert fp8_layout.supported_page_sizes == (16, 32, 64)
+    assert mse_layout.supported_page_sizes == (16, 64)
+
+    for bad_page_size in (8, 24, 128, 256):
+        with pytest.raises(ValueError, match="supported page sizes"):
+            fp8_layout.page_words_128(bad_page_size)
+    with pytest.raises(ValueError, match="supported page sizes"):
+        mse_layout.page_words_128(32)
+    with pytest.raises(ValueError, match="Cannot recover supported page_size"):
+        mse_layout.page_size_from_words_128(999)
+
+    with pytest.raises(ValueError, match="positive multiple of 128"):
+        tq.TQLayout(
+            head_dim=64,
+            key_bits=4,
+            value_bits=4,
+            norm_correction=True,
+            slot_size_aligned=70,
+        )
+    with pytest.raises(ValueError, match="power-of-two head_dim"):
+        tq.TQLayout(
+            head_dim=384,
+            key_bits=4,
+            value_bits=4,
+            norm_correction=True,
+            slot_size_aligned=390,
+        )
+
+
 @pytest.mark.parametrize(
     ("preset", "page_size", "head_dim"),
     [(p, 16, 128) for p in PRESETS]
     + [
+        ("turboquant_k8v4", 32, 128),
         ("turboquant_k8v4", 64, 256),
         ("turboquant_4bit_nc", 64, 256),
     ],
@@ -88,6 +128,49 @@ def test_vreg_pack_update_dequant_roundtrip(preset, page_size, head_dim):
     np.testing.assert_allclose(
         dk_reconstructed, np.tile(np.asarray(dk), (4, 1)), rtol=1e-3, atol=1e-3
     )
+
+    # Bit-for-bit parity against a NumPy transcription of upstream store/dequant math.
+    levels = (1 << layout.value_bits) - 1
+    v0 = v[:, 0]
+    v_min = v0.min(axis=-1, keepdims=True)
+    v_max = v0.max(axis=-1, keepdims=True)
+    v_scale = np.maximum((v_max - v_min) / levels, 1e-8)
+    ref_v_idx = np.clip(np.floor((v0 - v_min) / v_scale + 0.5), 0, levels).astype(
+        np.uint8
+    )
+    np.testing.assert_array_equal(np.asarray(nv_i[:, 0]), ref_v_idx)
+    ref_dv = ref_v_idx.astype(np.float32) * _bf16_round_np(v_scale) + _bf16_round_np(
+        v_min
+    )
+    np.testing.assert_array_equal(np.asarray(dv), ref_dv)
+
+    k0 = k[:, 0]
+    if layout.is_key_fp8:
+        fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+        ref_dk = np.asarray(
+            jnp.clip(k0, -fp8_max, fp8_max)
+            .astype(jnp.float8_e4m3fn)
+            .astype(jnp.float32)
+        )
+        np.testing.assert_array_equal(np.asarray(dk), ref_dk)
+    else:
+        k_norm = np.sqrt(np.sum(k0 * k0, axis=-1, keepdims=True))
+        rot_k = (k0 / (k_norm + 1e-8)) @ tables.hadamard
+        ref_k_idx = np.searchsorted(tables.midpoints, rot_k, side="right")
+        half_levels = 1 << (layout.key_bits - 1)
+        ref_sign_mag = np.where(
+            ref_k_idx < half_levels,
+            (half_levels - 1 - ref_k_idx) | half_levels,
+            ref_k_idx - half_levels,
+        ).astype(np.uint8)
+        np.testing.assert_array_equal(np.asarray(nk_u[:, 0]), ref_sign_mag)
+        c_vec = tables.centroids[ref_k_idx]
+        if layout.norm_correction:
+            k_norm = k_norm / np.sqrt(
+                np.sum(c_vec * c_vec, axis=-1, keepdims=True) + 1e-16
+            )
+        ref_dk = _bf16_round_np(c_vec) * _bf16_round_np(k_norm)
+        np.testing.assert_array_equal(np.asarray(dk), ref_dk)
 
     q_in = q if layout.is_key_fp8 else np.asarray(tq.rotate(q, tables.hadamard))
     approx_scores = np.asarray(dk) @ q_in
