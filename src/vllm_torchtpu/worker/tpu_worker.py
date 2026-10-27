@@ -776,17 +776,21 @@ class TPUWorker(WorkerBase):
         # allocator keeps their pages. Return them before initialize_from_config,
         # where a KV connector may allocate its host store.
         _release_free_host_heap()
+        # Preserve parallel weight loading, then switch to serving's thread
+        # count before profile_run and warm-up compile anything: Dynamo guards
+        # every compiled entry on torch's thread count, so traces recorded at
+        # the startup count are discarded and re-traced on the first request.
+        set_torch_threads_for_runtime()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
-        if getattr(self, "speculative_config", None) is not None:
-            # Record the warm-up traces under the serving thread count. Other
-            # models keep upstream's warm-up at the startup count.
-            set_torch_threads_for_runtime()
+        # Normally already in effect since load_model; kept here so a warm-up
+        # reached without it (dummy weights, tests) still traces under the
+        # serving thread count.
+        set_torch_threads_for_runtime()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
-        set_torch_threads_for_runtime()
         # torch records every compile artifact for save_cache_artifacts(), which
         # vLLM never calls; drop the record so its memory can be freed.
         CacheArtifactManager.clear()

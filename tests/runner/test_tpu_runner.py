@@ -3622,3 +3622,79 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+def test_execute_model_subgraphs_precompile_under_no_grad(monkeypatch):
+    """Subgraphs served inside execute_model (@torch.no_grad) must also warm
+    under no_grad so Dynamo's GLOBAL_STATE grad_mode guard matches at runtime.
+    """
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner.synchronize_tensors", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner._get_sequence_layout_planner_for_runner",
+        lambda _r: SimpleNamespace(uses_selected_logits_hidden_states=True),
+    )
+
+    seen_grad: dict[str, list[bool]] = {
+        "compute_selected_logits": [],
+        "compute_logits_from_hidden_states": [],
+        "compute_selected_top_tokens": [],
+        "compute_top_tokens_from_hidden_states": [],
+        "substitute_placeholder_token": [],
+        "rollback_seed": [],
+        "rollback_migrate": [],
+    }
+
+    def record(name):
+        def _fn(*_args, **_kwargs):
+            seen_grad[name].append(torch.is_grad_enabled())
+            return torch.zeros((1,), dtype=torch.int32)
+
+        return _fn
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner._substitute_placeholder_token",
+        record("substitute_placeholder_token"),
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner._rollback_offsets_seed_compiled",
+        record("rollback_seed"),
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner._rollback_offsets_migrate_compiled",
+        record("rollback_migrate"),
+    )
+
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(get_hidden_size=lambda: 8),
+        num_tokens_paddings=[4],
+        num_reqs_paddings=[2],
+        max_num_reqs=2,
+        _hidden_states_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        _precompile_timed=lambda _name: contextlib.nullcontext(),
+        _greedy_head_owner=object(),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        _is_async_drafter=False,
+        mamba_slot_read_offsets=torch.zeros(8, dtype=torch.int32),
+        _mamba_copy_plan=[],
+        kv_cache_config=None,
+        _bucket_len=TPUModelRunner._bucket_len,
+        compute_selected_logits=record("compute_selected_logits"),
+        compute_logits_from_hidden_states=record("compute_logits_from_hidden_states"),
+        compute_selected_top_tokens=record("compute_selected_top_tokens"),
+        compute_top_tokens_from_hidden_states=record(
+            "compute_top_tokens_from_hidden_states"
+        ),
+    )
+
+    assert torch.is_grad_enabled()
+    TPUModelRunner._precompile_compute_selected_logits(runner)
+    TPUModelRunner._precompile_compute_logits_from_hidden_states(runner)
+    TPUModelRunner._precompile_compute_top_tokens(runner)
+    TPUModelRunner._precompile_substitute_placeholder_token(runner)
+    TPUModelRunner._precompile_mamba_rollback_helpers(runner)
+
+    for name, flags in seen_grad.items():
+        assert flags and not any(flags), (name, flags)

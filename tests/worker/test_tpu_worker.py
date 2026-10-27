@@ -371,12 +371,21 @@ def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
         "vllm_torchtpu.worker.tpu_worker._release_free_host_heap",
         lambda: events.append("release"),
     )
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker.set_torch_threads_for_runtime",
+        lambda: events.append("runtime_threads"),
+    )
     worker = SimpleNamespace(
         model_config=config,
         model_runner=SimpleNamespace(load_model=lambda: events.append("load")),
     )
     TPUWorker.load_model(worker)
-    assert events == [("model_load", {"model_config": config}), "load", "release"]
+    assert events == [
+        ("model_load", {"model_config": config}),
+        "load",
+        "release",
+        "runtime_threads",
+    ]
 
 
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
@@ -414,9 +423,9 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
             result = TPUWorker.compile_or_warm_up_model(worker)
         freeze.assert_called_once_with()
         gc_debug.assert_called_once_with()
-        # Speculative decoding warms up at the serving thread count; other
-        # models keep the startup count during warm-up.
-        assert warmup_threads == [runtime_threads if speculative else 2]
+        # Both speculative and non-speculative models warm up at the serving
+        # thread count so Dynamo's GLOBAL_STATE num_threads guard matches runtime.
+        assert warmup_threads == [runtime_threads]
         assert torch.get_num_threads() == runtime_threads
         assert result.language_model == worker.compilation_config.compilation_time
         assert result.encoder == 0.0

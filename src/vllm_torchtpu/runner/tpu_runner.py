@@ -6055,7 +6055,9 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
-        with self._precompile_timed("compute_selected_logits"):
+        # Serving calls this under execute_model's no_grad, and dynamo guards
+        # on grad mode: compile it the same way.
+        with self._precompile_timed("compute_selected_logits"), torch.no_grad():
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
@@ -6073,7 +6075,10 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
-        with self._precompile_timed("compute_logits_from_hidden_states"):
+        with (
+            self._precompile_timed("compute_logits_from_hidden_states"),
+            torch.no_grad(),
+        ):
             for num_reqs in self.num_reqs_paddings:
                 dummy_hidden = torch.zeros(
                     (num_reqs, hsize),
@@ -6087,7 +6092,7 @@ class TPUModelRunner(GPUModelRunner):
         if self._greedy_head_owner is None:
             return
         hsize = self.model_config.get_hidden_size()
-        with self._precompile_timed("compute_selected_top_tokens"):
+        with self._precompile_timed("compute_selected_top_tokens"), torch.no_grad():
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
@@ -6103,7 +6108,10 @@ class TPUModelRunner(GPUModelRunner):
             self
         ).uses_selected_logits_hidden_states:
             return
-        with self._precompile_timed("compute_top_tokens_from_hidden_states"):
+        with (
+            self._precompile_timed("compute_top_tokens_from_hidden_states"),
+            torch.no_grad(),
+        ):
             for num_reqs in self.num_reqs_paddings:
                 dummy_hidden = torch.zeros(
                     (num_reqs, hsize),
@@ -6250,7 +6258,12 @@ class TPUModelRunner(GPUModelRunner):
             next_lens.append(
                 self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
             )
-        with self._precompile_timed("substitute_placeholder_token"):
+        # Serving calls this from _prepare_inputs under execute_model's
+        # no_grad, and dynamo guards on grad mode: compile it the same way.
+        with (
+            self._precompile_timed("substitute_placeholder_token"),
+            torch.no_grad(),
+        ):
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
                 cur_input_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
@@ -6916,7 +6929,7 @@ class TPUModelRunner(GPUModelRunner):
         offsets = self.mamba_slot_read_offsets
         if offsets is None:
             return
-        with self._precompile_timed("mamba rollback helpers"):
+        with self._precompile_timed("mamba rollback helpers"), torch.no_grad():
             num_groups = max(
                 1,
                 len(self._mamba_copy_plan),
