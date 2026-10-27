@@ -90,6 +90,15 @@ class MetadataRef:
     # speculative decoding, where the only checkpoint is the slot's own
     # state block (`s_idx_to_state_indices`).
     s_idx_to_ckpt_indices: Any = None
+    # Prefill checkpoint (vLLM `num_prefill_checkpoint_blocks`), PER_SEQ
+    # only: `p_id_is_ckpt_tile[p]` marks the interior tile whose last token
+    # is the sequence's hash-block boundary, and the state after that tile
+    # is additionally written to block `s_idx_to_prefill_ckpt_block[s]`
+    # (window position 0; the tile is never a last tile). None when no
+    # sequence of the call requests a checkpoint, which keeps the decode
+    # path and every pre-existing caller untouched.
+    p_id_is_ckpt_tile: SmemWrapper | None = None
+    s_idx_to_prefill_ckpt_block: Any = None
 
     @classmethod
     def create(
@@ -105,9 +114,16 @@ class MetadataRef:
         s_idx_to_state_indices: jax.Array,
         s_idx_to_read_offset: jax.Array,
         s_idx_to_ckpt_indices: jax.Array | None = None,
+        p_id_is_ckpt_tile: jax.Array | None = None,
+        s_idx_to_prefill_ckpt_block: jax.Array | None = None,
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
+        if (p_id_is_ckpt_tile is None) != (s_idx_to_prefill_ckpt_block is None):
+            raise ValueError(
+                "p_id_is_ckpt_tile and s_idx_to_prefill_ckpt_block must be set "
+                "together."
+            )
         return cls(
             num_tiles=num_tiles,
             p_id_to_s_idx=SmemWrapper(p_id_to_s_idx, shape),
@@ -119,6 +135,25 @@ class MetadataRef:
             s_idx_to_state_indices=s_idx_to_state_indices,
             s_idx_to_read_offset=s_idx_to_read_offset,
             s_idx_to_ckpt_indices=s_idx_to_ckpt_indices,
+            p_id_is_ckpt_tile=(
+                None
+                if p_id_is_ckpt_tile is None
+                else SmemWrapper(p_id_is_ckpt_tile, shape)
+            ),
+            s_idx_to_prefill_ckpt_block=s_idx_to_prefill_ckpt_block,
+        )
+
+    def prefill_ckpt_tile(self, p_id, idx):
+        """Checkpoint-tile flag and destination block of tile slot `idx`.
+
+        Only meaningful when `p_id_is_ckpt_tile` is set; callers gate on
+        that statically so the default path emits no checkpoint DMA.
+        """
+        assert self.p_id_is_ckpt_tile is not None
+        s_idx = self.p_id_to_s_idx[p_id, idx]
+        return (
+            self.p_id_is_ckpt_tile[p_id, idx],
+            self.s_idx_to_prefill_ckpt_block[s_idx],
         )
 
     def __len__(self) -> int:
@@ -339,6 +374,20 @@ class StateOutBufferedRef(BaseBufferedRef):
                 sem,
             ).start()
 
+            # Prefill checkpoint: the interior tile ending on the hash-block
+            # boundary also exports its final state (window position 0,
+            # PER_SEQ has window_size == 1) to the checkpoint block.
+            if self.metadata_ref.p_id_is_ckpt_tile is not None:
+                is_ckpt_tile, ckpt_block = self.metadata_ref.prefill_ckpt_tile(
+                    p_id, idx
+                )
+                ckpt_dma_size = jnp.where(is_ckpt_tile, 1, 0)
+                pltpu.make_async_copy(
+                    vmem_ref.at[idx, pl.ds(0, ckpt_dma_size)],
+                    dst_ref.at[pl.ds(ckpt_block, ckpt_dma_size)],
+                    sem,
+                ).start()
+
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
@@ -353,6 +402,9 @@ class StateOutBufferedRef(BaseBufferedRef):
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
             dma_size += jnp.where(is_last_tile, num_ckpts, 0)
+            if self.metadata_ref.p_id_is_ckpt_tile is not None:
+                is_ckpt_tile, _ = self.metadata_ref.prefill_ckpt_tile(p_id, idx)
+                dma_size += jnp.where(is_ckpt_tile, 1, 0)
 
         # NOTE: With bounds checks disabled, the self-copy descriptor may
         # nominally exceed the window row; it is never executed, only used
@@ -523,6 +575,10 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
         pool never has to be exposed as a Pallas output. This path predates
         per-checkpoint blocks and PCP rejects speculative decoding, so it
         writes the compact tile without checkpoint addressing.
+
+        The compact buffer is `[num_seqs, num_slots, nblocks, ...]`: slot 0
+        holds the final state and slot 1, present only when the call
+        requests prefill checkpoints, the state at the checkpoint tile.
         """
         assert self.sem_sends is not None
         assert self.window_ref is not None
@@ -541,9 +597,21 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
 
             pltpu.make_async_copy(
                 vmem_ref.at[idx, 0, pl.ds(0, dma_size)],
-                self.compact_output_ref.at[s_idx, pl.ds(0, dma_size)],
+                self.compact_output_ref.at[s_idx, 0, pl.ds(0, dma_size)],
                 sem,
             ).start()
+
+            if self.metadata_ref.p_id_is_ckpt_tile is not None:
+                assert self.compact_output_ref.shape[1] == 2, (
+                    "prefill checkpoints need a second compact update slot"
+                )
+                is_ckpt_tile, _ = self.metadata_ref.prefill_ckpt_tile(p_id, idx)
+                ckpt_dma_size = jnp.where(is_ckpt_tile, self._unit(), 0)
+                pltpu.make_async_copy(
+                    vmem_ref.at[idx, 0, pl.ds(0, ckpt_dma_size)],
+                    self.compact_output_ref.at[s_idx, 1, pl.ds(0, ckpt_dma_size)],
+                    sem,
+                ).start()
 
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         if self.compact_output_ref is not None:
@@ -575,6 +643,20 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
                     sem,
                 ).start()
 
+            # Prefill checkpoint: the interior tile ending on the hash-block
+            # boundary also exports window position 0 (PER_SEQ has
+            # window_size == 1) to the sequence's checkpoint block.
+            if self.metadata_ref.p_id_is_ckpt_tile is not None:
+                is_ckpt_tile, ckpt_block = self.metadata_ref.prefill_ckpt_tile(
+                    p_id, idx
+                )
+                nblocks = jnp.where(is_ckpt_tile, self.region.nblocks, 0)
+                pltpu.make_async_copy(
+                    vmem_ref.at[idx, 0, pl.ds(0, nblocks)],
+                    self._region_slice(dst_ref, ckpt_block, nblocks),
+                    sem,
+                ).start()
+
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
@@ -589,6 +671,9 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
             dma_size += jnp.where(is_last_tile, num_ckpts, 0)
+            if self.metadata_ref.p_id_is_ckpt_tile is not None:
+                is_ckpt_tile, _ = self.metadata_ref.prefill_ckpt_tile(p_id, idx)
+                dma_size += jnp.where(is_ckpt_tile, 1, 0)
 
         # Each checkpoint's copy covers one full region tile; wait for that
         # many region tiles along the window dim of one sequence row (the

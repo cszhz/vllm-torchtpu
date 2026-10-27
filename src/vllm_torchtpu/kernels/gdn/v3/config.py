@@ -21,6 +21,13 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+# Token alignment of a mid-prefill state checkpoint relative to the query
+# start (vLLM `MambaSpec.prefill_checkpoint_alignment`). The PER_SEQ kernel
+# can only export a state on a tile boundary, so the wrapper asserts that
+# this is a multiple of the prefill tile size (every tiling candidate divides
+# 256) whenever checkpoints are requested.
+PREFILL_CKPT_ALIGNMENT = 256
+
 
 class AttentionMode(enum.StrEnum):
     # Gated Delta Net: one scalar gate per value head.

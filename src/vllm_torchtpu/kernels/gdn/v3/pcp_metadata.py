@@ -24,6 +24,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.experimental import pallas as pl
 
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
@@ -109,6 +110,7 @@ def _schedule_capacities(
     max_num_seqs: int,
     pcp_size: int,
     comm_chunk_size: int,
+    request_relative_tiles: bool = False,
 ) -> tuple[int, int]:
     """Return safe static storage capacities for stages and split tiles."""
     stage_size = pcp_size * comm_chunk_size
@@ -120,6 +122,10 @@ def _schedule_capacities(
     # valid even in small test geometries where one communication chunk is
     # smaller than one GDN tile.
     max_tiles = pl.cdiv(cfg.batch_size, cfg.tile_size) + pcp_size * max_stages
+    if request_relative_tiles:
+        # Splitting the tile that straddles a request's prefill checkpoint
+        # row adds at most one tile per request.
+        max_tiles += max_num_seqs
     return max_stages, max_tiles
 
 
@@ -136,12 +142,21 @@ def compute_pcp_stage_metadata(
     projection_token_block_size: int,
     num_qkv_out_blocks: int,
     num_projection_out_blocks: int,
+    prefill_ckpt_offsets: jax.Array | None = None,
+    prefill_ckpt_blocks: jax.Array | None = None,
 ) -> tuple[memory_ref.MetadataRef, PcpStageMetadata]:
     """Build PCP metadata from the current public request metadata.
 
     Query ownership follows the batch-flat request-major coordinate from
     ``query_start_loc[:-1]``. Request state and convolution semantics remain
     independent and use absolute starts reconstructed from ``seq_lens``.
+
+    ``prefill_ckpt_offsets`` / ``prefill_ckpt_blocks`` (see
+    ``metadata.compute_per_seq_metadata``) mark the tile whose last token is
+    the request's checkpoint offset. The single slot-aligned tile straddling
+    that row is split there (one extra tile per checkpointed request); every
+    other tile keeps the slot-aligned schedule, so such a tile always exists
+    wherever the request starts in the batch-flat stream.
     """
     if seq_lens.size != state_indices.size:
         raise ValueError("state_indices and seq_lens must have equal size.")
@@ -163,6 +178,8 @@ def compute_pcp_stage_metadata(
         projection_token_block_size=projection_token_block_size,
         num_qkv_out_blocks=num_qkv_out_blocks,
         num_projection_out_blocks=num_projection_out_blocks,
+        prefill_ckpt_offsets=prefill_ckpt_offsets,
+        prefill_ckpt_blocks=prefill_ckpt_blocks,
     )
 
 
@@ -180,6 +197,8 @@ def _compute_pcp_stage_metadata_from_coordinates(
     projection_token_block_size: int,
     num_qkv_out_blocks: int,
     num_projection_out_blocks: int,
+    prefill_ckpt_offsets: jax.Array | None = None,
+    prefill_ckpt_blocks: jax.Array | None = None,
 ) -> tuple[memory_ref.MetadataRef, PcpStageMetadata]:
     """Build live PCP stages and GDN tiles from independent coordinates.
 
@@ -214,11 +233,17 @@ def _compute_pcp_stage_metadata_from_coordinates(
             "request_absolute_starts and state_indices must have equal size."
         )
 
+    if (prefill_ckpt_offsets is None) != (prefill_ckpt_blocks is None):
+        raise ValueError(
+            "prefill_ckpt_offsets and prefill_ckpt_blocks must be set together."
+        )
+    request_relative_tiles = prefill_ckpt_offsets is not None
     max_stages, max_tiles = _schedule_capacities(
         cfg,
         max_num_seqs=max_num_seqs,
         pcp_size=pcp_size,
         comm_chunk_size=comm_chunk_size,
+        request_relative_tiles=request_relative_tiles,
     )
     int_dtype = jnp.int32
     ranks = jnp.arange(pcp_size, dtype=int_dtype)
@@ -229,6 +254,17 @@ def _compute_pcp_stage_metadata_from_coordinates(
     start_seq = start_seq.astype(int_dtype)
     end_seq = end_seq.astype(int_dtype)
     round_size = pcp_size * comm_chunk_size
+    if request_relative_tiles:
+        prefill_ckpt_offsets = prefill_ckpt_offsets.astype(int_dtype)
+        prefill_ckpt_blocks = prefill_ckpt_blocks.astype(int_dtype)
+        # Batch-flat row of each request's checkpoint; -1 for none. Only the
+        # one slot-aligned tile straddling that row is split, so every other
+        # tile keeps the original schedule.
+        ckpt_rows = jnp.where(
+            prefill_ckpt_offsets > 0, query_start_loc[:-1] + prefill_ckpt_offsets, -1
+        )
+    else:
+        ckpt_rows = jnp.full((max_num_seqs,), -1, dtype=int_dtype)
 
     initial = _BuilderState(
         request_index=jnp.asarray(0, dtype=int_dtype),
@@ -325,9 +361,25 @@ def _compute_pcp_stage_metadata_from_coordinates(
                     tile_last,
                 ) = rank_state
                 source_rows = valid_rows[source_rank]
-                source_num_tiles = pl.cdiv(source_rows, cfg.tile_size)
                 source_physical_row = source_rank * comm_chunk_size
                 source_query_row = stage_query_begin + dense_starts[source_rank]
+                # Slot-aligned grid: tile k covers rows [k, k + 1) * tile_size
+                # of this slot. If the request's checkpoint row falls strictly
+                # inside tile `split_tile`, that tile alone is split there:
+                # [k * tile, ckpt) ends on the checkpoint and [ckpt, (k + 1) *
+                # tile) follows; later tiles shift by one index and keep their
+                # rows. `split_tile` past the slot means no split.
+                ckpt_in_slot = ckpt_rows[req] - source_query_row
+                split = jnp.logical_and(
+                    jnp.logical_and(ckpt_in_slot > 0, ckpt_in_slot < source_rows),
+                    lax.rem(ckpt_in_slot, cfg.tile_size) != 0,
+                )
+                split_tile = jnp.where(
+                    split, ckpt_in_slot // cfg.tile_size, cfg.batch_size
+                )
+                source_num_tiles = pl.cdiv(source_rows, cfg.tile_size) + split.astype(
+                    int_dtype
+                )
 
                 def _emit_tile(tile_in_rank, tile_state):
                     (
@@ -340,8 +392,20 @@ def _compute_pcp_stage_metadata_from_coordinates(
                         tile_last,
                     ) = tile_state
                     tile = tile_cursor + tile_in_rank
-                    source_offset = tile_in_rank * cfg.tile_size
-                    real_size = jnp.minimum(source_rows - source_offset, cfg.tile_size)
+                    grid_index = jnp.where(
+                        tile_in_rank <= split_tile, tile_in_rank, tile_in_rank - 1
+                    )
+                    source_offset = jnp.where(
+                        tile_in_rank == split_tile + 1,
+                        ckpt_in_slot,
+                        grid_index * cfg.tile_size,
+                    )
+                    source_end = jnp.where(
+                        tile_in_rank == split_tile,
+                        ckpt_in_slot,
+                        jnp.minimum((grid_index + 1) * cfg.tile_size, source_rows),
+                    )
+                    real_size = source_end - source_offset
                     query_row = source_query_row + source_offset
                     return (
                         tile_stage.at[tile].set(stage),
@@ -530,6 +594,16 @@ def _compute_pcp_stage_metadata_from_coordinates(
         projection_work_offset,
     )
 
+    tile_is_ckpt = None
+    if request_relative_tiles:
+        # Same exact end match as the per-sequence tiling: the request's
+        # query-relative checkpoint offset expressed in batch-flat rows.
+        tile_req = result.tile_request_id
+        tile_end = result.tile_query_row_start + result.tile_num_tokens
+        tile_is_ckpt = jnp.logical_and(
+            prefill_ckpt_offsets[tile_req] > 0, tile_end == ckpt_rows[tile_req]
+        )
+
     gdn_metadata = memory_ref.MetadataRef.create(
         cfgs=cfg,
         num_tiles=result.active_tiles,
@@ -541,6 +615,8 @@ def _compute_pcp_stage_metadata_from_coordinates(
         s_idx_has_initial_state=has_initial_state,
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=jnp.zeros_like(state_indices),
+        p_id_is_ckpt_tile=tile_is_ckpt,
+        s_idx_to_prefill_ckpt_block=prefill_ckpt_blocks,
     )
     stage_metadata = PcpStageMetadata(
         num_stages=result.active_stages,

@@ -137,8 +137,9 @@ def inner_kernel(
                 if carry_conv_scratch_ref is None:
                     vmem_ldst.store_state_region(*args)
                 else:
-                    # copy_out only DMAs the tile that ends a sequence.
-                    pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
+                    # copy_out only DMAs the tile that ends a sequence, or
+                    # the interior tile that ends on a prefill checkpoint.
+                    pl.when(_should_store_state(metadata_ref, p_id, idx))(
                         functools.partial(vmem_ldst.store_state_region, *args)
                     )
     if carry_conv_scratch_ref is not None:
@@ -234,12 +235,34 @@ def inner_kernel(
                 if carry_recurrent_scratch_ref is None:
                     vmem_ldst.store_state_region(*args)
                 else:
-                    pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
+                    pl.when(_should_store_state(metadata_ref, p_id, idx))(
                         functools.partial(vmem_ldst.store_state_region, *args)
                     )
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
+
+
+def _should_store_state(metadata_ref: memory_ref.MetadataRef, p_id, idx):
+    """Whether tile slot `idx` must encode its state into the output tile.
+
+    That is the sequence's last tile, or the interior tile ending on a
+    prefill checkpoint. On the checkpoint tile the value stored is window
+    position 0 of `new_*_state`, which for PER_SEQ (`window_size == 1`) is
+    the same array as the carry `new_*_state[:, -1]`: `causal_conv1d`
+    builds one state per window position from the last `prev_kernel_size`
+    inputs up to row `chunk_size - window_size + w` (clamped to `real_sizes`),
+    and `recurrent_gdn_per_seq` / `chunked_gdn` return the state after the
+    tile's last real token. A full interior tile has `real_sizes ==
+    chunk_size`, so position 0 is exactly the post-tile state the next tile
+    resumes from.
+    """
+    should_store = metadata_ref.p_id_is_last_tile[p_id, idx]
+    if metadata_ref.p_id_is_ckpt_tile is not None:
+        should_store = jnp.logical_or(
+            should_store, metadata_ref.p_id_is_ckpt_tile[p_id, idx]
+        )
+    return should_store
 
 
 def outer_kernel(
@@ -382,6 +405,8 @@ def fused_conv1d_gdn(
     seq_lens: jax.Array,  # [num_seqs]
     read_offsets: jax.Array | None = None,  # [num_seqs]
     ckpt_indices: jax.Array | None = None,  # [num_seqs, num_spec_tokens + 1]
+    prefill_ckpt_offsets: jax.Array | None = None,  # [num_seqs]
+    prefill_ckpt_blocks: jax.Array | None = None,  # [num_seqs]
     *,
     n_kq: int,
     n_v: int,
@@ -440,6 +465,14 @@ def fused_conv1d_gdn(
             `state_indices[s] + read_offsets[s]` and write one checkpoint
             per window position to `state_indices[s] + t`. Required when
             `num_spec_tokens > 0`.
+        prefill_ckpt_offsets: Optional [num_seqs] int32 — vLLM prefill
+            checkpoint: token offset from the sequence's query start whose
+            post-token state must also be exported (0 = none). Must be a
+            multiple of the PER_SEQ tile size, which
+            `config.PREFILL_CKPT_ALIGNMENT` guarantees for aligned offsets.
+        prefill_ckpt_blocks: Optional [num_seqs] int32 — destination state
+            index (dense) or source block (pooled) of that checkpoint. Set
+            iff `prefill_ckpt_offsets` is set.
         n_kq: Number of key/query heads.
         n_v: Number of value heads.
         d_k: Key/query dimension.
@@ -546,6 +579,16 @@ def fused_conv1d_gdn(
             num_spec_tokens,
         )
         ckpt_indices = ckpt_indices.astype(jnp.int32)
+    if (prefill_ckpt_offsets is None) != (prefill_ckpt_blocks is None):
+        raise ValueError(
+            "prefill_ckpt_offsets and prefill_ckpt_blocks must be set together."
+        )
+    if prefill_ckpt_offsets is not None:
+        assert prefill_ckpt_offsets.shape == (num_seqs,), prefill_ckpt_offsets.shape
+        assert prefill_ckpt_blocks is not None
+        assert prefill_ckpt_blocks.shape == (num_seqs,), prefill_ckpt_blocks.shape
+        prefill_ckpt_offsets = prefill_ckpt_offsets.astype(jnp.int32)
+        prefill_ckpt_blocks = prefill_ckpt_blocks.astype(jnp.int32)
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
@@ -612,6 +655,22 @@ def fused_conv1d_gdn(
         # KDA verify keeps one sequence per tile until multi-sequence KDA
         # verify tiles are sized by a KDA-aware VMEM estimate.
         decode_tile_size = 1
+
+    if (
+        prefill_ckpt_offsets is not None
+        and batch_size >= config.PREFILL_CKPT_ALIGNMENT
+        and config.PREFILL_CKPT_ALIGNMENT % mixed_tile_size != 0
+    ):
+        # A checkpoint is exported on the tile boundary at its offset, so
+        # every aligned offset must land on the PER_SEQ tile grid. Batches
+        # shorter than the alignment cannot hold a checkpoint (the offset is
+        # strictly inside one query), so their clamped tile is irrelevant.
+        raise ValueError(
+            "GDN prefill checkpoint alignment "
+            f"{config.PREFILL_CKPT_ALIGNMENT} is not a multiple of the prefill "
+            f"tile size {mixed_tile_size}; the checkpoint state would fall "
+            "inside a tile."
+        )
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
@@ -712,6 +771,8 @@ def fused_conv1d_gdn(
                 start_seq=distribution[0],
                 end_seq=distribution[-1],
                 ckpt_indices=ckpt_indices,
+                prefill_ckpt_offsets=prefill_ckpt_offsets,
+                prefill_ckpt_blocks=prefill_ckpt_blocks,
             )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)

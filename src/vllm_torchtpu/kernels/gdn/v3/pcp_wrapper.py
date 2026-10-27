@@ -61,6 +61,8 @@ _TPU_TILE_COLUMNS = 128
 def _qkv_receive_group_stride(
     comm_chunk_size: int,
     tile_size: int,
+    *,
+    request_relative_tiles: bool = False,
 ) -> int:
     """Return the tile-group capacity reserved for one source rank.
 
@@ -68,6 +70,10 @@ def _qkv_receive_group_stride(
     tile. Both the communication copy and the final compute tile therefore
     need one possible leading partial group. Aligned rows use the smaller
     runtime copy/load shapes and do not pay for this worst-case capacity.
+
+    With ``request_relative_tiles`` (prefill checkpoints) the second half of
+    a split tile may start on any row of the slot, not only on multiples of
+    ``tile_size``, so a load window may begin at the slot's final row.
     """
     max_valid_groups = pl.cdiv(
         comm_chunk_size + _TPU_TILE_ROWS - 1,
@@ -77,7 +83,10 @@ def _qkv_receive_group_stride(
         tile_size + _TPU_TILE_ROWS - 1,
         _TPU_TILE_ROWS,
     )
-    max_tile_start = (comm_chunk_size - 1) // tile_size * tile_size
+    if request_relative_tiles:
+        max_tile_start = comm_chunk_size - 1
+    else:
+        max_tile_start = (comm_chunk_size - 1) // tile_size * tile_size
     return max(
         max_valid_groups,
         max_tile_start // _TPU_TILE_ROWS + max_compute_groups,
@@ -143,56 +152,75 @@ def _compute_gdn_tile(
     *,
     cfg: config.GDNConfig,
     comm_chunk_size: int,
+    request_relative_tiles: bool = False,
 ) -> None:
     """Convert one received BF16 tile and run the existing GDN inner kernel."""
     p_id = pl.program_id(0)
     stage = stage_metadata_ref.tile_stage[p_id]
     recv_slot = lax.rem(stage, 2)
-    token_start = pl.multiple_of(
-        stage_metadata_ref.tile_row_in_stage[p_id],
-        16,
-    )
-    source_rank = token_start // comm_chunk_size
-    source_offset = lax.rem(token_start, comm_chunk_size)
-    source_row = stage_metadata_ref.rank_row_start[stage, source_rank]
-    source_prefix = lax.rem(source_row, _TPU_TILE_ROWS)
+    tile_row = stage_metadata_ref.tile_row_in_stage[p_id]
     receive_group_stride = _qkv_receive_group_stride(
         comm_chunk_size,
         cfg.tile_size,
-    )
-    receive_group_start = (
-        source_rank * receive_group_stride + source_offset // _TPU_TILE_ROWS
-    )
-    tile_prefix = lax.rem(
-        source_prefix + source_offset,
-        _TPU_TILE_ROWS,
+        request_relative_tiles=request_relative_tiles,
     )
 
-    def _load_qkv(prefix: int) -> None:
-        @pl.when(tile_prefix == prefix)
-        def _load() -> None:
-            compute_groups = pl.cdiv(prefix + cfg.tile_size, _TPU_TILE_ROWS)
-            packed_qkv = received_qkv_ref[
-                recv_slot,
-                pl.ds(receive_group_start, compute_groups),
-                :,
-                :,
-                :,
-            ]
-            dense_qkv = pltpu.einshape(
-                "acbd->(ab)(cd)",
-                packed_qkv,
-                assert_is_tile_preserving=True,
-            )
-            compute_qkv_ref[
-                0,
-                :,
-                0,
-                :,
-            ] = dense_qkv[prefix : prefix + cfg.tile_size, :].astype(jnp.float32)
+    def _load_qkv_tile(token_start) -> None:
+        source_rank = token_start // comm_chunk_size
+        source_offset = lax.rem(token_start, comm_chunk_size)
+        source_row = stage_metadata_ref.rank_row_start[stage, source_rank]
+        source_prefix = lax.rem(source_row, _TPU_TILE_ROWS)
+        receive_group_start = (
+            source_rank * receive_group_stride + source_offset // _TPU_TILE_ROWS
+        )
+        tile_prefix = lax.rem(
+            source_prefix + source_offset,
+            _TPU_TILE_ROWS,
+        )
 
-    for prefix in range(_TPU_TILE_ROWS):
-        _load_qkv(prefix)
+        def _load_qkv(prefix: int) -> None:
+            @pl.when(tile_prefix == prefix)
+            def _load() -> None:
+                compute_groups = pl.cdiv(prefix + cfg.tile_size, _TPU_TILE_ROWS)
+                packed_qkv = received_qkv_ref[
+                    recv_slot,
+                    pl.ds(receive_group_start, compute_groups),
+                    :,
+                    :,
+                    :,
+                ]
+                dense_qkv = pltpu.einshape(
+                    "acbd->(ab)(cd)",
+                    packed_qkv,
+                    assert_is_tile_preserving=True,
+                )
+                compute_qkv_ref[
+                    0,
+                    :,
+                    0,
+                    :,
+                ] = dense_qkv[prefix : prefix + cfg.tile_size, :].astype(jnp.float32)
+
+        for prefix in range(_TPU_TILE_ROWS):
+            _load_qkv(prefix)
+
+    if not request_relative_tiles:
+        # Slot-aligned tiles start on multiples of the tile size.
+        _load_qkv_tile(pl.multiple_of(tile_row, 16))
+    else:
+        # Prefill checkpoints: only the tile that starts on a checkpoint row
+        # (the second half of a split tile) may start on an arbitrary row.
+        # Keep the aligned fast path for every other tile and take the
+        # general prefix-branch load just for that one.
+        row_is_aligned = lax.rem(tile_row, 16) == 0
+
+        @pl.when(row_is_aligned)
+        def _load_aligned() -> None:
+            _load_qkv_tile(pl.multiple_of(tile_row, 16))
+
+        @pl.when(jnp.logical_not(row_is_aligned))
+        def _load_unaligned() -> None:
+            _load_qkv_tile(tile_row)
 
     wrapper.inner_kernel(
         compute_qkv_ref,
@@ -265,6 +293,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     projection_cfg: _ProjectionConfig,
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
+    request_relative_tiles: bool = False,
 ) -> None:
     """Schedule QKVZ projection, QKV remote DMA, and per-sequence GDN."""
     del packed_out_hbm_ref
@@ -392,6 +421,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     receive_group_stride = _qkv_receive_group_stride(
         comm_chunk_size,
         cfg.tile_size,
+        request_relative_tiles=request_relative_tiles,
     )
     num_qkv_out_blocks = pcp_size
     num_z_out_blocks = pcp_size
@@ -972,6 +1002,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             compute_qkv_ref,
             cfg=cfg,
             comm_chunk_size=comm_chunk_size,
+            request_relative_tiles=request_relative_tiles,
         )
 
         @pl.when(projection_is_active)
@@ -991,6 +1022,10 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 wait_final=(work_id == num_projection_work_tiles - 1),
             )
 
+        # A full tile of rows is stored from the tile's first row; a tile
+        # shorter than `tile_size` spills into rows a later tile of this
+        # stage overwrites, or into the slot's trailing padding (sized for
+        # the worst-case split-tile start).
         output_slot = lax.rem(stage, 2)
         output_stage_ref[
             output_slot,
@@ -1209,6 +1244,8 @@ def _scatter_compact_state_updates(
     state_stride: int,
     region: config.StateRegion,
     whole_block_dma: bool,
+    prefill_ckpt_offsets: jax.Array | None = None,
+    prefill_ckpt_blocks: jax.Array | None = None,
 ) -> jax.Array:
     """Apply raw per-sequence state tiles to a donated unified pool.
 
@@ -1216,15 +1253,28 @@ def _scatter_compact_state_updates(
     the final pool update with native dynamic slices keeps the mutation visible
     to JAX/XLA and allows donation to reuse the input allocation, without
     making the whole pool a Pallas output.
+
+    ``updates`` is ``[num_seqs, num_slots, ...]``: slot 0 lands on the
+    sequence's state block; slot 1, when the prefill checkpoint arrays are
+    given, on ``prefill_ckpt_blocks[s]`` for sequences whose
+    ``prefill_ckpt_offsets[s] > 0`` (the kernel wrote that slot only for
+    them; a zero offset means no checkpoint regardless of the block id).
     """
     num_sequences = state_indices.shape[0]
     active_bound = jnp.minimum(num_active_seqs, num_sequences)
+    if (prefill_ckpt_offsets is None) != (prefill_ckpt_blocks is None):
+        raise ValueError(
+            "prefill_ckpt_offsets and prefill_ckpt_blocks must be set together."
+        )
+    if prefill_ckpt_blocks is not None and updates.shape[1] != 2:
+        raise ValueError(
+            "prefill checkpoints need a second compact update slot, got "
+            f"{updates.shape=}."
+        )
 
-    def _apply_one(sequence_id, pool):
-        state_index = state_indices[sequence_id]
+    def _write_slot(pool, sequence_id, slot, state_index, valid):
         block_start = state_index * state_stride + region.kb0
-        has_tokens = query_start_loc[sequence_id + 1] > query_start_loc[sequence_id]
-        valid = jnp.logical_and(has_tokens, state_index >= 0)
+        valid = jnp.logical_and(valid, state_index >= 0)
         valid = jnp.logical_and(
             valid,
             block_start + region.nblocks <= state_source.shape[0],
@@ -1239,9 +1289,25 @@ def _scatter_compact_state_updates(
                     region.row0,
                     *(0,) * (state_source.ndim - 2),
                 )
-            return lax.dynamic_update_slice(pool, updates[sequence_id], start_indices)
+            return lax.dynamic_update_slice(
+                pool, updates[sequence_id, slot], start_indices
+            )
 
         return lax.cond(valid, _write, lambda pool: pool, pool)
+
+    def _apply_one(sequence_id, pool):
+        has_tokens = query_start_loc[sequence_id + 1] > query_start_loc[sequence_id]
+        pool = _write_slot(pool, sequence_id, 0, state_indices[sequence_id], has_tokens)
+        if prefill_ckpt_blocks is not None:
+            assert prefill_ckpt_offsets is not None
+            pool = _write_slot(
+                pool,
+                sequence_id,
+                1,
+                prefill_ckpt_blocks[sequence_id],
+                jnp.logical_and(has_tokens, prefill_ckpt_offsets[sequence_id] > 0),
+            )
+        return pool
 
     # A runtime loop scales the update work with the live request count rather
     # than the compile bucket's maximum sequence capacity.
@@ -1254,19 +1320,41 @@ def _compact_state_updates_shape(
     region: config.StateRegion,
     *,
     whole_block_dma: bool,
+    num_slots: int = 1,
 ) -> jax.ShapeDtypeStruct:
-    """Shape of one compact external-state update per sequence.
+    """Shape of compact external-state updates per sequence.
 
     NHD can address a token-row subregion directly. HND stores tokens on the
     minormost lane, so the V3 state seam copies complete source pages and keeps
     all of their inner dimensions, matching ``ExternalStateInBufferedRef`` and
     ``ExternalStateOutBufferedRef``.
+
+    ``num_slots`` is 1 for the final state alone and 2 when a prefill
+    checkpoint is exported alongside it.
     """
     if whole_block_dma:
         region_shape = (region.nblocks, *state_source.shape[1:])
     else:
         region_shape = (region.nblocks, region.nrows, *state_source.shape[2:])
-    return jax.ShapeDtypeStruct((num_sequences, *region_shape), state_source.dtype)
+    return jax.ShapeDtypeStruct(
+        (num_sequences, num_slots, *region_shape), state_source.dtype
+    )
+
+
+def _validate_prefill_ckpt_tiling(*, tile_size: int) -> None:
+    """Pin the tile size under which prefill checkpoints are reachable.
+
+    `pcp_metadata` splits the one slot-aligned tile that straddles a
+    request's checkpoint row, so the row is always a tile end. The tile must
+    still divide ``PREFILL_CKPT_ALIGNMENT`` so the per-sequence (non-PCP)
+    kernel, whose grid is the request's own, reaches the same row.
+    """
+    alignment = config.PREFILL_CKPT_ALIGNMENT
+    if alignment % tile_size != 0:
+        raise ValueError(
+            f"GDN PCP prefill checkpoint alignment {alignment} must be a "
+            f"multiple of the compute tile, got {tile_size=}."
+        )
 
 
 def _validate_compact_state_writeback_plan(state_plan: config.StateSourcePlan) -> None:
@@ -1333,6 +1421,8 @@ def fused_qkvz_projection_pcp_gdn(
     state_indices: jax.Array,
     distribution: jax.Array,
     seq_lens: jax.Array,
+    prefill_ckpt_offsets: jax.Array | None = None,
+    prefill_ckpt_blocks: jax.Array | None = None,
     *,
     n_kq: int,
     n_v: int,
@@ -1355,6 +1445,17 @@ def fused_qkvz_projection_pcp_gdn(
     describes its conv and recurrent byte regions. Runtime stage metadata
     handles mixed request lengths and arbitrary absolute query offsets without
     expanding active work to the compile bucket.
+
+    prefill_ckpt_offsets / prefill_ckpt_blocks (``[num_seqs]``, see
+    ``wrapper.fused_conv1d_gdn``) additionally export each request's state
+    at its query-relative checkpoint offset into the given pool block. The
+    GDN tiles follow the batch-flat rank-slot grid; the single tile that
+    straddles a request's checkpoint row is split there, so the checkpoint
+    row is a tile end wherever the request starts. That costs one extra
+    compute tile per checkpointed request and no padding tokens; every other
+    tile keeps the original schedule and the aligned load path. The receive
+    window and output stage buffer grow by one tile of tail room because the
+    second half of a split tile may start on any slot row.
     """
     if pcp_size <= 1:
         raise ValueError("The PCP fused GDN kernel requires pcp_size > 1.")
@@ -1499,6 +1600,15 @@ def fused_qkvz_projection_pcp_gdn(
     num_z_out_blocks = pcp_size
     num_projection_out_blocks = num_qkv_out_blocks + num_z_out_blocks
 
+    if (prefill_ckpt_offsets is None) != (prefill_ckpt_blocks is None):
+        raise ValueError(
+            "prefill_ckpt_offsets and prefill_ckpt_blocks must be set together."
+        )
+    has_prefill_ckpt = prefill_ckpt_offsets is not None
+    if has_prefill_ckpt:
+        _validate_prefill_ckpt_tiling(tile_size=tile_size)
+    num_state_update_slots = 2 if has_prefill_ckpt else 1
+
     act_out_dtype = hidden_states.dtype
 
     b = b.astype(jnp.float32)
@@ -1535,7 +1645,13 @@ def fused_qkvz_projection_pcp_gdn(
         v_head_dim=d_v,
         state_plan=state_plan,
     )
-    receive_group_stride = _qkv_receive_group_stride(comm_chunk_size, tile_size)
+    receive_group_stride = _qkv_receive_group_stride(
+        comm_chunk_size, tile_size, request_relative_tiles=has_prefill_ckpt
+    )
+    # The second half of a split tile may start near the slot's last row and
+    # still store a full tile of output rows; give each stage slot that much
+    # tail room.
+    output_stage_rows = global_stage_tokens + (tile_size if has_prefill_ckpt else 0)
 
     metadata_obj, stage_metadata_obj = pcp_metadata.compute_pcp_stage_metadata(
         cfg=cfg,
@@ -1554,6 +1670,8 @@ def fused_qkvz_projection_pcp_gdn(
         projection_token_block_size=projection_cfg.token_block_size,
         num_qkv_out_blocks=num_qkv_out_blocks,
         num_projection_out_blocks=num_projection_out_blocks,
+        prefill_ckpt_offsets=prefill_ckpt_offsets,
+        prefill_ckpt_blocks=prefill_ckpt_blocks,
     )
     metadata_spec = jax.tree.map(
         lambda _: pl.BlockSpec(memory_space=pltpu.SMEM),
@@ -1615,12 +1733,14 @@ def fused_qkvz_projection_pcp_gdn(
         state_indices.shape[0],
         state_plan.conv,
         whole_block_dma=state_plan.whole_block_dma,
+        num_slots=num_state_update_slots,
     )
     recurrent_state_updates_shape = _compact_state_updates_shape(
         state_source,
         state_indices.shape[0],
         state_plan.recurrent,
         whole_block_dma=state_plan.whole_block_dma,
+        num_slots=num_state_update_slots,
     )
     projection_scratch_shapes = (
         pltpu.SemaphoreType.DMA,
@@ -1720,6 +1840,7 @@ def fused_qkvz_projection_pcp_gdn(
             projection_cfg=projection_cfg,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            request_relative_tiles=has_prefill_ckpt,
         ),
         out_shape=(
             zero_gdn_out,
@@ -1775,7 +1896,7 @@ def fused_qkvz_projection_pcp_gdn(
                 jnp.float32,
             ),
             pltpu.VMEM(
-                (2, global_stage_tokens, local_n_v, d_v),
+                (2, output_stage_rows, local_n_v, d_v),
                 act_out_dtype,
             ),
             *projection_scratch_shapes,
@@ -1813,6 +1934,8 @@ def fused_qkvz_projection_pcp_gdn(
         state_stride=state_plan.stride,
         region=state_plan.conv,
         whole_block_dma=state_plan.whole_block_dma,
+        prefill_ckpt_offsets=prefill_ckpt_offsets,
+        prefill_ckpt_blocks=prefill_ckpt_blocks,
     )
     state_source = _scatter_compact_state_updates(
         state_source,
@@ -1823,6 +1946,8 @@ def fused_qkvz_projection_pcp_gdn(
         state_stride=state_plan.stride,
         region=state_plan.recurrent,
         whole_block_dma=state_plan.whole_block_dma,
+        prefill_ckpt_offsets=prefill_ckpt_offsets,
+        prefill_ckpt_blocks=prefill_ckpt_blocks,
     )
 
     packed_out = packed_out.reshape(local_num_tokens, n_v, d_v)

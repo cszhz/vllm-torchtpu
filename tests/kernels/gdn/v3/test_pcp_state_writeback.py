@@ -44,13 +44,14 @@ def test_compact_state_update_shape_matches_pool_layout():
         hnd_pool, 3, region, whole_block_dma=True
     )
 
-    assert nhd_shape.shape == (3, 2, 16, 1, 4, 128)
-    assert hnd_shape.shape == (3, 2, 4, 32, 4, 256)
+    # [num_seqs, num_slots, nblocks, ...]: one slot without prefill checkpoints.
+    assert nhd_shape.shape == (3, 1, 2, 16, 1, 4, 128)
+    assert hnd_shape.shape == (3, 1, 2, 4, 32, 4, 256)
 
 
 def test_nhd_compact_state_scatter_updates_only_selected_rows():
     pool = jnp.arange(4 * 8 * 2, dtype=jnp.float32).reshape(4, 8, 2)
-    updates = jnp.full((1, 1, 2, 2), 99, dtype=pool.dtype)
+    updates = jnp.full((1, 1, 1, 2, 2), 99, dtype=pool.dtype)
     region = _region(kb0=0, nblocks=1, row0=3, nrows=2)
 
     actual = pcp_wrapper._scatter_compact_state_updates(
@@ -70,7 +71,7 @@ def test_nhd_compact_state_scatter_updates_only_selected_rows():
 
 def test_hnd_compact_state_scatter_replaces_complete_page():
     pool = jnp.arange(4 * 2 * 3 * 4 * 8, dtype=jnp.float32).reshape(4, 2, 3, 4, 8)
-    updates = jnp.full((1, 1, 2, 3, 4, 8), 77, dtype=pool.dtype)
+    updates = jnp.full((1, 1, 1, 2, 3, 4, 8), 77, dtype=pool.dtype)
     region = _region(kb0=1, nblocks=1, row0=0, nrows=4)
 
     actual = pcp_wrapper._scatter_compact_state_updates(

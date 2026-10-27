@@ -72,6 +72,8 @@ def compute_per_seq_metadata(
     start_seq: jax.Array,
     end_seq: jax.Array,
     ckpt_indices: jax.Array | None = None,
+    prefill_ckpt_offsets: jax.Array | None = None,
+    prefill_ckpt_blocks: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing single sequence per tile.
 
@@ -81,6 +83,14 @@ def compute_per_seq_metadata(
     prefix-cache resume on the unified pool may land on a boundary state
     block whose committed state is a non-zero checkpoint from a verify step.
     The final state is always written to checkpoint 0.
+
+    `prefill_ckpt_offsets[s]` (0 = none) is the token offset from sequence
+    `s`'s query start at which vLLM's prefill checkpoint must be exported,
+    and `prefill_ckpt_blocks[s]` its destination block. The checkpoint tile
+    is the tile whose last token sits exactly on that offset, so the offset
+    must be a multiple of `cfg.chunk_size` (the caller asserts the declared
+    alignment against the tile size); it is never the sequence's last tile
+    because vLLM only requests checkpoints strictly inside the query.
     """
     max_seqs = seq_lens.size
     max_tokens = cfg.batch_size
@@ -96,6 +106,13 @@ def compute_per_seq_metadata(
         # Sequence-major axis only: the checkpoint axis must stay put or the
         # read offset would select another slot's block.
         ckpt_indices = jnp.roll(ckpt_indices, shift=-start_seq, axis=0)
+    if (prefill_ckpt_offsets is None) != (prefill_ckpt_blocks is None):
+        raise ValueError(
+            "prefill_ckpt_offsets and prefill_ckpt_blocks must be set together."
+        )
+    if prefill_ckpt_offsets is not None:
+        prefill_ckpt_offsets = jnp.roll(prefill_ckpt_offsets, shift=-start_seq)
+        prefill_ckpt_blocks = jnp.roll(prefill_ckpt_blocks, shift=-start_seq)
 
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     # NOTE: query_lens is used for calculating num_tiles. Defensive programming
@@ -141,6 +158,18 @@ def compute_per_seq_metadata(
     p_id_is_first_tile = p_id_to_t_id == 0
     p_id_is_last_tile = p_id_to_t_id == (s_idx_to_num_tiles[p_id_to_s_idx] - 1)
 
+    # Prefill checkpoint tile: the tile whose last token is the checkpoint
+    # offset. Written as an exact end match (not `offset // chunk - 1`) so an
+    # offset off the tile grid flags no tile instead of a wrong one; the
+    # query-relative row keeps it valid wherever the query starts.
+    p_id_is_ckpt_tile = None
+    if prefill_ckpt_offsets is not None:
+        s_idx_to_ckpt_row = query_start_loc[:-1] + prefill_ckpt_offsets
+        p_id_is_ckpt_tile = jnp.logical_and(
+            prefill_ckpt_offsets[p_id_to_s_idx] > 0,
+            p_id_to_r_base + p_id_to_r_size == s_idx_to_ckpt_row[p_id_to_s_idx],
+        )
+
     # NOTE: Since query_lens[i] = 0 where i >= num_seqs, s_idx_to_num_tiles[i]
     # where i >= num_seqs will also be 0. Therefore, s_idx_to_num_tiles.sum()
     # will contain number of tiles for valid sequence.
@@ -158,4 +187,6 @@ def compute_per_seq_metadata(
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
         s_idx_to_ckpt_indices=ckpt_indices,
+        p_id_is_ckpt_tile=p_id_is_ckpt_tile,
+        s_idx_to_prefill_ckpt_block=prefill_ckpt_blocks,
     )
