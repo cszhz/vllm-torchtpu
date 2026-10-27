@@ -817,6 +817,16 @@ def test_expert_slot_placement_is_bit_exact(routing):
     assert not np.array_equal(np.asarray(unmapped), np.asarray(identity))
 
 
+def test_order_after_orders_the_program_and_changes_no_value():
+    """`order_after` only holds the kernel back until it exists: the layer
+    must come out with the same bits with and without it."""
+    mesh = _mesh()
+    weights, scales, x, gating, common = _fp4_layer(mesh)
+    plain = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    ordered = fused_ep_moe_v2(x, *weights, *scales, gating, order_after=x, **common)
+    np.testing.assert_array_equal(np.asarray(ordered), np.asarray(plain))
+
+
 @pytest.fixture(scope="module")
 def production_weights():
     """The Qwen3.5-397B MoE weights, fp8 e4m3 with per-channel scales.

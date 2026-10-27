@@ -183,6 +183,7 @@ def _build_op(
     token_replica_groups=None,
     sorted_gather=None,
     has_expert_slot=False,
+    has_order_after=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -206,6 +207,7 @@ def _build_op(
         token_replica_groups,
         None if sorted_gather is None else sorted_gather[1],
         has_expert_slot,
+        has_order_after,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -321,6 +323,7 @@ def _build_op(
         + ((PartitionSpec(),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
         + ((PartitionSpec(),) if has_expert_slot else ())
+        + ((spec,) if has_order_after else ())
     )
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
@@ -328,12 +331,15 @@ def _build_op(
     # JaxCallable with that one line replaced, was the way around it. Torchtpu
     # takes output_partition_specs itself now, which is the same information
     # without a copy of anyone's source.
-    if has_expert_slot:
+    if has_expert_slot or has_order_after:
         fn = _operand_fn(
             call,
-            ("score_bias",) * has_score_bias
-            + ("hash_topk_ids",) * has_hash_ids
-            + ("expert_slot",),
+            (
+                ("score_bias",) * has_score_bias
+                + ("hash_topk_ids",) * has_hash_ids
+                + ("expert_slot",) * has_expert_slot
+                + ("order_after",) * has_order_after
+            ),
         )
     elif has_score_bias:
         fn = moe_with_score_bias
@@ -346,7 +352,7 @@ def _build_op(
         fn,
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
-        # [, expert_slot]
+        # [, expert_slot] [, order_after]
         # -- and the single output is sharded on axis 0 like x.
         input_partition_specs=input_specs,
         output_partition_specs=spec,
@@ -568,6 +574,7 @@ _OPERAND_DTYPES = {
     "score_bias": jnp.float32,
     "hash_topk_ids": jnp.int32,
     "expert_slot": None,
+    "order_after": None,
 }
 
 
@@ -576,8 +583,9 @@ def _operand_fn(call, names):
     rank, *names), every operand annotated jax.Array as torch_tpu requires.
 
     The three fixed-arity functions in _build_op cover the unplaced layers and
-    keep their programs as they were; every placed combination goes through
-    here instead of one more hand-written function per combination.
+    keep their programs as they were; every combination with a placement or
+    an ordering operand goes through here instead of one more hand-written
+    function per combination.
     """
     import inspect
 
@@ -612,6 +620,7 @@ def fused_moe_ep(
     score_bias: torch.Tensor | None = None,
     hash_ids: torch.Tensor | None = None,
     expert_slot: torch.Tensor | None = None,
+    order_after: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -624,7 +633,9 @@ def fused_moe_ep(
     `score_bias` is the layer's `e_score_correction_bias`, [global experts]
     f32, and `hash_ids` is `hash_topk_ids_operand`'s [tokens, topk] i32 table
     lookup; `expert_slot` is a placed layer's slot table
-    (`expert_placement.expert_slot_table`). Each must be passed exactly when
+    (`expert_placement.expert_slot_table`); `order_after` is what the kernel
+    must wait for under MOE_FUSED_EP_SHARED_BEFORE_KERNEL (the shared expert's
+    output). Each must be passed exactly when
     prebuild saw the corresponding thing on the layer -- prebuild built the
     op's signature around that.
     Getting it wrong is a torch arity error at the first call, not a wrong
@@ -647,7 +658,9 @@ def fused_moe_ep(
     )
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
-    extra = tuple(t for t in (score_bias, hash_ids, expert_slot) if t is not None)
+    extra = tuple(
+        t for t in (score_bias, hash_ids, expert_slot, order_after) if t is not None
+    )
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
@@ -988,13 +1001,16 @@ def prebuild_fused_moe_ep(
             "placements; it keeps the checkpoint's contiguous expert blocks.",
             layer.layer_name,
         )
-    if sorted_gather is not None and placed is not None:
+    has_order_after = envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL
+    if sorted_gather is not None and (placed is not None or has_order_after):
         # _build_split_ops passes at most one extra operand to route and
-        # compute; the slot table is not wired through it. The single fused
-        # program takes it.
+        # compute; the slot table and the ordering operand are not wired
+        # through it. The single fused program takes both.
         logger.warning_once(
-            "MOE_FUSED_EP_SORTED_GATHER does not cover TPU_EXPERT_PLACEMENT "
-            "yet; placed layers run as the single fused program instead."
+            "MOE_FUSED_EP_SORTED_GATHER does not cover TPU_EXPERT_PLACEMENT or "
+            "MOE_FUSED_EP_SHARED_BEFORE_KERNEL yet; %s runs as the single fused "
+            "program instead.",
+            "placed layers" if not has_order_after else "every layer",
         )
         sorted_gather = None
 
@@ -1020,6 +1036,7 @@ def prebuild_fused_moe_ep(
         token_replica_groups=token_replica_groups,
         sorted_gather=sorted_gather,
         has_expert_slot=placed is not None,
+        has_order_after=has_order_after,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
