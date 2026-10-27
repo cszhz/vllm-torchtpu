@@ -1072,7 +1072,8 @@ def test_fp8_indexer_multitile_compilation(
         else jnp.tile(jnp.array([1, 0], jnp.int32), tokens // 2),
     )
     expected = jnp.where(jnp.arange(512) < lengths[:, None], jnp.arange(512), -1)
-    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(v2_kernels._compact_selected(actual), expected)
+    np.testing.assert_array_equal(actual >= 0, expected >= 0)
 
 
 @pytest.mark.parametrize("dtype", ["auto", "bf16", "fp8", "mxfp4", "nvfp4"])

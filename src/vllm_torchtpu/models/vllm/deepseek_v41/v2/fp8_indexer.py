@@ -477,6 +477,7 @@ def _select_indexer_jax(
         k=topk,
         exclude_neg_inf=True,
         reconstruct_threshold=PACKED_FP8_DENSE_TOPK_THRESHOLD,
+        sorted_indices=False,
     )
 
     def block(start, rows, inputs, *, score_only=False, group=None, publication=None):
