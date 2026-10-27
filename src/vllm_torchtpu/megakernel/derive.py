@@ -163,11 +163,14 @@ def derive_model_geometry(
     qcfg = merged.get("quantization_config")
     if not isinstance(qcfg, Mapping) and isinstance(hf_config, Mapping):
         qcfg = hf_config.get("quantization_config")
-    hf_qalgo = (
-        str(qcfg.get("quant_algo", "")).strip().upper()
-        if isinstance(qcfg, Mapping)
-        else ""
-    )
+    hf_qalgo = ""
+    if isinstance(qcfg, Mapping):
+        # ModelOpt nests the algorithm under `quantization`; others keep it flat.
+        nested_q = qcfg.get("quantization")
+        raw_qalgo = qcfg.get("quant_algo") or (
+            nested_q.get("quant_algo") if isinstance(nested_q, Mapping) else None
+        )
+        hf_qalgo = str(raw_qalgo or "").strip().upper()
     explicit_eq = moe_b.options.get("expert_quant")
     eff_quant = (
         str(explicit_eq)

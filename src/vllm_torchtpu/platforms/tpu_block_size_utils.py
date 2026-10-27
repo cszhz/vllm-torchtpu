@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
@@ -389,6 +390,15 @@ def _derive_tpu_block_slot_config(
     block_size_source = "input_block_size"
     if mamba_layout is not None:
         mamba_fit_block_size = mamba_layout.required_tokens * fa_pool_row_tokens
+        if os.environ.get("VLLM_TPU_MEGAKERNEL", "").strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "off",
+            "none",
+        ):
+            # PoolLayout reserves 5 pages of 128 tokens (640 tokens) per Mamba slot.
+            mamba_fit_block_size = max(mamba_fit_block_size, 640)
         if vllm_config.cache_config.user_specified_block_size:
             user_block_size_floor = input_block_size
         block_size_floor = max(

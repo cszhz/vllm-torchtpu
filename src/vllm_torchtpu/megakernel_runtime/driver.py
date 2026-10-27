@@ -64,6 +64,7 @@ from vllm_torchtpu.megakernel.modules.gqa import GQAModule, GQATunables
 from vllm_torchtpu.megakernel.ops import rup
 from vllm_torchtpu.megakernel.pool.config import (
     CacheExec,
+    cache_exec,
     check_dcp_interleave,
     with_cache,
 )
@@ -977,8 +978,12 @@ def _check_host_major_mesh(mesh: Any, group_size: int = 8) -> bool:
     if len(set(int_pids)) <= 1:
         return True
     base_pid = int_pids[0]
+    # One process per host (JAX multi-controller) gives base + r // group_size;
+    # vLLM's mp executor runs one process per device in node-major rank order,
+    # which gives base + r.
+    per_device = all(pid == base_pid + r for r, pid in enumerate(int_pids))
     for r, pid in enumerate(int_pids):
-        if pid != base_pid + (r // group_size):
+        if not per_device and pid != base_pid + (r // group_size):
             logger.warning(
                 "Megakernel multi-host mesh requires host-major rank ordering "
                 "(process_index == base + r // %d), got %s; skipping.",
@@ -1139,6 +1144,7 @@ class MegakernelDriver:
         self.attn_layer_name: str = ""
         self._ckpt_window: int = 1
         self._zero_roff_1d: torch.Tensor | None = None
+        self._tp_rank_1d: torch.Tensor | None = None
         self._runner_token_paddings: tuple[int, ...] = ()
         self._bucket_steps: dict[Any, Any] = {}
         self._bucket_ops: dict[tuple[int, int], Any] = {}
@@ -1167,16 +1173,51 @@ class MegakernelDriver:
     def _build_spec(self, mode: str, r_cnt: int, geom: Any = None) -> Any:
         model_def = self._model_def()
         if geom is None:
-            e_slots = 0
-            if mode == "ep":
-                w13_0 = get_routed_experts(self.backbone.layers[0].mlp).w13_weight
-                e_slots = int(w13_0.shape[0])
+            routed0 = get_routed_experts(self.backbone.layers[0].mlp)
+            e_slots = int(routed0.w13_weight.shape[0]) if mode == "ep" else 0
             geom = model_def.derive_geometry(
-                model_def.default_hf_config,
+                _default_hf_config_for_quant(model_def, _routed_expert_quant(routed0)),
                 moe_tp=(mode == "tp"),
-                e_slots=0 if mode == "tp" else e_slots,
+                e_slots=e_slots,
             )
         return model_def.to_model_spec(geom, R=r_cnt)
+
+    def _make_tp_all_gather_fn(
+        self, r_cnt: int
+    ) -> Callable[[torch.Tensor], torch.Tensor] | None:
+        if r_cnt <= 1:
+            return None
+        try:
+            from vllm.distributed import (
+                get_tensor_model_parallel_world_size,
+                tensor_model_parallel_all_gather,
+            )
+
+            if get_tensor_model_parallel_world_size() != r_cnt:
+                return None
+        except (ImportError, AssertionError, RuntimeError):
+            return None
+
+        def _gather(t: torch.Tensor) -> torch.Tensor:
+            orig_shape = tuple(t.shape)
+            orig_dtype = t.dtype
+            flat = t.contiguous().reshape(-1)
+            if flat.element_size() == 1:
+                u8 = flat.view(torch.uint8)
+                wire = (
+                    u8.view(torch.int32) if u8.numel() % 4 == 0 else u8.to(torch.int32)
+                )
+                gathered = tensor_model_parallel_all_gather(wire, dim=0)
+                raw = (
+                    gathered.view(torch.uint8)
+                    if u8.numel() % 4 == 0
+                    else gathered.to(torch.uint8)
+                )
+                return raw.view(orig_dtype).reshape(r_cnt, *orig_shape)
+            gathered = tensor_model_parallel_all_gather(flat, dim=0)
+            return gathered.reshape(r_cnt, *orig_shape)
+
+        return _gather
 
     def _prepare_and_pack_weights(
         self,
@@ -1185,6 +1226,9 @@ class MegakernelDriver:
         reshard_ep_to_tp: bool,
         expert_placement: Any,
     ) -> dict[str, Any]:
+        pack_ex = self.profile.exec_for(
+            self.base_exec, B=self.base_exec.B, T=1, g=self.geom
+        )
         if reshard_ep_to_tp and mode == "tp":
             from vllm.distributed import tensor_model_parallel_all_gather
 
@@ -1203,7 +1247,7 @@ class MegakernelDriver:
                     self.backbone.layers[l_idx].mlp,
                     tp_rank=self.tp_rank,
                     g=self.geom,
-                    ex=self.base_exec,
+                    ex=pack_ex,
                     all_gather_fn=lambda t: tensor_model_parallel_all_gather(t, dim=0),
                     prebuild_moe_fn=prebuild_fused_moe_kernel,
                 )
@@ -1222,10 +1266,15 @@ class MegakernelDriver:
         weights = pack_weights(
             self.backbone,
             g=self.geom,
-            ex=self.base_exec,
+            ex=pack_ex,
             tp_rank=self.tp_rank,
             expert_placement=expert_placement,
+            tp_all_gather_fn=self._make_tp_all_gather_fn(pack_ex.R),
         )
+        if weights["w_flat"] and weights["w_flat"][0].device.type == "tpu":
+            from vllm_torchtpu.utils import synchronize_tensors
+
+            synchronize_tensors(weights["w_flat"])
         logger.info(
             "Packed %s megakernel weights (%d flat tensors, mode=%s) in %.2fs",
             self.spec.name,
@@ -1258,7 +1307,9 @@ class MegakernelDriver:
                     exc,
                 )
                 return False
-            g_def = mdef.derive_geometry(mdef.default_hf_config)
+            g_def = mdef.derive_geometry(
+                _default_hf_config_for_quant(mdef, str(g_hf.expert_quant))
+            )
             if g_hf != g_def:
                 diffs = [
                     f"{f.name}={getattr(g_hf, f.name)!r} "
@@ -1478,6 +1529,9 @@ class MegakernelDriver:
         self._zero_roff_1d = torch.zeros(
             (1,), dtype=torch.int32, device=pools[0].device
         )
+        self._tp_rank_1d = torch.tensor(
+            [int(self.tp_rank)], dtype=torch.int32, device=pools[0].device
+        )
         k_spec = (
             int(runner.speculative_config.num_speculative_tokens)
             if getattr(runner, "speculative_config", None) is not None
@@ -1559,6 +1613,13 @@ class MegakernelDriver:
             if p >= b:
                 return p
         return m_rows
+
+    def _rank_tensor(self, dev: torch.device) -> torch.Tensor:
+        t = self.__dict__.get("_tp_rank_1d")
+        if t is None or t.device != dev:
+            t = torch.tensor([int(self.tp_rank)], dtype=torch.int32, device=dev)
+            self._tp_rank_1d = t
+        return t
 
     def _build_all_buckets(self) -> None:
         self._bucket_steps.clear()
@@ -1658,6 +1719,7 @@ class MegakernelDriver:
             ex,
             op_name=op_name,
             donate_pools=True,
+            tp_rank=self.tp_rank,
         )
         self._bucket_ops[bkt_key] = op
 
@@ -1665,8 +1727,16 @@ class MegakernelDriver:
         out_rows = int(out_pad_rows) if out_pad_rows is not None else m_rows
         max_pages = self.max_pages_per_seq
         embed = self.embed_tokens
+        tp_rank_1d = (
+            self._rank_tensor(self.raw_pools[0].device)
+            if is_tpu and int(self.mesh.devices.size) > 1
+            else None
+        )
 
-        def _step_impl(
+        # Compile input slicing and token embedding in a separate graph so
+        # distributed embedding collectives are not fused into the pooled
+        # megakernel HLO module.
+        def _prep_embed_impl(
             input_ids: torch.Tensor,
             positions: torch.Tensor,
             block_tables: torch.Tensor,
@@ -1677,9 +1747,13 @@ class MegakernelDriver:
             s2: torch.Tensor,
             c2: torch.Tensor,
             roff: torch.Tensor,
-            weights: list[torch.Tensor],
-            pools: list[torch.Tensor],
-        ) -> torch.Tensor:
+        ) -> tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]:
             c0_2d = c0 if c0.ndim == 2 else c0.reshape(-1, 1)
             c1_2d = c1 if c1.ndim == 2 else c1.reshape(-1, 1)
             c2_2d = c2 if c2.ndim == 2 else c2.reshape(-1, 1)
@@ -1707,6 +1781,17 @@ class MegakernelDriver:
             hid = embed(ids_b).to(torch.bfloat16)
             if bucket_t < m_rows:
                 hid = F.pad(hid, (0, 0, 0, m_rows - bucket_t))
+            return pos_b, hid, pt_b, ckpt_b, roff_b
+
+        def _pooled_step_impl(
+            pos_b: torch.Tensor,
+            hid: torch.Tensor,
+            pt_b: torch.Tensor,
+            ckpt_b: torch.Tensor,
+            roff_b: torch.Tensor,
+            weights: list[torch.Tensor],
+            pools: list[torch.Tensor],
+        ) -> torch.Tensor:
             hid_out = execute_pooled_step_inplace(
                 op,
                 pos_b,
@@ -1716,6 +1801,7 @@ class MegakernelDriver:
                 roff_b,
                 weights,
                 pools,
+                tp_rank_1d=tp_rank_1d,
             )
             if hid_out.shape[0] > out_rows:
                 hid_out = hid_out[:out_rows].clone()
@@ -1726,13 +1812,21 @@ class MegakernelDriver:
         # Give each bucket its own code object: nested closures share `__code__`,
         # and Dynamo caches compiled graphs per code object, so all buckets
         # would otherwise compete for one entry's `cache_size_limit`.
+        prep_name = f"prep_step_t{tokens_per_seq}_b{bucket_t}"
+        _prep_embed_impl = types.FunctionType(
+            _prep_embed_impl.__code__.replace(co_name=prep_name, co_qualname=prep_name),
+            _prep_embed_impl.__globals__,
+            prep_name,
+            _prep_embed_impl.__defaults__,
+            _prep_embed_impl.__closure__,
+        )
         bkt_name = f"step_t{tokens_per_seq}_b{bucket_t}"
-        _step_impl = types.FunctionType(
-            _step_impl.__code__.replace(co_name=bkt_name, co_qualname=bkt_name),
-            _step_impl.__globals__,
+        _pooled_step_impl = types.FunctionType(
+            _pooled_step_impl.__code__.replace(co_name=bkt_name, co_qualname=bkt_name),
+            _pooled_step_impl.__globals__,
             bkt_name,
-            _step_impl.__defaults__,
-            _step_impl.__closure__,
+            _pooled_step_impl.__defaults__,
+            _pooled_step_impl.__closure__,
         )
 
         if is_tpu:
@@ -1744,19 +1838,64 @@ class MegakernelDriver:
                     bucket_t=bucket_t,
                 )
 
+            prep_fn: Any = torch.compile(
+                _prep_embed_impl,
+                backend="tpu",
+                fullgraph=True,
+                dynamic=False,
+                options={"name": prep_name, "serializable": False},
+            )
             compile_opts: dict[str, Any] = {
                 "name": bkt_name,
                 "debug_callback": _on_torchtpu_compile,
                 "serializable": False,
             }
-            return torch.compile(
-                _step_impl,
+            pooled_fn: Any = torch.compile(
+                _pooled_step_impl,
                 backend="tpu",
                 fullgraph=True,
                 dynamic=False,
                 options=compile_opts,
             )
-        return _step_impl
+        else:
+            prep_fn = _prep_embed_impl
+            pooled_fn = _pooled_step_impl
+
+        def _step_runner(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            block_tables: torch.Tensor,
+            s0: torch.Tensor,
+            c0: torch.Tensor,
+            s1: torch.Tensor,
+            c1: torch.Tensor,
+            s2: torch.Tensor,
+            c2: torch.Tensor,
+            roff: torch.Tensor,
+            weights: list[torch.Tensor],
+            pools: list[torch.Tensor],
+        ) -> torch.Tensor:
+            pos_b, hid, pt_b, ckpt_b, roff_b = prep_fn(
+                input_ids,
+                positions,
+                block_tables,
+                s0,
+                c0,
+                s1,
+                c1,
+                s2,
+                c2,
+                roff,
+            )
+            return pooled_fn(pos_b, hid, pt_b, ckpt_b, roff_b, weights, pools)
+
+        return types.FunctionType(
+            _step_runner.__code__.replace(co_name=bkt_name, co_qualname=bkt_name),
+            _step_runner.__globals__,
+            bkt_name,
+            _step_runner.__defaults__,
+            _step_runner.__closure__,
+        )
 
     def _verify_torchtpu_compile_debug(
         self,
@@ -2036,10 +2175,14 @@ class MegakernelDriver:
                             assert sent_kv is not None and sent_gdn is not None
                             out_cpu = out_b[:b].detach().float().cpu()
                             out_fin_ok = bool(torch.isfinite(out_cpu).all())
+                            cx = cache_exec(self.base_exec)
+                            dcp_g = cx.dcp_size if cx.dcp_kv_sharded else 1
+                            kv_owner = (self.tp_rank % max(1, dcp_g)) == 0
                             for idx, p in enumerate(self.raw_pools):
-                                kv_ok = not torch.equal(
+                                kv_changed = not torch.equal(
                                     p[kv_page].view(torch.uint8).cpu(), sent_kv[idx]
                                 )
+                                kv_ok = kv_changed or not kv_owner
                                 gdn_ok = not torch.equal(
                                     p[gdn_p0 : gdn_p0 + rpp].view(torch.uint8).cpu(),
                                     sent_gdn[idx],
@@ -2637,6 +2780,24 @@ def _runner_hf_config(runner: Any) -> Any:
     return getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
 
 
+def _default_hf_config_for_quant(
+    mdef: type[ModelDef], expert_quant: str
+) -> dict[str, Any]:
+    """`mdef.default_hf_config` declaring `expert_quant` the way a checkpoint does."""
+    cfg = dict(mdef.default_hf_config)
+    if expert_quant == "nvfp4":
+        cfg["quantization_config"] = {"quant_algo": "NVFP4"}
+    return cfg
+
+
+def _routed_expert_quant(experts: Any) -> str:
+    """`nvfp4` when the routed experts carry NVFP4 weights, else `fp8`."""
+    nvfp4 = getattr(experts, "_mk_nvfp4_raw", None) is not None or (
+        experts.w13_weight.dtype in (torch.uint8, torch.float4_e2m1fn_x2)
+    )
+    return "nvfp4" if nvfp4 else "fp8"
+
+
 class Qwen35Megakernel(MegakernelDriver):
     """Qwen3.5 (`Qwen3_5MoeForConditionalGeneration`) megakernel driver."""
 
@@ -2711,8 +2872,23 @@ def register_megakernel_driver(
     _MODEL_DRIVER_REGISTRY[arch_or_model_type] = factory
 
 
+def _drop_nvfp4_raw_stash(model: Any) -> None:
+    """Release the CPU NVFP4 copies kept for packing when no driver packs them."""
+    modules = model.modules() if hasattr(model, "modules") else ()
+    for mod in modules:
+        if getattr(mod, "_mk_nvfp4_raw", None) is not None:
+            delattr(mod, "_mk_nvfp4_raw")
+
+
 def maybe_create(runner: Any) -> Any:
     """Create a megakernel driver for `runner` if enabled for its model architecture."""
+    drv = _maybe_create_driver(runner)
+    if drv is None:
+        _drop_nvfp4_raw_stash(getattr(runner, "model", None))
+    return drv
+
+
+def _maybe_create_driver(runner: Any) -> Any:
     hf_cfg = _runner_hf_config(runner)
     if (
         hf_cfg is not None
