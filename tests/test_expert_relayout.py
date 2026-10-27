@@ -254,7 +254,12 @@ class _Mover:
         self.auto = auto
         self.started: list[rl.Plan] = []
         self.cancelled = 0
+        self.drained: list[float] = []
         self._failed = False
+
+    def drain(self, timeout_s):
+        self.drained.append(timeout_s)
+        return True
 
     def start(self, plan, modules):
         self.started.append(plan)
@@ -362,12 +367,16 @@ def test_staging_timeout_and_mover_failure_abort():
     assert (
         cs[0].state == rl.IDLE and cs[0].stats["aborted"] == 1 and slow.cancelled == 1
     )
+    # Every rank times out at the same step: the exchange is drained first.
+    assert slow.drained == [cs[0].drain_s]
     failing = _Mover(auto=False)
     cs = [_controller(0, tap, failing, installs)]
     _run(cs, tap, 6)
     failing._failed = True
     _run(cs, tap, 1, start=6)
     assert cs[0].state == rl.IDLE and cs[0].stats["aborted"] == 1
+    # A rank-local failure cannot count on its peers: no drain.
+    assert failing.drained == [] and failing.cancelled == 1
 
 
 def test_flat_traffic_never_triggers_a_move():
@@ -604,6 +613,7 @@ def test_the_floors_drop_small_savings_and_cap_bytes_by_saving_per_byte():
     the layers with the most saving per byte are kept, in that order."""
     c = rl.Controller.__new__(rl.Controller)
     c.min_gain_us, c.max_bytes, c.move_bytes = 10.0, 3 * 100, {"target": 100}
+    c.rank_bytes_cap = 0
     c.stats = {}
     plan = rl.Plan(generation=1, trigger_step=0)
     lay = _layout()
@@ -626,3 +636,47 @@ def test_the_floors_drop_small_savings_and_cap_bytes_by_saving_per_byte():
         and len(out.moves) == 3
     )
     assert c.stats["floored"] == 2
+
+
+def test_the_per_rank_cap_keeps_a_generation_within_what_the_budget_moves():
+    """D8 (j-608af38f): ~1 GB of slabs in plus out per rank through a 16 MB
+    step budget needs ~62 pumps against a 64-step timeout, so every
+    generation timed out. The controller now caps each rank's in-plus-out
+    bytes at half of budget x timeout, keeping layers by saving per byte."""
+    tap = _Tap()
+    c = _controller(0, tap, _Mover(), [], step_budget_bytes=100, timeout_windows=1)
+    assert c.timeout_steps == 4 and c.rank_bytes_cap == 100 * 4 // 2
+    c.min_gain_us, c.max_bytes, c.move_bytes = 0.0, 0, {"target": 50}
+    plan = rl.Plan(generation=1, trigger_step=0)
+    lay = _layout()
+    # Layer 0: two moves into rank 1 (rank 1: 100 in; rank 0: 100 out).
+    # Layer 1: one move 2 -> 3. Layer 2: two moves into rank 1 again.
+    for lid, saving, moves in (
+        (0, 40.0, [(0, 1), (0, 1)]),
+        (1, 10.0, [(2, 3)]),
+        (2, 30.0, [(2, 1), (2, 1)]),
+    ):
+        plan.layouts[("target", lid)] = lay
+        plan.predicted[("target", lid)] = (100.0, 100.0 - saving)
+        for i, (src, dst) in enumerate(moves):
+            plan.moves.append(rl.Move("target", lid, i, src, i, dst, 4))
+    out = c._floors(plan)
+    # Cap 200: layer 0 then layer 2 put rank 1 at exactly 200, layer 1 puts
+    # ranks 2 and 3 at 150 and 50: everything fits.
+    assert set(out.layouts) == {("target", 0), ("target", 1), ("target", 2)}
+    c.rank_bytes_cap = 150
+    plan2 = rl.Plan(generation=1, trigger_step=0)
+    for lid, saving, moves in (
+        (0, 40.0, [(0, 1), (0, 1)]),
+        (1, 10.0, [(2, 3)]),
+        (2, 30.0, [(2, 1), (2, 1)]),
+    ):
+        plan2.layouts[("target", lid)] = lay
+        plan2.predicted[("target", lid)] = (100.0, 100.0 - saving)
+        for i, (src, dst) in enumerate(moves):
+            plan2.moves.append(rl.Move("target", lid, i, src, i, dst, 4))
+    out2 = c._floors(plan2)
+    # Layer 0 puts rank 1 at 100; layer 2 would take it to 200 > 150: dropped;
+    # layer 1 (ranks 2 and 3 at 50) still fits.
+    assert set(out2.layouts) == {("target", 0), ("target", 1)}
+    assert all((m.group, m.layer) in out2.layouts for m in out2.moves)

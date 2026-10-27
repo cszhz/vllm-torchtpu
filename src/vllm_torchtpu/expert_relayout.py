@@ -492,6 +492,8 @@ class Controller:
         max_bytes: int = 0,
         move_bytes: dict[str, int] | None = None,
         hang_dump_s: float = 0.0,
+        step_budget_bytes: int = 0,
+        drain_s: float = 30.0,
     ) -> None:
         """groups: name -> dict(experts, active, staging, replica_cap).
         snapshot(): (group, layer) -> cumulative counts [P]. install(module,
@@ -515,6 +517,13 @@ class Controller:
             self.window_steps if warmup_steps is None else int(warmup_steps)
         )
         self.timeout_steps = max(int(timeout_windows), 1) * self.window_steps
+        # One rank's slabs in plus out pass through the mover's per-step byte
+        # budget (one pump a step): a generation larger than half of what the
+        # timeout lets through cannot stage in time, so it is capped there
+        # (0 = an unbounded budget, no cap).
+        budget = max(int(step_budget_bytes), 0)
+        self.rank_bytes_cap = budget * self.timeout_steps // 2
+        self.drain_s = float(drain_s)
         self.generation = 0
         self.state = IDLE
         self.pending: Plan | None = None
@@ -563,7 +572,10 @@ class Controller:
             elif min_staged >= self.pending.generation:
                 self._install(step)
             elif step - self.pending.trigger_step > self.timeout_steps:
-                self._abort(step, f"not staged within {self.timeout_steps} steps")
+                # Every rank reaches this at the same step: drain together.
+                self._abort(
+                    step, f"not staged within {self.timeout_steps} steps", drain=True
+                )
         elif self.state == PENDING:
             assert self.pending is not None
             if hash_max == min_hash == self.pending.hash62:
@@ -727,24 +739,41 @@ class Controller:
         return self._floors(plan)
 
     def _floors(self, plan: Plan) -> Plan:
+        """Drop the layers under the absolute gain floor, then keep layers by
+        saving per byte while the generation fits both byte caps: the total
+        (`max_bytes`) and each rank's slabs in plus out (`rank_bytes_cap`,
+        what the step budget lets through before the timeout)."""
         keys = list(plan.layouts)
         saving = {k: plan.predicted[k][0] - plan.predicted[k][1] for k in keys}
         drop = {k for k in keys if saving[k] < self.min_gain_us}
-        if self.max_bytes > 0:
-            cost = {
-                k: sum(1 for m in plan.moves if (m.group, m.layer) == k)
-                * self.move_bytes.get(k[0], 0)
-                for k in keys
-            }
+        rank_cap = getattr(self, "rank_bytes_cap", 0)
+        if self.max_bytes > 0 or rank_cap > 0:
+            cost = dict.fromkeys(keys, 0)
+            per_rank: dict = {k: {} for k in keys}
+            for m in plan.moves:
+                k = (m.group, m.layer)
+                if k not in cost:
+                    continue
+                b = self.move_bytes.get(m.group, 0)
+                cost[k] += b
+                for r in (m.src_rank, m.dst_rank):
+                    per_rank[k][r] = per_rank[k].get(r, 0) + b
             spent = 0
+            spent_rank: dict[int, int] = {}
             for k in sorted(
                 (k for k in keys if k not in drop),
                 key=lambda k: -(saving[k] / max(cost[k], 1)),
             ):
-                if spent + cost[k] > self.max_bytes:
+                over_total = self.max_bytes > 0 and spent + cost[k] > self.max_bytes
+                over_rank = rank_cap > 0 and any(
+                    spent_rank.get(r, 0) + b > rank_cap for r, b in per_rank[k].items()
+                )
+                if over_total or over_rank:
                     drop.add(k)
-                else:
-                    spent += cost[k]
+                    continue
+                spent += cost[k]
+                for r, b in per_rank[k].items():
+                    spent_rank[r] = spent_rank.get(r, 0) + b
         if drop:
             for k in drop:
                 plan.layouts.pop(k, None)
@@ -786,16 +815,31 @@ class Controller:
         self.pending = None
         self.state = IDLE
 
-    def _abort(self, step: int, why: str) -> None:
+    def _abort(self, step: int, why: str, drain: bool = False) -> None:
+        """Drop the pending generation. A drop every rank takes at the same
+        step (the staging timeout) drains the mover's exchange first, so no
+        posted receive outlives its generation; a rank-local drop (a failed
+        mover) cannot count on its peers and gives the generation up."""
         assert self.pending is not None
         self.stats["aborted"] += 1
+        self._watchdog(False)
+        how = ""
+        drainer = getattr(self.mover, "drain", None)
+        if drain and drainer is not None:
+            t0 = time.monotonic()
+            ok = drainer(self.drain_s)
+            how = (
+                f"; exchange drained in {time.monotonic() - t0:.2f} s"
+                if ok
+                else f"; exchange abandoned after {self.drain_s:.0f} s"
+            )
         logger.warning(
-            "expert relayout | step %d: generation %d dropped: %s",
+            "expert relayout | step %d: generation %d dropped: %s%s",
             step,
             self.pending.generation,
             why,
+            how,
         )
-        self._watchdog(False)
         self.mover.cancel()
         self.mover.settle(self.generation)
         self.pending = None
@@ -921,6 +965,8 @@ def arm(
         max_bytes=int(envs.TPU_MOE_EPLB_MAX_BYTES_PER_GEN_MB) << 20,
         move_bytes=move_bytes,
         hang_dump_s=envs.TPU_MOE_EPLB_HANG_DUMP_S,
+        step_budget_bytes=mover.step_budget_bytes,
+        drain_s=envs.TPU_MOE_EPLB_DRAIN_S,
     )
     first = next(iter(kept_modules.values()))
     try:
@@ -938,7 +984,7 @@ def arm(
     logger.info(
         "expert relayout armed | rank %d of %d | groups %s | %d layers | "
         "window %d steps "
-        "x %d sub-windows | min gain %.0f%% | mover %s",
+        "x %d sub-windows | min gain %.0f%% | mover %s | per-rank cap %.0f MB",
         ep_rank,
         ep_world,
         {g: (v["active"], v["staging"], v["replica_cap"]) for g, v in groups.items()},
@@ -947,6 +993,7 @@ def arm(
         controller.sub_windows,
         100 * controller.min_gain,
         type(transport).__name__,
+        controller.rank_bytes_cap / 1e6,
     )
     return controller
 

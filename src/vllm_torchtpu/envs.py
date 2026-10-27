@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     TPU_MOE_EPLB_MIN_GAIN_US: float = 0.0
     TPU_MOE_EPLB_MAX_BYTES_PER_GEN_MB: int = 0
     TPU_MOE_EPLB_HANG_DUMP_S: float = 120.0
+    TPU_MOE_EPLB_DRAIN_S: float = 30.0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -730,6 +731,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_EPLB_HANG_DUMP_S": lambda: float(
         os.getenv("TPU_MOE_EPLB_HANG_DUMP_S", "120") or 0
     ),
+    # A generation dropped at its staging timeout finishes its host exchange
+    # (no device writes) for at most this long before it is abandoned
+    # (seconds): no receive it posted may outlive it.
+    "TPU_MOE_EPLB_DRAIN_S": lambda: float(os.getenv("TPU_MOE_EPLB_DRAIN_S", "30") or 0),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(

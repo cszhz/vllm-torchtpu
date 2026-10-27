@@ -69,9 +69,30 @@ BIAS_PARTS = PARTS[4:6]
 _GROUP_IDS = {"target": 0, "draft": 1}
 
 
-def move_tag(group: str, layer: int, dst_slot: int, part: int) -> int:
-    """A unique int32 tag per (group, layer, destination slot, part)."""
-    return ((_GROUP_IDS.get(group, 2) * 1024 + layer) * 256 + dst_slot) * 8 + part + 1
+def move_tag(
+    group: str, layer: int, dst_slot: int, part: int, generation: int = 0
+) -> int:
+    """A unique int32 tag per (group, layer, destination slot, part), and per
+    generation modulo 128: a receive a dropped generation left posted can
+    never match a later generation's send (the base fits in 23 bits)."""
+    base = ((_GROUP_IDS.get(group, 2) * 1024 + layer) * 256 + dst_slot) * 8 + part + 1
+    return ((int(generation) % 128) << 23) + base
+
+
+class _ExchangeState:
+    """One generation's link between the pump and its exchange thread. A
+    new one per generation: a thread a dropped generation left behind keeps
+    its own queues and flags and never touches the next generation's."""
+
+    def __init__(self, generation=None, incoming=None) -> None:
+        self.generation = generation
+        self.incoming = incoming if incoming is not None else []
+        self.send_q: queue.Queue = queue.Queue()
+        self.recv_q: queue.Queue = queue.Queue()
+        self.sends_closed = threading.Event()
+        self.cancel = threading.Event()
+        self.done = threading.Event()
+        self.error: BaseException | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -560,14 +581,12 @@ class SlabMover:
         self.step_budget_bytes = max(int(step_budget_bytes), 0)
         self._staged = generation
         self._failed = False
-        self._cancel = threading.Event()
         self._phase = "idle"
         self._pumps = 0
         self._pump_s = 0.0
         self._pump_max_s = 0.0
         self._thread: threading.Thread | None = None
-        self._thread_done = threading.Event()
-        self._thread_error: BaseException | None = None
+        self._x = _ExchangeState()
         self.last_report: dict[str, Any] = {}
         self._reset_work()
 
@@ -597,9 +616,11 @@ class SlabMover:
         self._to_release: list = []  # transport buffers handed back at the end
         # The exchange thread: payloads in, arrivals (indices into
         # `_incoming`) out, and "nothing more to send" from the pump.
-        self._send_q: queue.Queue = queue.Queue()
-        self._recv_q: queue.Queue = queue.Queue()
-        self._sends_closed = threading.Event()
+        self._x = _ExchangeState()
+        # A dropped generation finishing its exchange without device writes
+        # (`drain`), and one given up on with copies possibly in flight.
+        self._draining = False
+        self._abandoned = False
         self._marks: dict[str, float] = {}
 
     # -- Mover protocol
@@ -610,7 +631,6 @@ class SlabMover:
         if self._phase != "idle":
             raise RuntimeError("a generation is still staging")
         self._reset_work()
-        self._cancel.clear()
         self._failed = False
         self._gen = plan.generation
         self._t0 = time.monotonic()
@@ -679,11 +699,9 @@ class SlabMover:
             return
         # The host leg streams from the start: receives are posted now and
         # every payload is sent the step it lands on the host.
-        self._thread_done.clear()
-        self._thread_error = None
-        self._sends_closed.clear()
+        self._x = _ExchangeState(self._gen, self._incoming)
         self._thread = threading.Thread(
-            target=self._exchange, name="expert-mover", daemon=True
+            target=self._exchange, args=(self._x,), name="expert-mover", daemon=True
         )
         self._thread.start()
         self._phase = "stream"
@@ -692,7 +710,7 @@ class SlabMover:
         """One bounded slice of device work, from the main thread."""
         if self._phase == "idle" or self._failed:
             return
-        if self._cancel.is_set():
+        if self._x.cancel.is_set():
             self._phase = "idle"
             return
         t0 = time.perf_counter()
@@ -717,14 +735,65 @@ class SlabMover:
         return self._failed
 
     def cancel(self) -> None:
-        self._cancel.set()
+        self._x.cancel.set()
+
+    def drain(self, timeout_s: float) -> bool:
+        """Finish a dropped generation's host exchange without writing the
+        device: every remaining device-to-host copy is issued (no budget),
+        every payload sent, every posted receive absorbed and discarded.
+        Every rank drops a timed-out generation at the same step and drains
+        it, so every receive a peer posted gets its send; nothing is left to
+        match a later generation's messages. True when the exchange and its
+        copies finished within `timeout_s`; otherwise the generation is
+        abandoned: its thread is told to stop and its host buffers are never
+        reused (a copy may still be landing in them)."""
+        if self._phase != "stream" or self._thread is None:
+            return True
+        x = self._x
+        self._draining = True
+        end = time.monotonic() + max(float(timeout_s), 0.0)
+        try:
+            while time.monotonic() < end and x.error is None:
+                self._pump_stream()
+                if self._drained():
+                    break
+                time.sleep(0.002)
+        except Exception:  # noqa: BLE001 - an abandoned drain, reported below
+            logger.exception(
+                "expert mover | rank %d: draining generation %s failed",
+                self.rank,
+                self._gen,
+            )
+        ok = x.error is None and self._drained()
+        if not ok:
+            self._abandoned = True
+            x.cancel.set()
+        return ok
+
+    def _drained(self) -> bool:
+        return (
+            self._x.done.is_set()
+            and not self._out_inflight
+            and not self._h2d_inflight
+            and all(tb["future"] is None or tb["ready"] for tb in self._tables.values())
+        )
 
     def settle(self, generation: int) -> None:
         self._staged = generation
-        if self._phase == "stream":  # cancelled mid-generation
-            self._sends_closed.set()
-            for host in self._to_release:
-                self.transport.release(host)
+        if self._phase == "stream":  # dropped mid-generation
+            self._x.sends_closed.set()
+            if self._abandoned:
+                # A device copy may still land in these: never reuse them.
+                logger.warning(
+                    "expert mover | rank %d: generation %s abandoned; %d host "
+                    "buffers left unreleased",
+                    self.rank,
+                    self._gen,
+                    len(self._to_release),
+                )
+            else:
+                for host in self._to_release:
+                    self.transport.release(host)
             self._to_release = []
         self._phase = "idle"
 
@@ -735,15 +804,18 @@ class SlabMover:
     # -- phases
 
     def _budget(self) -> float:
-        return float("inf") if self.step_budget_bytes == 0 else self.step_budget_bytes
+        if self._draining or self.step_budget_bytes == 0:
+            return float("inf")
+        return self.step_budget_bytes
 
     def _pump_stream(self) -> None:
         """One step's slice of every leg, under one byte budget: issue D2H
         (tables first), hand landed payloads to the exchange thread, apply
         arrived payloads (slots to the H2D queue, rows into their table's
         image), issue H2D, and finish when every leg has drained."""
-        if self._thread_error is not None:
-            raise RuntimeError(f"host exchange failed: {self._thread_error!r}")
+        x = self._x
+        if x.error is not None:
+            raise RuntimeError(f"host exchange failed: {x.error!r}")
         budget = self._budget()
         while self._tables_todo and budget > 0:
             table = self._tables[self._tables_todo.pop(0)]
@@ -778,18 +850,20 @@ class SlabMover:
                 self._send((m, part, image[a : a + span].clone()))
             self._apply_waiting_rows(key)
         if (
-            not self._sends_closed.is_set()
+            not x.sends_closed.is_set()
             and self._out_sent == self._out_expected
             and all(tb["ready"] or not tb["out_rows"] for tb in self._tables.values())
         ):
             self._marks["d2h_done_s"] = time.monotonic() - self._t0
-            self._sends_closed.set()
+            x.sends_closed.set()
         while True:
             try:
-                i = self._recv_q.get_nowait()
+                i = x.recv_q.get_nowait()
             except queue.Empty:
                 break
             self._in_received += 1
+            if self._draining:
+                continue  # absorbed, never applied
             self._marks.setdefault("first_arrival_s", time.monotonic() - self._t0)
             m, part, tensor, kind, dst_slot, payload = self._incoming[i]
             if kind == SLOT:
@@ -798,7 +872,7 @@ class SlabMover:
             key = (m.group, m.layer, part)
             self._rows_waiting.append(i)
             self._apply_waiting_rows(key)
-        while self._h2d_todo and budget > 0:
+        while self._h2d_todo and budget > 0 and not self._draining:
             host, tensor, first = self._h2d_todo.pop(0)
             self._h2d_inflight.append(self.transport.h2d(host, tensor, first))
             budget -= host.numel()
@@ -806,22 +880,23 @@ class SlabMover:
             f for f in self._h2d_inflight if not self.transport.ready(f)
         ]
         if (
-            self._thread_done.is_set()
-            and self._sends_closed.is_set()
+            not self._draining
+            and x.done.is_set()
+            and x.sends_closed.is_set()
             and self._in_received == len(self._incoming)
             and not self._rows_waiting
             and not self._h2d_todo
             and not self._h2d_inflight
         ):
-            if self._thread_error is not None:
-                raise RuntimeError(f"host exchange failed: {self._thread_error!r}")
+            if x.error is not None:
+                raise RuntimeError(f"host exchange failed: {x.error!r}")
             self._finish()
 
     def _send(self, item) -> None:
         self._marks.setdefault("first_send_s", time.monotonic() - self._t0)
         self._out_sent += 1
         self._sent_total += int(item[2].numel())
-        self._send_q.put(item)
+        self._x.send_q.put(item)
 
     def _sent_bytes(self) -> int:
         return self._sent_total
@@ -830,7 +905,7 @@ class SlabMover:
         """Patch the arrived row payloads of one table into its image once
         the image is on the host; queue the table's H2D when complete."""
         table = self._tables[key]
-        if not table["ready"]:
+        if not table["ready"] or self._draining:
             return
         image = table["host"].reshape(-1)
         span = table["rows"] * (image.numel() // int(table["tensor"].shape[0]))
@@ -848,20 +923,20 @@ class SlabMover:
             table["expected"] = 0  # queued once
             self._h2d_todo.append((table["host"], table["tensor"], 0))
 
-    def _exchange(self) -> None:
+    def _exchange(self, x: _ExchangeState) -> None:
         """The host-to-host leg on the mover's thread, CPU memory only: every
         receive is posted up front (non-blocking), payloads are sent as the
         pump hands them over, arrivals are reported by index. Ends when the
         pump has closed the sends and every send and receive has completed."""
         try:
             recvs = []
-            for i, (m, part, _t, _kind, dst_slot, payload) in enumerate(self._incoming):
+            for i, (m, part, _t, _kind, dst_slot, payload) in enumerate(x.incoming):
                 recvs.append(
                     (
                         i,
                         self.p2p.irecv(
                             m.src_rank,
-                            move_tag(m.group, m.layer, dst_slot, part),
+                            move_tag(m.group, m.layer, dst_slot, part, x.generation),
                             payload,
                         ),
                     )
@@ -869,16 +944,16 @@ class SlabMover:
             sends = []
             idle_since = None
             while True:
-                if self._cancel.is_set():
+                if x.cancel.is_set():
                     return
                 while True:
                     try:
-                        m, part, payload = self._send_q.get_nowait()
+                        m, part, payload = x.send_q.get_nowait()
                     except queue.Empty:
                         break
                     h = self.p2p.send(
                         m.dst_rank,
-                        move_tag(m.group, m.layer, m.dst_slot, part),
+                        move_tag(m.group, m.layer, m.dst_slot, part, x.generation),
                         payload,
                     )
                     if h is not None:
@@ -886,36 +961,36 @@ class SlabMover:
                 pending = []
                 for i, h in recvs:
                     if h.is_completed():
-                        self._recv_q.put(i)
+                        x.recv_q.put(i)
                         idle_since = None
                     else:
                         pending.append((i, h))
                 recvs = pending
                 sends = [h for h in sends if not h.is_completed()]
                 if (
-                    self._sends_closed.is_set()
-                    and self._send_q.empty()
+                    x.sends_closed.is_set()
+                    and x.send_q.empty()
                     and not recvs
                     and not sends
                 ):
                     return
                 # A backend whose handles only complete inside wait(): once
                 # every send is out, block on the oldest receive for a while.
-                if self._sends_closed.is_set() and self._send_q.empty() and recvs:
+                if x.sends_closed.is_set() and x.send_q.empty() and recvs:
                     if idle_since is None:
                         idle_since = time.monotonic()
                     elif time.monotonic() - idle_since > 1.0:
                         i, h = recvs[0]
                         h.wait()
-                        self._recv_q.put(i)
+                        x.recv_q.put(i)
                         recvs = recvs[1:]
                         idle_since = None
                         continue
                 time.sleep(0.0005)
         except BaseException as e:  # noqa: BLE001 - handed to the main thread
-            self._thread_error = e
+            x.error = e
         finally:
-            self._thread_done.set()
+            x.done.set()
 
     def _finish(self) -> None:
         received = sum(p.numel() for *_, p in self._incoming)

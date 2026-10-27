@@ -145,6 +145,103 @@ def test_tags_are_unique_per_group_layer_slot_and_part():
     }
     assert len(tags) == 2 * 3 * 2 * 6
     assert all(0 < t < 2**31 for t in tags)
+    # Per generation (mod 128) too, still int32 at the largest base.
+    gens = {mv.move_tag("draft", 1023, 255, 7, g) for g in range(128)}
+    assert len(gens) == 128 and max(gens) < 2**31
+    assert mv.move_tag("target", 7, 4, 0, 3) != mv.move_tag("target", 7, 4, 0, 4)
+
+
+class _CountingTransport(mv.TorchTransport):
+    """Torch copies that count the host buffers handed back."""
+
+    def __init__(self):
+        super().__init__()
+        self.released = 0
+
+    def release(self, host):
+        self.released += 1
+        super().release(host)
+
+
+def _snapshot(mods):
+    return [
+        {
+            n: getattr(m, n).data.clone()
+            for aliases in mv.PART_ALIASES
+            for n in aliases
+            if hasattr(m, n)
+        }
+        for m in mods
+    ]
+
+
+def test_a_dropped_generation_drains_and_the_next_one_gets_its_own_messages():
+    """The D8 hang (j-608af38f): a generation dropped at its timeout left
+    receives posted on the gloo group under tags the next generation reused,
+    which stole its payloads; every later generation timed out too, then the
+    server hung. Draining finishes the exchange on every rank without device
+    writes, and tags carry the generation besides."""
+    import threading
+
+    mods = [_module(1), _module(2)]
+    before = _snapshot(mods)
+    exchange = mv.LocalExchange()
+    transports = [_CountingTransport() for _ in range(2)]
+    movers = [
+        mv.SlabMover(r, transports[r], exchange.endpoint(r), step_budget_bytes=1)
+        for r in range(2)
+    ]
+    for r, m in enumerate(movers):
+        m.start(_plan(), {("target", 7): mods[r]})
+    # One pump each: under a one-byte budget a single copy is issued, so
+    # nothing has staged when the controllers drop the generation.
+    for m in movers:
+        m.pump()
+    assert all(m.staged_generation() == 0 for m in movers)
+    results = [None, None]
+
+    def drain(r):
+        results[r] = movers[r].drain(10.0)
+
+    threads = [threading.Thread(target=drain, args=(r,)) for r in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(20)
+    assert results == [True, True]
+    for m in movers:
+        m.cancel()
+        m.settle(0)
+    # Nothing was written to the device, and every host buffer went back.
+    after = _snapshot(mods)
+    for r in range(2):
+        for name, value in before[r].items():
+            torch.testing.assert_close(after[r][name], value)
+    assert all(t.released > 0 for t in transports)
+    # The next generation moves the same slots and gets exactly its bytes.
+    plan = _plan()
+    plan.generation = 4
+    for r, m in enumerate(movers):
+        m.start(plan, {("target", 7): mods[r]})
+    _drive(movers, generation=4)
+    for name in ("w13_weight", "w2_weight"):
+        torch.testing.assert_close(getattr(mods[1], name).data[4], before[0][name][1])
+        torch.testing.assert_close(getattr(mods[0], name).data[4], before[1][name][2])
+
+
+def test_a_drain_the_peer_never_joins_is_abandoned_and_keeps_its_buffers():
+    mods = [_module(1), _module(2)]
+    exchange = mv.LocalExchange()
+    transport = _CountingTransport()
+    mover = mv.SlabMover(0, transport, exchange.endpoint(0), step_budget_bytes=1)
+    mover.start(_plan(), {("target", 7): mods[0]})
+    mover.pump()
+    # Rank 1 never runs: its payload for rank 0 never comes.
+    assert mover.drain(0.2) is False
+    mover.cancel()
+    mover.settle(0)
+    assert transport.released == 0  # a copy might still land in them
+    assert mover._phase == "idle" and mover.staged_generation() == 0
 
 
 def test_a_failing_leg_marks_the_generation_failed():
