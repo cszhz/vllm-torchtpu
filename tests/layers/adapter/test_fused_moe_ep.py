@@ -28,6 +28,7 @@ import pytest
 import torch
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu import expert_placement
 from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
 from vllm_torchtpu.layers.adapter import fused_moe_ep as bridge
 from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
@@ -134,6 +135,41 @@ def test_native_replica_groups_reach_prebuilt_op():
         == "op"
     )
     assert seen[0]["token_replica_groups"] == groups
+
+
+def _placed_layer():
+    """A layer an expert placement permuted: the same equal blocks, plus the
+    slot table `expert_placement.apply_to_layer` registers."""
+    layer = _layer()
+    slots = torch.arange(layer.global_num_experts, dtype=torch.int32).flip(0)
+    setattr(layer, expert_placement.EXPERT_SLOT_ATTR, slots)
+    return layer
+
+
+def test_a_placed_layer_arms_with_its_slot_table():
+    seen = []
+    build_op = lambda *args, **kw: seen.append(kw) or "op"  # noqa: E731
+    assert _prebuild(_placed_layer(), build_op=build_op) == "op"
+    assert seen[0]["has_expert_slot"] is True
+    assert _prebuild(_layer(), build_op=build_op) == "op"
+    assert seen[1]["has_expert_slot"] is False
+
+
+def test_sorted_gather_gives_way_to_the_slot_table():
+    """The split route/compute ops take at most one extra operand, so a placed
+    layer runs as the single fused program instead of failing on arity at the
+    first call."""
+    seen = []
+    with (
+        patch.object(envs, "MOE_FUSED_EP_SORTED_GATHER", True),
+        patch.object(bridge, "ep_sorted_gather_group", return_value=("g", (1, 0))),
+    ):
+        build_op = lambda *args, **kw: seen.append(kw) or "op"  # noqa: E731
+        assert _prebuild(_placed_layer(), build_op=build_op) == "op"
+        assert seen[0]["sorted_gather"] is None
+        # An unplaced layer of the same model keeps the sorted gather.
+        assert _prebuild(_layer(), build_op=build_op) == "op"
+        assert seen[1]["sorted_gather"] == ("g", (1, 0))
 
 
 @pytest.mark.parametrize("sharded_plan", [False, True])

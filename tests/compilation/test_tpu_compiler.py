@@ -146,6 +146,32 @@ class TestTpuCompilerCache:
 
         assert dp1 != dp4
 
+    def test_tpu_hash_covers_the_expert_placement_contents(self, tmp_path):
+        """Rewriting the file at the same TPU_EXPERT_PLACEMENT path must
+        invalidate the compile cache."""
+        from vllm_torchtpu import expert_placement
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        path = tmp_path / "placement.json"
+        with (
+            patch(
+                "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+                return_value=[],
+            ),
+            patch.dict(os.environ, {"TPU_EXPERT_PLACEMENT": str(path)}),
+        ):
+            path.write_text('{"experts": 4, "shards": 2, "layers": {}}')
+            expert_placement.clear_cache()
+            first = compute_tpu_compilation_hash(self._config())
+            path.write_text(
+                '{"experts": 4, "shards": 2, "layers": {"0": [[2, 0], [3, 1]]}}'
+            )
+            expert_placement.clear_cache()
+            second = compute_tpu_compilation_hash(self._config())
+        expert_placement.clear_cache()
+
+        assert first != second
+
     def test_runtime_hash_covers_custom_op_boundaries(self):
         from vllm_torchtpu.compilation import tpu_compiler
 

@@ -64,7 +64,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config, Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, expert_placement
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -475,6 +475,16 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # Before the weights load: a placed layer's expert map names the
+        # experts this rank's slots hold, which is what the loader fetches.
+        if expert_placement.apply_to_layer(layer) and not envs.MOE_FUSED_EP_ENABLE_W4A8:
+            # Only the W4A8 fused EP path reads slot order (_prebuild_w4a8);
+            # refuse now rather than after the whole checkpoint has loaded.
+            raise RuntimeError(
+                f"TPU_EXPERT_PLACEMENT places {layer.layer_name}'s experts for "
+                "the fused EP kernel, which MOE_FUSED_EP_ENABLE_W4A8 does not "
+                "enable for DeepSeek-V4 MXFP4"
+            )
         Mxfp4MoEMethod.create_weights(
             self,
             layer,
@@ -702,6 +712,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         )
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
+        expert_placement.check_layer_served(layer, fused_armed=op is not None)
         if op is not None:
             reason = fused_moe_ep_unsupported_reason(
                 layer,
@@ -759,5 +770,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
                 hash_topk_ids_operand(layer, input_ids),
+                expert_placement.expert_slot_table(layer),
             )
         return super()._forward_monolithic_tpu(layer, x, router_logits, input_ids)
