@@ -1120,9 +1120,7 @@ class DcpAttention:
             assert key_valid is not None
             sequences = batch // self.sequence_rows
             rows = self.slots * self.sequence_rows
-            # Packets under one sublane tile: slice a whole-buffer load (partial
-            # sublane loads fail to lower).
-            whole = ws.receive[parity] if rows < 8 else None
+            whole = ws.receive[parity] if _whole_packets(rows) else None
 
             def source(s):
                 if whole is not None:
@@ -1243,6 +1241,13 @@ def _lse_packet(normalized, lse, lse_rows):
     packet = jnp.where(row640 == pad, jnp.concatenate((high_vector, pad_lanes), axis=1), packet)
     packet = jnp.where(row640 == pad + 1, jnp.concatenate((low_vector, pad_lanes), axis=1), packet)
     return packet.astype(jnp.bfloat16)
+
+
+def _whole_packets(rows):
+    """Whether explicit-key merges load the packet buffer whole: a sequence's
+    packet rows that are not whole BF16 sublane tiles (16 rows) cannot be loaded
+    as a slice (partial-tile loads fail to lower)."""
+    return rows % 16 != 0
 
 
 def _merge_received_keys(received, own_rows, keys, key_valid, group, *, unroll=1, lse_rows=0):
@@ -1477,8 +1482,8 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
             assert key_valid is not None
             # One sequence per chunk: its rows attend its explicit new keys.
             received, sources = (stage2_recv.at[ring(c)], hosts) if hier else (ws.receive.at[ring(c)], group)
-            if rows < 8:
-                received = received[...]  # a whole slot: partial sublane loads fail to lower
+            if _whole_packets(rows):
+                received = received[...]
             ws.merged[c, :rows, :] = _merge_received_keys(
                 received, ws.own_rows[c, :rows, :], keys[c], key_valid[c], sources,
                 lse_rows=self.slots if self.lse_in_padding else 0)
