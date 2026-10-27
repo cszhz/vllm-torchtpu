@@ -93,6 +93,12 @@ class _ExchangeState:
         self.cancel = threading.Event()
         self.done = threading.Event()
         self.error: BaseException | None = None
+        # Counters the thread keeps for `progress()` (plain ints: a racy read
+        # is fine for a diagnostic).
+        self.recvs_posted = 0
+        self.recvs_done = 0
+        self.sends_posted = 0
+        self.sends_done = 0
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +219,9 @@ class RawTransferTransport(TorchTransport):
         # program does not read, which is why tpu-sync's own WeightSynchronizer
         # skips the lock by default.
         self.skip_buffer_lock = bool(skip_buffer_lock)
-        self._anchor: torch.Tensor | None = None  # binds RawHostBuffers to the device
+        self._anchor: torch.Tensor | None = None
+        self.allocs = 0  # host buffers allocated (bound), and their time
+        self.alloc_s = 0.0  # binds RawHostBuffers to the device
         # Pinning host memory costs milliseconds per buffer, and the whole
         # scale-table images are tens of MB each, so buffers are pooled by
         # shape across generations rather than pinned anew on the main thread.
@@ -250,6 +258,7 @@ class RawTransferTransport(TorchTransport):
             free = self._pool.get(shape)
             if free:
                 return free.pop()
+        t0 = time.perf_counter()
         if self.host_memory == "raw":
             if self._anchor is None:
                 raise RuntimeError(
@@ -260,14 +269,19 @@ class RawTransferTransport(TorchTransport):
             host = _pinned(shape)
         with self._lock:
             self._owned.add(host.data_ptr())
+            self.allocs += 1
+            self.alloc_s += time.perf_counter() - t0
         return host
 
     def prepare_device(self, anchor: torch.Tensor) -> None:
-        """Adopt `anchor`, an existing small device tensor, as what binds
-        RawHostBuffers to its device. Nothing here creates a device op: a
-        tensor made for the purpose (torch.zeros on the device) hung the
-        process when materialized outside a step (after warm-up, at arm) and
-        forced a mid-step compile when made from a pump (`eplb-dyn-dp8-i`)."""
+        """Adopt `anchor`, an existing device tensor NO program writes (a
+        weight), as what binds RawHostBuffers to its device. Nothing here
+        creates a device op: a tensor made for the purpose (torch.zeros on
+        the device) hung the process when materialized outside a step and
+        forced a mid-step compile when made from a pump (`eplb-dyn-dp8-i`).
+        And binding through a tensor a step writes (the load accumulator)
+        waits on the host for that step's program at every allocation: the
+        constructor awaits the tensor's producer (~170 ms at DP32, seed-19)."""
         if self.host_memory != "raw" or self._anchor is not None:
             return
         if anchor.device.type == "cpu":
@@ -766,9 +780,43 @@ class SlabMover:
             )
         ok = x.error is None and self._drained()
         if not ok:
+            logger.warning(
+                "expert mover | rank %d: drain gave up after %.0f s: %s",
+                self.rank,
+                timeout_s,
+                self.progress(),
+            )
             self._abandoned = True
             x.cancel.set()
         return ok
+
+    def progress(self) -> str:
+        """Where a generation stands, for the logs of a timed-out or abandoned
+        one: device-to-host copies, the exchange's sends and receives, the
+        arrivals applied and the host-to-device copies."""
+        x = self._x
+        tables = self._tables.values()
+        alive = self._thread is not None and self._thread.is_alive()
+        marks = ", ".join(f"{k} {v:.2f}" for k, v in sorted(self._marks.items()))
+        return (
+            f"gen {self._gen} phase {self._phase} pumps {self._pumps}"
+            f" | d2h slabs {self._out_expected - len(self._out_todo)}"
+            f"/{self._out_expected} issued, {len(self._out_inflight)} in flight"
+            f" | tables {sum(t['future'] is not None for t in tables)}"
+            f"/{len(self._tables)} issued, {sum(t['ready'] for t in tables)} landed"
+            f" | handed {self._out_sent}/{self._out_expected}, queue"
+            f" {x.send_q.qsize()}, sends {x.sends_done}/{x.sends_posted} done,"
+            f" closed {x.sends_closed.is_set()}"
+            f" | recvs {x.recvs_done}/{x.recvs_posted} done, applied"
+            f" {self._in_received}/{len(self._incoming)}, rows waiting"
+            f" {len(self._rows_waiting)}"
+            f" | h2d {len(self._h2d_todo)} queued, {len(self._h2d_inflight)} in flight"
+            f" | thread {'alive' if alive else 'gone'}, done {x.done.is_set()},"
+            f" error {x.error!r}"
+            f" | host allocs {getattr(self.transport, 'allocs', 0)} in"
+            f" {getattr(self.transport, 'alloc_s', 0.0):.2f} s"
+            f" | marks {marks}"
+        )
 
     def _drained(self) -> bool:
         return (
@@ -941,6 +989,7 @@ class SlabMover:
                         ),
                     )
                 )
+            x.recvs_posted = len(recvs)
             sends = []
             idle_since = None
             while True:
@@ -956,17 +1005,23 @@ class SlabMover:
                         move_tag(m.group, m.layer, m.dst_slot, part, x.generation),
                         payload,
                     )
+                    x.sends_posted += 1
                     if h is not None:
                         sends.append(h)
+                    else:
+                        x.sends_done += 1
                 pending = []
                 for i, h in recvs:
                     if h.is_completed():
+                        x.recvs_done += 1
                         x.recv_q.put(i)
                         idle_since = None
                     else:
                         pending.append((i, h))
                 recvs = pending
-                sends = [h for h in sends if not h.is_completed()]
+                still = [h for h in sends if not h.is_completed()]
+                x.sends_done += len(sends) - len(still)
+                sends = still
                 if (
                     x.sends_closed.is_set()
                     and x.send_q.empty()
@@ -982,6 +1037,7 @@ class SlabMover:
                     elif time.monotonic() - idle_since > 1.0:
                         i, h = recvs[0]
                         h.wait()
+                        x.recvs_done += 1
                         x.recv_q.put(i)
                         recvs = recvs[1:]
                         idle_since = None

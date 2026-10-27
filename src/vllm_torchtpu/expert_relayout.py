@@ -824,6 +824,14 @@ class Controller:
         self.stats["aborted"] += 1
         self._watchdog(False)
         how = ""
+        progress = getattr(self.mover, "progress", None)
+        if progress is not None and self.state == STAGING:
+            logger.warning(
+                "expert relayout | step %d: generation %d at the drop: %s",
+                step,
+                self.pending.generation,
+                progress(),
+            )
         drainer = getattr(self.mover, "drain", None)
         if drain and drainer is not None:
             t0 = time.monotonic()

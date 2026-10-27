@@ -238,6 +238,10 @@ def test_a_drain_the_peer_never_joins_is_abandoned_and_keeps_its_buffers():
     mover.pump()
     # Rank 1 never runs: its payload for rank 0 never comes.
     assert mover.drain(0.2) is False
+    report = mover.progress()
+    # Everything this rank sends went out; nothing it waits for arrived.
+    assert "recvs 0/4 done" in report and "d2h slabs 4/4 issued" in report
+    assert "done False" in report
     mover.cancel()
     mover.settle(0)
     assert transport.released == 0  # a copy might still land in them
