@@ -48,6 +48,7 @@ def _fused_kernel(
     comb_out_ref,
     mix_scr,
     fn_stack_ref,
+    weights_scr,
     *dma_scratch,
     hc_mult,
     hidden_size,
@@ -128,17 +129,14 @@ def _fused_kernel(
     acc = utils.dot_stacked_chunks(g_bf, fn_stack_ref[...], hb_ref.shape[1])
     # The squared sum rides on the otherwise idle MXU instead of the VPU.
     sqr = utils.sqrsum_on_mxu(g_bf, new_blk[...])
-    # The collapse re-reads the stored streams: holding the packed GEMM
-    # operand live past both dots would spill ~3 MiB more scoped VMEM.
-    gf = new_blk[...].astype(jnp.float32)
 
     m = hc_mult
     mixes = acc * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
     pre_mix = jax.nn.sigmoid(mixes[:, :m] * sc_ref[0, 0] + hb_ref[:, :m]) + hc_pre_eps
-    lay = pre_mix[:, 0:1] * gf[:, :h]
-    for k in range(1, m):
-        lay = lay + pre_mix[:, k : k + 1] * gf[:, k * h : (k + 1) * h]
-    layer_ref[...] = lay.astype(jnp.bfloat16)
+    # The collapse re-reads the stored streams: holding the packed GEMM
+    # operand live past both dots would spill ~3 MiB more scoped VMEM.
+    weights_scr[...] = utils.replicate_lanes(pre_mix)
+    utils.collapse_rows(new_blk, weights_scr, layer_ref, hc_mult=m)
 
     utils.stage_mixes_and_gates(
         mixes,
@@ -264,6 +262,7 @@ def fused_post_pre_2d(
     scratch_shapes = [
         pltpu.VMEM((hc_mult3, group), jnp.float32),
         pltpu.VMEM((n_chunks * hc_mult3, hc_hidden), jnp.bfloat16),
+        pltpu.VMEM((tb, hc_mult * 128), jnp.float32),
     ]
     # A one-block grid has no neighbour to overlap with (decode, where XLA
     # also tends to keep the streams in VMEM), so it keeps the pipelined

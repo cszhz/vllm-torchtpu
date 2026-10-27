@@ -35,6 +35,11 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 # 1 x 1258 bundles per call vs 4 x 1134 for the sublane-slab epilogue at 256).
 GATE_GROUP_TOKENS = 1024
 
+# Token rows per step of the collapse loop (``collapse_rows``): one step's
+# streams fit in vregs, where a whole-block collapse in one basic block is
+# scheduled loads-first and spills them.
+COLLAPSE_LOOP_ROWS = 16
+
 
 def round_up(x: int, multiple: int) -> int:
     return (x + multiple - 1) // multiple * multiple
@@ -308,3 +313,35 @@ def stage_mixes_and_gates(
             rows = pl.ds(b * lanes, lanes)
             post_out_ref[rows, :] = jnp.concatenate([q[b : b + 1] for q in post], 0).T
             comb_out_ref[rows, :] = jnp.concatenate([q[b : b + 1] for q in comb], 0).T
+
+
+def replicate_lanes(cols: jax.Array) -> jax.Array:
+    """(rows, n) -> (rows, n * 128): column k repeated over lane tile k."""
+    rows, n = cols.shape
+    return jnp.concatenate(
+        [jnp.broadcast_to(cols[:, k : k + 1], (rows, 128)) for k in range(n)], axis=1
+    )
+
+
+def collapse_rows(streams_ref, weights_ref, out_ref, *, hc_mult: int) -> None:
+    """out = sum_k w_k * streams[:, k*h:(k+1)*h] in f32, k left to right.
+
+    ``weights_ref`` holds ``replicate_lanes(w)``, so each weight is a plain
+    vreg load in the loop rather than a lane broadcast.
+    """
+    tb, h = out_ref.shape
+    rows = min(COLLAPSE_LOOP_ROWS, tb)
+    assert tb % rows == 0, (tb, rows)
+
+    def body(t, carry):
+        r = pl.ds(pl.multiple_of(t * rows, rows), rows)
+        w = [weights_ref[r, k * 128 : (k + 1) * 128] for k in range(hc_mult)]
+        for c in range(0, h, 128):
+            lay = w[0] * streams_ref[r, c : c + 128].astype(jnp.float32)
+            for k in range(1, hc_mult):
+                g = streams_ref[r, k * h + c : k * h + c + 128].astype(jnp.float32)
+                lay = lay + w[k] * g
+            out_ref[r, c : c + 128] = lay.astype(out_ref.dtype)
+        return carry
+
+    jax.lax.fori_loop(0, tb // rows, body, 0)
