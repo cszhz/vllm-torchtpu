@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Analytical TPU serving roofline, step floor, solver, registry, and bucket scorer."""
+"""Analytical TPU serving roofline, solver, bucket regimes, and engine flag emitter."""
 
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ from .collectives import (
     submesh_for_group,
     torus_collective_s,
 )
+from .emit import emit_cdk_ceiling_rows, emit_engine_args
 from .geometry import LAYER_FAMILIES, ModelGeometry, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import (
@@ -102,6 +103,8 @@ __all__ = [
     "build_scenario",
     "default_envs_path",
     "dtypes_from_hf_config",
+    "emit_cdk_ceiling_rows",
+    "emit_engine_args",
     "env_keys",
     "ep_busiest_experts",
     "experts_touched",

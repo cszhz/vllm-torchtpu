@@ -11,16 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CLI entrypoint for solve, plan, and explain subcommands."""
+"""CLI entrypoint for solve, buckets, emit, ceiling, plan, and explain."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+from collections.abc import Sequence
 from dataclasses import asdict, replace
 
-from .chips import CHIPS
+from .buckets import recommend_bucket_regimes
+from .chips import CHIPS, TOPOLOGIES
+from .emit import emit_cdk_ceiling_rows, emit_engine_args
 from .geometry import from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import Dtypes, Parallel, StepShape
@@ -37,6 +40,14 @@ _EXPERT_BYTES: dict[str, float] = {
 }
 _KV_BYTES: dict[str, float] = {"bf16": 2.0, "fp8": 1.0}
 _STATE_BYTES: dict[str, float] = {"fp32": 4.0, "bf16": 2.0}
+
+
+def _explicit_flags(argv: Sequence[str]) -> set[str]:
+    out: set[str] = set()
+    for tok in argv:
+        if tok.startswith("--"):
+            out.add(tok.split("=", 1)[0])
+    return out
 
 
 def _add_model_source(p: argparse.ArgumentParser) -> None:
@@ -96,14 +107,58 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--json", action="store_true")
 
 
+def _topology_for_cores(cores: int) -> str | None:
+    for name, topo in TOPOLOGIES.items():
+        if topo.num_cores == cores:
+            return name
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the roofline CLI subcommand."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    explicit = _explicit_flags(raw_argv)
     parser = argparse.ArgumentParser(prog="python -m vllm_torchtpu.roofline")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_solve = sub.add_parser("solve")
     _add_scenario_args(p_solve)
+
+    p_buck = sub.add_parser("buckets")
+    _add_model_source(p_buck)
+    p_buck.add_argument("--chip", default="tpu7x", choices=sorted(CHIPS))
+    p_buck.add_argument("--topology", default=None, choices=sorted(TOPOLOGIES))
+    p_buck.add_argument("--tp", type=int, default=8)
+    p_buck.add_argument("--ep", type=int, default=None)
+    p_buck.add_argument("--moe", default="ep", choices=("tp_slice", "ep"))
+    p_buck.add_argument(
+        "--scenario", default="chat-8k1k", choices=sorted(SCENARIO_PRESETS)
+    )
+    p_buck.add_argument("--context", type=int, default=8192)
+    p_buck.add_argument("--spec-window", type=int, default=0)
+    p_buck.add_argument("--acceptance-length", type=float, default=None)
+    p_buck.add_argument("--max-num-batched-tokens", type=int, default=None)
+    p_buck.add_argument("--buckets", default=None)
+    p_buck.add_argument("--bucket-override", default=None)
+    p_buck.add_argument("--engine", default="vllm", choices=("vllm", "sglang"))
+    p_buck.add_argument("--json", action="store_true")
+
+    p_emit = sub.add_parser("emit")
+    _add_scenario_args(p_emit)
+    p_emit.add_argument("--engine", default="vllm", choices=("vllm", "sglang"))
+    p_emit.add_argument("--bucket-override", default=None)
+    p_emit.add_argument("--target-envs", default=None)
+    p_emit.add_argument("--strict", action="store_true")
+    p_emit.add_argument("--topology", default=None, choices=sorted(TOPOLOGIES))
+    p_emit.add_argument("--tp", type=int, default=None)
+    p_emit.add_argument("--ep", type=int, default=None)
+    p_emit.add_argument("--moe", default=None, choices=("tp_slice", "ep"))
+    p_emit.add_argument("--spec-window", type=int, default=0)
+    p_emit.add_argument("--acceptance-length", type=float, default=None)
+    p_emit.add_argument("--max-num-batched-tokens", type=int, default=None)
+
+    p_ceil = sub.add_parser("ceiling")
+    _add_scenario_args(p_ceil)
 
     p_plan = sub.add_parser("plan")
     _add_common_args(p_plan)
@@ -123,11 +178,16 @@ def main(argv: list[str] | None = None) -> int:
     geom = from_hf_config(cfg)
     chip = CHIPS[args.chip]
 
-    if args.cmd == "solve":
+    if args.cmd in ("solve", "emit", "ceiling"):
         concs = (
             tuple(int(x) for x in args.concurrency.split(",") if x.strip())
             if args.concurrency
             else None
+        )
+        eff_accept = (
+            args.acceptance_length
+            if (args.cmd == "emit" and args.acceptance_length is not None)
+            else args.accept_len
         )
         scen = build_scenario(
             args.scenario,
@@ -135,38 +195,196 @@ def main(argv: list[str] | None = None) -> int:
             osl=args.osl,
             concurrencies=concs,
             prefix_hit_rate=args.prefix_hit_rate,
-            accept_len=args.accept_len,
+            accept_len=eff_accept,
             slo_tier=args.slo_tier,
             ttft_slo_ms=args.ttft_slo_ms,
             tpot_slo_ms=args.tpot_slo_ms,
         )
         dt_auto = dtypes_from_hf_config(cfg)
+        max_chips = args.max_chips
+        if max_chips is None and args.cmd == "emit" and args.topology is not None:
+            max_chips = TOPOLOGIES[args.topology].num_cores // 2
         splan = solve_serving_plan(
-            geom, dt_auto, chip, scen, mode=args.mode, max_chips=args.max_chips
+            geom, dt_auto, chip, scen, mode=args.mode, max_chips=max_chips
+        )
+        if args.cmd == "solve":
+            if args.json:
+                sys.stdout.write(json.dumps(asdict(splan)) + "\n")
+                return 0
+            for w in splan.warnings:
+                sys.stdout.write(f"WARNING: {w}\n")
+            sys.stdout.write(
+                f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pools':<24}  "
+                f"{'p90_int_tok_s':>13}  {'tok_tput_chip':>13}  {'p90_ttft_ms':>11}  "
+                f"{'p90_tpot_ms':>11}\n"
+            )
+            for pt in splan.frontier:
+                if pt.prefill_pool is not None:
+                    pools = (
+                        f"{pt.prefill_pool.instances}x{pt.prefill_pool.topology}P+"
+                        f"{pt.decode_pool.instances}x{pt.decode_pool.topology}D"
+                    )
+                else:
+                    pools = f"1x{pt.decode_pool.topology}(TP{pt.decode_pool.tp})"
+                sys.stdout.write(
+                    f"{pt.mode:<7}  {pt.concurrency:>5}  {pt.total_chips:>5}  "
+                    f"{pools:<24}  {pt.p90_interactivity_tok_s:>13.2f}  "
+                    f"{pt.token_throughput_per_chip:>13.1f}  "
+                    f"{pt.p90_ttft_ms:>11.1f}  {pt.p90_tpot_ms:>11.2f}\n"
+                )
+            return 0
+
+        if args.cmd == "ceiling":
+            rows_ceil = emit_cdk_ceiling_rows(splan)
+            if args.json:
+                sys.stdout.write(json.dumps(rows_ceil) + "\n")
+                return 0
+            for rc_row in rows_ceil:
+                sys.stdout.write(json.dumps(rc_row) + "\n")
+            return 0
+
+        rec = splan.recommended
+        if args.tp is not None or args.ep is not None or args.topology is not None:
+            tp_e = (
+                args.tp if args.tp is not None else (rec.decode_pool.tp if rec else 8)
+            )
+            moe_e = (
+                args.moe
+                if args.moe is not None
+                else ("ep" if geom.num_experts > 0 else "tp_slice")
+            )
+            ep_e = args.ep if args.ep is not None else (tp_e if moe_e == "ep" else 1)
+            topo_name_e = (
+                args.topology
+                or (rec.decode_pool.topology if rec else None)
+                or _topology_for_cores(max(tp_e, ep_e))
+            )
+            topo_emit = TOPOLOGIES.get(topo_name_e) if topo_name_e is not None else None
+            dp_e = (
+                max(1, ep_e // max(1, tp_e)) if (moe_e == "ep" and ep_e > tp_e) else 1
+            )
+            par_emit = Parallel(
+                tp=tp_e,
+                dp=dp_e,
+                ep=ep_e,
+                moe=moe_e,
+                moe_dispatch=(
+                    "ag_ep"
+                    if (moe_e == "ep" and (dp_e > 1 or ep_e >= 16))
+                    else "allreduce"
+                ),
+            )
+        elif rec is not None:
+            d_pool = rec.decode_pool
+            topo_emit = TOPOLOGIES.get(d_pool.topology)
+            par_emit = Parallel(
+                tp=d_pool.tp,
+                dp=d_pool.dp,
+                ep=d_pool.ep,
+                pp=d_pool.pp,
+                pcp=d_pool.pcp,
+                kv_split=d_pool.kv_split,
+                moe="ep" if d_pool.ep > 1 else "tp_slice",
+                moe_dispatch=(
+                    "ag_ep"
+                    if (d_pool.ep > 1 and (d_pool.dp > 1 or d_pool.ep >= 16))
+                    else "allreduce"
+                ),
+                mesh_axes=d_pool.mesh_axes,
+            )
+        else:
+            topo_emit = TOPOLOGIES["2x2x1"]
+            par_emit = Parallel(
+                tp=8,
+                moe="ep" if geom.num_experts > 0 else "tp_slice",
+                ep=8 if geom.num_experts > 0 else 1,
+            )
+        bplan_emit = recommend_bucket_regimes(
+            geom,
+            dt_auto,
+            chip,
+            topo_emit,
+            par_emit,
+            context=scen.isl,
+            overrides=args.bucket_override,
+            engine=args.engine,
+            scenario=scen,
+            spec_window=args.spec_window,
+            acceptance_length=args.acceptance_length,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+        )
+        emitted = emit_engine_args(
+            splan,
+            bplan_emit,
+            engine=args.engine,
+            dtypes=dt_auto,
+            target_envs=args.target_envs,
+        )
+        if args.strict and emitted["refused_flags"]:
+            sys.stderr.write(
+                f"Refused flags absent from target envs: {emitted['refused_flags']}\n"
+            )
+            return 1
+        if args.json:
+            sys.stdout.write(json.dumps(emitted) + "\n")
+            return 0
+        env_prefix = " ".join(f"{k}={v}" for k, v in emitted["env"].items())
+        cli_joined = " ".join(emitted["cli_args"])
+        sys.stdout.write(f"{env_prefix} {args.engine} {cli_joined}\n")
+        return 0
+
+    if args.cmd == "buckets":
+        dt_b = dtypes_from_hf_config(cfg)
+        ep_b = args.ep if args.ep is not None else (args.tp if args.moe == "ep" else 1)
+        topo_name = args.topology or _topology_for_cores(max(args.tp, ep_b))
+        topo_b = TOPOLOGIES.get(topo_name) if topo_name is not None else None
+        dp_b = (
+            max(1, ep_b // max(1, args.tp))
+            if (args.moe == "ep" and ep_b > args.tp)
+            else 1
+        )
+        par_b = Parallel(
+            tp=args.tp,
+            dp=dp_b,
+            moe=args.moe,
+            ep=ep_b,
+            moe_dispatch="ag_ep"
+            if (args.moe == "ep" and (dp_b > 1 or ep_b >= 16))
+            else "allreduce",
+        )
+        b_list = (
+            [int(x) for x in args.buckets.split(",") if x.strip()]
+            if args.buckets
+            else None
+        )
+        scen_b = (
+            build_scenario(args.scenario, accept_len=args.acceptance_length)
+            if "--scenario" in explicit
+            else None
+        )
+        bplan = recommend_bucket_regimes(
+            geom,
+            dt_b,
+            chip,
+            topo_b,
+            par_b,
+            buckets=b_list,
+            context=args.context,
+            overrides=args.bucket_override,
+            engine=args.engine,
+            scenario=scen_b,
+            spec_window=args.spec_window,
+            acceptance_length=args.acceptance_length,
+            max_num_batched_tokens=args.max_num_batched_tokens,
         )
         if args.json:
-            sys.stdout.write(json.dumps(asdict(splan)) + "\n")
+            sys.stdout.write(json.dumps(asdict(bplan)) + "\n")
             return 0
-        for w in splan.warnings:
-            sys.stdout.write(f"WARNING: {w}\n")
-        sys.stdout.write(
-            f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pools':<24}  "
-            f"{'p90_int_tok_s':>13}  {'tok_tput_chip':>13}  {'p90_ttft_ms':>11}  "
-            f"{'p90_tpot_ms':>11}\n"
-        )
-        for pt in splan.frontier:
-            if pt.prefill_pool is not None:
-                pools = (
-                    f"{pt.prefill_pool.instances}x{pt.prefill_pool.topology}P+"
-                    f"{pt.decode_pool.instances}x{pt.decode_pool.topology}D"
-                )
-            else:
-                pools = f"1x{pt.decode_pool.topology}(TP{pt.decode_pool.tp})"
+        for band in bplan.bands:
             sys.stdout.write(
-                f"{pt.mode:<7}  {pt.concurrency:>5}  {pt.total_chips:>5}  "
-                f"{pools:<24}  {pt.p90_interactivity_tok_s:>13.2f}  "
-                f"{pt.token_throughput_per_chip:>13.1f}  "
-                f"{pt.p90_ttft_ms:>11.1f}  {pt.p90_tpot_ms:>11.2f}\n"
+                f"{band.min_tokens}..{band.max_tokens}: residual={band.residual} "
+                f"dispatch={band.moe_dispatch} mk={int(band.megakernel)} "
+                f"({band.source})\n"
             )
         return 0
 
