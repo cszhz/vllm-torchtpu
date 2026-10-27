@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Callable
 from typing import cast
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 
 # bf16 tiles are (16, 128); keep token blocks sublane-aligned.
 SUBLANE = 16
@@ -25,6 +27,12 @@ SUBLANE = 16
 # fused_moe use the same constant). Never rely on the backend default —
 # it varies by Mosaic version.
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+
+# Tokens whose post/comb gates the kernels' epilogue computes together,
+# tokens on lanes. Wider groups amortize the epilogue's serial Sinkhorn
+# chain over more lanes (deviceless tpu7x LLO at T=1024: 8x565 bundles
+# per call at 128, 4x972 at 256).
+GATE_GROUP_TOKENS = 256
 
 
 def round_up(x: int, multiple: int) -> int:
@@ -103,7 +111,8 @@ def mhc_pre_gates(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Gating / softmax / Sinkhorn on the tiny (T, hc_mult3) mix logits.
 
-    Shared by the Pallas ``pre_kernel`` and the fused seam op.
+    The XLA reference for the gates the kernels compute in-block
+    (``gate_epilogue``).
     Returns (pre_mix (T, M), post_mix (T, M), comb_mix (T, M, M)).
     """
     num_tokens = mixes.shape[0]
@@ -131,3 +140,82 @@ def mhc_pre_gates(
             jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps
         )
     return pre_mix, post_mix, comb_mix
+
+
+def gate_group_blocks(num_blocks: int, token_block: int) -> int:
+    """Grid blocks per gate group; divides ``num_blocks`` so groups tile the grid."""
+    return math.gcd(num_blocks, max(1, GATE_GROUP_TOKENS // token_block))
+
+
+def gate_epilogue(
+    mixes_t: jax.Array,
+    sc_ref,
+    hbt_ref,
+    *,
+    hc_mult: int,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[jax.Array, jax.Array]:
+    """In-kernel post/comb half of ``mhc_pre_gates``, tokens on lanes.
+
+    ``mixes_t`` is (hc_mult3, G): the RMS-scaled mixes, one token per lane.
+    ``sc_ref`` is the (1, 3) hc_scale block, ``hbt_ref`` the (hc_mult3, 1)
+    hc_base column. Same op order as ``mhc_pre_gates``; comb row ``i`` is
+    the (hc_mult, G) slab of rows ``i * hc_mult + j``, so the softmax and
+    row sums run down sublanes and the column sums add the slabs.
+
+    Returns post (hc_mult, G) and comb (hc_mult * hc_mult, G), row-major (i, j).
+    """
+    m = hc_mult
+    post_logits = mixes_t[m : 2 * m] * sc_ref[0, 1] + hbt_ref[m : 2 * m]
+    post = jax.nn.sigmoid(post_logits) * hc_post_mult_value
+
+    rows = []
+    for i in range(m):
+        lo = 2 * m + i * m
+        logits = mixes_t[lo : lo + m] * sc_ref[0, 2] + hbt_ref[lo : lo + m]
+        rows.append(jax.nn.softmax(logits, axis=0) + hc_sinkhorn_eps)
+
+    def col_norm(rows):
+        col = rows[0]
+        for r in rows[1:]:
+            col = col + r
+        col = col + hc_sinkhorn_eps
+        return [r / col for r in rows]
+
+    def row_norm(rows):
+        return [r / (jnp.sum(r, axis=0, keepdims=True) + hc_sinkhorn_eps) for r in rows]
+
+    rows = col_norm(rows)
+    for _ in range(sinkhorn_repeat - 1):
+        rows = col_norm(row_norm(rows))
+    return post, jnp.concatenate(rows, axis=0)
+
+
+def stage_mixes_and_gates(
+    mixes: jax.Array,
+    mix_scr,
+    post_out_ref,
+    comb_out_ref,
+    sc_ref,
+    hbt_ref,
+    *,
+    gate_blocks: int,
+    **gate_kwargs,
+) -> None:
+    """Stage this block's scaled mixes; the group's last block writes its gates.
+
+    ``mix_scr`` is a (G, hc_mult3) f32 scratch, G = gate_blocks * tb; the
+    gate outputs are (G, hc_mult) / (G, hc_mult * hc_mult) blocks indexed
+    by group, so they are written back once per group.
+    """
+    tb = mixes.shape[0]
+    j = pl.program_id(0) % gate_blocks
+    mix_scr[pl.ds(pl.multiple_of(j * tb, tb), tb), :] = mixes
+
+    @pl.when(j == gate_blocks - 1)
+    def _():
+        post, comb = gate_epilogue(mix_scr[...].T, sc_ref, hbt_ref, **gate_kwargs)
+        post_out_ref[...] = post.T
+        comb_out_ref[...] = comb.T
