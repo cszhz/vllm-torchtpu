@@ -11,6 +11,12 @@ import pytest
 
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_candidate_cache import (
     candidate_membership,
+    prepare_candidates,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
+    PackedFP8Layout,
+    read_fp8_records,
+    write_fp8_records,
 )
 
 
@@ -42,3 +48,52 @@ def test_candidate_membership_matches_per_query_set(rows, count, columns, blocks
     # Reuse the same executable with changed data: no stale per-row histogram.
     actual = run(jnp.full_like(candidates, -1), jnp.asarray(canonical))
     assert not np.any(np.asarray(actual))
+
+
+@pytest.mark.parametrize("owners", [[0], [0, 0], [0, 0, 0], [1, 0, 1, -1, 0, 1, 2]])
+@pytest.mark.parametrize("page_size", [8, 128])
+def test_prepared_keys_and_membership_keep_original_token_mapping(owners, page_size):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Exercises real SparseCore metadata and DMA")
+    width, block = 64, 16
+    requests = max(owners) + 1
+    pages_per_request = (width + page_size - 1) // page_size
+    layout = PackedFP8Layout(requests * pages_per_request, page_size=page_size)
+    rng = np.random.default_rng(192)
+    pages = jnp.asarray(rng.permutation(layout.pages).reshape(requests, -1))
+    pool = jnp.zeros((layout.pages * layout.page_rows, 128), jnp.int32)
+    banks = tuple(jnp.split(pool, 2)) if page_size == 8 else (pool,)
+    keys = jnp.asarray(rng.normal(size=(layout.pages * page_size, 128)), jnp.bfloat16)
+    banks = write_fp8_records(banks, jnp.arange(keys.shape[0]), keys, layout)
+    patterns = np.array([[0, 2, 2], [1, 3, -1], [2, 0, 99], [-1, -1, -1]], np.int32)
+    candidates = jnp.asarray(patterns[np.arange(len(owners)) % len(patterns)])
+    prepared = jax.jit(
+        functools.partial(prepare_candidates, layout=layout, block=block, width=width)
+    )(banks, pages, candidates, jnp.asarray(owners))
+    offsets = np.asarray(prepared.offsets)
+    compact_layout = PackedFP8Layout(prepared.keys.shape[0] // 33)
+    for row, original in enumerate(np.asarray(prepared.order)):
+        canonical = np.asarray(prepared.block_ids[row])
+        expected_ids = set(np.asarray(candidates[original])) & set(
+            range(width // block)
+        )
+        if owners[original] < 0:
+            expected_ids = set()
+        assert set(canonical[np.asarray(prepared.membership[row])]) == expected_ids
+        group = np.searchsorted(offsets[1:], row, side="right")
+        live = np.flatnonzero(canonical >= 0)
+        if not len(live):
+            continue
+        compact = (live[:, None] * block + np.arange(block)).reshape(-1)
+        compact_records = prepared.pages[group, compact // 128] * 128 + compact % 128
+        logical = (canonical[live, None] * block + np.arange(block)).reshape(-1)
+        records = (
+            pages[owners[original], logical // page_size] * page_size
+            + logical % page_size
+        )
+        np.testing.assert_array_equal(
+            np.asarray(
+                read_fp8_records((prepared.keys,), compact_records, compact_layout)
+            ),
+            np.asarray(read_fp8_records(banks, records, layout)),
+        )
