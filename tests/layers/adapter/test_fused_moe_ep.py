@@ -20,14 +20,18 @@ op is built, and the one path that does build stops at `_build_op`.
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from jax.sharding import Mesh
 
 import vllm_torchtpu.envs as envs
+import vllm_torchtpu.layers.core.fused_moe_gmm as gmm_mod
+from vllm_torchtpu.kernels.fused_moe import v2
 from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
 from vllm_torchtpu.layers.adapter import fused_moe_ep as bridge
 from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
@@ -1208,3 +1212,213 @@ def test_fused_scale_buffers_are_fresh_bases_aliased_by_the_parameters():
         assert buf in dict(layer.named_buffers())
         assert isinstance(weight, torch.nn.Parameter) and not weight.requires_grad
         assert weight.shape == ref.shape and weight.data_ptr() == table.data_ptr()
+
+
+def test_step_min_tokens_default_keeps_fused_ep(monkeypatch, caplog):
+    """Unset or 0 TPU_MOE_FUSED_EP_STEP_MIN_TOKENS keeps fused EP on every step."""
+    monkeypatch.delenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", raising=False)
+    assert envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS == 0
+
+    seen_min_step: list[int | None] = []
+    assert (
+        _prebuild(
+            _layer(),
+            build_op=lambda *_a, **kw: (
+                seen_min_step.append(kw.get("min_step_tokens")) or "op"
+            ),
+        )
+        == "op"
+    )
+    assert seen_min_step == [0]
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    closures = []
+
+    def build_op_stub(_name, fn, **_kwargs):
+        closures.append(fn)
+        return Mock()
+
+    monkeypatch.setattr(bridge, "jax_op", build_op_stub)
+    fep_spy = Mock(side_effect=lambda x, *_a, **_kw: x)
+    gmm_spy = Mock(side_effect=lambda x, *_a, **_kw: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", fep_spy)
+    monkeypatch.setattr(bridge, "_gmm_ep_fallback", gmm_spy)
+
+    mesh = SimpleNamespace(shape={bridge.EP_AXIS_NAME: 8})
+    bridge._build_op(
+        mesh,
+        2,
+        True,
+        "silu",
+        (0, 1, 2, 3, 4, 5, 6, 7),
+        False,
+        token_replica_groups=((0, 1, 2, 3, 4, 5, 6, 7),),
+        min_step_tokens=0,
+    )
+    fn = closures[0]
+    # 1 per-rank token across ep=8 shards -> global x.shape[0] = 8.
+    x_one = jnp.ones((8, 16), dtype=jnp.bfloat16)
+    g_one = jnp.zeros((8, 16), dtype=jnp.bfloat16)
+    rank = jnp.zeros((8, 1), dtype=jnp.int32)
+    with caplog.at_level("INFO"):
+        assert fn(x_one, None, None, None, None, g_one, rank) is x_one
+    assert fep_spy.call_count == 1
+    assert gmm_spy.call_count == 0
+    assert "fused_moe_ep step path | tokens=1 path=fused" in caplog.text
+
+
+def test_step_min_tokens_routes_small_bucket_to_gmm(monkeypatch, caplog):
+    """Steps with x.shape[0] // ep < min_step_tokens take _gmm_ep_fallback."""
+    orig_gmm_ep_fallback = bridge._gmm_ep_fallback
+    monkeypatch.setenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "33")
+    assert envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS == 33
+
+    seen_min_step: list[int | None] = []
+    assert (
+        _prebuild(
+            _layer(),
+            build_op=lambda *_a, **kw: (
+                seen_min_step.append(kw.get("min_step_tokens")) or "op"
+            ),
+        )
+        == "op"
+    )
+    assert seen_min_step == [33]
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    closures = []
+
+    def build_op_stub(_name, fn, **_kwargs):
+        closures.append(fn)
+        return Mock()
+
+    monkeypatch.setattr(bridge, "jax_op", build_op_stub)
+    fep_spy = Mock(side_effect=lambda x, *_a, **_kw: x)
+    gmm_spy = Mock(side_effect=lambda x, *_a, **_kw: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", fep_spy)
+    monkeypatch.setattr(bridge, "_gmm_ep_fallback", gmm_spy)
+
+    mesh = SimpleNamespace(shape={bridge.EP_AXIS_NAME: 8})
+    bridge._build_op(
+        mesh,
+        2,
+        True,
+        "silu",
+        (0, 1, 4, 5, 6, 7, 2, 3),
+        False,
+        token_replica_groups=((0, 1, 2, 3, 4, 5, 6, 7),),
+        min_step_tokens=33,
+    )
+    assert len(closures) == 1
+    fn = closures[0]
+
+    # Small bucket: 32 per-rank tokens * ep=8 -> x.shape[0]=256,
+    # step_tokens=32 < 33 -> gmm
+    x_small = jnp.ones((8 * 32, 16), dtype=jnp.bfloat16)
+    g_small = jnp.zeros((8 * 32, 16), dtype=jnp.bfloat16)
+    rank = jnp.zeros((8, 1), dtype=jnp.int32)
+    with caplog.at_level("INFO"):
+        assert fn(x_small, None, None, None, None, g_small, rank) is x_small
+    assert gmm_spy.call_count == 1
+    assert fep_spy.call_count == 0
+    assert gmm_spy.call_args.kwargs["mesh_expert_order"] == (
+        0,
+        1,
+        4,
+        5,
+        6,
+        7,
+        2,
+        3,
+    )
+    assert "fused_moe_ep step path | tokens=32 path=gmm" in caplog.text
+
+    # Large bucket on the same closure: 64 per-rank tokens * ep=8 ->
+    # step_tokens=64 >= 33 -> fused
+    x_large = jnp.ones((8 * 64, 16), dtype=jnp.bfloat16)
+    g_large = jnp.zeros((8 * 64, 16), dtype=jnp.bfloat16)
+    with caplog.at_level("INFO"):
+        assert fn(x_large, None, None, None, None, g_large, rank) is x_large
+    assert gmm_spy.call_count == 1
+    assert fep_spy.call_count == 1
+    assert "fused_moe_ep step path | tokens=64 path=fused" in caplog.text
+
+    # Verify _gmm_ep_fallback numerical execution on CPU with NaN padding
+    # and -inf non-rank rows.
+    monkeypatch.setattr(bridge, "_gmm_ep_fallback", orig_gmm_ep_fallback)
+    devs = np.array(jax.devices("cpu")[:1])
+    cpu_mesh = Mesh(devs, (bridge.EP_AXIS_NAME,))
+    called_gmm = []
+    called_starts = []
+
+    def fake_fused_moe_func(
+        hidden_states,
+        _w1,
+        _w2,
+        w1_scale,
+        w2_scale,
+        _w1_bias,
+        _w2_bias,
+        topk_weights,
+        topk_ids,
+        experts_start=None,
+        **kw,
+    ):
+        jax.debug.callback(
+            lambda v: called_starts.append(int(np.asarray(v).flat[0])),
+            experts_start,
+        )
+        called_gmm.append(
+            (
+                hidden_states,
+                w1_scale.shape,
+                w2_scale.shape,
+                topk_weights,
+                topk_ids,
+                kw,
+            )
+        )
+        return hidden_states * jnp.sum(topk_weights, axis=-1, keepdims=True)
+
+    monkeypatch.setattr(gmm_mod, "fused_moe_func", fake_fused_moe_func)
+    x_in = jnp.ones((4, 8), dtype=jnp.bfloat16)
+    g_in = jnp.array(
+        [
+            [1.0, 2.0, 0.5, -1.0],
+            [0.5, 1.5, 2.5, -0.5],
+            [jnp.nan, jnp.nan, jnp.nan, jnp.nan],
+            [float("-inf"), float("-inf"), float("-inf"), float("-inf")],
+        ],
+        dtype=jnp.float32,
+    )
+    w1 = jnp.ones((4, 8, 16), dtype=jnp.float8_e4m3fn)
+    w2 = jnp.ones((4, 8, 8), dtype=jnp.float8_e4m3fn)
+    s1 = jnp.ones((4, 16), dtype=jnp.float32)
+    s2 = jnp.ones((4, 8), dtype=jnp.float32)
+    out = bridge._gmm_ep_fallback(
+        x_in,
+        w1,
+        w2,
+        s1,
+        s2,
+        g_in,
+        jnp.array([[0]], dtype=jnp.int32),
+        mesh=cpu_mesh,
+        topk=2,
+        renormalize=True,
+        activation="silu",
+        scoring_fn="softmax",
+        routed_scaling_factor=1.0,
+        mesh_expert_order=(3,),
+        token_replica_groups=((0,),),
+        use_sparse_core=False,
+        onehot_threshold=0,
+    )
+    assert out.shape == (4, 8)
+    assert bool(jnp.all(jnp.isfinite(out)))
+    assert float(jnp.abs(out[2]).max()) == 0.0
+    assert float(jnp.abs(out[3]).max()) == 0.0
+    assert called_gmm[0][1] == (4, 1, 1, 16)
+    assert called_gmm[0][2] == (4, 1, 1, 8)
+    assert called_starts == [3 * 4]
+    assert called_gmm[0][5]["skip_padded_tokens"] is True

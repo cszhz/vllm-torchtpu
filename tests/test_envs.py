@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from vllm.config import CacheConfig, VllmConfig
 
+import vllm_torchtpu.envs as tpu_envs
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 REMOVED = "USE_MOE_EP_KERNEL"
@@ -64,5 +65,19 @@ def test_startup_accepts_the_knob_unset(
     mock_prepare_env, mock_apply_patches, monkeypatch, vllm_config
 ):
     monkeypatch.delenv(REMOVED, raising=False)
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "NHD")
+    vllm_config.cache_config.kv_cache_layout = None
 
     TpuPlatform.check_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 0), ("0", 0), ("33", 33), ("256", 256)],
+)
+def test_step_min_tokens_env_parses_nonnegative_int(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", raw)
+    assert expected == tpu_envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS
