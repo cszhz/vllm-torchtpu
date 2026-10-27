@@ -57,6 +57,9 @@ DENSE_PROJ_VMEM_LIMIT_BYTES = 24 * 1024 * 1024
 # with no MXU work to hide under, so the weight tile is wider (fewer steps).
 DENSE_PROJ_EPILOGUE_W_TILE_BYTES = 4 * 1024 * 1024
 DENSE_PROJ_EPILOGUE_VMEM_LIMIT_BYTES = 40 * 1024 * 1024
+# Rows per dot in the epilogue-fused kernel: a chunk's epilogue can start on
+# its first rows while the MXU computes the rest.
+DENSE_PROJ_EPILOGUE_SUB_M = 256
 # Chunks whose products a step of the epilogue-fused kernel leaves for the next
 # step to finish (it computes as many of the next tile's first chunks).
 DENSE_PROJ_EPILOGUE_LAG_CHUNKS = 1
@@ -580,7 +583,9 @@ def _dense_proj_epilogue_kernel(
     chunks = tile_n // sub_n
     rows = epilogue.rows
     assert m <= DENSE_PROJ_SUB_M
-    sub_m = m
+    sub_m = max(
+        d for d in range(rows, DENSE_PROJ_EPILOGUE_SUB_M + 1, rows) if m % d == 0
+    )
 
     def dot(w, r0):
         # K stays whole in one dot, as in XLA's fusion, so the f32 sums match.
