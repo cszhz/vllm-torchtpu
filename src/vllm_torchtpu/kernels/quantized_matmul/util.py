@@ -557,9 +557,10 @@ def _dense_proj_epilogue_kernel(
     x_scale_ref,  # (1, m) f32, lane-dense
     w_scale_ref,  # (1, n) f32
     x_ref,  # (m, k) fp8, whole in VMEM, where its producer already wrote it
-    *refs,  # epilogue operands, then w (k, tile_n) fp8 streamed, w_next
-    # (k, lag * sub_n) fp8 streamed, out (m, tile_n) bf16 streamed, x_scale_lanes
-    # (m, 128) f32 scratch, acc (lag, m, sub_n) f32 scratch, epilogue scratch
+    *refs,  # epilogue operands, then w (k, n) fp8 in HBM, out (m, tile_n) bf16
+    # streamed, x_scale_lanes (m, 128) f32 scratch, acc (lag, m, sub_n) f32
+    # scratch, w_buf (2, k, tile_n) fp8 scratch, w_sems (2, 2) DMA semaphores,
+    # epilogue scratch
     epilogue: DenseProjEpilogue,
 ):
     """_dense_proj_kernel's dot + scale with ``epilogue`` on every chunk,
@@ -567,16 +568,23 @@ def _dense_proj_epilogue_kernel(
 
     The products of a step's first ``lag`` chunks come from the step before it
     (acc_ref), and the step ends with the dots of the next tile's first ``lag``
-    chunks (w_next_ref). So the last chunks' VPU epilogues run under MXU work
-    instead of closing the step alone, and the first chunks' epilogues can start
-    before the step's first dot.
+    chunks. So the last chunks' VPU epilogues run under MXU work instead of
+    closing the step alone, and the first chunks' epilogues can start before
+    the step's first dot.
+
+    Weight tiles are copied in by hand into w_buf's slot ``tile % 2``, in two
+    DMAs: the first ``lag`` chunks, fetched two steps ahead because the step
+    before needs them at its end, and the rest, fetched one step ahead. So the
+    first step's lagged dots wait for their own chunks only, while the rest of
+    the first tile streams in under them, and no chunk is fetched twice. Every
+    wait sits at a step's top: a DMA wait mid-step would split its schedule.
     """
     num_operands = len(epilogue.operands)
     operand_refs = refs[:num_operands]
-    w_ref, w_next_ref, out_ref, x_scale_lanes_ref, acc_ref = refs[
-        num_operands : num_operands + 5
+    w_hbm_ref, out_ref, x_scale_lanes_ref, acc_ref, w_buf, w_sems = refs[
+        num_operands : num_operands + 6
     ]
-    epilogue_scratch_refs = refs[num_operands + 5 :]
+    epilogue_scratch_refs = refs[num_operands + 6 :]
     m, tile_n = out_ref.shape
     lag = acc_ref.shape[0]
     lanes = x_scale_lanes_ref.shape[1]
@@ -587,6 +595,22 @@ def _dense_proj_epilogue_kernel(
     sub_m = max(
         d for d in range(rows, DENSE_PROJ_EPILOGUE_SUB_M + 1, rows) if m % d == 0
     )
+    step = pl.program_id(0)
+    last_step = pl.num_programs(0) - 1
+    slot = step & 1
+
+    def w_copy(tile, part):
+        """DMA of ``tile``'s first ``lag`` chunks (part 0) or of the rest (part
+        1) into slot ``tile % 2``. A tile past the last one reads the last
+        one's columns, so its dots need no branch."""
+        c0, c1 = (0, lag) if part == 0 else (lag, chunks)
+        col0 = jnp.minimum(tile, last_step) * tile_n + c0 * sub_n
+        cols = (c1 - c0) * sub_n
+        return pltpu.make_async_copy(
+            w_hbm_ref.at[:, pl.ds(pl.multiple_of(col0, sub_n), cols)],
+            w_buf.at[tile & 1, :, pl.ds(c0 * sub_n, cols)],
+            w_sems.at[tile & 1, part],
+        )
 
     def dot(w, r0):
         # K stays whole in one dot, as in XLA's fusion, so the f32 sums match.
@@ -597,7 +621,15 @@ def _dense_proj_epilogue_kernel(
             preferred_element_type=jnp.float32,
         )
 
-    @pl.when(pl.program_id(0) == 0)
+    @pl.when(step < 1)
+    def _():
+        for tile, part in ((0, 0), (0, 1), (1, 0)):
+            w_copy(tile, part).start()
+        w_copy(0, 0).wait()
+
+    # A block of its own (another condition, so the two are not merged): the
+    # copies above start first, and the setup below runs under the dots.
+    @pl.when(step == 0)
     def _():
         x_scale_lanes_ref[...] = jnp.broadcast_to(
             jnp.transpose(x_scale_ref[...]), x_scale_lanes_ref.shape
@@ -606,8 +638,16 @@ def _dense_proj_epilogue_kernel(
         for c in range(lag):
             for r0 in range(0, m, sub_m):
                 acc_ref[c, pl.ds(r0, sub_m), :] = dot(
-                    w_ref[:, pl.ds(c * sub_n, sub_n)], r0
+                    w_buf[0, :, pl.ds(c * sub_n, sub_n)], r0
                 )
+
+    w_copy(step, 1).wait()
+    w_copy(step + 1, 0).wait()
+
+    @pl.when(step < last_step)
+    def _():
+        w_copy(step + 1, 1).start()
+        w_copy(step + 2, 0).start()
 
     def scale(acc, x_scale, col):
         # xla_quantized_matmul's epilogue order: x scale, then w scale.
@@ -639,14 +679,15 @@ def _dense_proj_epilogue_kernel(
         for c in range(lag)
         for r0 in range(0, m, sub_m)
     }
+    next_slot = 1 - slot
     # Program order puts each dot ahead of the epilogue ``lag`` chunks back.
     for c in range(lag, chunks + lag):
         for r0 in range(0, m, sub_m):
             if c < chunks:
-                acc = dot(w_ref[:, pl.ds(c * sub_n, sub_n)], r0)
+                acc = dot(w_buf[slot, :, pl.ds(c * sub_n, sub_n)], r0)
                 acc_rows[c, r0] = lambda b, acc=acc, r0=r0: acc[b - r0 : b - r0 + rows]
             else:
-                acc = dot(w_next_ref[:, pl.ds((c - chunks) * sub_n, sub_n)], r0)
+                acc = dot(w_buf[next_slot, :, pl.ds((c - chunks) * sub_n, sub_n)], r0)
             finish(c - lag, r0, acc_rows.pop((c - lag, r0)))
             if c >= chunks:  # After the epilogue that may read the same slot.
                 acc_ref[c - chunks, pl.ds(r0, sub_m), :] = acc
@@ -681,22 +722,17 @@ def dense_proj_matmul(
     scratch_shapes = [pltpu.VMEM((m, 128), jnp.float32)]
     if epilogue:
         kernel = functools.partial(_dense_proj_epilogue_kernel, epilogue=epilogue)
-        operands = (*epilogue.operands, w_q, w_q)
+        operands = (*epilogue.operands, w_q)
         lag = DENSE_PROJ_EPILOGUE_LAG_CHUNKS
-        next_cols = lag * DENSE_PROJ_SUB_N
-        assert tile_n % next_cols == 0
-        # The next tile's first chunks; the last step recomputes the last ones
-        # rather than branch around their dots.
-        w_next_spec = pl.BlockSpec(
-            (k, next_cols),
-            lambda j: (
-                0,
-                jnp.minimum((j + 1) * (tile_n // next_cols), n // next_cols - 1),
-            ),
-        )
-        in_specs = [*(vmem for _ in epilogue.operands), w_spec, w_next_spec]
+        assert tile_n % DENSE_PROJ_SUB_N == 0 and tile_n > lag * DENSE_PROJ_SUB_N
+        in_specs = [
+            *(vmem for _ in epilogue.operands),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+        ]
         scratch_shapes += [
             pltpu.VMEM((lag, m, DENSE_PROJ_SUB_N), jnp.float32),
+            pltpu.VMEM((2, k, tile_n), w_q.dtype),
+            pltpu.SemaphoreType.DMA((2, 2)),
             *epilogue.scratch_shapes,
         ]
     else:
