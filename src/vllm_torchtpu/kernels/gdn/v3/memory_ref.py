@@ -155,8 +155,18 @@ class BaseBufferedRef(pltpu.BufferedRef):
         use_lookahead: bool,
         cfg: config.GDNConfig,
         metadata_ref: MetadataRef,
+        source_memory_space=None,
+        is_trivial_windowing: bool = False,
         **fields,
     ):
+        create_kwargs = {}
+        if source_memory_space is not None:
+            # A ref the pipeline binds to the existing source instead of
+            # buffering (no VMEM window, no copies).
+            create_kwargs = dict(
+                source_memory_space=source_memory_space,
+                is_trivial_windowing=is_trivial_windowing,
+            )
         standard_ref = pltpu.BufferedRef.create(
             spec=spec,
             dtype_or_type=dtype_or_type,
@@ -164,6 +174,7 @@ class BaseBufferedRef(pltpu.BufferedRef):
             buffer_count=buffer_count,
             grid_rank=1,
             use_lookahead=use_lookahead,
+            **create_kwargs,
         )
         return cls(
             cfg=cfg,
@@ -591,6 +602,9 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
     def _unit(self) -> int:
         return self.region.nblocks
 
+    def _first_ckpt(self) -> int:
+        return self.cfg.window_size - config.bench_ckpt_writes(self.cfg.window_size)
+
     def _copy_out_compact(self, grid_indices: tuple[int | jax.Array]):
         """PCP fused kernel: one compact update per sequence.
 
@@ -640,7 +654,7 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
 
-            for t in range(self.cfg.window_size):
+            for t in range(self._first_ckpt(), self.cfg.window_size):
                 should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
                 nblocks = jnp.where(should_write, self.region.nblocks, 0)
                 state_idx = self._ckpt_state_idx(s_idx, t)
@@ -674,7 +688,7 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
                     ref = vmem_ref.at[idx, 0, pl.ds(0, n)]
                     pltpu.make_async_copy(ref, ref, sem).wait()
                     continue
-                for t in range(self.cfg.window_size):
+                for t in range(self._first_ckpt(), self.cfg.window_size):
                     should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
                     nblocks = jnp.where(should_write, self.region.nblocks, 0)
                     ref = vmem_ref.at[idx, t, pl.ds(0, nblocks)]
@@ -686,6 +700,7 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+            num_ckpts = jnp.maximum(num_ckpts - self._first_ckpt(), 0)
             dma_size += jnp.where(is_last_tile, num_ckpts, 0)
 
         # Each checkpoint's copy covers one full region tile; wait for that
@@ -939,12 +954,23 @@ def create_allocs(
             region=plan.conv,
             compact_output_ref=conv_state_output_ref,
         )
-        recurrent_out_alloc = ext_out_partial(
-            spec=block_spec_partial(block_shape=recurrent_out_shape),
-            dtype_or_type=conv_state_ref,
-            region=plan.recurrent,
-            compact_output_ref=recurrent_state_output_ref,
-        )
+        if cfg.manual_ckpt_dma:
+            # The body writes the recurrent checkpoints to the source itself
+            # (wrapper.inner_kernel); the pipeline hands it the source ref.
+            recurrent_out_alloc = ext_out_partial(
+                spec=pl.BlockSpec(memory_space=pltpu.HBM),
+                dtype_or_type=conv_state_ref,
+                region=plan.recurrent,
+                source_memory_space=pltpu.HBM,
+                is_trivial_windowing=True,
+            )
+        else:
+            recurrent_out_alloc = ext_out_partial(
+                spec=block_spec_partial(block_shape=recurrent_out_shape),
+                dtype_or_type=conv_state_ref,
+                region=plan.recurrent,
+                compact_output_ref=recurrent_state_output_ref,
+            )
 
     return (
         qkv_alloc,

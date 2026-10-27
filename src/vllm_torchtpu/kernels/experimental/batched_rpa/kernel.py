@@ -97,7 +97,7 @@ def calculate_and_store_out(
     cfgs: configs.RpaConfigs,
 ):
     def _accum(b_idx: int | jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
-        if flash_attention.static_pv(cfgs):
+        if flash_attention.static_pv(cfgs) and not flash_attention.p_prescaled(cfgs):
             # The accumulator carries P_SCALE; l sums the unscaled weights.
             batch_l = batch_l * jnp.asarray(flash_attention.P_SCALE, batch_l.dtype)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
@@ -402,6 +402,147 @@ def fetch_compute_metadata(
     )
 
 
+def decode_causal_mask_enabled() -> bool:
+    """TPU_RPA_DECODE_CAUSAL_MASK=1 masks the FULL-scope DECODE kernel's scores
+    on the causal test alone; read at trace time.
+
+    Every decode query sits at the end of its sequence, so a key the causal
+    test admits is below the sequence's KV length, and the KV-length test
+    (`kv_iota < n_valid`) adds nothing. Rows past a lane's query length admit
+    keys past its KV length, but rows are independent and those rows are never
+    stored. Unattended V lanes are zero in VMEM either way
+    (`_zero_unattended_v_lanes`).
+    """
+    return os.environ.get("TPU_RPA_DECODE_CAUSAL_MASK", "0") == "1"
+
+
+def decode_mask_bias_enabled() -> bool:
+    """TPU_RPA_DECODE_MASK_BIAS=1 masks the FULL-scope DECODE kernel's scores
+    with an additive tile kept in VMEM instead of a compare and select over
+    the score tile; read at trace time.
+
+    The tile holds 0 for visible keys and `mask_value` for the rest and joins
+    the QK dot as its accumulator. Only the columns around a lane's causal
+    boundary change between steps (`_update_mask_bias`), and K lanes past the
+    KV length are zeroed in VMEM like V's so no unfetched byte reaches a
+    score.
+    """
+    return os.environ.get("TPU_RPA_DECODE_MASK_BIAS", "0") in ("1", "2")
+
+
+def mask_bias_dtype(cfgs: configs.RpaConfigs) -> jnp.dtype:
+    """The bias tile's dtype: f32 (value 1, added as the QK dot's accumulator)
+    or the score dtype (value 2, added after the cast of the scores)."""
+    if os.environ.get("TPU_RPA_DECODE_MASK_BIAS", "0") == "2":
+        return jnp.dtype(cfgs.serve.dtype_out)
+    return jnp.dtype(jnp.float32)
+
+
+def mask_bias(cfgs: configs.RpaConfigs) -> bool:
+    """Whether this kernel masks scores with the VMEM bias tile."""
+    return (
+        decode_mask_bias_enabled()
+        and cfgs.mode == configs.RpaCase.DECODE
+        and cfgs.serve.attention_scope == configs.AttentionScope.FULL
+        and cfgs.model.sliding_window is None
+        and _zeroes_v_in_place(cfgs)
+        and cfgs.bq_sz <= pltpu.get_tpu_info().num_lanes
+        and not utils.bench_skip("mask")
+    )
+
+
+def mask_bias_patch_cols(cfgs: configs.RpaConfigs) -> int:
+    """Columns around the causal boundary that take the exact test.
+
+    Query row t of a lane sees keys up to e + t for the lane's first-row
+    limit e, so with `bq_sz` query tokens the boundary of every row lies in
+    the column holding e + 1 or in the ones after it that hold e + bq_sz.
+    """
+    return 1 + pl.cdiv(cfgs.bq_sz - 1, pltpu.get_tpu_info().num_lanes)
+
+
+def mask_bias_shapes(cfgs: configs.RpaConfigs):
+    """VMEM bias tile [batch, columns, rows, lanes] and SMEM column state."""
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    rows = cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head
+    return (
+        pltpu.VMEM(
+            (cfgs.batch_size, cfgs.bkv_sz // num_lanes, rows, num_lanes),
+            mask_bias_dtype(cfgs),
+        ),
+        pltpu.SMEM((cfgs.batch_size,), jnp.int32),
+    )
+
+
+def init_mask_bias(bias_ref: jax.Ref, col_ref: jax.Ref, *, cfgs: configs.RpaConfigs):
+    """Puts the bias tile in the all-visible state."""
+    bias_ref[...] = jnp.zeros_like(bias_ref)
+    start = bias_ref.shape[1] - mask_bias_patch_cols(cfgs)
+    for b in range(cfgs.batch_size):
+        col_ref[b] = start
+
+
+def _update_mask_bias(
+    bias_ref: jax.Ref,
+    col_ref: jax.Ref,
+    step_meta: ComputeMetadata,
+    *,
+    cfgs: configs.RpaConfigs,
+):
+    """Brings every lane's bias tile to this step's causal boundary.
+
+    Lane state: columns below `col_ref[b]` are 0, the `mask_bias_patch_cols`
+    columns from it hold the exact test, the columns after them hold
+    `mask_value`. Moving the boundary rewrites the columns whose state
+    changes and the patch columns, so a step inside a long context costs the
+    patch columns alone.
+    """
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    n_cols = bias_ref.shape[1]
+    rows = bias_ref.shape[2]
+    n_patch = mask_bias_patch_cols(cfgs)
+    zeros = jnp.zeros((rows, num_lanes), bias_ref.dtype)
+    masked = jnp.full((rows, num_lanes), cfgs.model.mask_value, bias_ref.dtype)
+    row_iota = lax.broadcasted_iota(jnp.int32, (rows, num_lanes), 0)
+    row_iota //= cfgs.aligned_num_q_heads_per_kv_head
+    diff = row_iota - lax.broadcasted_iota(jnp.int32, (rows, num_lanes), 1)
+
+    for b in range(cfgs.batch_size):
+        # Key j is visible to query row t iff t - j >= offset (`generate_mask`
+        # with bq_start 0), so row 0 sees keys up to e = -offset.
+        offset = step_meta.causal_offset[b]
+        col = jnp.clip((1 - offset) // num_lanes, 0, n_cols - n_patch)
+        prev = col_ref[b]
+
+        @pl.loop(prev, jnp.maximum(col, prev))
+        def _zero_cols(c, b=b):
+            bias_ref[b, c] = zeros
+
+        for k in range(n_patch):
+            c = col + k
+            visible = diff >= offset + c * num_lanes
+            bias_ref[b, c] = jnp.where(visible, zeros, masked)
+
+        lo = col + n_patch
+        hi = jnp.maximum(jnp.minimum(prev + n_patch, n_cols), lo)
+
+        @pl.loop(lo, hi)
+        def _mask_cols(c, b=b):
+            bias_ref[b, c] = masked
+
+        col_ref[b] = col
+
+
+def load_mask_bias(bias_ref: jax.Ref, *, cfgs: configs.RpaConfigs) -> jax.Array:
+    """Loads the bias as [batch, kv_heads, rows, bkv_sz]."""
+    n_cols = bias_ref.shape[1]
+    tiles = []
+    for b in range(cfgs.batch_size):
+        tile = jnp.concatenate([bias_ref[b, c] for c in range(n_cols)], axis=1)
+        tiles.append(jnp.stack([tile] * cfgs.model.num_kv_heads, axis=0))
+    return jnp.stack(tiles, axis=0)
+
+
 def generate_mask(
     shape: tuple[int, int, int, int],
     *,
@@ -412,6 +553,14 @@ def generate_mask(
 ) -> jax.Array:
     """Generates causal, sliding window, and attention scope mask for QK computation."""
     b, k_heads, tq, s = shape
+    causal_only = (
+        decode_causal_mask_enabled()
+        and cfgs.mode == configs.RpaCase.DECODE
+        and cfgs.serve.attention_scope == configs.AttentionScope.FULL
+        and cfgs.model.sliding_window is None
+        and step_meta.local_k_start is None
+        and step_meta.local_k_end is None
+    )
 
     kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
     q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
@@ -431,6 +580,9 @@ def generate_mask(
         # Step 2
         #   offset = causal_offset - bq_start
         offset = step_meta.causal_offset[b_idx] - bq_start
+        if causal_only:
+            masks.append(q_kv_diff >= offset)
+            continue
         n_valid = (
             stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
         )
@@ -510,6 +662,7 @@ def _zero_unattended_v_lanes(
     stitch_meta: StitchMetadata,
     *,
     cfgs: configs.RpaConfigs,
+    k_too: bool = False,
 ):
     """Zeroes, in VMEM, the V lanes at or past the last attended KV token.
 
@@ -537,15 +690,19 @@ def _zero_unattended_v_lanes(
         # Row r of `flat` is lane column (r % lanes_per_col) of u32 word row
         # (r // lanes_per_col), as in `stitch_utils._stitch_decode_lane`.
         flat = kv_in_vref.at[b].bitcast(jnp.uint32).reshape(-1, num_lanes)
-        zero_v_lanes_from(flat, hi, cfgs=cfgs)
+        zero_v_lanes_from(flat, hi, cfgs=cfgs, k_too=k_too)
 
 
-def zero_v_lanes_from(flat: jax.Ref, hi: jax.Array, *, cfgs: configs.RpaConfigs):
+def zero_v_lanes_from(
+    flat: jax.Ref, hi: jax.Array, *, cfgs: configs.RpaConfigs, k_too: bool = False
+):
     """Zeroes every V head's whole lane columns past the one holding `hi`.
 
     `flat` is the lane's SEQ_ALONG_LANE buffer viewed as u32 [-1, num_lanes].
     Lanes at or past `hi` in the column holding it are the stitch's to zero
-    (see `_zero_unattended_v_lanes`).
+    (see `_zero_unattended_v_lanes`). With `k_too`, the K heads' columns are
+    zeroed the same way (the mask bias adds to their scores instead of
+    replacing them).
     """
     num_lanes = pltpu.get_tpu_info().num_lanes
     lanes_per_col = cfgs.kv_vmem_lanes // num_lanes
@@ -556,8 +713,13 @@ def zero_v_lanes_from(flat: jax.Ref, hi: jax.Array, *, cfgs: configs.RpaConfigs)
     hi = jnp.clip(hi, 0, cfgs.bkv_sz).astype(jnp.int32)
     first_full_col = pl.cdiv(hi, num_lanes)
 
+    heads = []
     for kv_head in range(cfgs.model.num_kv_heads):
-        base = (kv_head * 2 + 1) * pack_dim * lanes_per_col
+        if k_too:
+            heads.append(kv_head * 2)
+        heads.append(kv_head * 2 + 1)
+    for head in heads:
+        base = head * pack_dim * lanes_per_col
 
         @pl.loop(first_full_col, n_cols)
         def _full_cols(c, base=base):
@@ -697,6 +859,8 @@ def rpa_body(
     # `pipeline.py`
     start_next_fetch: Callable[[], None],
     start_kv_writeback: Callable[[], None],
+    mask_bias_refs: tuple[jax.Ref, jax.Ref] | None = None,
+    mxu_accs: dict[str, tuple] | None = None,
 ):
     del slot
 
@@ -763,7 +927,18 @@ def rpa_body(
             _zeroes_v_in_place(cfgs)
             and cfgs.block.bq_sz <= pltpu.get_tpu_info().num_lanes
         ):
-            _zero_unattended_v_lanes(kv_in_vref, stitch_meta, cfgs=cfgs)
+            _zero_unattended_v_lanes(
+                kv_in_vref, stitch_meta, cfgs=cfgs, k_too=mask_bias_refs is not None
+            )
+        if mask_bias_refs is not None:
+            fence_meta = fetch_compute_metadata(
+                step,
+                schedule_ref,
+                q_offsets_ref,
+                kv_cache_lens_ref,
+                cfgs=cfgs,
+            )
+            _update_mask_bias(*mask_bias_refs, fence_meta, cfgs=cfgs)
 
     start_next_fetch()
 
@@ -789,6 +964,406 @@ def rpa_body(
         step=step,
         stitch_meta=stitch_meta,
         step_meta=step_meta,
+        cfgs=cfgs,
+        mask_bias_ref=mask_bias_refs[0] if mask_bias_refs is not None else None,
+        mxu_accs=mxu_accs or {},
+    )
+
+
+def skew_enabled() -> bool:
+    """TPU_RPA_DECODE_SKEW=1 runs the DECODE step loop as a two-stage software
+    pipeline (`pipeline.run_skewed_pipeline`): the QK dot and row max of KV
+    step s share a basic block with the softmax, PV and output store of step
+    s-1, with the scores of a step carried in VMEM scratch and the KV buffer
+    on four slots. Read at trace time."""
+    return os.environ.get("TPU_RPA_DECODE_SKEW", "0") == "1"
+
+
+SKEW_INPUT_SLOTS = 4
+
+
+def skewed(cfgs: configs.RpaConfigs) -> bool:
+    """Whether this kernel runs the skewed step loop."""
+    return (
+        skew_enabled()
+        and cfgs.mode == configs.RpaCase.DECODE
+        and cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+        and cfgs.serve.attention_scope == configs.AttentionScope.FULL
+        and cfgs.fuse_accum
+        and not cfgs.serve.return_lse
+        and not cfgs.serve.per_token_scale
+        and cfgs.serve.dtype_kv != jnp.uint8
+        and cfgs.model.soft_cap is None
+        and cfgs.bq_c_sz >= cfgs.bq_sz
+        and cfgs.bq_sz <= pltpu.get_tpu_info().num_lanes
+        and len(_q_tail_rungs(cfgs)) == 1
+        and not flash_attention.mxu_acc(cfgs, "qk")
+        and not flash_attention.mxu_acc(cfgs, "pv")
+    )
+
+
+def skew_shapes(cfgs: configs.RpaConfigs):
+    """Double-buffered scores and row max of a step: [2, batch, kv, rows, ...]."""
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    rows = cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head
+    return (
+        pltpu.VMEM(
+            (2, cfgs.batch_size, cfgs.model.num_kv_heads, rows, cfgs.bkv_sz),
+            cfgs.serve.dtype_out,
+        ),
+        pltpu.VMEM(
+            (2, cfgs.batch_size, cfgs.model.num_kv_heads, rows, num_lanes),
+            cfgs.serve.dtype_out,
+        ),
+    )
+
+
+def _load_kv_heads(
+    kv_in_vref: jax.Ref, *, cfgs: configs.RpaConfigs, want_k: bool, want_v: bool
+) -> tuple[jax.Array | None, jax.Array | None]:
+    """Strided loads of the K and/or V heads of a SEQ_ALONG_LANE block.
+
+    Returns each as [batch, kv_heads, head_dim, bkv_sz] (None when not
+    wanted), as `_rpa_step` loads them.
+    """
+    k_b = []
+    v_b = []
+    for b_idx in range(cfgs.batch_size):
+        ks = []
+        vs = []
+        for kv_head in range(cfgs.model.num_kv_heads):
+            pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
+            target_shape = (-1, cfgs.kv_vmem_lanes)
+            for want, which, lst in ((want_k, 0, ks), (want_v, 1, vs)):
+                if not want:
+                    continue
+                head_ref = (
+                    kv_in_vref.at[b_idx, kv_head * 2 + which]
+                    .bitcast(jnp.uint32)
+                    .reshape(target_shape)
+                )
+                head_u32 = utils.strided_load(head_ref, 0, pack_dim, 1)
+                head = pltpu.bitcast(head_u32, cfgs.serve.dtype_kv)[:, : cfgs.bkv_sz]
+                lst.append(head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
+        if want_k:
+            k_b.append(jnp.stack(ks, axis=0))
+        if want_v:
+            v_b.append(jnp.stack(vs, axis=0))
+    k = jnp.stack(k_b, axis=0) if want_k else None
+    v = jnp.stack(v_b, axis=0) if want_v else None
+    return k, v
+
+
+def fence_fold_enabled() -> bool:
+    """TPU_RPA_DECODE_FENCE_FOLD=1 runs the skewed step loop without the stitch
+    fence: iteration s stitches KV step s+1 (whose block arrived one step
+    earlier, the fetch running three steps ahead on five slots) in the same
+    basic block as the QK of step s and the PV of step s-1, zeroes the lanes
+    past the KV length with a DMA from a zero tile instead of a store loop,
+    and issues the writeback after the stitch stores. Read at trace time."""
+    return fence_fold_mode() != ""
+
+
+def fence_fold_mode() -> str:
+    """TPU_RPA_DECODE_FENCE_FOLD: "1" zeroes the lanes past the KV length with
+    DMAs, "2" with the store loop (a region ahead of the compute block), "3"
+    not at all (bench stand-in: unfetched lanes stay as they are)."""
+    mode = os.environ.get("TPU_RPA_DECODE_FENCE_FOLD", "0")
+    return {"1": "dma", "2": "loop", "3": "none"}.get(mode, "")
+
+
+def zero_dma_enabled() -> bool:
+    """TPU_RPA_DECODE_ZERO_DMA=1 zeroes the lanes past the KV length with DMAs
+    inside the fenced skewed loop (a cost probe for the folded loop)."""
+    return os.environ.get("TPU_RPA_DECODE_ZERO_DMA", "0") == "1"
+
+
+FOLD_INPUT_SLOTS = 5
+
+
+def fence_folded(cfgs: configs.RpaConfigs) -> bool:
+    """Whether the skewed loop runs with the fence folded into the compute block."""
+    return fence_fold_enabled() and skewed(cfgs) and not mask_bias(cfgs)
+
+
+def zero_dma_probe(cfgs: configs.RpaConfigs) -> bool:
+    return zero_dma_enabled() and skewed(cfgs) and not fence_folded(cfgs) and not mask_bias(cfgs)
+
+
+def zero_tile_shape(cfgs: configs.RpaConfigs):
+    """The zero source of the lane-zeroing DMAs: one KV head's rows over a block."""
+    return pltpu.VMEM(
+        (
+            cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv,
+            cfgs.serve.packing_kv,
+            cfgs.bkv_sz,
+        ),
+        cfgs.serve.dtype_kv,
+    )
+
+
+def _zero_v_lanes_dmas(
+    kv_vref: jax.Ref,
+    zeros_ref: jax.Ref,
+    sem,
+    stitch_meta: StitchMetadata,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> list:
+    """DMA descriptors that zero every V head's whole lane columns past the one
+    holding the lane's KV length (the DMA form of `zero_v_lanes_from`)."""
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    copies = []
+    for b in range(cfgs.batch_size):
+        hi = stitch_meta.bkv_sz_frm_cache[b] + stitch_meta.bkv_sz_frm_new[b]
+        hi = jnp.clip(hi, 0, cfgs.bkv_sz).astype(jnp.int32)
+        start = pl.multiple_of(utils.align_to(hi, num_lanes), num_lanes)
+        sz = pl.multiple_of(cfgs.bkv_sz - start, num_lanes)
+        for kv_head in range(cfgs.model.num_kv_heads):
+            copies.append(
+                pltpu.make_async_copy(
+                    zeros_ref.at[:, :, pl.ds(0, sz)],
+                    kv_vref.at[b, kv_head * 2 + 1, :, :, pl.ds(start, sz)],
+                    sem,
+                )
+            )
+    return copies
+
+
+def rpa_prepare_slot(
+    step: jax.Array,
+    kv_vref: jax.Ref,
+    schedule_ref: schedule.RpaSchedule,
+    zeros_ref: jax.Ref,
+    zero_sem,
+    *,
+    cu_q_lens_ref: jax.Ref,
+    kv_cache_lens_ref: jax.Ref,
+    kv_new_lens_ref: jax.Ref,
+    cfgs: configs.RpaConfigs,
+    start_kv_writeback: Callable[[], None],
+):
+    """Folded fence: stitches step `step` into its slot, starts the writeback
+    and the lane-zeroing DMAs. `kv_vref` carries no hazard annotation, so the
+    writeback and the zeroing follow the stitch stores."""
+    stitch_meta = fetch_stitch_metadata(
+        step, schedule_ref, cu_q_lens_ref, kv_cache_lens_ref, kv_new_lens_ref, cfgs=cfgs
+    )
+    results = []
+    for b_idx in range(cfgs.batch_size):
+        results.append(
+            stitch_utils.stitch_new_kv_lane(
+                kv_vref,
+                b_idx,
+                stitch_meta.bkv_sz_frm_cache[b_idx],
+                stitch_meta.new_kv_len_start[b_idx],
+                stitch_meta.bkv_sz_frm_new[b_idx],
+                cfgs=cfgs,
+            )
+        )
+    for b_idx in range(cfgs.batch_size):
+        stitch_utils.store_new_kv_lane(kv_vref, b_idx, results[b_idx], cfgs=cfgs)
+    start_kv_writeback()
+    mode = fence_fold_mode()
+    if mode == "dma":
+        for copy in _zero_v_lanes_dmas(kv_vref, zeros_ref, zero_sem, stitch_meta, cfgs=cfgs):
+            copy.start()
+    elif mode == "loop":
+        _zero_unattended_v_lanes(kv_vref, stitch_meta, cfgs=cfgs)
+
+
+def rpa_prepare_wait(
+    step: jax.Array,
+    kv_vref: jax.Ref,
+    schedule_ref: schedule.RpaSchedule,
+    zeros_ref: jax.Ref,
+    zero_sem,
+    *,
+    cu_q_lens_ref: jax.Ref,
+    kv_cache_lens_ref: jax.Ref,
+    kv_new_lens_ref: jax.Ref,
+    cfgs: configs.RpaConfigs,
+):
+    """Waits for the lane-zeroing DMAs `rpa_prepare_slot` started for `step`."""
+    if fence_fold_mode() != "dma":
+        return
+    stitch_meta = fetch_stitch_metadata(
+        step, schedule_ref, cu_q_lens_ref, kv_cache_lens_ref, kv_new_lens_ref, cfgs=cfgs
+    )
+    for copy in _zero_v_lanes_dmas(kv_vref, zeros_ref, zero_sem, stitch_meta, cfgs=cfgs):
+        copy.wait()
+
+
+def rpa_stage_a(
+    step: jax.Array,
+    q_vref: jax.Ref,
+    kv_in_vref: jax.Ref,
+    schedule_ref: schedule.RpaSchedule,
+    scores_ref: jax.Ref,
+    mcurr_ref: jax.Ref,
+    *,
+    cu_q_lens_ref: jax.Ref,
+    q_offsets_ref: jax.Ref,
+    kv_cache_lens_ref: jax.Ref,
+    kv_new_lens_ref: jax.Ref,
+    cfgs: configs.RpaConfigs,
+    start_next_fetch: Callable[[], None],
+    start_kv_writeback: Callable[[], None] | None,
+    mask_bias_refs: tuple[jax.Ref, jax.Ref] | None,
+    zero_dma: tuple | None = None,
+):
+    """Skewed pipeline, stage A of step `step`: stitch, DMA issue, QK, row max.
+
+    The scores (output dtype) and their row max land in buffer `step % 2` of
+    the scratches for `rpa_stage_b`. With `start_kv_writeback=None` the slot
+    was prepared by `rpa_prepare_slot` and the fence is skipped.
+    """
+    # pyrefly: ignore[bad-assignment]
+    kv_in_vref = pltpu.annotate(kv_in_vref, no_hazard_no_deps=True)
+    stitch_meta = fetch_stitch_metadata(
+        step,
+        schedule_ref,
+        cu_q_lens_ref,
+        kv_cache_lens_ref,
+        kv_new_lens_ref,
+        cfgs=cfgs,
+    )
+    always_true = kv_cache_lens_ref[0] >= 0
+
+    def _kv_store_fence():
+        stitch_results = []
+        for b_idx in range(cfgs.batch_size):
+            stitch_results.append(
+                stitch_utils.stitch_new_kv_lane(
+                    kv_in_vref,
+                    b_idx,
+                    stitch_meta.bkv_sz_frm_cache[b_idx],
+                    stitch_meta.new_kv_len_start[b_idx],
+                    stitch_meta.bkv_sz_frm_new[b_idx],
+                    cfgs=cfgs,
+                )
+            )
+        for b_idx in range(cfgs.batch_size):
+            stitch_utils.store_new_kv_lane(
+                kv_in_vref, b_idx, stitch_results[b_idx], cfgs=cfgs
+            )
+        start_kv_writeback()
+        if zero_dma is not None:
+            copies = _zero_v_lanes_dmas(
+                zero_dma[0], zero_dma[1], zero_dma[2], stitch_meta, cfgs=cfgs
+            )
+            for copy in copies:
+                copy.start()
+            for copy in copies:
+                copy.wait()
+        else:
+            _zero_unattended_v_lanes(
+                kv_in_vref, stitch_meta, cfgs=cfgs, k_too=mask_bias_refs is not None
+            )
+        if mask_bias_refs is not None:
+            fence_meta = fetch_compute_metadata(
+                step, schedule_ref, q_offsets_ref, kv_cache_lens_ref, cfgs=cfgs
+            )
+            _update_mask_bias(*mask_bias_refs, fence_meta, cfgs=cfgs)
+
+    if start_kv_writeback is not None:
+        pl.when(always_true)(jax.named_scope("stitch_and_issue_writeback")(_kv_store_fence))
+
+    start_next_fetch()
+    step_meta = fetch_compute_metadata(
+        step, schedule_ref, q_offsets_ref, kv_cache_lens_ref, cfgs=cfgs
+    )
+    k, _ = _load_kv_heads(kv_in_vref, cfgs=cfgs, want_k=True, want_v=False)
+    q = _load_q_chunk(q_vref, 0, cfgs.bq_sz, cfgs=cfgs)
+    rows = cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head
+
+    custom_mask = None
+    bias = None
+    if not utils.bench_skip("mask"):
+        if mask_bias_refs is not None:
+            bias = load_mask_bias(mask_bias_refs[0], cfgs=cfgs)
+        else:
+            custom_mask = generate_mask(
+                shape=(cfgs.batch_size, cfgs.model.num_kv_heads, rows, cfgs.bkv_sz),
+                bq_start=0,
+                stitch_meta=stitch_meta,
+                step_meta=step_meta,
+                cfgs=cfgs,
+            )
+    qk, m_curr = flash_attention.flash_attention_qk(
+        q,
+        k,
+        custom_mask=custom_mask,
+        cfgs=cfgs,
+        bq_start=0,
+        k_scale=cfgs.serve.scale_k,
+        mask_bias=bias,
+    )
+    buf = lax.rem(step, 2)
+    scores_ref[buf] = qk
+    mcurr_ref[buf] = jnp.broadcast_to(m_curr, mcurr_ref.shape[1:])
+
+
+def rpa_stage_b(
+    step: jax.Array,
+    kv_in_vref: jax.Ref,
+    o_vref: jax.Ref,
+    schedule_ref: schedule.RpaSchedule,
+    m_scratch_ref: jax.Ref,
+    l_scratch_ref: jax.Ref,
+    acc_scratch_ref: jax.Ref,
+    scores_ref: jax.Ref,
+    mcurr_ref: jax.Ref,
+    *,
+    cfgs: configs.RpaConfigs,
+):
+    """Skewed pipeline, stage B of step `step`: softmax, PV, output store.
+
+    Reads the scores `rpa_stage_a` left in buffer `step % 2` and V from the
+    step's KV slot, which `_zero_unattended_v_lanes` finished in stage A.
+    """
+    # pyrefly: ignore[bad-assignment]
+    kv_in_vref = pltpu.annotate(kv_in_vref, no_hazard_no_deps=True)
+    buf = lax.rem(step, 2)
+    qk = scores_ref[buf]
+    m_curr = mcurr_ref[buf]
+    q_slice = slice(0, cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head)
+    p, alpha_list, m_next, l_next, m_carry, l_carry = (
+        flash_attention.flash_attention_softmax(
+            step,
+            qk,
+            m_curr,
+            m_scratch_ref[:, q_slice],
+            l_scratch_ref[:, q_slice],
+            schedule_ref.is_last_k,
+            cfgs=cfgs,
+        )
+    )
+    m_scratch_ref[:, q_slice] = m_carry
+    l_scratch_ref[:, q_slice] = l_carry
+    del m_next
+
+    _, v = _load_kv_heads(kv_in_vref, cfgs=cfgs, want_k=False, want_v=True)
+    o_next, o_carry = flash_attention.flash_attention_pv(
+        p,
+        v,
+        alpha_list,
+        acc_scratch_ref[:, q_slice],
+        step,
+        schedule_ref.is_last_k,
+        cfgs=cfgs,
+        v_scale=None,
+    )
+    acc_scratch_ref[:, q_slice] = o_carry
+    calculate_and_store_out(
+        step,
+        schedule_ref,
+        o_next,
+        l_next,
+        None,
+        o_vref,
+        None,
+        chunk_start=0,
         cfgs=cfgs,
     )
 
@@ -826,6 +1401,8 @@ def _rpa_step(
     stitch_meta: StitchMetadata,
     step_meta: ComputeMetadata,
     cfgs: configs.RpaConfigs,
+    mask_bias_ref: jax.Ref | None = None,
+    mxu_accs: dict[str, tuple] | None = None,
 ):
     """Runs one step's attention over the stitched KV block.
 
@@ -940,6 +1517,10 @@ def _rpa_step(
         acc_new_list = []
         m_next = None
 
+        step_bias = None
+        if apply_mask and mask_bias_ref is not None:
+            step_bias = load_mask_bias(mask_bias_ref, cfgs=cfgs)
+
         prev_p = prev_alpha_list = prev_q_slice = None
         for rel_start in range(0, chunk_sz, step_bq_c_sz):
             rel_end = min(rel_start + step_bq_c_sz, chunk_sz)
@@ -955,7 +1536,12 @@ def _rpa_step(
             )
 
             custom_mask = None
-            if apply_mask:
+            bias = None
+            if step_bias is not None:
+                # Bias rows are the step's query rows, like `generate_mask`
+                # with the row offset folded in.
+                bias = step_bias[:, :, q_slice]
+            elif apply_mask:
                 custom_mask = generate_mask(
                     shape=(
                         cfgs.batch_size,
@@ -982,6 +1568,8 @@ def _rpa_step(
                     bq_start=bq_start,
                     k_scale=k_scale,
                     dma_q=dma_q_reset,
+                    mask_bias=bias,
+                    mxu_accs=(mxu_accs or {}).get("qk"),
                 )
             )
             m_scratch_ref[:, q_slice] = m_carry
@@ -1000,6 +1588,7 @@ def _rpa_step(
                     schedule_ref.is_last_k,
                     cfgs=cfgs,
                     v_scale=v_scale,
+                    mxu_accs=(mxu_accs or {}).get("pv"),
                 )
                 acc_scratch_ref[:, prev_q_slice] = o_carry
                 acc_new_list.append(o_next)
@@ -1018,6 +1607,7 @@ def _rpa_step(
             schedule_ref.is_last_k,
             cfgs=cfgs,
             v_scale=v_scale,
+            mxu_accs=(mxu_accs or {}).get("pv"),
         )
         acc_scratch_ref[:, prev_q_slice] = o_carry
         acc_new_list.append(o_next)
@@ -1054,7 +1644,7 @@ def _rpa_step(
 
     full = block_fully_visible(stitch_meta, step_meta, cfgs)
     if full is None:
-        _dispatch_rungs(apply_mask=True)
+        _dispatch_rungs(apply_mask=not utils.bench_skip("mask"))
         return
 
     @pl.when(full)
@@ -1074,6 +1664,7 @@ def create_allocs(
     o_hbm_ref: jax.Ref,
     lse_hbm_ref: jax.Ref | None,
     cfgs: configs.RpaConfigs,
+    in_slots: int = configs.NUM_INPUT_SLOTS,
 ) -> tuple[
     bref_override.BatchingQRef,
     bref_override.KVBufferedRefSeqAlongLane
@@ -1083,7 +1674,6 @@ def create_allocs(
 ]:
     # `use_lookahead` is disabled everywhere: slot rotation and prefetch depth are
     # driven explicitly by `pipeline.run_manual_triple_buffer`.
-    in_slots = configs.NUM_INPUT_SLOTS
     out_slots = configs.NUM_OUTPUT_SLOTS
     kv_cache_spec = pl.BlockSpec(
         block_shape=cfgs.kv_vmem_shape,
@@ -1242,8 +1832,15 @@ def rpa_kernel(
         if o_lse_hbm_ref is not None:
             del o_lse_hbm_ref
 
+        skew = skewed(cfgs)
+        fold = fence_folded(cfgs)
+        in_slots = configs.NUM_INPUT_SLOTS
+        if fold:
+            in_slots = FOLD_INPUT_SLOTS
+        elif skew:
+            in_slots = SKEW_INPUT_SLOTS
         q_alloc, kv_cache_alloc, o_alloc, lse_alloc = create_allocs(
-            kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
+            kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs, in_slots=in_slots
         )
 
         actual_steps = schedule_hbm_ref.actual_steps[0]
@@ -1266,9 +1863,20 @@ def rpa_kernel(
                     cfgs.acc_scratch_shape,
                     dtype=cfgs.serve.dtype_out,
                 ),  # acc
+            )
+            + (mask_bias_shapes(cfgs) if mask_bias(cfgs) else ()),
+            mxu_accs=flash_attention.mxu_acc_shapes(cfgs),
+            skew_scratches=skew_shapes(cfgs) if skew else (),
+            fold_scratches=(
+                (zero_tile_shape(cfgs), pltpu.SemaphoreType.DMA((FOLD_INPUT_SLOTS,)))
+                if (fold or zero_dma_probe(cfgs))
+                else ()
             ),
         )
-        def _run(final_allocs, schedule_ref, dma_sem, scratches):
+        def _run(
+            final_allocs, schedule_ref, dma_sem, scratches, mxu_accs, skew_scratches,
+            fold_scratches,
+        ):
             # Initialize Q to zeros to prevent NaN pollution.
             #
             # When a query block is partially filled, tail slots in uninitialized VMEM
@@ -1295,10 +1903,15 @@ def rpa_kernel(
             zero_kv_vmem = os.environ.get("TPU_RPA_ZERO_KV_VMEM", "0") == "1"
 
             q_alloc, kv_cache_alloc, o_alloc, lse_alloc = final_allocs
+            mask_bias_refs = tuple(scratches[3:5]) if mask_bias(cfgs) else None
 
             @pl.when(actual_steps > 0)
             def _active():
                 scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
+                if mask_bias_refs is not None:
+                    init_mask_bias(*mask_bias_refs, cfgs=cfgs)
+                if fold_scratches:
+                    fold_scratches[0][...] = jnp.zeros_like(fold_scratches[0])
 
                 num_lanes = pltpu.get_tpu_info().num_lanes
                 q_ref_flat = q_alloc.window_ref.bitcast(jnp.uint32).reshape(
@@ -1395,7 +2008,106 @@ def rpa_kernel(
                             cfgs=cfgs,
                             start_next_fetch=start_next_fetch,
                             start_kv_writeback=start_kv_writeback,
+                            mask_bias_refs=mask_bias_refs,
+                            mxu_accs=mxu_accs,
                         )
+
+                    if skew:
+                        scores_ref, mcurr_ref = skew_scratches
+
+                        def stage_a(step, slot, *, start_next_fetch, start_kv_writeback):
+                            zero_dma = None
+                            if zero_dma_probe(cfgs):
+                                zero_dma = (
+                                    kv_cache_alloc.window_ref.at[slot],
+                                    fold_scratches[0],
+                                    fold_scratches[1].at[slot],
+                                )
+                            rpa_stage_a(
+                                step,
+                                q_alloc.window_ref.at[slot],
+                                kv_cache_alloc.window_ref.at[slot],
+                                schedule_ref,
+                                scores_ref,
+                                mcurr_ref,
+                                cu_q_lens_ref=cu_q_lens_ref,
+                                q_offsets_ref=q_offsets_ref,
+                                kv_cache_lens_ref=kv_cache_lens_ref,
+                                kv_new_lens_ref=kv_new_lens_ref,
+                                cfgs=cfgs,
+                                start_next_fetch=start_next_fetch,
+                                start_kv_writeback=start_kv_writeback,
+                                mask_bias_refs=mask_bias_refs,
+                                zero_dma=zero_dma,
+                            )
+
+                        def stage_b(step, slot, *, out_slot):
+                            rpa_stage_b(
+                                step,
+                                kv_cache_alloc.window_ref.at[slot],
+                                o_alloc.window_ref.at[out_slot],
+                                schedule_ref,
+                                scratches[0],
+                                scratches[1],
+                                scratches[2],
+                                scores_ref,
+                                mcurr_ref,
+                                cfgs=cfgs,
+                            )
+
+                        if fold:
+                            zeros_ref, zero_sems = fold_scratches
+
+                            def prepare(step, slot, *, start_kv_writeback):
+                                rpa_prepare_slot(
+                                    step,
+                                    kv_cache_alloc.window_ref.at[slot],
+                                    schedule_ref,
+                                    zeros_ref,
+                                    zero_sems.at[slot],
+                                    cu_q_lens_ref=cu_q_lens_ref,
+                                    kv_cache_lens_ref=kv_cache_lens_ref,
+                                    kv_new_lens_ref=kv_new_lens_ref,
+                                    cfgs=cfgs,
+                                    start_kv_writeback=start_kv_writeback,
+                                )
+
+                            def prepare_wait(step, slot):
+                                rpa_prepare_wait(
+                                    step,
+                                    kv_cache_alloc.window_ref.at[slot],
+                                    schedule_ref,
+                                    zeros_ref,
+                                    zero_sems.at[slot],
+                                    cu_q_lens_ref=cu_q_lens_ref,
+                                    kv_cache_lens_ref=kv_cache_lens_ref,
+                                    kv_new_lens_ref=kv_new_lens_ref,
+                                    cfgs=cfgs,
+                                )
+
+                            pipeline.run_folded_pipeline(
+                                total_steps,
+                                prepare,
+                                prepare_wait,
+                                stage_a,
+                                stage_b,
+                                q_bound,
+                                o_bound,
+                                kv_bound,
+                                in_slots=FOLD_INPUT_SLOTS,
+                            )
+                            return
+
+                        pipeline.run_skewed_pipeline(
+                            total_steps,
+                            stage_a,
+                            stage_b,
+                            q_bound,
+                            o_bound,
+                            kv_bound,
+                            in_slots=SKEW_INPUT_SLOTS,
+                        )
+                        return
 
                     pipeline.run_manual_triple_buffer(
                         total_steps,

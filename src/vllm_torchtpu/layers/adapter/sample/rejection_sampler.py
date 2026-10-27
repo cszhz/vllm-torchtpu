@@ -18,10 +18,14 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     apply_top_k_top_p,
     extract_topk_candidates,
 )
+
+# Read once: the fused samplers run inside fullgraph torch.compile regions.
+_TOPK_MAX_K = envs.TPU_SAMPLER_TOPK_MAX_K
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
@@ -744,6 +748,8 @@ def _fused_spec_verify_and_sample_candidates(
         32 if topk_candidates == 0 else topk_candidates,
         scaled_cand.shape[-1],
     )
+    if topk_candidates > 0 and _TOPK_MAX_K > 0:
+        max_k = min(max_k, _TOPK_MAX_K)
     masked_cand = apply_top_k_top_p(scaled_cand, all_top_k, all_top_p, max_k=max_k)
     probs = torch.softmax(masked_cand, dim=-1, dtype=torch.float32)
 

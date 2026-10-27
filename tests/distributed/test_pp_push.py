@@ -236,6 +236,9 @@ def _install_on_fake_executor(monkeypatch, stages):
         def collective_rpc(self, method, **kwargs):
             self.calls.append((method, kwargs))
 
+        def profile(self, is_start=True, profile_prefix=None):
+            self.calls.append(("profile", {"args": (is_start, profile_prefix)}))
+
     monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", _FakeExecutor)
     pp_push.patch_executor_for_pp_wave(_config(stages))
     return _FakeExecutor()
@@ -306,6 +309,23 @@ def test_pipeline_executor_never_asks_the_workers_for_draft_tokens(monkeypatch, 
     assert executor.calls == []
 
 
+def test_profiling_settles_the_steps_in_flight_first(monkeypatch, queue):
+    executor = _install_on_fake_executor(monkeypatch, stages=8)
+    futures = [
+        executor.execute_model(_step(16, i), non_block=True) for i in range(1, 4)
+    ]
+    executor.profile(True, "steady")
+    # the settle carries steps 1-3 through, then the profiler RPC follows
+    assert [c[0] for c in executor.calls] == ["pp_settle", "profile"]
+    assert executor.calls[1][1]["args"] == (True, "steady")
+    # the steps were carried already: waiting on them sends nothing more
+    assert [f.result() for f in futures] == [("forward", i) for i in range(1, 4)]
+    assert len(executor.calls) == 2
+    # with nothing in flight the stop goes out alone
+    executor.profile(False, None)
+    assert [c[0] for c in executor.calls] == ["pp_settle", "profile", "profile"]
+
+
 def test_the_listener_hears_every_push_and_settle():
     executor = _Executor()
     wave = pp_push._WaveState(stages=8)
@@ -324,3 +344,44 @@ def test_the_listener_hears_every_push_and_settle():
     # A settle with nothing open is not sent and not heard.
     assert wave.settle(executor) is None
     assert len(heard) == 3
+
+
+def test_extra_steps_in_flight_widen_the_rings(queue, monkeypatch):
+    assert pp_push.rpc_ring_chunks(8, extra=1) == pp_push.rpc_ring_chunks(9)
+    monkeypatch.setattr(pp_push.envs, "TPU_PP_EXTRA_STEPS_IN_FLIGHT", 2)
+    pp_push._widen_rpc_ring(8)
+    assert queue(1, 1).kwargs["max_chunks"] == 48
+
+
+class _FakeVllmConfig:
+    def __init__(self, pp, async_scheduling=False):
+        self.parallel_config = SimpleNamespace(pipeline_parallel_size=pp)
+        self.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
+
+    @property
+    def max_concurrent_batches(self):
+        """vLLM's count."""
+        return max(self.parallel_config.pipeline_parallel_size, 1)
+
+
+def test_extra_steps_raise_the_engines_queue_depth(monkeypatch):
+    monkeypatch.setattr(pp_push, "_vllm_config_class", lambda: _FakeVllmConfig)
+    pp_push.raise_steps_in_flight(1)
+    assert _FakeVllmConfig(8).max_concurrent_batches == 9
+    assert _FakeVllmConfig(1).max_concurrent_batches == 1
+    assert _FakeVllmConfig(8, async_scheduling=True).max_concurrent_batches == 8
+    assert _FakeVllmConfig.max_concurrent_batches.__doc__ == "vLLM's count."
+    # Installed once: a second call with another count keeps the first.
+    pp_push.raise_steps_in_flight(3)
+    assert _FakeVllmConfig(8).max_concurrent_batches == 9
+
+
+def test_the_executor_patch_raises_the_queue_depth_when_asked(monkeypatch, queue):
+    class _Config(_FakeVllmConfig):
+        pass
+
+    monkeypatch.setattr(pp_push, "_vllm_config_class", lambda: _Config)
+    monkeypatch.setattr(pp_push.envs, "TPU_PP_EXTRA_STEPS_IN_FLIGHT", 1)
+    _install_on_fake_executor(monkeypatch, 8)
+    assert _Config(8).max_concurrent_batches == 9
+    assert queue(1, 1).kwargs["max_chunks"] == 44

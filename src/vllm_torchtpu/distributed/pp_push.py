@@ -42,6 +42,18 @@ creates its own rings, the engine its broadcast ring and every worker its
 reply ring, so the widening is installed in the engine process and, through
 ``widen_message_rings``, in every worker process; the ring size is the
 widest any pipeline in the process asked for.
+
+The engine keeps as many steps in flight as the pipeline has stages
+(``VllmConfig.max_concurrent_batches``) and dispatches the next one once
+the oldest has returned. The oldest returns when the last stage has
+sampled it, and the next step then reaches stage 0 through the engine
+core's update, schedule and RPC and the worker's input preparation, a
+chain of some 10 ms that is exposed whenever the last stage finishes less
+than that before the slowest stage. ``TPU_PP_EXTRA_STEPS_IN_FLIGHT`` adds
+that many steps to the count, so the chain runs a wave earlier and stage
+0's next forward is queued on its device behind the current one. The
+pushes a wait sends count the later steps that exist, so the deeper queue
+changes none of them.
 """
 
 import contextlib
@@ -50,6 +62,8 @@ from concurrent.futures import Future
 from typing import Any, cast
 
 from vllm.logger import init_logger
+
+from vllm_torchtpu import envs
 
 logger = init_logger(__name__)
 
@@ -216,16 +230,21 @@ def wave_state(executor: Any) -> _WaveState:
     return state
 
 
-def rpc_ring_chunks(stages: int) -> int:
+def extra_steps_in_flight() -> int:
+    """Steps the engine keeps in flight beyond the pipeline depth."""
+    return int(envs.TPU_PP_EXTRA_STEPS_IN_FLIGHT)
+
+
+def rpc_ring_chunks(stages: int, extra: int = 0) -> int:
     """Messages each ring buffer between the engine and its workers must hold.
 
-    The engine keeps up to ``stages`` steps in flight, each of them two
-    calls (execute_model and sample_tokens), so a worker reads a step's
-    calls up to that many steps late and, with a KV connector, holds up to
-    that many unread replies; a wait adds at most ``stages - 2`` pushes
-    or one settle.
+    The engine keeps up to ``stages + extra`` steps in flight, each of
+    them two calls (execute_model and sample_tokens), so a worker reads a
+    step's calls up to that many steps late and, with a KV connector,
+    holds up to that many unread replies; a wait adds at most
+    ``stages - 2`` pushes or one settle.
     """
-    return 4 * stages + 8
+    return 4 * (stages + extra) + 8
 
 
 # Messages every ring created in this process must hold: the widest any
@@ -239,7 +258,9 @@ def _widen_rpc_ring(stages: int) -> None:
     ``rpc_ring_chunks(stages)`` messages; a deeper pipeline raises the
     minimum, a shallower one leaves it."""
     global _ring_chunks_needed
-    _ring_chunks_needed = max(_ring_chunks_needed, rpc_ring_chunks(stages))
+    _ring_chunks_needed = max(
+        _ring_chunks_needed, rpc_ring_chunks(stages, extra_steps_in_flight())
+    )
     from vllm.distributed.device_communicators import shm_broadcast
 
     cls = shm_broadcast.MessageQueue
@@ -270,6 +291,41 @@ def widen_message_rings(vllm_config: Any) -> None:
         _widen_rpc_ring(stages)
 
 
+def _vllm_config_class() -> type:
+    from vllm.config import VllmConfig
+
+    return VllmConfig
+
+
+def raise_steps_in_flight(extra: int) -> None:
+    """Have ``VllmConfig.max_concurrent_batches`` count ``extra`` steps
+    beyond the pipeline depth for every pipeline in this process.
+
+    The engine core reads the property when it is built, so this runs
+    before it, from the same places as the executor patch. Pipelines of
+    one stage and engines with async scheduling, which size the queue for
+    their own overlap, keep vLLM's count. Installed once per process; the
+    first call's ``extra`` stands.
+    """
+    cls = _vllm_config_class()
+    if getattr(cls, "_tpu_pp_extra_steps", None) is not None:
+        return
+    orig = cls.max_concurrent_batches
+
+    def max_concurrent_batches(self) -> int:
+        depth = orig.fget(self)
+        if (
+            self.parallel_config.pipeline_parallel_size > 1
+            and not self.scheduler_config.async_scheduling
+        ):
+            depth += extra
+        return depth
+
+    max_concurrent_batches.__doc__ = orig.__doc__
+    cls.max_concurrent_batches = property(max_concurrent_batches)
+    cls._tpu_pp_extra_steps = extra
+
+
 def patch_executor_for_pp_wave(vllm_config: Any) -> None:
     """Install the push, the settle and the wider ring buffer on
     ``MultiprocExecutor``.
@@ -283,12 +339,16 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
     if stages <= 1:
         return
     _widen_rpc_ring(stages)
+    extra = extra_steps_in_flight()
+    if extra > 0:
+        raise_steps_in_flight(extra)
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
     if getattr(MultiprocExecutor, "_tpu_pp_wave_patch", False):
         return
     orig_execute = MultiprocExecutor.execute_model
     orig_sample = MultiprocExecutor.sample_tokens
+    orig_profile = MultiprocExecutor.profile
 
     def execute_model(self, scheduler_output, non_block=False):
         state = wave_state(self)
@@ -318,11 +378,24 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         # wait on the step's future sends.
         return None
 
+    def profile(self, is_start=True, profile_prefix=None):
+        # A blocking RPC that every worker answers, sent while steps are in
+        # flight. A stage past the first reaches it only after the forwards
+        # queued ahead of it, and those wait in the hand-off for launches
+        # that only a push or a settle sends, which the engine sends only
+        # when it waits on a step's future. The settle goes out first, so
+        # every stage runs through its queued forwards and answers.
+        wave_state(self).settle(self)
+        return orig_profile(self, is_start, profile_prefix)
+
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
     MultiprocExecutor.take_draft_token_ids = take_draft_token_ids
+    MultiprocExecutor.profile = profile
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(
-        "PP wave: engine push and settle installed, message ring %d chunks",
+        "PP wave: engine push and settle installed, message ring %d chunks, "
+        "%d steps in flight beyond the pipeline depth",
         _ring_chunks_needed,
+        extra,
     )

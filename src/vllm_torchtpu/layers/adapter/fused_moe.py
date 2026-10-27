@@ -189,6 +189,9 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         num_primary_experts=num_primary_experts,
+        nonep_gather=envs.TPU_MOE_NONEP_GATHER.lower(),
+        nonep_combine=envs.TPU_MOE_NONEP_COMBINE.lower(),
+        nonep_permute=envs.TPU_MOE_NONEP_PERMUTE.lower(),
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)

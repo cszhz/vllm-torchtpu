@@ -19,6 +19,7 @@ head dimensions, and KV cache data types on TPU.
 """
 
 import dataclasses
+import os
 import enum
 
 import jax
@@ -189,7 +190,9 @@ class ServingConfigs:
     # quantizes the softmax weights per row, "qkpv" does both. A "2" after
     # either ("qk2", "pv2", "qk2pv2") splits that operand into fp8 high and
     # residual halves stacked along the matmul rows (~bf16 accuracy for 2x
-    # LHS rows). Empty: off.
+    # LHS rows). An "s" after either ("qks", "pvs") takes the static scale
+    # the prefill path uses instead of a per-row one: "qks" casts q as is,
+    # "pvs" casts the softmax weights times P_SCALE. Empty: off.
     native_fp8: str = ""
     # The same for the PREFILL and MIXED kernels: "qk", "pv", "qkpv", each
     # optionally with "s" for a static operand scale instead of a per-row
@@ -201,6 +204,10 @@ class ServingConfigs:
     def native_fp8_split(self, which: str) -> bool:
         """Whether the native fp8 `which` operand is split into hi/lo halves."""
         return f"{which}2" in self.native_fp8
+
+    def native_fp8_static(self, which: str) -> bool:
+        """Whether the decode `which` operand takes the static fp8 scale."""
+        return f"{which}s" in self.native_fp8
 
     def native_fp8_prefill_static(self, which: str) -> bool:
         """Whether the prefill `which` operand takes the static fp8 scale."""
@@ -251,6 +258,16 @@ class ServingConfigs:
             kv_bits = jax.dtypes.itemsize_bits(self.dtype_kv)
             return max(1, scale_bits // kv_bits)
         return 0
+
+
+def kv_lane_pad_columns() -> int:
+    """TPU_RPA_DECODE_KV_LANE_PAD: 128-lane columns the SEQ_ALONG_LANE VMEM
+    buffer carries past the KV block (default 2, the new-token slack). The
+    column count is the sublane stride of every K/V load and store
+    (`strided_load` over the u32 rows), and a stride of 34 revisits a VMEM
+    bank within 24 rows (`utils.has_bank_conflicts`) where 35 does not; read
+    at trace time."""
+    return int(os.environ.get("TPU_RPA_DECODE_KV_LANE_PAD", "2"))
 
 
 @dataclasses.dataclass(frozen=True, eq=True)
@@ -492,7 +509,7 @@ class RpaConfigs:
         #   got   [o---][---n][nnnn][nn--]
         #
         # because we fetch at 128-lane boundary, we need 2 extra padding slots
-        return self.block.bkv_sz + 2 * self.kv_token_align
+        return self.block.bkv_sz + kv_lane_pad_columns() * self.kv_token_align
 
     @property
     def kv_vmem_shape(self):

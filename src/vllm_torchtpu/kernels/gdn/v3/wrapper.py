@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import functools
 import json
 import os
@@ -23,6 +24,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels import static_guards
 from vllm_torchtpu.kernels.gdn.v3 import (
     compute_conv1d,
     compute_gdn,
@@ -96,6 +98,13 @@ def _pooled_region_bytes(
     return region.nblocks * region.nrows * payload * itemsize
 
 
+def _scope(name: str):
+    """A profiler scope around a kernel phase, only under TPU_GDN_TRACE_SCOPES."""
+    if config.trace_scopes():
+        return jax.named_scope(name)
+    return contextlib.nullcontext()
+
+
 def _bf16_qkv_mode() -> int:
     raw = os.environ.get("TPU_GDN_BF16_QKV", "2").strip()
     try:
@@ -121,6 +130,9 @@ def inner_kernel(
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     act_scratch_ref: jax.Ref | None = None,
+    ckpt_stage_ref: jax.Ref | None = None,
+    ckpt_sems: jax.Ref | None = None,
+    dense_act_scratch_ref: jax.Ref | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -149,6 +161,15 @@ def inner_kernel(
             recurrent state carry.
         act_scratch_ref: Optional VMEM scratch reference for post-conv1d f32
             activations when qkv_slot_ref is bfloat16.
+        ckpt_stage_ref: With `cfg.manual_ckpt_dma`, the two-slot staging
+            tile [2, seq_tile_size, window_size, nblocks, *page] the
+            recurrent checkpoints are encoded into before the body DMAs
+            them to the source; `recurrent_out_slot_ref` is then the source
+            itself.
+        ckpt_sems: The staging tile's per-slot DMA semaphores.
+        dense_act_scratch_ref: With `cfg.dense_conv`, the token-dense f32
+            rows [8 + aligned chunk, dim_size] the bf16 qkv tile is unpacked
+            into (rows [8 - prev_kernel_size, 8) carry the previous conv rows).
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
@@ -165,7 +186,9 @@ def inner_kernel(
     # add to the VMEM peak: 4.0 MiB more for the per_seq b1 c64 kernel at dim
     # 12288 on TPU7x.
     qkv_work_ref = qkv_slot_ref
-    if qkv_slot_ref.ndim == 3:
+    dense = cfg.dense_conv
+    stub = config.bench_stub()
+    if qkv_slot_ref.ndim == 3 and not dense:
         assert act_scratch_ref is not None
         aligned_chunk = pl.cdiv(cfg.chunk_size, 16) * 16
         for idx in range(cfg.seq_tile_size):
@@ -187,6 +210,30 @@ def inner_kernel(
             else act_scratch_ref.at[:, : cfg.chunk_size]
         )
 
+    # Pooled BATCHED GDN tiles can encode each checkpoint inside the token
+    # loop, so neither the incoming nor the outgoing f32 states are stacked.
+    manual_dma = None
+    pooled_batched = (
+        cfg.state_plan is not None
+        and cfg.use_recurrent
+        and not cfg.is_kda
+        and carry_recurrent_scratch_ref is None
+    )
+    inline_ckpt = (
+        config.ckpt_store_inline() or cfg.manual_ckpt_dma
+    ) and pooled_batched
+    # Grouped tiles decode and encode the recurrent state per head group
+    # inside the chain, so the tile never holds a whole f32 state.
+    head_group = config.head_group()
+    grouped = (
+        head_group > 0
+        and pooled_batched
+        and vmem_ldst.head_rows_supported(cfg)
+        and cfg.num_v_heads % head_group == 0
+    )
+
+    setup_scope = _scope("gdn_setup")
+    setup_scope.__enter__()
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
         metadata_ref=metadata_ref,
@@ -196,26 +243,9 @@ def inner_kernel(
         carry_conv_scratch_ref=carry_conv_scratch_ref,
         carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
         cfg=cfg,
+        stack_recurrent=not inline_ckpt,
+        load_recurrent=not grouped,
     )
-
-    # Step 1: Conv1D.
-    # NOTE: Conv1D requires performing sliding window where inputs are slided
-    # across rows. If typical 2D layout was used, multiple rows are stored in a
-    # single register which necessitate costly shuffling for every sliding.
-    # Therefore, it is extremely important to leverage compact layout that
-    # ensures 1 register only stores data from 1 row.
-    if qkv_slot_ref.ndim == 3:
-        qkv_in_compact = qkv_work_ref[...]
-    elif qkv_slot_ref.shape[-2] == 2:
-        assert act_scratch_ref is not None
-        qkv_raw = qkv_slot_ref[...].astype(jnp.float32)
-        qkv_in_compact = jnp.concatenate(
-            [qkv_raw[:, :, 0:1, :], qkv_raw[:, :, 1:2, :]], axis=-1
-        )
-        qkv_work_ref = act_scratch_ref
-    else:
-        qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
-    qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
     # Prepare conv1d weights.
     conv_weight = weights_ref.conv.weight[...].astype(jnp.float32)
@@ -223,22 +253,93 @@ def inner_kernel(
     if weights_ref.conv.bias is not None:
         conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
 
-    qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
-        real_sizes=real_sizes,
-        lhs=qkv_in_compact,
-        conv_weight=conv_weight,
-        conv_bias=conv_bias,
-        cfg=cfg,
-    )
+    dense_act = None
+    if dense:
+        dense_act = _dense_conv_silu(
+            qkv_slot_ref=qkv_slot_ref,
+            dense_ref=dense_act_scratch_ref,
+            prev_conv=prev_conv,
+            real_sizes=real_sizes,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            conv_state_out_slot_ref=conv_state_out_slot_ref,
+            carry_conv_scratch_ref=carry_conv_scratch_ref,
+            metadata_ref=metadata_ref,
+            p_id=p_id,
+            cfg=cfg,
+        )
+        qkv_out_compact = None
+    else:
+        # Step 1: Conv1D.
+        # NOTE: Conv1D requires performing sliding window where inputs are
+        # slided across rows. If typical 2D layout was used, multiple rows are
+        # stored in a single register which necessitate costly shuffling for
+        # every sliding. Therefore, it is extremely important to leverage
+        # compact layout that ensures 1 register only stores data from 1 row.
+        if qkv_slot_ref.ndim == 3:
+            qkv_in_compact = qkv_work_ref[...]
+        elif qkv_slot_ref.shape[-2] == 2:
+            assert act_scratch_ref is not None
+            qkv_raw = qkv_slot_ref[...].astype(jnp.float32)
+            qkv_in_compact = jnp.concatenate(
+                [qkv_raw[:, :, 0:1, :], qkv_raw[:, :, 1:2, :]], axis=-1
+            )
+            qkv_work_ref = act_scratch_ref
+        else:
+            qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
+        qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
-    if cfg.state_plan is None:
+        conv_scope = _scope("gdn_conv")
+        conv_scope.__enter__()
+        lazy_state = (
+            config.prefill_lazy_conv_state()
+            and cfg.mode == config.GDNMode.PER_SEQ
+            and not cfg.use_recurrent
+            and carry_conv_scratch_ref is not None
+            and cfg.window_size == 1
+            and cfg.seq_tile_size == 1
+        )
+        if stub == "conv":
+            # Attribution stand-in: no taps, the tail rows are the state.
+            qkv_out_compact = qkv_in_compact[:, cfg.prev_kernel_size :]
+            new_conv_state = jnp.stack(
+                [qkv_in_compact[:, -cfg.prev_kernel_size :]] * cfg.window_size, axis=1
+            )
+        elif lazy_state:
+            qkv_out_compact = compute_conv1d.causal_conv1d_out(
+                qkv_in_compact, conv_weight, conv_bias, cfg
+            )
+            new_conv_state = None
+            _lazy_conv_state(
+                lhs=qkv_in_compact[0],
+                real_sizes=real_sizes,
+                conv_state_out_slot_ref=conv_state_out_slot_ref,
+                carry_conv_scratch_ref=carry_conv_scratch_ref,
+                metadata_ref=metadata_ref,
+                p_id=p_id,
+                cfg=cfg,
+            )
+        else:
+            qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
+                real_sizes=real_sizes,
+                lhs=qkv_in_compact,
+                conv_weight=conv_weight,
+                conv_bias=conv_bias,
+                cfg=cfg,
+            )
+
+    if dense or new_conv_state is None:
+        # The conv state was stored by the dense or lazy path.
+        pass
+    elif cfg.state_plan is None:
         conv_state_out_slot_ref[...] = new_conv_state
     else:
         # External source tiles: encode each window position's checkpoint
         # through the region's typed view; copy_out pushes the raw bytes
         # of the valid checkpoints back to the source.
+        first_ckpt = cfg.window_size - config.bench_ckpt_writes(cfg.window_size)
         for idx in range(cfg.seq_tile_size):
-            for t in range(cfg.window_size):
+            for t in range(first_ckpt, cfg.window_size):
                 args = (
                     conv_state_out_slot_ref.at[idx, t],
                     cfg.state_plan.conv,
@@ -251,13 +352,15 @@ def inner_kernel(
                     pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
                         functools.partial(vmem_ldst.store_state_region, *args)
                     )
-    if carry_conv_scratch_ref is not None:
+    if carry_conv_scratch_ref is not None and not dense and new_conv_state is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
         carry_conv_scratch_ref[...] = new_conv_state[:, -1]
 
     # Apply activation function.
-    qkv_out_compact = jax.nn.silu(qkv_out_compact)
+    if not dense:
+        qkv_out_compact = jax.nn.silu(qkv_out_compact)
+        conv_scope.__exit__(None, None, None)
 
     # Step 2: GDN.
 
@@ -288,53 +391,180 @@ def inner_kernel(
             )
         )
 
-        out, new_recurrent_state = recurrent_fn(
-            q_compact=q_compact,
-            k_compact=k_compact,
-            v_compact=v_compact,
-            b_compact=b_compact,
-            a_compact=a_compact,
-            state_prev=prev_recurrent,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            cfg=cfg,
-            real_sizes=real_sizes,
-        )
+        recurrent_kwargs = {}
+        deferred_dma = cfg.manual_ckpt_dma and config.ckpt_manual_dma_deferred()
+        if cfg.manual_ckpt_dma:
+            assert inline_ckpt and ckpt_stage_ref is not None
+            manual_dma = _ManualCkptDma(
+                metadata_ref=metadata_ref,
+                p_id=p_id,
+                stage_ref=ckpt_stage_ref,
+                sems=ckpt_sems,
+                source_ref=recurrent_out_slot_ref,
+                cfg=cfg,
+            )
+            # The slot about to be filled was last used two steps ago.
+            manual_dma.wait_step(p_id - 2, pl.when(p_id >= 2))
+            if deferred_dma:
+                # The previous step's checkpoints leave for the source between
+                # this step's setup and its token chain.
+                manual_dma.start_step(p_id - 1, pl.when(p_id >= 1))
+        if inline_ckpt:
+            first_ckpt = cfg.window_size - config.bench_ckpt_writes(cfg.window_size)
+
+            def _emit_state(idx: int, t: int, state: jax.Array) -> None:
+                if t < first_ckpt:
+                    return
+                if manual_dma is None:
+                    vmem_ldst.store_recurrent_state(
+                        recurrent_out_slot_ref.at[idx, t],
+                        conv_state_out_slot_ref.at[idx, t],
+                        cfg,
+                        state,
+                    )
+                    return
+                vmem_ldst.store_recurrent_state(
+                    manual_dma.stage.at[idx, t],
+                    conv_state_out_slot_ref.at[idx, t],
+                    cfg,
+                    state,
+                )
+                if not deferred_dma:
+                    manual_dma.start(idx, t)
+
+            recurrent_kwargs["emit_state"] = _emit_state
+
+        setup_scope.__exit__(None, None, None)
+        chain_scope = _scope("gdn_chain")
+        chain_scope.__enter__()
+        if grouped:
+            assert prev_recurrent is None
+            first_ckpt = cfg.window_size - config.bench_ckpt_writes(cfg.window_size)
+            has_initial = [
+                metadata_ref.s_idx_has_initial_state[metadata_ref.p_id_to_s_idx[p_id, idx]]
+                for idx in range(cfg.seq_tile_size)
+            ]
+
+            def _load_heads(idx: int, h0: int, nh: int) -> jax.Array:
+                return vmem_ldst.load_recurrent_heads(
+                    recurrent_in_slot_ref.at[idx, 0], cfg, h0, nh, has_initial[idx]
+                )
+
+            def _emit_heads(idx: int, t: int, h0: int, nh: int, state: jax.Array):
+                if t < first_ckpt:
+                    return
+                dst = (
+                    recurrent_out_slot_ref if manual_dma is None else manual_dma.stage
+                )
+                vmem_ldst.store_recurrent_heads(dst.at[idx, t], cfg, h0, nh, state)
+
+            def _after_seq(idx: int) -> None:
+                # Every head group of the sequence's checkpoints is encoded.
+                if manual_dma is not None and not deferred_dma:
+                    for t in range(first_ckpt, cfg.window_size):
+                        manual_dma.start(idx, t)
+
+            out = compute_gdn.recurrent_gdn_grouped(
+                real_sizes=real_sizes,
+                q_compact=q_compact,
+                k_compact=k_compact,
+                v_compact=v_compact,
+                b_compact=b_compact,
+                a_compact=a_compact,
+                a_log=a_log,
+                dt_bias=dt_bias,
+                cfg=cfg,
+                group=head_group,
+                load_state=_load_heads,
+                emit_state=_emit_heads,
+                after_seq=_after_seq,
+            )
+            new_recurrent_state = None
+        else:
+            out, new_recurrent_state = recurrent_fn(
+                q_compact=q_compact,
+                k_compact=k_compact,
+                v_compact=v_compact,
+                b_compact=b_compact,
+                a_compact=a_compact,
+                state_prev=prev_recurrent,
+                a_log=a_log,
+                dt_bias=dt_bias,
+                cfg=cfg,
+                real_sizes=real_sizes,
+                **recurrent_kwargs,
+            )
+        chain_scope.__exit__(None, None, None)
 
     else:
         chunked_fn = compute_kda.chunked_kda if cfg.is_kda else compute_gdn.chunked_gdn
-        q_large, k_large, v_large, b_large, a_large = (
-            vmem_ldst.load_activation_as_large(
-                qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_work_ref,
-                b_vmem_ref=b_slot_ref,
-                a_vmem_ref=a_slot_ref,
-                cfgs=cfg,
+        if dense:
+            assert dense_act is not None
+            # Heads are lane ranges of the dense rows; the split is free.
+            dk, dv = cfg.kq_head_dim, cfg.v_head_dim
+            k_off = cfg.num_kq_heads * dk
+            v_off = 2 * k_off
+            q_large = jnp.stack(
+                [dense_act[:, h * dk : (h + 1) * dk] for h in range(cfg.num_kq_heads)],
+                axis=0,
+            )[None]
+            k_large = jnp.stack(
+                [
+                    dense_act[:, k_off + h * dk : k_off + (h + 1) * dk]
+                    for h in range(cfg.num_kq_heads)
+                ],
+                axis=0,
+            )[None]
+            v_large = jnp.stack(
+                [
+                    dense_act[:, v_off + h * dv : v_off + (h + 1) * dv]
+                    for h in range(cfg.num_v_heads)
+                ],
+                axis=0,
+            )[None]
+            b_large = jnp.expand_dims(vmem_ldst.load_compact_to_large(b_slot_ref), axis=1)
+            a_large = jnp.expand_dims(vmem_ldst.load_compact_to_large(a_slot_ref), axis=1)
+        else:
+            q_large, k_large, v_large, b_large, a_large = (
+                vmem_ldst.load_activation_as_large(
+                    qkv_vreg=qkv_out_compact,
+                    qkv_vmem_ref=qkv_work_ref,
+                    b_vmem_ref=b_slot_ref,
+                    a_vmem_ref=a_slot_ref,
+                    cfgs=cfg,
+                )
             )
-        )
+        setup_scope.__exit__(None, None, None)
 
-        out, new_recurrent_state = chunked_fn(
-            q_large=q_large,
-            k_large=k_large,
-            v_large=v_large,
-            b_large=b_large,
-            a_large=a_large,
-            state_prev=prev_recurrent,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            cfg=cfg,
-            real_sizes=real_sizes,
-        )
+        with _scope("gdn_chunked"):
+            out, new_recurrent_state = chunked_fn(
+                q_large=q_large,
+                k_large=k_large,
+                v_large=v_large,
+                b_large=b_large,
+                a_large=a_large,
+                state_prev=prev_recurrent,
+                a_log=a_log,
+                dt_bias=dt_bias,
+                cfg=cfg,
+                real_sizes=real_sizes,
+            )
 
     # Store output and recurrent to vmem.
+    store_scope = _scope("gdn_store")
+    store_scope.__enter__()
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
-    if cfg.state_plan is None:
+    if new_recurrent_state is None:
+        # Checkpoints were encoded inside the token loop.
+        assert inline_ckpt or grouped
+    elif cfg.state_plan is None:
         recurrent_out_slot_ref[...] = new_recurrent_state.astype(
             recurrent_out_slot_ref.dtype
         )
     else:
+        first_ckpt = cfg.window_size - config.bench_ckpt_writes(cfg.window_size)
         for idx in range(cfg.seq_tile_size):
-            for t in range(cfg.window_size):
+            for t in range(first_ckpt, cfg.window_size):
                 args = (
                     recurrent_out_slot_ref.at[idx, t],
                     conv_state_out_slot_ref.at[idx, t],
@@ -350,6 +580,214 @@ def inner_kernel(
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
+
+    if manual_dma is not None:
+        # Nothing runs after the last tile, so its own checkpoints and the
+        # previous tile's are drained here.
+        last = metadata_ref.num_tiles[...] - 1
+        if deferred_dma:
+            manual_dma.start_step(p_id, pl.when(p_id == last))
+        manual_dma.wait_step(p_id - 1, pl.when((p_id == last) & (p_id >= 1)))
+        manual_dma.wait_step(p_id, pl.when(p_id == last))
+    store_scope.__exit__(None, None, None)
+
+
+def _dense_conv_silu(
+    *,
+    qkv_slot_ref: jax.Ref,  # [1, aligned_chunk + 16, dim] bf16
+    dense_ref: jax.Ref,  # [8 + aligned_chunk, dim] f32
+    prev_conv: jax.Array,  # [1, prev_kernel_size, 1, dim] f32
+    real_sizes: jax.Array,  # [1]
+    conv_weight: jax.Array,  # [kernel_size, 1, dim] f32
+    conv_bias: jax.Array | None,  # [dim] f32
+    conv_state_out_slot_ref: jax.Ref,
+    carry_conv_scratch_ref: jax.Ref,
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+) -> jax.Array:
+    """Token-dense unpack, causal conv, SiLU and conv-state store of one
+    PER_SEQ tile; returns the activated rows [chunk, dim] in f32.
+
+    The compact layout keeps one token row per vreg (one of eight sublanes
+    in use) so a tap is a whole-vreg op per 128 lanes per token; here the
+    rows are dense and a tap is a sublane shift of an 8-row-aligned load.
+    The conv state (rows [real_sizes, real_sizes + prev_kernel_size) of the
+    carried-plus-chunk rows) is a static tail slice on a full tile and a
+    masked row pick on the partial last tile of a sequence.
+    """
+    chunk = cfg.chunk_size
+    kprev = cfg.prev_kernel_size
+    dim = cfg.dim_size
+    aligned_chunk = pl.cdiv(chunk, 16) * 16
+    r_base = metadata_ref.p_id_to_r_base[p_id, 0]
+    r_prefix = jax.lax.rem(r_base, 16)
+    stub_conv = config.bench_stub() == "conv"
+
+    with _scope("gdn_unpack"):
+        for prefix in range(16):
+
+            @pl.when(r_prefix == prefix)
+            def _unpack(prefix=prefix):
+                load_rows = pl.cdiv(prefix + aligned_chunk, 16) * 16
+                rows = qkv_slot_ref[0, :load_rows, :]
+                dense_ref[8 : 8 + aligned_chunk, :] = rows[
+                    prefix : prefix + aligned_chunk, :
+                ].astype(jnp.float32)
+
+        for k in range(kprev):
+            dense_ref[8 - kprev + k : 8 - kprev + k + 1, :] = prev_conv[0, k]
+
+    with _scope("gdn_conv"):
+        # [8 + chunk, dim]: row 8 - kprev + t is token t - kprev of the chunk.
+        x = dense_ref[0 : 8 + chunk, :]
+        if stub_conv:
+            y = x[8 : 8 + chunk]
+        else:
+            y = x[8 - kprev : 8 - kprev + chunk] * conv_weight[0]
+            for k in range(1, cfg.kernel_size):
+                y = y + x[8 - kprev + k : 8 - kprev + k + chunk] * conv_weight[k]
+            if conv_bias is not None:
+                y = y + conv_bias.reshape(1, dim)
+        y = jax.nn.silu(y)
+
+        def _compact(rows2d: jax.Array) -> jax.Array:
+            # [kprev, dim] dense rows as the state's [kprev, 1, dim] layout.
+            return jnp.stack([rows2d[k : k + 1] for k in range(kprev)], axis=0)
+
+        def _store_state(state3: jax.Array) -> None:
+            _store_conv_state_tile(conv_state_out_slot_ref, cfg, state3)
+
+        rs = real_sizes[0]
+        is_last = metadata_ref.p_id_is_last_tile[p_id, 0]
+        tail = _compact(x[8 + chunk - kprev : 8 + chunk])
+        # The next tile of the sequence resumes from this tile's last rows.
+        carry_conv_scratch_ref[0] = tail
+
+        @pl.when(jnp.logical_and(is_last, rs == chunk))
+        def _full():
+            _store_state(tail)
+
+        @pl.when(rs < chunk)
+        def _partial():
+            # Only a sequence's last tile is partial.
+            row = jax.lax.broadcasted_iota(jnp.int32, (8 + chunk, 1), 0)
+            picks = [
+                jnp.sum(jnp.where(row == 8 - kprev + rs + k, x, 0.0), axis=0, keepdims=True)
+                for k in range(kprev)
+            ]
+            _store_state(_compact(jnp.concatenate(picks, axis=0)))
+
+    return y
+
+
+def _store_conv_state_tile(conv_state_out_slot_ref: jax.Ref, cfg: config.GDNConfig, state3):
+    """Stores one PER_SEQ tile's conv state ([prev_kernel_size, 1, dim]) into
+    window position 0 of slot 0, through the plan's region view when pooled."""
+    if cfg.state_plan is None:
+        conv_state_out_slot_ref[0, 0] = state3
+    else:
+        vmem_ldst.store_state_region(
+            conv_state_out_slot_ref.at[0, 0], cfg.state_plan.conv, state3
+        )
+
+
+def _lazy_conv_state(
+    *,
+    lhs: jax.Array,  # [prev_kernel_size + chunk, 1, dim] f32
+    real_sizes: jax.Array,  # [1]
+    conv_state_out_slot_ref: jax.Ref,
+    carry_conv_scratch_ref: jax.Ref,
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+) -> None:
+    """Conv state of a PER_SEQ chunked tile from its compact rows: the static
+    tail on a full tile, the per-row masked select only on the partial last
+    tile of a sequence."""
+    chunk, kprev = cfg.chunk_size, cfg.prev_kernel_size
+    rs = real_sizes[0]
+    is_last = metadata_ref.p_id_is_last_tile[p_id, 0]
+    tail = lhs[chunk : chunk + kprev]
+    carry_conv_scratch_ref[0] = tail
+
+    @pl.when(jnp.logical_and(is_last, rs == chunk))
+    def _full():
+        _store_conv_state_tile(conv_state_out_slot_ref, cfg, tail)
+
+    @pl.when(rs < chunk)
+    def _partial():
+        _store_conv_state_tile(
+            conv_state_out_slot_ref, cfg, compute_conv1d.conv_state_rows(lhs, rs, cfg)
+        )
+
+
+class _ManualCkptDma:
+    """Write-back of recurrent checkpoints from the kernel body.
+
+    Checkpoint t of tile slot idx is encoded into `stage[step % 2, idx, t]`
+    and DMA'd to its source block right away; the staging slot is reused two
+    steps later, after waiting on the copies it issued. One wait per copy,
+    mirroring the start descriptors, as the pipeline's buffered refs do.
+    """
+
+    def __init__(self, *, metadata_ref, p_id, stage_ref, sems, source_ref, cfg):
+        self.metadata_ref = metadata_ref
+        self.p_id = p_id
+        self.stage_ref = stage_ref
+        self.sems = sems
+        self.source_ref = source_ref
+        self.cfg = cfg
+        self.region = cfg.state_plan.recurrent
+        self.stride = cfg.state_plan.stride
+        self.first_ckpt = cfg.window_size - config.bench_ckpt_writes(cfg.window_size)
+        self.slot = jax.lax.rem(p_id, 2)
+        self.stage = stage_ref.at[self.slot]
+
+    def _nblocks(self, step, idx: int, t: int):
+        md = self.metadata_ref
+        is_last_tile = md.p_id_is_last_tile[step, idx]
+        num_ckpts = jnp.minimum(md.p_id_to_r_size[step, idx], self.cfg.window_size)
+        should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
+        return jnp.where(should_write, self.region.nblocks, 0)
+
+    def start(self, idx: int, t: int, step=None) -> None:
+        """Starts the copy of checkpoint t of slot idx, of this step by
+        default, from the staging slot that step encoded into."""
+        md = self.metadata_ref
+        if step is None:
+            step, slot = self.p_id, self.slot
+        else:
+            slot = jax.lax.rem(step, 2)
+        nblocks = self._nblocks(step, idx, t)
+        s_idx = md.p_id_to_s_idx[step, idx]
+        block = md.s_idx_to_ckpt_indices[s_idx, t] * self.stride + self.region.kb0
+        pltpu.make_async_copy(
+            self.stage_ref.at[slot, idx, t, pl.ds(0, nblocks)],
+            self.source_ref.at[pl.ds(block, nblocks)],
+            self.sems.at[slot],
+        ).start()
+
+    def start_step(self, step, when) -> None:
+        """Starts every checkpoint copy tile `step` encoded into its slot."""
+
+        @when
+        def _():
+            for idx in range(self.cfg.seq_tile_size):
+                for t in range(self.first_ckpt, self.cfg.window_size):
+                    self.start(idx, t, step)
+
+    def wait_step(self, step, when) -> None:
+        """Waits for every copy tile `step` issued from its staging slot."""
+        slot = jax.lax.rem(step, 2)
+
+        @when
+        def _():
+            for idx in range(self.cfg.seq_tile_size):
+                for t in range(self.first_ckpt, self.cfg.window_size):
+                    nblocks = self._nblocks(step, idx, t)
+                    ref = self.stage_ref.at[slot, idx, t, pl.ds(0, nblocks)]
+                    pltpu.make_async_copy(ref, ref, self.sems.at[slot]).wait()
 
 
 def outer_kernel(
@@ -370,6 +808,9 @@ def outer_kernel(
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
     act_scratch_ref: jax.Array | None = None,
+    ckpt_stage_ref: jax.Array | None = None,
+    ckpt_sems: jax.Array | None = None,
+    dense_act_scratch_ref: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -451,6 +892,9 @@ def outer_kernel(
                 carry_conv_scratch_ref,
                 carry_recurrent_scratch_ref,
                 act_scratch_ref,
+                ckpt_stage_ref,
+                ckpt_sems,
+                dense_act_scratch_ref,
             ),
             allocations=allocations,
         )
@@ -769,6 +1213,9 @@ def fused_conv1d_gdn(
         )
         if dynamic_tiling:
             dyn_decode_tile = fit_decode_tile
+        chunk_override = config.prefill_chunk()
+        if chunk_override > 0:
+            mixed_tile_size = max(1, min(chunk_override, batch_size))
         if bf16_qkv_mode and mixed_tile_size % 8:
             # The bf16 qkv layouts run only on multiple-of-8 chunks, and the
             # VMEM fit can cap the chunk below the one checked above.
@@ -901,6 +1348,13 @@ def fused_conv1d_gdn(
                 conv_state=(jnp.float32.dtype if pooled else in_conv_state.dtype),
             ),
             state_plan=state_plan,
+            manual_ckpt_dma=(
+                config.ckpt_manual_dma()
+                and pooled
+                and mode == config.GDNMode.BATCHED
+                and not is_kda
+                and window_size > 0
+            ),
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
@@ -961,6 +1415,29 @@ def fused_conv1d_gdn(
             input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
 
         vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+        vmem_fraction = config.prefill_vmem_fraction()
+        if mode == config.GDNMode.PER_SEQ and vmem_fraction > 0:
+            vmem_limit_bytes = int(
+                vmem_fraction * pltpu.get_tpu_info().vmem_capacity_bytes
+            )
+
+        scratch_shapes = cfg.get_scratch_shape_dict()
+        scratch_shapes.update(ckpt_stage_ref=None, ckpt_sems=None)
+        if cfg.manual_ckpt_dma:
+            assert state_plan is not None
+            scratch_shapes.update(
+                ckpt_stage_ref=pltpu.VMEM(
+                    (
+                        2,
+                        cfg.seq_tile_size,
+                        cfg.window_size,
+                        state_plan.recurrent.nblocks,
+                        *in_conv_state.shape[1:],
+                    ),
+                    in_conv_state.dtype,
+                ),
+                ckpt_sems=pltpu.SemaphoreType.DMA((2,)),
+            )
 
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
@@ -976,7 +1453,7 @@ def fused_conv1d_gdn(
                 weights_spec,
             ),
             out_specs=(hbm_spec, hbm_spec, None if pooled else hbm_spec),
-            scratch_shapes=cfg.get_scratch_shape_dict(),
+            scratch_shapes=scratch_shapes,
             input_output_aliases=input_output_aliases,
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,
@@ -1005,9 +1482,12 @@ def fused_conv1d_gdn(
                 state_source, None, None, config.GDNMode.BATCHED
             )
         if not batched_only:
+            # A prefill-only runner always has a PER_SEQ range and calls it
+            # directly (kernels/static_guards.py).
             if (
                 not prefill_only
                 and out_act is not None
+                and not static_guards.prefill_only()
                 and os.environ.get("TPU_GDN_SKIP_PER_SEQ", "cond") == "cond"
             ):
                 out_act, out_source = jax.lax.cond(

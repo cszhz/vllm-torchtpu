@@ -67,6 +67,18 @@ if TYPE_CHECKING:
     TPU_MOE_LOWTOK_FROM_SCORES: bool = True
     TPU_MOE_LOWTOK_IDS: bool = True
     TPU_MOE_LOWTOK_MAX_TOKENS: int = 256
+    TPU_MOE_LOWTOK_FUSED: bool = False
+    TPU_MOE_LOWTOK_FUSED_DISPATCH_FORM: str = "hier"
+    TPU_MOE_LOWTOK_FUSED_COMBINE_FORM: str = "hier"
+    TPU_MOE_LOWTOK_FUSED_FP8_DISPATCH: bool = False
+    TPU_MOE_LOWTOK_RING_DEPTH: int = 1
+    TPU_MOE_LOWTOK_GATHER: bool = False
+    TPU_MOE_NONEP_GATHER: str = "xla"
+    TPU_MOE_NONEP_GATHER_CHUNK: int = 16384
+    TPU_MOE_NONEP_GATHER_COLS: int = 1024
+    TPU_MOE_NONEP_COMBINE: str = "sc"
+    TPU_MOE_NONEP_PERMUTE: str = "sorts"
+    TPU_SC_COMBINE_BENCH: str = ""
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -84,6 +96,15 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
+    TPU_GDN_PREFILL_DOT_PRECISION: str = ""
+    TPU_GDN_PREFILL_CHUNK: int = 0
+    TPU_GDN_PREFILL_HEAD_GROUP: int = 0
+    TPU_GDN_PREFILL_TINV_BLOCK: int = 0
+    TPU_GDN_PREFILL_DENSE_CONV: bool = False
+    TPU_GDN_PREFILL_VMEM_FRACTION: float = 0.0
+    TPU_GDN_PREFILL_TINV_MODE: str = ""
+    TPU_GDN_PREFILL_SHARED_KKT: bool = False
+    TPU_GDN_PREFILL_LAZY_CONV_STATE: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_RPA_NATIVE_FP8_PREFILL: str = ""
     TPU_RPA_PREFILL_BLOCKS: str = ""
@@ -105,10 +126,15 @@ if TYPE_CHECKING:
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_LAZY_PUSH: bool = False
+    TPU_PP_EXTRA_STEPS_IN_FLIGHT: int = 0
+    TPU_PREFILL_ONLY_STATIC_GUARDS: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_GDN_FUSED_NORM_QUANT: bool = True
+    TPU_FUSED_SE_GATE_FRESH_BUFFER: bool = False
+    TPU_SAMPLER_TOPK_PALLAS: bool = False
+    TPU_SAMPLER_TOPK_MAX_K: int = 0
     TPU_FUSE_PRE_ATTN_NORM_QUANT: bool = True
     TPU_FUSE_POST_ATTN_NORM_MOE: bool = True
     TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS: int = 16
@@ -171,6 +197,9 @@ if TYPE_CHECKING:
     TPU_RAIDEN_STAGE3_MAX_INFLIGHT_LOADS: int = 0
     TPU_RAIDEN_STAGE3_HEAD_UNIQUE: bool = False
     TPU_RAIDEN_INLINE_LOAD: bool = False
+    TPU_RAIDEN_STAGE3_LATE_POLL: bool = False
+    TPU_RAIDEN_STAGE3_ASYNC_REGISTER: bool = False
+    TPU_RAIDEN_STAGE3_ASYNC_REGISTER_DELAY_MS: float = 10.0
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
     KDA_MANUAL_STATE_DMA: bool | None = None
     KDA_MANUAL_H0_DMA: bool | None = None
@@ -221,6 +250,8 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     TPU_SMALL_ALL_REDUCE: bool = True
+    TPU_SMALL_ALL_REDUCE_TP: bool = False
+    TPU_SMALL_ALL_REDUCE_TP_FORM: str = ""
     TPU_DP_PACKED_ROUTER_GATHER: bool = False
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 128
     TPU_ATTN_MOE_OVERLAP: bool = False
@@ -512,6 +543,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool(
         "TPU_ENABLE_GDN_DYNAMIC_TILING", default=False
     ),
+    # GDN v3 prefill (PER_SEQ chunked) kernel knobs, all default off.
+    # Operand precision of the chunked path's MXU dots: "" keeps the f32
+    # operands at Mosaic's default contraction, "bf16" rounds the operands to
+    # bf16 (f32 accumulation), "fp32" asks for Precision.HIGHEST.
+    "TPU_GDN_PREFILL_DOT_PRECISION": env_str("TPU_GDN_PREFILL_DOT_PRECISION", ""),
+    # Tokens per PER_SEQ chunk, bypassing the VMEM-fit cap when positive.
+    "TPU_GDN_PREFILL_CHUNK": env_nonnegative_int("TPU_GDN_PREFILL_CHUNK", 0),
+    # Value heads per chunked-GDN head group (0: all heads in one group).
+    "TPU_GDN_PREFILL_HEAD_GROUP": env_nonnegative_int("TPU_GDN_PREFILL_HEAD_GROUP", 0),
+    # Sub-block size of the chunked GDN triangular solve (0: the config's
+    # head-count-derived default).
+    "TPU_GDN_PREFILL_TINV_BLOCK": env_nonnegative_int("TPU_GDN_PREFILL_TINV_BLOCK", 0),
+    # PER_SEQ tiles with 2D bf16 qkv run the unpack, conv, SiLU and head
+    # split on token-dense [chunk, dim] rows instead of the one-row-per-vreg
+    # compact layout.
+    "TPU_GDN_PREFILL_DENSE_CONV": env_bool("TPU_GDN_PREFILL_DENSE_CONV", default=False),
+    # Scoped-VMEM fraction of the PER_SEQ pallas_call (0: GDNConfig default).
+    "TPU_GDN_PREFILL_VMEM_FRACTION": env_float("TPU_GDN_PREFILL_VMEM_FRACTION", 0.0),
+    # Triangular solve of the chunked GDN: "" is the blocked forward
+    # substitution, "doubling" the nilpotent-series product
+    # (I - L)(I + L^2)(I + L^4)... on the MXU.
+    "TPU_GDN_PREFILL_TINV_MODE": env_str("TPU_GDN_PREFILL_TINV_MODE", ""),
+    # Chunked GDN computes k k^T once per kq head and scales the rows by
+    # beta per value head, instead of one (beta k) k^T dot per value head.
+    "TPU_GDN_PREFILL_SHARED_KKT": env_bool("TPU_GDN_PREFILL_SHARED_KKT", default=False),
+    # PER_SEQ chunked tiles take the conv state from the static tail rows and
+    # run the per-row masked select only on a partial last tile.
+    "TPU_GDN_PREFILL_LAZY_CONV_STATE": env_bool(
+        "TPU_GDN_PREFILL_LAZY_CONV_STATE", default=False
+    ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
@@ -726,6 +787,71 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_LOWTOK_FROM_SCORES": env_bool("TPU_MOE_LOWTOK_FROM_SCORES", default=True),
     "TPU_MOE_LOWTOK_IDS": env_bool("TPU_MOE_LOWTOK_IDS", default=True),
     "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int("TPU_MOE_LOWTOK_MAX_TOKENS", 256),
+    # Run the DP dispatch and the EP combine of a replicated few-token MoE step
+    # inside the moe_lowtok kernel as remote DMAs (kernels/experimental/
+    # moe_lowtok/fused_collectives.py), on a DP x TP layout whose TP pairs are
+    # the mesh's consecutive cores. The forms are "flat" or "hier"; the fp8
+    # dispatch pushes rows quantized per row with their scale; the ring depth
+    # is the number of experts the weight ring holds.
+    "TPU_MOE_LOWTOK_FUSED": env_bool("TPU_MOE_LOWTOK_FUSED", default=False),
+    "TPU_MOE_LOWTOK_FUSED_DISPATCH_FORM": env_str("TPU_MOE_LOWTOK_FUSED_DISPATCH_FORM", "hier"),
+    "TPU_MOE_LOWTOK_FUSED_COMBINE_FORM": env_str("TPU_MOE_LOWTOK_FUSED_COMBINE_FORM", "hier"),
+    "TPU_MOE_LOWTOK_FUSED_FP8_DISPATCH": env_bool(
+        "TPU_MOE_LOWTOK_FUSED_FP8_DISPATCH", default=False
+    ),
+    "TPU_MOE_LOWTOK_RING_DEPTH": env_nonnegative_int("TPU_MOE_LOWTOK_RING_DEPTH", 1),
+    # With TPU_MOE_LOWTOK_FUSED, each expert runs on its routed rows only
+    # (gathered and scattered back by one-hot matmuls inside the kernel)
+    # instead of on every gathered row.
+    "TPU_MOE_LOWTOK_GATHER": env_bool("TPU_MOE_LOWTOK_GATHER", default=False),
+    # Token movement of the whole-expert (non-EP) grouped MoE path, as the
+    # PP8xTP1 prefill stages run it. Gather of the routed rows before the
+    # expert GMM: "xla" is hidden_states[token_indices_sorted] (XLA decides
+    # between a TensorCore gather fusion and the SparseCore gather offload),
+    # "xla_chunked" the same gather issued in pieces of
+    # TPU_MOE_NONEP_GATHER_CHUNK rows (each piece small enough for XLA's
+    # TensorCore gather fusion), "xla_colchunk" the gather done per block of
+    # TPU_MOE_NONEP_GATHER_COLS columns (each block's source table small
+    # enough to sit in VMEM for XLA's TensorCore gather fusion), "sc" the
+    # sc_ragged_gather_v2 kernel, "tc" a TensorCore Pallas kernel that copies
+    # one row per DMA (kernels/experimental/moe_tc_permute.py).
+    "TPU_MOE_NONEP_GATHER": env_with_choices(
+        "TPU_MOE_NONEP_GATHER",
+        "xla",
+        ["xla", "xla_chunked", "xla_colchunk", "sc", "tc"],
+        case_sensitive=False,
+    ),
+    "TPU_MOE_NONEP_GATHER_CHUNK": env_int("TPU_MOE_NONEP_GATHER_CHUNK", 16384),
+    "TPU_MOE_NONEP_GATHER_COLS": env_int("TPU_MOE_NONEP_GATHER_COLS", 1024),
+    # Weighted reduction of the expert outputs back to tokens: "sc" is the
+    # destination-major SparseCore kernel sc_ragged_gather_reduce_v3, "sc_v2"
+    # the v2 kernel, "xla" a gather and a weighted sum in XLA (f32 products),
+    # "xla_kmajor" one gather of num_tokens rows per route slot k summed in
+    # f32 in slot order, "xla_scatter" an f32 scatter-add indexed by the
+    # sorted token ids, "tc" the TensorCore Pallas kernel of
+    # kernels/experimental/moe_tc_permute.py.
+    "TPU_MOE_NONEP_COMBINE": env_with_choices(
+        "TPU_MOE_NONEP_COMBINE",
+        "sc",
+        ["sc", "sc_v2", "xla", "xla_kmajor", "xla_scatter", "tc"],
+        case_sensitive=False,
+    ),
+    # How the permutation metadata is built above TPU_MOE_SINGLE_SORT's row
+    # cap: "sorts" runs three sorts (argsort, its inverse, the packed token
+    # ids), "two_sorts" derives the sorted token ids from the argsort by
+    # division, "counting" takes the inverse permutation and the group sizes
+    # from the one-hot prefix-sum counting sort (block 1024) and keeps one
+    # argsort for the forward permutation.
+    "TPU_MOE_NONEP_PERMUTE": env_with_choices(
+        "TPU_MOE_NONEP_PERMUTE",
+        "sorts",
+        ["sorts", "two_sorts", "counting"],
+        case_sensitive=False,
+    ),
+    # Bench-only knob of sc_ragged_gather_reduce_v3: "skip_math" issues the
+    # row gathers and skips the scatter-adds, "half_cols" runs the scatter-adds
+    # on the first half of each column partition. Must stay unset in serving.
+    "TPU_SC_COMBINE_BENCH": env_str("TPU_SC_COMBINE_BENCH", ""),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
@@ -877,6 +1003,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run a GDN layer's output gated RMS norm and its out_proj's per-token fp8
     # quantization as one kernel. Needs per-channel fp8 out_proj weights.
     "TPU_GDN_FUSED_NORM_QUANT": env_bool("TPU_GDN_FUSED_NORM_QUANT", default=True),
+    # Gives every fused shared-expert gate weight its own [hidden] device
+    # buffer. Built from a reshape of the [1, hidden] gate weight, the
+    # parameter otherwise keeps that buffer and torch_tpu extracts it with one
+    # tt_jit_execute_as_strided program per layer on every compiled call.
+    "TPU_FUSED_SE_GATE_FRESH_BUFFER": env_bool(
+        "TPU_FUSED_SE_GATE_FRESH_BUFFER", default=False
+    ),
+    # Sampler top-k masking over the candidate logits takes the k-th value
+    # from the repeated max-and-mask Pallas kernel (kernels/router_topk.py)
+    # instead of torch.topk.
+    "TPU_SAMPLER_TOPK_PALLAS": env_bool("TPU_SAMPLER_TOPK_PALLAS", default=False),
+    # Caps the sampler's candidate top-k width at this many values (0: the
+    # candidate block count). The runner keeps the candidate path only while
+    # every active request's top_k fits under the cap.
+    "TPU_SAMPLER_TOPK_MAX_K": env_nonnegative_int("TPU_SAMPLER_TOPK_MAX_K", 0),
     # Qwen3.5: compute the decoder input RMSNorm and the per-row FP8
     # quantization feeding attention as one op (needs TPU_SP_FP8_GATHER; see
     # models/vllm/qwen3_next_patch.py).
@@ -931,6 +1072,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the pipeline only when stage 0 would otherwise idle and drops empty
     # steps, so requests share the pipeline (core/pp_lazy_step.py).
     "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
+    # Pipeline parallelism: scheduler steps the engine keeps in flight beyond
+    # the pipeline depth (distributed/pp_push.py). With the depth alone, the
+    # step after the one on the last stage is dispatched only once that
+    # stage has sampled, and stage 0 waits for the engine core's update,
+    # schedule and RPC and for the worker's input preparation; each extra
+    # step moves that chain one wave earlier. The lazy-push loop keeps the
+    # depth alone.
+    "TPU_PP_EXTRA_STEPS_IN_FLIGHT": env_nonnegative_int(
+        "TPU_PP_EXTRA_STEPS_IN_FLIGHT", 0
+    ),
+    # A prefill-only runner (an MTP producer under context or pipeline
+    # parallelism) never runs a step without prefill sequences, so the
+    # attention and GDN wrappers call their per-sequence kernels directly
+    # instead of under a lax.cond on the request distribution
+    # (kernels/static_guards.py).
+    "TPU_PREFILL_ONLY_STATIC_GUARDS": env_bool(
+        "TPU_PREFILL_ONLY_STATIC_GUARDS", default=False
+    ),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,
@@ -1171,6 +1330,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
+    # Consumer only: poll Stage-3 load completion again when a step's async
+    # output is materialized, so a load that lands during the step is
+    # scheduled one step earlier.
+    "TPU_RAIDEN_STAGE3_LATE_POLL": env_bool(
+        "TPU_RAIDEN_STAGE3_LATE_POLL", default=False
+    ),
+    # Producer only: run the Stage-3 request-block registration (span
+    # lowering and controller RPCs) on a side thread so it overlaps the
+    # step's forward instead of delaying its dispatch.
+    "TPU_RAIDEN_STAGE3_ASYNC_REGISTER": env_bool(
+        "TPU_RAIDEN_STAGE3_ASYNC_REGISTER", default=False
+    ),
+    # Longest the side thread waits for the step's forward dispatch before
+    # it starts the registration anyway.
+    "TPU_RAIDEN_STAGE3_ASYNC_REGISTER_DELAY_MS": env_float(
+        "TPU_RAIDEN_STAGE3_ASYNC_REGISTER_DELAY_MS", 10.0
+    ),
     # Comma-separated dot-bounded module prefix names to quantize to FP8 on load.
     # Examples: QUANTIZE_ON_LOAD_PREFIXES="self_attn,shared_experts,layers.0.mlp"
     "QUANTIZE_ON_LOAD_PREFIXES": lambda: [
@@ -1342,6 +1518,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run small decode-step TP all-reduces and DP MoE combines as Pallas
     # kernels (kernels/experimental/small_collectives) instead of XLA's.
     "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE", default=True),
+    # With TPU_SMALL_ALL_REDUCE, also run the TP all-reduces of a layout whose
+    # TP group is a sub-group of the EP mesh (DP x TP engines) as the Pallas
+    # kernel over the TP pair; TPU_SMALL_ALL_REDUCE_TP_FORM picks the kernel
+    # form ("oneshot", "twoshot"; empty: the kernel's size rule).
+    "TPU_SMALL_ALL_REDUCE_TP": env_bool("TPU_SMALL_ALL_REDUCE_TP", default=False),
+    "TPU_SMALL_ALL_REDUCE_TP_FORM": env_str("TPU_SMALL_ALL_REDUCE_TP_FORM", ""),
     # A replicated sequence-parallel MoE step under DP>1 gathers the hidden rows
     # and the router logits in one DP all-gather (packed along the last dim)
     # instead of two. Lossless: the split returns the same values.

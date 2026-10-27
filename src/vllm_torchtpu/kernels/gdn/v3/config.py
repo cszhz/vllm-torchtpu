@@ -16,12 +16,15 @@
 
 import dataclasses
 import enum
+import os
 from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu import envs
 
 
 class AttentionMode(enum.StrEnum):
@@ -138,6 +141,11 @@ class GDNConfig:
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
     qkv_2d: bool = False
+    # Pooled BATCHED GDN only: the recurrent checkpoints bypass the
+    # pipeline's output buffering and are DMA'd to the source by the kernel
+    # body itself, one checkpoint at a time as the token loop produces it,
+    # from a two-slot staging tile (`ckpt_stage_ref`). See ckpt_manual_dma().
+    manual_ckpt_dma: bool = False
 
     @property
     def chunk_size(self) -> int:
@@ -196,6 +204,9 @@ class GDNConfig:
                     return b
             return 2
         # GDN: between-block updates scale as 1 / B.
+        override = prefill_tinv_block()
+        if override > 0 and self.mode == GDNMode.PER_SEQ:
+            return max(1, min(override, self.chunk_size))
         return max(2, min(16, 16 // head_groups))
 
     @property
@@ -284,7 +295,15 @@ class GDNConfig:
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
         act_scratch = None
-        if self.dtypes.act_in == jnp.bfloat16.dtype:
+        dense_act_scratch = None
+        if self.dense_conv:
+            # Token-dense f32 rows of the unpacked bf16 qkv tile.
+            # Rows [8 - prev_kernel_size, 8) hold the carried conv rows, rows
+            # [8, 8 + chunk) the chunk, so every tap is a sublane shift of one
+            # 8-row-aligned load.
+            scratch_chunk = 8 + pl.cdiv(self.chunk_size, 16) * 16
+            dense_act_scratch = pltpu.VMEM((scratch_chunk, self.dim_size), jnp.float32)
+        elif self.dtypes.act_in == jnp.bfloat16.dtype:
             scratch_chunk = (
                 pl.cdiv(self.chunk_size, 16) * 16 if self.qkv_2d else self.chunk_size
             )
@@ -296,4 +315,175 @@ class GDNConfig:
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
             act_scratch_ref=act_scratch,
+            dense_act_scratch_ref=dense_act_scratch,
         )
+
+    @property
+    def dense_conv(self) -> bool:
+        """Whether this tile runs the token-dense conv path (PER_SEQ chunked
+        GDN over 2D bf16 qkv rows, TPU_GDN_PREFILL_DENSE_CONV)."""
+        return (
+            prefill_dense_conv()
+            and self.mode == GDNMode.PER_SEQ
+            and self.qkv_2d
+            and not self.use_recurrent
+            and not self.is_kda
+            and self.chunk_size % 8 == 0
+        )
+
+
+def bench_ckpt_writes(window_size: int) -> int:
+    """Window positions whose checkpoints are written back: the last n.
+
+    Benchmark attribution knob (TPU_GDN_BENCH_CKPT_WRITES); unset writes
+    every position, which is the only correct setting for serving.
+    """
+    raw = os.environ.get("TPU_GDN_BENCH_CKPT_WRITES", "").strip()
+    if not raw:
+        return window_size
+    return max(0, min(int(raw), window_size))
+
+
+def bench_stub() -> str:
+    """Part of the token chain replaced by a stand-in of wrong numerics.
+
+    Benchmark attribution knob (TPU_GDN_BENCH_STUB): "recurrence" skips the
+    state update and the dots, "dots" replaces the MXU dots with VPU
+    products of the same shape. Unset runs the real kernel.
+    """
+    return os.environ.get("TPU_GDN_BENCH_STUB", "").strip().lower()
+
+
+def ckpt_store_inline() -> bool:
+    """Whether BATCHED pooled tiles encode each recurrent checkpoint as the
+    token loop produces it (TPU_GDN_CKPT_STORE_INLINE), instead of stacking
+    the window's f32 states and encoding them after the loop."""
+    return os.environ.get("TPU_GDN_CKPT_STORE_INLINE", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def ckpt_manual_dma() -> bool:
+    """Whether pooled BATCHED GDN tiles issue the recurrent checkpoints'
+    write-back DMAs from the kernel body (TPU_GDN_CKPT_MANUAL_DMA) rather than
+    through the pipeline's end-of-step copy_out. Implies ckpt_store_inline.
+    "1" starts each copy as the token loop encodes its checkpoint; "next"
+    starts a step's copies at the following step, after that step's setup
+    and before its token chain (see ckpt_manual_dma_deferred)."""
+    return os.environ.get("TPU_GDN_CKPT_MANUAL_DMA", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+        "next",
+    )
+
+
+def ckpt_manual_dma_deferred() -> bool:
+    """Whether the manual checkpoint DMAs of a step are started at the next
+    step (TPU_GDN_CKPT_MANUAL_DMA=next) rather than inside the token loop."""
+    return os.environ.get("TPU_GDN_CKPT_MANUAL_DMA", "0").strip().lower() == "next"
+
+
+def head_group() -> int:
+    """Value heads per token-chain group in pooled BATCHED GDN tiles
+    (TPU_GDN_HEAD_GROUP). With a positive value the recurrence runs head
+    groups outer and window tokens inner, so a group's state is decoded from
+    the input tile once, stays live across the window, and each checkpoint
+    is encoded straight into the output tile; the whole-tile f32 state copies
+    disappear. 0 (the default) runs tokens outer over all heads at once."""
+    raw = os.environ.get("TPU_GDN_HEAD_GROUP", "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def kt_xpose() -> bool:
+    """Whether the recurrence builds k^T's lane broadcast with a sublane
+    broadcast and an XLU transpose (TPU_GDN_KT_XPOSE), shared by the value
+    heads of one kq head, instead of the masked lane reduction and a
+    per-head broadcast. Applies to the production token order and to the
+    grouped one."""
+    return os.environ.get("TPU_GDN_KT_XPOSE", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def trace_scopes() -> bool:
+    """Whether the kernel body wraps its phases in named scopes
+    (TPU_GDN_TRACE_SCOPES), which the TPU profiler records in TRACE_COMPUTE
+    mode. Benchmark attribution knob."""
+    return os.environ.get("TPU_GDN_TRACE_SCOPES", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def prefill_dot_precision() -> str:
+    """Operand precision of the chunked GDN dots (TPU_GDN_PREFILL_DOT_PRECISION):
+    "" for f32 operands at Mosaic's default contraction, "bf16" for bf16
+    operands with f32 accumulation, "fp32" for Precision.HIGHEST."""
+    mode = envs.TPU_GDN_PREFILL_DOT_PRECISION.lower()
+    if mode not in ("", "bf16", "fp32"):
+        raise ValueError(f"TPU_GDN_PREFILL_DOT_PRECISION={mode!r}: expected '', bf16 or fp32")
+    return mode
+
+
+def prefill_chunk() -> int:
+    """PER_SEQ chunk override in tokens (TPU_GDN_PREFILL_CHUNK), 0 for the
+    VMEM-fit pick."""
+    return envs.TPU_GDN_PREFILL_CHUNK
+
+
+def prefill_head_group() -> int:
+    """Value heads per chunked-GDN head group (TPU_GDN_PREFILL_HEAD_GROUP),
+    0 for all heads at once."""
+    return envs.TPU_GDN_PREFILL_HEAD_GROUP
+
+
+def prefill_tinv_block() -> int:
+    """Triangular-solve sub-block override (TPU_GDN_PREFILL_TINV_BLOCK), 0
+    for the head-count-derived default."""
+    return envs.TPU_GDN_PREFILL_TINV_BLOCK
+
+
+def prefill_dense_conv() -> bool:
+    """Whether PER_SEQ tiles run the token-dense conv path
+    (TPU_GDN_PREFILL_DENSE_CONV)."""
+    return envs.TPU_GDN_PREFILL_DENSE_CONV
+
+
+def prefill_vmem_fraction() -> float:
+    """Scoped-VMEM fraction override of the PER_SEQ pallas_call
+    (TPU_GDN_PREFILL_VMEM_FRACTION), 0 for the GDNConfig default."""
+    return envs.TPU_GDN_PREFILL_VMEM_FRACTION
+
+
+def prefill_tinv_mode() -> str:
+    """Triangular-solve algorithm of the chunked GDN (TPU_GDN_PREFILL_TINV_MODE):
+    "" for the blocked forward substitution, "doubling" for the MXU series."""
+    mode = envs.TPU_GDN_PREFILL_TINV_MODE.lower()
+    if mode not in ("", "doubling"):
+        raise ValueError(f"TPU_GDN_PREFILL_TINV_MODE={mode!r}: expected '' or doubling")
+    return mode
+
+
+def prefill_shared_kkt() -> bool:
+    """Whether chunked GDN shares k k^T across the value heads of a kq head
+    (TPU_GDN_PREFILL_SHARED_KKT)."""
+    return envs.TPU_GDN_PREFILL_SHARED_KKT
+
+
+def prefill_lazy_conv_state() -> bool:
+    """Whether PER_SEQ chunked tiles defer the conv-state row select to a
+    partial last tile (TPU_GDN_PREFILL_LAZY_CONV_STATE)."""
+    return envs.TPU_GDN_PREFILL_LAZY_CONV_STATE
