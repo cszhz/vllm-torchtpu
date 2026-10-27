@@ -20,7 +20,11 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
-from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
+
+# Scoped VMEM the post kernel reserves: the smallest round budget whose
+# _vmem_need estimate still admits the default 64-token block, instead of
+# the whole of VMEM, so XLA can keep its own buffers resident across the call.
+POST_VMEM_LIMIT_BYTES = 24 * 1024 * 1024
 
 
 def _post_kernel(x_ref, res_ref, post_ref, comb_ref, out_ref, *, hc_mult, hidden_size):
@@ -49,7 +53,7 @@ def mhc_post_2d(
     comb_res_mix: jax.Array,
     *,
     token_block_size: int = 64,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int = POST_VMEM_LIMIT_BYTES,
 ) -> jax.Array:
     """2D-native entry: the kernel's own layout as public API.
 
@@ -127,7 +131,7 @@ def mhc_post(
     comb_res_mix: jax.Array,
     *,
     token_block_size: int = 64,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int = POST_VMEM_LIMIT_BYTES,
 ) -> jax.Array:
     """Pallas replacement for vLLM's ``mhc_post_torch``.
 

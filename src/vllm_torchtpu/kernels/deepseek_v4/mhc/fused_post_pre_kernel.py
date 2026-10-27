@@ -21,7 +21,12 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
-from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
+
+# Scoped VMEM the seam kernel reserves. XLA keeps the rest of VMEM free for
+# its own buffers across the call, so this sits just above the kernel's
+# need (AOT: ~5.8 MiB at T=1024, ~8.3 MiB at T=8192) rather than at the
+# whole of VMEM.
+FUSED_VMEM_LIMIT_BYTES = 12 * 1024 * 1024
 
 
 def _fused_kernel(
@@ -119,7 +124,7 @@ def fused_post_pre_mixes(
     *,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int = FUSED_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """The Pallas seam kernel: post recombine fused with pre's mix GEMM
     and in-block collapse.
@@ -239,7 +244,7 @@ def mhc_fused_post_pre(
     *,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int = FUSED_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Fused seam op: Pallas post+GEMM+collapse kernel, XLA gates epilogue.
     Returns (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur).

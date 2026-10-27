@@ -21,7 +21,11 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
-from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
+
+# Scoped VMEM the pre kernels reserve: the smallest round budget whose
+# _vmem_need estimate still admits the default 64-token block, instead of
+# the whole of VMEM, so XLA can keep its own buffers resident across the call.
+PRE_VMEM_LIMIT_BYTES = 24 * 1024 * 1024
 
 
 def _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref):
@@ -93,7 +97,7 @@ def mhc_pre_mixes(
     fn: jax.Array,
     *,
     token_block_size: int = 64,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int = PRE_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array]:
     """Pallas replacement for the mix GEMM + squared sum of mhc_pre.
 
@@ -175,7 +179,7 @@ def mhc_pre_mixes_collapse(
     hc_pre_eps: float,
     *,
     token_block_size: int = 64,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int = PRE_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Mixes + in-block collapse: the full memory-bound half of ``mhc_pre``.
 
@@ -269,7 +273,7 @@ def mhc_pre(
     sinkhorn_repeat: int,
     *,
     token_block_size: int = 64,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int = PRE_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``mhc_pre`` with the mix GEMM AND the collapse in Pallas; only the
     tiny gates/Sinkhorn stay in XLA.
