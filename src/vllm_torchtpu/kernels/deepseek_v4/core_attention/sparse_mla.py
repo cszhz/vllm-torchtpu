@@ -205,6 +205,8 @@ DENSE_KV_BLOCK = 256
 # this many blocks per online-softmax step: each step rescales the f32
 # accumulator once.
 DENSE_BLOCKS_PER_STEP = 2
+# Nonzero: a batch leaves out the blocks none of its tokens selected.
+DENSE_SKIP_EMPTY_BLOCKS = 1
 # A single-sequence batch whose tokens can select more compressed rows than
 # this keeps the per-token SparseCore gather.
 DENSE_MAX_ROWS = 1 << 30
@@ -225,6 +227,10 @@ class DenseRefs(NamedTuple):
     # SMEM i32[num_tokens // batch_size]: per batch, rows [0, n) of its
     # sequence that cover every entry its tokens selected.
     batch_rows_ref: Any
+    # SMEM i32[num_tokens // batch_size * (max_rows // DENSE_KV_BLOCK)]: per
+    # batch, in order, the blocks of rows [0, n) it attends, then padding.
+    block_list_ref: Any
+    num_blocks_ref: Any  # SMEM i32[num_tokens // batch_size], the list's length
     page_indices_ref: Any  # SMEM i32[max_num_seqs * pages_per_seq]
     cache_nope_hbm_ref: Any  # int32[total_pages, page_size, 128]
     cache_rope_hbm_ref: Any  # int32[total_pages, page_size // 4, 128]
@@ -251,6 +257,8 @@ def _attention_dense_kernel(
     bo_ids_ref,
     token_seq_ref,
     batch_rows_ref,
+    block_list_ref,
+    num_blocks_ref,
     page_indices_ref,
     attention_sinks_ref,
     q_hbm_ref,
@@ -287,6 +295,8 @@ def _attention_dense_kernel(
         dense=DenseRefs(
             token_seq_ref,
             batch_rows_ref,
+            block_list_ref,
+            num_blocks_ref,
             page_indices_ref,
             cache_nope_hbm_ref,
             cache_rope_hbm_ref,
@@ -760,18 +770,23 @@ def _attention_kernel(
 
     def attend_from_cache(bi_sem_idx, bo_sem_idx, attention_sinks):
         """`process`'s token loop for a `DenseRefs` batch, over the
-        DENSE_KV_BLOCK-row blocks that cover `dense_batch_rows`."""
+        DENSE_KV_BLOCK-row blocks of `dense.block_list_ref`."""
         num_rows = dense_batch_rows(batch_start_seq_idx)
-        num_blocks = cdiv(num_rows, DENSE_KV_BLOCK)
-
-        def block_row(j):
-            return pl.multiple_of(j * DENSE_KV_BLOCK, DENSE_KV_BLOCK)
 
         @pl.when(starts_dense_run(batch_start_seq_idx))
         def _():
-            @pl.loop(0, num_blocks)
+            @pl.loop(0, cdiv(num_rows, DENSE_KV_BLOCK))
             def _(j):
-                build_dense_block(bi_sem_idx, num_rows, block_row(j))
+                first_row = pl.multiple_of(j * DENSE_KV_BLOCK, DENSE_KV_BLOCK)
+                build_dense_block(bi_sem_idx, num_rows, first_row)
+
+        batch = batch_start_seq_idx // batch_size
+        num_blocks = dense.num_blocks_ref[batch]
+        list_start = batch * (max_rows // DENSE_KV_BLOCK)
+
+        def block_row(i):
+            block = dense.block_list_ref[list_start + i]
+            return pl.multiple_of(block * DENSE_KV_BLOCK, DENSE_KV_BLOCK)
 
         per_step = DENSE_BLOCKS_PER_STEP
         num_steps = num_blocks // per_step
@@ -1092,6 +1107,45 @@ def _dense_batches(
     return token_seq.astype(jnp.int32), rows.astype(jnp.int32)
 
 
+def _dense_blocks(topk_indices, batch_rows, batch_size: int, max_rows: int):
+    """`DenseRefs.block_list_ref` and `DenseRefs.num_blocks_ref`: each batch
+    attends the DENSE_KV_BLOCK-row blocks of its `batch_rows` that one of its
+    tokens selected an entry in, or all of them without
+    DENSE_SKIP_EMPTY_BLOCKS. Leaving out a block nobody selected is exact: it
+    would add probability 0 to every token."""
+    num_blocks = max_rows // DENSE_KV_BLOCK
+    block = jnp.arange(num_blocks)
+    attend = block < cdiv(batch_rows, DENSE_KV_BLOCK)[:, None]
+    if DENSE_SKIP_EMPTY_BLOCKS:
+        # Per batch, the OR over its entries of one bit per selected block.
+        assert DENSE_KV_BLOCK & (DENSE_KV_BLOCK - 1) == 0
+        entry_block = lax.shift_right_logical(
+            topk_indices, DENSE_KV_BLOCK.bit_length() - 1
+        )
+        bit = jnp.left_shift(jnp.uint32(1), (entry_block & 31).astype(jnp.uint32))
+        words = []
+        for w in range(cdiv(num_blocks, 32)):
+            hit = (topk_indices >= 0) & (lax.shift_right_logical(entry_block, 5) == w)
+            words.append(
+                lax.reduce(
+                    jnp.where(hit, bit, jnp.uint32(0)).reshape(
+                        -1, batch_size, topk_indices.shape[1]
+                    ),
+                    jnp.uint32(0),
+                    lax.bitwise_or,
+                    (1, 2),
+                )
+            )
+        bits = jnp.stack(words, axis=1)[:, block // 32]
+        selected = (bits >> (block % 32).astype(jnp.uint32)) & 1
+        attend &= selected != 0
+    block_list = jnp.sort(jnp.where(attend, block, num_blocks), axis=1)
+    return (
+        block_list.reshape(-1).astype(jnp.int32),
+        jnp.sum(attend, axis=1).astype(jnp.int32),
+    )
+
+
 def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):
@@ -1376,12 +1430,20 @@ def sparse_ragged_paged_attention(
             (
                 token_seq,
                 batch_rows,
+                block_list,
+                num_blocks,
                 dense_page_indices,
                 dense_cache_nope,
                 dense_cache_rope,
                 select,
             ) = dense_inputs
-            dense_prefetches = (token_seq, batch_rows, dense_page_indices)
+            dense_prefetches = (
+                token_seq,
+                batch_rows,
+                block_list,
+                num_blocks,
+                dense_page_indices,
+            )
             operands += (dense_cache_nope, dense_cache_rope, select)
             in_specs += [pl.BlockSpec(memory_space=pltpu.HBM)] * 3
             pages_per_seq = num_page_indices // max_num_seqs
@@ -1476,9 +1538,17 @@ def sparse_ragged_paged_attention(
             attention_kernel_batch_size,
             gather_and_attention_chunk_size,
         )
+        block_list, num_blocks = _dense_blocks(
+            topk_indices,
+            batch_rows,
+            attention_kernel_batch_size,
+            pages_per_seq * page_size,
+        )
         dense_inputs = (
             token_seq,
             batch_rows,
+            block_list,
+            num_blocks,
             page_indices,
             cache_kv_nope,
             cache_kv_rope,
