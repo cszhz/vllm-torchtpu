@@ -148,10 +148,10 @@ local maxNumSeqs = cdk.numVar('MAX_NUM_SEQS', 64);
 //   Both limits only meet near 0.92, with ~35M to spare. 2048 at 0.90 had 15.59 GiB (1,264,937
 //   tokens, j-68dfea6b-1db1-465b-91ef). Interpolating, 3072 at 0.90 leaves ~13.4 GiB and ~2G of
 //   compile headroom.
-// c=160: 128, as in j-21d066d3-552c-4ad4-87e9. At c=64 (forge run ya5w5534, objective p90 interactivity)
-// 64 was better: every step pays the DP-wide max bucket, which at 128 is T128 on ~100% of steps (~73.5 ms)
-// vs T64 (~57 ms): n=2 248.1k vs 243.0k total tok/s, intvty p90 60.8 vs 47.05 (j-418771d5, j-d1e2c60f).
-local maxNumBatchedTokens = cdk.numVar('MAX_NUM_BATCHED_TOKENS', 128);
+// c=192: 160, for throughput. n=3 vs n=5 same window: 58.8k vs 55.4k tok/s/chip (+6%), TTFT mean 21.4 vs
+// 28.4 s, intvty p50/p90 41.2/37.1 vs 47.6/42.6 (still above the starting point's 38.2/34.6). 192 gave
+// 60.9k but intvty p50/p90 37.5/33.1, below the starting point.
+local maxNumBatchedTokens = cdk.numVar('MAX_NUM_BATCHED_TOKENS', 160);
 // As in j-2c8a1b3b-17f0-4b33-bfb6. BLOCK_SIZE=0 drops --block-size and leaves it to vLLM.
 local blockSize = cdk.numVar('BLOCK_SIZE', 1024);
 // The DSv4 HCA and indexer kernel blocks count KV pages, and vllm-torchtpu's defaults (6990d19b3) are sized

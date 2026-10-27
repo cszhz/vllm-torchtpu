@@ -32,7 +32,9 @@ local servedModelName = cdk.var('SERVED_MODEL_NAME', 'deepseek-ai/DeepSeek-V4-Pr
 local gcsCkptDir = cdk.var('GCS_CKPT_DIR', 'gs://cloud-devkit/ckpt/hf/deepseek-ai/DeepSeek-V4-Pro-0813');
 local gcsModelSrc = cdk.var('GCS_MODEL_SRC', gcsCkptDir);
 local gcsDatasetCache = cdk.var('GCS_DATASET_CACHE', 'gs://cloud-devkit/datasets/hf_cache/semianalysisai/cc-traces-weka-062126');
-local sharedCachePvc = cdk.var('SHARED_CACHE_PVC', '');
+// Read-only PVC mounted at /vllm-cache; it holds the weights at /vllm-cache/DeepSeek-V4-Pro-0813, as in
+// j-21d066d3-552c-4ad4-87e9. SHARED_CACHE_PVC= (empty) mounts nothing and syncs from GCS_CKPT_DIR instead.
+local sharedCachePvc = cdk.var('SHARED_CACHE_PVC', 'gxd-dsv4-pro-weights-rox-pvc');
 local hfStorageSize = cdk.var('HF_STORAGE_SIZE', '1500Gi');
 
 // --- Cluster shape -----------------------------------------------------------
@@ -56,11 +58,14 @@ local kvOffload = cdk.boolVar('KV_OFFLOAD', true) || cdk.boolVar('ENABLE_KV_OFFL
 // 30 GiB/rank x 8 ranks = 240 GiB/host, the same host footprint as the TP=16 note above. The 900 GiB/host
 // limit also covers /dev/shm (memory-backed, up to 300Gi) and the vLLM processes, so raise it with care.
 // j-2c8a1b3b-17f0-4b33-bfb6 ran with 12079595520 bytes (11.25 GiB/rank = 90 GiB/host).
-// 24, not 30: the host-staged weights stay resident after loading (~640 GiB anon a host, per the
-// "hostmem:" lines of j-f432a2c4-3c5f-4658-b382), so 30 GiB/rank left no margin and that run and
-// j-191aa11f-389d-43cb-bc1d were OOM-killed as the store came up. 24 GiB/rank = 192 GiB/host,
-// ~20% fewer DRAM KV blocks. Back to 30 once the staging is actually freed.
-local kvOffloadingSize = cdk.var('KV_OFFLOADING_SIZE', '24');
+// 48 GiB/rank = 384 GiB/host, as in j-21d066d3-552c-4ad4-87e9. Until vllm-torchtpu returned freed memory
+// to tcmalloc's page heap (release_memory_to_os), each TPU process kept its ~73 GiB of staged weights after
+// loading (~645 GiB anon a host: j-ee9a6ca2-0e32-4583-a32c held 852/900 GiB anon on the head pod with
+// 24 GiB/rank), and 30 GiB/rank OOM-killed j-191aa11f-389d-43cb-bc1d and j-f432a2c4-3c5f-4658-b382 as the
+// store came up. With the staging released the head pod should hold ~65 GiB of processes + 384 GiB of
+// store + 32 GiB premapped (see TPU_PREMAPPED_BUFFER_SIZE), about 480 GiB; check the "hostmem:" lines.
+// On a vllm-torchtpu tree without that release, use KV_OFFLOADING_SIZE=24.
+local kvOffloadingSize = cdk.var('KV_OFFLOADING_SIZE', '48');
 local offloadControllerPort = cdk.numVar('OFFLOAD_CONTROLLER_PORT', 27801);
 local globalRegistryPort = cdk.numVar('GLOBAL_REGISTRY_PORT', 27800);
 // Run global_registry_server on the head and point every Raiden store at it: stores publish their
@@ -143,9 +148,10 @@ local maxNumSeqs = cdk.numVar('MAX_NUM_SEQS', 64);
 //   Both limits only meet near 0.92, with ~35M to spare. 2048 at 0.90 had 15.59 GiB (1,264,937
 //   tokens, j-68dfea6b-1db1-465b-91ef). Interpolating, 3072 at 0.90 leaves ~13.4 GiB and ~2G of
 //   compile headroom.
-// c=64 (forge run ya5w5534, objective p90 interactivity): every step pays the DP-wide max bucket, which
-// at 128 is T128 on ~100% of steps (~73.5 ms). 64 runs every step at T64 (~57 ms): n=2 248.1k vs 243.0k
-// total tok/s, intvty p90 60.8 vs 47.05 (j-418771d5, j-d1e2c60f). 48 is no cheaper than 64 (T48 56 ms).
+// c=64: 64. Every step pays the DP-wide max bucket; at 64 the steps run T64 instead of T128. With the
+// rest of the c=160 settings, n=3 vs n=3: 31.30k vs 30.82k tok/s/chip and intvty p90 66.7 vs 62.3 against
+// the previous c=64 settings (MNBT 64, no intra-chip TP, 24 GiB offload, no cap); MNBT 128 gave 31.4k but
+// intvty p90 56.5. Below 64 the fused EP MoE kernel is not armed and expert placement refuses to start.
 local maxNumBatchedTokens = cdk.numVar('MAX_NUM_BATCHED_TOKENS', 64);
 // As in j-2c8a1b3b-17f0-4b33-bfb6. BLOCK_SIZE=0 drops --block-size and leaves it to vLLM.
 local blockSize = cdk.numVar('BLOCK_SIZE', 1024);
@@ -316,11 +322,8 @@ local hostMemSampleSeconds = cdk.numVar('HOST_MEM_SAMPLE_SECONDS', 30);
 // infx-qwen35-agentx (one var sets both, as there). Without it every transfer maps its own DMA
 // buffer: in j-f74e6597-85ac-4f79-869a MapDmaBuffer took ~850 ms during program reloads and
 // blocked that rank's H2D/D2H, stalling all 16 ranks for ~1.1 s.
-// It pins 4 GiB in each of the 8 TPU processes a host, 32 GiB, which only fits beside
-// KV_OFFLOADING_SIZE=24: with 30 it took j-191aa11f-389d-43cb-bc1d and j-f432a2c4-3c5f-4658-b382
-// past the 900Gi host limit. j-d0188942-b76b-47ec-98db (24, no buffer) held 835/900 GiB on the head
-// pod for the whole benchmark, so this leaves ~30 GiB. none sets neither variable, and libtpu then
-// enables no buffer.
+// It pins 4 GiB in each of the 8 TPU processes a host, 32 GiB, counted in the KV_OFFLOADING_SIZE
+// budget above. none sets neither variable, and libtpu then enables no buffer.
 local premappedBufferSize = cdk.var('TPU_PREMAPPED_BUFFER_SIZE', '4294967296');
 // vllm-torchtpu ee93d4833+: after loading, log the CPU tensor storage still reachable and what holds
 // it, to find what keeps the staged weights resident. 0 turns it off.
@@ -338,7 +341,13 @@ local pairSwap = cdk.var('TPU_DSV4_PAIR_SWAP', '1');
 // SrptPrefillScheduler caps each step's attention work (sum over scheduled tokens of their context) by
 // clipping prefill chunks while some DP rank decodes, so one rank's chunk deep in a long prompt stops
 // setting every rank's step. Empty = off.
-local srptAttnWorkCap = cdk.var('VLLM_TPU_SRPT_ATTN_WORK_CAP', '');
+// c=160: full stack + 25M, n=3 vs n=4: intvty p90 46.4-47.8 vs 45.1-45.8, TTFT mean 19.8-20.3 vs
+// 21.4-23.5 s, tok/s/chip +2% (in noise).
+local srptAttnWorkCap = cdk.var('VLLM_TPU_SRPT_ATTN_WORK_CAP', '25000000');
+// Each TensorCore keeps half of wq_b/wo_a/wo_b and the chip pair exchanges activations; the freed HBM goes
+// to KV (1.875M -> 3.14M tokens/rank in j-02810869, 361,390 vs ~310k total tok/s). Tolerance tier:
+// mmlu_pro 0.8386 vs 0.845 off (McNemar p=0.40). Empty = off.
+local attnIntraChipTp = cdk.var('TPU_DSV4_ATTN_INTRA_CHIP_TP', '1');
 
 // --- Benchmark client --------------------------------------------------------
 local fastMode = cdk.boolVar('FAST', false) || cdk.boolVar('FAST_MODE', false);
@@ -528,6 +537,11 @@ local serverScript = agentx.fill(
     if [ -d "/vllm-cache/deepseek-ai/DeepSeek-V4-Pro-0813" ]; then
       echo "Found DeepSeek-V4 on shared PVC at /vllm-cache/deepseek-ai/DeepSeek-V4-Pro-0813"
       export MODEL_PATH="/vllm-cache/deepseek-ai/DeepSeek-V4-Pro-0813"
+      export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Pro-0813}"
+      export HF_HUB_OFFLINE=1
+    elif [ -d "/vllm-cache/DeepSeek-V4-Pro-0813" ]; then
+      echo "Found DeepSeek-V4 on shared PVC at /vllm-cache/DeepSeek-V4-Pro-0813"
+      export MODEL_PATH="/vllm-cache/DeepSeek-V4-Pro-0813"
       export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Pro-0813}"
       export HF_HUB_OFFLINE=1
     elif [ -d "/vllm-cache/hub/models--deepseek-ai--DeepSeek-V4-Pro-0813" ]; then
@@ -775,6 +789,7 @@ local serverJob = cdk.job(
           'TPU_DSV4_PAIR_SWAP',
           'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK',
           'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK',
+          'TPU_DSV4_ATTN_INTRA_CHIP_TP',
           'TPU_PJRT_EVENT_TRACE_ENABLE',
           'USE_PHASED_PROFILER',
           'VLLM_TPU_MOST_MODEL_LEN',
@@ -810,6 +825,7 @@ local serverJob = cdk.job(
         [if srptAttnWorkCap != '' then 'VLLM_TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
         [if hcaKvPagesPerBlock != '' then 'TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK']: hcaKvPagesPerBlock,
         [if indexerKvPagesPerBlock != '' then 'TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK']: indexerKvPagesPerBlock,
+        [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
         // Read by the scheduler in the EngineCore processes, not by Ray workers.
         [if prefillGateMinCadences != '' then 'TPU_PREFILL_GATE_MIN_CADENCES']: prefillGateMinCadences,
         [if prefillGateLogSteps != '' then 'TPU_PREFILL_GATE_LOG_STEPS']: prefillGateLogSteps,
