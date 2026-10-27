@@ -160,6 +160,8 @@ Tests requiring physical TPU hardware run in Buildkite CI.
 
 * **On-call fixes**: A PR that fixes a broken main or nightly build can also take the `oncall-fix` label. Its TPU jobs then run ahead of every other build, including builds of `main`. Adding the label starts a new build and cancels the queued one. Use it only for on-call fixes.
 
+* **Changes that need no TPU run**: A PR that touches no TPU code path (CI scripts, docs tooling, CPU-only code) can take the `skip-tpu-ci` label. Its builds then skip the TPU steps but still run the type check and the CPU unit tests, so a test that only fails on a CPU host is caught before the merge. Do not use it to get a red TPU step out of the way.
+
 ---
 
 ## 6. Pull Request & Review Lifecycle

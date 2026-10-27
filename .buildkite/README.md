@@ -22,6 +22,17 @@ steps not gated on it. The schedules keep clear of the hours the nightly's
 perf steps take. The integration pipeline also runs the lane, because its LKG
 promotion waits on two of its steps.
 
+A PR whose change needs no TPU run takes the `skip-tpu-ci` label. Its builds,
+and the post-merge build of its squash commit, upload the `tests` lane alone
+and skip its TPU steps: `bootstrap.sh` sets `TPU_STEPS_SKIP`, which every step
+built on `x-tpu-step-defaults` in `pipeline_tests.yml` takes as its `skip`
+reason, and the `-omni` image is not built. The type check and the CPU unit
+tests still run, so a test that only fails on a CPU host is caught before the
+merge. `SKIP_TPU=1` in a build's environment does the same without the label,
+and the label wins over `run-full-ci` and `run-perf-eval`. The pipeline's
+first step on Buildkite runs `bootstrap.sh` as is: it must not exit on the
+label itself, or nothing runs.
+
 Releases and nightly images are published by the `vllm-torchtpu-release`
 pipeline in the TPU Release cluster; [`release/README.md`](release/README.md)
 has how to cut a release. Its nightly step runs

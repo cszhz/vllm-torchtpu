@@ -61,6 +61,20 @@ determine_job_priority() {
   echo "$priority $workload_priority"
 }
 
+# True when the merged pull request $1 carries the label $2 on GitHub. A
+# merged PR's labels do not reach its post-merge build, so they are read with
+# a token from the agent's GitHub App helper. Any failure (no helper, no
+# token, no answer) is false, which leaves the build running everything.
+merged_pr_has_label() {
+  local pr="$1" label="$2" helper token labels
+  helper="${GITHUB_APP_CREDENTIAL_HELPER:-/etc/buildkite-agent/git-credential-github-app}"
+  token=$("$helper" get 2>/dev/null </dev/null | sed -n 's/^password=//p') || true
+  [[ -n "$token" ]] || return 1
+  labels=$(curl -fsS --max-time 10 -H "Authorization: token $token" \
+    "https://api.github.com/repos/vllm-project/vllm-torchtpu/issues/${pr}/labels" 2>/dev/null) || return 1
+  grep -q "\"name\": *\"${label}\"" <<< "$labels"
+}
+
 job_priorities=$(determine_job_priority)
 read -r JOB_PRIORITY WORKLOAD_PRIORITY <<< "$job_priorities"
 export JOB_PRIORITY
@@ -193,6 +207,40 @@ elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_RE
       "Runs the perf/eval lane (\`run-perf-eval\` label)."
   fi
 fi
+
+# A PR with the skip-tpu-ci label runs the tests lane alone, with its TPU
+# steps skipped (pipeline_tests.yml reads TPU_STEPS_SKIP): the type check and
+# the CPU unit tests still run, so a test that only fails on the CPU runner is
+# caught before the merge. The post-merge build of such a PR does the same;
+# the PR is the number GitHub puts at the end of a squash commit's subject.
+# SKIP_TPU=1 in a build's environment asks for the same without the label.
+# The label wins over run-full-ci and run-perf-eval, and the integration
+# pipeline ignores it: its LKG promotion needs the whole suite.
+skip_tpu_reason=""
+if [[ "${SKIP_TPU:-0}" == "1" ]]; then
+  skip_tpu_reason="SKIP_TPU=1"
+elif [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
+  :
+elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+  if grep -qx "skip-tpu-ci" <<< "${pr_labels//,/$'\n'}"; then
+    skip_tpu_reason="the PR has the \`skip-tpu-ci\` label"
+  fi
+elif [[ "${BUILDKITE_BRANCH:-}" == "main" && "${BUILDKITE_SOURCE:-}" == "webhook" ]]; then
+  merged_pr=$(head -n1 <<< "${BUILDKITE_MESSAGE:-}" | sed -nE 's/.*\(#([0-9]+)\)$/\1/p')
+  if [[ -n "${merged_pr}" ]] && merged_pr_has_label "${merged_pr}" "skip-tpu-ci"; then
+    skip_tpu_reason="#${merged_pr} has the \`skip-tpu-ci\` label"
+  fi
+fi
+# pipeline_tests.yml skips its TPU steps when this is non-empty; it is their
+# skip reason, which Buildkite caps at 70 characters.
+TPU_STEPS_SKIP=""
+if [[ -n "${skip_tpu_reason}" ]]; then
+  default_lanes="tests"
+  TPU_STEPS_SKIP="skip-tpu-ci"
+  buildkite-agent annotate --style info --context skip-tpu-ci \
+    "TPU steps skipped (${skip_tpu_reason}): only the type check and the CPU unit tests run."
+fi
+export TPU_STEPS_SKIP
 lanes="${CI_LANES:-${default_lanes}}"
 for lane in ${lanes}; do
   if [[ " ${ALL_LANES} " != *" ${lane} "* ]]; then
@@ -229,6 +277,8 @@ fi
 OMNI_IMAGE_SKIP=""
 if [[ " ${lanes} " != *" tests "* ]]; then
   OMNI_IMAGE_SKIP="Only the tests lane uses the -omni image; this build has none."
+elif [[ -n "${TPU_STEPS_SKIP}" ]]; then
+  OMNI_IMAGE_SKIP="Only the omni TPU tests use the -omni image; this build skips them."
 fi
 export OMNI_IMAGE_SKIP
 

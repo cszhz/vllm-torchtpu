@@ -28,6 +28,11 @@ x-kube-plugin: &kube_plugin
 
 x-tpu-step-defaults: &tpu_step
   depends_on: "build_docker"
+  # Empty, and so not skipped, unless bootstrap.sh skips the TPU steps (the
+  # skip-tpu-ci label, or SKIP_TPU=1). The CPU steps do not read it. Every
+  # step that needs a chip takes these defaults, so this is the one place
+  # that skip has to be.
+  skip: "${TPU_STEPS_SKIP:-}"
   # Covers queueing too: the agent pod starts at once and waits inside the
   # step, so this is the launcher's whole budget, not a test's length.
   timeout_in_minutes: 1440
