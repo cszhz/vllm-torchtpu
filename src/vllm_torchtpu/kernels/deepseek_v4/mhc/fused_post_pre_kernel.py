@@ -24,9 +24,14 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 
 # Scoped VMEM the seam kernel reserves. XLA keeps the rest of VMEM free for
 # its own buffers across the call, so this sits just above the kernel's
-# need (AOT: ~5.8 MiB at T=1024, ~8.3 MiB at T=8192) rather than at the
+# need at TOKEN_BLOCK=128 (AOT: ~30 MiB at T=1024, ~32 MiB at T=8192; the
+# double-buffered res/new_res blocks alone are 16 MiB) rather than at the
 # whole of VMEM.
-FUSED_VMEM_LIMIT_BYTES = 12 * 1024 * 1024
+FUSED_VMEM_LIMIT_BYTES = 35651584  # 34 MiB
+
+# Tokens per grid step. Each step re-pushes the resident fn chunks into the
+# MXU, so a larger block amortizes those pushes over more rows.
+TOKEN_BLOCK = 128
 
 
 def _fused_kernel(
@@ -134,7 +139,7 @@ def fused_post_pre_2d(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     *,
-    token_block_size: int = 32,
+    token_block_size: int = TOKEN_BLOCK,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = FUSED_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -153,10 +158,7 @@ def fused_post_pre_2d(
         rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
             sinkhorn_repeat: static gate constants, as in
             ``utils.mhc_pre_gates``.
-        token_block_size: tokens per grid step. Default 32 keeps the
-            worst-case VMEM footprint (f32 old streams + bf16 blocks +
-            the three resident bf16 fn chunks) near 12 MB at DeepSeek-V4
-            shapes; 64 also fits.
+        token_block_size: tokens per grid step (default ``TOKEN_BLOCK``).
         gemm_precision: "highest" (exact hi+mid+lo decomposition, one
             pass against the stacked chunks; the default) or "default"
             (hi chunk only; the gates and the collapse then also see the
@@ -182,7 +184,7 @@ def fused_post_pre_2d(
     assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, res2d.shape)
     assert gemm_precision in ("highest", "default"), gemm_precision
 
-    # This kernel keeps a fixed block: its default (32) already fits the
+    # This kernel keeps a fixed block: its default already fits the
     # budget at DeepSeek-V4 shapes, so there is no vmem_need to shrink by.
     tb, padded_tokens = utils.select_token_block(num_tokens, token_block_size)
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
@@ -266,7 +268,7 @@ def mhc_fused_post_pre(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     *,
-    token_block_size: int = 32,
+    token_block_size: int = TOKEN_BLOCK,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = FUSED_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
