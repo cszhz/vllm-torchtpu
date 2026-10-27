@@ -100,8 +100,12 @@ def budget_native_swa(
     attention_specs = cast(dict[str, AttentionSpec], specs)
     # Cache groups may overlay the same block IDs. Different native layouts
     # need separate storage, even though the scheduler still shares those IDs.
+    # The materializer keys owners by their page geometry. Keep block_size in
+    # this key too: different SWA windows can have the same state payload but
+    # still require separate physical owners.
     swa_bytes = {
         (
+            attention_specs[name].block_size,
             attention_specs[name].num_states,
             attention_specs[name].state_content_size_bytes,
             attention_specs[name].dtype,

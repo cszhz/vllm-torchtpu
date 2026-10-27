@@ -121,6 +121,53 @@ def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
 
 
 @pytest.mark.cpu_test
+def test_native_swa_budget_keeps_distinct_block_geometries():
+    """Budget every physical SWA geometry, including its block size."""
+    specs = {
+        "main": MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            page_size_padded=65536,
+        ),
+        "swa.small": NativeSWASpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+            page_size_padded=65536,
+        ),
+        "swa.large": NativeSWASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            sliding_window=256,
+            page_size_padded=65536,
+        ),
+    }
+    normalized = cache_module.unify_kv_cache_spec_page_size(specs)
+    assert (
+        len({normalized[name].block_size for name in ("swa.small", "swa.large")}) == 2
+    )
+    expected = max(
+        normalized["main"].unpadded_page_size_bytes
+        + sum(
+            normalized[name].unpadded_page_size_bytes
+            for name in ("swa.small", "swa.large")
+        ),
+        max(spec.page_size_bytes for spec in normalized.values()),
+    )
+
+    budgeted = cache_module.budget_native_swa(
+        specs, frozenset(("swa.small", "swa.large"))
+    )
+    assert budgeted["main"].page_size_padded == expected
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("split", [False, True])
 def test_native_swa_allocation_with_packed_fp8_indexer(
     monkeypatch, split, vllm_config_context
