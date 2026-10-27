@@ -1120,8 +1120,17 @@ class DcpAttention:
             assert key_valid is not None
             sequences = batch // self.sequence_rows
             rows = self.slots * self.sequence_rows
+            # Packets under one sublane tile: slice a whole-buffer load (partial
+            # sublane loads fail to lower).
+            whole = ws.receive[parity] if rows < 8 else None
+
+            def source(s):
+                if whole is not None:
+                    return whole[:, rows * s:rows * (s + 1)]
+                return ws.receive.at[parity, :, pl.ds(rows * s, rows)]
+
             merged = jnp.concatenate([
-                _merge_received_keys(ws.receive.at[parity, :, pl.ds(rows * s, rows)],
+                _merge_received_keys(source(s),
                                      ws.own_rows[pl.ds(rows * s, rows), :], keys[s], key_valid[s], group,
                                      lse_rows=self.slots if self.lse_in_padding else 0)
                 for s in range(sequences)], axis=0)
@@ -1243,10 +1252,7 @@ def _merge_received_keys(received, own_rows, keys, key_valid, group, *, unroll=1
     every peer's log-sum-exp (lanes 512:514) in one load, one maximum, then a
     weighted sum of the partials (no rescaling or exp per peer)."""
     del unroll
-    if received.shape[1] < 8:
-        # Packets under one sublane tile (2-row sequences): load them whole, then
-        # slice the value (partial-tile loads fail to lower).
-        received = received[...]
+    rows = own_rows.shape[0]  # real packet rows (a chunk slot may pad to 8)
     keys = keys.astype(jnp.float32)
     scores = jax.lax.dot_general(own_rows, keys, (((1, ), (1, )), ((), ())),
                                  precision=jax.lax.Precision.HIGHEST,
@@ -1255,18 +1261,15 @@ def _merge_received_keys(received, own_rows, keys, key_valid, group, *, unroll=1
     if lse_rows:
         # ``lse_in_padding``: the last ``lse_rows`` packet rows (a padding
         # row's head slots) hold the others' lse, packet row r at lane r.
-        rows = received.shape[1]
         pad = rows - lse_rows
-        # Load the lane block whole, then pick the two rows (a
-        # single-row load fails for the 4-row packets of 2-row sequences).
-        block = received[:, :, pl.ds(0, 128)].astype(jnp.float32)
+        block = received[:, :rows, 0:128].astype(jnp.float32)
         vector = block[:, pad, :] + block[:, pad + 1, :]  # [G, 128]
         row = jax.lax.broadcasted_iota(jnp.int32, (group, rows, 128), 1)
         lane = jax.lax.broadcasted_iota(jnp.int32, (group, rows, 128), 2)
         lse = jnp.sum(jnp.where(lane == row, vector[:, None, :], 0.0), axis=2, keepdims=True)  # [G, rows, 1]
         lse = jnp.where(row[:, :, :1] < pad, lse, NEG)  # the padding row: no peers
     else:
-        tails = received[:, :, LATENT:LATENT + 128].astype(jnp.float32)  # [G, rows, 128]
+        tails = received[:, :rows, LATENT:LATENT + 128].astype(jnp.float32)  # [G, rows, 128]
         lse = tails[:, :, 0:1] + tails[:, :, 1:2]  # [G, rows, 1]
     top = jnp.maximum(jnp.max(scores, axis=1, keepdims=True), jnp.max(lse, axis=0))  # [rows, 1]
     weights = jnp.exp(scores - top)
@@ -1276,7 +1279,7 @@ def _merge_received_keys(received, own_rows, keys, key_valid, group, *, unroll=1
                                       preferred_element_type=jnp.float32)
     denominator = jnp.sum(weights, axis=1, keepdims=True) + jnp.sum(peer_weights, axis=0)
     for peer in range(group):
-        accumulator = accumulator + peer_weights[peer] * received[peer, :, :LATENT].astype(jnp.float32)
+        accumulator = accumulator + peer_weights[peer] * received[peer, :rows, :LATENT].astype(jnp.float32)
     return accumulator / denominator
 
 
@@ -1474,6 +1477,8 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
             assert key_valid is not None
             # One sequence per chunk: its rows attend its explicit new keys.
             received, sources = (stage2_recv.at[ring(c)], hosts) if hier else (ws.receive.at[ring(c)], group)
+            if rows < 8:
+                received = received[...]  # a whole slot: partial sublane loads fail to lower
             ws.merged[c, :rows, :] = _merge_received_keys(
                 received, ws.own_rows[c, :rows, :], keys[c], key_valid[c], sources,
                 lse_rows=self.slots if self.lse_in_padding else 0)
