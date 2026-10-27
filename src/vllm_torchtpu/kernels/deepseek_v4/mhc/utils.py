@@ -148,9 +148,7 @@ def gate_group_blocks(num_blocks: int, token_block: int) -> int:
 
 
 def gate_epilogue(
-    mixes_t: jax.Array,
-    sc_ref,
-    hbt_ref,
+    logits_t: jax.Array,
     *,
     hc_mult: int,
     hc_sinkhorn_eps: float,
@@ -159,23 +157,21 @@ def gate_epilogue(
 ) -> tuple[jax.Array, jax.Array]:
     """In-kernel post/comb half of ``mhc_pre_gates``, tokens on lanes.
 
-    ``mixes_t`` is (hc_mult3, G): the RMS-scaled mixes, one token per lane.
-    ``sc_ref`` is the (1, 3) hc_scale block, ``hbt_ref`` the (hc_mult3, 1)
-    hc_base column. Same op order as ``mhc_pre_gates``; comb row ``i`` is
-    the (hc_mult, G) slab of rows ``i * hc_mult + j``, so the softmax and
-    row sums run down sublanes and the column sums add the slabs.
+    ``logits_t`` is (hc_mult3, G): the gate logits (scaled mixes times
+    hc_scale plus hc_base), one token per lane. Same op order as
+    ``mhc_pre_gates``; comb row ``i`` is the (hc_mult, G) slab of rows
+    ``i * hc_mult + j``, so the softmax and row sums run down sublanes and
+    the column sums add the slabs.
 
     Returns post (hc_mult, G) and comb (hc_mult * hc_mult, G), row-major (i, j).
     """
     m = hc_mult
-    post_logits = mixes_t[m : 2 * m] * sc_ref[0, 1] + hbt_ref[m : 2 * m]
-    post = jax.nn.sigmoid(post_logits) * hc_post_mult_value
+    post = jax.nn.sigmoid(logits_t[m : 2 * m]) * hc_post_mult_value
 
     rows = []
     for i in range(m):
         lo = 2 * m + i * m
-        logits = mixes_t[lo : lo + m] * sc_ref[0, 2] + hbt_ref[lo : lo + m]
-        rows.append(jax.nn.softmax(logits, axis=0) + hc_sinkhorn_eps)
+        rows.append(jax.nn.softmax(logits_t[lo : lo + m], axis=0) + hc_sinkhorn_eps)
 
     def col_norm(rows):
         col = rows[0]
@@ -199,23 +195,31 @@ def stage_mixes_and_gates(
     post_out_ref,
     comb_out_ref,
     sc_ref,
-    hbt_ref,
+    hb_ref,
     *,
     gate_blocks: int,
+    hc_mult: int,
     **gate_kwargs,
 ) -> None:
-    """Stage this block's scaled mixes; the group's last block writes its gates.
+    """Stage this block's gate logits; the group's last block writes its gates.
 
     ``mix_scr`` is a (G, hc_mult3) f32 scratch, G = gate_blocks * tb; the
     gate outputs are (G, hc_mult) / (G, hc_mult * hc_mult) blocks indexed
-    by group, so they are written back once per group.
+    by group, so they are written back once per group. The logits are
+    formed tokens-on-sublanes so hc_base is read as the (1, hc_mult3) row
+    it already is; a (hc_mult3, 1) column costs an XLA relayout per call.
     """
     tb = mixes.shape[0]
+    m = hc_mult
+    col = jax.lax.broadcasted_iota(jnp.int32, (1, mixes.shape[1]), 1)
+    scale = jnp.where(
+        col < m, sc_ref[0, 0], jnp.where(col < 2 * m, sc_ref[0, 1], sc_ref[0, 2])
+    )
     j = pl.program_id(0) % gate_blocks
-    mix_scr[pl.ds(pl.multiple_of(j * tb, tb), tb), :] = mixes
+    mix_scr[pl.ds(pl.multiple_of(j * tb, tb), tb), :] = mixes * scale + hb_ref[...]
 
     @pl.when(j == gate_blocks - 1)
     def _():
-        post, comb = gate_epilogue(mix_scr[...].T, sc_ref, hbt_ref, **gate_kwargs)
+        post, comb = gate_epilogue(mix_scr[...].T, hc_mult=m, **gate_kwargs)
         post_out_ref[...] = post.T
         comb_out_ref[...] = comb.T

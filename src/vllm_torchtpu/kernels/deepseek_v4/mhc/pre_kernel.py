@@ -59,7 +59,6 @@ def _mixes_collapse_kernel(
     fn_lo_ref,
     sc_ref,
     hb_ref,
-    hbt_ref,
     layer_ref,
     post_out_ref,
     comb_out_ref,
@@ -98,7 +97,7 @@ def _mixes_collapse_kernel(
         post_out_ref,
         comb_out_ref,
         sc_ref,
-        hbt_ref,
+        hb_ref,
         gate_blocks=gate_blocks,
         hc_mult=hc_mult,
         **gate_kwargs,
@@ -223,7 +222,6 @@ def mhc_pre_collapse_gates(
     fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
-    hbt2d = hc_base.reshape(hc_mult3, 1).astype(jnp.float32)
 
     def _vmem_need(tb: int) -> int:
         # Double-buffered bf16 x block + layer output, transient f32
@@ -277,7 +275,6 @@ def mhc_pre_collapse_gates(
             resident,
             pl.BlockSpec((1, 3), lambda i: (0, 0)),
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
-            pl.BlockSpec((hc_mult3, 1), lambda i: (0, 0)),
         ],
         out_specs=[
             pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
@@ -291,7 +288,7 @@ def mhc_pre_collapse_gates(
         ],
         scratch_shapes=[pltpu.VMEM((group, hc_mult3), jnp.float32)],
         compiler_params=compiler_params,
-    )(x2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d, hbt2d)
+    )(x2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array],
