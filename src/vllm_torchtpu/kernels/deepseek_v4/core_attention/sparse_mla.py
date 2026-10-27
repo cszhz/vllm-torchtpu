@@ -206,7 +206,7 @@ DENSE_KV_BLOCK = 256
 # accumulator once.
 DENSE_BLOCKS_PER_STEP = 2
 # Nonzero: a batch leaves out the blocks none of its tokens selected.
-DENSE_SKIP_EMPTY_BLOCKS = 1
+DENSE_SKIP_EMPTY_BLOCKS = 0
 # A single-sequence batch whose tokens can select more compressed rows than
 # this keeps the per-token SparseCore gather.
 DENSE_MAX_ROWS = 1 << 30
