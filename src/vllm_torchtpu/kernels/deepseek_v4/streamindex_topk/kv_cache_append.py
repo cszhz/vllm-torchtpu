@@ -824,18 +824,12 @@ def scatter_rows(
 
     wave = min(num_tokens, _MAX_WAVE)
     if layout == KVLayout.SEQ_ALONG_LANE:
-        # A SAL granule is 128 rows, and every run of a wave read-modify-writes
-        # its whole granule from one snapshot: two runs of one granule in a
-        # wave lose one of their writes. Destination order makes each
-        # granule's rows one run (the compressor emits them grouped by HBM row
-        # size, not by row).
-        num_rows = cache_kv.shape[0] * page_size
-        writable = (dst_rows >= 0) & (dst_rows < num_rows)
+        # Sort by destination row so each 128-row SAL granule is written in one run.
+        writable = (dst_rows >= 0) & (dst_rows < cache_kv.shape[0] * page_size)
         order = jnp.argsort(
             jnp.where(writable, dst_rows, jnp.iinfo(jnp.int32).max), stable=True
         )
-        dst_rows = dst_rows[order]
-        src = src[order]
+        dst_rows, src = dst_rows[order], src[order]
         k_in, kernel, scratch_shapes = _sal_launch(
             cache_kv,
             src if short_run_fast_path else _format_rows(src, cache_kv, layout),
