@@ -51,18 +51,9 @@ import pytest
 import torch
 
 import vllm_torchtpu.models.vllm.deepseek_v41.v2.attention as v2_attn
-import vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels as v2_kernels
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl as indexer_ops
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import (
     _index_page_records,
-)
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
-    _INDEX_KEYS_PER_ITER,
-    _INDEX_MAX_TILE,
-    _visible_top_k,
-    initialize_indexer,
-    paged_index_scores_jax,
-    paged_indexer,
-    select_indexer_jax,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     ROW_WORDS,
@@ -71,6 +62,15 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     gather_cache_values,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.candidate_cache import CandidateCache
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
+    _INDEX_KEYS_PER_ITER,
+    _INDEX_MAX_TILE,
+    _visible_top_k,
+    initialize_indexer,
+    paged_index_scores_jax,
+    paged_indexer,
+    select_indexer_jax,
+)
 
 
 class TestGatherCachePageValues:
@@ -345,7 +345,7 @@ class TestAttentionKernelsDecodeIndexer:
             sparsecore_calls.append((scores.shape, k))
             return jnp.zeros((scores.shape[0], k), dtype=jnp.int32)
 
-        monkeypatch.setattr(v2_kernels, "_sparsecore_top_k", mock_sc_top_k)
+        monkeypatch.setattr(indexer_ops, "_sparsecore_top_k", mock_sc_top_k)
 
         bound = jnp.int32(2048)
 
@@ -413,7 +413,7 @@ class TestAttentionKernelsDecodeIndexer:
                 args[5],
             )
 
-        monkeypatch.setattr(v2_kernels, "_indexer_op", mock_op)
+        monkeypatch.setattr(indexer_ops, "_indexer_op", mock_op)
 
         q = torch.zeros(4, 2, 128)
         pool = torch.zeros(16, ROW_WORDS, dtype=torch.int32)
@@ -521,13 +521,13 @@ class TestAttentionKernelsDecodeIndexer:
 
         mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
         with set_vllm_model_wrapper_context(mesh=mesh):
-            v2_kernels._indexer_op = None
+            indexer_ops._indexer_op = None
             initialize_indexer()
-            assert v2_kernels._indexer_op is not None
+            assert indexer_ops._indexer_op is not None
             # Test early return branch
-            saved_op = v2_kernels._indexer_op
+            saved_op = indexer_ops._indexer_op
             initialize_indexer()
-            assert v2_kernels._indexer_op is saved_op
+            assert indexer_ops._indexer_op is saved_op
 
         # Verify fake registration by calling op with meta device tensors
         q = torch.empty((4, 2, 128), dtype=torch.bfloat16, device="meta")
@@ -539,7 +539,11 @@ class TestAttentionKernelsDecodeIndexer:
         requests = torch.empty((4,), dtype=torch.int32, device="meta")
         batch_max = torch.empty((1,), dtype=torch.int32, device="meta")
 
-        op = v2_kernels._indexer_op if bank_count == 1 else v2_kernels._indexer_2bank_op
+        op = (
+            indexer_ops._indexer_op
+            if bank_count == 1
+            else indexer_ops._indexer_2bank_op
+        )
         f_sel, f_pub = op(
             q,
             *((pool,) * bank_count),
@@ -648,7 +652,7 @@ class TestAttentionSelectPagedIndicesDecode:
                 candidates_part,
             )
 
-        monkeypatch.setattr(v2_kernels, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_ops, "paged_indexer", mock_paged_indexer)
 
         select = self._make_selection_call(attn, count, cache_offset=16 * 256)
 
@@ -688,7 +692,7 @@ class TestAttentionSelectPagedIndicesDecode:
                 pub_part,
             )
 
-        monkeypatch.setattr(v2_kernels, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_ops, "paged_indexer", mock_paged_indexer)
 
         select = self._make_selection_call(attn, count)
 
@@ -732,7 +736,7 @@ class TestAttentionSelectPagedIndicesDecode:
                 candidates_part,
             )
 
-        monkeypatch.setattr(v2_kernels, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_ops, "paged_indexer", mock_paged_indexer)
 
         select = self._make_selection_call(attn, count)
 
@@ -769,7 +773,7 @@ class TestAttentionSelectPagedIndicesDecode:
                 candidates_part,
             )
 
-        monkeypatch.setattr(v2_kernels, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_ops, "paged_indexer", mock_paged_indexer)
 
         select = self._make_selection_call(attn, count)
 
@@ -790,7 +794,7 @@ class TestAttentionSelectPagedIndicesDecode:
             layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 0)
             index_cache_2b = IndexCacheRows((raw_lo, raw_hi), layout)
             monkeypatch.setattr(
-                v2_kernels,
+                indexer_ops,
                 "paged_indexer",
                 lambda q_part, idx_c, *a, **kw: (
                     torch.zeros(q_part.shape[0], 4, dtype=torch.int32),
@@ -823,10 +827,13 @@ def test_candidate_envelope_keeps_token_rows_dynamic():
 @pytest.fixture(params=[False, True], ids=["bf16", "fp8"])
 def sparse_indexer_case(request):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import sparse_mqa_indexer as module
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import (
+        PackedFP8IndexCacheRows,
+    )
 
     packed = request.param
     raw = torch.zeros((128, 128), dtype=torch.int32)
-    cache_type = module.PackedFP8IndexCacheRows if packed else IndexCacheRows
+    cache_type = PackedFP8IndexCacheRows if packed else IndexCacheRows
     cache = cache_type(
         raw,
         (
@@ -898,8 +905,8 @@ def test_sparse_mqa_indexer_routes_both_cache_formats(
     def cached(q, *args, **kwargs):
         return q[:, 0, :1].float().int().expand(-1, 512) + 7
 
-    monkeypatch.setattr(module.fp8_indexer, "paged_indexer", paged)
-    monkeypatch.setattr(module.attention_kernels, "paged_indexer", paged)
+    monkeypatch.setattr(module.indexer_impl, "paged_fp8_indexer", paged)
+    monkeypatch.setattr(module.indexer_impl, "paged_indexer", paged)
 
     def prepare(*args, **kwargs):
         return CandidateCache(*(inputs["requests"],) * 5)
@@ -954,8 +961,8 @@ def test_sparse_mqa_indexer_reuses_only_matching_stage_and_source(
     monkeypatch.setattr(module, "prepare_candidate_cache", prepare)
     monkeypatch.setattr(candidate_cache, "_select_op", select)
     monkeypatch.setattr(candidate_cache, "_select_2bank_op", select)
-    monkeypatch.setattr(module.fp8_indexer, "_prepare_op", prepare)
-    monkeypatch.setattr(module.fp8_indexer, "_prepared_select_op", select)
+    monkeypatch.setattr(module.indexer_impl, "_prepare_op", prepare)
+    monkeypatch.setattr(module.indexer_impl, "_prepared_select_op", select)
     for _ in range(4):
         op(**inputs)
     assert len(prepared) == 1
@@ -980,7 +987,9 @@ def test_fp8_indexer_bank_sequence_roundtrip(monkeypatch, bank_count, page_size)
     from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
         quantize_index_rows,
     )
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import fp8_indexer
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+        indexer_impl as indexer_ops,
+    )
 
     monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
     with jax.default_device(jax.devices("cpu")[0]):
@@ -991,15 +1000,15 @@ def test_fp8_indexer_bank_sequence_roundtrip(monkeypatch, bank_count, page_size)
         keys = jnp.asarray(
             np.random.default_rng(19).normal(size=(3, 128)), jnp.bfloat16
         )
-        updated = fp8_indexer._write(banks, records, keys, jnp.empty((0,)), layout)
-        actual = fp8_indexer._read(updated, records, layout)
+        updated = indexer_ops._write(banks, records, keys, jnp.empty((0,)), layout)
+        actual = indexer_ops._read(updated, records, layout)
         quantized, scales, _ = quantize_index_rows(keys)
         expected = (quantized.astype(jnp.float32) * scales[:, None]).astype(
             jnp.bfloat16
         )
         expected = expected.at[-1].set(0)
         np.testing.assert_array_equal(actual, expected)
-        untouched = fp8_indexer._read(updated, jnp.array([1]), layout)
+        untouched = indexer_ops._read(updated, jnp.array([1]), layout)
         np.testing.assert_array_equal(untouched, jnp.zeros((1, 128), jnp.bfloat16))
 
 
@@ -1023,16 +1032,18 @@ def test_fp8_indexer_multitile_compilation(
     from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
         PackedFP8Layout,
     )
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import fp8_indexer
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+        indexer_impl as indexer_ops,
+    )
 
     monkeypatch.setattr(
-        v2_kernels, "_INDEX_UNTILED_SCORE_ELEMENTS", budget_rows * width
+        indexer_ops, "_INDEX_UNTILED_SCORE_ELEMENTS", budget_rows * width
     )
     if key_tile is not None:
         monkeypatch.setattr(
-            fp8_indexer,
+            indexer_ops,
             "PACKED_FP8_MQA_CONFIG",
-            replace(fp8_indexer.PACKED_FP8_MQA_CONFIG, key_tile=key_tile),
+            replace(indexer_ops.PACKED_FP8_MQA_CONFIG, key_tile=key_tile),
         )
     layout = PackedFP8Layout(2)
     page = jnp.concatenate(
@@ -1045,7 +1056,7 @@ def test_fp8_indexer_multitile_compilation(
     lengths = lengths.at[-1].set(context_length)
 
     def select(q, banks, pages, weights, lengths, requests):
-        return fp8_indexer.select_indexer_jax(
+        return indexer_ops.select_fp8_indexer_jax(
             q,
             banks,
             pages,
@@ -1074,8 +1085,104 @@ def test_fp8_indexer_multitile_compilation(
         else jnp.tile(jnp.array([1, 0], jnp.int32), tokens // 2),
     )
     expected = jnp.where(jnp.arange(512) < lengths[:, None], jnp.arange(512), -1)
-    np.testing.assert_array_equal(v2_kernels._compact_selected(actual), expected)
+    np.testing.assert_array_equal(indexer_ops._compact_selected(actual), expected)
     np.testing.assert_array_equal(actual >= 0, expected >= 0)
+
+
+@pytest.mark.parametrize("mode", ["dense", "publish", "candidate"])
+def test_fp8_decode_schedule_matches_bounded(monkeypatch, mode, record_property):
+    if jax.default_backend() != "tpu":
+        pytest.skip("SparseCore selection requires TPU")
+    from tests.kernels.deepseek_v41.test_fp8_paged_mqa_logits import _pack_fp8_cache
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
+        PackedFP8Layout,
+    )
+
+    rng = np.random.default_rng(902)
+    requests, queries, width, chunk = 48, 6, 8192, 96
+    rows = requests * queries
+    count = 0 if mode == "dense" else 128
+    layout = PackedFP8Layout(requests * width // 128)
+    keys = torch.from_numpy(
+        rng.normal(size=(layout.pages, 128, 1, 128)).astype(np.float32)
+    ).to(torch.bfloat16)
+    words = _pack_fp8_cache(keys, layout)
+    split = layout.pages // 2 * layout.page_rows
+    pages = jnp.asarray(rng.permutation(layout.pages).reshape(requests, -1), jnp.int32)
+    q = jnp.asarray(rng.normal(size=(rows, 32, 128)), jnp.float8_e4m3fn)
+    weights = jnp.asarray(rng.uniform(0.1, 1, size=(rows, 32)), jnp.float32)
+    lengths = jnp.tile(width - queries + 1 + jnp.arange(queries), requests)
+    if mode != "publish":
+        lengths = lengths.at[-queries:].set(jnp.array([0, 1, 127, 511, 512, 513]))
+    candidates = jnp.broadcast_to(jnp.arange(count, dtype=jnp.int32), (rows, count))
+    owners = jnp.repeat(jnp.arange(requests, dtype=jnp.int32), queries)
+    monkeypatch.setitem(
+        indexer_ops.PACKED_FP8_INDEXER_QUERY_ROWS,
+        (rows, width, count, 512, 8, 2),
+        chunk,
+    )
+    monkeypatch.setitem(
+        indexer_ops.PACKED_FP8_PREPARED_QUERY_ROWS, (rows, count * 8, 512), chunk
+    )
+
+    def run(q, banks, pages, weights, lengths, candidates, owners):
+        return indexer_ops.select_fp8_indexer_jax(
+            q,
+            banks,
+            pages,
+            weights,
+            lengths,
+            candidates,
+            owners,
+            lengths.max(),
+            astuple(layout),
+            512,
+            8,
+            mode == "publish",
+            mode == "candidate",
+            True,
+            width,
+        )
+
+    args = (
+        q,
+        (words[:split], words[split:]),
+        pages,
+        weights,
+        lengths,
+        candidates,
+        owners,
+    )
+    calls = []
+    unrolled = indexer_ops.indexer.pipeline_score_topk_unrolled
+
+    def traced_unrolled(*args):
+        calls.append(args[0])
+        return unrolled(*args)
+
+    monkeypatch.setattr(
+        indexer_ops.indexer, "pipeline_score_topk_unrolled", traced_unrolled
+    )
+    candidate = jax.jit(run).lower(*args).compile()
+    actual = jax.tree.map(np.asarray, candidate(*args))
+    assert calls and set(calls) == {rows // chunk}
+    monkeypatch.setattr(
+        indexer_ops.indexer,
+        "pipeline_score_topk_unrolled",
+        indexer_ops.indexer.pipeline_score_topk_bounded,
+    )
+    reference = jax.jit(lambda *values: run(*values)).lower(*args).compile()
+    expected = jax.tree.map(np.asarray, reference(*args))
+    for got, want in zip(actual, expected):
+        np.testing.assert_array_equal(np.sort(got, axis=-1), np.sort(want, axis=-1))
+    valid = actual[0] >= 0
+    assert np.all(~valid[:, 1:] | valid[:, :-1])
+    record_property(
+        "unrolled_temp_bytes", candidate.memory_analysis().temp_size_in_bytes
+    )
+    record_property(
+        "bounded_temp_bytes", reference.memory_analysis().temp_size_in_bytes
+    )
 
 
 @pytest.mark.parametrize("dtype", ["auto", "bf16", "fp8", "mxfp4", "nvfp4"])
@@ -1099,7 +1206,9 @@ def test_indexer_cache_initializes_only_its_format(monkeypatch, dtype):
         lambda self, **kwargs: None,
     )
     monkeypatch.setattr(
-        indexer_cache.fp8_indexer, "initialize", lambda: initialized.append(1)
+        indexer_cache.indexer_ops,
+        "initialize_fp8_indexer",
+        lambda: initialized.append(1),
     )
     if dtype in ("mxfp4", "nvfp4"):
         with pytest.raises(ValueError, match="requires bf16 or fp8"):

@@ -1099,6 +1099,7 @@ def select_candidate_tokens(
     k: int,
     block_size: int,
     unordered: bool,
+    sorted_indices: bool = True,
     scheduling_group_id: int | None = None,
 ) -> jax.Array:
     """Select compact scores and map winners to logical token IDs."""
@@ -1115,6 +1116,7 @@ def select_candidate_tokens(
             logical_blocks=candidates,
             k=k,
             exclude_neg_inf=True,
+            sorted_indices=sorted_indices,
             reconstruct_threshold=tuned_block_sizes.PACKED_FP8_CANDIDATE_TOPK_CONFIG.get(
                 (*scores.shape, k), 8192
             ),

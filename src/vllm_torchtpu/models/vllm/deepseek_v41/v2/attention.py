@@ -36,7 +36,6 @@ from .cache import (
     write_cache,
 )
 from .ced import prefix_replay_enabled
-from .fp8_indexer import quantize_query
 from .indexer_cache import IndexerCache, PackedFP8IndexCacheRows, indexer_uses_fp8
 from .ops import (
     device_hooks,
@@ -46,7 +45,7 @@ from .ops import (
     round_fp8_activation,
 )
 from .projection_rope import initialize_projection_rope
-from .sparse_mqa_indexer import SparseMQAIndexer
+from .sparse_mqa_indexer import SparseMQAIndexer, quantize_query
 
 logger = init_logger(__name__)
 
@@ -1681,6 +1680,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
         else:
             qr_part, weights_part, candidates_part = qr, weights, candidates
+
         if (
             isinstance(index_cache, PackedFP8IndexCacheRows)
             and qr_part.device.type != "cpu"
@@ -1699,6 +1699,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             weights_part = weights_part.float() * q_scale.squeeze(-1)
         else:
             q_part = self._project_index_q(qr_part, positions_part)
+
         selected, published = indexer.indexer_op(
             q_part,
             weights_part,

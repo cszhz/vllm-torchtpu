@@ -30,15 +30,21 @@ def test_representative_block_max_long_context(width):
 
 
 @pytest.mark.parametrize("unordered", [False, True])
+@pytest.mark.parametrize("sorted_indices", [False, True])
 @pytest.mark.parametrize("k", [0, 16])
-def test_select_candidate_tokens_maps_logical_ids(unordered, k):
+def test_select_candidate_tokens_maps_logical_ids(unordered, sorted_indices, k):
     candidates = jnp.array([[1, 4, -1, -1], [2, 7, 9, -1]], jnp.int32)
     scores = np.tile(np.arange(32, dtype=np.float32) % 3, (2, 1))
     scores[0, 10:] = -np.inf
     scores[1] = -np.inf
     actual = np.asarray(
         select_candidate_tokens(
-            jnp.asarray(scores), candidates, k=k, block_size=8, unordered=unordered
+            jnp.asarray(scores),
+            candidates,
+            k=k,
+            block_size=8,
+            unordered=unordered,
+            sorted_indices=sorted_indices,
         )
     )
     for row in range(2):
@@ -46,7 +52,13 @@ def test_select_candidate_tokens_maps_logical_ids(unordered, k):
         slots = eligible[np.argsort(-scores[row, eligible], kind="stable")[:k]]
         logical = np.asarray(candidates)[row, slots // 8] * 8 + slots % 8
         expected = np.pad(np.sort(logical), (0, k - slots.size), constant_values=-1)
-        np.testing.assert_array_equal(actual[row], expected)
+        if sorted_indices:
+            np.testing.assert_array_equal(actual[row], expected)
+        else:
+            np.testing.assert_array_equal(
+                np.sort(actual[row, : slots.size]), np.sort(logical)
+            )
+            np.testing.assert_array_equal(actual[row, slots.size :], -1)
 
 
 @pytest.mark.parametrize(

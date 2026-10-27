@@ -1,22 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unified FP8/BF16 indexer with stage-local candidate key reuse."""
+"""Sparse MQA indexer routing and stage-local candidate key reuse."""
 
+import functools
 from collections.abc import Callable
-from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import cache_capacity
 
-from . import attention_kernels, fp8_indexer
+from . import indexer_impl
 from .cache import IndexCacheRows
 from .candidate_cache import prepare_candidate_cache, select_candidate_cache
 from .indexer_cache import PackedFP8IndexCacheRows
 
 if TYPE_CHECKING:
     from vllm.models.deepseek_v41.attention import DeepseekV4IndexerCache
+
+
+def quantize_query(
+    q: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate Q, quantize each head and fold its scale into FP32 weights."""
+    operation = indexer_impl._query_op
+    assert operation is not None
+    return operation(q, positions, cos_sin, weights)
 
 
 class SparseMQAIndexer(torch.nn.Module):
@@ -78,15 +90,17 @@ class SparseMQAIndexer(torch.nn.Module):
         )
         if capacity is None:
             select: Callable[..., tuple[torch.Tensor, torch.Tensor]] = (
-                partial(
-                    fp8_indexer.paged_indexer,
+                functools.partial(
+                    indexer_impl.paged_fp8_indexer,
                     score_width=score_width,
                     stage_cache=stage_cache,
                     source_prefix=self.k_cache.prefix,
                     candidate_source=self.candidate_source_layer,
                 )
                 if packed_fp8
-                else partial(attention_kernels.paged_indexer, page_records=page_records)
+                else functools.partial(
+                    indexer_impl.paged_indexer, page_records=page_records
+                )
             )
             return select(
                 q,
