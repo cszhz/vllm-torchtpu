@@ -48,58 +48,96 @@ def _fused_kernel(
     comb_out_ref,
     mix_scr,
     fn_stack_ref,
-    *,
+    *dma_scratch,
     hc_mult,
     hidden_size,
     rms_eps,
     hc_pre_eps,
+    num_blocks,
     gate_blocks,
     gate_kwargs,
 ):
-    """One token block: recombine, store once, stacked-chunk GEMM, collapse, gates."""
+    """One token block: recombine, store once, stacked-chunk GEMM, collapse, gates.
 
-    @pl.when(pl.program_id(0) == 0)
+    With ``dma_scratch`` (res_buf, new_buf, in_sem, out_sem) the residual
+    streams are HBM refs moved by hand through two VMEM slots: block i+1 is
+    fetched during block i and block i is written back during block i+1.
+    Without it, res_ref/newres_ref are the pipelined (tb, hc_hidden) blocks.
+    """
+    i = pl.program_id(0)
+    tb = x_ref.shape[0]
+    h = hidden_size
+    last = num_blocks - 1
+
+    if dma_scratch:
+        res_buf, new_buf, in_sem, out_sem = dma_scratch
+        slot = i % 2
+        res_blk, new_blk = res_buf.at[slot], new_buf.at[slot]
+    else:
+        res_blk, new_blk = res_ref, newres_ref
+
+    def res_copy(block):
+        rows = pl.ds(pl.multiple_of(block * tb, utils.SUBLANE), tb)
+        return pltpu.make_async_copy(
+            res_ref.at[rows], res_buf.at[block % 2], in_sem.at[block % 2]
+        )
+
+    def new_copy(block):
+        rows = pl.ds(pl.multiple_of(block * tb, utils.SUBLANE), tb)
+        return pltpu.make_async_copy(
+            new_buf.at[block % 2], newres_ref.at[rows], out_sem.at[block % 2]
+        )
+
+    def recombine(r):
+        # Keep the streams (and x) in bf16 and upcast per use: transient f32
+        # values instead of 4 held f32 copies halves the resident working
+        # set. bf16 -> f32 casts are exact, so results are unchanged.
+        post = post_ref[r, :]  # (rows, hc_mult) f32
+        comb = comb_ref[r, :]  # (rows, hc_mult * hc_mult) f32, row-major (i, j)
+        x_bf = x_ref[r, :]  # (rows, hidden) bf16
+        old_bf = [res_blk[r, k * h : (k + 1) * h] for k in range(hc_mult)]
+        streams_bf = []
+        for j in range(hc_mult):
+            acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
+            for k in range(hc_mult):
+                kj = k * hc_mult + j
+                acc = acc + comb[:, kj : kj + 1] * old_bf[k].astype(jnp.float32)
+            # Round to bf16 BEFORE the GEMM: the unfused path's pre reads the
+            # bf16 residual that post stored, and parity requires matching it.
+            new_bf = acc.astype(jnp.bfloat16)
+            new_blk[r, j * h : (j + 1) * h] = new_bf
+            streams_bf.append(new_bf)
+        return jnp.concatenate(streams_bf, axis=1)
+
+    @pl.when(i == 0)
     def _():
+        if dma_scratch:
+            res_copy(0).start()
         utils.stack_fn_chunks_into(fn_ref, fn_stack_ref)
 
-    post = post_ref[...]  # (tb, hc_mult) f32
-    comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
+    if dma_scratch:
+        res_copy(i).wait()
 
-    # Keep the streams (and x) in bf16 and upcast per use: transient f32
-    # values instead of 4 held f32 copies halves the resident working set,
-    # leaving VMEM headroom for the pipeline to prefetch the next block.
-    # bf16 -> f32 casts are exact, so results are unchanged.
-    x_bf = x_ref[...]  # (tb, hidden) bf16
-    old_bf = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
-    ]
+        # Block i+1 is fetched once block i has landed, so at step 0 the two
+        # do not share the bandwidth block 0 waits on.
+        @pl.when(i < last)
+        def _():
+            res_copy(i + 1).start()
 
-    streams_bf = []
-    for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
-        for i in range(hc_mult):
-            k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
-        # Round to bf16 BEFORE the GEMM: the unfused path's pre reads the
-        # bf16 residual that post stored, and parity requires matching it.
-        new_bf = acc.astype(jnp.bfloat16)
-        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = new_bf
-        streams_bf.append(new_bf)
-
-    g_bf = jnp.concatenate(streams_bf, axis=1)  # (tb, hc_mult * hidden_size)
+    g_bf = recombine(slice(0, tb))
     acc = utils.dot_stacked_chunks(g_bf, fn_stack_ref[...], hb_ref.shape[1])
     # The squared sum rides on the otherwise idle MXU instead of the VPU.
-    sqr = utils.sqrsum_on_mxu(g_bf, newres_ref[...])
+    sqr = utils.sqrsum_on_mxu(g_bf, new_blk[...])
     # The collapse re-reads the stored streams: holding the packed GEMM
     # operand live past both dots would spill ~3 MiB more scoped VMEM.
-    gf = newres_ref[...].astype(jnp.float32)
+    gf = new_blk[...].astype(jnp.float32)
 
-    m, h = hc_mult, hidden_size
+    m = hc_mult
     mixes = acc * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
     pre_mix = jax.nn.sigmoid(mixes[:, :m] * sc_ref[0, 0] + hb_ref[:, :m]) + hc_pre_eps
     lay = pre_mix[:, 0:1] * gf[:, :h]
-    for i in range(1, m):
-        lay = lay + pre_mix[:, i : i + 1] * gf[:, i * h : (i + 1) * h]
+    for k in range(1, m):
+        lay = lay + pre_mix[:, k : k + 1] * gf[:, k * h : (k + 1) * h]
     layer_ref[...] = lay.astype(jnp.bfloat16)
 
     utils.stage_mixes_and_gates(
@@ -113,6 +151,20 @@ def _fused_kernel(
         hc_mult=hc_mult,
         **gate_kwargs,
     )
+
+    if not dma_scratch:
+        return
+    new_copy(i).start()
+
+    # The previous block's write-back had this whole step to finish; the
+    # last step also drains its own before the kernel ends.
+    @pl.when(i > 0)
+    def _():
+        new_copy(i - 1).wait()
+
+    @pl.when(i == last)
+    def _():
+        new_copy(i).wait()
 
 
 @functools.partial(
@@ -200,14 +252,32 @@ def fused_post_pre_2d(
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
     compiler_params = pltpu.CompilerParams(
-        # A gate group's output block is revisited by its grid steps, and
-        # step 0 fills the stacked-chunk scratch that later steps read.
+        # A gate group's output block is revisited by its grid steps, step 0
+        # fills the stacked-chunk scratch that later steps read, and each
+        # step's residual DMAs span its neighbours.
         dimension_semantics=("arbitrary",),
         vmem_limit_bytes=vmem_limit_bytes,
         disable_bounds_checks=True,
     )
 
     resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
+    scratch_shapes = [
+        pltpu.VMEM((hc_mult3, group), jnp.float32),
+        pltpu.VMEM((n_chunks * hc_mult3, hc_hidden), jnp.bfloat16),
+    ]
+    # A one-block grid has no neighbour to overlap with (decode, where XLA
+    # also tends to keep the streams in VMEM), so it keeps the pipelined
+    # blocks; longer grids move the streams by hand.
+    if num_blocks == 1:
+        res_spec = pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0))
+    else:
+        res_spec = pl.BlockSpec(memory_space=pl.ANY)
+        scratch_shapes += [
+            pltpu.VMEM((2, tb, hc_hidden), jnp.bfloat16),
+            pltpu.VMEM((2, tb, hc_hidden), jnp.bfloat16),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2,)),
+        ]
     new_res, layer2d, post_mix, comb_mix = pl.pallas_call(
         functools.partial(
             _fused_kernel,
@@ -215,6 +285,7 @@ def fused_post_pre_2d(
             hidden_size=hidden_size,
             rms_eps=rms_eps,
             hc_pre_eps=hc_pre_eps,
+            num_blocks=num_blocks,
             gate_blocks=gate_blocks,
             gate_kwargs=dict(
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
@@ -225,7 +296,7 @@ def fused_post_pre_2d(
         grid=(num_blocks,),
         in_specs=[
             pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
-            pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
+            res_spec,
             pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
             resident,
@@ -233,7 +304,7 @@ def fused_post_pre_2d(
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
         ],
         out_specs=[
-            pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
+            res_spec,
             pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
             pl.BlockSpec((group, hc_mult), lambda i: (i // gate_blocks, 0)),
             pl.BlockSpec((group, hc_mult * hc_mult), lambda i: (i // gate_blocks, 0)),
@@ -244,10 +315,7 @@ def fused_post_pre_2d(
             jax.ShapeDtypeStruct((padded_tokens, hc_mult), jnp.float32),
             jax.ShapeDtypeStruct((padded_tokens, hc_mult * hc_mult), jnp.float32),
         ],
-        scratch_shapes=[
-            pltpu.VMEM((hc_mult3, group), jnp.float32),
-            pltpu.VMEM((n_chunks * hc_mult3, hc_hidden), jnp.bfloat16),
-        ],
+        scratch_shapes=scratch_shapes,
         compiler_params=compiler_params,
     )(x2d, res2d, post2d, comb2d, fn, sc2d, hb2d)
 
