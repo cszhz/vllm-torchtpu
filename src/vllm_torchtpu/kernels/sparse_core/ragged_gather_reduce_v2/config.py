@@ -105,17 +105,14 @@ class Config:
         return self.padded_input_size // self.num_row_partitions
 
     @property
-    def row_partition_size_padded(self) -> int:
-        # Pad each partition to a whole number of windows (fixed per-window DMA size).
-        return _align_to(self.row_partition_size, self.window_size)
-
-    @property
-    def max_blocks_per_partition(self) -> int:
-        return pl.cdiv(self.row_partition_size, self.row_chunk_size)
+    def max_rows_per_partition(self) -> int:
+        """Most compacted rows a row partition reads, alignment lead included."""
+        num_simd_lanes = self.sc_info.num_lanes
+        return self.row_partition_size + self.reduce_group_size + num_simd_lanes - 2
 
     @property
     def max_window(self) -> int:
-        """Largest window of row-blocks whose resident sort permutation fits SPMEM.
+        """Largest window of 16-row chunks whose resident row metadata fits SPMEM.
 
         Streaming a fixed window instead of the whole partition makes SPMEM use
         independent of input_size; the clamp keeps small inputs single-window.
@@ -125,22 +122,28 @@ class Config:
         words_per_subcore = self.sc_info.vmem_capacity_bytes // 4
         num_simd_lanes = self.sc_info.num_lanes
         # Input-size-independent resident scratch (32-bit words): prev-row carry
-        # (col_size), out_vmem + column gather double-buffer (3*lanes*col_chunk),
-        # the num_rows + next-window-first-row vectors (2*lanes), and 6 row
-        # index/dma buffers + the row gather pipeline double-buffers (10*row_chunk).
+        # (col_size), the double-buffered column gather and scatter source
+        # (4*lanes*col_chunk) and the partition bounds (2*lanes).
         fixed = (
             self.col_size
-            + 3 * num_simd_lanes * self.col_chunk_size
+            + 4 * num_simd_lanes * self.col_chunk_size
             + 2 * num_simd_lanes
-            + 10 * self.row_chunk_size
         )
-        window = (int(words_per_subcore * 0.9) - fixed) // self.row_chunk_size
-        return max(1, min(window, max(1, self.max_blocks_per_partition)))
+        # Four resident words per row: sort slot, packed scatter metadata, source
+        # row index and top-k weight.
+        window = (int(words_per_subcore * 0.9) - fixed) // (4 * num_simd_lanes)
+        max_chunks = pl.cdiv(self.max_rows_per_partition, num_simd_lanes)
+        return max(1, min(window, max_chunks))
 
     @property
     def window_size(self) -> int:
-        """Number of rows whose sort permutation is resident per window."""
-        return self.max_window * self.row_chunk_size
+        """Number of compacted rows whose metadata is resident per window."""
+        return self.max_window * self.sc_info.num_lanes
+
+    @property
+    def compacted_size(self) -> int:
+        """Length of the compacted row arrays; every window DMA stays in bounds."""
+        return self.padded_input_size + self.window_size + self.sc_info.num_lanes
 
     @property
     def row_chunk_size(self) -> int:

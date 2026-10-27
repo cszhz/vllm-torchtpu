@@ -45,7 +45,7 @@ def _preprocess_scalar_data(
     valid_rows_mask: jax.Array,
     cfg: config.Config,
 ) -> tuple[memory_ref.IndexRef, jax.Array]:
-    """Sorts valid source rows to the front of each row partition.
+    """Compacts each row partition's valid source rows and plans their scatters.
 
     Args:
       indices: Indices for gather.
@@ -53,37 +53,63 @@ def _preprocess_scalar_data(
       cfg: Ragged gather reduce config.
 
     Returns:
-      sorted_by_validity: original row index of each slot after the stable
-        sort, flattened across partitions and padded to ``row_chunk_size``.
-      num_src_rows_per_row_partition: valid row count per partition, padded to
-        ``num_simd_lanes`` so the kernel can load it as a single vector.
+      The kernel's index refs: ``sorted_by_validity``, each compacted row's
+        source position (valid rows first within each row partition, in order);
+        ``scatter_meta``, per compacted row ``2 * destination + same_as_prev``,
+        where the destination is the output row for the last row of a reduce
+        group and the garbage row otherwise; ``partition_bounds``, the
+        [start, end) range of compacted rows each row partition reduces (starts
+        in the first ``num_simd_lanes`` words, ends in the next).
       mask: per output group, whether the group has any valid source row.
     """
     num_simd_lanes = cfg.sc_info.num_lanes
-    valid_rows_mask_2d = valid_rows_mask.reshape(cfg.num_row_partitions, -1)
+    num_row_partitions = cfg.num_row_partitions
+    partition_size = cfg.row_partition_size
+    valid_rows_mask_2d = valid_rows_mask.reshape(num_row_partitions, -1)
 
     # Stable sort of a boolean key is a stable partition: valid rows keep their
     # relative order and move ahead of the invalid ones.
     sorted_by_validity = jnp.argsort(
         ~valid_rows_mask_2d, descending=False, stable=True, axis=-1
     )
-    sorted_by_validity += (
-        jnp.arange(cfg.num_row_partitions)[:, None] * cfg.row_partition_size
+    partition_base = jnp.arange(num_row_partitions, dtype=jnp.int32) * partition_size
+    sorted_by_validity = sorted_by_validity.astype(jnp.int32) + partition_base[:, None]
+    num_valid = jnp.sum(valid_rows_mask_2d, axis=-1).astype(jnp.int32)
+
+    dst = sorted_by_validity // cfg.reduce_group_size
+    slot = jnp.arange(partition_size, dtype=jnp.int32)[None, :]
+    no_group = jnp.full((num_row_partitions, 1), -1, jnp.int32)
+    next_dst = jnp.concatenate([dst[:, 1:], no_group], axis=1)
+    prev_dst = jnp.concatenate([no_group, dst[:, :-1]], axis=1)
+    is_final = (slot < num_valid[:, None]) & (
+        (slot + 1 >= num_valid[:, None]) | (next_dst != dst)
+    )
+    garbage_dst = cfg.padded_input_size // cfg.reduce_group_size
+    scatter_meta = jnp.where(is_final, dst, garbage_dst) * 2 + (prev_dst == dst)
+
+    tail = cfg.compacted_size - cfg.padded_input_size
+    # Rows past a partition's end are gathered but never written; keep their
+    # source positions inside the (unpadded) index and weight arrays.
+    sorted_by_validity = jnp.pad(
+        jnp.minimum(sorted_by_validity.reshape(-1), cfg.input_size - 1), (0, tail)
+    )
+    scatter_meta = jnp.pad(
+        scatter_meta.reshape(-1), (0, tail), constant_values=garbage_dst * 2
     )
 
-    padding = cfg.row_partition_size_padded - cfg.row_partition_size
-    sorted_by_validity = jnp.pad(sorted_by_validity, ((0, 0), (0, padding)))
-    sorted_by_validity = sorted_by_validity.reshape(-1)
-
-    num_src_rows_per_row_partition = jnp.pad(
-        jnp.sum(valid_rows_mask_2d, axis=-1).astype(jnp.int32),
-        (0, max(0, num_simd_lanes - cfg.num_row_partitions)),
+    lane_pad = (0, num_simd_lanes - num_row_partitions)
+    partition_bounds = jnp.concatenate(
+        [
+            jnp.pad(partition_base, lane_pad),
+            jnp.pad(partition_base + num_valid, lane_pad),
+        ]
     )
     mask = jnp.any(valid_rows_mask.reshape(-1, cfg.reduce_group_size), axis=-1)
     scalar = memory_ref.IndexRef(
+        partition_bounds=partition_bounds,
         indices=indices,
-        sorted_by_validity=sorted_by_validity.astype(jnp.int32),
-        num_src_rows_per_row_partition=num_src_rows_per_row_partition,
+        sorted_by_validity=sorted_by_validity,
+        scatter_meta=scatter_meta.astype(jnp.int32),
     )
     return scalar, mask
 
@@ -112,16 +138,16 @@ def main_kernel(
         scratch_ref=scratch_ref,
     )
 
-    # Step 2: Stage this partition's row count (the sort permutation is streamed
+    # Step 2: Stage the partition bounds (the compacted row metadata is streamed
     # one window at a time in call_kernel_pipeline, bounding the resident scratch).
     recv_sem = refs.scratch.sem.at[0]
-    num_rows_dma = pltpu.make_async_copy(
-        refs.index.num_src_rows_per_row_partition,
-        refs.scratch.num_rows_per_row_partition_vmem,
+    bounds_dma = pltpu.make_async_copy(
+        refs.index.partition_bounds,
+        refs.scratch.partition_bounds_vmem,
         recv_sem,
     )
-    num_rows_dma.start()
-    num_rows_dma.wait()
+    bounds_dma.start()
+    bounds_dma.wait()
 
     kernel.call_kernel_pipeline(
         row_partition_id=row_partition_id,
