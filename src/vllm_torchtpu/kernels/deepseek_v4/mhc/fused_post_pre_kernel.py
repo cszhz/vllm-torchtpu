@@ -42,6 +42,7 @@ def _fused_kernel(
     post_out_ref,
     comb_out_ref,
     mix_scr,
+    fn_stack_ref,
     *,
     hc_mult,
     hidden_size,
@@ -51,6 +52,11 @@ def _fused_kernel(
     gate_kwargs,
 ):
     """One token block: recombine, store once, stacked-chunk GEMM, collapse, gates."""
+
+    @pl.when(pl.program_id(0) == 0)
+    def _():
+        utils.stack_fn_chunks_into(fn_ref, fn_stack_ref)
+
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
 
@@ -76,7 +82,7 @@ def _fused_kernel(
         streams_bf.append(new_bf)
 
     g_bf = jnp.concatenate(streams_bf, axis=1)  # (tb, hc_mult * hidden_size)
-    acc = utils.dot_stacked_chunks(g_bf, fn_ref[...], hb_ref.shape[1])
+    acc = utils.dot_stacked_chunks(g_bf, fn_stack_ref[...], hb_ref.shape[1])
     gf = g_bf.astype(jnp.float32)  # f32 for the squared sum + collapse
     sqr = jnp.sum(gf * gf, axis=-1, keepdims=True)
 
@@ -184,18 +190,19 @@ def fused_post_pre_2d(
     gate_blocks = utils.gate_group_blocks(num_blocks, tb)
     group = gate_blocks * tb
 
-    fn_stack = utils.stack_fn_chunks(fn, gemm_precision)
+    n_chunks = 3 if gemm_precision == "highest" else 1
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
     compiler_params = pltpu.CompilerParams(
-        # A gate group's output block is revisited by its grid steps.
+        # A gate group's output block is revisited by its grid steps, and
+        # step 0 fills the stacked-chunk scratch that later steps read.
         dimension_semantics=("arbitrary",),
         vmem_limit_bytes=vmem_limit_bytes,
         disable_bounds_checks=True,
     )
 
-    resident = pl.BlockSpec(fn_stack.shape, lambda i: (0, 0))
+    resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     new_res, layer2d, post_mix, comb_mix = pl.pallas_call(
         functools.partial(
             _fused_kernel,
@@ -232,9 +239,12 @@ def fused_post_pre_2d(
             jax.ShapeDtypeStruct((padded_tokens, hc_mult), jnp.float32),
             jax.ShapeDtypeStruct((padded_tokens, hc_mult * hc_mult), jnp.float32),
         ],
-        scratch_shapes=[pltpu.VMEM((group, hc_mult3), jnp.float32)],
+        scratch_shapes=[
+            pltpu.VMEM((group, hc_mult3), jnp.float32),
+            pltpu.VMEM((n_chunks * hc_mult3, hc_hidden), jnp.bfloat16),
+        ],
         compiler_params=compiler_params,
-    )(x2d, res2d, post2d, comb2d, fn_stack, sc2d, hb2d)
+    )(x2d, res2d, post2d, comb2d, fn, sc2d, hb2d)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],

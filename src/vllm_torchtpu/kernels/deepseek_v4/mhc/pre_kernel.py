@@ -45,6 +45,7 @@ def _mixes_collapse_kernel(
     post_out_ref,
     comb_out_ref,
     mix_scr,
+    fn_stack_ref,
     *,
     hc_mult,
     hidden_size,
@@ -60,9 +61,14 @@ def _mixes_collapse_kernel(
     entirely in-block. The post/comb gates run once per gate group on
     the staged mixes (``utils.stage_mixes_and_gates``).
     """
+
+    @pl.when(pl.program_id(0) == 0)
+    def _():
+        utils.stack_fn_chunks_into(fn_ref, fn_stack_ref)
+
     m, h = hc_mult, hidden_size
     x = x_ref[...]
-    acc = utils.dot_stacked_chunks(x, fn_ref[...], hb_ref.shape[1])
+    acc = utils.dot_stacked_chunks(x, fn_stack_ref[...], hb_ref.shape[1])
     xf = x.astype(jnp.float32)
     sqr = jnp.sum(xf * xf, axis=-1, keepdims=True)
     # Same op order as utils.mhc_pre_gates for bit-level agreement.
@@ -199,17 +205,17 @@ def mhc_pre_collapse_gates(
     hc_mult = next(m for m in range(1, 64) if m * (m + 2) == hc_mult3)
     hidden_size = hc_hidden // hc_mult
 
-    fn_stack = utils.stack_fn_chunks(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
     def _vmem_need(tb: int) -> int:
         # Double-buffered bf16 x block + layer output, transient f32
-        # copy, resident bf16 fn chunks; x2 spill/scratch headroom.
+        # copy, resident f32 fn + its stacked bf16 chunks; x2
+        # spill/scratch headroom.
         return 2 * (
             tb * hc_hidden * (2 * 2 + 4)
             + tb * hidden_size * 2 * 2
-            + 3 * hc_mult3 * hc_hidden * 2
+            + hc_mult3 * hc_hidden * (2 * 4 + 3 * 2)
         )
 
     tb, padded_tokens = utils.select_token_block(
@@ -226,13 +232,14 @@ def mhc_pre_collapse_gates(
     group = gate_blocks * tb
 
     compiler_params = pltpu.CompilerParams(
-        # A gate group's output block is revisited by its grid steps.
+        # A gate group's output block is revisited by its grid steps, and
+        # step 0 fills the stacked-chunk scratch that later steps read.
         dimension_semantics=("arbitrary",),
         vmem_limit_bytes=vmem_limit_bytes,
         disable_bounds_checks=True,
     )
 
-    resident = pl.BlockSpec(fn_stack.shape, lambda i: (0, 0))
+    resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     layer2d, post_mix, comb_mix = pl.pallas_call(
         functools.partial(
             _mixes_collapse_kernel,
@@ -264,9 +271,12 @@ def mhc_pre_collapse_gates(
             jax.ShapeDtypeStruct((padded_tokens, hc_mult), jnp.float32),
             jax.ShapeDtypeStruct((padded_tokens, hc_mult * hc_mult), jnp.float32),
         ],
-        scratch_shapes=[pltpu.VMEM((group, hc_mult3), jnp.float32)],
+        scratch_shapes=[
+            pltpu.VMEM((group, hc_mult3), jnp.float32),
+            pltpu.VMEM((3 * hc_mult3, hc_hidden), jnp.bfloat16),
+        ],
         compiler_params=compiler_params,
-    )(x2d, fn_stack, sc2d, hb2d)
+    )(x2d, fn, sc2d, hb2d)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array],

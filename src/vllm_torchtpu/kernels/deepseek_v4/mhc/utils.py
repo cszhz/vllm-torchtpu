@@ -105,6 +105,29 @@ def stack_fn_chunks(fn: jax.Array, gemm_precision: str = "highest") -> jax.Array
     return jnp.concatenate(chunks, axis=0)
 
 
+def stack_fn_chunks_into(fn_ref, out_ref, lanes: int = 1024) -> None:
+    """In-kernel ``stack_fn_chunks``: f32 fn -> stacked bf16 chunks in VMEM.
+
+    f32 -> bf16 casts round to nearest even, as ``split_fn3``'s
+    reduce_precision does, and each remainder is exact, so the chunks match.
+    """
+    rows, cols = fn_ref.shape
+    n_chunks = out_ref.shape[0] // rows
+    lanes = min(lanes, cols)
+    assert cols % lanes == 0, (cols, lanes)
+
+    def body(c, carry):
+        sl = pl.ds(pl.multiple_of(c * lanes, lanes), lanes)
+        rem = fn_ref[:, sl]
+        for k in range(n_chunks):
+            part = rem.astype(jnp.bfloat16)
+            out_ref[k * rows : (k + 1) * rows, sl] = part
+            rem = rem - part.astype(jnp.float32)
+        return carry
+
+    jax.lax.fori_loop(0, cols // lanes, body, 0)
+
+
 def dot_stacked_chunks(x: jax.Array, fn_stack: jax.Array, n_out: int) -> jax.Array:
     """x @ fn.T from one dot against ``stack_fn_chunks``: hi + mid + lo."""
     dn = (((1,), (1,)), ((), ()))
