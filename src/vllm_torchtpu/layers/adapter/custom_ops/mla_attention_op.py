@@ -22,6 +22,7 @@ import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -64,8 +65,14 @@ from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
+    _retain_buffers,
 )
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    DCP_ROWS_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+    get_prequantized_matmul_op,
+    prequantized_matmul,
+)
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
@@ -73,6 +80,19 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
+
+
+def _after_jax(x: jax.Array, dep: jax.Array) -> jax.Array:
+    """Order `x` after `dep` in the scheduler without data dependency."""
+    return jax.lax.optimization_barrier((x, dep))[0]
+
+
+def _fake_after(x: torch.Tensor, dep: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+_after = pallas.jax_op("pallas::after", _after_jax)
+_after.register_fake(_fake_after)
 
 # Skip indexer scoring when every sequence in the batch is shorter than
 # `index_topk`, where the top-k is the identity and the scores decide nothing.
@@ -1021,6 +1041,10 @@ class VllmTPUMLAAttention(MLAAttention):
         # gathering q every step -- that trade is the point of qrep.
         self.W_UK_T_dcp_qrep = None
         self.W_UK_T_dcp_qrep_scale = None
+        self.W_UV_dcp_qrep = None
+        self.W_UV_dcp_qrep_scale = None
+        self.W_O_dcp_qrep = None
+        self.W_O_dcp_qrep_scale = None
         if self.dcp_q_replicate:
             dcp_group = get_dcp_group()
             if dcp_group is None or int(dcp_group.world_size) <= 1:
@@ -1035,6 +1059,26 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.W_UK_T_dcp_qrep_scale = fresh_buffer(
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
+            o = getattr(self, "o_proj", None)
+            if o is not None and getattr(o, "weight_dcp", None) is None:
+                logger.warning_once(
+                    "TPU_DCP_MLA_OPROJ_ALL_REDUCE needs an FP8 o_proj from an "
+                    "FP8 checkpoint; keeping the reduce-scatter."
+                )
+            elif o is not None:
+                self.W_O_dcp_qrep = o.weight_dcp
+                self.W_O_dcp_qrep_scale = o.weight_scale_dcp
+                del o.weight_dcp, o.weight_scale_dcp
+                get_prequantized_matmul_op()
+            # The group's W_UV too, so W_UV can run before the merge.
+            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE:
+                self.W_UV_dcp_qrep = fresh_buffer(
+                    dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
+                )
+                if hasattr(self, "W_UV_scale"):
+                    self.W_UV_dcp_qrep_scale = fresh_buffer(
+                        dcp_group.all_gather(self.W_UV_scale.contiguous(), dim=0)
+                    )
 
         # Safely detach and clear kv_b_proj parameter buffers without breaking
         # PyTorch attribute integrity
@@ -1051,7 +1095,14 @@ class VllmTPUMLAAttention(MLAAttention):
                 tensors.extend([self.W_UK_T_scale, self.W_UV_scale])
             tensors.extend(
                 t
-                for t in (self.W_UK_T_dcp_qrep, self.W_UK_T_dcp_qrep_scale)
+                for t in (
+                    self.W_UK_T_dcp_qrep,
+                    self.W_UK_T_dcp_qrep_scale,
+                    self.W_UV_dcp_qrep,
+                    self.W_UV_dcp_qrep_scale,
+                    self.W_O_dcp_qrep,
+                    self.W_O_dcp_qrep_scale,
+                )
                 if t is not None
             )
             synchronize_tensors(tensors)
@@ -1077,7 +1128,7 @@ class VllmTPUMLAAttention(MLAAttention):
         k_pe: torch.Tensor,
         output: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | list[tuple[torch.Tensor, torch.Tensor]]:
         attn_metadata, _, kv_cache, _ = get_attention_context(self.layer_name)
 
         return cast(PallasMLAttentionBackendImpl, self.impl).forward(
@@ -1190,6 +1241,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             topk_indices_buffer=self.topk_indices_buffer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
+        if (
+            envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE
+            and envs.TPU_DCP_MLA_UV_BEFORE_MERGE
+            and self.mla_attn.dcp_q_replicate
+            and self.g_proj is None
+            and not self.gate_is_fused
+        ):
+            setattr(self.o_proj, DCP_ROWS_ATTR, True)
+            self.mla_attn.o_proj = self.o_proj
 
         self.prefix = prefix
 
@@ -1339,9 +1399,32 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         )
 
         if output_gate is not None:
+            assert isinstance(attn_out, torch.Tensor)
             attn_out *= output_gate.sigmoid()
         elif self.g_proj is not None:
+            assert isinstance(attn_out, torch.Tensor)
             attn_out *= self.g_proj(hidden_states)[0].sigmoid()
+        w_o = getattr(self.mla_attn, "W_O_dcp_qrep", None)
+        if w_o is not None:
+            s_o = cast(torch.Tensor, self.mla_attn.W_O_dcp_qrep_scale)
+            assert s_o is not None
+            if isinstance(attn_out, torch.Tensor):
+                attn_out = _retain_buffers(attn_out, w_o, s_o)
+            else:
+                outs: list[torch.Tensor] = []
+                for x, x_scale in attn_out:
+                    y = prequantized_matmul(x, x_scale, w_o, s_o)
+                    if outs:
+                        y = _after(y, outs[-1])
+                    outs.append(tensor_model_parallel_all_reduce(y))
+                out = outs[0] if len(outs) == 1 else torch.cat(outs)
+                return _retain_buffers(
+                    out,
+                    cast(torch.Tensor, self.o_proj.weight),
+                    cast(torch.Tensor, getattr(self.o_proj, "weight_scale", None)),
+                    cast(torch.Tensor | None, getattr(self.o_proj, "bias", None)),
+                )
+        assert isinstance(attn_out, torch.Tensor)
         if prefill_group is not None:
             return prefill_group.project_reduce_scatter(attn_out, self.o_proj)
         return self.o_proj(attn_out)[0]

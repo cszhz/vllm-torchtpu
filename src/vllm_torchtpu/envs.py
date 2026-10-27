@@ -25,6 +25,9 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_RS_OUT_PRECISION: bool = True
+    TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
+    TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
+    TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -432,6 +435,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
+    # Under qrep, apply W_UV before the DCP merge so the merge carries
+    # v_head_dim instead of kv_lora_rank. Replicates W_UV per rank.
+    "TPU_DCP_MLA_UV_BEFORE_MERGE": env_bool(
+        "TPU_DCP_MLA_UV_BEFORE_MERGE", default=False
+    ),
+    # Replicate FP8 o_proj across the DCP group when W_UV is replicated so
+    # large backbone steps skip the merge reduce-scatter and sum weighted
+    # partials inside o_proj's all-reduce.
+    "TPU_DCP_MLA_OPROJ_ALL_REDUCE": env_bool(
+        "TPU_DCP_MLA_OPROJ_ALL_REDUCE", default=False
+    ),
+    # Token chunk size (multiple of 128) for pipelining o_proj and all-reduce
+    # under TPU_DCP_MLA_OPROJ_ALL_REDUCE; 0 runs in a single chunk.
+    "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS": env_int(
+        "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS", 512
+    ),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
     # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must

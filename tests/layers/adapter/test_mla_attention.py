@@ -1016,6 +1016,207 @@ def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
     torch.testing.assert_close(q_pe, q_pe_rep)
 
 
+def test_mla_forward_qrep_applies_w_uv_before_the_merge(monkeypatch):
+    """With the group's W_UV built, the merge receives f32 partials already
+    projected to v_head_dim, and the local W_UV is not applied again."""
+    dcp_size, local_heads, num_tokens = 2, 16, 4
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+    group_heads = local_heads * dcp_size
+
+    torch.manual_seed(2)
+    layer.W_UK_T_dcp_qrep = torch.randn(group_heads, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+    layer.W_UV_dcp_qrep = torch.randn(group_heads, 512, 128) * 0.05
+    layer.W_UV_dcp_qrep_scale = None
+    layer.W_UV = None  # must not be touched
+    partial = torch.randn(num_tokens, group_heads, 512)
+    lse = torch.zeros(num_tokens, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    merged_inputs = []
+    merge_kwargs = []
+
+    def _merge(out, _lse, **kw):
+        merged_inputs.append(out)
+        merge_kwargs.append(kw)
+        return out[:, :local_heads, :]
+
+    monkeypatch.setattr(attention_adapter, "merge_lse_partials_scatter_heads", _merge)
+
+    got = impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+        q_dcp_replicated=(
+            torch.randn(num_tokens, group_heads, 128),
+            torch.randn(num_tokens, group_heads, 64),
+        ),
+    )
+
+    (seen,) = merged_inputs
+    assert seen.dtype == torch.float32
+    assert merge_kwargs[0]["wire_dtype"] == partial.dtype
+    projected = torch.bmm(partial.transpose(0, 1), layer.W_UV_dcp_qrep).transpose(0, 1)
+    torch.testing.assert_close(seen, projected)
+    torch.testing.assert_close(
+        got,
+        projected[:, :local_heads].to(got.dtype).reshape(num_tokens, -1),
+    )
+
+
+@pytest.mark.parametrize(
+    "model_tag, rs_bf16, want",
+    [
+        ("backbone", True, torch.bfloat16),
+        ("backbone", False, torch.float32),
+        ("eagle_head", True, torch.float32),
+    ],
+)
+def test_mla_forward_qrep_projects_into_the_wire_dtype(
+    model_tag, rs_bf16, want, monkeypatch
+):
+    """A bf16 partial is projected straight to bf16 when the merge narrows
+    anyway (backbone, TPU_DCP_RS_OUT_PRECISION); otherwise it stays f32."""
+    dcp_size, local_heads, num_tokens = 2, 16, 4
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+    group_heads = local_heads * dcp_size
+
+    torch.manual_seed(3)
+    layer.W_UK_T_dcp_qrep = torch.randn(group_heads, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+    layer.W_UV_dcp_qrep = (torch.randn(group_heads, 512, 128) * 0.05).to(torch.bfloat16)
+    layer.W_UV_dcp_qrep_scale = None
+    layer.W_UV = None
+    partial = torch.randn(num_tokens, group_heads, 512).to(torch.bfloat16)
+    lse = torch.zeros(num_tokens, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    monkeypatch.setattr(attention_adapter.envs, "TPU_DCP_RS_OUT_PRECISION", rs_bf16)
+    monkeypatch.setattr(
+        attention_adapter.vllm_compilation_backends, "model_tag", model_tag
+    )
+    seen = []
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse, **kw: seen.append((out, kw)) or out[:, :local_heads, :],
+    )
+
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+        q_dcp_replicated=(
+            torch.randn(num_tokens, group_heads, 128),
+            torch.randn(num_tokens, group_heads, 64),
+        ),
+    )
+
+    ((out, kw),) = seen
+    assert out.dtype == want
+    assert kw["is_backbone"] == (model_tag == "backbone")
+    assert kw["wire_dtype"] == torch.bfloat16
+
+
+def test_mla_forward_oproj_all_reduce_returns_quantized_chunks(monkeypatch):
+    """Under TPU_DCP_MLA_OPROJ_ALL_REDUCE, large backbone steps skip the merge
+    reduce-scatter and return quantized LSE-weighted chunks, while A2A-sized
+    steps and the MTP drafter keep the merge."""
+    dcp_size, local_heads = 2, 16
+    group_heads = local_heads * dcp_size
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+
+    torch.manual_seed(4)
+    layer.W_UK_T_dcp_qrep = torch.randn(group_heads, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+    layer.W_UV_dcp_qrep = (torch.randn(group_heads, 512, 128) * 0.05).to(torch.bfloat16)
+    layer.W_UV_dcp_qrep_scale = None
+    layer.W_O_dcp_qrep = torch.zeros((group_heads * 128, 64), dtype=torch.float8_e4m3fn)
+    layer.W_O_dcp_qrep_scale = torch.ones((64,), dtype=torch.float32)
+    layer.W_UV = None
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    monkeypatch.setattr(attention_adapter.envs, "TPU_DCP_LSE_MERGE_A2A", True)
+    monkeypatch.setattr(attention_adapter.envs, "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 4)
+    monkeypatch.setattr(
+        attention_adapter.envs, "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS", 4
+    )
+    monkeypatch.setattr(
+        attention_adapter.vllm_compilation_backends, "model_tag", "backbone"
+    )
+    weight_calls = []
+    merge_calls = []
+    monkeypatch.setattr(
+        attention_adapter,
+        "weight_lse_partials",
+        lambda out, _lse, dt, chunk: weight_calls.append((out.shape[0], dt, chunk))
+        or [
+            (
+                torch.zeros((out.shape[0], group_heads * 128)),
+                torch.ones((out.shape[0], 1)),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse, **kw: merge_calls.append(out.shape[0])
+        or out[:, :local_heads, :],
+    )
+
+    # Large step (> A2A max tokens): returns quantized chunks without merge.
+    num_tokens = 8
+    partial = torch.randn(num_tokens, group_heads, 512).to(torch.bfloat16)
+    lse = torch.zeros(num_tokens, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    got_chunks = impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+        q_dcp_replicated=(
+            torch.randn(num_tokens, group_heads, 128),
+            torch.randn(num_tokens, group_heads, 64),
+        ),
+    )
+    assert isinstance(got_chunks, list)
+    assert weight_calls == [(8, torch.float8_e4m3fn, 4)]
+    assert merge_calls == []
+
+    # Decode step (<= A2A max tokens): keeps merge_lse_partials_scatter_heads.
+    num_decode = 4
+    partial_dec = torch.randn(num_decode, group_heads, 512).to(torch.bfloat16)
+    lse_dec = torch.zeros(num_decode, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial_dec, lse_dec))
+    got_dec = impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_decode, 8), dtype=torch.int32),
+        q_dcp_replicated=(
+            torch.randn(num_decode, group_heads, 128),
+            torch.randn(num_decode, group_heads, 64),
+        ),
+    )
+    assert isinstance(got_dec, torch.Tensor)
+    assert merge_calls == [4]
+
+
 def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     """The gather is only skipped when a replicated q actually arrives; the
     unreplicated DCP path is untouched."""
