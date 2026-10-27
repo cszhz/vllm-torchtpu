@@ -198,7 +198,7 @@ def _attention_swa_decode_kernel(
 # `DenseRefs` batch from the paged cache; decode-sized calls never do.
 DENSE_MIN_TOKENS = 256
 # Tokens of a `DenseRefs` batch per QK / PV matmul over its shared rows.
-DENSE_TOKENS_PER_MATMUL = 4
+DENSE_TOKENS_PER_MATMUL = 16
 # A `DenseRefs` batch attends over its sequence's first rows in multiples of
 # this many, enough to cover every row its tokens selected.
 DENSE_KV_BLOCK = 512
