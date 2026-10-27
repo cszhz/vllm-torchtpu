@@ -1728,6 +1728,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
+    # Compilation transforms.microbatch knobs for GLM-5.2 and general models.
+    "TPU_TOKEN_MICROBATCHES": env_nonnegative_int("TPU_TOKEN_MICROBATCHES", 0),
+    "TPU_MICROBATCH_MIN_TOKENS": env_int("TPU_MICROBATCH_MIN_TOKENS", 1024),
     # Comma-separated dot-bounded module prefix names to quantize to FP8 on load.
     # Examples: QUANTIZE_ON_LOAD_PREFIXES="self_attn,shared_experts,layers.0.mlp"
     "QUANTIZE_ON_LOAD_PREFIXES": lambda: [
