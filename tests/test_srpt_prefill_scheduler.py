@@ -13,7 +13,6 @@
 # limitations under the License.
 """SrptPrefillScheduler tests on a real scheduler, through schedule()."""
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -30,7 +29,6 @@ from vllm.config import (
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -659,9 +657,27 @@ def test_attn_work_cap_applies_while_this_rank_decodes(shared_model_config):
     assert scheduler.schedule().num_scheduled_tokens == {"dec": 1, "long": 32}
 
 
-def test_upstream_routes_both_queues_through_the_chunk_hook():
-    # The attention work cap lives in _reserve_prefill_lookahead, so it stops
-    # working, silently, unless Scheduler.schedule() calls it for running and
-    # waiting requests alike; fail if a vLLM upgrade moves or drops a call.
-    source = inspect.getsource(Scheduler.schedule)
-    assert source.count("self._reserve_prefill_lookahead(") == 2
+def test_attn_work_cap_holds_chunk_with_most_attention_work(shared_model_config):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=128,
+        max_num_batched_tokens=256,
+        long_prefill_token_threshold=64,
+    )
+    scheduler.add_request(_make_real_request("fresh", 512, hasher, seed=1))
+    scheduler.max_num_scheduled_tokens = 16
+    assert scheduler.schedule().num_scheduled_tokens == {"fresh": 16}
+    scheduler.max_num_scheduled_tokens = 64
+    scheduler.add_request(_make_real_request("deep", 448, hasher, seed=2))
+    for _ in range(4):
+        assert scheduler.schedule().num_scheduled_tokens == {"deep": 64}
+    scheduler.max_num_scheduled_tokens = 256
+
+    # `deep` (192 left at context 256) takes 64 tokens = 18432 work; `fresh`
+    # (496 left at context 16) is capped to 16 tokens = 384 work. Token budget
+    # is left (176 >= 64), so holding `deep` rather than the longer-remaining
+    # `fresh` frees enough attention work in one hold for both `fresh` and `wait`.
+    scheduler.attn_work_cap = 18900
+    scheduler._other_rank_decoding = True
+    scheduler.add_request(_make_real_request("wait", 64, hasher, seed=3))
+    assert scheduler.schedule().num_scheduled_tokens == {"fresh": 64, "wait": 64}

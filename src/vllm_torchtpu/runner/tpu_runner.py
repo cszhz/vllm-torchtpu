@@ -5180,6 +5180,7 @@ class TPUModelRunner(GPUModelRunner):
                 kv_connector_output=kv_connector_output,
             )
             # Read by SrptPrefillScheduler.update_from_output.
+            # pyrefly: ignore[missing-attribute]
             model_runner_output.other_rank_decoding = self._dp_step_other_decode
 
             async_output = AsyncTPUModelRunnerOutput(

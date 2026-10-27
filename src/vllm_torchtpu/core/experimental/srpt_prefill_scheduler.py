@@ -42,21 +42,22 @@ still wait while decodes fill the budget.
 With ``VLLM_TPU_SRPT_ATTN_WORK_CAP=W`` (default 0, off) a step's attention work,
 ``sum(n * (c + n / 2))`` over the chunks it schedules (``n`` new tokens after
 ``c`` computed ones, decodes included), is kept under ``W`` by shrinking prefill
-chunks. Data-parallel ranks step in lockstep, so one rank's deep-context chunk
+chunks. Under expert-parallel DP lockstep, one rank's deep-context chunk
 otherwise stretches every rank's step and the decodes in it. A shrunk chunk's
 end, not its length, is rounded down to a multiple of
 ``VLLM_TPU_SRPT_ATTN_TILE_TOKENS`` (default 32, the query tile of the TPU
-attention kernels), so a chunk that starts off that grid still ends on it:
-DeepSeek-V4 long-context outputs lose coherence when shrunk chunks end off its
-16-token grid. The step's first prefill chunk always advances to the next
-multiple, so a chunk whose context alone exceeds ``W`` still advances. A chunk
-the cap shrank counts as progress for the anti-starvation rule above.
+attention kernels), so a chunk that starts off that grid still ends on it. The
+step's first prefill chunk always advances to the next multiple, so a chunk
+whose context alone exceeds ``W`` still advances. A chunk the cap shrank counts
+as progress for the anti-starvation rule above.
 
-The cap only protects decodes, so it applies only while some DP rank decodes:
-this rank, in the step being scheduled, or another rank, in the last step the
-runner reported (``TPUModelRunner`` adds the highest and the lowest decoding
-rank to the DP metadata all-reduce it already runs). While no rank decodes,
-prefill chunks are not shrunk.
+The cap only protects decodes, so it applies while this rank decodes in the
+step being scheduled or, under EP lockstep (``DP > 1`` and expert parallel),
+while another DP rank decoded in the last step the runner reported
+(``TPUModelRunner`` adds the highest and the lowest decoding rank to the DP
+metadata all-reduce it runs under ``_dp_lockstep_enabled``; with plain DP,
+``_other_rank_decoding`` stays ``False`` and the cap applies only while this
+rank decodes). While no rank decodes, prefill chunks are not shrunk.
 
 Under KV pressure upstream preempts ``running[-1]``, which is the longest
 non-stalled prefill chunk, so a long prompt can be preempted repeatedly.
@@ -432,20 +433,27 @@ class SrptPrefillScheduler(AsyncScheduler):
             ):
                 break
             # Non-stalled prefill chunks sit last in `kept`, ordered by
-            # remaining tokens, so this is the longest one.
-            candidate = next(
-                (
-                    r
-                    for r in reversed(kept)
-                    if r.request_id in alloc
-                    and r.is_prefill_chunk
-                    and self._remaining(r) > target_remaining
-                    and not self._is_stalled(r)
-                ),
-                None,
-            )
-            if candidate is None:
+            # remaining tokens; when `left >= need`, the cap is what shrank
+            # `admit`, so hold the candidate that frees the most attention work.
+            candidates = [
+                r
+                for r in reversed(kept)
+                if r.request_id in alloc
+                and r.is_prefill_chunk
+                and self._remaining(r) > target_remaining
+                and not self._is_stalled(r)
+            ]
+            if not candidates:
                 break
+            candidate = (
+                max(
+                    candidates,
+                    key=lambda r: alloc[r.request_id]
+                    * (r.num_computed_tokens + alloc[r.request_id] / 2),
+                )
+                if left >= need
+                else candidates[0]
+            )
             kept.remove(candidate)
             held.append(candidate)
         if not held or admit <= 0:
