@@ -29,7 +29,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel import kernel, planner
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
 from vllm_torchtpu.megakernel.modules.gdn import GDNModule
@@ -135,8 +135,8 @@ def test_m2_gdn_module_invariants_and_layout():
 
     # vh > 64 violates 64-lane b|a packing in ybuf[:, BA:BA+128]
     g_vh_over_64 = dataclasses.replace(g, KH=64, VH=128)
-    ex_r1 = ExecSpec(B=4, T=1, R=1, ctx=256)
-    with pytest.raises(AssertionError):
+    ex_r1 = ExecSpec(B=4, T=1, R=1, ctx=256, tiles=Tiles(bank=8 << 20))
+    with pytest.raises(AssertionError, match="vh <= 64"):
         planner.plan(qwen35.qwen35_spec(g_vh_over_64), ex_r1)
 
     # VH % KH != 0 violates grouped-query GDN expansion
