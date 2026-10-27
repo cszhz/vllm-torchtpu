@@ -23,9 +23,13 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 
 # Scoped VMEM the pre kernels reserve: the smallest round budget whose
-# _vmem_need estimate still admits the default 64-token block, instead of
+# _vmem_need estimate still admits the default token block, instead of
 # the whole of VMEM, so XLA can keep its own buffers resident across the call.
 PRE_VMEM_LIMIT_BYTES = 24 * 1024 * 1024
+
+# Tokens per grid step of the chain-start pre kernel. Each step re-pushes the
+# resident fn chunks into the MXU, so a larger block amortizes those pushes.
+TOKEN_BLOCK = 128
 
 
 def _mixes_kernel(x_ref, fn_ref, mixes_ref, sqrsum_ref):
@@ -188,7 +192,7 @@ def mhc_pre_collapse_gates(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     *,
-    token_block_size: int = 64,
+    token_block_size: int = TOKEN_BLOCK,
     vmem_limit_bytes: int = PRE_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Mixes + in-block collapse + gates: all of ``mhc_pre`` in one kernel.
@@ -209,14 +213,12 @@ def mhc_pre_collapse_gates(
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
     def _vmem_need(tb: int) -> int:
-        # Double-buffered bf16 x block + layer output, transient f32
-        # copy, resident f32 fn + its stacked bf16 chunks; x2
-        # spill/scratch headroom.
-        return 2 * (
-            tb * hc_hidden * (2 * 2 + 4)
-            + tb * hidden_size * 2 * 2
-            + hc_mult3 * hc_hidden * (2 * 4 + 3 * 2)
-        )
+        # Double-buffered bf16 x block + layer output, double-buffered f32
+        # fn + its stacked bf16 chunks, +25% for Mosaic's own temporaries
+        # (deviceless AOT at tb=128: 15.8 MiB need vs 15.25 MiB summed).
+        need = 2 * tb * (hc_hidden + hidden_size) * 2
+        need += hc_mult3 * hc_hidden * (2 * 4 + 3 * 2)
+        return need * 5 // 4
 
     tb, padded_tokens = utils.select_token_block(
         num_tokens,
@@ -295,7 +297,7 @@ def mhc_pre(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     *,
-    token_block_size: int = 64,
+    token_block_size: int = TOKEN_BLOCK,
     vmem_limit_bytes: int = PRE_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``mhc_pre`` as one Pallas kernel: mix GEMM, collapse and gates.
