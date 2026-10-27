@@ -134,6 +134,10 @@ steps:
         if: 'build.env("NIGHTLY") != "1"'
         env:
           SHAPE: *shape_multi
+          # Keeps every spawned worker group's output and libtpu logs, to
+          # diagnose the intermittent "START_SESSION failed" slice bring-up;
+          # see tests/tpu_worker_logs.py.
+          ARTIFACTS_DIR: &multichip_artifacts "multichip_logs"
         plugins:
           - *kube_plugin
           - tests#v1.0.0:
@@ -263,6 +267,7 @@ steps:
         if: 'build.env("NIGHTLY") == "1"'
         env:
           SHAPE: *shape_multi
+          ARTIFACTS_DIR: *multichip_artifacts
         plugins:
           - *kube_plugin
           - tests#v1.0.0:

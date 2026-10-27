@@ -478,10 +478,13 @@ def test_hnd_partial_prefill_and_decode_preserve_attention_and_cache(tmp_path):
         "--worker",
         str(tmp_path),
     ]
+    from tests.tpu_worker_logs import WorkerGroupLog
+
+    group_log = WorkerGroupLog()
     with (tmp_path / "workers.log").open("w") as log:
         proc = subprocess.Popen(
             command,
-            env=env,
+            env=group_log.env(env),
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -492,6 +495,12 @@ def test_hnd_partial_prefill_and_decode_preserve_attention_and_cache(tmp_path):
             os.killpg(proc.pid, signal.SIGTERM)
             proc.wait(timeout=30)
             pytest.fail(f"PCP workers timed out; see {tmp_path / 'workers.log'}")
+        finally:
+            group_log.finish(
+                proc.returncode,
+                (tmp_path / "workers.log").read_text(errors="replace"),
+                tmp_path,
+            )
     assert returncode == 0, (tmp_path / "workers.log").read_text()[-12000:]
     rows = []
     for rank in range(8):

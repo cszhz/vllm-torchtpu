@@ -241,11 +241,15 @@ def test_serving_preserves_local_rows_and_matches_dense_reference(tmp_path):
         "--result-dir",
         str(tmp_path),
     ]
+    from tests.tpu_worker_logs import WorkerGroupLog
+
     log_path = tmp_path / "workers.log"
+    env = _prepare_worker_env()
+    group_log = WorkerGroupLog()
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command,
-            env=_prepare_worker_env(),
+            env=group_log.env(env),
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -262,6 +266,10 @@ def test_serving_preserves_local_rows_and_matches_dense_reference(tmp_path):
             pytest.fail(
                 f"adaptive MoE workers timed out; see {log_path}\n"
                 + log_path.read_text()[-12000:]
+            )
+        finally:
+            group_log.finish(
+                process.returncode, log_path.read_text(errors="replace"), tmp_path
             )
     results = []
     for rank in range(WORLD_SIZE):

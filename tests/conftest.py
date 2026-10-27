@@ -30,6 +30,17 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 
+# In CI, keep libtpu's own logs (TPU session start and stop, ICI bring-up) for
+# every TPU process the run starts; by default they land in the pod's /tmp and
+# are lost with it. Spawned worker groups get a directory of their own
+# (tests/tpu_worker_logs.py); this catches the rest, engines included.
+if os.environ.get("ARTIFACTS_DIR"):
+    os.environ.setdefault(
+        "TPU_LOG_DIR",
+        os.path.join(os.path.abspath(os.environ["ARTIFACTS_DIR"]), "tpu_logs"),
+    )
+    os.makedirs(os.environ["TPU_LOG_DIR"], exist_ok=True)
+
 import pytest
 import torch
 
@@ -164,6 +175,21 @@ def device(request):
         except Exception as e:
             pytest.fail(f"TPU requested but failed to initialize: {e}")
     return torch.device("cpu")
+
+
+def pytest_sessionfinish(session):
+    """Drop libtpu's `tpu_driver.INFO`-style links from the CI log directory.
+
+    Each points at the newest log of its level, so uploading them with the
+    directory would store those logs twice.
+    """
+    log_dir = os.environ.get("TPU_LOG_DIR")
+    if not os.environ.get("ARTIFACTS_DIR") or not log_dir or not os.path.isdir(log_dir):
+        return
+    for name in os.listdir(log_dir):
+        path = os.path.join(log_dir, name)
+        if os.path.islink(path):
+            os.unlink(path)
 
 
 def pytest_collection_finish(session):

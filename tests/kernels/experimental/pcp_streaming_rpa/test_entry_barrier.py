@@ -108,15 +108,20 @@ def _prepare_worker_env() -> dict[str, str]:
 
 
 def _run_worker_group(result_dir: Path) -> subprocess.CompletedProcess[str]:
+    from tests.tpu_worker_logs import WorkerGroupLog
+
+    env = _prepare_worker_env()
+    log = WorkerGroupLog()
     process = subprocess.Popen(
         _worker_command(result_dir),
         cwd=Path(__file__).resolve().parents[4],
-        env=_prepare_worker_env(),
+        env=log.env(env),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         start_new_session=True,
     )
+    output = ""
     try:
         output, _ = process.communicate(timeout=LAUNCH_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as exc:
@@ -130,6 +135,8 @@ def _run_worker_group(result_dir: Path) -> subprocess.CompletedProcess[str]:
             "PCP workers timed out and were terminated. Output tail:\n"
             f"{output[-12000:]}"
         ) from exc
+    finally:
+        log.finish(process.returncode, output, result_dir)
     return subprocess.CompletedProcess(process.args, process.returncode, output, "")
 
 
