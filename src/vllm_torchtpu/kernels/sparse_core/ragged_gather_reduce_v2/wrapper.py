@@ -40,6 +40,22 @@ def _fallback_implementation(
     return out
 
 
+def _stable_partition_by_validity(valid_rows_mask: jax.Array) -> jax.Array:
+    """The indices of the valid entries, then of the invalid ones, each in order.
+
+    Equal to a stable ``argsort(~mask)``: each key packs (invalid, index) into
+    one int32, the keys are distinct, so one single-operand unstable sort gives
+    the stable order without the two-operand comparator.
+    """
+    (num_rows,) = valid_rows_mask.shape
+    index_bits = max(1, (num_rows - 1).bit_length())
+    assert index_bits < 31, f"{num_rows} entries do not pack into int32 keys"
+    index = jnp.arange(num_rows, dtype=jnp.int32)
+    keys = jnp.where(valid_rows_mask, 0, 1 << index_bits) | index
+    keys = jax.lax.sort(keys, is_stable=False)
+    return jnp.bitwise_and(keys, (1 << index_bits) - 1)
+
+
 def _preprocess_scalar_data(
     indices: jax.Array,
     valid_rows_mask: jax.Array,
@@ -67,9 +83,9 @@ def _preprocess_scalar_data(
     group_size = cfg.reduce_group_size
     num_rows = valid_rows_mask.shape[0]
 
-    # Stable sort of a boolean key is a stable partition: valid rows keep their
-    # relative order and move ahead of the invalid ones.
-    sorted_by_validity = jnp.argsort(~valid_rows_mask, stable=True).astype(jnp.int32)
+    # A stable partition: valid rows keep their relative order and move ahead
+    # of the invalid ones.
+    sorted_by_validity = _stable_partition_by_validity(valid_rows_mask)
     num_valid = jnp.sum(valid_rows_mask, dtype=jnp.int32)
 
     dst = sorted_by_validity // group_size
