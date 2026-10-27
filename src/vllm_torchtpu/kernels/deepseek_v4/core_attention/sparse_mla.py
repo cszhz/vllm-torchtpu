@@ -201,7 +201,7 @@ DENSE_MIN_TOKENS = 256
 DENSE_TOKENS_PER_MATMUL = 16
 # A `DenseRefs` batch attends over its sequence's first rows in multiples of
 # this many, enough to cover every row its tokens selected.
-DENSE_KV_BLOCK = 512
+DENSE_KV_BLOCK = 1024
 # A single-sequence batch whose tokens can select more compressed rows than
 # this keeps the per-token SparseCore gather.
 DENSE_MAX_ROWS = 1 << 30
