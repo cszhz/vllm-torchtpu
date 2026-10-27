@@ -824,23 +824,51 @@ def _attention_kernel(
         num_steps = num_blocks // per_step
         group = min(DENSE_TOKENS_PER_MATMUL, batch_size)
         assert batch_size % group == 0
+        def step_rows(i):
+            return [block_row(i * per_step + k) for k in range(per_step)]
+
+        def tail_rows(tail):
+            return [block_row(num_steps * per_step + k) for k in range(tail)]
+
         for first in range(0, batch_size, group):
             tokens = range(first, first + group)
-            init_dense_state(bi_sem_idx, tokens)
 
-            @pl.loop(0, num_steps)
-            def _(i):
-                rows = [block_row(i * per_step + k) for k in range(per_step)]
+            def init():
+                init_dense_state(bi_sem_idx, tokens)
+
+            def step(rows):
                 attend_blocks_from_cache(bi_sem_idx, tokens, rows, DENSE_STEP_CHUNKS)
+
+            def tail_step(rows):
+                attend_blocks_from_cache(bi_sem_idx, tokens, rows, DENSE_TAIL_CHUNKS)
+
+            # The batch's first step shares a basic block with the state
+            # init, so the init's stores run under the step's first QK.
+            @pl.when(num_steps > 0)
+            def _():
+                init()
+                step(step_rows(0))
+
+            @pl.loop(1, num_steps)
+            def _(i):
+                step(step_rows(i))
+
+            @pl.when(num_blocks == 0)
+            def _():
+                init()
 
             for tail in range(1, per_step):
 
-                @pl.when(num_blocks - num_steps * per_step == tail)
+                @pl.when(num_blocks == tail)
                 def _(tail=tail):
-                    rows = [block_row(num_steps * per_step + k) for k in range(tail)]
-                    attend_blocks_from_cache(
-                        bi_sem_idx, tokens, rows, DENSE_TAIL_CHUNKS
-                    )
+                    init()
+                    tail_step(tail_rows(tail))
+
+                @pl.when(
+                    (num_steps > 0) & (num_blocks - num_steps * per_step == tail)
+                )
+                def _(tail=tail):
+                    tail_step(tail_rows(tail))
 
             out = finish_dense_state(attention_sinks, group)
             for i, b in enumerate(tokens):
