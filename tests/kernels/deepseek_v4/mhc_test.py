@@ -369,6 +369,59 @@ class MhcPostPallasTpuTest(parameterized.TestCase):
         )
 
 
+def _ref_collapse_head(hidden, hc_fn, hc_scale, hc_base, rms_eps, hc_eps):
+    """jnp port of the model's ``mhc_collapse_head``."""
+    flat = hidden.reshape(*hidden.shape[:-2], -1).astype(jnp.float32)
+    norm = flat * jax.lax.rsqrt(jnp.mean(flat * flat, -1, keepdims=True) + rms_eps)
+    mix = jax.lax.dot_general(
+        norm, hc_fn, (((1,), (1,)), ((), ())), precision=jax.lax.Precision.HIGHEST
+    )
+    mix = jax.nn.sigmoid(mix * hc_scale + hc_base) + hc_eps
+    out = jnp.sum(mix[..., None] * hidden.astype(jnp.float32), axis=-2)
+    return out.astype(hidden.dtype)
+
+
+@pytest.mark.tpu_test
+class MhcPostHeadPallasTpuTest(parameterized.TestCase):
+    """Post + hc_head kernel vs post then the collapse reference. Needs TPU."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.product(num_tokens=[1, 17, 128, 300], hidden_size=[256, 7168])
+    def test_matches_reference(self, num_tokens, hidden_size):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import post_kernel
+
+        rng = np.random.default_rng(9)
+        x, res, plm, crm = _make_post_inputs(rng, num_tokens, hidden_size)
+        hc_fn = jnp.asarray(
+            rng.standard_normal((HC_MULT, HC_MULT * hidden_size), dtype=np.float32)
+            * 0.02
+        )
+        hc_scale = jnp.asarray([0.8], jnp.float32)
+        hc_base = jnp.asarray(0.5 * rng.standard_normal(HC_MULT), jnp.float32)
+
+        want = _ref_collapse_head(
+            _ref_mhc_post(x, res, plm, crm, precision=jax.lax.Precision.HIGHEST),
+            hc_fn,
+            hc_scale,
+            hc_base,
+            RMS_EPS,
+            HC_PRE_EPS,
+        )
+        got = post_kernel.mhc_post_head(
+            x, res, plm, crm, hc_fn, hc_scale, hc_base, RMS_EPS, HC_PRE_EPS
+        )
+
+        self.assertEqual(got.shape, (num_tokens, hidden_size))
+        self.assertEqual(got.dtype, jnp.bfloat16)
+        np.testing.assert_allclose(
+            _to_np(got), _to_np(want), rtol=BF16_RTOL, atol=BF16_ATOL
+        )
+
+
 def _make_fused_inputs(rng, num_tokens, hidden_size):
     """x/residual/gates (post-style) plus fn/scale/base (pre-style)."""
     x, residual, post_mix, comb_mix = _make_post_inputs(rng, num_tokens, hidden_size)
