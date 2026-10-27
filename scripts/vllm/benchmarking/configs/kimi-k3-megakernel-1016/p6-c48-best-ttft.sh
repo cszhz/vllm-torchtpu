@@ -11,6 +11,7 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
+# limitations under the License.
 # p6-c48-best with a prefill scheduler for the TTFT tail: 8 prefill sequences
 # per step instead of 4 and long prompts capped at 2,048 tokens per step instead
 # of 4,096, so short turns are not queued behind long chunks.
