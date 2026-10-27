@@ -5422,6 +5422,7 @@ class TPUModelRunner(GPUModelRunner):
                         "mhc_ops",
                         "mhc_post_op",
                         "qnorm_rope_op",
+                        "project_qnorm_rope_op",
                         "kv_rope_op",
                         "o_proj_op",
                     ):

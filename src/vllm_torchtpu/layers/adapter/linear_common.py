@@ -23,7 +23,12 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    dense_proj_matmul,
+    dense_proj_matmul_applies,
+    quantize_tensor,
+    xla_quantized_matmul,
+)
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
 # `apply` -- by code that assumes vLLM's `[n_out, n_in]` layout. Flipping those
@@ -104,6 +109,9 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
+    if dense_proj_matmul_applies(x, w_q, w_s):
+        x_q, x_scale = quantize_tensor(x, w_q.dtype)
+        return dense_proj_matmul(x_q, x_scale, w_q, w_s, x.dtype)
     return xla_quantized_matmul(x, w_q, w_s)
 
 

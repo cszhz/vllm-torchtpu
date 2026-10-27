@@ -13,6 +13,7 @@
 # limitations under the License.
 """Utility functions for quantized matmul kernel."""
 
+import dataclasses
 import functools
 from collections.abc import Callable
 from typing import Any
@@ -37,6 +38,32 @@ ROW_QUANT_MIN_STEPS = 4
 ROW_QUANT_ROW_GROUP = 64
 # Columns per amax/quantize step inside a row group.
 ROW_QUANT_COL_CHUNK = 512
+
+# Prefill fp8 linears whose (K, N) weight is listed here run dense_proj_matmul
+# instead of XLA's dot fusion: attention wq_b and wo_b.
+DENSE_PROJ_MIN_TOKENS = 512
+DENSE_PROJ_SHAPES = ((1024, 32768), (8192, 4096))
+# fp8 weight bytes per grid step (one column tile, double-buffered).
+DENSE_PROJ_W_TILE_BYTES = 2 * 1024 * 1024
+# Rows and columns of each dot + scale epilogue chunk inside a column tile.
+# At K=8192 a 256-column chunk makes Mosaic split K into two MRB passes added
+# on the VPU, which reorders the f32 sums; 512 keeps K in one accumulation.
+DENSE_PROJ_SUB_M = 1024
+DENSE_PROJ_SUB_N = 512
+# Kept small so XLA can leave the fp8 activation in VMEM, where act_quant_rows
+# wrote it; with 48 MiB it moves the K=8192 activation to HBM first.
+DENSE_PROJ_VMEM_LIMIT_BYTES = 24 * 1024 * 1024
+# fp8 weight bytes per grid step with a fused epilogue. The epilogue is
+# pipelined across steps, so a step boundary costs little and a narrower tile
+# shortens the first weight fetch and the last output writeback, both exposed.
+DENSE_PROJ_EPILOGUE_W_TILE_BYTES = 2 * 1024 * 1024
+DENSE_PROJ_EPILOGUE_VMEM_LIMIT_BYTES = 40 * 1024 * 1024
+# Rows per dot in the epilogue-fused kernel: a chunk's epilogue can start on
+# its first rows while the MXU computes the rest.
+DENSE_PROJ_EPILOGUE_SUB_M = 256
+# Chunks whose products a step of the epilogue-fused kernel leaves for the next
+# step to finish (it computes as many of the next tile's first chunks).
+DENSE_PROJ_EPILOGUE_LAG_CHUNKS = 1
 
 
 def unfold_args(
@@ -440,3 +467,292 @@ def quantize_block(data, axis, target_dtype):
     else:
         data_q = jnp.round(data / scale).astype(target_dtype)
     return data_q, scale
+
+
+def dense_proj_matmul_applies(x: jax.Array, w_q: jax.Array, w_scale: jax.Array) -> bool:
+    """Whether the per-channel fp8 linear x @ w_q runs dense_proj_matmul."""
+    return (
+        x.ndim == 2
+        and x.dtype == jnp.bfloat16
+        and w_scale.ndim == 1
+        and w_q.dtype == jnp.float8_e4m3fn
+        and x.shape[0] >= DENSE_PROJ_MIN_TOKENS
+        and x.shape[0] % min(DENSE_PROJ_SUB_M, x.shape[0]) == 0
+        and tuple(w_q.shape) in DENSE_PROJ_SHAPES
+    )
+
+
+def _dense_proj_tile_n(k: int, n: int, w_tile_bytes: int) -> int:
+    """Widest multiple of DENSE_PROJ_SUB_N dividing n whose fp8 weight tile
+    fits w_tile_bytes (at least one sub-column)."""
+    tile_n = max(DENSE_PROJ_SUB_N, min(n, w_tile_bytes // k))
+    tile_n -= tile_n % DENSE_PROJ_SUB_N
+    while n % tile_n:
+        tile_n -= DENSE_PROJ_SUB_N
+    return tile_n
+
+
+@dataclasses.dataclass(frozen=True)
+class DenseProjEpilogue:
+    """Work fused onto each (rows, DENSE_PROJ_SUB_N) block of dense_proj_matmul's
+    output while it is still in vregs, between the scale epilogue and the store.
+
+    ``operands`` are passed whole in VMEM. ``init(operand_refs, scratch_refs)``
+    runs on the first grid step. ``block(y, row0, operand_refs, scratch_refs)``
+    takes the scaled block ``y`` (in the output dtype, first row ``row0``) and
+    returns the values to store in its place.
+    """
+
+    operands: tuple[jax.Array, ...]
+    scratch_shapes: tuple[Any, ...]
+    rows: int
+    init: Callable[..., None]
+    block: Callable[..., jax.Array]
+
+
+def _dense_proj_kernel(
+    x_scale_ref,  # (1, m) f32, lane-dense
+    w_scale_ref,  # (1, n) f32
+    x_ref,  # (m, k) fp8, whole in VMEM, where its producer already wrote it
+    w_ref,  # (k, tile_n) fp8, streamed
+    out_ref,  # (m, tile_n) bf16, streamed
+    x_scale_lanes_ref,  # (m, 128) f32 scratch
+):
+    m, tile_n = out_ref.shape
+    lanes = x_scale_lanes_ref.shape[1]
+    sub_m, sub_n = min(DENSE_PROJ_SUB_M, m), DENSE_PROJ_SUB_N
+
+    @pl.when(pl.program_id(0) == 0)
+    def _():
+        x_scale_lanes_ref[...] = jnp.broadcast_to(
+            jnp.transpose(x_scale_ref[...]), x_scale_lanes_ref.shape
+        )
+
+    def scale(acc, x_scale, col):
+        # xla_quantized_matmul's epilogue order: x scale, then w scale.
+        n0 = pl.multiple_of(pl.program_id(0) * tile_n + col, lanes)
+        return (acc * x_scale * w_scale_ref[:, pl.ds(n0, lanes)]).astype(out_ref.dtype)
+
+    for r in range(m // sub_m):
+        rows = pl.ds(r * sub_m, sub_m)
+        x_scale = x_scale_lanes_ref[rows, :]
+        for c in range(tile_n // sub_n):
+            # K stays whole in one dot, as in XLA's fusion, so the f32 sums match.
+            acc = jax.lax.dot_general(
+                x_ref[rows, :],
+                w_ref[:, pl.ds(c * sub_n, sub_n)],
+                dimension_numbers=(((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            # One 128-lane column at a time, so the lane-broadcast x scale
+            # is reused.
+            for j in range(sub_n // lanes):
+                col = c * sub_n + j * lanes
+                out_ref[rows, pl.ds(col, lanes)] = scale(
+                    acc[:, j * lanes : (j + 1) * lanes], x_scale, col
+                )
+
+
+def _dense_proj_epilogue_kernel(
+    x_scale_ref,  # (1, m) f32, lane-dense
+    w_scale_ref,  # (1, n) f32
+    x_ref,  # (m, k) fp8, whole in VMEM, where its producer already wrote it
+    *refs,  # epilogue operands, then w (k, n) fp8 in HBM, out (m, tile_n) bf16
+    # streamed, x_scale_lanes (m, 128) f32 scratch, acc (lag, m, sub_n) f32
+    # scratch, w_buf (2, k, tile_n) fp8 scratch, w_sems (2, 2) DMA semaphores,
+    # epilogue scratch
+    epilogue: DenseProjEpilogue,
+):
+    """_dense_proj_kernel's dot + scale with ``epilogue`` on every chunk,
+    software-pipelined across grid steps.
+
+    The products of a step's first ``lag`` chunks come from the step before it
+    (acc_ref), and the step ends with the dots of the next tile's first ``lag``
+    chunks. So the last chunks' VPU epilogues run under MXU work instead of
+    closing the step alone, and the first chunks' epilogues can start before
+    the step's first dot.
+
+    Weight tiles are copied in by hand into w_buf's slot ``tile % 2``, in two
+    DMAs: the first ``lag`` chunks, fetched two steps ahead because the step
+    before needs them at its end, and the rest, fetched one step ahead. So the
+    first step's lagged dots wait for their own chunks only, while the rest of
+    the first tile streams in under them, and no chunk is fetched twice. Every
+    wait sits at a step's top: a DMA wait mid-step would split its schedule.
+    """
+    num_operands = len(epilogue.operands)
+    operand_refs = refs[:num_operands]
+    w_hbm_ref, out_ref, x_scale_lanes_ref, acc_ref, w_buf, w_sems = refs[
+        num_operands : num_operands + 6
+    ]
+    epilogue_scratch_refs = refs[num_operands + 6 :]
+    m, tile_n = out_ref.shape
+    lag = acc_ref.shape[0]
+    lanes = x_scale_lanes_ref.shape[1]
+    sub_n = DENSE_PROJ_SUB_N
+    chunks = tile_n // sub_n
+    rows = epilogue.rows
+    assert m <= DENSE_PROJ_SUB_M
+    sub_m = max(
+        d for d in range(rows, DENSE_PROJ_EPILOGUE_SUB_M + 1, rows) if m % d == 0
+    )
+    step = pl.program_id(0)
+    last_step = pl.num_programs(0) - 1
+    slot = step & 1
+
+    def w_copy(tile, part):
+        """DMA of ``tile``'s first ``lag`` chunks (part 0) or of the rest (part
+        1) into slot ``tile % 2``. A tile past the last one reads the last
+        one's columns, so its dots need no branch."""
+        c0, c1 = (0, lag) if part == 0 else (lag, chunks)
+        col0 = jnp.minimum(tile, last_step) * tile_n + c0 * sub_n
+        cols = (c1 - c0) * sub_n
+        return pltpu.make_async_copy(
+            w_hbm_ref.at[:, pl.ds(pl.multiple_of(col0, sub_n), cols)],
+            w_buf.at[tile & 1, :, pl.ds(c0 * sub_n, cols)],
+            w_sems.at[tile & 1, part],
+        )
+
+    def dot(w, r0):
+        # K stays whole in one dot, as in XLA's fusion, so the f32 sums match.
+        return jax.lax.dot_general(
+            x_ref[pl.ds(r0, sub_m), :],
+            w,
+            dimension_numbers=(((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+
+    @pl.when(step < 1)
+    def _():
+        for tile, part in ((0, 0), (0, 1), (1, 0)):
+            w_copy(tile, part).start()
+        w_copy(0, 0).wait()
+
+    # A block of its own (another condition, so the two are not merged): the
+    # copies above start first, and the setup below runs under the dots.
+    @pl.when(step == 0)
+    def _():
+        x_scale_lanes_ref[...] = jnp.broadcast_to(
+            jnp.transpose(x_scale_ref[...]), x_scale_lanes_ref.shape
+        )
+        epilogue.init(operand_refs, epilogue_scratch_refs)
+        for c in range(lag):
+            for r0 in range(0, m, sub_m):
+                acc_ref[c, pl.ds(r0, sub_m), :] = dot(
+                    w_buf[0, :, pl.ds(c * sub_n, sub_n)], r0
+                )
+
+    w_copy(step, 1).wait()
+    w_copy(step + 1, 0).wait()
+
+    @pl.when(step < last_step)
+    def _():
+        w_copy(step + 1, 1).start()
+        w_copy(step + 2, 0).start()
+
+    def scale(acc, x_scale, col):
+        # xla_quantized_matmul's epilogue order: x scale, then w scale.
+        n0 = pl.multiple_of(pl.program_id(0) * tile_n + col, lanes)
+        return (acc * x_scale * w_scale_ref[:, pl.ds(n0, lanes)]).astype(out_ref.dtype)
+
+    def finish(c, r0, acc_rows):
+        for b in range(r0, r0 + sub_m, rows):
+            acc = acc_rows(b)
+            x_scale = x_scale_lanes_ref[pl.ds(b, rows), :]
+            y = jnp.concatenate(
+                [
+                    scale(
+                        acc[:, j * lanes : (j + 1) * lanes],
+                        x_scale,
+                        c * sub_n + j * lanes,
+                    )
+                    for j in range(sub_n // lanes)
+                ],
+                axis=1,
+            )
+            out_ref[pl.ds(b, rows), pl.ds(c * sub_n, sub_n)] = epilogue.block(
+                y, b, operand_refs, epilogue_scratch_refs
+            )
+
+    # acc_rows[(c, r0)](b): rows b.. of chunk c's product, in its row block r0.
+    acc_rows = {
+        (c, r0): lambda b, c=c: acc_ref[c, pl.ds(b, rows), :]
+        for c in range(lag)
+        for r0 in range(0, m, sub_m)
+    }
+    next_slot = 1 - slot
+    # Program order puts each dot ahead of the epilogue ``lag`` chunks back.
+    for c in range(lag, chunks + lag):
+        for r0 in range(0, m, sub_m):
+            if c < chunks:
+                acc = dot(w_buf[slot, :, pl.ds(c * sub_n, sub_n)], r0)
+                acc_rows[c, r0] = lambda b, acc=acc, r0=r0: acc[b - r0 : b - r0 + rows]
+            else:
+                acc = dot(w_buf[next_slot, :, pl.ds((c - chunks) * sub_n, sub_n)], r0)
+            finish(c - lag, r0, acc_rows.pop((c - lag, r0)))
+            if c >= chunks:  # After the epilogue that may read the same slot.
+                acc_ref[c - chunks, pl.ds(r0, sub_m), :] = acc
+
+
+def dense_proj_matmul(
+    x_q: jax.Array,  # [m, k] fp8
+    x_scale: jax.Array,  # [m, 1] f32
+    w_q: jax.Array,  # [k, n] fp8
+    w_scale: jax.Array,  # [n]
+    out_dtype: jnp.dtype,
+    epilogue: DenseProjEpilogue | None = None,
+) -> jax.Array:
+    """The dot + scale epilogue of xla_quantized_matmul as a Pallas kernel.
+
+    The activation is read in place from VMEM; weight column tiles stream in
+    and output tiles stream out while the MXU works on the tile between them.
+    K is never split and the epilogue keeps XLA's order, so the result is
+    bit-identical to xla_quantized_matmul.
+    """
+    m, k = x_q.shape
+    n = w_q.shape[1]
+    if epilogue:
+        w_tile_bytes = DENSE_PROJ_EPILOGUE_W_TILE_BYTES
+        vmem_limit_bytes = DENSE_PROJ_EPILOGUE_VMEM_LIMIT_BYTES
+    else:
+        w_tile_bytes = DENSE_PROJ_W_TILE_BYTES
+        vmem_limit_bytes = DENSE_PROJ_VMEM_LIMIT_BYTES
+    tile_n = _dense_proj_tile_n(k, n, w_tile_bytes)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    w_spec = pl.BlockSpec((k, tile_n), lambda j: (0, j))
+    scratch_shapes = [pltpu.VMEM((m, 128), jnp.float32)]
+    if epilogue:
+        kernel = functools.partial(_dense_proj_epilogue_kernel, epilogue=epilogue)
+        operands = (*epilogue.operands, w_q)
+        lag = DENSE_PROJ_EPILOGUE_LAG_CHUNKS
+        assert tile_n % DENSE_PROJ_SUB_N == 0 and tile_n > lag * DENSE_PROJ_SUB_N
+        in_specs = [
+            *(vmem for _ in epilogue.operands),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+        ]
+        scratch_shapes += [
+            pltpu.VMEM((lag, m, DENSE_PROJ_SUB_N), jnp.float32),
+            pltpu.VMEM((2, k, tile_n), w_q.dtype),
+            pltpu.SemaphoreType.DMA((2, 2)),
+            *epilogue.scratch_shapes,
+        ]
+    else:
+        kernel, operands, in_specs = _dense_proj_kernel, (w_q,), [w_spec]
+    return pl.pallas_call(
+        kernel,
+        grid=(n // tile_n,),
+        in_specs=[vmem, vmem, vmem, *in_specs],
+        out_specs=pl.BlockSpec((m, tile_n), lambda j: (0, j)),
+        out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
+        scratch_shapes=scratch_shapes,
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        name="dense_proj_matmul",
+    )(
+        x_scale.reshape(1, m),
+        w_scale.astype(jnp.float32).reshape(1, n),
+        x_q,
+        *operands,
+    )
