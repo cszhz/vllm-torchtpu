@@ -9,6 +9,7 @@ the SparseCore selector, so both paths are compared on identical score bits.
 
 import functools
 import importlib
+import types
 
 import jax
 import jax.numpy as jnp
@@ -69,11 +70,9 @@ def _copy_in_whole_pages(self, src_ref, grid_indices):
     kv_p_start = meta_ref.bkv_idx[p_id] * self.bkv_p
     slot = self.current_copy_in_slot
     vmem_dst = self.window_ref.at[slot]
-    num_page_indices = page_indices_ref.shape[0]
     for batch_idx in range(self.seq_batch_size):
-        offset = (seq + batch_idx) * self.pages_per_seq + kv_p_start
         for i in range(self.bkv_p):
-            page = page_indices_ref[jnp.minimum(offset + i, num_page_indices - 1)]
+            page = self.page_id(page_indices_ref, seq + batch_idx, kv_p_start, i)
             page = jnp.minimum(page, cache_kv_hbm.shape[0] - 1)
             pltpu.make_async_copy(
                 cache_kv_hbm.at[page],
@@ -437,6 +436,68 @@ def test_indexer_step_flags_keep_the_selection(monkeypatch, interpret, case, fla
     for flag in flags:
         monkeypatch.setenv(flag, "1")
     np.testing.assert_array_equal(select(args), expected)
+
+
+@pytest.mark.parametrize("slot", [0, 1])
+def test_pool_page_ids_match_the_expanded_table(slot):
+    """Every kernel page, including reads past the last sequence's last page
+    (clamped), resolves to the expanded table's page id."""
+    seqs, entries, expansion, stride = 3, 5, 13, 104
+    table = jnp.asarray(
+        np.random.default_rng(0).permutation(64)[: seqs * entries], jnp.int32
+    )
+    expanded = (
+        table[:, None] * stride + slot * expansion + jnp.arange(expansion)
+    ).reshape(-1)
+    pages_per_seq = entries * expansion
+
+    ref = types.SimpleNamespace(
+        pages_per_seq=pages_per_seq,
+        table_expansion=(expansion, stride, slot * expansion),
+    )
+    block = 8  # not a multiple of the expansion: blocks start mid-entry
+    for seq in range(seqs + 1):
+        for start in range(0, pages_per_seq + 2 * expansion, block):
+            for i in range(block):
+                k = start + i
+                want = expanded[min(seq * pages_per_seq + k, len(expanded) - 1)]
+                got = bref_override.StreamIndexKVBufferedRef.page_id(
+                    ref, table, jnp.int32(seq), jnp.int32(start), i
+                )
+                assert int(got) == int(want), (seq, k)
+
+
+@pytest.mark.parametrize("chunk", [1 << 20, 4])
+@pytest.mark.parametrize("slot", [0, 1, 7])
+@pytest.mark.parametrize("kv_block", [256, 1024])
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_pool_page_table_keeps_the_selection(
+    monkeypatch, interpret, case, kv_block, slot, chunk
+):
+    """VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE: the KV reader expanding pool-page
+    entries reads the same kernel pages as the pre-expanded table, whatever
+    the slot, the KV block, or the query window."""
+    q_lens, context, tokens = CASES[case]
+    args = inputs(len(case), q_lens, context, tokens, "integer")
+    monkeypatch.setattr(
+        pooled_qsa,
+        "streamindex_topk",
+        functools.partial(streamindex.streamindex_topk, topk_backend=ReferenceTopK()),
+    )
+    monkeypatch.setattr(pooled_qsa, "decode_query_chunk_size", lambda pages: chunk)
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", "4")
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_KV_BLOCK", str(kv_block))
+
+    def run():
+        return np.asarray(
+            pooled_qsa.select_blocks(
+                **args, ratio=RATIO, block_topk=BLOCK_TOPK, slot=slot
+            )
+        )
+
+    expected = run()
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE", "1")
+    np.testing.assert_array_equal(run(), expected)
 
 
 def test_mixed_only_lowers_without_decode_passes(monkeypatch):
