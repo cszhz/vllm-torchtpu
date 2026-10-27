@@ -46,6 +46,15 @@ HEADS = 64
 VDIM = 512
 CHECK_TOKENS = 64
 LAUNCH_TIMEOUT_SECONDS = 900
+LAUNCH_ATTEMPTS = 2
+RETRY_DELAY_SECONDS = 30
+# Worker errors that come from bringing the slice up, not from the merge.
+TPU_BRINGUP_ERRORS = (
+    "START_SESSION failed",
+    "PjRtClient is not initialized",
+    "failed to retrieve the PjRt client",
+    "already opened by another process",
+)
 
 # name -> TPU_DCP_LSE_MERGE_A2A
 ARMS = {
@@ -416,6 +425,36 @@ def _results(result_dir: Path, world: int) -> list[dict]:
     return out
 
 
+def _tpu_bringup_failed(completed: subprocess.CompletedProcess[str], results) -> bool:
+    text = (completed.stdout or "") + json.dumps(results)
+    return any(e in text for e in TPU_BRINGUP_ERRORS)
+
+
+def _run_worker_group(
+    result_dir: Path, extra: list[str]
+) -> tuple[subprocess.CompletedProcess[str], list[dict]]:
+    """Run the workers, retrying once if the slice fails to come up.
+
+    In the full CI session another worker-spawning test runs just before this
+    one, and its workers release the TPUs asynchronously. Some of this test's
+    workers then fail to open a TPU session ("START_SESSION failed ... Max # of
+    tries(=3) exhausted", CI builds 6461, 6484, 6516) or find a device node
+    still open, while the next spawning test, ~20s later, comes up fine. That
+    is a resource race, not a merge defect, so wait briefly and launch the
+    group again.
+    """
+    for attempt in range(1, LAUNCH_ATTEMPTS + 1):
+        completed = _launch(result_dir, extra)
+        results = _results(result_dir, WORLD_SIZE)
+        if attempt == LAUNCH_ATTEMPTS or not _tpu_bringup_failed(completed, results):
+            break
+        print(f"TPU bring-up failed on attempt {attempt}, retrying: {results}")
+        for path in result_dir.glob("rank_*.json"):
+            path.unlink()
+        time.sleep(RETRY_DELAY_SECONDS)
+    return completed, results
+
+
 def assert_merge_results(results: list[dict]) -> None:
     errors = [r for r in results if "error" in r]
     assert not errors, f"worker failures: {errors}"
@@ -448,20 +487,25 @@ def assert_merge_results(results: list[dict]) -> None:
                 )
 
 
+# Room for every launch to run to its timeout; CI passes --timeout=600.
+@pytest.mark.timeout(
+    LAUNCH_ATTEMPTS * (LAUNCH_TIMEOUT_SECONDS + 60) + RETRY_DELAY_SECONDS
+)
 def test_all_to_all_merge_on_real_collectives(tmp_path):
     result_dir = tmp_path / "dcp_merge"
     result_dir.mkdir()
     extra = []
     if os.environ.get("DCP_MERGE_BENCH_TOKENS"):
         extra = ["--bench-tokens", os.environ["DCP_MERGE_BENCH_TOKENS"]]
-    completed = _launch(result_dir, extra)
-    results = _results(result_dir, WORLD_SIZE)
+    completed, results = _run_worker_group(result_dir, extra)
     for line in (completed.stdout or "").splitlines():
         if line.startswith("BENCH "):
             print(line)
     print(json.dumps(results[0], indent=1))
-    assert completed.returncode == 0 or any("error" in r for r in results), (
-        completed.stdout[-12000:]
+    errors = [r for r in results if "error" in r]
+    assert completed.returncode == 0 and not errors, (
+        f"worker failure: returncode={completed.returncode}, errors={errors}\n"
+        f"output tail:\n{(completed.stdout or '')[-12000:]}"
     )
     assert_merge_results(results)
 
