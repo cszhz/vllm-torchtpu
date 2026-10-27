@@ -53,6 +53,10 @@ DENSE_PROJ_SUB_N = 512
 # Kept small so XLA can leave the fp8 activation in VMEM, where act_quant_rows
 # wrote it; with 48 MiB it moves the K=8192 activation to HBM first.
 DENSE_PROJ_VMEM_LIMIT_BYTES = 24 * 1024 * 1024
+# With a fused epilogue every grid step ends in a VPU tail on its last chunk
+# with no MXU work to hide under, so the weight tile is wider (fewer steps).
+DENSE_PROJ_EPILOGUE_W_TILE_BYTES = 4 * 1024 * 1024
+DENSE_PROJ_EPILOGUE_VMEM_LIMIT_BYTES = 40 * 1024 * 1024
 
 
 def unfold_args(
@@ -471,10 +475,10 @@ def dense_proj_matmul_applies(x: jax.Array, w_q: jax.Array, w_scale: jax.Array) 
     )
 
 
-def _dense_proj_tile_n(k: int, n: int) -> int:
+def _dense_proj_tile_n(k: int, n: int, w_tile_bytes: int) -> int:
     """Widest multiple of DENSE_PROJ_SUB_N dividing n whose fp8 weight tile
-    fits DENSE_PROJ_W_TILE_BYTES (at least one sub-column)."""
-    tile_n = max(DENSE_PROJ_SUB_N, min(n, DENSE_PROJ_W_TILE_BYTES // k))
+    fits w_tile_bytes (at least one sub-column)."""
+    tile_n = max(DENSE_PROJ_SUB_N, min(n, w_tile_bytes // k))
     tile_n -= tile_n % DENSE_PROJ_SUB_N
     while n % tile_n:
         tile_n -= DENSE_PROJ_SUB_N
@@ -583,7 +587,13 @@ def dense_proj_matmul(
     """
     m, k = x_q.shape
     n = w_q.shape[1]
-    tile_n = _dense_proj_tile_n(k, n)
+    if epilogue:
+        w_tile_bytes = DENSE_PROJ_EPILOGUE_W_TILE_BYTES
+        vmem_limit_bytes = DENSE_PROJ_EPILOGUE_VMEM_LIMIT_BYTES
+    else:
+        w_tile_bytes = DENSE_PROJ_W_TILE_BYTES
+        vmem_limit_bytes = DENSE_PROJ_VMEM_LIMIT_BYTES
+    tile_n = _dense_proj_tile_n(k, n, w_tile_bytes)
     operands = epilogue.operands if epilogue else ()
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     return pl.pallas_call(
@@ -604,7 +614,7 @@ def dense_proj_matmul(
         ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=DENSE_PROJ_VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=vmem_limit_bytes,
         ),
         name="dense_proj_matmul",
     )(
