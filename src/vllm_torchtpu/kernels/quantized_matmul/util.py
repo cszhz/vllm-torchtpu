@@ -13,6 +13,7 @@
 # limitations under the License.
 """Utility functions for quantized matmul kernel."""
 
+import dataclasses
 import functools
 from collections.abc import Callable
 from typing import Any
@@ -480,14 +481,36 @@ def _dense_proj_tile_n(k: int, n: int) -> int:
     return tile_n
 
 
+@dataclasses.dataclass(frozen=True)
+class DenseProjEpilogue:
+    """Work fused onto each (rows, DENSE_PROJ_SUB_N) block of dense_proj_matmul's
+    output while it is still in vregs, between the scale epilogue and the store.
+
+    ``operands`` are passed whole in VMEM. ``init(operand_refs, scratch_refs)``
+    runs on the first grid step. ``block(y, row0, operand_refs, scratch_refs)``
+    takes the scaled block ``y`` (in the output dtype, first row ``row0``) and
+    returns the values to store in its place.
+    """
+
+    operands: tuple[jax.Array, ...]
+    scratch_shapes: tuple[Any, ...]
+    rows: int
+    init: Callable[..., None]
+    block: Callable[..., jax.Array]
+
+
 def _dense_proj_kernel(
     x_scale_ref,  # (1, m) f32, lane-dense
     w_scale_ref,  # (1, n) f32
     x_ref,  # (m, k) fp8, whole in VMEM, where its producer already wrote it
-    w_ref,  # (k, tile_n) fp8, streamed
-    out_ref,  # (m, tile_n) bf16, streamed
-    x_scale_lanes_ref,  # (m, 128) f32 scratch: each row's scale on every lane
+    *refs,  # epilogue operands, then w (k, tile_n) fp8 streamed, out (m, tile_n)
+    # bf16 streamed, x_scale_lanes (m, 128) f32 scratch, epilogue scratch
+    epilogue: DenseProjEpilogue | None,
 ):
+    num_operands = len(epilogue.operands) if epilogue else 0
+    operand_refs = refs[:num_operands]
+    w_ref, out_ref, x_scale_lanes_ref = refs[num_operands : num_operands + 3]
+    epilogue_scratch_refs = refs[num_operands + 3 :]
     m, tile_n = out_ref.shape
     lanes = x_scale_lanes_ref.shape[1]
     sub_m, sub_n = min(DENSE_PROJ_SUB_M, m), DENSE_PROJ_SUB_N
@@ -497,6 +520,13 @@ def _dense_proj_kernel(
         x_scale_lanes_ref[...] = jnp.broadcast_to(
             jnp.transpose(x_scale_ref[...]), x_scale_lanes_ref.shape
         )
+        if epilogue:
+            epilogue.init(operand_refs, epilogue_scratch_refs)
+
+    def scale(acc, x_scale, col):
+        # xla_quantized_matmul's epilogue order: x scale, then w scale.
+        n0 = pl.multiple_of(pl.program_id(0) * tile_n + col, lanes)
+        return (acc * x_scale * w_scale_ref[:, pl.ds(n0, lanes)]).astype(out_ref.dtype)
 
     for r in range(m // sub_m):
         rows = pl.ds(r * sub_m, sub_m)
@@ -509,14 +539,31 @@ def _dense_proj_kernel(
                 dimension_numbers=(((1,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )
-            # xla_quantized_matmul's epilogue order: x scale, then w scale. One
-            # 128-lane column at a time, so the lane-broadcast x scale is reused.
-            for j in range(sub_n // lanes):
-                col = c * sub_n + j * lanes
-                n0 = pl.multiple_of(pl.program_id(0) * tile_n + col, lanes)
-                out = acc[:, j * lanes : (j + 1) * lanes] * x_scale
-                out = out * w_scale_ref[:, pl.ds(n0, lanes)]
-                out_ref[rows, pl.ds(col, lanes)] = out.astype(out_ref.dtype)
+            if epilogue is None:
+                # One 128-lane column at a time, so the lane-broadcast x scale
+                # is reused.
+                for j in range(sub_n // lanes):
+                    col = c * sub_n + j * lanes
+                    out_ref[rows, pl.ds(col, lanes)] = scale(
+                        acc[:, j * lanes : (j + 1) * lanes], x_scale, col
+                    )
+                continue
+            for b in range(0, sub_m, epilogue.rows):
+                y = jnp.concatenate(
+                    [
+                        scale(
+                            acc[b : b + epilogue.rows, j * lanes : (j + 1) * lanes],
+                            x_scale[b : b + epilogue.rows],
+                            c * sub_n + j * lanes,
+                        )
+                        for j in range(sub_n // lanes)
+                    ],
+                    axis=1,
+                )
+                row0 = r * sub_m + b
+                out_ref[pl.ds(row0, epilogue.rows), pl.ds(c * sub_n, sub_n)] = (
+                    epilogue.block(y, row0, operand_refs, epilogue_scratch_refs)
+                )
 
 
 def dense_proj_matmul(
@@ -525,6 +572,7 @@ def dense_proj_matmul(
     w_q: jax.Array,  # [k, n] fp8
     w_scale: jax.Array,  # [n]
     out_dtype: jnp.dtype,
+    epilogue: DenseProjEpilogue | None = None,
 ) -> jax.Array:
     """The dot + scale epilogue of xla_quantized_matmul as a Pallas kernel.
 
@@ -536,18 +584,24 @@ def dense_proj_matmul(
     m, k = x_q.shape
     n = w_q.shape[1]
     tile_n = _dense_proj_tile_n(k, n)
+    operands = epilogue.operands if epilogue else ()
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     return pl.pallas_call(
-        _dense_proj_kernel,
+        functools.partial(_dense_proj_kernel, epilogue=epilogue),
         grid=(n // tile_n,),
         in_specs=[
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-            pl.BlockSpec(memory_space=pltpu.VMEM),
+            vmem,
+            vmem,
+            vmem,
+            *(vmem for _ in operands),
             pl.BlockSpec((k, tile_n), lambda j: (0, j)),
         ],
         out_specs=pl.BlockSpec((m, tile_n), lambda j: (0, j)),
         out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
-        scratch_shapes=[pltpu.VMEM((m, 128), jnp.float32)],
+        scratch_shapes=[
+            pltpu.VMEM((m, 128), jnp.float32),
+            *(epilogue.scratch_shapes if epilogue else ()),
+        ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=DENSE_PROJ_VMEM_LIMIT_BYTES,
@@ -557,5 +611,6 @@ def dense_proj_matmul(
         x_scale.reshape(1, m),
         w_scale.astype(jnp.float32).reshape(1, n),
         x_q,
+        *operands,
         w_q,
     )
