@@ -20,10 +20,6 @@ they leave the default-tile VMEM fit on; each adds a module extra input that
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
-
 import dataclasses
 from typing import Any
 

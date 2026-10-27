@@ -15,34 +15,27 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 from typing import Any
 
-_xla_flags = os.environ.get("XLA_FLAGS", "")
-if "--xla_force_host_platform_device_count" not in _xla_flags:
-    os.environ["XLA_FLAGS"] = (
-        f"{_xla_flags} --xla_force_host_platform_device_count=8".strip()
-    )
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+import torch
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
-import jax  # noqa: E402
-import jax.numpy as jnp  # noqa: E402
-import numpy as np  # noqa: E402
-import pytest  # noqa: E402
-import torch  # noqa: E402
-from jax.sharding import Mesh, NamedSharding  # noqa: E402
-from jax.sharding import PartitionSpec as P  # noqa: E402
-
-import vllm_torchtpu.megakernel as mk  # noqa: E402
-from vllm_torchtpu.megakernel import planner  # noqa: E402
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec  # noqa: E402
-from vllm_torchtpu.megakernel.models import qwen35  # noqa: E402
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES  # noqa: E402
-from vllm_torchtpu.megakernel.runtime import (  # noqa: E402
+import vllm_torchtpu.megakernel as mk
+from vllm_torchtpu.megakernel import planner
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.models import qwen35
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
+from vllm_torchtpu.megakernel.runtime import (
     verify_compiled_step_ir,
     verify_pooled_step_hlo,
 )
-from vllm_torchtpu.megakernel_runtime.exported_bridge import (  # noqa: E402
+from vllm_torchtpu.megakernel_runtime.exported_bridge import (
     build_pooled_step_op,
     execute_pooled_step_inplace,
     export_pooled_step,

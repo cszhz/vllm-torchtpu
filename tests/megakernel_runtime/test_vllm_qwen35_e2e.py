@@ -16,36 +16,29 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
-_xla_flags = os.environ.get("XLA_FLAGS", "")
-if "--xla_force_host_platform_device_count" not in _xla_flags:
-    os.environ["XLA_FLAGS"] = (
-        f"{_xla_flags} --xla_force_host_platform_device_count=8".strip()
-    )
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+import torch
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
-import jax  # noqa: E402
-import jax.numpy as jnp  # noqa: E402
-import numpy as np  # noqa: E402
-import pytest  # noqa: E402
-import torch  # noqa: E402
-from jax.sharding import Mesh, NamedSharding  # noqa: E402
-from jax.sharding import PartitionSpec as P  # noqa: E402
-
-import vllm_torchtpu.megakernel as mk  # noqa: E402
-import vllm_torchtpu.megakernel_runtime.driver as driver_mod  # noqa: E402
-from tests.megakernel_runtime.test_weight_collector import (  # noqa: E402
+import vllm_torchtpu.megakernel as mk
+import vllm_torchtpu.megakernel_runtime.driver as driver_mod
+from tests.megakernel_runtime.test_weight_collector import (
     _jax_to_torch,
     make_synthetic_qwen35_backbone,
 )
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec  # noqa: E402
-from vllm_torchtpu.megakernel.models import qwen35, qwen35_pool  # noqa: E402
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES  # noqa: E402
-from vllm_torchtpu.megakernel.pool.config import CacheExec, with_cache  # noqa: E402
-from vllm_torchtpu.megakernel.runtime import (  # noqa: E402
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.models import qwen35, qwen35_pool
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
+from vllm_torchtpu.megakernel.pool.config import CacheExec, with_cache
+from vllm_torchtpu.megakernel.runtime import (
     DEFAULT_BUCKETS,
     DEFAULT_VERIFY_BUCKETS,
     BatchShape,

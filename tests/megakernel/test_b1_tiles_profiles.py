@@ -15,11 +15,8 @@
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
-
 import dataclasses
+import os
 import subprocess
 import sys
 from typing import Any

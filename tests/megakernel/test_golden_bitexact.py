@@ -43,14 +43,11 @@ and say so in the PR: `MK_REGEN_GOLDEN=1 pytest <this file>`.
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
-
 import dataclasses
 import fcntl
 import hashlib
 import json
+import os
 import pathlib
 import platform
 import sys
