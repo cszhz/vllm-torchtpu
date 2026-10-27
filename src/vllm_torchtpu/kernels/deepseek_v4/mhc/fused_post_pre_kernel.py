@@ -136,6 +136,10 @@ def _fused_kernel(
     # The collapse re-reads the stored streams: holding the packed GEMM
     # operand live past both dots would spill ~3 MiB more scoped VMEM.
     weights_scr[...] = utils.replicate_lanes(pre_mix)
+    if dma_scratch:
+        # The collapse and the gates only read the slot, so block i's
+        # write-back runs under them, the last block's included.
+        new_copy(i).start()
     utils.collapse_rows(new_blk, weights_scr, layer_ref, hc_mult=m)
 
     utils.stage_mixes_and_gates(
@@ -152,7 +156,6 @@ def _fused_kernel(
 
     if not dma_scratch:
         return
-    new_copy(i).start()
 
     # The previous block's write-back had this whole step to finish; the
     # last step also drains its own before the kernel ends.
