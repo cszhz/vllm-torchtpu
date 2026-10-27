@@ -510,7 +510,7 @@ def _select_indexer_jax(
             cache_layout=layout,
             query_start=start if shared_inputs else 0,
             query_count=rows,
-            reuse_keys=prefill_chunk_rows is not None,
+            reuse_keys=prefill_chunk_rows is not None and capacity == key_tile,
         )
         if score_only:
             return (
@@ -750,15 +750,15 @@ def select_indexer_jax(
     ):
         return _select_indexer_jax(*arguments, score_width)
 
-    # Preserve the existing score-buffer row boundaries, but use one retained
-    # K tile when it covers every live key. Longer contexts keep the old path.
+    # Preserve score-buffer row boundaries for both widths. Only contexts
+    # covered by one K tile can narrow the scores and retain their keys.
     live = (requests >= 0) & (requests < page_table.shape[0])
     longest = jnp.where(live, lengths, 0).max()
     grouped = jnp.all(requests[1:] >= requests[:-1])
     return jax.lax.cond(
         grouped & (longest <= width),
         lambda: _select_indexer_jax(*arguments, width, prefill_chunk_rows=chunk),
-        lambda: _select_indexer_jax(*arguments, score_width),
+        lambda: _select_indexer_jax(*arguments, score_width, prefill_chunk_rows=chunk),
     )
 
 

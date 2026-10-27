@@ -1011,6 +1011,8 @@ def test_fp8_indexer_bank_sequence_roundtrip(monkeypatch, bank_count, page_size)
         (64, 16384, 16, 4096, 4096),
         (96, 32768, 24, 4096, 4096),
         (64, 16384, 16, 4096, 4097),
+        (64, 16384, 16, 4096, 8193),
+        (64, 131072, 16, 65536, 98304),
     ],
 )
 def test_fp8_indexer_multitile_compilation(
