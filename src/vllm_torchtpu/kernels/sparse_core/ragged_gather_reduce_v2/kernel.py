@@ -142,13 +142,13 @@ def _window_kernel(
 
 
 def _wait_scatters(refs: memory_ref.KernelRefs, slot, cfg: config.Config):
-    """Waits for one step's row scatters from ``out_vmem[slot]``."""
-    for _ in range(cfg.sc_info.num_lanes):
-        pltpu.make_async_copy(
-            refs.scratch.out_vmem.at[slot, 0, pl.ds(0, cfg.col_chunk_size)],
-            refs.data.out.at[0, pl.ds(0, cfg.col_chunk_size)],
-            refs.scratch.sem.at[1 + slot],
-        ).wait()
+    """Waits for one step's row scatter from ``out_vmem[slot]``."""
+    rows = jnp.zeros((cfg.sc_info.num_lanes,), jnp.int32)
+    pltpu.make_async_copy(
+        refs.scratch.out_vmem.at[slot],
+        refs.data.out.at[rows, pl.ds(0, cfg.col_chunk_size)],
+        refs.scratch.sem.at[1 + slot],
+    ).wait()
 
 
 def _col_gather_spec(
@@ -267,10 +267,10 @@ def _col_kernel(
         garbage_dst,
     )
 
-    # Waited two steps later, so the scatters drain under the next step.
-    for i in range(num_simd_lanes):
-        pltpu.make_async_copy(
-            out_vmem.at[slot, i, pl.ds(0, cfg.col_chunk_size)],
-            refs.data.out.at[dst_rows[i], pl.ds(col_hbm_start, cfg.col_chunk_size)],
-            scratch.sem.at[1 + slot],
-        ).start()
+    # One indirect scatter of the 16 rows, waited two steps later, so it drains
+    # under the next step.
+    pltpu.make_async_copy(
+        out_vmem.at[slot],
+        refs.data.out.at[dst_rows, pl.ds(col_hbm_start, cfg.col_chunk_size)],
+        scratch.sem.at[1 + slot],
+    ).start()
