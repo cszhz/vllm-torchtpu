@@ -172,9 +172,17 @@ def _rotate_gptj(x: jax.Array) -> jax.Array:
     constant-index lane shuffle and a sign, no reshape. Lane parity may be read
     for channel parity because ``LANE - rotary_dim`` is even.
     """
-    lane = jnp.arange(LANE)
-    sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
-    return _lane_gather(x, lane ^ 1) * sign
+    return _swap_pairs(x) * _gptj_sign()
+
+
+def _swap_pairs(x: jax.Array) -> jax.Array:
+    """``_rotate_gptj`` without its sign: lane ``i`` reads lane ``i ^ 1``."""
+    return _lane_gather(x, jnp.arange(LANE) ^ 1)
+
+
+def _gptj_sign() -> jax.Array:
+    """``_rotate_gptj``'s sign per lane: -1 on even lanes, 1 on odd ones."""
+    return jnp.where(jnp.arange(LANE) % 2 == 0, -1.0, 1.0).astype(jnp.float32)
 
 
 def _rope_body(
@@ -332,17 +340,27 @@ def _qnorm_rope_body(
 
 
 def _qnorm_rope_rows(
-    x: jax.Array, cos: jax.Array, sin: jax.Array, *, eps: float
+    x: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
+    *,
+    eps: float,
+    signed_sin: bool = False,
 ) -> jax.Array:
     """RMSNorm (no weight) of each ``head_dim`` row of f32 ``x``, then RoPE on
-    its last lane block with ``cos``/``sin`` from ``_cos_sin_lanes``."""
+    its last lane block with ``cos``/``sin`` from ``_cos_sin_lanes``.
+
+    With ``signed_sin``, ``sin`` already carries ``_gptj_sign``. Multiplying by
+    +-1 is exact, so the result is the same bits for one multiply less.
+    """
     rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
     y = x * rms
 
     # Only the last lane block holds roped channels; the rest of the row passes
     # through with nothing but the norm applied.
     tail = y[..., -LANE:]
-    roped = tail * cos + _rotate_gptj(tail) * sin
+    rotated = _swap_pairs(tail) if signed_sin else _rotate_gptj(tail)
+    roped = tail * cos + rotated * sin
     return jnp.concatenate([y[..., :-LANE], roped], axis=-1)
 
 
@@ -613,16 +631,16 @@ def _qnorm_rope_epilogue(
                 cos_sin_ref[pl.ds(r, rows), :], rotary_dim=rotary_dim, inverse=False
             )
             cos_ref[pl.ds(r, rows), :] = cos
-            sin_ref[pl.ds(r, rows), :] = sin
+            sin_ref[pl.ds(r, rows), :] = sin * _gptj_sign()
 
     def block(y, row0, operand_refs, scratch_refs):
         del operand_refs
         cos_ref, sin_ref = scratch_refs
         cos = cos_ref[pl.ds(row0, rows), :]
         sin = sin_ref[pl.ds(row0, rows), :]
-        return _qnorm_rope_rows(y.astype(jnp.float32), cos, sin, eps=eps).astype(
-            y.dtype
-        )
+        return _qnorm_rope_rows(
+            y.astype(jnp.float32), cos, sin, eps=eps, signed_sin=True
+        ).astype(y.dtype)
 
     return DenseProjEpilogue(
         operands=(cos_sin_cache[positions],),
