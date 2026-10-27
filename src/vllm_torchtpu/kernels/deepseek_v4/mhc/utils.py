@@ -96,6 +96,25 @@ def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     )
 
 
+def stack_fn_chunks(fn: jax.Array, gemm_precision: str = "highest") -> jax.Array:
+    """bf16 chunks of fn stacked along the output axis, so one MXU pass
+    against the stack does the work of one pass per chunk."""
+    chunks = split_fn3(fn)
+    if gemm_precision == "default":
+        chunks = chunks[:1]
+    return jnp.concatenate(chunks, axis=0)
+
+
+def dot_stacked_chunks(x: jax.Array, fn_stack: jax.Array, n_out: int) -> jax.Array:
+    """x @ fn.T from one dot against ``stack_fn_chunks``: hi + mid + lo."""
+    dn = (((1,), (1,)), ((), ()))
+    acc3 = jax.lax.dot_general(x, fn_stack, dn, preferred_element_type=jnp.float32)
+    acc = acc3[:, :n_out]
+    for c in range(1, fn_stack.shape[0] // n_out):
+        acc = acc + acc3[:, c * n_out : (c + 1) * n_out]
+    return acc
+
+
 def mhc_pre_gates(
     mixes: jax.Array,
     sqrsum: jax.Array,
