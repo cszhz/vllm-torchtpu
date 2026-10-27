@@ -68,6 +68,8 @@ class PCPStagePlan(NamedTuple):
     q_sequence: jax.Array
     query_row_valid: jax.Array
     needs_reroute: jax.Array
+    max_writeback_count: jax.Array | int = 0
+    block_tables: jax.Array | None = None
 
 
 def get_pcp_rank_without_axis_index(pcp_axis_name: str, pcp_size: int) -> jax.Array:
@@ -429,14 +431,21 @@ def _compact_writeback_slot_ids_for_cache_rank(
     cache_rank: int | jax.Array,
     *,
     capacity: int | None = None,
+    window_offset: int | jax.Array = 0,
 ) -> jax.Array:
     """Compact cache slots into the same dense order as captured KV rows."""
     if capacity is None:
         capacity = int(writeback_mapping.capture_offsets.shape[0])
     cache_rank = jnp.asarray(cache_rank, dtype=jnp.int32)
-    owned = writeback_mapping.cache_owner_ranks == cache_rank
-    offsets = jnp.where(owned, writeback_mapping.capture_offsets, capacity)
-    slots = jnp.where(owned, writeback_mapping.cache_local_slot_ids, -1)
+    rel_offsets = writeback_mapping.capture_offsets - jnp.asarray(
+        window_offset, dtype=jnp.int32
+    )
+    in_window = jnp.logical_and(
+        writeback_mapping.cache_owner_ranks == cache_rank,
+        jnp.logical_and(rel_offsets >= 0, rel_offsets < capacity),
+    )
+    offsets = jnp.where(in_window, rel_offsets, capacity)
+    slots = jnp.where(in_window, writeback_mapping.cache_local_slot_ids, -1)
     compact_slots = jnp.full((capacity,), -1, dtype=jnp.int32)
     return compact_slots.at[offsets].set(slots, mode="drop")
 
@@ -450,6 +459,7 @@ def _compute_pcp_capture_source_rows_for_cache_rank(
     local_tokens: int,
     pcp_size: int,
     interleave_size: int,
+    window_offset: int | jax.Array = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Rank-major source row for each capture offset owned by cache_rank.
 
@@ -474,9 +484,15 @@ def _compute_pcp_capture_source_rows_for_cache_rank(
         interleave_size=interleave_size,
     )
     num_rows = pcp_size * local_tokens
-    owned = wb_mapping.cache_owner_ranks == jnp.asarray(cache_rank, dtype=jnp.int32)
-    offsets = jnp.where(owned, wb_mapping.capture_offsets, local_tokens)
-    rows = jnp.where(owned, jnp.arange(num_rows, dtype=jnp.int32), -1)
+    rel_offsets = wb_mapping.capture_offsets - jnp.asarray(
+        window_offset, dtype=jnp.int32
+    )
+    in_window = jnp.logical_and(
+        wb_mapping.cache_owner_ranks == jnp.asarray(cache_rank, dtype=jnp.int32),
+        jnp.logical_and(rel_offsets >= 0, rel_offsets < local_tokens),
+    )
+    offsets = jnp.where(in_window, rel_offsets, local_tokens)
+    rows = jnp.where(in_window, jnp.arange(num_rows, dtype=jnp.int32), -1)
     source_rows = jnp.full((local_tokens,), -1, dtype=jnp.int32)
     source_rows = source_rows.at[offsets].set(rows, mode="drop")
     return jnp.clip(source_rows, 0, num_rows - 1), source_rows >= 0
@@ -578,8 +594,9 @@ def _compute_misaligned_writeback_slots(
     page_size: int,
     pcp_size: int,
     interleave_size: int,
-) -> tuple[jax.Array, jax.Array]:
-    """Computes cache slots and count for misaligned writeback."""
+    window_offset: int | jax.Array = 0,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Computes cache slots, window count, and max count for misaligned writeback."""
     rank_major_query_rows = _compute_pcp_rank_major_query_row_mapping_from_metadata(
         kv_lens,
         cu_q_lens,
@@ -600,9 +617,16 @@ def _compute_misaligned_writeback_slots(
         wb_mapping,
         cache_rank,
         capacity=local_tokens,
+        window_offset=window_offset,
     )
-    wb_count = wb_mapping.writeback_counts[cache_rank]
-    return slot_ids, wb_count
+    wb_count = jnp.clip(
+        wb_mapping.writeback_counts[cache_rank]
+        - jnp.asarray(window_offset, dtype=jnp.int32),
+        0,
+        local_tokens,
+    )
+    max_wb_count = jnp.max(wb_mapping.writeback_counts)
+    return slot_ids, wb_count, max_wb_count
 
 
 def build_pcp_local_stage_plan(
@@ -675,7 +699,20 @@ def build_pcp_local_stage_plan(
     )
     query_row_valid = local_query_rows.is_valid
 
-    compact_slot_ids, writeback_count = lax.cond(
+    def _aligned_writeback(_: None) -> tuple[jax.Array, jax.Array, jax.Array]:
+        slots, cnt = _compute_aligned_writeback_slots(
+            local_query_rows.absolute_positions,
+            local_query_rows.request_indices,
+            query_row_valid,
+            block_tables,
+            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
+            page_size=page_size,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+        )
+        return slots, cnt, cnt
+
+    compact_slot_ids, writeback_count, max_writeback_count = lax.cond(
         needs_reroute,
         lambda _: _compute_misaligned_writeback_slots(
             kv_lens,
@@ -688,17 +725,9 @@ def build_pcp_local_stage_plan(
             page_size=page_size,
             pcp_size=pcp_size,
             interleave_size=interleave_size,
+            window_offset=0,
         ),
-        lambda _: _compute_aligned_writeback_slots(
-            local_query_rows.absolute_positions,
-            local_query_rows.request_indices,
-            query_row_valid,
-            block_tables,
-            local_kv_cache_num_blocks=local_kv_cache_num_blocks,
-            page_size=page_size,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
-        ),
+        _aligned_writeback,
         operand=None,
     )
     segment_descriptors, num_segments = _build_writeback_segment_descriptors(
@@ -781,4 +810,6 @@ def build_pcp_local_stage_plan(
         q_sequence=q_sequence,
         query_row_valid=query_row_valid,
         needs_reroute=needs_reroute,
+        max_writeback_count=max_writeback_count,
+        block_tables=block_tables,
     )

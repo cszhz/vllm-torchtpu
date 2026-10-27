@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import inspect
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
+from jax.experimental import topologies
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import kernel as pcp_kernel
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import (
@@ -847,6 +854,7 @@ def test_metadata_entry_caps_stacked_q_heads_at_q_per_kv(
     stage_plan = SimpleNamespace(
         needs_reroute=jnp.asarray(False),
         q_seg_ids=jnp.zeros((128,), dtype=jnp.int32),
+        block_tables=None,
     )
 
     pcp_kernel.pcp_streaming_attention_page_groups_packed_local_from_metadata(
@@ -1304,3 +1312,783 @@ def test_attend_multi_vpage_groups_streams_causal_groups_and_sentinels(monkeypat
     assert float(np.max(np.abs(actual[:, :60, :] - ref_req0))) <= tol_stream
     assert float(np.max(np.abs(actual[:, 60:120, :] - ref_req1))) <= tol_stream
     assert float(np.max(np.abs(ref_req0_g0_only - ref_req0))) > 100.0 * tol_stream
+
+
+def _load_pcp8_bench_module():
+    bench_path = Path(__file__).with_name("test_pcp8_160k_chunk_benchmark.py")
+    spec = importlib.util.spec_from_file_location("_pcp8_bench_test_mod", bench_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_gather_vpages_to_head_major_with_odd_fp8_kv_heads():
+    """Verifies FP8 gather drops padded sublane planes after all_gather."""
+    pcp_size = 8
+    page_size = 16
+    interleave_size = 16
+    num_vpages = 4
+    num_blocks = 6
+    head_dim = 128
+    kv_packing = 4
+    block_ids = jnp.asarray([1, 3, 0, 5], dtype=jnp.int32)
+    virtual_page_size = page_size * pcp_size
+    num_tokens = num_vpages * virtual_page_size
+
+    def _run_gather(local_caches: jax.Array, num_kvh: int):
+        return jax.vmap(
+            lambda cache_shard: pcp_kernel._gather_vpages_to_head_major(
+                cache_shard,
+                block_ids,
+                kv_heads=num_kvh,
+                head_dim=head_dim,
+                page_size=page_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                kv_layout=pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE,
+                pcp_axis_name="pcp",
+            ),
+            in_axes=0,
+            out_axes=0,
+            axis_name="pcp",
+        )(local_caches)
+
+    for kv_heads in (1, 3):
+        packed_groups = math.ceil(2 * kv_heads / kv_packing)
+        rng = np.random.default_rng(100 + kv_heads)
+        k_true = rng.choice(
+            np.array([-2.0, -1.0, -0.5, 0.5, 1.0, 2.0], dtype=np.float32),
+            size=(kv_heads, num_blocks * virtual_page_size, head_dim),
+        ).astype(jnp.float8_e4m3fn)
+        v_true = rng.choice(
+            np.array([-1.5, -0.5, 0.25, 0.75, 1.5, 3.0], dtype=np.float32),
+            size=(kv_heads, num_blocks * virtual_page_size, head_dim),
+        ).astype(jnp.float8_e4m3fn)
+
+        kv_interleaved = np.zeros(
+            (num_blocks, pcp_size, page_size, packed_groups * kv_packing, head_dim),
+            dtype=np.float32,
+        )
+        # Seed padded sublane planes so unsliced planes fail parity loudly.
+        kv_interleaved[:, :, :, 2 * kv_heads :, :] = -7.0
+        k_np = np.asarray(k_true, dtype=np.float32).reshape(
+            kv_heads, num_blocks, pcp_size, page_size, head_dim
+        )
+        v_np = np.asarray(v_true, dtype=np.float32).reshape(
+            kv_heads, num_blocks, pcp_size, page_size, head_dim
+        )
+        for h in range(kv_heads):
+            kv_interleaved[:, :, :, 2 * h, :] = np.transpose(k_np[h], (0, 1, 2, 3))
+            kv_interleaved[:, :, :, 2 * h + 1, :] = np.transpose(v_np[h], (0, 1, 2, 3))
+
+        # Per-rank cache shards [pcp, blocks, page_size, groups, packing, head_dim]
+        local_caches = jnp.asarray(
+            np.transpose(kv_interleaved, (1, 0, 2, 3, 4)).reshape(
+                pcp_size, num_blocks, page_size, packed_groups, kv_packing, head_dim
+            ),
+            dtype=jnp.float8_e4m3fn,
+        )
+
+        gathered_k, gathered_v = _run_gather(local_caches, kv_heads)
+
+        expected_k = (
+            np.asarray(k_true, dtype=np.float32)
+            .reshape(kv_heads, num_blocks, virtual_page_size, head_dim)[
+                :, np.asarray(block_ids), :, :
+            ]
+            .reshape(kv_heads, num_tokens, head_dim)
+        )
+        expected_v = (
+            np.asarray(v_true, dtype=np.float32)
+            .reshape(kv_heads, num_blocks, virtual_page_size, head_dim)[
+                :, np.asarray(block_ids), :, :
+            ]
+            .reshape(kv_heads, num_tokens, head_dim)
+        )
+        for rank in range(pcp_size):
+            np.testing.assert_allclose(
+                np.asarray(gathered_k[rank], dtype=np.float32),
+                expected_k,
+                rtol=0.0,
+                atol=0.0,
+            )
+            np.testing.assert_allclose(
+                np.asarray(gathered_v[rank], dtype=np.float32),
+                expected_v,
+                rtol=0.0,
+                atol=0.0,
+            )
+        # Negative control: padded plane sentinel differs from valid planes by >= 4.0.
+        pad_plane = np.asarray(local_caches[0, 1, :, -1, -1, :], dtype=np.float32)
+        assert float(np.max(np.abs(pad_plane - expected_v[-1, :page_size, :]))) >= 4.0
+
+
+def test_packed_local_from_metadata_with_overflow_writeback():
+    """Verifies multi-window writeback when a cache rank owns > local_tokens rows."""
+    pcp_size = 8
+    page_size = 128
+    interleave_size = 128
+    local_tokens = 128
+    kv_heads = 2
+    q_per_kv = 2
+    head_dim = 128
+    kv_packing = 4
+    num_blocks = 8
+    max_seqs = 4
+    steps_added = [[53, 1, 129], [1, 3, 2], [2, 1, 1]]
+    block_tables_np = np.zeros((max_seqs, 2), dtype=np.int32)
+    block_tables_np[0] = [0, 1]
+    block_tables_np[1] = [2, 3]
+    block_tables_np[2] = [4, 5]
+
+    orig_write = pcp_kernel.write_captured_kv_to_local_cache
+    orig_attend = pcp_kernel._attend_over_vpage_groups
+    orig_stage_rank = pcp_stage_plan.get_pcp_rank_without_axis_index
+    orig_kernel_rank = pcp_kernel._get_pcp_rank_without_axis_index
+
+    seen_desc_shapes: list[tuple[int, ...]] = []
+
+    def _pure_write(
+        kv_cache_local,
+        captured_kv_local,
+        segment_descriptors,
+        num_segments,
+        *,
+        kv_layout=pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE,
+    ):
+        seen_desc_shapes.append(tuple(int(d) for d in segment_descriptors.shape))
+        max_segs = int(segment_descriptors.shape[1])
+        cap = int(
+            captured_kv_local.shape[-1]
+            if kv_layout == pcp_kernel.KVLayout.SEQ_ALONG_LANE
+            else captured_kv_local.shape[0]
+        )
+        seg_ids = jnp.arange(max_segs, dtype=jnp.int32)[:, None]
+        offs = jnp.arange(cap, dtype=jnp.int32)[None, :]
+        s0 = segment_descriptors[0, :][:, None]
+        d0 = segment_descriptors[1, :][:, None]
+        ln = segment_descriptors[2, :][:, None]
+        src = s0 + offs
+        valid = (seg_ids < jnp.reshape(num_segments, ())) & (offs < ln)
+        src_safe = jnp.clip(src, 0, cap - 1)
+        flat_slots = d0 + offs
+        if kv_layout == pcp_kernel.KVLayout.SEQ_ALONG_LANE:
+            page_sz = kv_cache_local.shape[-1]
+            total_slots = kv_cache_local.shape[0] * page_sz
+            flat_cache = kv_cache_local.transpose(0, 4, 1, 2, 3).reshape(
+                total_slots, *kv_cache_local.shape[1:4]
+            )
+            cap_rows = captured_kv_local.transpose(3, 0, 1, 2)
+            vals = cap_rows[src_safe.reshape(-1)]
+            idx = jnp.where(valid.reshape(-1), flat_slots.reshape(-1), total_slots)
+            updated = flat_cache.at[idx].set(vals, mode="drop")
+            return updated.reshape(
+                kv_cache_local.shape[0], page_sz, *kv_cache_local.shape[1:4]
+            ).transpose(0, 2, 3, 4, 1)
+        page_sz = kv_cache_local.shape[1]
+        total_slots = kv_cache_local.shape[0] * page_sz
+        flat_cache = kv_cache_local.reshape(total_slots, *kv_cache_local.shape[2:])
+        vals = captured_kv_local[src_safe.reshape(-1)]
+        idx = jnp.where(valid.reshape(-1), flat_slots.reshape(-1), total_slots)
+        return flat_cache.at[idx].set(vals, mode="drop").reshape(kv_cache_local.shape)
+
+    def _stub_attend(kv_cache_local, q_scaled_hm, stage_plan, **kwargs):
+        return jnp.zeros(q_scaled_hm.shape, dtype=jnp.float32)
+
+    def _make_step_runner(kv_layout_val):
+        @jax.jit
+        def _run_step(
+            q_sharded, kv_sharded, cache_sharded, kv_lens_j, pages_j, cu_q_j, dist_j
+        ):
+            def _per_rank(q_loc, kv_loc, cache_loc):
+                plan = pcp_stage_plan.build_pcp_local_stage_plan(
+                    kv_lens_j,
+                    pages_j,
+                    cu_q_j,
+                    dist_j,
+                    local_tokens=local_tokens,
+                    local_kv_cache_num_blocks=num_blocks,
+                    page_size=page_size,
+                    pcp_size=pcp_size,
+                    interleave_size=interleave_size,
+                    vpage_group_size=4,
+                    kv_layout=kv_layout_val,
+                    pcp_axis_name="pcp",
+                )
+                _, next_cache = (
+                    pcp_kernel.pcp_streaming_attention_page_groups_packed_local_from_metadata(
+                        q_loc,
+                        kv_loc,
+                        cache_loc,
+                        kv_lens_j,
+                        cu_q_j,
+                        dist_j,
+                        plan.segment_descriptors,
+                        plan.num_segments,
+                        pcp_size=pcp_size,
+                        interleave_size=interleave_size,
+                        sm_scale=1.0,
+                        k_scale=1.0,
+                        v_scale=1.0,
+                        kv_layout=kv_layout_val,
+                        mesh_axis_names=("pcp",),
+                        pcp_axis_name="pcp",
+                        stage_plan=plan,
+                        vpage_group_size=4,
+                    )
+                )
+                return next_cache
+
+            return jax.vmap(_per_rank, in_axes=(0, 0, 0), out_axes=0, axis_name="pcp")(
+                q_sharded, kv_sharded, cache_sharded
+            )
+
+        return _run_step
+
+    try:
+        pcp_kernel.write_captured_kv_to_local_cache = _pure_write
+        pcp_kernel._attend_over_vpage_groups = _stub_attend
+        pcp_stage_plan.get_pcp_rank_without_axis_index = (
+            lambda axis_name, _pcp_size: jax.lax.axis_index(axis_name)
+        )
+        pcp_kernel._get_pcp_rank_without_axis_index = (
+            lambda axis_name, _pcp_size: jax.lax.axis_index(axis_name)
+        )
+
+        for layout in (
+            pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE,
+            pcp_kernel.KVLayout.SEQ_ALONG_LANE,
+        ):
+            if layout == pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE:
+                cache_shape = (
+                    pcp_size,
+                    num_blocks,
+                    page_size,
+                    1,
+                    kv_packing,
+                    head_dim,
+                )
+            else:
+                cache_shape = (
+                    pcp_size,
+                    num_blocks,
+                    2 * kv_heads,
+                    head_dim // kv_packing,
+                    kv_packing,
+                    page_size,
+                )
+
+            run_step_fn = _make_step_runner(layout)
+            cache_actual = jnp.full(cache_shape, -2.0, dtype=jnp.float8_e4m3fn)
+            cache_ref = np.full(cache_shape, -2.0, dtype=np.float32)
+            seq_so_far = [0, 0, 0]
+            step0_inputs = None
+            window0_only_ref = None
+
+            for step_idx, added in enumerate(steps_added):
+                q_starts = [0]
+                for a in added:
+                    q_starts.append(q_starts[-1] + a)
+                total_q = q_starts[-1]
+                cu_q_np = np.full((max_seqs + 1,), total_q, dtype=np.int32)
+                for r_i, s in enumerate(q_starts):
+                    cu_q_np[r_i] = s
+                kv_lens_np = np.zeros((max_seqs,), dtype=np.int32)
+                for r_i in range(3):
+                    seq_so_far[r_i] += added[r_i]
+                    kv_lens_np[r_i] = seq_so_far[r_i]
+                dist_np = np.array([0, 0, 3], dtype=np.int32)
+
+                if layout == pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE:
+                    cur_kv_np = np.zeros(
+                        (pcp_size, local_tokens, 1, kv_packing, head_dim),
+                        dtype=np.float32,
+                    )
+                else:
+                    cur_kv_np = np.zeros(
+                        (
+                            pcp_size,
+                            2 * kv_heads,
+                            head_dim // kv_packing,
+                            kv_packing,
+                            local_tokens,
+                        ),
+                        dtype=np.float32,
+                    )
+
+                cycle = pcp_size * interleave_size
+                step0_rank0_writes = 0
+                for rank in range(pcp_size):
+                    row_cursor = 0
+                    for r_i in range(3):
+                        h_start = seq_so_far[r_i] - added[r_i]
+                        o_start = q_starts[r_i]
+                        o_end = q_starts[r_i + 1]
+                        c_pos = (o_start // cycle) * cycle + rank * interleave_size
+                        if c_pos + interleave_size <= o_start:
+                            c_pos += cycle
+                        while c_pos < o_end:
+                            s_lo = max(c_pos, o_start)
+                            s_hi = min(c_pos + interleave_size, o_end)
+                            for op in range(s_lo, s_hi):
+                                abs_pos = h_start + (op - o_start)
+                                val = float(
+                                    ((step_idx + 1) * 3 + r_i + abs_pos) % 7 + 1
+                                )
+                                vpage = abs_pos // (pcp_size * page_size)
+                                rem = abs_pos % (pcp_size * page_size)
+                                c_rank = (rem // interleave_size) % pcp_size
+                                p_off = (
+                                    rem // (pcp_size * interleave_size)
+                                ) * interleave_size + (rem % interleave_size)
+                                blk = int(block_tables_np[r_i, vpage])
+                                if layout == pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE:
+                                    cur_kv_np[rank, row_cursor] = val
+                                    cache_ref[c_rank, blk, p_off] = val
+                                else:
+                                    cur_kv_np[rank, :, :, :, row_cursor] = val
+                                    cache_ref[c_rank, blk, :, :, :, p_off] = val
+                                if step_idx == 0 and c_rank == 0:
+                                    step0_rank0_writes += 1
+                                row_cursor += 1
+                            c_pos += cycle
+
+                if step_idx == 0:
+                    # Window-0-only control drops writes 128..181 on cache rank 0.
+                    assert step0_rank0_writes == 182
+                    window0_only_ref = cache_ref.copy()
+                    # Token abs_pos=128 of req 2 is capture_offset 181 on rank 0.
+                    if layout == pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE:
+                        window0_only_ref[0, int(block_tables_np[2, 0]), 127] = -2.0
+                    else:
+                        window0_only_ref[
+                            0, int(block_tables_np[2, 0]), :, :, :, 127
+                        ] = -2.0
+
+                q_dummy = jnp.zeros(
+                    (pcp_size, local_tokens, kv_heads, q_per_kv, head_dim),
+                    dtype=jnp.bfloat16,
+                )
+                cache_actual = run_step_fn(
+                    q_dummy,
+                    jnp.asarray(cur_kv_np, dtype=jnp.float8_e4m3fn),
+                    cache_actual,
+                    jnp.asarray(kv_lens_np),
+                    jnp.asarray(block_tables_np.reshape(-1)),
+                    jnp.asarray(cu_q_np),
+                    jnp.asarray(dist_np),
+                )
+                if step_idx == 0:
+                    step0_inputs = (
+                        jnp.asarray(kv_lens_np),
+                        jnp.asarray(block_tables_np.reshape(-1)),
+                        jnp.asarray(cu_q_np),
+                        jnp.asarray(dist_np),
+                    )
+
+            expected_fp8 = np.asarray(
+                jnp.asarray(cache_ref, dtype=jnp.float8_e4m3fn), dtype=np.float32
+            )
+            actual_f32 = np.asarray(cache_actual, dtype=np.float32)
+            np.testing.assert_allclose(actual_f32, expected_fp8, rtol=0.0, atol=0.0)
+            assert step0_inputs is not None
+            step0_max_wb = jax.vmap(
+                lambda _, inps=step0_inputs, kv_layout_val=layout: (
+                    pcp_stage_plan.build_pcp_local_stage_plan(
+                        *inps,
+                        local_tokens=local_tokens,
+                        local_kv_cache_num_blocks=num_blocks,
+                        page_size=page_size,
+                        pcp_size=pcp_size,
+                        interleave_size=interleave_size,
+                        vpage_group_size=4,
+                        kv_layout=kv_layout_val,
+                        pcp_axis_name="pcp",
+                    ).max_writeback_count
+                ),
+                in_axes=0,
+                out_axes=0,
+                axis_name="pcp",
+            )(jnp.arange(pcp_size, dtype=jnp.int32))
+            assert int(np.asarray(step0_max_wb)[0]) == 182
+            assert seen_desc_shapes and all(
+                sh == (3, local_tokens) for sh in seen_desc_shapes
+            )
+            assert window0_only_ref is not None
+            assert float(np.max(np.abs(window0_only_ref - expected_fp8))) >= 3.0
+    finally:
+        pcp_kernel.write_captured_kv_to_local_cache = orig_write
+        pcp_kernel._attend_over_vpage_groups = orig_attend
+        pcp_stage_plan.get_pcp_rank_without_axis_index = orig_stage_rank
+        pcp_kernel._get_pcp_rank_without_axis_index = orig_kernel_rank
+
+
+def test_tpu7x_compile_only_zero_kv_cache_copy_and_zero_entry_hoist():
+    """Compiles on tpu7x:2x2x1 and asserts zero KV-cache copies or ENTRY hoists."""
+    if jax.default_backend() == "tpu" and len(jax.devices()) >= 8:
+        tpu_devices = np.asarray(jax.devices()[:8])
+    else:
+        topo = topologies.get_topology_desc(topology_name="tpu7x:2x2x1", platform="tpu")
+        tpu_devices = np.asarray(topo.devices).reshape(-1)[:8]
+    mesh = Mesh(tpu_devices, ("pcp",))
+
+    def _compile_hlo(
+        kv_heads: int, num_blocks: int, page_size: int, local_tokens: int
+    ) -> str:
+        packed_groups = math.ceil(2 * kv_heads / 4)
+        q_per_kv = 8 if kv_heads == 2 else 4
+        head_dim = 256 if kv_heads == 2 else 128
+        max_seqs = 8
+
+        @jax.shard_map(
+            mesh=mesh,
+            in_specs=(
+                P("pcp", None, None, None),
+                P("pcp", None, None, None),
+                P("pcp", None, None, None, None, None),
+                P(None),
+                P(None),
+                P(None),
+                P(None),
+            ),
+            out_specs=(
+                P("pcp", None, None, None),
+                P("pcp", None, None, None, None, None),
+            ),
+            check_vma=False,
+        )
+        def _shard_fn(q_sh, kv_sh, cache_sh, kv_lens, pages, cu_q, dist):
+            cache_loc = jnp.squeeze(cache_sh, axis=0)
+            plan = pcp_stage_plan.build_pcp_local_stage_plan(
+                kv_lens,
+                pages,
+                cu_q,
+                dist,
+                local_tokens=local_tokens,
+                local_kv_cache_num_blocks=num_blocks,
+                page_size=page_size,
+                pcp_size=8,
+                interleave_size=page_size,
+                vpage_group_size=32,
+                kv_layout=pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE,
+                pcp_axis_name="pcp",
+            )
+            out_loc, next_cache = (
+                pcp_kernel.pcp_streaming_attention_page_groups_packed_local_from_metadata(
+                    q_sh,
+                    kv_sh,
+                    cache_loc,
+                    kv_lens,
+                    cu_q,
+                    dist,
+                    plan.segment_descriptors,
+                    plan.num_segments,
+                    pcp_size=8,
+                    interleave_size=page_size,
+                    sm_scale=1.0,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    kv_layout=pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE,
+                    mesh_axis_names=("pcp",),
+                    pcp_axis_name="pcp",
+                    stage_plan=plan,
+                    vpage_group_size=32,
+                )
+            )
+            return out_loc, jnp.expand_dims(next_cache, axis=0)
+
+        fn = jax.jit(_shard_fn, donate_argnums=(2,))
+        lowered = fn.lower(
+            jax.ShapeDtypeStruct(
+                (8 * local_tokens, kv_heads, q_per_kv, head_dim), jnp.bfloat16
+            ),
+            jax.ShapeDtypeStruct(
+                (8 * local_tokens, packed_groups, 4, head_dim), jnp.float8_e4m3fn
+            ),
+            jax.ShapeDtypeStruct(
+                (8, num_blocks, page_size, packed_groups, 4, head_dim),
+                jnp.float8_e4m3fn,
+            ),
+            jax.ShapeDtypeStruct((max_seqs,), jnp.int32),
+            jax.ShapeDtypeStruct((max_seqs * num_blocks,), jnp.int32),
+            jax.ShapeDtypeStruct((max_seqs + 1,), jnp.int32),
+            jax.ShapeDtypeStruct((3,), jnp.int32),
+        )
+        return lowered.compile().as_text()
+
+    def _scan_slow_paths(hlo_text: str, cache_prefix: str, full_rows: int):
+        lines = hlo_text.splitlines()
+        entry_idx = next(
+            (i for i, line in enumerate(lines) if line.startswith("ENTRY ")), 0
+        )
+        entry_lines = lines[entry_idx:]
+        donated_copies = [
+            line.strip()
+            for line in lines
+            if " copy(" in line
+            and cache_prefix in line
+            and 'metadata={op_name="jit(_shard_fn)/shard_map"' not in line
+        ]
+        entry_scatters = [
+            line.strip()
+            for line in entry_lines
+            if 'op_name="jit(_shard_fn)/shard_map/while/body/' in line
+            or ("scatter" in line and f"s32[{full_rows}]" in line)
+        ]
+        odd_f8_copies = [
+            line.strip() for line in lines if " copy(" in line and "f8e4m3fn[6," in line
+        ]
+        entry_whiles = [line.strip() for line in entry_lines if " while(" in line]
+        return donated_copies, entry_scatters, odd_f8_copies, entry_whiles
+
+    hlo_qwen35 = _compile_hlo(
+        kv_heads=2, num_blocks=128, page_size=256, local_tokens=4096
+    )
+    copies_q35, scatters_q35, _, whiles_q35 = _scan_slow_paths(
+        hlo_qwen35, "f8e4m3fn[128,256,", 8 * 4096
+    )
+    assert len(whiles_q35) >= 1, "Expected overflow writeback while loop in ENTRY"
+    assert copies_q35 == [], f"Unexpected donated KV-cache kCopy ops: {copies_q35}"
+    assert scatters_q35 == [], f"Unexpected hoisted ENTRY scatter ops: {scatters_q35}"
+
+    hlo_odd3 = _compile_hlo(kv_heads=3, num_blocks=64, page_size=128, local_tokens=128)
+    copies_odd, scatters_odd, odd_f8_copies, whiles_odd = _scan_slow_paths(
+        hlo_odd3, "f8e4m3fn[64,128,", 8 * 128
+    )
+    assert len(whiles_odd) >= 1, "Expected overflow writeback while loop in ENTRY"
+    assert copies_odd == [], f"Unexpected donated KV-cache kCopy ops: {copies_odd}"
+    assert scatters_odd == [], f"Unexpected hoisted ENTRY scatter ops: {scatters_odd}"
+    assert odd_f8_copies == [], (
+        f"Unexpected odd-FP8 transpose kCopy ops: {odd_f8_copies}"
+    )
+
+    # Negative control: detector catches synthetic %copy.198, scatter, and f8e4m3fn[6,
+    synthetic_bad = (
+        "ENTRY %main {\n"
+        "  %copy.198 = f8e4m3fn[128,256,1,4,256] copy(%bitcast.858)\n"
+        "  %copy.236 = f8e4m3fn[6,32,1,128,128] copy(%slice.9)\n"
+        "  %scatter_offload = ((s32[512]{0}, s32[32768]{0})) async-update(%p)\n"
+        "}\n"
+    )
+    bad_c, bad_s, bad_o, _ = _scan_slow_paths(
+        synthetic_bad, "f8e4m3fn[128,256,", 8 * 4096
+    )
+    assert len(bad_c) == 1 and len(bad_s) == 1 and len(bad_o) == 1
+
+
+def test_extract_profiled_kernel_summary_with_unified_splash_ops(tmp_path, monkeypatch):
+    """Verifies unified Splash XProf summary and misaligned_overflow reference."""
+    bench_mod = _load_pcp8_bench_module()
+
+    def _write_xspace(out_dir: Path, inject_copy_ns: int = 0) -> None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        planes_txt = []
+        wb_name = "%pcp_write_captured_kv_to_local_cache.6"
+        sp_name = "%splash_mha_fwd_segmented_part.1"
+        copy_hbm_name = (
+            "%copy.198 = f8e4m3fn[128,256,1,4,256]"
+            "{3,2,1,0:T(8,128)(4,1)} copy(%param.23)"
+        )
+        copy_start_name = (
+            "%copy-start.70 = (s32[2]{0:T(128)S(1)}, s32[2]{0:T(128)}, "
+            "u32[]{:S(2)}) copy-start(%p)"
+        )
+        copy_s32_name = (
+            "%copy.257 = s32[16,16,8,128]{3,1,2,0:T(8,128)} "
+            "copy(%select_bitcast_fusion.8)"
+        )
+        copy_vmem_name = (
+            "%copy.160 = f8e4m3fn[16,256,1,4,256]"
+            "{4,1,3,0,2:T(8,128)(4,1)S(1)} copy(%gte)"
+        )
+        for dev_idx in range(bench_mod.WORLD_SIZE):
+            events_txt = []
+            # Metadata 1 = writeback, 2 = splash, 3 = 5D HBM copy, 4..6 = excluded
+            for step in range(bench_mod.PROFILE_STEPS):
+                base_ps = (step + 1) * 100_000_000_000  # 100 ms in picoseconds
+                # Two writeback windows (0.4 ms and 0.6 ms = 1.0 ms total)
+                events_txt.append(
+                    f"events {{ metadata_id: 1 offset_ps: {base_ps} "
+                    "duration_ps: 400000000 }"
+                )
+                events_txt.append(
+                    f"events {{ metadata_id: 1 offset_ps: {base_ps + 500_000_000} "
+                    "duration_ps: 600000000 }"
+                )
+                for mid in (4, 5, 6):
+                    noise_ps = base_ps + 1_100_000_000 + mid * 10_000_000
+                    events_txt.append(
+                        f"events {{ metadata_id: {mid} offset_ps: {noise_ps}"
+                        " duration_ps: 50000000 }"
+                    )
+                if inject_copy_ns > 0:
+                    events_txt.append(
+                        f"events {{ metadata_id: 3 offset_ps: {base_ps + 1_200_000_000}"
+                        f" duration_ps: {inject_copy_ns * 1000} }}"
+                    )
+                # Three splash groups (2.0 ms + 3.0 ms + 4.0 ms + 0.1*dev_idx ms)
+                extra_ps = dev_idx * 100_000_000
+                events_txt.append(
+                    f"events {{ metadata_id: 2 offset_ps: {base_ps + 2_000_000_000} "
+                    "duration_ps: 2000000000 }"
+                )
+                events_txt.append(
+                    f"events {{ metadata_id: 2 offset_ps: {base_ps + 5_000_000_000} "
+                    "duration_ps: 3000000000 }"
+                )
+                events_txt.append(
+                    f"events {{ metadata_id: 2 offset_ps: {base_ps + 9_000_000_000} "
+                    f"duration_ps: {4000000000 + extra_ps} }}"
+                )
+            line_joined = "\n      ".join(events_txt)
+            planes_txt.append(
+                f"""planes {{
+  id: {dev_idx + 1}
+  name: "/device:TPU:{dev_idx}"
+  event_metadata {{ key: 1 value {{ id: 1 name: "{wb_name}" }} }}
+  event_metadata {{ key: 2 value {{ id: 2 name: "{sp_name}" }} }}
+  event_metadata {{ key: 3 value {{ id: 3 name: "{copy_hbm_name}" }} }}
+  event_metadata {{ key: 4 value {{ id: 4 name: "{copy_start_name}" }} }}
+  event_metadata {{ key: 5 value {{ id: 5 name: "{copy_s32_name}" }} }}
+  event_metadata {{ key: 6 value {{ id: 6 name: "{copy_vmem_name}" }} }}
+  lines {{
+    id: 1
+    name: "XLA Ops"
+    timestamp_ns: 1000
+    {line_joined}
+  }}
+}}"""
+            )
+        xspace_bytes = jax.profiler.ProfileData.text_proto_to_serialized_xspace(
+            "\n".join(planes_txt)
+        )
+        (out_dir / "host0.xplane.pb").write_bytes(xspace_bytes)
+
+    clean_dir = tmp_path / "xprof_clean"
+    _write_xspace(clean_dir, inject_copy_ns=0)
+    monkeypatch.setenv("TPU_PCP8_160K_PROFILE_DIR", str(clean_dir))
+    summary_clean = bench_mod._extract_profiled_kernel_summary()
+    # Slowest core is dev_idx=7: writeback=1.0 ms, splash=9.7 ms -> critical=10.7 ms
+    assert math.isclose(
+        float(summary_clean["profiled_kernel_current_state_core_step_median_ms"]),
+        1.0,
+        abs_tol=1e-6,
+    )
+    assert math.isclose(
+        float(summary_clean["profiled_kernel_copy_core_step_median_ms"]),
+        0.0,
+        abs_tol=1e-6,
+    )
+    assert math.isclose(
+        float(summary_clean["profiled_kernel_critical_step_median_ms"]),
+        10.7,
+        abs_tol=1e-6,
+    )
+
+    # Negative control: injected 2.5 ms %copy.198 raises copy_ms to 2.5 and sum to 13.2.
+    bad_dir = tmp_path / "xprof_with_copy"
+    _write_xspace(bad_dir, inject_copy_ns=2_500_000)
+    monkeypatch.setenv("TPU_PCP8_160K_PROFILE_DIR", str(bad_dir))
+    summary_bad = bench_mod._extract_profiled_kernel_summary()
+    assert math.isclose(
+        float(summary_bad["profiled_kernel_copy_core_step_median_ms"]),
+        2.5,
+        abs_tol=1e-6,
+    )
+    assert bench_mod._is_donated_kv_cache_hbm_copy_event("%copy.198")
+    assert math.isclose(
+        float(summary_bad["profiled_kernel_critical_step_median_ms"]),
+        13.2,
+        abs_tol=1e-6,
+    )
+
+    # Legacy reference arm (writeback + current + history, zero splash) must not
+    # enter the unified branch despite matching the writeback custom-call prefix.
+    legacy_dir = tmp_path / "xprof_legacy"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    legacy_planes = []
+    legacy_cur = "%pcp_streaming_attention_current_state_page_groups_multi_head.1"
+    legacy_wb = "%pcp_write_captured_kv_to_local_cache.1"
+    legacy_hist = (
+        "%pcp_streaming_attention_history_output_page_groups_multi_head.1.o_in_ref"
+    )
+    for dev_idx in range(bench_mod.WORLD_SIZE):
+        legacy_events = []
+        for step in range(bench_mod.PROFILE_STEPS):
+            base_ps = (step + 1) * 100_000_000_000
+            legacy_events.append(
+                f"events {{ metadata_id: 1 offset_ps: {base_ps} "
+                "duration_ps: 2000000000 }"
+            )
+            legacy_events.append(
+                f"events {{ metadata_id: 2 offset_ps: {base_ps + 3_000_000_000} "
+                "duration_ps: 500000000 }"
+            )
+            legacy_events.append(
+                f"events {{ metadata_id: 3 offset_ps: {base_ps + 4_000_000_000} "
+                "duration_ps: 20000000000 }"
+            )
+        joined_leg = "\n      ".join(legacy_events)
+        legacy_planes.append(
+            f"""planes {{
+  id: {dev_idx + 1}
+  name: "/device:TPU:{dev_idx}"
+  event_metadata {{ key: 1 value {{ id: 1 name: "{legacy_cur}" }} }}
+  event_metadata {{ key: 2 value {{ id: 2 name: "{legacy_wb}" }} }}
+  event_metadata {{ key: 3 value {{ id: 3 name: "{legacy_hist}" }} }}
+  lines {{
+    id: 1
+    name: "XLA Ops"
+    timestamp_ns: 1000
+    {joined_leg}
+  }}
+}}"""
+        )
+    (legacy_dir / "host0.xplane.pb").write_bytes(
+        jax.profiler.ProfileData.text_proto_to_serialized_xspace(
+            "\n".join(legacy_planes)
+        )
+    )
+    monkeypatch.setenv("TPU_PCP8_160K_PROFILE_DIR", str(legacy_dir))
+    summary_legacy = bench_mod._extract_profiled_kernel_summary()
+    assert math.isclose(
+        float(summary_legacy["profiled_kernel_critical_step_median_ms"]),
+        22.0,
+        abs_tol=1e-6,
+    )
+
+    # Verify misaligned_overflow output matches _compute_pcp_local_query_row_mapping.
+    monkeypatch.setenv("TPU_PCP8_160K_WORKLOAD", "misaligned_overflow")
+    active_reqs = bench_mod.OVERFLOW_ACTIVE_REQS
+    q_toks = bench_mod.OVERFLOW_QUERY_TOKENS
+    hist_toks = bench_mod.OVERFLOW_HISTORY_TOKENS
+    q_lens = jnp.asarray(
+        [q_toks] * active_reqs + [0] * (bench_mod.MAX_NUM_SEQS - active_reqs),
+        dtype=jnp.int32,
+    )
+    q_starts = jnp.asarray(
+        [i * q_toks for i in range(active_reqs)]
+        + [0] * (bench_mod.MAX_NUM_SEQS - active_reqs),
+        dtype=jnp.int32,
+    )
+    hist_starts = jnp.asarray(
+        [hist_toks] * active_reqs + [0] * (bench_mod.MAX_NUM_SEQS - active_reqs),
+        dtype=jnp.int32,
+    )
+    for rank in range(bench_mod.WORLD_SIZE):
+        mapping = pcp_stage_plan._compute_pcp_local_query_row_mapping(
+            q_lens,
+            token_owner_starts=q_starts,
+            request_absolute_starts=hist_starts,
+            local_padded_tokens=bench_mod.LOCAL_QUERY_TOKENS,
+            pcp_size=bench_mod.WORLD_SIZE,
+            pcp_rank=rank,
+            interleave_size=bench_mod.PCP_INTERLEAVE_SIZE,
+        )
+        abs_p = np.asarray(mapping.absolute_positions, dtype=np.float64)
+        valid_p = np.asarray(mapping.is_valid, dtype=bool)
+        safe_abs = np.where(valid_p, abs_p, 0.0)
+        ref_out = np.where(valid_p, safe_abs / (safe_abs + 1.0), 0.0).astype(np.float32)
+        got_out = bench_mod._expected_local_output(torch, rank).numpy()
+        np.testing.assert_allclose(got_out, ref_out, rtol=0.0, atol=1e-7)

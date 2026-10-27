@@ -53,6 +53,8 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.stage_plan import (
     PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS,
     PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
+    _build_writeback_segment_descriptors,
+    _compute_misaligned_writeback_slots,
     _compute_pcp_capture_source_rows_for_cache_rank,
 )
 
@@ -2446,19 +2448,23 @@ def _gather_vpages_to_head_major(
         ).reshape(2, kv_heads, num_tokens, head_dim)
         return pages_hm[0], pages_hm[1]
 
+    packed_planes = local_pages.shape[2] * local_pages.shape[3]
     local_hm = jnp.transpose(
         local_pages.reshape(
             num_vpages,
             chunks_per_page,
             interleave_size,
-            2 * kv_heads,
+            packed_planes,
             head_dim,
         ),
         (3, 0, 1, 2, 4),
     )
-    pages_hm = lax.all_gather(
-        local_hm, axis_name=pcp_axis_name, axis=3, tiled=True
-    ).reshape(kv_heads, 2, num_tokens, head_dim)
+    pages_hm = lax.all_gather(local_hm, axis_name=pcp_axis_name, axis=3, tiled=True)
+    # Skip StableHLO slice when 2 * kv_heads fills whole sublane packs; slicing
+    # after all_gather keeps axis 0 divisible by 4 so transpose is a zero-copy bitcast.
+    if packed_planes != 2 * kv_heads:
+        pages_hm = pages_hm[: 2 * kv_heads]
+    pages_hm = pages_hm.reshape(kv_heads, 2, num_tokens, head_dim)
     return pages_hm[:, 0, :, :], pages_hm[:, 1, :, :]
 
 
@@ -2905,6 +2911,7 @@ def _route_current_kv_to_captured_kv(
     interleave_size: int,
     kv_layout: KVLayout,
     pcp_axis_name: str,
+    window_offset: int | jax.Array = 0,
 ) -> jax.Array:
     """Routes current_kv_local rows to this cache rank's captured rows by token."""
     my_rank = _get_pcp_rank_without_axis_index(pcp_axis_name, pcp_size)
@@ -2916,6 +2923,7 @@ def _route_current_kv_to_captured_kv(
         local_tokens=local_tokens,
         pcp_size=pcp_size,
         interleave_size=interleave_size,
+        window_offset=window_offset,
     )
     zero = jnp.zeros((), dtype=current_kv_local.dtype)
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
@@ -3017,6 +3025,87 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         writeback_num_segments,
         kv_layout=kv_layout,
     )
+    # Synthetic unit-test PCPStagePlan fixtures omit block_tables when skipping
+    # multi-window writeback; keep window 0 outside lax.cond to preserve KV-cache
+    # input-output aliasing without an HBM relayout copy.
+    plan_block_tables = stage_plan.block_tables
+    if plan_block_tables is not None:
+        num_writeback_windows = jnp.where(
+            stage_plan.needs_reroute,
+            jnp.maximum(
+                1,
+                (
+                    jnp.asarray(stage_plan.max_writeback_count, dtype=jnp.int32)
+                    + local_tokens
+                    - 1
+                )
+                // local_tokens,
+            ),
+            1,
+        )
+        max_wb_segments = int(writeback_segment_descriptors.shape[1])
+        local_num_blocks = int(kv_cache_local.shape[0])
+
+        def _write_overflow_window(
+            win_idx: jax.Array, cache_carry: jax.Array
+        ) -> jax.Array:
+            # Bind metadata to win_idx so XLA does not hoist 32K-row scatters to ENTRY.
+            win_idx_b, kv_lens_b, cu_q_lens_b, dist_b, block_tables_b = (
+                lax.optimization_barrier(
+                    (
+                        win_idx,
+                        kv_lens,
+                        cu_q_lens,
+                        distribution,
+                        plan_block_tables,
+                    )
+                )
+            )
+            window_offset = win_idx_b * local_tokens
+            captured_win = _route_current_kv_to_captured_kv(
+                current_kv_local,
+                cu_q_lens_b,
+                kv_lens_b,
+                dist_b,
+                local_tokens=local_tokens,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                kv_layout=kv_layout,
+                pcp_axis_name=pcp_axis_name,
+                window_offset=window_offset,
+            )
+            my_rank = _get_pcp_rank_without_axis_index(pcp_axis_name, pcp_size)
+            win_slots, win_count, _ = _compute_misaligned_writeback_slots(
+                kv_lens_b,
+                cu_q_lens_b,
+                dist_b,
+                block_tables_b,
+                my_rank,
+                local_tokens=local_tokens,
+                local_kv_cache_num_blocks=local_num_blocks,
+                page_size=page_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                window_offset=window_offset,
+            )
+            win_desc, win_num_seg = _build_writeback_segment_descriptors(
+                win_slots,
+                win_count,
+                max_segments=max_wb_segments,
+                kv_layout=kv_layout,
+                page_size=page_size,
+            )
+            return write_captured_kv_to_local_cache(
+                cache_carry,
+                captured_win,
+                win_desc,
+                win_num_seg,
+                kv_layout=kv_layout,
+            )
+
+        kv_cache_local = lax.fori_loop(
+            1, num_writeback_windows, _write_overflow_window, kv_cache_local
+        )
     eff_q_scale = (
         (1.0 if sm_scale is None else float(sm_scale))
         * (1.0 if k_scale is None else float(k_scale))

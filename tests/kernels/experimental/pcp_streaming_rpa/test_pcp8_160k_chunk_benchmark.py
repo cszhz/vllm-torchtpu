@@ -54,6 +54,7 @@ import argparse
 import json
 import math
 import os
+import re
 import signal
 import statistics
 import subprocess
@@ -93,6 +94,10 @@ BENCHMARK_STEPS = 10
 PROFILE_STEPS = 3
 LAUNCH_TIMEOUT_SECONDS = 900
 KV_LAYOUT_ENV = "TPU_PCP8_160K_KV_LAYOUT"
+WORKLOAD_ENV = "TPU_PCP8_160K_WORKLOAD"
+OVERFLOW_ACTIVE_REQS = 20
+OVERFLOW_HISTORY_TOKENS = 1
+OVERFLOW_QUERY_TOKENS = 257
 
 
 def _selected_kv_layout_name() -> str:
@@ -100,6 +105,13 @@ def _selected_kv_layout_name() -> str:
     if layout not in ("HEAD_ALONG_SUBLANE", "SEQ_ALONG_LANE"):
         raise ValueError(f"Unsupported {KV_LAYOUT_ENV}={layout!r}.")
     return layout
+
+
+def _selected_workload_name() -> str:
+    workload = os.getenv(WORKLOAD_ENV, "aligned").strip().lower()
+    if workload not in ("aligned", "misaligned_overflow"):
+        raise ValueError(f"Unsupported {WORKLOAD_ENV}={workload!r}.")
+    return workload
 
 
 def _require_benchmark() -> None:
@@ -202,7 +214,9 @@ def _gather_global_device_ids(torch, dist, tpu_distributed) -> tuple[int, ...]:
     return tuple(int(tensor.cpu().item()) for tensor in gathered)
 
 
-def _build_mesh(jax, np, global_device_ids: tuple[int, ...], axis_name: str):
+def _build_mesh(
+    jax, np, global_device_ids: tuple[int, ...], pcp_axis_name: str, tp_axis_name: str
+):
     devices_by_id = {int(device.id): device for device in jax.devices()}
     missing = [
         device_id for device_id in global_device_ids if device_id not in devices_by_id
@@ -212,8 +226,10 @@ def _build_mesh(jax, np, global_device_ids: tuple[int, ...], axis_name: str):
             f"JAX does not expose worker TPU ids {missing}; "
             f"available={sorted(devices_by_id)}"
         )
-    devices = np.asarray([devices_by_id[device_id] for device_id in global_device_ids])
-    return jax.sharding.Mesh(devices, axis_names=(axis_name,))
+    devices = np.asarray(
+        [devices_by_id[device_id] for device_id in global_device_ids]
+    ).reshape(WORLD_SIZE, 1)
+    return jax.sharding.Mesh(devices, axis_names=(pcp_axis_name, tp_axis_name))
 
 
 def _make_inputs(torch):
@@ -247,24 +263,45 @@ def _make_inputs(torch):
         )
     kv_cache = torch.zeros(kv_cache_shape, dtype=torch.float8_e4m3fn, device="tpu")
 
-    # Production pads request metadata to max_num_seqs=64 even though only the
-    # first request is live in this benchmark.
+    workload = _selected_workload_name()
     seq_lens = torch.zeros((MAX_NUM_SEQS,), dtype=torch.int32, device="tpu")
-    seq_lens[0] = TOTAL_KV_TOKENS
-    query_start_loc = torch.full(
-        (MAX_NUM_SEQS + 1,), CHUNK_TOKENS, dtype=torch.int32, device="tpu"
-    )
-    query_start_loc[0] = 0
-    request_distribution = torch.tensor([0, 0, 1], dtype=torch.int32, device="tpu")
-
     block_tables = torch.zeros(
         (MAX_NUM_SEQS, MAX_LOCAL_PAGES_PER_SEQ),
         dtype=torch.int32,
         device="tpu",
     )
-    block_tables[0] = torch.arange(
-        MAX_LOCAL_PAGES_PER_SEQ, dtype=torch.int32, device="tpu"
-    )
+    if workload == "misaligned_overflow":
+        # Each of 20 requests has 1 cached token (V=0) + 257 new tokens (V=1),
+        # concentrating 20 * 255 = 5,100 > 4,096 writeback rows onto cache rank 0.
+        seq_lens[:OVERFLOW_ACTIVE_REQS] = (
+            OVERFLOW_HISTORY_TOKENS + OVERFLOW_QUERY_TOKENS
+        )
+        total_overflow_q = OVERFLOW_ACTIVE_REQS * OVERFLOW_QUERY_TOKENS
+        query_start_loc = torch.full(
+            (MAX_NUM_SEQS + 1,), total_overflow_q, dtype=torch.int32, device="tpu"
+        )
+        query_start_loc[:OVERFLOW_ACTIVE_REQS] = (
+            torch.arange(OVERFLOW_ACTIVE_REQS, dtype=torch.int32, device="tpu")
+            * OVERFLOW_QUERY_TOKENS
+        )
+        request_distribution = torch.tensor(
+            [0, 0, OVERFLOW_ACTIVE_REQS], dtype=torch.int32, device="tpu"
+        )
+        block_tables[:OVERFLOW_ACTIVE_REQS, 0] = torch.arange(
+            OVERFLOW_ACTIVE_REQS, dtype=torch.int32, device="tpu"
+        )
+    else:
+        # Production pads request metadata to max_num_seqs=64 even though only the
+        # first request is live in this benchmark.
+        seq_lens[0] = TOTAL_KV_TOKENS
+        query_start_loc = torch.full(
+            (MAX_NUM_SEQS + 1,), CHUNK_TOKENS, dtype=torch.int32, device="tpu"
+        )
+        query_start_loc[0] = 0
+        request_distribution = torch.tensor([0, 0, 1], dtype=torch.int32, device="tpu")
+        block_tables[0] = torch.arange(
+            MAX_LOCAL_PAGES_PER_SEQ, dtype=torch.int32, device="tpu"
+        )
     return kv_cache, (
         query,
         key,
@@ -277,11 +314,29 @@ def _make_inputs(torch):
 
 
 def _expected_local_output(torch, rank: int):
+    cycle = WORLD_SIZE * PCP_INTERLEAVE_SIZE
+    if _selected_workload_name() == "misaligned_overflow":
+        expected_vals: list[float] = []
+        for req_idx in range(OVERFLOW_ACTIVE_REQS):
+            owner_start = req_idx * OVERFLOW_QUERY_TOKENS
+            owner_end = owner_start + OVERFLOW_QUERY_TOKENS
+            chunk_pos = (owner_start // cycle) * cycle + rank * PCP_INTERLEAVE_SIZE
+            if chunk_pos + PCP_INTERLEAVE_SIZE <= owner_start:
+                chunk_pos += cycle
+            while chunk_pos < owner_end:
+                seg_start = max(chunk_pos, owner_start)
+                seg_end = min(chunk_pos + PCP_INTERLEAVE_SIZE, owner_end)
+                for owner_pos in range(seg_start, seg_end):
+                    abs_pos = OVERFLOW_HISTORY_TOKENS + (owner_pos - owner_start)
+                    expected_vals.append(float(abs_pos) / float(abs_pos + 1))
+                chunk_pos += cycle
+        expected_vals.extend([0.0] * (LOCAL_QUERY_TOKENS - len(expected_vals)))
+        return torch.tensor(expected_vals, dtype=torch.float32)
+
     # Query ownership is rank-major in 256-token chunks. Q=K=0 makes all
     # attention logits equal, history V is zero and current V is one, so row i
     # is exactly (new tokens visible so far) / (all tokens visible so far).
     offsets = []
-    cycle = WORLD_SIZE * PCP_INTERLEAVE_SIZE
     chunk_start = rank * PCP_INTERLEAVE_SIZE
     while chunk_start < CHUNK_TOKENS:
         chunk_end = min(chunk_start + PCP_INTERLEAVE_SIZE, CHUNK_TOKENS)
@@ -397,10 +452,11 @@ def _run_worker(result_dir: Path) -> None:
         )
         from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
             PCP_AXIS_NAME,
+            TP_AXIS_NAME,
         )
 
         global_device_ids = _gather_global_device_ids(torch, dist, tpu_distributed)
-        mesh = _build_mesh(jax, np, global_device_ids, PCP_AXIS_NAME)
+        mesh = _build_mesh(jax, np, global_device_ids, PCP_AXIS_NAME, TP_AXIS_NAME)
         kv_cache, args = _make_inputs(torch)
         kv_layout = KVLayout[_selected_kv_layout_name()]
         sync.synchronize([kv_cache, *args], wait=True)
@@ -479,13 +535,30 @@ def _run_worker(result_dir: Path) -> None:
 def _resolve_result_dir(tmp_path: Path) -> Path:
     configured = os.getenv("TPU_PCP8_160K_RESULT_DIR", "").strip()
     layout = _selected_kv_layout_name().lower()
+    workload = _selected_workload_name()
+    suffix = layout if workload == "aligned" else f"{layout}_{workload}"
     result_dir = (
         Path(configured).resolve()
         if configured
-        else (tmp_path / f"pcp8_qwen35_397b_h128k_q32k_{layout}")
+        else (tmp_path / f"pcp8_qwen35_397b_h128k_q32k_{suffix}")
     )
     result_dir.mkdir(parents=True, exist_ok=True)
     return result_dir
+
+
+def _is_donated_kv_cache_hbm_copy_event(event_name: str) -> bool:
+    """True for synchronous 5D HBM floating-point KV-cache kCopy events."""
+    lhs, sep, rhs = event_name.partition(" = ")
+    if not re.fullmatch(r"%?copy(?:\.\d+)?", lhs.strip()):
+        return False
+    if not sep:
+        return True
+    result_type = rhs.split(" copy(", 1)[0].strip()
+    shape_match = re.match(r"^(?:f8\w+|bf16|f16|f32|f64)\[([0-9,]+)\]", result_type)
+    if shape_match is None:
+        return False
+    dims = [dim for dim in shape_match.group(1).split(",") if dim]
+    return len(dims) == 5 and not bool(re.search(r"S\([1-9]\d*\)", result_type))
 
 
 def _extract_profiled_kernel_summary() -> dict[str, object]:
@@ -495,9 +568,13 @@ def _extract_profiled_kernel_summary() -> dict[str, object]:
 
     import jax
 
-    prefixes = {
+    legacy_prefixes = {
         "current": "%pcp_streaming_attention_current_state_page_groups_multi_head.",
         "history": "%pcp_streaming_attention_history_output_page_groups_multi_head.",
+    }
+    unified_prefixes = {
+        "writeback": "%pcp_write_captured_kv_to_local_cache",
+        "splash": "%splash_mha_fwd_segmented",
     }
     core_step_samples = []
     for xplane_path in sorted(Path(configured).rglob("*.xplane.pb")):
@@ -505,22 +582,80 @@ def _extract_profiled_kernel_summary() -> dict[str, object]:
         for plane in profile.planes:
             if not plane.name.startswith("/device:TPU:") or "SparseCore" in plane.name:
                 continue
-            events = {key: [] for key in prefixes}
+            legacy_events: dict[str, list[object]] = {
+                key: [] for key in legacy_prefixes
+            }
+            unified_events: list[tuple[int, str, object]] = []
+            copy_events: list[object] = []
             for line in plane.lines:
                 if line.name != "XLA Ops":
                     continue
                 for event in line.events:
-                    for key, prefix in prefixes.items():
+                    for key, prefix in legacy_prefixes.items():
                         if event.name.startswith(prefix):
-                            events[key].append(event)
-            if not events["current"] and not events["history"]:
+                            legacy_events[key].append(event)
+                    for kind, prefix in unified_prefixes.items():
+                        if event.name.startswith(prefix):
+                            unified_events.append((event.start_ns, kind, event))
+                    if _is_donated_kv_cache_hbm_copy_event(event.name):
+                        copy_events.append(event)
+
+            if any(kind == "splash" for _, kind, _ in unified_events):
+                unified_events.sort(key=lambda item: item[0])
+                step_buckets: list[dict[str, list[object]]] = []
+                for _, kind, event in unified_events:
+                    if kind == "writeback":
+                        if not step_buckets or step_buckets[-1]["splash"]:
+                            step_buckets.append({"writeback": [event], "splash": []})
+                        else:
+                            step_buckets[-1]["writeback"].append(event)
+                    else:
+                        assert step_buckets, (
+                            f"splash event before writeback on {plane.name}: "
+                            f"{event.name}"
+                        )
+                        step_buckets[-1]["splash"].append(event)
+                assert len(step_buckets) == PROFILE_STEPS, (
+                    f"expected {PROFILE_STEPS} unified step buckets on {plane.name}, "
+                    f"found {len(step_buckets)}"
+                )
+                for step, bucket in enumerate(step_buckets):
+                    assert bucket["writeback"] and bucket["splash"]
+                    step_start = min(ev.start_ns for ev in bucket["writeback"])
+                    step_end = max(
+                        ev.start_ns + ev.duration_ns
+                        for ev in bucket["writeback"] + bucket["splash"]
+                    )
+                    step_copies = [
+                        ev
+                        for ev in copy_events
+                        if ev.start_ns < step_end
+                        and ev.start_ns + ev.duration_ns > step_start
+                    ]
+                    current_ms = sum(ev.duration_ns for ev in bucket["writeback"]) / 1e6
+                    history_ms = sum(ev.duration_ns for ev in bucket["splash"]) / 1e6
+                    copy_ms = sum(ev.duration_ns for ev in step_copies) / 1e6
+                    core_step_samples.append(
+                        {
+                            "xplane": xplane_path.name,
+                            "device_plane": plane.name,
+                            "step": step,
+                            "current_state_ms": current_ms,
+                            "history_output_ms": history_ms,
+                            "copy_ms": copy_ms,
+                            "kernel_sum_ms": current_ms + history_ms + copy_ms,
+                        }
+                    )
                 continue
-            for values in events.values():
+
+            if not legacy_events["current"] and not legacy_events["history"]:
+                continue
+            for values in legacy_events.values():
                 values.sort(key=lambda event: event.start_ns)
-            assert len(events["current"]) == PROFILE_STEPS
-            assert len(events["history"]) == PROFILE_STEPS
+            assert len(legacy_events["current"]) == PROFILE_STEPS
+            assert len(legacy_events["history"]) == PROFILE_STEPS
             for step, (current, history) in enumerate(
-                zip(events["current"], events["history"])
+                zip(legacy_events["current"], legacy_events["history"])
             ):
                 current_ms = current.duration_ns / 1e6
                 history_ms = history.duration_ns / 1e6
@@ -531,6 +666,7 @@ def _extract_profiled_kernel_summary() -> dict[str, object]:
                         "step": step,
                         "current_state_ms": current_ms,
                         "history_output_ms": history_ms,
+                        "copy_ms": 0.0,
                         "kernel_sum_ms": current_ms + history_ms,
                     }
                 )
@@ -546,6 +682,7 @@ def _extract_profiled_kernel_summary() -> dict[str, object]:
     history_samples = [
         float(sample["history_output_ms"]) for sample in core_step_samples
     ]
+    copy_samples = [float(sample["copy_ms"]) for sample in core_step_samples]
     sum_samples = [float(sample["kernel_sum_ms"]) for sample in core_step_samples]
     critical_step_samples = [
         max(
@@ -562,6 +699,7 @@ def _extract_profiled_kernel_summary() -> dict[str, object]:
         "profiled_kernel_history_output_core_step_median_ms": statistics.median(
             history_samples
         ),
+        "profiled_kernel_copy_core_step_median_ms": statistics.median(copy_samples),
         "profiled_kernel_sum_core_step_median_ms": statistics.median(sum_samples),
         "profiled_kernel_critical_step_samples_ms": critical_step_samples,
         "profiled_kernel_critical_step_median_ms": statistics.median(
@@ -602,6 +740,7 @@ def test_pcp8_qwen35_397b_history128k_chunk32k_layout_benchmark(tmp_path, capsys
     summary = {
         "model": "Qwen3.5-397B-A17B-FP8",
         "layout": _selected_kv_layout_name(),
+        "workload": _selected_workload_name(),
         "world_size": WORLD_SIZE,
         "data_parallel_size": 1,
         "prefill_context_parallel_size": WORLD_SIZE,
