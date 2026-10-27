@@ -501,9 +501,18 @@ def _attention_kernel(
     def dense_batch_rows(seq_idx_start):
         return dense.batch_rows_ref[seq_idx_start // batch_size]
 
+    def starts_dense_run(seq_idx_start):
+        """Whether the `DenseRefs` batch must build its rows: the batches of
+        one sequence run in a call share `dense_batch_rows`, so the rest of
+        the run reuses the first batch's `dense.kv_vmem_ref`."""
+        prev = dense.token_seq_ref[jnp.maximum(seq_idx_start - 1, 0)]
+        return jnp.logical_or(
+            seq_idx_start == start_seq_idx, prev != dense.token_seq_ref[seq_idx_start]
+        )
+
     def _fetch_dense_batch(seq_idx_start, bkv_sem_idx, *, wait=False):
-        """Copy the batch's selection masks and the cache pages holding rows
-        [0, `dense_batch_rows`) of its sequence."""
+        """Copy the batch's selection masks and, if it starts a run, the
+        cache pages holding rows [0, `dense_batch_rows`) of its sequence."""
         sem_nope, sem_rope, sem_select = (
             dense.sems.at[i, bkv_sem_idx] for i in range(3)
         )
@@ -517,7 +526,11 @@ def _attention_kernel(
         _async_copy(select_src, select_dst, sem_select, wait)
 
         seq = -dense.token_seq_ref[seq_idx_start] - 1
-        num_pages = cdiv(dense_batch_rows(seq_idx_start), page_size)
+        num_pages = jnp.where(
+            starts_dense_run(seq_idx_start),
+            cdiv(dense_batch_rows(seq_idx_start), page_size),
+            0,
+        )
         for i in range(dense.pages_per_seq):
 
             @pl.when(i < num_pages)
@@ -738,11 +751,15 @@ def _attention_kernel(
         """`process`'s token loop for a `DenseRefs` batch, over the smallest
         width in `dense_widths` that covers `dense_batch_rows`."""
         num_rows = dense_batch_rows(batch_start_seq_idx)
+        build = starts_dense_run(batch_start_seq_idx)
         for lo, width in zip([0] + dense_widths[:-1], dense_widths):
 
             @pl.when((num_rows > lo) & (num_rows <= width))
             def _(width=width):
-                build_dense_bkv(bi_sem_idx, num_rows, width)
+                @pl.when(build)
+                def _():
+                    build_dense_bkv(bi_sem_idx, num_rows, width)
+
                 attend_rows_from_cache(bi_sem_idx, bo_sem_idx, attention_sinks, width)
 
     def attend_rows_from_cache(bi_sem_idx, bo_sem_idx, attention_sinks, width):
@@ -986,7 +1003,7 @@ def _dense_batches(
 
     A batch of valid tokens of one sequence reads the cache when its rows fit
     in DENSE_MAX_ROWS. Its rows cover every entry selected by a batch of the
-    same sequence and call, so all of them build the same rows.
+    same sequence and call, so consecutive ones can share one build.
     """
     num_tokens = topk_indices.shape[0]
     num_batches = num_tokens // batch_size
