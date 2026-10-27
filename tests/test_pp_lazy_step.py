@@ -140,6 +140,9 @@ def _executor(monkeypatch, stages=4):
                 unique_reply_rank=self.output_rank,
             )
 
+        def profile(self, is_start=True, profile_prefix=None):
+            self.collective_rpc("profile", args=(is_start, profile_prefix))
+
     monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", _Executor)
     pp_push.patch_executor_for_pp_wave(_config(stages))
     pp_lazy_step._patch_collective_rpc()

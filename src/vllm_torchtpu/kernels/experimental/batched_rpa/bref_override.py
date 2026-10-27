@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 
 
 class _BaseBufferedRef(pltpu.BufferedRef):
@@ -170,6 +170,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         total_steps: int | jax.Array,
     ):
         # src_ref: (kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref)
+        if utils.bench_skip("kv_dma"):
+            return
         is_no_op, block_idx = _step_guard(step, total_steps)
         kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref = self.src_ref
         sem = self.sem_recvs.at[slot]
@@ -243,6 +245,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         slot: int | jax.Array,
         total_steps: int | jax.Array,
     ):
+        if utils.bench_skip("kv_dma"):
+            return
         is_no_op, block_idx = _step_guard(step, total_steps)
         _, _, schedule_ref, _ = self.src_ref
         sem = self.sem_recvs.at[slot]

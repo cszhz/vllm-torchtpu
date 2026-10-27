@@ -13,10 +13,23 @@
 # limitations under the License.
 """Utility functions for Ragged Paged Attention."""
 
+import os
+
 import jax
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
+
+
+def bench_skip(stage: str) -> bool:
+    """Whether TPU_RPA_BENCH_SKIP names `stage` ("matmul", "softmax", "kv_dma",
+    "mask").
+
+    The decode microbench (scripts/vllm/benchmark/rpa_decode_bench.py) sets it
+    to leave a stage out and attribute the kernel's time; the output is wrong
+    with any stage listed. Read at trace time. Empty: every stage runs.
+    """
+    return stage in os.environ.get("TPU_RPA_BENCH_SKIP", "").split(",")
 
 
 def align_to(a, b):

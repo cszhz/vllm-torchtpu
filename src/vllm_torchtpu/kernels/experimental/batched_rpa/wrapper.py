@@ -28,6 +28,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels import static_guards
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
     kernel,
@@ -534,12 +535,46 @@ def calculate_block_sizes(
 
     prefill_batch_size = 2
 
-    decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
+    decode_block_sizes = decode_block_override(
+        find_best_block_sizes(decode_batch_size, decode_query_size), serve_cfgs
+    )
     prefill_block_sizes = prefill_block_override(
         find_best_block_sizes(prefill_batch_size), serve_cfgs, mxu_column_size
     )
 
     return decode_block_sizes, prefill_block_sizes
+
+
+def decode_block_override(
+    default: configs.BlockSizes, serve_cfgs: configs.ServingConfigs
+) -> configs.BlockSizes:
+    """Applies TPU_RPA_DECODE_BLOCKS ("bkv,batch[,bq_c]") to the decode tiles.
+
+    bkv is the KV block (a multiple of the page size), batch the decode lanes
+    and bq_c the query sub-chunk, which must divide the query block (default:
+    the heuristic's). Every caller of calculate_block_sizes sees the same
+    tiles. Empty: the heuristic.
+    """
+    raw = os.environ.get("TPU_RPA_DECODE_BLOCKS", "").strip()
+    if not raw:
+        return default
+    try:
+        parts = [int(x) for x in raw.split(",")]
+        bkv, batch = parts[0], parts[1]
+        bq_c = parts[2] if len(parts) > 2 else default.bq_c_sz
+    except (ValueError, IndexError) as e:
+        raise ValueError(
+            f"TPU_RPA_DECODE_BLOCKS must be 'bkv,batch[,bq_c]'; got {raw!r}"
+        ) from e
+    if min(bkv, batch, bq_c) <= 0 or bkv % serve_cfgs.page_size or default.bq_sz % bq_c:
+        raise ValueError(
+            f"TPU_RPA_DECODE_BLOCKS={raw!r}: sizes must be positive, bkv a "
+            f"multiple of the page size {serve_cfgs.page_size} and bq_c a "
+            f"divisor of the query block {default.bq_sz}"
+        )
+    return configs.BlockSizes(
+        bq_sz=default.bq_sz, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=batch
+    )
 
 
 def prefill_block_override(
@@ -911,9 +946,9 @@ def ragged_paged_attention(
         return_lse: If True, return log-sum-exp (lse) values along with the
             output. Defaults to False.
         native_fp8: Run the DECODE kernel's QK and/or PV matmuls natively in
-            the fp8 KV dtype ("qk", "pv", "qkpv", or with hi/lo split operands
-            "qk2", "pv2", "qk2pv2"); see
-            `configs.ServingConfigs.native_fp8`. Defaults to the
+            the fp8 KV dtype ("qk", "pv", "qkpv", with hi/lo split operands
+            "qk2", "pv2", "qk2pv2", or with static operand scales "qks",
+            "pvs"); see `configs.ServingConfigs.native_fp8`. Defaults to the
             TPU_RPA_NATIVE_FP8 environment variable (unset: off).
         native_fp8_prefill: The same for the PREFILL and MIXED kernels ("qk",
             "pv", "qkpv", each operand optionally with "s" for its static
@@ -994,10 +1029,12 @@ def ragged_paged_attention(
         native_fp8 = os.environ.get("TPU_RPA_NATIVE_FP8", "")
     if native_fp8 in ("1", "true", "True"):
         native_fp8 = "qkpv"
-    if native_fp8 not in ("", "0") and not re.fullmatch(r"(qk2?)?(pv2?)?", native_fp8):
+    if native_fp8 not in ("", "0") and not re.fullmatch(
+        r"(qk[2s]?)?(pv[2s]?)?", native_fp8
+    ):
         raise ValueError(
-            f"native_fp8 must match (qk[2])(pv[2]), e.g. qkpv or qk2pv2; got "
-            f"{native_fp8!r}"
+            f"native_fp8 must match (qk[2s])(pv[2s]), e.g. qkpv, qk2pv2 or pvs; "
+            f"got {native_fp8!r}"
         )
     if native_fp8_prefill is None:
         native_fp8_prefill = envs.TPU_RPA_NATIVE_FP8_PREFILL
@@ -1212,7 +1249,13 @@ def ragged_paged_attention(
         # "cond" skips the MIXED call when its sequence range
         # [distribution[0], distribution[2]) (`configs.RpaConfigs.seq_range`)
         # is empty.
-        rpa_skip_mode = os.environ.get("TPU_RPA_SKIP_MIXED", "cond")
+        # A prefill-only runner always has a MIXED range and calls it
+        # directly (kernels/static_guards.py).
+        rpa_skip_mode = (
+            "never"
+            if static_guards.prefill_only()
+            else os.environ.get("TPU_RPA_SKIP_MIXED", "cond")
+        )
         if rpa_skip_mode == "cond":
             if return_lse:
 

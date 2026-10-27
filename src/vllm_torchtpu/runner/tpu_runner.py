@@ -88,6 +88,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
 from vllm_torchtpu import envs, utils
+from vllm_torchtpu.compilation import glue_debug
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -95,6 +96,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
+from vllm_torchtpu.kernels import static_guards
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
@@ -1075,6 +1077,8 @@ class TPUModelRunner(GPUModelRunner):
         self._mtp_prefill_only = self._prefill_only_mtp(
             vllm_config.parallel_config, self._pcp_enabled, self._mtp_enabled
         )
+        if envs.TPU_PREFILL_ONLY_STATIC_GUARDS and self._mtp_prefill_only:
+            static_guards.set_prefill_only()
         self._skip_verify_warmup = bool(
             envs.TPU_PREFILL_SKIP_VERIFY_WARMUP
             and self._mtp_enabled
@@ -2303,6 +2307,11 @@ class TPUModelRunner(GPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with set_current_vllm_config(self.vllm_config):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+        if glue_debug.enabled():
+            glue_debug.register_module("model", self.model)
+            glue_debug.register_object("runner", self)
+            if self.drafter is not None:
+                glue_debug.register_object("drafter", self.drafter)
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.kv_cache_manager.get_kv_prewarm_shapes()
@@ -7155,6 +7164,8 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def load_model(self) -> None:
+        if glue_debug.enabled():
+            glue_debug.install()
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
@@ -10756,7 +10767,10 @@ class TPUModelRunner(GPUModelRunner):
         if num_blocks == 0 or grammar_output is not None:
             return 0
         top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
-        if not bool(((top_k >= 1) & (top_k <= num_blocks // 2)).all()):
+        max_k = num_blocks // 2
+        if envs.TPU_SAMPLER_TOPK_MAX_K > 0:
+            max_k = min(max_k, envs.TPU_SAMPLER_TOPK_MAX_K)
+        if not bool(((top_k >= 1) & (top_k <= max_k)).all()):
             return 0
         logger.info_once(
             "Sampler top-k filters vocab to %d candidate blocks of %d logits.",

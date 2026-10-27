@@ -15,6 +15,7 @@
 """
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -25,10 +26,21 @@ from jax.experimental.pallas import tpu_sc as plsc
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
 
 _TOKEN_SUBCHUNK = 16
-_NUM_TOKEN_SUBCHUNKS = 4
+# Bench-only retiling knobs (TPU_SC_COMBINE_SUBCHUNKS: 16-token subchunks per
+# destination block, 2 or 4; TPU_SC_COMBINE_COL_PARTITIONS: column partitions
+# of the SparseCore subcores, else the width-derived count). Unset in serving.
+_NUM_TOKEN_SUBCHUNKS = int(os.environ.get("TPU_SC_COMBINE_SUBCHUNKS", "") or "4")
+_FORCED_COL_PARTITIONS = int(os.environ.get("TPU_SC_COMBINE_COL_PARTITIONS", "") or "0")
 _TOKEN_BLOCK = _TOKEN_SUBCHUNK * _NUM_TOKEN_SUBCHUNKS
 _ROUTE_INDEX_BITS = 20
 _ROUTE_INDEX_MASK = (1 << _ROUTE_INDEX_BITS) - 1
+
+
+def _bench_mode() -> str:
+    """Bench-only attribution knob (TPU_SC_COMBINE_BENCH): "skip_math" keeps
+    the row gathers and drops the scatter-adds, "half_cols" scatter-adds the
+    first half of each column partition."""
+    return os.environ.get("TPU_SC_COMBINE_BENCH", "").strip()
 
 
 def _align_to(value: int, alignment: int) -> int:
@@ -76,7 +88,7 @@ def partition_counts(hidden_size: int, tpu_info) -> tuple[int, int]:
     """Column and row partition counts of the SparseCore subcores for a width."""
     sc_info = tpu_info.sparse_core
     num_cores = sc_info.num_cores * sc_info.num_subcores
-    num_column_partitions = _calculate_num_column_partitions(
+    num_column_partitions = _FORCED_COL_PARTITIONS or _calculate_num_column_partitions(
         hidden_size, num_cores, tpu_info.num_lanes
     )
     return num_column_partitions, num_cores // num_column_partitions
@@ -103,6 +115,7 @@ def _main_kernel(
     num_column_partitions: int,
     blocks_per_row_partition: int,
     topk: int,
+    bench_mode: str = "",
 ):
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None
@@ -258,15 +271,19 @@ def _main_kernel(
                             mask=scatter_mask,
                         )
 
+            if bench_mode == "skip_math":
+                return
+            math_col_size = col_size // 2 if bench_mode == "half_cols" else col_size
+
             @pl.when(fixed_two_routes)
             def run_fixed_two_route_path():
-                plsc.parallel_loop(0, col_size, step=_TOKEN_SUBCHUNK)(
+                plsc.parallel_loop(0, math_col_size, step=_TOKEN_SUBCHUNK)(
                     fixed_two_route_column_loop
                 )
 
             @pl.when(jnp.logical_not(fixed_two_routes))
             def run_generic_path():
-                plsc.parallel_loop(0, col_size, step=_TOKEN_SUBCHUNK)(
+                plsc.parallel_loop(0, math_col_size, step=_TOKEN_SUBCHUNK)(
                     generic_column_loop
                 )
 
@@ -442,6 +459,7 @@ def ragged_gather_reduce(
 
     col_size = hidden_size // num_column_partitions
     blocks_per_row_partition = num_blocks // num_row_partitions
+    bench_mode = _bench_mode()
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
         num_subcores=sc_info.num_subcores,
@@ -457,6 +475,7 @@ def ragged_gather_reduce(
             num_column_partitions=num_column_partitions,
             blocks_per_row_partition=blocks_per_row_partition,
             topk=reduce_group_size,
+            bench_mode=bench_mode,
         ),
         out_type=jax.ShapeDtypeStruct((padded_num_tokens, hidden_size), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
@@ -470,6 +489,9 @@ def ragged_gather_reduce(
             pltpu.SemaphoreType.DMA((2,)),
         ),
         mesh=vector_mesh,
-        name="sc_ragged_gather_reduce_v3",
+        name="sc_ragged_gather_reduce_v3"
+        + (f"_{bench_mode}" if bench_mode else "")
+        + (f"_sub{_NUM_TOKEN_SUBCHUNKS}" if _NUM_TOKEN_SUBCHUNKS != 4 else "")
+        + (f"_cp{_FORCED_COL_PARTITIONS}" if _FORCED_COL_PARTITIONS else ""),
     )(x, route_metadata, route_weights, route_counts)
     return out[:num_tokens]

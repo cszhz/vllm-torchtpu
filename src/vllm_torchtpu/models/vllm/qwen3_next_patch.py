@@ -917,7 +917,12 @@ def maybe_setup_fused_gate_se(moe: Any) -> bool:
 
     w_gu_buf = torch.empty_like(w_gu_cat).copy_(w_gu_cat)
     s_gu_buf = torch.empty_like(s_gu_cat).copy_(s_gu_cat)
-    w_seg_buf = torch.empty_like(w_seg_1d).copy_(w_seg_1d)
+    if envs.TPU_FUSED_SE_GATE_FRESH_BUFFER:
+        # The host round trip is the one path that cannot alias the [1, hidden]
+        # gate buffer behind the [hidden] parameter.
+        w_seg_buf = w_seg_1d.cpu().to(w_seg_1d.device)
+    else:
+        w_seg_buf = torch.empty_like(w_seg_1d).copy_(w_seg_1d)
     w_down_buf = torch.empty_like(w_down_cat).copy_(w_down_cat)
     s_down_buf = torch.empty_like(s_down_cat).copy_(s_down_cat)
     del (

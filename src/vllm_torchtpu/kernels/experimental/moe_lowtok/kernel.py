@@ -26,6 +26,7 @@ The routing arrives either as a table built from the caller's local top-k ids
 """
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -52,6 +53,20 @@ _VMEM_FRACTION = 0.75
 _VMEM_MARGIN = 1.50  # over declared scratch and operands, for compiler tiles
 _FP8 = jnp.float8_e4m3fn
 _FP8_MAX = 448.0
+# Attribution knob of scripts/vllm/benchmark/moe_decode_bench.py, never set in serving:
+# "skip_gemm" keeps the weight DMAs and drops the matmuls, "skip_dma" keeps the matmuls on
+# whatever the VMEM slots hold and issues no weight DMA; a comma joins both.
+_BENCH = os.environ.get("TPU_MOE_LOWTOK_BENCH", "")
+_SKIP_GEMM = "skip_gemm" in _BENCH.split(",")
+_SKIP_DMA = "skip_dma" in _BENCH.split(",")
+
+
+def _dot(a, b):
+    if _SKIP_GEMM:
+        return jnp.zeros((a.shape[0], b.shape[1]), jnp.float32)
+    return jax.lax.dot_general(
+        a, b, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+    )
 
 
 def can_use_moe_lowtok(hidden, w1, w2, s1, s2, b1, b2, *, activation, rhs_quant_dtype):
@@ -129,6 +144,7 @@ def _stream(
     owned=None,
     choice=None,
     gid_of=None,
+    x_scale_ref=None,
 ):
     """Stream the hit experts of this shard and accumulate their outputs.
 
@@ -136,7 +152,9 @@ def _stream(
     maps local slot `e` to its global lane); hits_s [1, lanes] (SMEM) is 1 on
     lanes some row routes to; wtab_ref [rows, lanes] holds the routing weights.
     Each expert is `w13_parts` gate|up units then one down unit; the ring has
-    one slot per w13 unit plus a dedicated w2 slot.
+    one slot per w13 unit plus a dedicated w2 slot. With `x_scale_ref`, x_ref holds the
+    rows already quantized to FP8 and x_scale_ref [rows, lanes] their restoring scale
+    (lane 0), as `_quantize_rows` would have produced them.
     """
     if gid_of is None:
         gid_of = lambda e: gid_s[0, e]  # noqa: E731
@@ -213,6 +231,8 @@ def _stream(
         return jnp.where(wrap, e_idx + 1, e_idx), jnp.where(wrap, p - units, p)
 
     def start(e_idx, part):
+        if _SKIP_DMA:
+            return
         part, w13_copies, w2_copies = unit_copies(e_idx, part)
 
         @pl.when(part < w13_parts)
@@ -226,6 +246,8 @@ def _stream(
                 c.start()
 
     def wait(e_idx, part):
+        if _SKIP_DMA:
+            return
         part, w13_copies, w2_copies = unit_copies(e_idx, part)
 
         @pl.when(part < w13_parts)
@@ -255,7 +277,11 @@ def _stream(
                 start(jnp.int32(0), jnp.int32(ahead))
 
     acc[...] = jnp.zeros_like(acc)
-    x_q, x_s = _quantize_rows(x_ref[...].astype(jnp.float32))
+    if x_scale_ref is None:
+        x_q, x_s = _quantize_rows(x_ref[...].astype(jnp.float32))
+    else:
+        x_q = x_ref[...]
+        x_s = x_scale_ref[:, 0:1]
 
     def body(u, carry):
         e_idx, part = carry
@@ -270,23 +296,13 @@ def _stream(
         if w13_parts == 2:
             @pl.when(part == 0)
             def _gate_half():
-                h = jax.lax.dot_general(
-                    x_q,
-                    w13_buf[0],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
+                h = _dot(x_q, w13_buf[0])
                 gate = h * x_s * s13_buf[0]
                 h_acc[...] = gate * jax.nn.sigmoid(gate)
 
             @pl.when(part == 1)
             def _up_half():
-                h = jax.lax.dot_general(
-                    x_q,
-                    w13_buf[1],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
+                h = _dot(x_q, w13_buf[1])
                 up = h * x_s * s13_buf[1]
                 h_acc[...] = h_acc[...] * up
 
@@ -303,24 +319,14 @@ def _stream(
                     keepdims=True,
                 )
                 row_scale = a_s * w
-                o = jax.lax.dot_general(
-                    a_q,
-                    w2_buf[0],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
+                o = _dot(a_q, w2_buf[0])
                 acc[...] += (o * s2_buf[0]) * row_scale
         else:
             for p in range(w13_parts):
 
                 @pl.when(part == p)
                 def _gate_up_half(p=p):
-                    h = jax.lax.dot_general(
-                        x_q,
-                        w13_buf[p],
-                        (((1,), (0,)), ((), ())),
-                        preferred_element_type=jnp.float32,
-                    )
+                    h = _dot(x_q, w13_buf[p])
                     scales = s13_buf[p]
                     col = p * half
                     h_acc[:, col : col + half] = h[:, :half] * x_s * scales[:, :half]
@@ -343,12 +349,7 @@ def _stream(
                     keepdims=True,
                 )
                 row_scale = a_s * w
-                o = jax.lax.dot_general(
-                    a_q,
-                    w2_buf[0],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
+                o = _dot(a_q, w2_buf[0])
                 acc[...] += (o * s2_buf[0]) * row_scale
 
         return advance(e_idx, part, 1)
@@ -411,18 +412,18 @@ def _kernel(
     s2_hbm,
     w13_hbm,
     w2_hbm,
-    out_ref,
-    ids,
-    hits_v,
-    hits_s,
-    hsem,
-    *scratch,
+    *rest,
     n_experts,
     inter,
     w13_parts,
     topk,
     from_logits=False,
+    prequant=False,
 ):
+    x_scale_ref = None
+    if prequant:
+        x_scale_ref, *rest = rest
+    out_ref, ids, hits_v, hits_s, hsem, *scratch = rest
     if topk is None:
         wtab_ref = route_ref
     else:
@@ -451,6 +452,7 @@ def _kernel(
         n_experts=n_experts,
         inter=inter,
         w13_parts=w13_parts,
+        x_scale_ref=x_scale_ref,
     )
 
 
@@ -714,6 +716,7 @@ def moe_lowtok(
     owned=64,
     has_copies=False,
     from_logits=False,
+    x_scale=None,
 ):
     """This shard's MoE output for a few tokens.
 
@@ -724,11 +727,25 @@ def moe_lowtok(
     [experts_start, experts_start + E). With `has_copies=True`, `tables`,
     `prim`, `copy`, and `hot1h` provide the placement's holder tables and the
     kernel assigns each hit copied expert to the less-loaded holder.
+
+    With `x_scale` ([tokens, 1] f32), `x` is already quantized to FP8 per row (the
+    `_quantize_rows` of the bf16 rows, done by the caller before the dispatch) and the
+    kernel skips its own quantization; not available with `has_copies`.
     """
     tokens, hidden = x.shape
     n_experts, inter, w13_parts, rows = _layout(x, w13)
     lanes = pl.cdiv(route.shape[1], _LANE) * _LANE
     x_rows = jnp.pad(x, ((0, rows - tokens), (0, 0)))
+    prequant = x_scale is not None
+    if prequant:
+        if has_copies:
+            raise ValueError("x_scale is not supported with has_copies")
+        if x.dtype != _FP8:
+            raise ValueError(f"x must be {_FP8} with x_scale, got {x.dtype}")
+        x_scale_rows = jnp.broadcast_to(
+            jnp.pad(x_scale.astype(jnp.float32).reshape(tokens, 1), ((0, rows - tokens), (0, 0))),
+            (rows, _LANE),
+        )
     if from_logits:
         route_dtype = route.dtype if route.dtype in (jnp.bfloat16, jnp.float32) else jnp.float32
         pad_val = jnp.asarray(-jnp.inf if route_dtype == jnp.bfloat16 else _NEG, dtype=route_dtype)
@@ -798,12 +815,14 @@ def moe_lowtok(
             compiler_params=pltpu.CompilerParams(
                 vmem_limit_bytes=_vmem_budget(rows, hidden, inter, w13_parts, lanes)
             ),
-            name="moe_lowtok_copies",
+            name="moe_lowtok_copies" + (f"_{_BENCH.replace(',', '_')}" if _BENCH else ""),
         )(tab, prim_v, copy_v, hot1h_v, x_rows, route, s13, s2, w13, w2)
         return out[:tokens]
 
     gid = (experts_start + jnp.arange(n_experts, dtype=jnp.int32)).reshape(1, n_experts)
     wtab = () if topk is None else (pltpu.VMEM((rows, lanes), jnp.float32),)
+    out_dtype = jnp.bfloat16 if prequant else x.dtype
+    extra_in = (x_scale_rows,) if prequant else ()
     out = pl.pallas_call(
         functools.partial(
             _kernel,
@@ -812,11 +831,12 @@ def moe_lowtok(
             w13_parts=w13_parts,
             topk=topk,
             from_logits=from_logits,
+            prequant=prequant,
         ),
-        out_shape=jax.ShapeDtypeStruct((rows, hidden), x.dtype),
+        out_shape=jax.ShapeDtypeStruct((rows, hidden), out_dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[vmem, vmem, hbm, hbm, hbm, hbm],
+            in_specs=[vmem, vmem, hbm, hbm, hbm, hbm] + ([vmem] if prequant else []),
             out_specs=vmem,
             scratch_shapes=(
                 pltpu.SMEM((n_experts,), jnp.int32),
@@ -831,6 +851,6 @@ def moe_lowtok(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=_vmem_budget(rows, hidden, inter, w13_parts, lanes)
         ),
-        name="moe_lowtok",
-    )(gid, x_rows, route, s13, s2, w13, w2)
+        name="moe_lowtok" + ("_xq" if prequant else "") + (f"_{_BENCH.replace(',', '_')}" if _BENCH else ""),
+    )(gid, x_rows, route, s13, s2, w13, w2, *extra_in)
     return out[:tokens]

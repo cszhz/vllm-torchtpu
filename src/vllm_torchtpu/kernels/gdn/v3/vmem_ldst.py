@@ -218,6 +218,98 @@ def store_state_region(
             )
 
 
+def head_rows_supported(cfg: config.GDNConfig) -> bool:
+    """Whether load_recurrent_heads / store_recurrent_heads apply to the plan:
+    an unscaled, unpermuted bf16 or f32 recurrent region whose typed rows
+    fill its blocks exactly."""
+    plan = cfg.state_plan
+    if plan is None or plan.scale is not None:
+        return False
+    region = plan.recurrent
+    if region.rows_perm is not None or region.pack not in (1, 2):
+        return False
+    return region.rows_used % cfg.num_v_heads == 0
+
+
+def _recurrent_head_pieces(
+    slot_ref: jax.Ref, cfg: config.GDNConfig, h0: int, nh: int
+) -> list[tuple[int, int, int]]:
+    """(block, row0, rows) typed-row pieces holding value heads [h0, h0 + nh)
+    of one checkpoint's recurrent tile."""
+    region = cfg.state_plan.recurrent
+    rows_pb, _ = _region_rows_per_block(slot_ref, region)
+    assert region.rows_used == region.nblocks * rows_pb, (
+        region.rows_used,
+        region.nblocks,
+        rows_pb,
+    )
+    rows_per_head = region.rows_used // cfg.num_v_heads
+    r, r1 = h0 * rows_per_head, (h0 + nh) * rows_per_head
+    pieces = []
+    while r < r1:
+        j, off = divmod(r, rows_pb)
+        n = min(r1, (j + 1) * rows_pb) - r
+        pieces.append((j, off + region.block_row0, n))
+        r += n
+    return pieces
+
+
+def load_recurrent_heads(
+    slot_ref: jax.Ref,
+    cfg: config.GDNConfig,
+    h0: int,
+    nh: int,
+    has_initial_state: jax.Array,
+) -> jax.Array:
+    """Decodes value heads [h0, h0 + nh) of one slot's recurrent state tile
+    to f32, zero for a slot without an initial state.
+
+    The select runs on the packed source words, before the widening, so it
+    touches half the vregs the f32 state takes.
+    """
+    region = cfg.state_plan.recurrent
+    parts = [
+        typed_ldst.load_typed(
+            slot_ref.at[j],
+            view_dtype=region.view_dtype,
+            lane_split=region.lane_split,
+            row0=off,
+            rows=n,
+        )
+        for j, off, n in _recurrent_head_pieces(slot_ref, cfg, h0, nh)
+    ]
+    arr = parts[0] if len(parts) == 1 else jnp.concat(parts, axis=0)
+    arr = jnp.where(has_initial_state, arr, jnp.zeros_like(arr))
+    if region.pack == 2:
+        arr = typed_ldst.unpack_bf16_pairs(arr)
+    return arr.astype(jnp.float32).reshape(nh, cfg.kq_head_dim, cfg.v_head_dim)
+
+
+def store_recurrent_heads(
+    slot_ref: jax.Ref, cfg: config.GDNConfig, h0: int, nh: int, values: jax.Array
+) -> None:
+    """Encodes value heads [h0, h0 + nh) of a checkpoint into one slot's
+    recurrent state tile, the rows load_recurrent_heads reads back."""
+    region = cfg.state_plan.recurrent
+    _, out_lanes = _region_rows_per_block(slot_ref, region)
+    if region.pack == 2:
+        arr = typed_ldst.pack_bf16_pairs(
+            values.astype(jnp.bfloat16).reshape(-1, out_lanes)
+        )
+    else:
+        arr = values.astype(region.view_dtype).reshape(-1, out_lanes)
+    r = 0
+    for j, off, n in _recurrent_head_pieces(slot_ref, cfg, h0, nh):
+        typed_ldst.store_typed(
+            slot_ref.at[j],
+            arr[r : r + n],
+            lane_split=region.lane_split,
+            row0=off,
+            rows=n,
+        )
+        r += n
+
+
 def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int) -> jax.Array:
     """One slot's conv state, decoded through the plan when there is one."""
     # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
@@ -310,7 +402,9 @@ def load_and_select_states(
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.GDNConfig,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+    stack_recurrent: bool = True,
+    load_recurrent: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array | tuple[jax.Array, ...] | None]:
     """Load correct states from HBM or prior tile, and masks invalid states.
 
     Reference metadata to select the appropriate prior states. If `is_first_tile`
@@ -340,7 +434,10 @@ def load_and_select_states(
         prev_conv_state: Selected convolution state of shape [seq_tile_size,
         prev_kernel_size, 1, dim_size] in float32.
         prev_recurrent_state: Selected recurrent state of shape [seq_tile_size,
-        num_v_heads, kq_head_dim, v_head_dim].
+        num_v_heads, kq_head_dim, v_head_dim], or with `stack_recurrent`
+        False the per-slot states as a tuple, so the tile never materializes
+        the stacked copy; None with `load_recurrent` False, when the caller
+        decodes the recurrent state itself (pooled tiles only).
     """
 
     real_sizes_list = []
@@ -362,6 +459,11 @@ def load_and_select_states(
             prev_conv_state = jnp.where(
                 has_initial_state, _load_conv_state(conv_state_in_slot_ref, cfg, idx), 0
             )
+            if not load_recurrent:
+                assert carry_conv_scratch_ref is None and cfg.state_plan is not None
+                real_sizes_list.append(real_sizes)
+                prev_conv_state_list.append(prev_conv_state)
+                continue
             prev_recurrent_state = jnp.where(
                 has_initial_state,
                 _load_recurrent_state(
@@ -409,6 +511,10 @@ def load_and_select_states(
 
     real_sizes = jnp.stack(real_sizes_list, axis=0)
     prev_conv_state = jnp.stack(prev_conv_state_list, axis=0)
+    if not load_recurrent:
+        return real_sizes, prev_conv_state, None
+    if not stack_recurrent:
+        return real_sizes, prev_conv_state, tuple(prev_recurrent_state_list)
     prev_recurrent_state = jnp.stack(prev_recurrent_state_list, axis=0)
 
     return real_sizes, prev_conv_state, prev_recurrent_state
