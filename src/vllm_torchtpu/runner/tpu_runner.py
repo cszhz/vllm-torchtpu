@@ -7565,6 +7565,9 @@ class TPUModelRunner(GPUModelRunner):
                             name,
                             _DRAFT_KV_BLOCK_CAP,
                         )
+                    # Native FP8 attention is target-only: mark the layer
+                    # before its kernels are built (native_fp8_scope).
+                    impl.native_fp8_draft = is_draft
                     impl.initialize_kernel(cast(AttentionLayer, attn_layer))
                     layer_widths.append(
                         (
@@ -7631,6 +7634,10 @@ class TPUModelRunner(GPUModelRunner):
             dict(Counter(layer_widths)),
             len(draft_attn_names),
         )
+        from vllm_torchtpu.layers.adapter import native_fp8_scope
+
+        n_draft = sum(1 for w in layer_widths if w[0] == "draft")
+        logger.info(native_fp8_scope.scope_line(len(layer_widths) - n_draft, n_draft))
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules. "
             "decode_query_size=%s -> reorder_batch_threshold=%d "

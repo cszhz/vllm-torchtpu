@@ -76,7 +76,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
 )
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
-from vllm_torchtpu.layers.adapter import batched_rpa_decode
+from vllm_torchtpu.layers.adapter import batched_rpa_decode, native_fp8_scope
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu.layers.adapter import kv_split_attention as _kv_split
 from vllm_torchtpu.layers.adapter.cp_attention import (
@@ -522,12 +522,17 @@ def _pallas_rpa_kernel_batched(
     decode_query_size: int = 1,
     decode_tuning: batched_rpa_decode.DecodeTuning | None = None,
     block_major: bool = False,
+    native_fp8_off: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
     kernel_kwargs = batched_rpa_decode.kernel_kwargs(decode_tuning, query.shape[0])
     if decode_query_size > 1:
         kernel_kwargs["decode_query_size"] = decode_query_size
+    if native_fp8_off:
+        # A draft layer under TPU_RPA_NATIVE_FP8[_PREFILL] keeps the non-FP8
+        # kernel (native_fp8_scope).
+        kernel_kwargs.update(native_fp8_scope.OFF_KWARGS)
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -736,11 +741,16 @@ def _pallas_rpa_kernel_batched_scheduled(
     decode_query_size: int = 1,
     decode_tuning: batched_rpa_decode.DecodeTuning | None = None,
     block_major: bool = False,
+    native_fp8_off: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry consuming a precomputed 28-tensor schedule."""
     kernel_kwargs = batched_rpa_decode.kernel_kwargs(decode_tuning, query.shape[0])
     if decode_query_size > 1:
         kernel_kwargs["decode_query_size"] = decode_query_size
+    if native_fp8_off:
+        # A draft layer under TPU_RPA_NATIVE_FP8[_PREFILL] keeps the non-FP8
+        # kernel (native_fp8_scope).
+        kernel_kwargs.update(native_fp8_scope.OFF_KWARGS)
     precomputed_schedules = (
         (
             d_s0,
@@ -1075,6 +1085,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
     decode_tuning: batched_rpa_decode.DecodeTuning | None = None
+    # Set by the runner on a speculative draft's attention layers before
+    # their kernels are built: native FP8 attention stays off for them
+    # (native_fp8_scope).
+    native_fp8_draft: bool = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -1211,6 +1225,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if use_pcp_streaming
             else batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
         )
+        fp8_off = native_fp8_scope.draft_off(self.native_fp8_draft)
         config_key = (
             self._kernel_op_prefix,
             self.sliding_window,
@@ -1224,6 +1239,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             self.decode_tuning,
             block_major,
+            fp8_off,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1264,6 +1280,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             self.decode_tuning,
             block_major,
+            fp8_off,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1306,6 +1323,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 entry_kwargs["decode_query_size"] = self.decode_query_size
             if "decode_tuning" in entry_params:
                 entry_kwargs["decode_tuning"] = self.decode_tuning
+            # Entries without the argument run kernels that never read the
+            # native FP8 variables.
+            if fp8_off and "native_fp8_off" in entry_params:
+                entry_kwargs["native_fp8_off"] = True
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
@@ -1660,6 +1681,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     cp_rank=self.dcp_rank,
                     kv_layout=self.kv_layout,
                     decode_query_size=self.decode_query_size,
+                    native_fp8_off=native_fp8_scope.draft_off(self.native_fp8_draft),
                 )
             return
 
@@ -1835,6 +1857,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         skip_kv_update: bool = False,
         block_major: bool = False,
     ):
+        fp8_off = native_fp8_scope.draft_off(self.native_fp8_draft)
         config_key = (
             "pallas::rpa_kernel_batched_scheduled",
             self.sliding_window,
@@ -1845,6 +1868,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             self.decode_tuning,
             block_major,
+            fp8_off,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1867,6 +1891,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             self.decode_tuning,
             block_major,
+            fp8_off,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1890,6 +1915,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             decode_query_size=self.decode_query_size,
             decode_tuning=self.decode_tuning,
             block_major=block_major,
+            **({"native_fp8_off": True} if fp8_off else {}),
         )
         rpa_donate_argnums = None if envs.TPU_KERNEL_ITER_MODE else (0,)
         rpa_kernel_op = pallas.jax_op(

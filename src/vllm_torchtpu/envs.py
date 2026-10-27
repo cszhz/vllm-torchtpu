@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     TPU_GDN_PREFILL_SHARED_KKT: bool = False
     TPU_GDN_PREFILL_LAZY_CONV_STATE: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_RPA_NATIVE_FP8: str = ""
     TPU_RPA_NATIVE_FP8_PREFILL: str = ""
     TPU_RPA_PREFILL_BLOCKS: str = ""
     TPU_MOE_HIERARCHICAL_EP: bool = False
@@ -925,6 +926,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fp8 operands against the fp8 KV cache: "qk", "pv" or "qkpv", each
     # operand optionally suffixed "s" for its static scale (e.g. "qkpvs").
     # Empty: bf16 matmuls. See kernels/experimental/batched_rpa/configs.py.
+    # Native FP8 QK/PV in the batched RPA decode kernel ("qk", "pv", "pvs", ...);
+    # the wrapper reads it directly. Target model only (native_fp8_scope).
+    "TPU_RPA_NATIVE_FP8": lambda: os.getenv("TPU_RPA_NATIVE_FP8", ""),
     "TPU_RPA_NATIVE_FP8_PREFILL": lambda: os.getenv("TPU_RPA_NATIVE_FP8_PREFILL", ""),
     # "bq,bq_c,bkv,batch": replaces the batched RPA prefill/mixed tile sizes that
     # calculate_block_sizes picks (empty: the heuristic). See wrapper.prefill_block_override.
