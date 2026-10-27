@@ -76,6 +76,7 @@ class ModelDef:
     default_hf_config: ClassVar[Mapping[str, Any] | None] = None
     pool_layout_override: ClassVar[Callable[..., PoolLayout] | None] = None
     geometry_cls: ClassVar[type[ModelGeometry]] = ModelGeometry
+    hf_oracle: ClassVar[Callable[..., tuple[Any, Any]] | None] = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -210,9 +211,11 @@ class ModelDef:
         ex: ExecSpec | None = None,
     ) -> ModelGeometry:
         """Return a tiny `ModelGeometry` with `periods` cycles that passes checks."""
-        return cls.derive_geometry(hf_config_or_geom).shrink(
+        shrunk = cls.derive_geometry(hf_config_or_geom).shrink(
             periods=periods, R=R, ex=ex
         )
+        object.__setattr__(shrunk, "_model_def", cls)
+        return shrunk
 
     @classmethod
     def default_profile(cls) -> Profile:
@@ -337,6 +340,8 @@ def find_model(target: Any) -> type[ModelDef] | None:
     """Look up a `ModelDef` by name, HF architecture, `model_type`, or `hf_config`."""
     if isinstance(target, type) and issubclass(target, ModelDef):
         return target
+    if (mdef := getattr(target, "_model_def", None)) is not None:
+        return mdef
     if isinstance(target, str):
         key = target.strip()
         return (

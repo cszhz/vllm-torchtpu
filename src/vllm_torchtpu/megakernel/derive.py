@@ -21,7 +21,6 @@ from typing import Any
 
 from .decls import REQUIRED, _lookup_raw_key, _sub_cfg
 from .errors import MegakernelConfigError
-from .exec_spec import ExecSpec
 from .geometry import ModelGeometry
 from .modules.gdn import GDNModule
 from .modules.gqa import GQAModule
@@ -327,55 +326,68 @@ def resolve_model_schedule(cls: Any, hf_config_or_geom: Any = None) -> ResolvedS
     return cls.schedule.resolve(cfg, int(cls._from_hf_decl().resolve(cfg)["layers"]))
 
 
-def shrink_model_hf_config(
-    cls: Any,
-    hf_config: Any = None,
-    *,
-    periods: int = 2,
-    R: int = 8,
-    ex: ExecSpec | None = None,
+def hf_config_for_geometry(
+    cls: Any, g: ModelGeometry, hf_config: Any = None, *, max_vocab: int | None = None
 ) -> dict[str, Any]:
-    """Return a shrunk HF config dict (`periods` cycles, legal heads/experts)."""
-    cfg = cls._effective_hf_config(hf_config)
-    g_tiny = cls.derive_geometry(cfg).shrink(periods=periods, R=R, ex=ex)
-    out = _merged_cfg(cfg, {})
+    """Return an HF config dict updated to match `g` via `FromHF` and bindings."""
+    out = _merged_cfg(cls._effective_hf_config(hf_config), {})
+    updates: dict[str, Any] = {}
     for k, v in cls._from_hf_decl().fields.items():
         hf_k = v[0] if isinstance(v, tuple) else v
-        if isinstance(hf_k, str) and k in ("layers", "hidden"):
-            out[hf_k] = g_tiny.L if k == "layers" else g_tiny.H
-    sched = cls.resolve_schedule(g_tiny)
-    gqa_map = {"heads": g_tiny.NH, "kv_heads": g_tiny.NKV, "head_dim": g_tiny.HD}
-    gdn_map = {
-        "k_heads": g_tiny.KH,
-        "v_heads": g_tiny.VH,
-        "k_dim": g_tiny.KD,
-        "v_dim": g_tiny.VD,
+        if isinstance(hf_k, str):
+            if k == "layers":
+                updates[hf_k] = int(g.L)
+            elif k == "hidden":
+                updates[hf_k] = int(g.H)
+            elif k == "vocab" and max_vocab is not None:
+                v_sz = int(getattr(g, "V", out.get(hf_k, max_vocab)))
+                updates[hf_k] = min(v_sz, int(max_vocab))
+    sched = cls.resolve_schedule(g)
+    gqa_m = {"heads": int(g.NH), "kv_heads": int(g.NKV), "head_dim": int(g.HD)}
+    gdn_m = {
+        "k_heads": int(g.KH),
+        "v_heads": int(g.VH),
+        "k_dim": int(g.KD),
+        "v_dim": int(g.VD),
     }
-    moe_map = {
-        "experts": g_tiny.E,
-        "top_k": g_tiny.TOPK,
-        "inter": g_tiny.I,
-        "shared_inter": g_tiny.IS,
+    moe_m = {
+        "experts": int(g.E),
+        "top_k": int(g.TOPK),
+        "inter": int(g.I),
+        "shared_inter": int(g.IS),
     }
     for b, mapping in (
-        (cls._find_binding(GQAModule, sched), gqa_map),
-        (cls._find_binding(GDNModule, sched), gdn_map),
-        (cls._find_binding(MoEModule, sched), moe_map),
+        (cls._find_binding(GQAModule, sched), gqa_m),
+        (cls._find_binding(GDNModule, sched), gdn_m),
+        (cls._find_binding(MoEModule, sched), moe_m),
     ):
         if b is not None:
             for canon, val in mapping.items():
                 spec_v = b.fields.get(canon)
                 hf_k = spec_v[0] if isinstance(spec_v, tuple) else spec_v
                 if isinstance(hf_k, str):
-                    out[hf_k] = val
-    if (synth := _synth_layer_types(cls, g_tiny)) is not None:
-        out[synth[0]] = synth[1]
+                    updates[hf_k] = val
+    if (synth := _synth_layer_types(cls, g)) is not None:
+        updates[synth[0]] = synth[1]
+    out.update(updates)
+    if isinstance(out.get("text_config"), Mapping):
+        out["text_config"] = {**out["text_config"], **updates}
     return out
+
+
+def shrink_model_hf_config(
+    cls: Any, hf_config: Any = None, *, periods: int = 2, R: int = 8, ex: Any = None
+) -> dict[str, Any]:
+    """Return a shrunk HF config dict (`periods` cycles, legal heads/experts)."""
+    cfg = cls._effective_hf_config(hf_config)
+    g_tiny = cls.derive_geometry(cfg).shrink(periods=periods, R=R, ex=ex)
+    return hf_config_for_geometry(cls, g_tiny, cfg)
 
 
 __all__ = [
     "derive_model_geometry",
     "derive_model_spec",
+    "hf_config_for_geometry",
     "instantiate_spec_module",
     "resolve_model_schedule",
     "shrink_model_hf_config",

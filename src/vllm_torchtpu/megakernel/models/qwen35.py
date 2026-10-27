@@ -26,15 +26,14 @@ from ..model_def import LMHead, ModelDef, register_model
 from ..modules import GDN, GQA, Embedding, GDNModule, GQAModule, MoE, MoEModule, Norm
 from ..schedule import FromHFLayerTypes, Schedule
 from ..spec import ModelSpec, Module
-from . import qwen35_candidate30, qwen35_pool
-from .qwen35_pack import (
-    accept_states,
-    pack_inputs,
-    random_inputs,
-    random_logical_inputs,
-)
+from . import qwen35_candidate30, qwen35_hf, qwen35_pool
 from .qwen35_profile import DEFAULT_HF_CONFIG, PROFILE, QWEN35_MODEL_NAME
-from .qwen35_weights import random_hf_weights
+
+
+def accept_states(g: Any, ex: ExecSpec, st: dict[str, Any], acc: Any) -> dict[str, Any]:
+    """Delegate verify-mode GDN state selection to `GDNModule.accept`."""
+    return GDNModule.accept(st, st, acc, T=ex.T, vh=g.vh(ex.R))
+
 
 _REEXPORTS = (
     GDNModule,
@@ -42,10 +41,6 @@ _REEXPORTS = (
     MoEModule,
     qwen35_pool,
     accept_states,
-    pack_inputs,
-    random_inputs,
-    random_logical_inputs,
-    random_hf_weights,
 )
 
 
@@ -81,6 +76,7 @@ class Qwen35(ModelDef):
     geometry_cls = Qwen35Geometry
     layer_type_name = "qwen35_layer"
     default_hf_config = DEFAULT_HF_CONFIG
+    hf_oracle = staticmethod(qwen35_hf.qwen35_hf_oracle)
     geometry = FromHF(
         hidden="hidden_size",
         layers="num_hidden_layers",
