@@ -544,6 +544,7 @@ class Qwen38SegmentDriver:
         self.whole_above = "stock"  # `wholeabove=stock|seg`: steps above `wholerows`
         self.whole_program = None
         self.whole_calls = 0
+        self.whole_dry = False  # `wholedry=1`: decide and count as whole=1, run stock (AL control)
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -605,6 +606,7 @@ class Qwen38SegmentDriver:
         drv.warm = _parse_flag(raw, "warm", False)
         drv.noaot = _parse_flag(raw, "noaot", False)
         drv.whole = _parse_flag(raw, "whole", False)
+        drv.whole_dry = _parse_flag(raw, "wholedry", False)
         cap = _parse_int(raw, "wholecap")
         if cap is not None:
             drv.whole_cap = cap
@@ -1292,7 +1294,7 @@ class Qwen38SegmentDriver:
         if inputs_embeds is not None or intermediate_tensors is not None:
             return False, None
         if self.program is None:  # disabled (it failed): the self-check still counts steps
-            if self.whole:
+            if self.whole and not self.whole_dry:
                 self._whole_self_check(runner)
             return False, None
         self.seq += 1
@@ -1301,7 +1303,7 @@ class Qwen38SegmentDriver:
         if not ok or t_seq != T_VERIFY:
             self._note(reason if not ok else f"stock_t{t_seq}")
             return False, None
-        if self.whole:
+        if self.whole and not self.whole_dry:
             self._whole_self_check(runner)
         if rows not in self.buckets or n_req * T_VERIFY > rows:
             self._note(f"stock_rows{rows}_n{n_req}")
@@ -1317,6 +1319,13 @@ class Qwen38SegmentDriver:
             above = rows > min(WHOLE_MAX_ROWS, self.whole_max_rows)
             self._note(f"stock_above_whole_b{rows}" if above else "stock_whole_ctx")
             self._count("drafts_stock", n_req * (T_VERIFY - 1))
+            return False, None
+        if self.whole_dry and self.whole_program is not None:
+            # `wholedry=1`: the same eligibility decision and per-path draft counters, but the
+            # whole-step-eligible steps run stock too: the stock acceptance of exactly the
+            # requests whole-step would serve (per-path AL control).
+            self._note(f"dry_whole_b{rows}")
+            self._count("drafts_whole", n_req * (T_VERIFY - 1))
             return False, None
         self._note(f"mk_b{rows}")
         self.mk_calls += 1
