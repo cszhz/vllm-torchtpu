@@ -87,9 +87,7 @@ def registered_layers() -> int:
 def _read_all_sync() -> np.ndarray:
     """Every registered layer's accumulator as one [layers, widest] int64 host
     array through torch: a stack program and a synchronous `.cpu()`. The
-    fallback where tpu-sync's raw transfer is unavailable (CPU tests) or
-    refused the accumulators, and the reference the async reader checks
-    itself against once."""
+    fallback where the asynchronous reader is unavailable (CPU tests)."""
     buffers = [getattr(layer, LOAD_ATTR) for _, layer, _ in _REGISTERED]
     width = max(b.numel() for b in buffers)
     if all(b.numel() == width for b in buffers):
@@ -101,104 +99,43 @@ def _read_all_sync() -> np.ndarray:
     return stacked.cpu().numpy().astype(np.int64)
 
 
-class _RawReader:
-    """Reads the accumulators by tpu-sync's whole-buffer raw D2H into pinned
-    `RawHostBuffer`s: no device program, no synchronous readback. Each
-    accumulator gets its own host buffer of its physical size and a
-    `PreparedTorchRawTransfer` rebound per read (the operand is donated, so
-    the device buffer behind the tensor is new every step); the sliced
-    transfer forms cannot address a 1-D array (its device shape is
-    lane-padded, so a logical-size copy counts as partial, which rank < 3
-    refuses). A read is issued from the step thread (`issue`), the DMA lands
-    while the step runs, and the result is adopted by `poll` a step or two
-    later. At bind a synchronous read is checked against the torch path and
-    the reader is refused on a mismatch (the raw bytes are the device's
-    physical layout: a 1-D int32 array is linear with padding at the end)."""
+class _AsyncReader:
+    """Reads the accumulators the way the runner fetches sampled tokens: one
+    non-blocking device-to-host copy per accumulator enqueued on the device
+    stream right after the step's dispatch (`.to("cpu", non_blocking=True)`)
+    and a recorded `torch.tpu.Event`, polled at the next hook. Nothing on the
+    host waits at issue: the copies queue behind the program that produces
+    the accumulators. (A tpu-sync raw transfer per accumulator worked but its
+    constructor awaits that program on the host, ~170 ms per read at DP32.)"""
 
     def __init__(self) -> None:
-        from tpu_sync.api.torch import raw_transfer
-
-        if not callable(raw_transfer.major_slice_bytes):
-            raise ImportError("tpu-sync raw transfer lacks major_slice_bytes")
-        self._rt = raw_transfer
         self._srcs: list[torch.Tensor] = []
-        self._bufs: list = []
-        self._views: list[np.ndarray] = []
-        self._prepared: list = []
-        self._futures: list | None = None
+        self._cpu: list[torch.Tensor] | None = None
+        self._event = None
         self.issued_step: int | None = None
         self.latest: np.ndarray | None = None
         self.latest_step: int | None = None
-        self.checked = False
-        self._ptrs: list[int] | None = None
+        self.polls_block = False  # the event lacks query(): poll synchronizes
         self.stats = {
             "issues": 0,
-            "rebound": -1,
             "issue_ms": 0.0,
             "issue_ms_max": 0.0,
             "ready_steps": [],
         }
 
     def bind(self) -> None:
-        import ctypes
-
-        srcs = [getattr(layer, LOAD_ATTR) for _, layer, _ in _REGISTERED]
-        self._bufs, self._views = [], []
-        for t in srcs:
-            # The physical size is lane-padded (and may be sublane-padded);
-            # the buffer is sized by the first binding's answer.
-            guess = max(t.numel(), 1024) * t.element_size() * 8
-            buf = self._rt.RawHostBuffer(guess)
-            prepared = self._rt.PreparedTorchRawTransfer(t, buf, True)
-            physical = int(prepared.physical_size_bytes)
-            if physical < t.numel() * t.element_size():
-                raise ValueError("accumulator physical size below its logical size")
-            owner = (ctypes.c_uint8 * buf.size_bytes).from_address(buf.data_ptr)
-            flat = torch.frombuffer(owner, dtype=torch.uint8)[
-                : t.numel() * t.element_size()
-            ]
-            self._bufs.append(buf)
-            self._views.append(flat.numpy().view(np.int32).reshape(-1))
-        self._srcs = srcs
-        # The self-check, here and synchronous: a read issued now, waited for,
-        # against the torch path read at the same point (no step in between).
-        self.issue(-1)
-        self._rt.await_all(self._futures)
-        self._futures, self._prepared = None, []
-        width = max(v.size for v in self._views)
-        host = np.zeros((len(self._views), width), dtype=np.int64)
-        for i, v in enumerate(self._views):
-            host[i, : v.size] = v
-        ref = _read_all_sync()
-        if ref.shape != host.shape or not np.array_equal(ref, host):
-            raise ValueError(
-                "raw readback disagrees with the torch readback (the 1-D "
-                "accumulator's physical layout is not linear)"
-            )
-        self.checked = True
-        self.stats["issues"] = 0
-        self.stats["issue_ms"] = 0.0
-        self.stats["issue_ms_max"] = 0.0
+        self._srcs = [getattr(layer, LOAD_ATTR) for _, layer, _ in _REGISTERED]
+        event = torch.tpu.Event()  # raises where the device module is absent
+        self.polls_block = not callable(getattr(event, "query", None))
 
     def issue(self, step: int) -> None:
-        if self._futures is not None:
+        if self._event is not None:
             return
         t0 = time.perf_counter()
-        # Do the accumulators' device buffers change between reads? (They
-        # are donated operands, so presumably yes; if not, the transfers
-        # could be bound once instead of per read.)
-        ptrs = [t.untyped_storage().data_ptr() for t in self._srcs]
-        if self._ptrs is not None:
-            self.stats["rebound"] = sum(
-                a != b for a, b in zip(ptrs, self._ptrs, strict=True)
-            )
-        self._ptrs = ptrs
-        prepared, futures = [], []
-        for t, buf in zip(self._srcs, self._bufs, strict=True):
-            pt = self._rt.PreparedTorchRawTransfer(t, buf, True)
-            prepared.append(pt)
-            futures.append(pt.d2h_async())
-        self._prepared, self._futures = prepared, futures
+        self._cpu = [t.to("cpu", non_blocking=True) for t in self._srcs]
+        event = torch.tpu.Event()
+        event.record()
+        self._event = event
         ms = (time.perf_counter() - t0) * 1e3
         self.issued_step = step
         st = self.stats
@@ -206,29 +143,32 @@ class _RawReader:
         st["issue_ms"] += ms
         st["issue_ms_max"] = max(st["issue_ms_max"], ms)
 
-    def _adopt(self, step: int) -> None:
-        width = max(v.size for v in self._views)
-        host = np.zeros((len(self._views), width), dtype=np.int64)
-        for i, v in enumerate(self._views):
-            host[i, : v.size] = v
-        self._futures, self._prepared = None, []
-        self.latest, self.latest_step = host, step
-        self.stats["ready_steps"].append(step - (self.issued_step or step))
+    def _done(self) -> bool:
+        if self.polls_block:
+            self._event.synchronize()
+            return True
+        return bool(self._event.query())
 
     def poll(self, step: int) -> bool:
         """Adopt a completed read; True when `latest` changed."""
-        if self._futures is None or not self._rt.is_ready(self._futures):
+        if self._event is None or not self._done():
             return False
-        self._adopt(step)
+        width = max(t.numel() for t in self._cpu)
+        host = np.zeros((len(self._cpu), width), dtype=np.int64)
+        for i, c in enumerate(self._cpu):
+            host[i, : c.numel()] = c.numpy().astype(np.int64, copy=False)
+        self._event, self._cpu = None, None
+        self.latest, self.latest_step = host, step
+        self.stats["ready_steps"].append(step - (self.issued_step or step))
         return True
 
 
-_READER: _RawReader | None = None
+_READER: _AsyncReader | None = None
 _CADENCE: list[int] = []  # step cadences that want a fresh read (controller windows)
 
 
-def _reader() -> _RawReader | None:
-    """The raw reader once it is bound and self-checked, or None (torch path)."""
+def _reader() -> _AsyncReader | None:
+    """The asynchronous reader once bound, or None (synchronous torch path)."""
     global _READER
     if _READER is not None or _STATE.get("raw_disabled"):
         return _READER
@@ -236,14 +176,20 @@ def _reader() -> _RawReader | None:
         _STATE["raw_disabled"] = True
         return None
     try:
-        reader = _RawReader()
+        reader = _AsyncReader()
         reader.bind()
     except Exception as e:  # noqa: BLE001 - the torch path stays
         logger.warning(
-            "expert load | raw readback unavailable (%s); reading through torch", e
+            "expert load | asynchronous readback unavailable (%s); reading "
+            "synchronously",
+            e,
         )
         _STATE["raw_disabled"] = True
         return None
+    logger.info(
+        "expert load | asynchronous readback armed (%s)",
+        "poll synchronizes" if reader.polls_block else "event query",
+    )
     _READER = reader
     return reader
 
@@ -257,7 +203,7 @@ def _compilations() -> int | None:
 
 
 def _read_all(step: int) -> np.ndarray | None:
-    """The counts for a consumer (a window boundary or a log point): the raw
+    """The counts for a consumer (a window boundary or a log point): the
     reader's latest adopted read, or None when none has landed yet. Never a
     wait: the hook runs before the step is dispatched, and a read's DMA is
     chained behind the program that produces the accumulators, which the hook
@@ -271,9 +217,8 @@ def _read_all(step: int) -> np.ndarray | None:
 
 def after_dispatch() -> None:
     """Called once per step right after the forward's programs are
-    dispatched: the step's read is issued here, so its DMA queues behind the
-    programs that produce the accumulators (already dispatched) and the
-    transfer's materialization is a no-op; nothing here blocks."""
+    dispatched: the step's read is issued here, so its copies queue behind
+    the programs that produce the accumulators; nothing here blocks."""
     reader = _reader()
     if reader is None:
         return
@@ -282,7 +227,7 @@ def after_dispatch() -> None:
             reader.issue(_STATE["steps"])
     except Exception as e:  # noqa: BLE001 - fall back for good
         logger.warning(
-            "expert load | raw readback failed (%s); reading through torch", e
+            "expert load | asynchronous readback failed (%s); reading synchronously", e
         )
         _STATE["raw_disabled"] = True
         global _READER
@@ -354,19 +299,18 @@ def maybe_log(dp_rank: int) -> None:
                 st = reader.stats
                 logger.info(
                     "expert load | read %d adopted at step %d: issued %d step(s) "
-                    "earlier, issue %.2f ms (max %.2f), %s buffers changed since "
-                    "the last read, compilations %s",
+                    "earlier, issue %.2f ms (max %.2f), compilations %s",
                     st["issues"],
                     step,
                     st["ready_steps"][-1],
                     st["issue_ms"] / max(st["issues"], 1),
                     st["issue_ms_max"],
-                    st["rebound"],
                     _compilations(),
                 )
         except Exception as e:  # noqa: BLE001 - fall back for good
             logger.warning(
-                "expert load | raw readback failed (%s); reading through torch", e
+                "expert load | asynchronous readback failed (%s); reading synchronously",
+                e,
             )
             _STATE["raw_disabled"] = True
             global _READER

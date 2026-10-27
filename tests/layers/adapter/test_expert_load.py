@@ -84,75 +84,39 @@ def test_readback_every_n_steps_differences_the_windows(monkeypatch, tmp_path):
     assert snap["window"].tolist() == [[1, 0, 5, 0], [0, 0, 0, 0]]
 
 
-def _fake_raw(monkeypatch):
-    """A tpu-sync raw-transfer stand-in: batched D2H copies the (CPU) source
-    tensors' bytes into the destination views when the future lands; buffers
-    are plain host memory."""
-    import ctypes
-    import sys
+def _fake_events(monkeypatch):
+    """A torch.tpu.Event stand-in: a recorded event completes when the test
+    lands it; copies are the CPU tensors themselves (already on the host)."""
     import types
 
-    class Buf:
-        def __init__(self, n):
-            self._mem = (ctypes.c_uint8 * n)()
-            self.size_bytes = n
+    events = []
 
-        @property
-        def data_ptr(self):
-            return ctypes.addressof(self._mem)
+    class Event:
+        def __init__(self):
+            self.recorded, self.done = False, False
 
-    class Future:
-        def __init__(self, src, buf):
-            self.src, self.buf, self.done = src, buf, False
+        def record(self):
+            self.recorded = True
+            events.append(self)
 
-        def land(self):
-            n = self.src.numel() * self.src.element_size()
-            ctypes.memmove(
-                self.buf.data_ptr, self.src.detach().contiguous().data_ptr(), n
-            )
+        def query(self):
+            return self.done
+
+        def synchronize(self):
             self.done = True
 
-    class Prepared:
-        def __init__(self, tensor, buf, skip=True):
-            self.tensor, self.buf = tensor, buf
-            self.physical_size_bytes = (
-                tensor.numel() * tensor.element_size() * 2
-            )  # padded
-
-        def d2h_async(self):
-            f = Future(self.tensor, self.buf)
-            issued.append(f)
-            return f
-
-    rt = types.SimpleNamespace()
-    rt.major_slice_bytes = lambda t, **kw: t.element_size()
-    rt.RawHostBuffer = Buf
-    rt.PreparedTorchRawTransfer = Prepared
-    issued = []
-
-    def _all(fs):
-        return fs if isinstance(fs, list) else [fs]
-
-    rt.is_ready = lambda fs: all(f.done for f in _all(fs))
-    rt.await_all = lambda fs: [f.land() for f in _all(fs) if not f.done]
-    monkeypatch.setitem(sys.modules, "tpu_sync", types.SimpleNamespace())
-    monkeypatch.setitem(sys.modules, "tpu_sync.api", types.SimpleNamespace())
-    monkeypatch.setitem(
-        sys.modules, "tpu_sync.api.torch", types.SimpleNamespace(raw_transfer=rt)
-    )
-    monkeypatch.setitem(sys.modules, "tpu_sync.api.torch.raw_transfer", rt)
-    # The CPU guard keeps the suite on the torch path; lift it for these.
+    monkeypatch.setattr(torch, "tpu", types.SimpleNamespace(Event=Event), raising=False)
+    # The CPU guard keeps the suite on the synchronous path; lift it here.
     monkeypatch.setattr(expert_load, "_reader", _bind)
-    return rt, issued
+    return events
 
 
 def _bind():
-    """Production's `_reader()` without its CPU guard: bind once, refuse for
-    good on any error."""
+    """Production's `_reader()` without its CPU guard."""
     if expert_load._READER is not None or expert_load._STATE.get("raw_disabled"):
         return expert_load._READER
     try:
-        reader = expert_load._RawReader()
+        reader = expert_load._AsyncReader()
         reader.bind()
     except Exception:  # noqa: BLE001
         expert_load._STATE["raw_disabled"] = True
@@ -161,10 +125,10 @@ def _bind():
     return reader
 
 
-def test_raw_reader_issues_after_dispatch_adopts_at_the_hook_never_waits(monkeypatch):
+def test_async_reader_issues_after_dispatch_adopts_at_the_hook_never_waits(monkeypatch):
     monkeypatch.setattr(envs, "TPU_MOE_EXPERT_LOAD_LOG_EVERY", 0)
     monkeypatch.setattr(envs, "TPU_MOE_EPLB_DYNAMIC", True)
-    rt, issued = _fake_raw(monkeypatch)
+    events = _fake_events(monkeypatch)
     a, b = _layer("model.layers.0.ffn.experts"), _layer("model.layers.1.ffn.experts")
     expert_load.register(a, physical=4, ep=2)
     expert_load.register(b, physical=2, ep=2)
@@ -181,22 +145,21 @@ def test_raw_reader_issues_after_dispatch_adopts_at_the_hook_never_waits(monkeyp
     for _ in range(3):
         step()
     reader = expert_load._READER
-    assert reader.checked and len(issued) == 2  # the bind's own check read
+    assert reader is not None and not reader.polls_block and events == []
     assert expert_load.snapshot() == {}  # nothing landed: no wait, no counts
     step()  # step 4: issued after dispatch, four steps ahead of the boundary
-    assert len(issued) == 4 and reader.latest is None
-    for f in issued:
-        f.land()
+    assert len(events) == 1 and reader.latest is None
+    events[0].done = True
     step()  # step 5: adopted at the hook
     assert reader.latest_step == 5 and reader.stats["ready_steps"] == [1]
     assert reader.latest.tolist() == [[1, 2, 3, 4], [5, 6, 0, 0]]
     for _ in range(3):
         step()  # steps 6..8
     snap = expert_load.snapshot()  # the boundary takes the adopted read
-    assert len(issued) == 4 and snap[("target", 0)].tolist() == [1, 2, 3, 4]
-    for _ in range(8):  # steps 9..16: the step-12 read never lands
+    assert len(events) == 1 and snap[("target", 0)].tolist() == [1, 2, 3, 4]
+    for _ in range(8):  # steps 9..16: the step-12 read never completes
         step()
-    assert len(issued) == 6 and reader.latest_step == 5
+    assert len(events) == 2 and reader.latest_step == 5
     assert expert_load.snapshot()[("target", 0)].tolist() == [
         1,
         2,
@@ -205,20 +168,23 @@ def test_raw_reader_issues_after_dispatch_adopts_at_the_hook_never_waits(monkeyp
     ]  # stale, no wait
 
 
-def test_raw_reader_disagreeing_with_torch_falls_back(monkeypatch):
+def test_async_reader_without_an_event_falls_back_to_the_synchronous_path(monkeypatch):
+    import types
+
     monkeypatch.setattr(envs, "TPU_MOE_EXPERT_LOAD_LOG_EVERY", 4)
     monkeypatch.setattr(envs, "TPU_MOE_EPLB_DYNAMIC", False)
     monkeypatch.setattr(envs, "TPU_MOE_EXPERT_LOAD_DIR", "")
-    rt, issued = _fake_raw(monkeypatch)
+
+    def no_event():
+        raise RuntimeError("no device")
+
+    monkeypatch.setattr(
+        torch, "tpu", types.SimpleNamespace(Event=no_event), raising=False
+    )
+    monkeypatch.setattr(expert_load, "_reader", _bind)
     a = _layer("model.layers.0.ffn.experts")
     expert_load.register(a, physical=4, ep=2)
     a._tpu_layout_key = ("target", 0)
-    original = rt.PreparedTorchRawTransfer
-
-    class Corrupt(original):
-        def __init__(self, tensor, buf, skip=True):
-            super().__init__(torch.full_like(tensor, 9), buf, skip)
-
-    rt.PreparedTorchRawTransfer = Corrupt
-    expert_load.maybe_log(0)  # the bind's synchronous check refuses the reader
+    for _ in range(4):
+        expert_load.maybe_log(0)  # the log point reads synchronously
     assert expert_load._STATE.get("raw_disabled") and expert_load._READER is None
