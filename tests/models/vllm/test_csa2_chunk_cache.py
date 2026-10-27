@@ -168,6 +168,37 @@ def test_native_swa_budget_keeps_distinct_block_geometries():
 
 
 @pytest.mark.cpu_test
+def test_native_swa_budget_preserves_packed_indexer_padding():
+    """Keep the shared page budget on PackedFP8IndexerSpec reconstruction."""
+    specs = {
+        "main": MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+        ),
+        "indexer": PackedFP8IndexerSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=132,
+            dtype=torch.uint8,
+            alignment=512,
+        ),
+        "swa": NativeSWASpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        ),
+    }
+    budgeted = cache_module.budget_native_swa(specs, frozenset(("swa",)))
+
+    assert budgeted["indexer"].page_size_bytes == 65536
+    assert {spec.page_size_bytes for spec in budgeted.values()} == {65536}
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("split", [False, True])
 def test_native_swa_allocation_with_packed_fp8_indexer(
     monkeypatch, split, vllm_config_context
