@@ -32,11 +32,19 @@ from .ops import (
     slice_alias_targets,
     target_axis_widths,
 )
+from .synthetic import (
+    pack_inputs,
+    random_hf_weights,
+    random_inputs,
+    random_logical_inputs,
+)
+from .vllm_synth import SyntheticVLLMWeightSource, normalize_hf_for_vllm
 
 __all__ = [
     "ArrayOps",
     "JaxArrayOps",
     "MappingWeightSource",
+    "SyntheticVLLMWeightSource",
     "WeightSource",
     "apply_decl_pad",
     "default_eplb_cores",
@@ -44,7 +52,12 @@ __all__ = [
     "load_hf",
     "load_logical_weights",
     "load_weights",
+    "normalize_hf_for_vllm",
+    "pack_inputs",
     "pack_logical_weights",
+    "random_hf_weights",
+    "random_inputs",
+    "random_logical_inputs",
     "resolve_mapping_ecopy",
     "resolve_spec_and_norms",
     "slice_alias_targets",

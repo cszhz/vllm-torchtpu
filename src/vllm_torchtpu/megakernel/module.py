@@ -266,6 +266,34 @@ class Module:
     def cache_decl(self, g: Any = None) -> KVCacheDecl | RecurrentCacheDecl | None:
         return None
 
+    def init_logical_states(
+        self, key: Any, g: Any, ex: ExecSpec, n_layers: int
+    ) -> dict[str, Any]:
+        """Return initial unfolded logical state arrays (`[R, n_layers, ...]`)."""
+        del key, g, ex, n_layers
+        return {}
+
+    def pack_logical_states(
+        self, logical_states: Mapping[str, Any], g: Any, ex: ExecSpec
+    ) -> dict[str, Any]:
+        """Pack logical state arrays into rank-folded kernel state layout."""
+        del logical_states, g, ex
+        return {}
+
+    def unpack_kernel_states(
+        self, raw_states: Mapping[str, Any], g: Any, ex: ExecSpec
+    ) -> dict[str, Any]:
+        """Unpack rank-folded kernel state outputs into `[R, ...]` reference states."""
+        del raw_states, g, ex
+        return {}
+
+    def next_logical_states(
+        self, out_states: Mapping[str, Any], g: Any, ex: ExecSpec
+    ) -> dict[str, Any]:
+        """Extract next-step unfolded logical states (`[R, n_layers, NS, ...]`)."""
+        del out_states, g, ex
+        return {}
+
     def reference(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError(f"{type(self).__name__}.reference is not implemented")
 

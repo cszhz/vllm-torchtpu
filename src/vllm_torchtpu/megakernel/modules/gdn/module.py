@@ -18,8 +18,6 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 import jax
-import jax.numpy as jnp
-from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
 from ...decls import (
@@ -54,7 +52,16 @@ from .params import (
 )
 from .recurrence import gdn_rec, gdn_rec_chunked
 from .reference import gdn_reference
-from .states import conv_out_src, rec_drain, rec_in
+from .states import (
+    conv_out_src,
+    gdn_accept,
+    gdn_init_logical_states,
+    gdn_next_logical_states,
+    gdn_pack_logical_states,
+    gdn_unpack_kernel_states,
+    rec_drain,
+    rec_in,
+)
 
 
 class GDNModule(Module):
@@ -107,39 +114,10 @@ class GDNModule(Module):
         *,
         T: int,
         vh: int,
+        taps: int = 3,
     ) -> dict[str, Any]:
         """Jittable on-device selection of post-verify GDN states from checkpoints."""
-        c_ckpt = ckpts["conv_ckpt"] if "conv_ckpt" in ckpts else ckpts.get("conv")
-        r_ckpt = ckpts["rec_ckpt"] if "rec_ckpt" in ckpts else ckpts.get("rec")
-        out = {k: v for k, v in states.items() if k not in ("conv_ckpt", "rec_ckpt")}
-        if c_ckpt is None or r_ckpt is None:
-            return out
-
-        NS = c_ckpt.shape[-3]
-        acc_arr = jnp.asarray(acc, dtype=I32)
-        assert acc_arr.shape == (NS,), (acc_arr.shape, NS)
-
-        conv_next = jax.vmap(
-            lambda c_seq, a_s: c_seq.at[..., 0:3, :].set(
-                lax.dynamic_slice_in_dim(c_seq, a_s, 3, axis=-2)
-            ),
-            in_axes=(-3, 0),
-            out_axes=-3,
-        )(c_ckpt, acc_arr)
-
-        lead = r_ckpt.shape[:-3]
-        KD, VD = r_ckpt.shape[-2], r_ckpt.shape[-1]
-        r_unflat = r_ckpt.reshape((*lead, NS, T, vh, KD, VD))
-        r_sel = jax.vmap(
-            lambda r_seq, a_s: lax.dynamic_index_in_dim(
-                r_seq, a_s - 1, axis=-4, keepdims=False
-            ),
-            in_axes=(-5, 0),
-            out_axes=-4,
-        )(r_unflat, acc_arr)
-        out["conv"] = conv_next
-        out["rec"] = r_sel.reshape((*lead, NS * vh, KD, VD))
-        return out
+        return gdn_accept(states, ckpts, acc, T=T, vh=vh, taps=taps)
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         lay = self.lin_in_layout(g, ex)
@@ -189,10 +167,11 @@ class GDNModule(Module):
                 )
             return st
         lay = self.lin_in_layout(g, ex)
+        taps = self.cache_decl(g).conv_taps
         conv_shape = (
-            (rup(3 * ex.B, 8), lay.QKV)
+            (rup(taps * ex.B, 8), lay.QKV)
             if ex.T == 1
-            else (ex.NS, rup(3 + ex.T, 8), lay.QKV)
+            else (ex.NS, rup(taps + ex.T, 8), lay.QKV)
         )
         return [
             StateDecl("conv", shape=conv_shape, dtype=F32, access="rw"),
@@ -205,11 +184,12 @@ class GDNModule(Module):
         if cache_exec(ex).FUSED:
             return []
         lay = self.lin_in_layout(g, ex)
+        taps = self.cache_decl(g).conv_taps
         if ex.VER:
             return [
                 StateDecl(
                     "conv_ckpt",
-                    shape=(ex.NS, rup(3 + ex.T, 8), lay.QKV),
+                    shape=(ex.NS, rup(taps + ex.T, 8), lay.QKV),
                     dtype=BF16 if cache_exec(ex).GPR else F32,
                     access="w",
                 ),
@@ -221,7 +201,9 @@ class GDNModule(Module):
                 ),
             ]
         return [
-            StateDecl("conv", shape=(rup(3 * ex.B, 8), lay.QKV), dtype=F32, access="w"),
+            StateDecl(
+                "conv", shape=(rup(taps * ex.B, 8), lay.QKV), dtype=F32, access="w"
+            ),
             StateDecl(
                 "rec", shape=(ex.B * lay.vh, lay.KD, lay.VD), dtype=BF16, access="w"
             ),
@@ -369,6 +351,38 @@ class GDNModule(Module):
 
     def cache_decl(self, g: Any = None) -> RecurrentCacheDecl:
         return gdn_cache_decl(self._require_geometry(g))
+
+    def init_logical_states(
+        self, key: Any, g: Any, ex: ExecSpec, n_layers: int
+    ) -> dict[str, Any]:
+        geom = self._require_geometry(g)
+        return gdn_init_logical_states(
+            key, geom, ex, n_layers, conv_taps=self.cache_decl(geom).conv_taps
+        )
+
+    def pack_logical_states(
+        self, logical_states: Any, g: Any, ex: ExecSpec
+    ) -> dict[str, Any]:
+        geom = self._require_geometry(g)
+        return gdn_pack_logical_states(
+            logical_states, geom, ex, conv_taps=self.cache_decl(geom).conv_taps
+        )
+
+    def unpack_kernel_states(
+        self, raw_states: Any, g: Any, ex: ExecSpec
+    ) -> dict[str, Any]:
+        geom = self._require_geometry(g)
+        return gdn_unpack_kernel_states(
+            raw_states, geom, ex, conv_taps=self.cache_decl(geom).conv_taps
+        )
+
+    def next_logical_states(
+        self, out_states: Any, g: Any, ex: ExecSpec
+    ) -> dict[str, Any]:
+        geom = self._require_geometry(g)
+        return gdn_next_logical_states(
+            out_states, geom, ex, conv_taps=self.cache_decl(geom).conv_taps
+        )
 
     def reference(
         self, params: Any, x: Any, state: Any = None, *, g: Any = None, **kw: Any

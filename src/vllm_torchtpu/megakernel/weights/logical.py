@@ -61,7 +61,7 @@ def _resolve_norm_mod(
         opts = dict(binding_or_mod.options)
         if opts.get("small_field") is None and default_small_field is not None:
             opts["small_field"] = default_small_field
-        resolved = ResolvedModuleGeometry(
+        res = ResolvedModuleGeometry(
             binding_or_mod.module_cls,
             binding_or_mod.prefix,
             vals,
@@ -69,7 +69,7 @@ def _resolve_norm_mod(
             binding_or_mod.rename,
             binding_or_mod.transforms,
         )
-        return binding_or_mod.module_cls._from_resolved(resolved)
+        return binding_or_mod.module_cls._from_resolved(res)
     return None
 
 
@@ -111,6 +111,8 @@ def _coerce_canonical_hf_entry(
     d: HFParamDecl,
     hf: Mapping[str, Any],
     fuse_members: Mapping[str, list[HFParamDecl]],
+    *,
+    has_layer_dim: bool = True,
 ) -> jax.Array:
     """Resolve `d` from `hf` (supporting pre-fused keys and declared HF shapes)."""
     if d.name in hf:
@@ -132,9 +134,7 @@ def _coerce_canonical_hf_entry(
         raise KeyError(f"Missing parameter {d.name!r} in HF weight mapping")
 
     rank = len(d.shape)
-    if arr.ndim == rank and arr.shape == d.shape:
-        return arr
-    if arr.ndim == rank and arr.shape == d.hf_shape:
+    if not has_layer_dim:
         lead, trail = (), arr.shape
     elif arr.ndim >= 2:
         lead, trail = (arr.shape[0],), arr.shape[1:]
@@ -144,29 +144,42 @@ def _coerce_canonical_hf_entry(
             f"expected shape={d.shape} or hf_shape={d.hf_shape}"
         )
 
-    if trail == d.shape:
-        return arr
     if trail == d.hf_shape:
+        if d.transform.split_slice is not None:
+            s0, s1 = d.transform.split_slice
+            sl = [slice(None)] * arr.ndim
+            sl[len(lead)] = slice(s0, s1)
+            arr = arr[tuple(sl)]
+            trail = arr.shape[len(lead) :]
         tp = d.transform.transpose
-        if len(d.hf_shape) == rank:
+        if len(trail) == rank:
             if tp is not None:
                 arr = _transpose_with_lead(arr, lead, tp)
             if arr.shape[len(lead) :] == d.shape:
                 return arr
-        elif len(d.hf_shape) < rank:
-            if math.prod(d.hf_shape) == math.prod(d.shape):
-                if rank == 3 and len(d.hf_shape) == 2 and tp == (0, 2, 1):
+        elif len(trail) < rank:
+            if math.prod(trail) == math.prod(d.shape):
+                if rank == 3 and len(trail) == 2 and tp == (0, 2, 1):
                     arr_3d = arr.reshape((*lead, d.shape[0], d.shape[2], d.shape[1]))
                     return _transpose_with_lead(arr_3d, lead, (0, 2, 1))
                 return arr.reshape((*lead, *d.shape))
-            if len(d.hf_shape) == 1 and rank == 2 and d.hf_shape[0] == d.shape[-1]:
+            if len(trail) == 1 and rank == 2 and trail[0] == d.shape[-1]:
                 return jnp.broadcast_to(
-                    arr.reshape((*lead, 1, d.hf_shape[0])), (*lead, *d.shape)
+                    arr.reshape((*lead, 1, trail[0])), (*lead, *d.shape)
                 )
-        elif math.prod(d.hf_shape) == math.prod(d.shape):
-            if tp is not None and len(tp) == len(d.hf_shape):
+        elif math.prod(trail) == math.prod(d.shape):
+            if (
+                d.transform.flatten_tail
+                and rank == 2
+                and trail == (d.shape[1], 1, d.shape[0])
+            ):
+                arr_2d = arr.reshape((*lead, d.shape[1], d.shape[0]))
+                return _transpose_with_lead(arr_2d, lead, (1, 0))
+            if tp is not None and len(tp) == len(trail):
                 arr = _transpose_with_lead(arr, lead, tp)
             return arr.reshape((*lead, *d.shape))
+    if trail == d.shape:
+        return arr
 
     raise ValueError(
         f"HF parameter {d.name!r} has trailing shape {trail}, "
@@ -189,14 +202,10 @@ def load_logical_weights(
     er, ew = int(geom.ER(R)), int(geom.EW(R))
     moe_tp = bool(getattr(geom, "moe_tp", True))
 
-    decls: list[HFParamDecl] = []
-    for nm in (pre_n, post_n):
-        if nm is not None:
-            decls.extend(nm.hf_params(g=geom))
-    for mod in ms.all_modules():
-        decls.extend(mod.hf_params(g=geom))
-    if final_n is not None:
-        decls.extend(final_n.hf_params(g=geom))
+    mods_l = [m for m in (pre_n, post_n) if m is not None] + list(ms.all_modules())
+    per_layer = [d for m in mods_l for d in m.hf_params(g=geom)]
+    final_d = final_n.hf_params(g=geom) if final_n is not None else []
+    decls = [*per_layer, *final_d]
 
     fuse_members: dict[str, list[HFParamDecl]] = {}
     for d in decls:
@@ -205,7 +214,16 @@ def load_logical_weights(
     for grp in fuse_members.values():
         grp.sort(key=lambda m: m.transform.fuse_order)
 
-    canon_hf = {d.name: _coerce_canonical_hf_entry(d, hf, fuse_members) for d in decls}
+    canon_hf = {
+        d.name: _coerce_canonical_hf_entry(d, hf, fuse_members, has_layer_dim=True)
+        for d in per_layer
+    }
+    canon_hf.update(
+        {
+            d.name: _coerce_canonical_hf_entry(d, hf, fuse_members, has_layer_dim=False)
+            for d in final_d
+        }
+    )
 
     if not moe_tp and ew > er:
         if e_cores is None:
@@ -247,11 +265,7 @@ def load_logical_weights(
 
 
 def pack_logical_weights(
-    model_def: Any,
-    ex: ExecSpec,
-    logical_weights: Mapping[str, Any],
-    *,
-    g: Any = None,
+    model_def: Any, ex: ExecSpec, logical_weights: Mapping[str, Any], *, g: Any = None
 ) -> dict[str, Any]:
     """Pack all-ranks `logical_weights` into tiled megakernel weights (`weights_mk`)."""
     ms, geom, pre_n, post_n, final_n = resolve_spec_and_norms(model_def, ex, g=g)
@@ -263,18 +277,16 @@ def pack_logical_weights(
     def set_sm(name: str, val: jax.Array, lyr: int | None = None) -> None:
         nonlocal sm
         o, w = lay[name]
+        vw = min(w, val.shape[-1])
+        assert val.shape[-1] <= w, (name, val.shape[-1], w)
         if lyr is None:
-            if val.ndim == 2:
-                val = jnp.broadcast_to(val[None, :, :], (R, L, val.shape[-1]))
-            assert val.shape[-1] <= w, (name, val.shape[-1], w)
-            vw = min(w, val.shape[-1])
-            sm = sm.at[:, :, 0, o : o + vw].set(val[:, :, :vw].astype(F32))
+            sh = (R, L, val.shape[-1])
+            v = jnp.broadcast_to(val[None], sh) if val.ndim == 2 else val
+            sm = sm.at[:, :, 0, o : o + vw].set(v[:, :, :vw].astype(F32))
         else:
-            if val.ndim == 1:
-                val = jnp.broadcast_to(val[None, :], (R, val.shape[-1]))
-            assert val.shape[-1] <= w, (name, val.shape[-1], w)
-            vw = min(w, val.shape[-1])
-            sm = sm.at[:, lyr, 0, o : o + vw].set(val[:, :vw].astype(F32))
+            sh = (R, val.shape[-1])
+            v = jnp.broadcast_to(val[None], sh) if val.ndim == 1 else val
+            sm = sm.at[:, lyr, 0, o : o + vw].set(v[:, :vw].astype(F32))
 
     def small_pairs(mod: Module) -> list[tuple[str, str]]:
         seen: set[tuple[str, str]] = set()
@@ -284,8 +296,7 @@ def pack_logical_weights(
             if sf_name is not None:
                 if sf_name not in lay:
                     raise ValueError(
-                        f"Module {mod.name!r} HFParamDecl {d.name!r} declares "
-                        f"small_field={sf_name!r}, not in {list(lay)}"
+                        f"{mod.name!r} {d.name!r} small_field={sf_name!r} not in lay"
                     )
                 pair = (sf_name, d.transform.fuse_into or d.name)
                 if pair not in seen:
@@ -294,10 +305,9 @@ def pack_logical_weights(
         return out
 
     populated_sm: set[str] = set()
-    all_layer_mods = [m for m in (pre_n, post_n) if m is not None] + [
-        s for s in ms.layer_type.slots if isinstance(s, Module)
-    ]
-    for mod in all_layer_mods:
+    mods_l = [m for m in (pre_n, post_n) if m is not None]
+    mods_l.extend(s for s in ms.layer_type.slots if isinstance(s, Module))
+    for mod in mods_l:
         for sm_field, l_key in small_pairs(mod):
             if l_key not in logical_weights:
                 raise ValueError(f"Missing logical weight {l_key!r} for {sm_field!r}")
@@ -316,15 +326,10 @@ def pack_logical_weights(
                 b_mod, ord_idx = switch_branch_for_layer(slot, lyr)
                 for sm_field, l_key in b_pairs[b_mod.name]:
                     if l_key not in logical_weights:
-                        raise ValueError(
-                            f"Missing logical weight {l_key!r} for {sm_field!r}"
-                        )
+                        raise ValueError(f"Missing {l_key!r} for {sm_field!r}")
                     arr = logical_weights[l_key]
-                    set_sm(
-                        sm_field,
-                        arr[:, lyr] if arr.shape[1] == L else arr[:, ord_idx],
-                        lyr=lyr,
-                    )
+                    v_l = arr[:, lyr] if arr.shape[1] == L else arr[:, ord_idx]
+                    set_sm(sm_field, v_l, lyr=lyr)
                     populated_sm.add(sm_field)
 
     for mod in ms.all_modules():
@@ -358,21 +363,16 @@ def pack_logical_weights(
                     if isinstance(raw, (tuple, list)):
                         raw = jnp.stack(raw, axis=1)
                     if raw.ndim == 1 + len(wd.lead_dims) + 2:
-                        raw = jnp.broadcast_to(raw[None, ...], (R, *raw.shape)).astype(
-                            wd.dtype
-                        )
+                        sh = (R, *raw.shape)
+                        raw = jnp.broadcast_to(raw[None, ...], sh).astype(wd.dtype)
                     weights_mk[wd.name] = tile_w(raw, wd.name)
                 else:
-                    src = (
-                        raw
-                        if isinstance(raw, (tuple, list))
-                        else [raw[:, i] for i in range(n_layers)]
-                    )
+                    is_seq = isinstance(raw, (tuple, list))
+                    src = raw if is_seq else [raw[:, i] for i in range(n_layers)]
                     weights_mk[wd.name] = tuple(tile_w(x, wd.name) for x in src)
             else:
-                weights_mk[wd.name] = raw.reshape(
-                    (R, n_layers, *wd.lead_dims, wd.K, wd.N)
-                ).astype(wd.dtype)
+                sh = (R, n_layers, *wd.lead_dims, wd.K, wd.N)
+                weights_mk[wd.name] = raw.reshape(sh).astype(wd.dtype)
 
     if "smalls" in p.w_names:
         weights_mk["smalls"] = sm
@@ -388,13 +388,8 @@ def pack_logical_weights(
 
 
 def load_hf(
-    model_def: Any,
-    ex: ExecSpec,
-    hf: Mapping[str, Any],
-    *,
-    g: Any = None,
-    e_cores: list[list[list[int]]] | None = None,
+    model_def: Any, ex: ExecSpec, hf: Mapping[str, Any], *, g: Any = None, **kw: Any
 ) -> dict[str, Any]:
     """Load and pack unsharded HF weights across `R = ex.R` ranks."""
-    logical = load_logical_weights(model_def, ex, hf, g=g, e_cores=e_cores)
+    logical = load_logical_weights(model_def, ex, hf, g=g, **kw)
     return pack_logical_weights(model_def, ex, logical, g=g)

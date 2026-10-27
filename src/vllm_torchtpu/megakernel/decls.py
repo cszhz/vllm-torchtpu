@@ -68,10 +68,10 @@ class FrozenDict(Mapping[str, Any]):
         return hash(frozenset(self._dict.items()))
 
     def __eq__(self, other: object) -> Any:
-        if isinstance(other, Mapping):
-            other_d = other if isinstance(other, FrozenDict) else FrozenDict(other)
-            return self._dict == other_d._dict
-        return NotImplemented
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        od = other if isinstance(other, FrozenDict) else FrozenDict(other)
+        return self._dict == od._dict
 
     def __repr__(self) -> str:
         return f"FrozenDict({self._dict!r})"
@@ -110,6 +110,14 @@ class RecurrentCacheDecl:
 
 
 @dataclass(frozen=True)
+class ParamInit:
+    """Declarative synthetic initialization parameters for an `HFParamDecl`."""
+
+    mean: float = 0.0
+    std: float = 0.05
+
+
+@dataclass(frozen=True)
 class ParamTransform:
     """Declarative transform rules for a canonical module parameter."""
 
@@ -134,14 +142,9 @@ class ParamTransform:
     def __post_init__(self) -> None:
         if self.transpose is not None and (
             not isinstance(self.transpose, tuple)
-            or not all(
-                isinstance(i, int) and not isinstance(i, bool) for i in self.transpose
-            )
+            or not all(type(i) is int for i in self.transpose)
         ):
-            raise TypeError(
-                f"ParamTransform.transpose must be an int permutation tuple or None, "
-                f"got {self.transpose!r}"
-            )
+            raise TypeError("transpose must be a permutation tuple or None")
 
 
 _TRANSFORM_FIELD_NAMES = frozenset(f.name for f in dataclasses.fields(ParamTransform))
@@ -163,12 +166,7 @@ class VLLMAlias:
 
 @dataclass(frozen=True)
 class HFParamDecl:
-    """Canonical parameter declaration (`shape` in MK layout, `hf_shape` in raw HF).
-
-    When `hf_shape` is 2D and `shape` is multi-dimensional with a `transpose`
-    permutation, raw HF weights are first reshaped to the inverse-permuted
-    `shape` and then permuted by `transform.transpose` into `shape`.
-    """
+    """Canonical parameter declaration (`shape` in MK layout, `hf_shape` in raw HF)."""
 
     name: str
     hf_name: str
@@ -177,14 +175,12 @@ class HFParamDecl:
     hf_shape: tuple[int, ...] | None = None
     transform: ParamTransform = ParamTransform()
     vllm_aliases: tuple[VLLMAlias, ...] = ()
+    init: ParamInit | None = None
 
     def __post_init__(self) -> None:
         perm = self.transform.transpose
         if perm is not None and sorted(perm) != list(range(len(self.shape))):
-            raise ValueError(
-                f"HFParamDecl {self.name!r}: transpose={perm} is not a valid "
-                f"rank-{len(self.shape)} permutation for shape={self.shape}"
-            )
+            raise ValueError(f"not a valid rank-{len(self.shape)} permutation")
         if self.hf_shape is None:
             hf_sh = (
                 tuple(self.shape[perm.index(i)] for i in range(len(perm)))
@@ -256,10 +252,9 @@ def _lookup_raw_key(cfg: Any, key: str) -> Any:
         for s in ("rope_parameters", "rope_scaling")
         if (sub := _sub_cfg(r, s)) is not None
     ]
-    for c in (*roots, *subs):
-        if (val := _sub_cfg(c, key)) is not None:
-            return val
-    return REQUIRED
+    return next(
+        (v for c in (*roots, *subs) if (v := _sub_cfg(c, key)) is not None), REQUIRED
+    )
 
 
 def _resolve_field_spec(
@@ -299,37 +294,27 @@ def validate_rename_and_transforms(
     param_name_override: str | None = None,
 ) -> None:
     """Validate `rename` and `transforms` keys against `module_cls.PARAM_NAMES`."""
-    allowed = set(getattr(module_cls, "PARAM_NAMES", ())) | (
-        {param_name_override} if param_name_override else set()
-    )
+    cls_n = module_cls.__name__
+    extra = {param_name_override} if param_name_override else set()
+    allowed = set(getattr(module_cls, "PARAM_NAMES", ())) | extra
     seen: set[str] = set()
     for k, v in rename.items():
         if allowed and k not in allowed:
-            raise ValueError(f"{module_cls.__name__}.bind got unknown rename key {k!r}")
+            raise ValueError(f"{cls_n}.bind got unknown rename key {k!r}")
         if not isinstance(v, str) or not v:
-            raise ValueError(f"{module_cls.__name__}.bind invalid rename[{k!r}]={v!r}")
+            raise ValueError(f"{cls_n}.bind invalid rename[{k!r}]={v!r}")
         if (v in allowed and v != k) or v in seen:
-            raise ValueError(
-                f"{module_cls.__name__}.bind rename target collision {v!r}"
-            )
+            raise ValueError(f"{cls_n}.bind rename target collision {v!r}")
         seen.add(v)
     allowed_tf = allowed | seen
     for k, v in transforms.items():
         if allowed_tf and k not in allowed_tf:
-            raise ValueError(
-                f"{module_cls.__name__}.bind got unknown transforms key {k!r}"
-            )
+            raise ValueError(f"{cls_n}.bind got unknown transforms key {k!r}")
         if isinstance(v, Mapping):
-            if bad := (set(v) - _TRANSFORM_FIELD_NAMES):
-                raise ValueError(
-                    f"{module_cls.__name__}.bind transforms[{k!r}] got unknown "
-                    f"fields {sorted(bad)}"
-                )
+            if bad := sorted(set(v) - _TRANSFORM_FIELD_NAMES):
+                raise ValueError(f"{cls_n}.bind transforms[{k!r}] unknown fields {bad}")
         elif not isinstance(v, ParamTransform):
-            raise TypeError(
-                f"{module_cls.__name__}.bind transforms[{k!r}] invalid type "
-                f"{type(v).__name__}"
-            )
+            raise TypeError(f"{cls_n}.bind transforms[{k!r}] invalid type")
 
 
 @dataclass(frozen=True)

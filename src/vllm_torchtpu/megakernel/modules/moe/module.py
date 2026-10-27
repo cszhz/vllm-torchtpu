@@ -227,6 +227,7 @@ class MoEModule(Module):
             self.debug_flags(ex),
             moe_tp=moe_tp,
             e_slots=e_slots,
+            module_name=self.name,
         )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:

@@ -123,9 +123,16 @@ def derive_moe_params(
     *,
     moe_tp: bool,
     e_slots: int,
+    module_name: str = "moe",
 ) -> MoEParams:
     """Resolve `MoEParams` from model geometry, `ExecSpec`, and `StreamPlan`."""
     tiles = ex.resolve_tiles(g)
+    moe_layers = plan.module_layer_counts.get(module_name, g.L)
+    if moe_layers != g.L:
+        raise MegakernelConfigError(
+            f"MoEModule requires execution on every layer (got {moe_layers} "
+            f"of L={g.L} layers)"
+        )
     er = g.E // ex.R
     isr = g.IS // ex.R
     ir = g.I // ex.R if moe_tp else g.I

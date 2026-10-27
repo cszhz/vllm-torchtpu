@@ -321,6 +321,56 @@ class GQAModule(Module):
             geom = self._require_geometry(g)
         return gqa_cache_decl(geom, pool_layout=self.pool_layout)
 
+    def init_logical_states(
+        self, key: Any, g: Any, ex: ExecSpec, n_layers: int
+    ) -> dict[str, Any]:
+        import jax
+
+        geom = self._require_geometry(g)
+        cdecl = self.cache_decl(geom)
+        nkv = int(geom.NKV)
+        g_rep = ex.R // nkv
+        k_kc, k_vc = jax.random.split(key)
+        sh = (nkv, n_layers, ex.NS, ex.ctx, cdecl.hd)
+        return {
+            "kc": jnp.repeat(jax.random.normal(k_kc, sh, dtype=BF16) * 0.1, g_rep, 0),
+            "vc": jnp.repeat(jax.random.normal(k_vc, sh, dtype=BF16) * 0.1, g_rep, 0),
+        }
+
+    def pack_logical_states(
+        self, logical_states: Mapping[str, Any], g: Any, ex: ExecSpec
+    ) -> dict[str, Any]:
+        del g
+        if (
+            cache_exec(ex).paged_kv
+            or "kc" not in logical_states
+            or "vc" not in logical_states
+        ):
+            return {}
+        kc, vc = logical_states["kc"], logical_states["vc"]
+        return {
+            "kc": kc.reshape((kc.shape[0] * kc.shape[1], *kc.shape[2:])),
+            "vc": vc.reshape((vc.shape[0] * vc.shape[1], *vc.shape[2:])),
+        }
+
+    def unpack_kernel_states(
+        self, raw_states: Mapping[str, Any], g: Any, ex: ExecSpec
+    ) -> dict[str, Any]:
+        del g
+        return {
+            k: raw_states[k].reshape(
+                (ex.R, raw_states[k].shape[0] // ex.R, *raw_states[k].shape[1:])
+            )
+            for k in ("kc", "vc")
+            if k in raw_states
+        }
+
+    def next_logical_states(
+        self, out_states: Mapping[str, Any], g: Any, ex: ExecSpec
+    ) -> dict[str, Any]:
+        del g, ex
+        return {k: out_states[k] for k in ("kc", "vc") if k in out_states}
+
     def reference(
         self, params: Any, x: Any, state: Any = None, *, g: Any = None, **kw: Any
     ) -> tuple[Any, dict[str, Any]]:

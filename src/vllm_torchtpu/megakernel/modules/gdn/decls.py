@@ -21,6 +21,7 @@ from ...decls import (
     REQUIRED,
     HFParamDecl,
     ModuleBinding,
+    ParamInit,
     ParamTransform,
     RecurrentCacheDecl,
     ResolvedModuleGeometry,
@@ -118,12 +119,7 @@ def resolve_gdn_binding(
         }
     )
     return ResolvedModuleGeometry(
-        module_cls=cls,
-        prefix=binding.prefix,
-        values=vals,
-        options=binding.options,
-        rename=binding.rename,
-        transforms=binding.transforms,
+        cls, binding.prefix, vals, binding.options, binding.rename, binding.transforms
     )
 
 
@@ -265,7 +261,9 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
         ),
     )
 
-    def _vec1d(canon: str, hf_stem: str, dim: int, shard: int | None) -> HFParamDecl:
+    def _vec1d(
+        canon: str, hf_stem: str, dim: int, shard: int | None, init: ParamInit
+    ) -> HFParamDecl:
         n = _n(canon)
         return HFParamDecl(
             name=n,
@@ -286,6 +284,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
                     flipped=False,
                 ),
             ),
+            init=init,
         )
 
     decls = [
@@ -380,25 +379,16 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
                 ),
             ),
         ),
-        _vec1d("alog", "A_log", VH, 0),
-        _vec1d("dtb", "dt_bias", VH, 0),
-        _vec1d("gnorm", "norm.weight", VD, None),
+        _vec1d("alog", "A_log", VH, 0, ParamInit(mean=-1.0, std=0.1)),
+        _vec1d("dtb", "dt_bias", VH, 0, ParamInit(mean=0.0, std=0.1)),
+        _vec1d("gnorm", "norm.weight", VD, None, ParamInit(mean=1.0, std=0.05)),
     ]
     return apply_decl_overrides(decls, geom)
 
 
 def gdn_cache_decl(geom: Any) -> RecurrentCacheDecl:
     """Return the `RecurrentCacheDecl` describing one GDN layer's slot geometry."""
-    conv_kernel = _check_conv_kernel(int(getattr(geom, "conv_kernel", 4)))
-    conv_taps = int(getattr(geom, "conv_taps", conv_kernel - 1))
-    return RecurrentCacheDecl(
-        kh=int(geom.KH),
-        vh=int(geom.VH),
-        KD=int(geom.KD),
-        VD=int(geom.VD),
-        rec_dtype=BF16,
-        rec_pages_per_slot=None,
-        conv_taps=conv_taps,
-        conv_dtype=BF16,
-        conv_pages_per_slot=None,
-    )
+    conv_k = _check_conv_kernel(int(getattr(geom, "conv_kernel", 4)))
+    taps = int(getattr(geom, "conv_taps", conv_k - 1))
+    kh, vh, kd, vd = int(geom.KH), int(geom.VH), int(geom.KD), int(geom.VD)
+    return RecurrentCacheDecl(kh, vh, kd, vd, BF16, None, taps, BF16, None)

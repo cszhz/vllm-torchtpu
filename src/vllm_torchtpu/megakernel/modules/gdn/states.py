@@ -15,17 +15,62 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...ops import BF16, U32, bswitch
+from ...ops import BF16, F32, I32, U32, bswitch, rup
 from ...pool.backend import kernel_debug_check
 from ...pool.config import cache_exec
-from .params import GDNParams
+from .params import GDNParams, gdn_lin_in_layout
+
+
+def gdn_accept(
+    states: dict[str, Any],
+    ckpts: dict[str, Any],
+    acc: Any,
+    *,
+    T: int,
+    vh: int,
+    taps: int = 3,
+) -> dict[str, Any]:
+    """Jittable on-device selection of post-verify GDN states from checkpoints."""
+    c_ckpt = ckpts["conv_ckpt"] if "conv_ckpt" in ckpts else ckpts.get("conv")
+    r_ckpt = ckpts["rec_ckpt"] if "rec_ckpt" in ckpts else ckpts.get("rec")
+    out = {k: v for k, v in states.items() if k not in ("conv_ckpt", "rec_ckpt")}
+    if c_ckpt is None or r_ckpt is None:
+        return out
+
+    NS = c_ckpt.shape[-3]
+    acc_arr = jnp.asarray(acc, dtype=I32)
+    assert acc_arr.shape == (NS,), (acc_arr.shape, NS)
+
+    conv_next = jax.vmap(
+        lambda c_seq, a_s: c_seq.at[..., 0:taps, :].set(
+            lax.dynamic_slice_in_dim(c_seq, a_s, taps, axis=-2)
+        ),
+        in_axes=(-3, 0),
+        out_axes=-3,
+    )(c_ckpt, acc_arr)
+
+    lead = r_ckpt.shape[:-3]
+    KD, VD = r_ckpt.shape[-2], r_ckpt.shape[-1]
+    r_unflat = r_ckpt.reshape((*lead, NS, T, vh, KD, VD))
+    r_sel = jax.vmap(
+        lambda r_seq, a_s: lax.dynamic_index_in_dim(
+            r_seq, a_s - 1, axis=-4, keepdims=False
+        ),
+        in_axes=(-5, 0),
+        out_axes=-4,
+    )(r_unflat, acc_arr)
+    out["conv"] = conv_next
+    out["rec"] = r_sel.reshape((*lead, NS * vh, KD, VD))
+    return out
 
 
 def is_seq_active(ctx: Any, gp: GDNParams, s: Any) -> Any:
@@ -263,3 +308,108 @@ def rec_in(ctx: Any, gp: GDNParams, o: Any) -> list[Any]:
         )
         for s in range(NS)
     ]
+
+
+def gdn_init_logical_states(
+    key: Any, g: Any, ex: Any, n_layers: int, *, conv_taps: int
+) -> dict[str, Any]:
+    """Initialize unfolded `[R, n_layers, ...]` GDN `conv` and `rec` states."""
+    lay = gdn_lin_in_layout(g, ex)
+    k_conv, k_rec = jax.random.split(key)
+    return {
+        "conv": (
+            jax.random.normal(
+                k_conv, (ex.R, n_layers, ex.NS, conv_taps, lay.QKV), dtype=F32
+            )
+            * 0.05
+        ),
+        "rec": (
+            jax.random.normal(
+                k_rec, (ex.R, n_layers, ex.NS, lay.vh, lay.KD, lay.VD), dtype=BF16
+            )
+            * 0.05
+        ),
+    }
+
+
+def gdn_pack_logical_states(
+    logical_states: Mapping[str, Any], g: Any, ex: Any, *, conv_taps: int
+) -> dict[str, Any]:
+    """Pack unfolded GDN `conv` and `rec` states into rank-folded kernel layout."""
+    if "conv" not in logical_states or "rec" not in logical_states:
+        return {}
+    conv_l, rec_l = logical_states["conv"], logical_states["rec"]
+    lay = gdn_lin_in_layout(g, ex)
+    R, B, T, NS = ex.R, ex.B, ex.T, ex.NS
+    n_layers = conv_l.shape[1]
+    if conv_l.ndim == 5 and conv_l.shape[3] == conv_taps:
+        if T == 1:
+            cr = rup(conv_taps * B, 8)
+            conv_tb = jnp.swapaxes(conv_l, 2, 3).reshape(
+                R, n_layers, conv_taps * B, lay.QKV
+            )
+            conv_p = jnp.pad(conv_tb, ((0, 0), (0, 0), (0, cr - conv_taps * B), (0, 0)))
+        else:
+            hr = rup(conv_taps + T, 8)
+            conv_p = jnp.pad(
+                conv_l, ((0, 0), (0, 0), (0, 0), (0, hr - conv_taps), (0, 0))
+            )
+    else:
+        conv_p = conv_l
+    rec_p = (
+        rec_l.reshape(R, n_layers, NS * lay.vh, lay.KD, lay.VD)
+        if rec_l.ndim == 6
+        else rec_l
+    )
+    return {
+        "conv": conv_p.astype(F32).reshape(
+            (conv_p.shape[0] * conv_p.shape[1], *conv_p.shape[2:])
+        ),
+        "rec": rec_p.astype(BF16).reshape(
+            (rec_p.shape[0] * rec_p.shape[1], *rec_p.shape[2:])
+        ),
+    }
+
+
+def gdn_unpack_kernel_states(
+    raw_states: Mapping[str, Any], g: Any, ex: Any, *, conv_taps: int
+) -> dict[str, Any]:
+    """Unpack rank-folded GDN state outputs into `[R, ...]` reference states."""
+    del g, conv_taps
+    return {
+        k: raw_states[k].reshape(
+            (ex.R, raw_states[k].shape[0] // ex.R, *raw_states[k].shape[1:])
+        )
+        for k in ("conv", "rec", "conv_ckpt", "rec_ckpt")
+        if k in raw_states
+    }
+
+
+def gdn_next_logical_states(
+    out_states: Mapping[str, Any], g: Any, ex: Any, *, conv_taps: int
+) -> dict[str, Any]:
+    """Extract final-token unfolded GDN `conv` and `rec` states from step outputs."""
+    lay = gdn_lin_in_layout(g, ex)
+    R, B, T, NS = ex.R, ex.B, ex.T, ex.NS
+    out: dict[str, Any] = {}
+    c_src = out_states.get("conv_ckpt" if T > 1 else "conv")
+    if c_src is not None:
+        n_l = c_src.shape[1]
+        if T == 1 and c_src.ndim == 4:
+            c_tb = c_src[:, :, : conv_taps * B, :].reshape(
+                R, n_l, conv_taps, B, lay.QKV
+            )
+            out["conv"] = jnp.swapaxes(c_tb, 2, 3)
+        elif c_src.ndim == 5 and c_src.shape[3] >= T + conv_taps:
+            out["conv"] = c_src[:, :, :, T : T + conv_taps, :]
+        else:
+            out["conv"] = c_src
+    r_src = out_states.get("rec_ckpt" if T > 1 else "rec")
+    if r_src is not None:
+        n_l = r_src.shape[1]
+        if T > 1 and r_src.shape[2] == NS * T * lay.vh:
+            r_t = r_src.reshape(R, n_l, NS, T, lay.vh, lay.KD, lay.VD)
+            out["rec"] = r_t[:, :, :, -1]
+        else:
+            out["rec"] = r_src.reshape(R, n_l, NS, lay.vh, lay.KD, lay.VD)
+    return out

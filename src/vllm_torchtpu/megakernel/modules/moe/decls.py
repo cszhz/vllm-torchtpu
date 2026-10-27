@@ -22,6 +22,7 @@ from ...decls import (
     REQUIRED,
     HFParamDecl,
     ModuleBinding,
+    ParamInit,
     ParamTransform,
     ResolvedModuleGeometry,
     VLLMAlias,
@@ -126,16 +127,12 @@ def resolve_moe_binding(
 
 
 def moe_hf_params(
-    prefix: str,
-    geom: Any,
-    *,
-    shared_gate: bool = True,
-    moe_tp: bool | None = None,
+    prefix: str, geom: Any, *, shared_gate: bool = True, moe_tp: bool | None = None
 ) -> list[HFParamDecl]:
     """Return canonical (unfused) HF parameter declarations for `MoEModule`."""
     p = f"{prefix}." if prefix else ""
     H, E, IS = int(geom.H), int(geom.E), int(geom.IS)
-    I = int(geom.I)  # noqa: E741
+    inter_dim = int(geom.I)
     moe_tp = bool(getattr(geom, "moe_tp", True)) if moe_tp is None else bool(moe_tp)
     shard_e13 = -1 if moe_tp else 0
     shard_e2 = 1 if moe_tp else 0
@@ -191,8 +188,8 @@ def moe_hf_params(
             HFParamDecl(
                 name=w_n,
                 hf_name=f"{p}experts.{hf_stem}.weight",
-                shape=(E, H, I),
-                hf_shape=(E, I, H),
+                shape=(E, H, inter_dim),
+                hf_shape=(E, inter_dim, H),
                 dtype=FP8,
                 transform=ParamTransform(
                     fuse_into="e13",
@@ -208,8 +205,8 @@ def moe_hf_params(
             HFParamDecl(
                 name=s_n,
                 hf_name=f"{p}experts.{hf_stem}.weight_scale_inv",
-                shape=(E, I),
-                hf_shape=(E, I),
+                shape=(E, inter_dim),
+                hf_shape=(E, inter_dim),
                 dtype=F32,
                 transform=ParamTransform(
                     fuse_into="e13_s",
@@ -249,6 +246,7 @@ def moe_hf_params(
                     flipped=False,
                 ),
             ),
+            init=ParamInit(mean=0.0, std=0.1),
         ),
     ]
     if shared_gate:
@@ -278,6 +276,7 @@ def moe_hf_params(
                         flipped=False,
                     ),
                 ),
+                init=ParamInit(mean=0.0, std=0.1),
             )
         )
     sh_gu_alias = (
@@ -358,8 +357,8 @@ def moe_hf_params(
             HFParamDecl(
                 name=_n("e2"),
                 hf_name=f"{p}experts.down_proj.weight",
-                shape=(E, I, H),
-                hf_shape=(E, H, I),
+                shape=(E, inter_dim, H),
+                hf_shape=(E, H, inter_dim),
                 dtype=FP8,
                 transform=ParamTransform(
                     transpose=(0, 2, 1),

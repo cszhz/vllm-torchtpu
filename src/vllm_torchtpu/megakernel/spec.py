@@ -25,17 +25,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .decls import (  # noqa: F401
+from .decls import (
     REQUIRED,
     FrozenDict,
     HFParamDecl,
     KVCacheDecl,
     ModuleBinding,
+    ParamInit,
     ParamTransform,
     RecurrentCacheDecl,
     ResolvedModuleGeometry,
     VLLMAlias,
-    _resolve_field_spec,
     combined_hf_param_shapes,
     validate_rename_and_transforms,
 )
@@ -196,3 +196,29 @@ class ModelSpec:
                         f"name {b.name!r}: {prev!r} vs {b!r}"
                     )
         return out
+
+
+__all__ = [
+    "REQUIRED",
+    "ExtraInput",
+    "FrozenDict",
+    "HFParamDecl",
+    "KVCacheDecl",
+    "LayerType",
+    "ModelSpec",
+    "Module",
+    "ModuleBinding",
+    "ParamInit",
+    "ParamTransform",
+    "RecurrentCacheDecl",
+    "ResolvedModuleGeometry",
+    "ScratchReq",
+    "SmallField",
+    "Spec",
+    "StateDecl",
+    "SwitchSlot",
+    "VLLMAlias",
+    "WeightDecl",
+    "combined_hf_param_shapes",
+    "validate_rename_and_transforms",
+]
