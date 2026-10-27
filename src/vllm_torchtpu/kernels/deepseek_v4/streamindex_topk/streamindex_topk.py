@@ -1011,18 +1011,20 @@ def _effective_row_lengths(
     max_num_seqs = seq_lens.shape[0]
     num_seqs = distribution[2]
     token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_mask = token_ids[:, None] >= cu_q_lens[None, 1 : max_num_seqs + 1]
-    seq_mask = jnp.where(jnp.arange(max_num_seqs)[None, :] < num_seqs, seq_mask, False)
-    seq_ids = jnp.sum(seq_mask, axis=1)
-
-    q_start = cu_q_lens[seq_ids]
-    q_len = cu_q_lens[seq_ids + 1] - q_start
-    seq_len = seq_lens[seq_ids]
-    token_pos = seq_len - q_len + (token_ids - q_start)
+    tok_col = token_ids[:, None]
+    seq_valid = jnp.arange(max_num_seqs, dtype=jnp.int32)[None, :] < num_seqs
+    member = (
+        (tok_col >= cu_q_lens[None, :max_num_seqs])
+        & (tok_col < cu_q_lens[None, 1 : max_num_seqs + 1])
+        & seq_valid
+    )
+    seq_len = jnp.sum(jnp.where(member, seq_lens[None, :], 0), axis=1)
+    pos_offset = seq_lens - cu_q_lens[1 : max_num_seqs + 1]
+    token_pos = token_ids + jnp.sum(jnp.where(member, pos_offset[None, :], 0), axis=1)
     kv_len = seq_len // compression_ratio
     visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
-    valid = token_ids < cu_q_lens[num_seqs]
+    valid = jnp.any(member, axis=1)
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
 
 
@@ -1607,20 +1609,19 @@ def streamindex_topk(
         return out, scores_out
 
     def _fast_path(_):
-        token_idx = jnp.arange(q.shape[0])
-        seq_idx = jnp.minimum(
-            jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
-            seq_lens.shape[0] - 1,
+        token_idx = jnp.arange(q.shape[0], dtype=jnp.int32)
+        tok_col = token_idx[:, None]
+        member = (tok_col >= cu_q_lens[None, :-1]) & (tok_col < cu_q_lens[None, 1:])
+        seq_len = jnp.sum(jnp.where(member, seq_lens[None, :], 0), axis=1)
+        pos_offset = seq_lens - cu_q_lens[1:]
+        q_abs_pos = token_idx + jnp.sum(
+            jnp.where(member, pos_offset[None, :], 0), axis=1
         )
-        seq_len = seq_lens[seq_idx]
-        q_len = cu_q_lens[seq_idx + 1] - cu_q_lens[seq_idx]
-        q_start = cu_q_lens[seq_idx]
-        q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
         max_valid_idx = jnp.minimum(
             seq_len // compression_ratio - 1,
             q_abs_pos // compression_ratio,
         )
-        max_valid_idx = jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
+        max_valid_idx = jnp.where(jnp.any(member, axis=1), max_valid_idx, -1)
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
         return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
 

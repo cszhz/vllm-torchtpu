@@ -86,6 +86,11 @@ STREAMIDX_KV_PAGES_PER_BLOCK = (2, 2, 2)
 STREAMIDX_QUERIES_PER_BLOCK = (1, 128, 128)
 # MIXED-pass KV pages per block for small buckets when only the bq knob is set.
 STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
+# Small decode bucket (`num_tokens <= 32`) chunk and batch sizes when chunked.
+STREAMIDX_SMALL_DECODE_TOKENS = 32
+STREAMIDX_SMALL_DECODE_CHUNK_TOKENS = 8
+STREAMIDX_SMALL_DECODE_REQ_BATCH_SIZE = 8
+STREAMIDX_SMALL_DECODE_BKVP = 3
 
 
 def _streamidx_block_sizes(
@@ -482,13 +487,22 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
                 # Insert this step's K rows into the KV cache.
                 tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-                seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                    jnp.int32
+                tok_col = tok[:, None]
+                member = (tok_col >= cu_q_lens[None, :-1]) & (
+                    tok_col < cu_q_lens[None, 1:]
                 )
-                q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-                pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
+                seq_id = jnp.sum(
+                    jnp.where(
+                        member,
+                        jnp.arange(seq_lens.shape[0], dtype=jnp.int32)[None, :],
+                        0,
+                    ),
+                    axis=1,
+                )
+                pos_offset = seq_lens - cu_q_lens[1:]
+                pos = tok + jnp.sum(jnp.where(member, pos_offset[None, :], 0), axis=1)
                 page = jnp.where(
-                    tok < cu_q_lens[-1],
+                    jnp.any(member, axis=1),
                     page_indices.reshape(seq_lens.shape[0], -1)[
                         seq_id, pos // block_size
                     ],
@@ -509,9 +523,23 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            num_tokens = q.shape[0]
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], *small_bucket
+                num_tokens, *small_bucket
             )
+            bucket_chunk_tokens = chunk_tokens
+            decode_req_batch_size = 4
+            if (
+                chunk_tokens is not None
+                and num_tokens <= STREAMIDX_SMALL_DECODE_TOKENS
+                and num_tokens % STREAMIDX_SMALL_DECODE_CHUNK_TOKENS == 0
+            ):
+                bucket_chunk_tokens = STREAMIDX_SMALL_DECODE_CHUNK_TOKENS
+                decode_req_batch_size = STREAMIDX_SMALL_DECODE_REQ_BATCH_SIZE
+                kv_pages_per_block = (
+                    STREAMIDX_SMALL_DECODE_BKVP,
+                    *kv_pages_per_block[1:],
+                )
             topk_indices = streamindex_topk(
                 q,
                 weights,
@@ -524,9 +552,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 compression_ratio=1,
                 num_kv_pages_per_block=kv_pages_per_block,
                 num_queries_per_block=queries_per_block,
+                decode_req_batch_size=decode_req_batch_size,
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
-                chunk_tokens=chunk_tokens,
+                chunk_tokens=bucket_chunk_tokens,
             )
             return cache_kv, topk_indices
 

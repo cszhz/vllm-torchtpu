@@ -22,6 +22,7 @@ it every row is gathered.
 from __future__ import annotations
 
 import functools
+import math
 from typing import Any
 
 import jax
@@ -262,8 +263,8 @@ def dsa_gather_native_sc(
     num_owners = num_cores * num_subcores
 
     max_possible_atoms = out_size // (num_owners * OCCURRENCES_PER_ATOM)
-    if atoms_per_batch > max_possible_atoms > 0:
-        atoms_per_batch = max_possible_atoms
+    if max_possible_atoms > 0 and max_possible_atoms % atoms_per_batch != 0:
+        atoms_per_batch = math.gcd(max_possible_atoms, atoms_per_batch)
     if atoms_per_batch <= 0:
         raise ValueError(
             f"atoms_per_batch ({atoms_per_batch}) must be > 0 "

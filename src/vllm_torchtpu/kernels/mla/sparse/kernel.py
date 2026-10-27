@@ -165,6 +165,61 @@ def _floor_divmod_const(x: jax.Array, d: int) -> tuple[jax.Array, jax.Array]:
     return q, r
 
 
+def _token_seq_ids(cu_q_lens: jax.Array, num_tokens: int) -> jax.Array:
+    """Maps each token index in `[0, num_tokens)` to its sequence ID.
+
+    Uses a vectorized `[T, S]` comparison instead of `jnp.repeat` / `jnp.searchsorted`,
+    which XLA lowers to a per-layer HLO `while` loop on TPU.
+    """
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
+    return jnp.sum(tok >= cu_q_lens[None, 1:-1], axis=1, dtype=jnp.int32)
+
+
+def _fused_gather_indices_kernel(
+    windows_ref,  # i32[block_tokens, padded_pps] page-table row per token
+    topk_ref,  # i32[block_tokens, topk] logical top-k indices
+    out_ref,  # i32[block_tokens, topk] physical cache row indices
+    *,
+    block_tokens: int,
+    topk: int,
+    page_size: int,
+    pages_per_seq: int,
+    total_num_pages: int,
+    num_chunks: int,
+):
+    """Translates logical top-k indices into physical cache rows in a single pass."""
+    tb = pl.program_id(0)
+    idx = topk_ref[...]
+    is_padding = idx == -1
+
+    seq_page, token_offset = _floor_divmod_const(idx, page_size)
+    logical = jnp.clip(seq_page, 0, pages_per_seq - 1)
+
+    page = jnp.zeros_like(logical)
+    for c in range(num_chunks):
+        window_chunk = windows_ref[
+            :, c * _GATHER_PAGE_CHUNK : (c + 1) * _GATHER_PAGE_CHUNK
+        ]
+        local = logical - c * _GATHER_PAGE_CHUNK
+        gathered = jnp.take_along_axis(
+            window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
+        )
+        page = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, page)
+
+    row = tb * block_tokens + lax.broadcasted_iota(jnp.int32, idx.shape, 0)
+    col = lax.broadcasted_iota(jnp.int32, idx.shape, 1)
+    flat_element_index = row * topk + col
+
+    _, scattered_page = _floor_divmod_const(
+        flat_element_index * 104729, total_num_pages
+    )
+    _, scattered_offset = _floor_divmod_const(flat_element_index * 15485863, page_size)
+
+    page = jnp.where(is_padding, scattered_page, page)
+    token_offset = jnp.where(is_padding, scattered_offset, token_offset)
+    out_ref[...] = page * page_size + token_offset
+
+
 def _capped_window_indices_kernel(
     live_windows_ref,  # i32[1] (scalar prefetch; sizes the grid)
     windows_ref,  # i32[block_tokens, padded_pps] page-table row per token
@@ -294,10 +349,7 @@ def prepare_capped_window_indices(
         page_table = jnp.pad(page_table, ((0, 0), (0, padded_pps - pages_per_seq)))
 
     # Associate each token with its sequence ID to look up its page table row.
-    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
-    seq_ids_segment = jnp.repeat(
-        jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
-    )
+    seq_ids_segment = _token_seq_ids(cu_q_lens, num_tokens)
     windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
 
     def token_block(w, c, tb, lw):
@@ -1088,9 +1140,9 @@ def sparse_ragged_paged_attention(
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
     small_chunk_tokens: int = 32,
-    small_chunk_batch_size: int | None = 1,
+    small_chunk_batch_size: int | None = 2,
     small_chunk_live_gather: bool = True,
-    small_chunk_gather_atoms: int = 1,
+    small_chunk_gather_atoms: int = 8,
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
     q_pe: jax.Array | None = None,
@@ -1391,10 +1443,6 @@ def prepare_gather_indices(
     num_tokens, topk = topk_indices.shape
     # TODO: skip gather for padding tokens in topk_indices.
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
-    is_padding = topk_indices == -1
-    flat_element_index = jnp.arange(num_tokens * topk, dtype=jnp.int32).reshape(
-        num_tokens, topk
-    )
     if page_indices is not None:
         num_page_indices = page_indices.shape[0]
         if num_page_indices % max_num_seqs != 0:
@@ -1402,23 +1450,60 @@ def prepare_gather_indices(
                 f"page_indices size ({num_page_indices}) must be divisible by "
                 f"the sequence count ({max_num_seqs})"
             )
-        tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
-        seq_ids_segment = jnp.repeat(
-            jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
-        )
-        seq_page_ids = topk_indices // page_size
-        token_offset = topk_indices % page_size
-        page_ids = gather_page_ids(
-            page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
-        )
+        pages_per_seq = num_page_indices // max_num_seqs
+        num_chunks = cdiv(pages_per_seq, _GATHER_PAGE_CHUNK)
+        padded_pps = num_chunks * _GATHER_PAGE_CHUNK
 
-        # Scatter "-1" padding across the cache to avoid read hot spots.
-        scattered_page_ids = (flat_element_index * 104729) % total_num_pages
-        scattered_token_offset = (flat_element_index * 15485863) % page_size
-        page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
-        token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
-        physical_indices = page_ids * page_size + token_offset
+        page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
+        if padded_pps != pages_per_seq:
+            page_table = jnp.pad(page_table, ((0, 0), (0, padded_pps - pages_per_seq)))
+
+        seq_ids_segment = _token_seq_ids(cu_q_lens, num_tokens)
+        windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
+
+        block_tokens = (
+            32
+            if num_tokens >= 64 and num_tokens % 32 == 0
+            else (16 if num_tokens >= 16 and num_tokens % 16 == 0 else 8)
+        )
+        padded_tokens = align_to(num_tokens, block_tokens)
+        topk_in = topk_indices
+        if padded_tokens != num_tokens:
+            pad = padded_tokens - num_tokens
+            windows = jnp.pad(windows, ((0, pad), (0, 0)))
+            topk_in = jnp.pad(topk_in, ((0, pad), (0, 0)), constant_values=-1)
+
+        physical_indices = pl.pallas_call(
+            functools.partial(
+                _fused_gather_indices_kernel,
+                block_tokens=block_tokens,
+                topk=topk,
+                page_size=page_size,
+                pages_per_seq=pages_per_seq,
+                total_num_pages=total_num_pages,
+                num_chunks=num_chunks,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    pl.BlockSpec((block_tokens, padded_pps), lambda t: (t, 0)),
+                    pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
+                ],
+                out_specs=pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
+                grid=(padded_tokens // block_tokens,),
+            ),
+            out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                disable_bounds_checks=True,
+            ),
+            name="fused_gather_indices",
+        )(windows, topk_in)[:num_tokens]
     else:
+        is_padding = topk_indices == -1
+        flat_element_index = jnp.arange(num_tokens * topk, dtype=jnp.int32).reshape(
+            num_tokens, topk
+        )
         total_tokens = total_num_pages * page_size
         scattered_physical = (flat_element_index * 15485863) % total_tokens
         physical_indices = jnp.where(is_padding, scattered_physical, topk_indices)

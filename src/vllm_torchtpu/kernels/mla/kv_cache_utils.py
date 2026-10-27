@@ -201,10 +201,13 @@ def pack_tokens(values: jax.Array, token_bytes: int) -> jax.Array:
     assert token_bytes % WORD_BYTES == 0, (
         f"token_bytes ({token_bytes}) must be a multiple of {WORD_BYTES}"
     )
+    word_width = token_bytes // WORD_BYTES
+    u8 = jax.lax.bitcast_convert_type(values, jnp.uint8).reshape(values.shape[0], -1)
+    if u8.shape[-1] == 2 * word_width:
+        bands = u8.reshape(u8.shape[0], 2, word_width).astype(jnp.uint32)
+        return bands[:, 0] | (bands[:, 1] << 8)
     u8 = as_token_bytes(values, token_bytes)
-    bands = u8.reshape(u8.shape[0], WORD_BYTES, token_bytes // WORD_BYTES).astype(
-        jnp.uint32
-    )
+    bands = u8.reshape(u8.shape[0], WORD_BYTES, word_width).astype(jnp.uint32)
     return bands[:, 0] | (bands[:, 1] << 8) | (bands[:, 2] << 16) | (bands[:, 3] << 24)
 
 
@@ -226,12 +229,17 @@ def _row_positions(
     """
     num_seqs = seq_lens.shape[0]
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_id = jnp.searchsorted(query_start_loc[1:], tok, side="right").astype(jnp.int32)
-    valid = tok < query_start_loc[-1]
-
-    seq_id = jnp.minimum(seq_id, num_seqs - 1)
-    q_len = query_start_loc[seq_id + 1] - query_start_loc[seq_id]
-    pos = seq_lens[seq_id] - q_len + (tok - query_start_loc[seq_id])
+    tok_col = tok[:, None]
+    member = (tok_col >= query_start_loc[None, :-1]) & (
+        tok_col < query_start_loc[None, 1:]
+    )
+    seq_id = jnp.sum(
+        jnp.where(member, jnp.arange(num_seqs, dtype=jnp.int32)[None, :], 0),
+        axis=1,
+    )
+    pos_offset = seq_lens - query_start_loc[1:]
+    pos = tok + jnp.sum(jnp.where(member, pos_offset[None, :], 0), axis=1)
+    valid = jnp.any(member, axis=1)
     return tok, seq_id, pos, valid
 
 
@@ -405,6 +413,19 @@ def _scatter_caches(
     from vllm_torchtpu.kernels.mla import scatter
 
     dst_rows = _dst_rows(page, slot, nope_spec.page_size)
+    if (
+        nope_spec.layout is KVCacheLayout.SPARSECORE
+        and rope_spec.layout is KVCacheLayout.SPARSECORE
+    ):
+        return scatter.scatter_pair(
+            kv_cache_nope,
+            kv_c_normed,
+            nope_spec,
+            kv_cache_rope,
+            k_pe,
+            rope_spec,
+            dst_rows=dst_rows,
+        )
     kv_cache_nope = scatter.scatter(
         kv_cache_nope, kv_c_normed, nope_spec, dst_rows=dst_rows
     )

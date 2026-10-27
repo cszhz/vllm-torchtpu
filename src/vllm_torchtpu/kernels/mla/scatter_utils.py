@@ -219,3 +219,155 @@ def scatter_rows(
     )(dst_rows, src.reshape(-1, row_width), cache_ref)
 
     return jax.freeze(cache_ref).reshape(cache.shape)
+
+
+def _scatter_pair_kernel(
+    dst_hbm_ref: Any,
+    src_nope_ref: Any,
+    src_rope_ref: Any,
+    cache_nope_ref: Any,
+    cache_rope_ref: Any,
+    sem_nope: Any,
+    sem_rope: Any,
+    *,
+    core_axis_name: str,
+    subcore_axis_name: str,
+    plan: Plan,
+) -> None:
+    core_index = lax.axis_index((core_axis_name, subcore_axis_name))
+    num_rows = cache_nope_ref.shape[0]
+
+    block_slot = core_index // plan.cores_per_block
+    lane_group = lax.rem(core_index, plan.cores_per_block)
+
+    def block_index(step):
+        return step * plan.blocks_per_round + block_slot
+
+    def body(dst_ref, src_nope_buf, src_rope_buf):
+        dst_rows = dst_ref[...]
+        copies = []
+        for i in range(plan.lanes_per_block):
+            dst = dst_rows[i]
+            write = jnp.logical_and(dst >= 0, dst < num_rows)
+            if plan.cores_per_block > 1:
+                write = jnp.logical_and(write, lane_group == i // plan.lanes_per_core)
+            row = jnp.clip(dst, 0, num_rows - 1)
+            copy_nope = pltpu.make_async_copy(
+                src_nope_buf.at[pl.ds(i, 1)],
+                cache_nope_ref.at[pl.ds(row, 1)],
+                sem_nope.at[i],
+            )
+            copy_rope = pltpu.make_async_copy(
+                src_rope_buf.at[pl.ds(i, 1)],
+                cache_rope_ref.at[pl.ds(row, 1)],
+                sem_rope.at[i],
+            )
+            copies.append((write, copy_nope, copy_rope))
+
+            @pl.when(write)
+            def _(cn=copy_nope, cr=copy_rope):
+                cn.start()
+                cr.start()
+
+        for write, cn, cr in copies:
+
+            @pl.when(write)
+            def _(cn=cn, cr=cr):
+                cn.wait()
+                cr.wait()
+
+    pltpu.emit_pipeline(
+        body,
+        grid=(plan.steps_per_core,),
+        tiling=pltpu.Tiling.SPARSE_CORE,
+        in_specs=(
+            pl.BlockSpec(
+                (plan.lanes_per_block,),
+                lambda r: (block_index(r),),
+            ),
+            pl.BlockSpec(
+                (plan.lanes_per_block, src_nope_ref.shape[-1]),
+                lambda r: (block_index(r), 0),
+            ),
+            pl.BlockSpec(
+                (plan.lanes_per_block, src_rope_ref.shape[-1]),
+                lambda r: (block_index(r), 0),
+            ),
+        ),
+    )(dst_hbm_ref, src_nope_ref, src_rope_ref)
+
+
+def scatter_pair_rows(
+    cache_nope: jax.Array,
+    src_nope: jax.Array,
+    cache_rope: jax.Array,
+    src_rope: jax.Array,
+    dst_rows: jax.Array,
+    name: str = "scatter_nope_rope_sparsecore_cache",
+) -> tuple[jax.Array, jax.Array]:
+    """Writes one row of `src_nope` and `src_rope` per token into SC caches."""
+    assert cache_nope.dtype == jnp.uint32 and src_nope.dtype == jnp.uint32, (
+        f"nope cache/src must be uint32, got {cache_nope.dtype}/{src_nope.dtype}"
+    )
+    assert cache_rope.dtype == jnp.uint32 and src_rope.dtype == jnp.uint32, (
+        f"rope cache/src must be uint32, got {cache_rope.dtype}/{src_rope.dtype}"
+    )
+    assert src_nope.shape[0] == src_rope.shape[0], (
+        f"token counts must match: {src_nope.shape[0]} vs {src_rope.shape[0]}"
+    )
+
+    sc_info = pltpu.get_tpu_info().sparse_core
+    assert sc_info is not None, "SparseCore info is missing."
+    num_cores = sc_info.num_cores * sc_info.num_subcores
+    plan = split_plan(src_nope.shape[0], sc_info.num_lanes, num_cores)
+
+    pad_tokens = plan.total_tokens - src_nope.shape[0]
+    if pad_tokens > 0:
+        dst_rows = jnp.pad(
+            dst_rows, (0, pad_tokens), constant_values=kv_cache_utils.SKIP_ROW
+        )
+        src_nope = jnp.pad(src_nope, ((0, pad_tokens), (0, 0)))
+        src_rope = jnp.pad(src_rope, ((0, pad_tokens), (0, 0)))
+
+    nope_width = src_nope.shape[-1]
+    rope_width = src_rope.shape[-1]
+    cache_nope_ref = jax.new_ref(cache_nope.reshape(-1, nope_width))
+    cache_rope_ref = jax.new_ref(cache_rope.reshape(-1, rope_width))
+
+    vector_mesh = plsc.VectorSubcoreMesh(
+        num_cores=sc_info.num_cores,
+        num_subcores=sc_info.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    pl.kernel(
+        functools.partial(
+            _scatter_pair_kernel,
+            core_axis_name=vector_mesh.core_axis_name,
+            subcore_axis_name=vector_mesh.subcore_axis_name,
+            plan=plan,
+        ),
+        out_type=(),
+        scratch_types=(
+            pltpu.SemaphoreType.DMA((plan.lanes_per_block,)),
+            pltpu.SemaphoreType.DMA((plan.lanes_per_block,)),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=False,
+            needs_layout_passes=True,
+            disable_bounds_checks=True,
+        ),
+        mesh=vector_mesh,
+        name=name,
+    )(
+        dst_rows,
+        src_nope.reshape(-1, nope_width),
+        src_rope.reshape(-1, rope_width),
+        cache_nope_ref,
+        cache_rope_ref,
+    )
+
+    return (
+        jax.freeze(cache_nope_ref).reshape(cache_nope.shape),
+        jax.freeze(cache_rope_ref).reshape(cache_rope.shape),
+    )

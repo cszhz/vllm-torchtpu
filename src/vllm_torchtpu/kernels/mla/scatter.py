@@ -70,3 +70,28 @@ def scatter(
         dst_rows,
         name=f"scatter_{spec.cache_type.value}_{spec.layout.value}_cache",
     )
+
+
+def scatter_pair(
+    cache_nope: jax.Array,
+    values_nope: jax.Array,
+    nope_spec: kv_cache_utils.SparseMLAKVCacheSpec,
+    cache_rope: jax.Array,
+    values_rope: jax.Array,
+    rope_spec: kv_cache_utils.SparseMLAKVCacheSpec,
+    dst_rows: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Packs `values_nope` and `values_rope` and scatters both in one SC kernel."""
+    assert (
+        nope_spec.layout is kv_cache_utils.KVCacheLayout.SPARSECORE
+        and rope_spec.layout is kv_cache_utils.KVCacheLayout.SPARSECORE
+    ), "scatter_pair requires SPARSECORE layout for both nope and rope caches"
+    src_nope = kv_cache_utils.pack_tokens(values_nope, nope_spec.token_bytes)
+    src_rope = kv_cache_utils.pack_tokens(values_rope, rope_spec.token_bytes)
+    return scatter_utils.scatter_pair_rows(
+        cache_nope,
+        src_nope,
+        cache_rope,
+        src_rope,
+        dst_rows,
+    )
