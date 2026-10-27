@@ -280,8 +280,9 @@ def _unpack_bits_vreg(
     if bits == 4:
         parts = []
         for plane in planes:
-            parts.append((plane & jnp.uint8(0xF)) if mask_lo else plane)
-            parts.append(plane >> jnp.uint8(4))
+            plane_u32 = plane.astype(jnp.uint32)
+            parts.append((plane_u32 & jnp.uint32(0xF)) if mask_lo else plane_u32)
+            parts.append(plane_u32 >> jnp.uint32(4))
         return jnp.concatenate(parts, axis=0).astype(out_dtype)
     assert bits == 3, bits
     unpacked = []
@@ -607,12 +608,16 @@ def _update_tq_page_vreg(
         if bits == 4:
             half = p_sz // 2
             m_lo, m_hi = valid_mask[:half], valid_mask[half:]
-            n_lo = (new_idx if is_single else new_idx[:half]) & jnp.uint8(0xF)
+            old_u32 = old_plane.astype(jnp.uint32)
+            new_u32 = new_idx.astype(jnp.uint32)
+            n_lo = (new_u32 if is_single else new_u32[:half]) & jnp.uint32(0xF)
             n_hi = (
-                (new_idx if is_single else new_idx[half:]) & jnp.uint8(0xF)
-            ) << jnp.uint8(4)
-            merged = jnp.where(m_lo, (old_plane & jnp.uint8(0xF0)) | n_lo, old_plane)
-            return jnp.where(m_hi, (merged & jnp.uint8(0x0F)) | n_hi, merged)
+                (new_u32 if is_single else new_u32[half:]) & jnp.uint32(0xF)
+            ) << jnp.uint32(4)
+            merged = jnp.where(m_lo, (old_u32 & jnp.uint32(0xF0)) | n_lo, old_u32)
+            return jnp.where(m_hi, (merged & jnp.uint32(0x0F)) | n_hi, merged).astype(
+                jnp.uint8
+            )
         assert bits == 3, bits
         grp = p_sz // 8
         old_u32 = old_plane.astype(jnp.uint32)
@@ -649,10 +654,14 @@ def _update_tq_page_vreg(
         old_vp = old_page[k_words + fold_i * v_wpf : k_words + (fold_i + 1) * v_wpf]
         if layout.is_key_fp8:
             new_ku, new_vi = tok_words[fold_i], tok_words[folds + fold_i]
-            k_planes.append(jnp.where(valid_mask, new_ku, old_kp))
+            k_planes.append(
+                jnp.where(
+                    valid_mask, new_ku.astype(jnp.uint32), old_kp.astype(jnp.uint32)
+                ).astype(jnp.uint8)
+            )
         else:
-            kv_nib = tok_words[fold_i]
-            new_ku, new_vi = kv_nib, kv_nib >> jnp.uint8(4)
+            kv_nib = tok_words[fold_i].astype(jnp.uint32)
+            new_ku, new_vi = kv_nib, kv_nib >> jnp.uint32(4)
             k_planes.append(_merge_bits_vreg(old_kp, new_ku, layout.key_bits))
         v_planes.append(_merge_bits_vreg(old_vp, new_vi, layout.value_bits))
 
@@ -669,16 +678,24 @@ def _update_tq_page_vreg(
         assert slot_idx is not None
         col_match = (col_slot == slot_idx) & in_bounds
         meta_planes = [
-            jnp.where(col_match, tok_words[m_off + mw], old_meta[mw : mw + 1])
+            jnp.where(
+                col_match,
+                tok_words[m_off + mw].astype(jnp.uint32),
+                old_meta[mw : mw + 1].astype(jnp.uint32),
+            ).astype(jnp.uint8)
             for mw in range(meta_words)
         ]
     else:
         row_iota = jax.lax.broadcasted_iota(jnp.int32, (p_sz, _WORD_SIZE), 0)
         match = valid_mask & (row_iota == col_slot) & in_bounds
-        msk = _reduce_or_axis0(jnp.where(match, jnp.uint8(0xFF), jnp.uint8(0)))
+        msk = _reduce_or_axis0(jnp.where(match, jnp.uint32(0xFF), jnp.uint32(0)))
         meta_planes = [
-            (old_meta[mw : mw + 1] & ~msk)
-            | _reduce_or_axis0(jnp.where(match, tok_words[m_off + mw], jnp.uint8(0)))
+            (
+                (old_meta[mw : mw + 1].astype(jnp.uint32) & ~msk)
+                | _reduce_or_axis0(
+                    jnp.where(match, tok_words[m_off + mw].astype(jnp.uint32), 0)
+                )
+            ).astype(jnp.uint8)
             for mw in range(meta_words)
         ]
 
@@ -741,14 +758,13 @@ def tq_ragged_paged_attention(
             k_in = (keys if k_rot is None else k_rot).astype(compute_dtype)
 
     dequant_fn = functools.partial(_dequant_tq_page_vreg, layout=layout, tables=tables)
-    tq_new_kv = None
+    dequant_1 = functools.partial(dequant_fn, kv_dtype=compute_dtype)
+    v_in = values.astype(compute_dtype)
     if not skip_kv_update:
         nk_u, nv_i, n_meta = _quantize_kv_components(
             keys, values, layout, tables, rotated_key=k_rot
         )
         tq_new_kv = _pack_new_tq_tokens_128(nk_u, nv_i, n_meta, page_size, layout)
-
-    if not skip_kv_update:
         max_num_seqs = kv_lens.shape[0]
         pages_per_seq = page_indices.shape[0] // max_num_seqs
         num_seqs = distribution[2]
@@ -771,7 +787,6 @@ def tq_ragged_paged_attention(
         slot_iota = jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
 
         def _apply_tok(tok_i, cache):
-            assert tq_new_kv is not None
             slot_in_p = slot_in_pages[tok_i]
             page_i = page_indices[local_page[tok_i]]
             valid_mask = (slot_in_p >= 0) & (slot_iota == slot_in_p)
@@ -785,9 +800,14 @@ def tq_ragged_paged_attention(
             return cache.at[page_i].set(jnp.where(slot_in_p >= 0, new_p, old_p))
 
         kv_cache = jax.lax.fori_loop(0, num_tokens, _apply_tok, kv_cache)
+        hist_k, hist_v = jax.vmap(jax.vmap(dequant_1))(kv_cache[page_indices])
+        is_decode = (tok_idx < cu_q_lens[distribution[0]])[:, None, None]
+        slot_clamped = jnp.maximum(slot_in_pages, 0)
+        k_in = jnp.where(is_decode, hist_k[local_page, :, slot_clamped, :], k_in)
+        v_in = jnp.where(is_decode, hist_v[local_page, :, slot_clamped, :], v_in)
+    else:
+        hist_k, hist_v = jax.vmap(jax.vmap(dequant_1))(kv_cache[page_indices])
 
-    dequant_1 = functools.partial(dequant_fn, kv_dtype=compute_dtype)
-    hist_k, hist_v = jax.vmap(jax.vmap(dequant_1))(kv_cache[page_indices])
     n_pages, n_heads, _, head_dim = hist_k.shape
     merged = merge_kv(
         hist_k.swapaxes(1, 2).reshape(n_pages * page_size, n_heads, head_dim),
@@ -799,7 +819,7 @@ def tq_ragged_paged_attention(
     outputs, _ = rpa_fn(
         q_in,
         k_in,
-        values.astype(compute_dtype),
+        v_in,
         pool,
         kv_lens,
         pool_page_indices,
