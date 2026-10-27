@@ -309,7 +309,8 @@ def maybe_log(dp_rank: int) -> None:
                 )
         except Exception as e:  # noqa: BLE001 - fall back for good
             logger.warning(
-                "expert load | asynchronous readback failed (%s); reading synchronously",
+                "expert load | asynchronous readback failed (%s); reading "
+                "synchronously",
                 e,
             )
             _STATE["raw_disabled"] = True
