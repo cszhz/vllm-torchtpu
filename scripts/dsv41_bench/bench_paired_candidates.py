@@ -250,7 +250,6 @@ def main():
     gathered = measure(
         "gather",
         functools.partial(
-            candidate_membership,
             gather_candidate_keys,
             block=min(args.block, args.page_size),
             layout=layout,
