@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
@@ -759,6 +760,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # arming everything. Below the threshold the grouped-matmul path serves.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS": lambda: int(
         os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")
+    ),
+    # Per-rank padded input token count below which an armed fused EP MoE op
+    # routes the compiled bucket to grouped matmul instead of fused EP. 0 keeps
+    # fused EP on every step.
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 0
     ),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
