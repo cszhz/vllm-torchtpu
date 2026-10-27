@@ -761,12 +761,17 @@ def _select_prepared(
     candidates = PreparedCandidates(*prepared)
     lengths = jnp.where(candidates.valid_queries, lengths, 0)
 
-    ids = jnp.arange(min(topk, width), dtype=jnp.int32)
-    short = jnp.where(ids[None, :] < lengths[:, None], ids[None, :], -1)
-    # Select rather than branch: a conditional would fence the final SparseCore
-    # top-k from the following layer's independent TensorCore work. Steady
-    # decode always scores, so the short path costs only a vector select.
-    scored = _score_prepared(
-        q, weights, lengths, candidates, topk, block, unordered, width, grouped=True
+    def short():
+        ids = jnp.broadcast_to(
+            jnp.arange(min(topk, width), dtype=jnp.int32),
+            (q.shape[0], min(topk, width)),
+        )
+        return jnp.where(ids < lengths[:, None], ids, -1)
+
+    return jax.lax.cond(
+        jnp.max(lengths) <= topk,
+        short,
+        lambda: _score_prepared(
+            q, weights, lengths, candidates, topk, block, unordered, width, grouped=True
+        ),
     )
-    return jnp.where(jnp.max(lengths) <= topk, short, scored)
