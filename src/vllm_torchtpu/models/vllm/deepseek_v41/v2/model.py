@@ -94,6 +94,24 @@ def _ced_config(
     return ced_enabled, ced_boundary
 
 
+def _with_window_starts(context, first, positions):
+    """Publish each request's SWA bounded replay start to the attention layers."""
+    requests = first.seq_lens.shape[0] if first is not None else 1
+    hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
+    window_starts = torch.tensor(
+        hits + (0,) * (requests - len(hits)),
+        dtype=positions.dtype,
+        device=positions.device,
+    )
+    return replace(
+        context,
+        additional_kwargs={
+            **context.additional_kwargs,
+            "deepseek_v41_window_starts": window_starts,
+        },
+    )
+
+
 def _scatter_decoder_rows(
     tensor: torch.Tensor, indices: torch.Tensor, total_rows: int
 ) -> torch.Tensor:
@@ -647,7 +665,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             )
             self._engram_prepared_outside_stage = True
         try:
-            if not self._ced_enabled:
+            if not self._ced_enabled and not getattr(self, "_prefix_replay", False):
                 return self.full_stage(
                     input_ids,
                     positions,
@@ -660,21 +678,20 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             first = (
                 next(iter(metadata.values())) if isinstance(metadata, dict) else None
             )
+            if not self._ced_enabled:
+                # Full forward with prefix caching replays the SWA window too.
+                with override_forward_context(
+                    _with_window_starts(context, first, positions)
+                ):
+                    return self.full_stage(
+                        input_ids,
+                        positions,
+                        intermediate_tensors,
+                        inputs_embeds,
+                        lookback_token_ids,
+                    )
             # Keep the window bounds upload after Engram's blocking hash D2H.
-            requests = first.seq_lens.shape[0] if first is not None else 1
-            hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
-            window_starts = torch.tensor(
-                hits + (0,) * (requests - len(hits)),
-                dtype=positions.dtype,
-                device=positions.device,
-            )
-            encoder_context = replace(
-                context,
-                additional_kwargs={
-                    **context.additional_kwargs,
-                    "deepseek_v41_window_starts": window_starts,
-                },
-            )
+            encoder_context = _with_window_starts(context, first, positions)
             with override_forward_context(encoder_context):
                 if getattr(self, "_engram_split_layer", None) is None:
                     encoded = self.encoder_stage(
@@ -1177,6 +1194,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         self._ced_enabled, self._ced_boundary = _ced_config(
             vllm_config, warn_prefix_caching=True, fallback_config=self.config
         )
+        self._prefix_replay = prefix_replay_enabled(vllm_config)
         self._ced_window = self.layers[self._ced_boundary].attn.window_size
         self._ced_compile_sizes = tuple(
             n
