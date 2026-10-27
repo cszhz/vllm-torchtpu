@@ -135,21 +135,6 @@ def _window_kernel(
     )
     pipeline(refs.data.source.bitcast(jnp.uint32))
 
-    # Drain the scatters of the window's last two steps (one per out_vmem slot).
-    num_steps = chunks_in_window * cfg.num_col_chunks
-    for slot in range(2):
-        pl.when(num_steps > slot)(functools.partial(_wait_scatters, refs, slot, cfg))
-
-
-def _wait_scatters(refs: memory_ref.KernelRefs, slot, cfg: config.Config):
-    """Waits for one step's row scatter from ``out_vmem[slot]``."""
-    rows = jnp.zeros((cfg.sc_info.num_lanes,), jnp.int32)
-    pltpu.make_async_copy(
-        refs.scratch.out_vmem.at[slot],
-        refs.data.out.at[rows, pl.ds(0, cfg.col_chunk_size)],
-        refs.scratch.sem.at[1 + slot],
-    ).wait()
-
 
 def _col_gather_spec(
     src_indices_vmem: jax.Ref,
@@ -193,9 +178,6 @@ def _col_kernel(
     num_simd_lanes = cfg.sc_info.num_lanes
     scratch = refs.scratch
     out_vmem = scratch.out_vmem
-
-    # out_vmem[slot] is still the source of the scatters issued two steps ago.
-    pl.when(step >= 2)(functools.partial(_wait_scatters, refs, slot, cfg))
 
     row_slice = pl.ds(r * num_simd_lanes, num_simd_lanes)
     tw_slice = scratch.tw_f32_vmem[row_slice]
@@ -267,10 +249,11 @@ def _col_kernel(
         garbage_dst,
     )
 
-    # One indirect scatter of the 16 rows, waited two steps later, so it drains
-    # under the next step.
-    pltpu.make_async_copy(
+    # One indirect scatter of the 16 rows, completed within the step.
+    scatter = pltpu.make_async_copy(
         out_vmem.at[slot],
         refs.data.out.at[dst_rows, pl.ds(col_hbm_start, cfg.col_chunk_size)],
         scratch.sem.at[1 + slot],
-    ).start()
+    )
+    scatter.start()
+    scatter.wait()
