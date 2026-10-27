@@ -711,6 +711,7 @@ def dense_proj_matmul(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
         ),
         name="dense_proj_matmul",
     )(
