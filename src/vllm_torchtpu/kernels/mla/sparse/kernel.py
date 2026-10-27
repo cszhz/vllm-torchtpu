@@ -1087,7 +1087,7 @@ def sparse_ragged_paged_attention(
     sparsecore_atoms_per_batch: int = 16,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
-    small_chunk_tokens: int = 16,
+    small_chunk_tokens: int = 32,
     small_chunk_batch_size: int | None = 1,
     small_chunk_live_gather: bool = True,
     small_chunk_gather_atoms: int = 1,

@@ -32,6 +32,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj, rotate_neox
 from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
     DeepseekScalingRotaryEmbedding,
@@ -790,6 +791,105 @@ class VllmTPUIndexerCache(DeepseekV32IndexerCache):
         return VllmTPUDeepseekV32IndexerBackend
 
 
+def _build_rope_matmul_tensors(
+    rope_dim: int,
+    total_dim: int,
+    is_neox_style: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Build (P, R, B_nope) for matmul-based RoPE rotation on `(..., total_dim)`.
+
+    Rotates `[:rope_dim]` by half-dim `(cos, sin)` of shape `(T, rope_dim // 2)`
+    and leaves `[rope_dim:]` unchanged:
+        cos_full = cos @ R (+ B_nope if total_dim > rope_dim)
+        sin_full = sin @ R
+        out = x * cos_full + (x @ P) * sin_full
+    Every column of `P` and `R` has at most one `+-1` entry, so the MXU matmuls
+    are bit-exact in `bfloat16` and avoid `::2` strided views (`aten.as_strided`),
+    size-2 minor dimensions, and sub-tile split/cat ops.
+    Built purely from functional tensor ops (`eye`/`zeros`/`ones`/`stack`/`cat`)
+    so no `index_put_` is emitted if traced under `torch.compile`.
+    """
+    half = rope_dim // 2
+    eye = torch.eye(half, dtype=dtype, device=device)
+    zeros = torch.zeros(half, half, dtype=dtype, device=device)
+    if is_neox_style:
+        r_rope = torch.cat([eye, eye], dim=1)
+        p_rope = torch.cat(
+            [
+                torch.cat([zeros, eye], dim=1),
+                torch.cat([-eye, zeros], dim=1),
+            ],
+            dim=0,
+        )
+    else:
+        r_rope = torch.stack([eye, eye], dim=-1).reshape(half, rope_dim)
+        row_even = torch.stack([zeros, eye], dim=-1).reshape(half, rope_dim)
+        row_odd = torch.stack([-eye, zeros], dim=-1).reshape(half, rope_dim)
+        p_rope = torch.stack([row_even, row_odd], dim=1).reshape(rope_dim, rope_dim)
+    if total_dim > rope_dim:
+        nope_dim = total_dim - rope_dim
+        r = torch.cat(
+            [r_rope, torch.zeros(half, nope_dim, dtype=dtype, device=device)],
+            dim=1,
+        )
+        p_top = torch.cat(
+            [p_rope, torch.zeros(rope_dim, nope_dim, dtype=dtype, device=device)],
+            dim=1,
+        )
+        p = torch.cat(
+            [p_top, torch.zeros(nope_dim, total_dim, dtype=dtype, device=device)],
+            dim=0,
+        )
+        b_nope: torch.Tensor | None = torch.cat(
+            [
+                torch.zeros(1, rope_dim, dtype=dtype, device=device),
+                torch.ones(1, nope_dim, dtype=dtype, device=device),
+            ],
+            dim=1,
+        )
+    else:
+        p = p_rope
+        r = r_rope
+        b_nope = None
+    return p, r, b_nope
+
+
+def _get_rope_matmul_buffers(
+    module: torch.nn.Module,
+    rope_dim: int,
+    total_dim: int,
+    is_neox_style: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Return `(P, R, B_nope)` registered as non-persistent buffers on `module`."""
+    p_buf = getattr(module, "_tpu_rope_p", None)
+    key = (rope_dim, total_dim, is_neox_style, dtype)
+    if (
+        p_buf is None
+        or getattr(module, "_tpu_rope_matmul_key", None) != key
+        or p_buf.device.type != device.type
+        or (device.index is not None and p_buf.device.index != device.index)
+    ):
+        p, r, b_nope = _build_rope_matmul_tensors(
+            rope_dim, total_dim, is_neox_style, dtype, device
+        )
+        if not torch.compiler.is_compiling():
+            module.register_buffer("_tpu_rope_p", p, persistent=False)
+            module.register_buffer("_tpu_rope_r", r, persistent=False)
+            module.register_buffer("_tpu_rope_b_nope", b_nope, persistent=False)
+            module._tpu_rope_matmul_key = key  # type: ignore[assignment]
+        else:
+            return p, r, b_nope
+    return (
+        cast(torch.Tensor, module._tpu_rope_p),
+        cast(torch.Tensor, module._tpu_rope_r),
+        cast("torch.Tensor | None", module._tpu_rope_b_nope),
+    )
+
+
 class VllmTPUIndexer(Indexer):
     """TPU-optimized out-of-tree wrapper for Indexer.
 
@@ -826,30 +926,58 @@ class VllmTPUIndexer(Indexer):
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
         # Fused wk + weights_proj: one GEMM, then split
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
 
         k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
 
-        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-        # Note: RoPE (NeoX) can introduce extra leading dimensions during
-        # compilation so we need to reshape back to token-flattened shapes
-        q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
-        k_pe = k_pe.reshape(-1, 1, self.rope_dim)
+        if (
+            q.dtype == torch.bfloat16
+            and type(rotary_emb) is RotaryEmbedding
+            and rotary_emb.rotary_dim == self.rope_dim
+            and rotary_emb.head_size == self.rope_dim
+        ):
+            cos_sin = rotary_emb._match_cos_sin_cache_dtype(q).index_select(
+                0, positions.flatten()
+            )
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            p_mat, r_mat, b_nope = _get_rope_matmul_buffers(
+                self,
+                self.rope_dim,
+                self.head_dim,
+                rotary_emb.is_neox_style,
+                q.dtype,
+                q.device,
+            )
+            cos_full = torch.matmul(cos, r_mat)
+            if b_nope is not None:
+                cos_full = cos_full + b_nope
+            sin_full = torch.matmul(sin, r_mat)
+            q = q * cos_full.unsqueeze(-2) + torch.matmul(
+                q, p_mat
+            ) * sin_full.unsqueeze(-2)
+            k = k * cos_full + torch.matmul(k, p_mat) * sin_full
+        else:
+            q_pe, q_nope = torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+            k_pe, k_nope = torch.split(
+                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
 
-        # `rotary_emb` is shape-preserving; `q_pe` is already
-        # [num_tokens, n_head, rope_dim].
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
-        k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+            # Note: RoPE (NeoX) can introduce extra leading dimensions during
+            # compilation so we need to reshape back to token-flattened shapes
+            q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+            k_pe = k_pe.reshape(-1, 1, self.rope_dim)
+
+            # `rotary_emb` is shape-preserving; `q_pe` is already
+            # [num_tokens, n_head, rope_dim].
+            q = torch.cat([q_pe, q_nope], dim=-1)
+            # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
+            k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
@@ -1202,9 +1330,59 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             # torch's stubs resolve this hasattr-guarded method as a Tensor.
             # pyrefly: ignore[not-callable]
             super().process_weights_after_loading(act_dtype)
+        device = torch.device("tpu")
+        rope_sync: list[torch.Tensor] = []
         if self.rotary_emb is not None and hasattr(self.rotary_emb, "cos_sin_cache"):
-            device = torch.device("tpu")
             self.rotary_emb.cos_sin_cache = self.rotary_emb.cos_sin_cache.to(device)
+            rope_sync.append(self.rotary_emb.cos_sin_cache)
+            if (
+                act_dtype == torch.bfloat16
+                and type(self.rotary_emb) is RotaryEmbedding
+                and not self.rotary_emb.is_neox_style
+                and self.rotary_emb.rotary_dim == self.qk_rope_head_dim
+            ):
+                p, r, _ = _get_rope_matmul_buffers(
+                    self,
+                    self.qk_rope_head_dim,
+                    self.qk_rope_head_dim,
+                    False,
+                    act_dtype,
+                    device,
+                )
+                rope_sync.extend((p, r))
+            elif (
+                act_dtype == torch.bfloat16
+                and isinstance(self.rotary_emb, VllmDeepseekScalingRotaryEmbedding)
+                and not self.rotary_emb.is_neox_style
+            ):
+                p, r, _ = _get_rope_matmul_buffers(
+                    self.rotary_emb,
+                    self.rotary_emb.rotary_dim,
+                    self.rotary_emb.rotary_dim,
+                    False,
+                    act_dtype,
+                    device,
+                )
+                rope_sync.extend((p, r))
+        if (
+            self.indexer is not None
+            and act_dtype == torch.bfloat16
+            and type(self.indexer_rope_emb) is RotaryEmbedding
+            and self.indexer_rope_emb.rotary_dim == self.indexer.rope_dim
+        ):
+            p, r, b_nope = _get_rope_matmul_buffers(
+                self.indexer,
+                self.indexer.rope_dim,
+                self.indexer.head_dim,
+                self.indexer_rope_emb.is_neox_style,
+                act_dtype,
+                device,
+            )
+            rope_sync.extend((p, r))
+            if b_nope is not None:
+                rope_sync.append(b_nope)
+        if rope_sync:
+            synchronize_tensors(rope_sync)
 
     def forward(
         self,
@@ -1244,17 +1422,22 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
                 qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
                 if self.gate_is_fused:
-                    q_c, kv_lora, output_gate = qkv_lora.split(
+                    q_c, kv_c, k_pe, output_gate = qkv_lora.split(
                         [
                             self.q_lora_rank,
-                            self.kv_lora_rank + self.qk_rope_head_dim,
+                            self.kv_lora_rank,
+                            self.qk_rope_head_dim,
                             self.num_heads * self.v_head_dim,
                         ],
                         dim=-1,
                     )
                 else:
-                    q_c, kv_lora = qkv_lora.split(
-                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    q_c, kv_c, k_pe = qkv_lora.split(
+                        [
+                            self.q_lora_rank,
+                            self.kv_lora_rank,
+                            self.qk_rope_head_dim,
+                        ],
                         dim=-1,
                     )
                 q_c = self.q_a_layernorm(q_c)
@@ -1268,11 +1451,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 )
                 kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
                 q = self.q_proj(hidden_states)[0]
+                assert kv_lora is not None
+                kv_c, k_pe = kv_lora.split(
+                    [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+                )
 
-            assert kv_lora is not None
-            kv_c, k_pe = kv_lora.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
             kv_c_normed = self.kv_a_layernorm(kv_c)
 
         # `dcp_group_size` is 1 unless query replication is on, in which case
@@ -1284,14 +1467,38 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         k_pe = k_pe.unsqueeze(1)
 
         if self.rotary_emb is not None:
-            q_pe_dtype = q_pe.dtype
-            k_pe_dtype = k_pe.dtype
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-            # RoPE caches/frequencies can be fp32 and promote the rotated
-            # tensors.  Dense MLA requires new KV values to exactly match the
-            # cache dtype, and queries should remain in the activation dtype.
-            q_pe = q_pe.to(dtype=q_pe_dtype)
-            k_pe = k_pe.to(dtype=k_pe_dtype)
+            if (
+                q_pe.dtype == torch.bfloat16
+                and type(self.rotary_emb) is RotaryEmbedding
+                and not self.rotary_emb.is_neox_style
+                and self.rotary_emb.rotary_dim == self.qk_rope_head_dim
+                and self.rotary_emb.head_size == self.qk_rope_head_dim
+            ):
+                cos_sin = self.rotary_emb._match_cos_sin_cache_dtype(q_pe).index_select(
+                    0, positions.flatten()
+                )
+                cos, sin = cos_sin.chunk(2, dim=-1)
+                p_mat, r_mat, _ = _get_rope_matmul_buffers(
+                    self,
+                    self.qk_rope_head_dim,
+                    self.qk_rope_head_dim,
+                    False,
+                    q_pe.dtype,
+                    q_pe.device,
+                )
+                cos2 = torch.matmul(cos, r_mat).unsqueeze(-2)
+                sin2 = torch.matmul(sin, r_mat).unsqueeze(-2)
+                q_pe = q_pe * cos2 + torch.matmul(q_pe, p_mat) * sin2
+                k_pe = k_pe * cos2 + torch.matmul(k_pe, p_mat) * sin2
+            else:
+                q_pe_dtype = q_pe.dtype
+                k_pe_dtype = k_pe.dtype
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+                # RoPE caches/frequencies can be fp32 and promote the rotated
+                # tensors.  Dense MLA requires new KV values to exactly match the
+                # cache dtype, and queries should remain in the activation dtype.
+                q_pe = q_pe.to(dtype=q_pe_dtype)
+                k_pe = k_pe.to(dtype=k_pe_dtype)
 
         topk_indices = None
         if self.is_sparse:
@@ -1371,13 +1578,28 @@ class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         if self.is_neox_style:
             cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
             sin = torch.cat((sin, sin), dim=-1).unsqueeze(-2)
+            query_rot = query_rot * cos + rotate_neox(query_rot) * sin
+            key_rot = key_rot * cos + rotate_neox(key_rot) * sin
+        elif query_rot.dtype == torch.bfloat16 and key_rot.dtype == torch.bfloat16:
+            cos = cos.to(query_rot.dtype)
+            sin = sin.to(query_rot.dtype)
+            p_mat, r_mat, _ = _get_rope_matmul_buffers(
+                self,
+                self.rotary_dim,
+                self.rotary_dim,
+                False,
+                query_rot.dtype,
+                query_rot.device,
+            )
+            cos2 = torch.matmul(cos, r_mat).unsqueeze(-2)
+            sin2 = torch.matmul(sin, r_mat).unsqueeze(-2)
+            query_rot = query_rot * cos2 + torch.matmul(query_rot, p_mat) * sin2
+            key_rot = key_rot * cos2 + torch.matmul(key_rot, p_mat) * sin2
         else:
             cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
             sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
-
-        rotate_fn = rotate_neox if self.is_neox_style else rotate_gptj
-        query_rot = query_rot * cos + rotate_fn(query_rot) * sin
-        key_rot = key_rot * cos + rotate_fn(key_rot) * sin
+            query_rot = query_rot * cos + rotate_gptj(query_rot) * sin
+            key_rot = key_rot * cos + rotate_gptj(key_rot) * sin
 
         if self.rotary_dim < self.head_size:
             query = torch.cat((query_rot, query[..., self.rotary_dim :]), dim=-1)

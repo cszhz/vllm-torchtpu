@@ -169,8 +169,8 @@ def _randomize(layer, seed=0):
     return layer
 
 
-def _make_rope(dtype=torch.float32):
-    """A real NeoX `RotaryEmbedding`, as `get_rope` would build for the indexer.
+def _make_rope(dtype=torch.float32, is_neox_style=True):
+    """A real `RotaryEmbedding`, as `get_rope` would build for the indexer.
 
     `CustomOp.__init__` resolves its forward at construction time and needs a
     current vLLM config for that; a bare CompilationConfig is enough and binds
@@ -187,7 +187,7 @@ def _make_rope(dtype=torch.float32):
             rotary_dim=ROPE_DIM,
             max_position_embeddings=MAX_MODEL_LEN,
             base=10000.0,
-            is_neox_style=True,
+            is_neox_style=is_neox_style,
             dtype=dtype,
         )
 
@@ -340,11 +340,12 @@ def test_fused_gemm_shard_order_matches_forward_split():
     _assert_relclose(weights, expected, 1e-5, "weights")
 
 
+@pytest.mark.parametrize("is_neox_style", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_forward_emits_expected_triple(dtype):
+def test_forward_emits_expected_triple(dtype, is_neox_style):
     """The captured triple matches the reference term by term."""
     layer = _randomize(_build_indexer(dtype))
-    rope = _make_rope(dtype)
+    rope = _make_rope(dtype, is_neox_style=is_neox_style)
     num_tokens = 6
 
     out, (hidden_states, qr, positions) = _run(
@@ -364,10 +365,10 @@ def test_forward_emits_expected_triple(dtype):
     assert weights.dtype == dtype
 
     q_ref, k_ref, weights_ref = _reference(layer, hidden_states, qr, positions, rope)
-    # In bf16 a 1-ULP reassociation is ~0.4%; fp8 e4m3 error would be ~10x
-    # that, so these still separate "kept in the activation dtype" from
-    # "silently quantized".
-    tol = 1e-5 if dtype == torch.float32 else 5e-3
+    # In bf16 a 1-ULP reassociation is up to 2^-7 (~0.78%) near the bottom of an
+    # exponent bin; fp8 e4m3 error would be ~10x that, so these still separate
+    # "kept in the activation dtype" from "silently quantized".
+    tol = 1e-5 if dtype == torch.float32 else 8e-3
 
     # k is handed over unquantized: the fp8 conversion is fused into the cache
     # insertion inside the op, so nothing may perturb it here.
