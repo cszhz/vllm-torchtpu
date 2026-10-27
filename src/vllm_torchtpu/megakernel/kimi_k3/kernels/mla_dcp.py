@@ -944,11 +944,16 @@ class DcpAttention:
                                               preferred_element_type=jnp.float32)  # [group, 128]
                 row = slots * (start + rows - 1) + part
                 if rows == 2:
-                    # Whole-block update: single-row stores fail on 4-row packets.
-                    block = ws.send[:, :, pl.ds(0, 128)]
+                    # Packets under one sublane tile: update the whole buffer
+                    # (partial-tile loads and stores fail to lower).
+                    block = ws.send[...]
+                    width = block.shape[-1]
+                    wide = jnp.concatenate(
+                        (vectors, jnp.zeros((vectors.shape[0], width - 128), jnp.float32)), axis=1)
                     packet_row = jax.lax.broadcasted_iota(jnp.int32, block.shape, 1)
-                    ws.send[:, :, pl.ds(0, 128)] = jnp.where(
-                        packet_row == row, vectors[:, None, :].astype(jnp.bfloat16), block)
+                    packet_lane = jax.lax.broadcasted_iota(jnp.int32, block.shape, 2)
+                    ws.send[...] = jnp.where((packet_row == row) & (packet_lane < 128),
+                                             wide[:, None, :].astype(block.dtype), block)
                 else:
                     ws.send[:, pl.ds(row, 1), pl.ds(0, 128)] = vectors[:, None, :].astype(jnp.bfloat16)
 
@@ -1238,6 +1243,10 @@ def _merge_received_keys(received, own_rows, keys, key_valid, group, *, unroll=1
     every peer's log-sum-exp (lanes 512:514) in one load, one maximum, then a
     weighted sum of the partials (no rescaling or exp per peer)."""
     del unroll
+    if received.shape[1] < 8:
+        # Packets under one sublane tile (2-row sequences): load them whole, then
+        # slice the value (partial-tile loads fail to lower).
+        received = received[...]
     keys = keys.astype(jnp.float32)
     scores = jax.lax.dot_general(own_rows, keys, (((1, ), (1, )), ((), ())),
                                  precision=jax.lax.Precision.HIGHEST,
