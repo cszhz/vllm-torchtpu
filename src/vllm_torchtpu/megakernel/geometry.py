@@ -372,8 +372,8 @@ class ModelGeometry:
             VH=vh,
             E=e_tiny,
             TOPK=min(self.TOPK, 4),
-            I=max(i_min, min(self.I, 1024)),
-            IS=max(128 * R, min(self.IS, 1024)),
+            I=max(i_min, min(self.I, 512)),
+            IS=max(128 * R, min(self.IS, 512)),
             e_slots=e_slots,
         )
         mdef = getattr(self, "_model_def", None)
