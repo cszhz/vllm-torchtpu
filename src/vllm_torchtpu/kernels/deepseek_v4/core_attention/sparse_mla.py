@@ -205,6 +205,12 @@ DENSE_KV_BLOCK = 256
 # this many blocks per online-softmax step: each step rescales the f32
 # accumulator once.
 DENSE_BLOCKS_PER_STEP = 2
+# A full step and the 1-block tail step split their token group into this
+# many sub-groups with independent QK -> softmax -> PV chains, so both MXUs
+# share each matmul stage and one sub-group's softmax runs under another's
+# matmuls.
+DENSE_STEP_CHUNKS = 1
+DENSE_TAIL_CHUNKS = 4
 # Nonzero: a batch leaves out the blocks none of its tokens selected.
 DENSE_SKIP_EMPTY_BLOCKS = 0
 # A single-sequence batch whose tokens can select more compressed rows than
@@ -825,14 +831,16 @@ def _attention_kernel(
             @pl.loop(0, num_steps)
             def _(i):
                 rows = [block_row(i * per_step + k) for k in range(per_step)]
-                attend_blocks_from_cache(bi_sem_idx, tokens, rows)
+                attend_blocks_from_cache(bi_sem_idx, tokens, rows, DENSE_STEP_CHUNKS)
 
             for tail in range(1, per_step):
 
                 @pl.when(num_blocks - num_steps * per_step == tail)
                 def _(tail=tail):
                     rows = [block_row(num_steps * per_step + k) for k in range(tail)]
-                    attend_blocks_from_cache(bi_sem_idx, tokens, rows)
+                    attend_blocks_from_cache(
+                        bi_sem_idx, tokens, rows, DENSE_TAIL_CHUNKS
+                    )
 
             out = finish_dense_state(attention_sinks, group)
             for i, b in enumerate(tokens):
@@ -851,19 +859,34 @@ def _attention_kernel(
         dense.l_ref[...] = jnp.broadcast_to(swa_l, dense.l_ref.shape)
         dense.m_ref[...] = jnp.broadcast_to(swa_m, dense.m_ref.shape)
 
-    def attend_blocks_from_cache(bi_sem_idx, tokens, first_rows):
+    def attend_blocks_from_cache(bi_sem_idx, tokens, first_rows, num_chunks):
         """One online-softmax step of `tokens` over the blocks at
         `first_rows`: the tokens share their rows, so each block runs one QK
-        and one PV matmul for all of them."""
+        and one PV matmul per sub-group of them."""
         bkvs = [dense.kv_vmem_ref[pl.ds(r, DENSE_KV_BLOCK)] for r in first_rows]
+        assert len(tokens) % num_chunks == 0
+        chunk = len(tokens) // num_chunks
+        chunks = [tokens[c * chunk : (c + 1) * chunk] for c in range(num_chunks)]
+        # Every QK first: the MXU runs its matmuls in program order.
+        scores = [chunk_qk(bi_sem_idx, ts, bkvs) for ts in chunks]
+        for c, (ts, s) in enumerate(zip(chunks, scores)):
+            attend_chunk(bi_sem_idx, ts, c * chunk * num_q_heads, first_rows, bkvs, s)
+
+    def chunk_qk(bi_sem_idx, tokens, bkvs):
         q = jnp.concatenate([load_bq(bi_sem_idx, b) for b in tokens], axis=0)
-        s = jnp.concatenate(
+        return jnp.concatenate(
             [
                 jnp.einsum("nd,md->nm", q, bkv, preferred_element_type=jnp.float32)
                 for bkv in bkvs
             ],
             axis=1,
         )
+
+    def attend_chunk(bi_sem_idx, tokens, row0, first_rows, bkvs, s):
+        """`attend_blocks_from_cache` for `tokens`, whose state is rows
+        [row0, row0 + len(tokens) * num_q_heads) of the dense state refs, from
+        their QK `s`."""
+        state_rows = pl.ds(row0, len(tokens) * num_q_heads)
         s *= sm_scale
         width = s.shape[1]
         select = jnp.concatenate(
@@ -879,15 +902,15 @@ def _attention_kernel(
             axis=0,
         )
         s = jnp.where(select, s, jnp.finfo(s.dtype).min)
-        m_prev = dense.m_ref[...]
+        m_prev = dense.m_ref[state_rows]
         m_curr = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
         lanes = m_curr.shape[1]
         p = jnp.exp(s - jnp.tile(m_curr, (1, width // lanes)))
         alpha = jnp.exp(m_prev - m_curr)
-        dense.l_ref[...] = alpha * dense.l_ref[...] + jnp.sum(
+        dense.l_ref[state_rows] = alpha * dense.l_ref[state_rows] + jnp.sum(
             p, axis=1, keepdims=True
         )
-        dense.m_ref[...] = m_curr
+        dense.m_ref[state_rows] = m_curr
         pv = sum(
             jnp.einsum(
                 "nm,md->nd",
@@ -897,8 +920,8 @@ def _attention_kernel(
             )
             for k, bkv in enumerate(bkvs)
         )
-        dense.acc_ref[...] = (
-            jnp.tile(alpha, (1, head_dim // lanes)) * dense.acc_ref[...] + pv
+        dense.acc_ref[state_rows] = (
+            jnp.tile(alpha, (1, head_dim // lanes)) * dense.acc_ref[state_rows] + pv
         )
 
     def finish_dense_state(attention_sinks, group):
