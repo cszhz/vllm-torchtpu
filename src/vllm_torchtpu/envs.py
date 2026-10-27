@@ -233,7 +233,7 @@ if TYPE_CHECKING:
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_MEGAKERNEL: str = ""
-    VLLM_TPU_MK_OWN_OPERANDS: bool = False
+    VLLM_TPU_MK_OWN_OPERANDS: bool = True
 
 
 def env_with_choices(
@@ -1451,9 +1451,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable and configure the fused Pallas megakernel ("1"/"true" for defaults,
     # "ep"/"tp" for mode, or "mode=tp,buckets=8:16:32,verify_buckets=4:8:16,ab=1").
     "VLLM_TPU_MEGAKERNEL": env_str("VLLM_TPU_MEGAKERNEL", ""),
-    # Qwen3.8 megakernel: register the packed kernel operands as non-view
-    # tensors (torch_tpu re-materializes a view operand on every call).
-    "VLLM_TPU_MK_OWN_OPERANDS": env_bool("VLLM_TPU_MK_OWN_OPERANDS"),
+    # Qwen3.8 megakernel: boundary-friendly kernel operands (flat smalls, fresh
+    # tensors, small packed operands round-tripped through the host). torch_tpu
+    # re-materializes a buffer with an in-place slice write or a dtype view on
+    # every call (~22 as_strided/step, ~1 ms); exact, so on by default.
+    "VLLM_TPU_MK_OWN_OPERANDS": env_bool("VLLM_TPU_MK_OWN_OPERANDS", True),
 }
 
 
