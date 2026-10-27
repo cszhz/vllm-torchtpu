@@ -67,6 +67,9 @@ SCATTER_RING_DEFAULT = 4
 # Tokens per grid step of the combine's weighted sum, and its token loop's
 # unroll.
 COMBINE_TOKENS_PER_TILE_DEFAULT = 128
+# Config.compact_message: the most rows per shard whose routing message is
+# compacted, and the message's tokens per top-k slot then (half a lane row).
+COMPACT_MESSAGE_TOKENS = LANES // 2
 COMBINE_UNROLL_DEFAULT = 32
 # Columns of the intermediate the FFN kernel activates and requantizes per
 # pass, so the live bf16 intermediate stays small.
@@ -198,6 +201,34 @@ class Config:
         a table whose sort program is over the sparse core's program
         size. None (the default): sorted_rows_by_shape decides from the
         shard's experts and tokens.
+      combine_real_tokens: the combine gathers and sums only the real
+        tokens' pairs (padded to a sublane tile) rather than the routing
+        message's whole token padding (a multiple of 128 tokens), and
+        reads the gathered rows without copying the real prefix out.
+        The same per-token sum, so the output is bit-identical; it pays
+        off when a shard has far fewer tokens than the message holds.
+      sort_index_compare: the sorted-rows gather's live-row mask as one
+        compare of every row against the (expert, shard) runs, instead
+        of two scatter-adds and a running sum. The same mask.
+      compact_message: a shard of at most COMPACT_MESSAGE_TOKENS rows
+        sends a routing message of that many tokens per top-k slot rather
+        than a whole 128-lane row per slot: the select still runs on the
+        128-token block, and its per-slot index rows are cut to the
+        message's tokens and laid end to end. The routed pairs per shard
+        halve (DP4xTP2 decode at 48-64 rows per core: 1280 -> 640 real
+        and padding slots, 2048 -> 1024 after the tables' step padding),
+        and so do the shard-tables and row-tables programs' pair work. The
+        pairs keep their order (slot-major, then token), so every table,
+        the expert kernel's rows and the combine are the same: the output
+        is bit-identical. Routing handed in by the caller is not
+        compacted.
+      reorder_chain: (sorted rows) the dispatch chain's index-independent
+        work is formed as programs of its own so the compiler can run it
+        in the sparse cores' waits: the sort's live-row fill and gathered
+        prefix during the row-tables scatter, the combine's pair index
+        before the FFN kernel; and the exchange's finish is ordered after
+        the shard tables instead of after the scatter, so its waits overlap
+        the scatter. Only the schedule changes: the same values.
     """
     result_slots: int = RESULT_SLOTS_DEFAULT
     row_fetch_ahead: int = ROW_FETCH_AHEAD_DEFAULT
@@ -226,6 +257,10 @@ class Config:
     tables_zero_words: int = TABLES_ZERO_WORDS_DEFAULT
     weight_dma_priority: int = WEIGHT_DMA_PRIORITY_DEFAULT
     sorted_rows: object = None
+    combine_real_tokens: bool = False
+    sort_index_compare: bool = False
+    compact_message: bool = False
+    reorder_chain: bool = False
 
     @property
     def token_dtype(self):

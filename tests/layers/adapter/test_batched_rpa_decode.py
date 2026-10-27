@@ -406,3 +406,48 @@ def test_batched_rpa_schedule_scope_torch_compile_mark_dynamic(monkeypatch):
     assert len(kern_nodes) == 3
 
 
+
+
+# TPU_RPA_DECODE_LANES: the decode batch (lanes) of every batched RPA program.
+@pytest.mark.parametrize(
+    "rows, tuning, expected",
+    [
+        (112, None, {"decode_batch_size": 4}),
+        (64, None, {"decode_batch_size": 4}),
+        (64, TUNING, {"vmem_limit_bytes": 32 * MIB, "decode_batch_size": 4}),
+        (2048, TUNING, {"decode_batch_size": 4}),
+    ],
+)
+def test_decode_lanes_env_sets_the_decode_batch(monkeypatch, rows, tuning, expected):
+    monkeypatch.setenv("TPU_RPA_DECODE_LANES", "4")
+    assert batched_rpa_decode.kernel_kwargs(tuning, rows) == expected
+
+
+def test_decode_lanes_off_by_default(monkeypatch):
+    monkeypatch.delenv("TPU_RPA_DECODE_LANES", raising=False)
+    assert batched_rpa_decode.kernel_kwargs(None, 112) == {}
+    monkeypatch.setenv("TPU_RPA_DECODE_LANES", "0")
+    assert batched_rpa_decode.kernel_kwargs(None, 112) == {}
+
+
+@pytest.mark.parametrize("rows", [64, 112])
+def test_decode_lanes_reach_the_kernel_and_the_schedule(monkeypatch, rows):
+    # The served DP4xTP2 path (no decode tuning, 4 query rows per request):
+    # the kernel entry and the hoisted schedule must get the same lanes.
+    monkeypatch.setenv("TPU_RPA_DECODE_LANES", "4")
+    seen = {}
+
+    def impl(*args, rpa_func, **kwargs):
+        seen["rpa_func"] = rpa_func
+
+    monkeypatch.setattr(attention, "_pallas_rpa_kernel_impl", impl)
+    attention._pallas_rpa_kernel_batched(
+        None, SimpleNamespace(shape=(rows, 16, 256)), *([None] * 10),
+        mesh=None, sliding_window=None, skip_kv_update=False, kv_layout=None,
+        decode_query_size=4, decode_tuning=None,
+    )
+    rpa_func = seen["rpa_func"]
+    assert isinstance(rpa_func, functools.partial)
+    assert rpa_func.keywords == {"decode_batch_size": 4, "decode_query_size": 4}
+    # The schedule builder reads the same helper with the program's rows.
+    assert batched_rpa_decode.kernel_kwargs(None, rows) == {"decode_batch_size": 4}
