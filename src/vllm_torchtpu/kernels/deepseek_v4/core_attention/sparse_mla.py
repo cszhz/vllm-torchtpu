@@ -199,9 +199,12 @@ def _attention_swa_decode_kernel(
 DENSE_MIN_TOKENS = 256
 # Tokens of a `DenseRefs` batch per QK / PV matmul over its shared rows.
 DENSE_TOKENS_PER_MATMUL = 16
-# A `DenseRefs` batch attends over its sequence's first rows in multiples of
-# this many, enough to cover every row its tokens selected.
-DENSE_KV_BLOCK = 1024
+# A `DenseRefs` batch attends over the blocks of this many of its sequence's
+# first rows that cover every row its tokens selected,
+DENSE_KV_BLOCK = 256
+# this many blocks per online-softmax step: each step rescales the f32
+# accumulator once.
+DENSE_BLOCKS_PER_STEP = 2
 # A single-sequence batch whose tokens can select more compressed rows than
 # this keeps the per-token SparseCore gather.
 DENSE_MAX_ROWS = 1 << 30
@@ -230,8 +233,13 @@ class DenseRefs(NamedTuple):
     nope_x2_ref: Any  # int32[2, max_rows, 128], a batch's copied nope rows
     rope_x2_ref: Any  # int32[2, max_rows // 4, 128], its copied rope rows
     select_x2_ref: Any  # int32[2, batch_size * max_rows // 128, 128]
-    rope_vmem_ref: Any  # int32[max_rows // 4, 128], rope in csa_gather's layout
+    # int32[DENSE_KV_BLOCK // 4, 128], a block's rope in csa_gather's layout
+    rope_vmem_ref: Any
     kv_vmem_ref: Any  # bf16[max_rows, head_dim], the batch's dequantized rows
+    # f32 online-softmax state of a DENSE_TOKENS_PER_MATMUL token group:
+    acc_ref: Any  # [group * num_q_heads, head_dim]
+    m_ref: Any  # [group * num_q_heads, 128], lane-replicated
+    l_ref: Any  # [group * num_q_heads, 128], lane-replicated
     sems: Any  # DMA [3, 2]: nope, rope and mask copies per slot
     pages_per_seq: int
 
@@ -260,7 +268,8 @@ def _attention_dense_kernel(
     **kwargs,
 ):
     """`_attention_kernel` that reads `DenseRefs` batches from the paged cache."""
-    *scratch, nope_x2, rope_x2, select_x2, rope_vmem, kv_vmem, dense_sems = scratch
+    *state, dense_sems = scratch[-4:]
+    *scratch, nope_x2, rope_x2, select_x2, rope_vmem, kv_vmem = scratch[:-4]
     _attention_kernel(
         kv_lens_ref,
         start_end_seq_idx_ref,
@@ -287,6 +296,7 @@ def _attention_dense_kernel(
             select_x2,
             rope_vmem,
             kv_vmem,
+            *state,
             dense_sems,
             pages_per_seq,
         ),
@@ -396,7 +406,6 @@ def _attention_kernel(
         swa_l,  # [bq_sz * num_q_heads],
         attention_sinks,  # [num_q_heads]
         masked,
-        select=None,  # bool [bq_sz * num_q_heads, kv rows], the rows to attend
     ):
         assert len(q.shape) == 2
         assert len(kv.shape) == 2
@@ -410,8 +419,6 @@ def _attention_kernel(
         if masked:
             k_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
             s = jnp.where(k_span < kv_len, s, jnp.finfo(s.dtype).min)
-        if select is not None:
-            s = jnp.where(select, s, jnp.finfo(s.dtype).min)
 
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = swa_m
@@ -486,14 +493,8 @@ def _attention_kernel(
         max_rows = dense.kv_vmem_ref.shape[0]
         assert max_rows == dense.pages_per_seq * page_size
         select_words = max_rows // csa_cache_layout.ROW_WORDS
-        dense_widths = sorted(
-            {
-                min(w, max_rows)
-                for w in range(
-                    DENSE_KV_BLOCK, max_rows + DENSE_KV_BLOCK, DENSE_KV_BLOCK
-                )
-            }
-        )
+        assert max_rows % DENSE_KV_BLOCK == 0
+        assert DENSE_KV_BLOCK % csa_cache_layout.ROW_WORDS == 0
 
     def is_dense_batch(seq_idx_start):
         return dense.token_seq_ref[seq_idx_start] < 0
@@ -719,28 +720,38 @@ def _attention_kernel(
             bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
-    def build_dense_bkv(bkv_sem_idx, num_rows, width):
-        """Dequantize a `DenseRefs` batch's first `width` copied rows into
-        `dense.kv_vmem_ref`, the same rows `load_bkv` builds from a gather,
-        zeroing the rows from `num_rows` on: they may be uncopied or decode to
-        NaN, and no token selected them."""
-        words = dense.nope_x2_ref[bkv_sem_idx, pl.ds(0, width)]
+    def build_dense_block(bkv_sem_idx, num_rows, first_row):
+        """Dequantize copied rows [first_row, first_row + DENSE_KV_BLOCK) of a
+        `DenseRefs` batch into `dense.kv_vmem_ref`, the same rows `load_bkv`
+        builds from a gather, zeroing the rows from `num_rows` on: they may be
+        uncopied or decode to NaN, and no token selected them."""
+        words = dense.nope_x2_ref[bkv_sem_idx, pl.ds(first_row, DENSE_KV_BLOCK)]
         even, odd = _rope_rows_as_gathered(
-            dense.rope_x2_ref[bkv_sem_idx, pl.ds(0, width // 4)]
+            dense.rope_x2_ref[
+                bkv_sem_idx,
+                pl.ds(pl.multiple_of(first_row // 4, 8), DENSE_KV_BLOCK // 4),
+            ]
         )
         half = even.shape[0]
         dense.rope_vmem_ref[pl.ds(0, half, stride=2), :] = even
         dense.rope_vmem_ref[pl.ds(1, half, stride=2), :] = odd
-        bkv_rope = dense.rope_vmem_ref.bitcast(jnp.bfloat16)[pl.ds(0, width // 2)]
+        bkv_rope = dense.rope_vmem_ref.bitcast(jnp.bfloat16)[...]
         bkv = join_bkv(words, bkv_rope)
-        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        dense.kv_vmem_ref[pl.ds(0, width)] = jnp.where(k_span < num_rows, bkv, 0)
+        k_span = first_row + lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+        dense.kv_vmem_ref[pl.ds(first_row, DENSE_KV_BLOCK)] = jnp.where(
+            k_span < num_rows, bkv, 0
+        )
 
-    def load_select(bkv_sem_idx, batch_idx, width):
-        """bool [1, width]: the rows token `batch_idx` selected."""
+    def load_select(bkv_sem_idx, batch_idx, first_row):
+        """bool [1, DENSE_KV_BLOCK]: which rows of the block at `first_row`
+        token `batch_idx` selected."""
+        row_words = csa_cache_layout.ROW_WORDS
         rows = dense.select_x2_ref[
             bkv_sem_idx,
-            pl.ds(batch_idx * select_words, width // csa_cache_layout.ROW_WORDS),
+            pl.ds(
+                batch_idx * select_words + first_row // row_words,
+                DENSE_KV_BLOCK // row_words,
+            ),
         ]
         return (
             jnp.concatenate([rows[i : i + 1] for i in range(rows.shape[0])], axis=1)
@@ -748,58 +759,117 @@ def _attention_kernel(
         )
 
     def attend_from_cache(bi_sem_idx, bo_sem_idx, attention_sinks):
-        """`process`'s token loop for a `DenseRefs` batch, over the smallest
-        width in `dense_widths` that covers `dense_batch_rows`."""
+        """`process`'s token loop for a `DenseRefs` batch, over the
+        DENSE_KV_BLOCK-row blocks that cover `dense_batch_rows`."""
         num_rows = dense_batch_rows(batch_start_seq_idx)
-        build = starts_dense_run(batch_start_seq_idx)
-        for lo, width in zip([0] + dense_widths[:-1], dense_widths):
+        num_blocks = cdiv(num_rows, DENSE_KV_BLOCK)
 
-            @pl.when((num_rows > lo) & (num_rows <= width))
-            def _(width=width):
-                @pl.when(build)
-                def _():
-                    build_dense_bkv(bi_sem_idx, num_rows, width)
+        def block_row(j):
+            return pl.multiple_of(j * DENSE_KV_BLOCK, DENSE_KV_BLOCK)
 
-                attend_rows_from_cache(bi_sem_idx, bo_sem_idx, attention_sinks, width)
+        @pl.when(starts_dense_run(batch_start_seq_idx))
+        def _():
+            @pl.loop(0, num_blocks)
+            def _(j):
+                build_dense_block(bi_sem_idx, num_rows, block_row(j))
 
-    def attend_rows_from_cache(bi_sem_idx, bo_sem_idx, attention_sinks, width):
-        """The tokens share their rows, so each group of
-        DENSE_TOKENS_PER_MATMUL tokens runs one QK and one PV matmul over
-        them, the rows loaded into the MXU once."""
-        bkv = dense.kv_vmem_ref[pl.ds(0, width)]
+        per_step = DENSE_BLOCKS_PER_STEP
+        num_steps = num_blocks // per_step
         group = min(DENSE_TOKENS_PER_MATMUL, batch_size)
         assert batch_size % group == 0
         for first in range(0, batch_size, group):
             tokens = range(first, first + group)
-            states = [load_swa_output(bi_sem_idx, b) for b in tokens]
-            swa_acc, swa_l, swa_m = (
-                jnp.concatenate([state[i] for state in states], axis=0)
-                for i in range(3)
-            )
-            select = jnp.concatenate(
-                [
-                    jnp.broadcast_to(
-                        load_select(bi_sem_idx, b, width), (num_q_heads, width)
-                    )
-                    for b in tokens
-                ],
-                axis=0,
-            )
-            p, exp_m_diff, l_total = flash_attention_step1_qk_softmax(
-                jnp.concatenate([load_bq(bi_sem_idx, b) for b in tokens], axis=0),
-                bkv,
-                None,
-                swa_m,
-                swa_l,
-                jnp.concatenate([attention_sinks] * group, axis=0),
-                masked=False,
-                select=select,
-            )
-            out = flash_attention_step2_pv(p, bkv, exp_m_diff, swa_acc, l_total)
+            init_dense_state(bi_sem_idx, tokens)
+
+            @pl.loop(0, num_steps)
+            def _(i):
+                rows = [block_row(i * per_step + k) for k in range(per_step)]
+                attend_blocks_from_cache(bi_sem_idx, tokens, rows)
+
+            for tail in range(1, per_step):
+
+                @pl.when(num_blocks - num_steps * per_step == tail)
+                def _(tail=tail):
+                    rows = [block_row(num_steps * per_step + k) for k in range(tail)]
+                    attend_blocks_from_cache(bi_sem_idx, tokens, rows)
+
+            out = finish_dense_state(attention_sinks, group)
             for i, b in enumerate(tokens):
                 bo_x2_ref.at[bo_sem_idx, b][...] = out[
                     i * num_q_heads : (i + 1) * num_q_heads
                 ]
+
+    def init_dense_state(bi_sem_idx, tokens):
+        """Start the online softmax of `tokens` from their SWA state."""
+        states = [load_swa_output(bi_sem_idx, b) for b in tokens]
+        swa_acc, swa_l, swa_m = (
+            jnp.concatenate([state[i] for state in states], axis=0)
+            for i in range(3)
+        )
+        dense.acc_ref[...] = swa_acc.astype(jnp.float32)
+        dense.l_ref[...] = jnp.broadcast_to(swa_l, dense.l_ref.shape)
+        dense.m_ref[...] = jnp.broadcast_to(swa_m, dense.m_ref.shape)
+
+    def attend_blocks_from_cache(bi_sem_idx, tokens, first_rows):
+        """One online-softmax step of `tokens` over the blocks at
+        `first_rows`: the tokens share their rows, so each block runs one QK
+        and one PV matmul for all of them."""
+        bkvs = [dense.kv_vmem_ref[pl.ds(r, DENSE_KV_BLOCK)] for r in first_rows]
+        q = jnp.concatenate([load_bq(bi_sem_idx, b) for b in tokens], axis=0)
+        s = jnp.concatenate(
+            [
+                jnp.einsum("nd,md->nm", q, bkv, preferred_element_type=jnp.float32)
+                for bkv in bkvs
+            ],
+            axis=1,
+        )
+        s *= sm_scale
+        width = s.shape[1]
+        select = jnp.concatenate(
+            [
+                jnp.broadcast_to(
+                    jnp.concatenate(
+                        [load_select(bi_sem_idx, b, r) for r in first_rows], axis=1
+                    ),
+                    (num_q_heads, width),
+                )
+                for b in tokens
+            ],
+            axis=0,
+        )
+        s = jnp.where(select, s, jnp.finfo(s.dtype).min)
+        m_prev = dense.m_ref[...]
+        m_curr = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
+        lanes = m_curr.shape[1]
+        p = jnp.exp(s - jnp.tile(m_curr, (1, width // lanes)))
+        alpha = jnp.exp(m_prev - m_curr)
+        dense.l_ref[...] = alpha * dense.l_ref[...] + jnp.sum(
+            p, axis=1, keepdims=True
+        )
+        dense.m_ref[...] = m_curr
+        pv = sum(
+            jnp.einsum(
+                "nm,md->nd",
+                p[:, k * DENSE_KV_BLOCK : (k + 1) * DENSE_KV_BLOCK],
+                bkv,
+                preferred_element_type=jnp.float32,
+            )
+            for k, bkv in enumerate(bkvs)
+        )
+        dense.acc_ref[...] = (
+            jnp.tile(alpha, (1, head_dim // lanes)) * dense.acc_ref[...] + pv
+        )
+
+    def finish_dense_state(attention_sinks, group):
+        """The tokens' normalized output, the sinks added to the denominator."""
+        m = dense.m_ref[:, :1]
+        l_total = dense.l_ref[:, :1] + jnp.exp(
+            jnp.concatenate([attention_sinks] * group, axis=0) - m
+        )
+        acc = dense.acc_ref[...]
+        if q_dtype == jnp.float32:
+            return lax.div(acc, l_total)
+        return (acc * pl.reciprocal(l_total, approx=True)).astype(q_dtype)
 
     def run_swa_decode(bq_sem_idx):
         """Write the decode tokens' unnormalized SWA state where the HBM
@@ -1317,12 +1387,16 @@ def sparse_ragged_paged_attention(
             pages_per_seq = num_page_indices // max_num_seqs
             max_rows = pages_per_seq * dense_cache_nope.shape[1]
             select_rows = batch_size * max_rows // lanes
+            group_rows = min(DENSE_TOKENS_PER_MATMUL, batch_size) * num_q_heads
             scratch_shapes += [
                 pltpu.VMEM((2, max_rows, lanes), jnp.int32),
                 pltpu.VMEM((2, max_rows // 4, lanes), jnp.int32),
                 pltpu.VMEM((2, select_rows, lanes), jnp.int32),
-                pltpu.VMEM((max_rows // 4, lanes), jnp.int32),
+                pltpu.VMEM((DENSE_KV_BLOCK // 4, lanes), jnp.int32),
                 pltpu.VMEM((max_rows, head_dim), jnp.bfloat16),
+                pltpu.VMEM((group_rows, head_dim), jnp.float32),
+                pltpu.VMEM((group_rows, lanes), jnp.float32),
+                pltpu.VMEM((group_rows, lanes), jnp.float32),
                 pltpu.SemaphoreType.DMA((3, 2)),
             ]
             kernel_fn = _attention_dense_kernel
