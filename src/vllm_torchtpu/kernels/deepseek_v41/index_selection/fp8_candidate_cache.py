@@ -27,6 +27,7 @@ class PreparedCandidates(NamedTuple):
     order: jax.Array
     pages: jax.Array
     valid_queries: jax.Array
+    membership: jax.Array
 
 
 def compact_table_width(capacity: int) -> int:
@@ -48,46 +49,77 @@ def prepare_candidates(
     *,
     grouped: bool = False,
 ) -> PreparedCandidates:
-    """Gather one candidate cache per request; retain per-query visibility."""
+    """Share gathered keys between adjacent queries of even-sized requests.
+
+    As in vLLM v0.31.1rc0's attention/dsa/sparse_mqa_logits.py, candidates
+    remain per query. Pairing only shares reads; membership preserves each
+    query's selection domain. Odd-sized requests use individual gathers.
+    """
     tokens, count = candidates.shape
     owners = jnp.clip(requests, 0, pages.shape[0] - 1)
     order = (
         jnp.arange(tokens, dtype=jnp.int32)
         if grouped
-        else jnp.argsort(owners, stable=True)
+        else jnp.argsort(
+            jnp.where(
+                (requests >= 0) & (requests < pages.shape[0]), owners, pages.shape[0]
+            ),
+            stable=True,
+        )
     )
     if not grouped:
         candidates, owners = candidates[order], owners[order]
-    counts = jnp.bincount(owners, length=pages.shape[0])
-    offsets = jnp.concatenate((jnp.zeros(1, jnp.int32), jnp.cumsum(counts)))
     valid = (requests[order] >= 0) & (requests[order] < pages.shape[0])
-    representatives = jax.ops.segment_min(
-        jnp.where(valid, jnp.arange(tokens), tokens), owners, pages.shape[0]
+    counts = jnp.bincount(
+        owners, weights=valid.astype(jnp.int32), length=pages.shape[0]
+    )
+    rows = jnp.arange(tokens, dtype=jnp.int32)
+    first = jax.ops.segment_min(jnp.where(valid, rows, tokens), owners, pages.shape[0])
+    paired = valid & (counts[owners] % 2 == 0)
+    starts = ~paired | ((rows - first[owners]) % 2 == 0)
+    groups = jnp.cumsum(starts.astype(jnp.int32)) - 1
+    sizes = jnp.bincount(groups, length=tokens)
+    offsets = jnp.concatenate((jnp.zeros(1, jnp.int32), jnp.cumsum(sizes)))
+    representatives = jax.ops.segment_min(rows, groups, tokens)
+    representatives = jnp.minimum(representatives, tokens - 1)
+    group_candidates = candidates[representatives]
+    if tokens > 1:
+        following = candidates[jnp.minimum(representatives + 1, tokens - 1)]
+        group_candidates = jnp.concatenate(
+            (group_candidates, jnp.where(sizes[:, None] == 2, following, -1)), axis=1
+        )
+    group_candidates = jnp.where(
+        (sizes > 0)[:, None] & valid[representatives, None], group_candidates, -1
     )
     canonical, physical = canonical_candidate_blocks(
-        candidates[jnp.minimum(representatives, tokens - 1)],
-        pages,
+        group_candidates,
+        pages[owners[representatives]],
         offsets,
         block=block,
         width=width,
         cache_pages=layout.pages,
         page_size=layout.page_size,
     )
-    canonical = canonical[owners]
+    canonical = canonical[groups]
+    sorted_candidates = jnp.sort(candidates, axis=1)
+    slots = jax.vmap(jnp.searchsorted)(sorted_candidates, canonical)
+    membership = (canonical >= 0) & (
+        jnp.take_along_axis(sorted_candidates, jnp.minimum(slots, count - 1), axis=1)
+        == canonical
+    )
     fragment = min(block, layout.page_size)
     per_page = PAGE_RECORDS // fragment
     padded = (physical.shape[1] + per_page - 1) // per_page * per_page
     physical = jnp.pad(
         physical, ((0, 0), (0, padded - physical.shape[1])), constant_values=-1
     )
-    physical = jnp.where(representatives[:, None] < tokens, physical, -1)
     keys = gather_candidate_keys(
         banks, physical, offsets, block=fragment, layout=layout
     )
-    compact_pages = jnp.arange(
-        pages.shape[0] * padded // per_page, dtype=jnp.int32
-    ).reshape(pages.shape[0], -1)
-    table_width = compact_table_width(count * block)
+    compact_pages = jnp.arange(tokens * padded // per_page, dtype=jnp.int32).reshape(
+        tokens, -1
+    )
+    table_width = compact_table_width(group_candidates.shape[1] * block)
     compact_pages = jnp.pad(
         compact_pages,
         ((0, 0), (0, table_width - compact_pages.shape[1])),
@@ -100,6 +132,7 @@ def prepare_candidates(
         order,
         compact_pages,
         (requests >= 0) & (requests < pages.shape[0]),
+        membership,
     )
 
 
