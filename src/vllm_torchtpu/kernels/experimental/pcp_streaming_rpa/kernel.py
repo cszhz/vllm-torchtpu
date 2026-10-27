@@ -2948,9 +2948,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
     *,
     pcp_size: int,
     interleave_size: int,
-    q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
     sm_scale: float | None = 1.0,
-    q_compute_size: int | None = None,
     num_lanes: int = 1,
     k_scale: float | None = None,
     v_scale: float | None = None,
@@ -2966,8 +2964,6 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
     """
     if num_lanes != 1:
         raise NotImplementedError("Only num_lanes == 1 is supported.")
-    if q_block_size <= 0 or (q_compute_size is not None and q_compute_size <= 0):
-        raise ValueError("q_block_size and q_compute_size must be positive.")
     if pcp_axis_name not in mesh_axis_names:
         raise ValueError(f"{pcp_axis_name=} must be in {mesh_axis_names=}.")
     _validate_packed_kv_layout(

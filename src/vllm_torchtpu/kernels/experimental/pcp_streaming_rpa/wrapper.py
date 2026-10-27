@@ -319,8 +319,6 @@ def sharded_pcp_ragged_paged_attention(
     v_scale: float | None = None,
     update_kv_cache: bool = True,
     cp_kv_cache_interleave_size: int = 1,
-    q_block_size: int = 128,
-    q_compute_size: int | None = None,
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
     vpage_group_size: int = PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
 ):
@@ -422,8 +420,6 @@ def sharded_pcp_ragged_paged_attention(
                 pcp_size=pcp_size,
                 interleave_size=cp_kv_cache_interleave_size,
                 sm_scale=sm_scale,
-                q_block_size=q_block_size,
-                q_compute_size=q_compute_size,
                 k_scale=k_scale,
                 v_scale=v_scale,
                 kv_layout=kv_layout,

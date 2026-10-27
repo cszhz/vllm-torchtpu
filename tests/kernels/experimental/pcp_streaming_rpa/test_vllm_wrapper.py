@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import math
 from types import SimpleNamespace
 
 import jax.numpy as jnp
@@ -953,3 +954,353 @@ def test_gather_vpage_group_zeroes_unwritten_fp8_slots(monkeypatch):
     assert not bool(jnp.isnan(v_hm.astype(jnp.float32)).any())
     assert bool((k_hm[:, :5].astype(jnp.float32) == 1.5).all())
     assert int((kv_seg_ids == 0).sum()) == 5
+
+
+def test_merge_attention_partials_matches_full_softmax():
+    rng = np.random.default_rng(2026)
+    heads, q_tokens, s1, s2, head_dim = 4, 32, 96, 64, 128
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    q = rng.normal(size=(heads, q_tokens, head_dim)).astype(np.float64)
+    k = rng.normal(size=(heads, s1 + s2, head_dim)).astype(np.float64)
+    v = rng.normal(size=(heads, s1 + s2, head_dim)).astype(np.float64)
+
+    def exact_part(k_slice, v_slice):
+        scores = np.einsum("htd,hsd->hts", q, k_slice) * sm_scale
+        m = scores.max(axis=-1, keepdims=True)
+        exp_s = np.exp(scores - m)
+        denom = exp_s.sum(axis=-1, keepdims=True)
+        out = np.einsum("hts,hsd->htd", exp_s / denom, v_slice)
+        lse = m[..., 0] + np.log(denom[..., 0])
+        return out.astype(np.float32), lse.astype(np.float32)
+
+    o1, lse1 = exact_part(k[:, :s1], v[:, :s1])
+    o2, lse2 = exact_part(k[:, s1:], v[:, s1:])
+    o_full, lse_full = exact_part(k, v)
+
+    o_merged, lse_merged = pcp_kernel._merge_attention_partials(
+        jnp.asarray(o1),
+        jnp.asarray(lse1),
+        jnp.asarray(o2),
+        jnp.asarray(lse2),
+    )
+    o_merged_np = np.asarray(o_merged, dtype=np.float64)
+    lse_merged_np = np.asarray(lse_merged, dtype=np.float64)
+
+    u_f32 = 2.0**-24
+    max_abs_v = float(np.max(np.abs(v)))
+    max_abs_lse = float(np.max(np.abs(lse_full)))
+    # Omitted f32 terms: input cast (1 * u_f32), two exp weights + sum/inv
+    # (4 * u_f32), and two weighted FMA products (3 * u_f32).
+    tol_o = (1.0 + 4.0 + 3.0) * u_f32 * max_abs_v
+    tol_lse = (1.0 + 4.0 + 3.0) * u_f32 * max(1.0, max_abs_lse)
+
+    assert float(np.max(np.abs(o_merged_np - o_full))) <= tol_o
+    assert float(np.max(np.abs(lse_merged_np - lse_full))) <= tol_lse
+    assert float(np.max(np.abs(o1.astype(np.float64) - o_full))) > 100.0 * tol_o
+
+
+def test_merge_attention_partials_ignores_empty_splash_group():
+    rng = np.random.default_rng(7)
+    o_valid = jnp.asarray(rng.normal(size=(2, 16, 64)).astype(np.float32))
+    lse_valid = jnp.asarray(rng.normal(size=(2, 16)).astype(np.float32))
+    o_zero = jnp.zeros_like(o_valid)
+    sentinel = float(
+        pcp_kernel._splash_kernel.DEFAULT_MASK_VALUE / pcp_kernel._splash_kernel.LOG2E
+    )
+    lse_sentinel = jnp.full_like(lse_valid, sentinel)
+
+    o_right, lse_right = pcp_kernel._merge_attention_partials(
+        o_valid, lse_valid, o_zero, lse_sentinel
+    )
+    np.testing.assert_array_equal(np.asarray(o_right), np.asarray(o_valid))
+    np.testing.assert_array_equal(np.asarray(lse_right), np.asarray(lse_valid))
+
+    o_left, lse_left = pcp_kernel._merge_attention_partials(
+        o_zero, lse_sentinel, o_valid, lse_valid
+    )
+    np.testing.assert_array_equal(np.asarray(o_left), np.asarray(o_valid))
+    np.testing.assert_array_equal(np.asarray(lse_left), np.asarray(lse_valid))
+
+    lse_neginf = jnp.full_like(lse_valid, -jnp.inf)
+    o_empty, lse_empty = pcp_kernel._merge_attention_partials(
+        o_zero, lse_neginf, o_zero, lse_neginf
+    )
+    assert not bool(jnp.isnan(o_empty).any())
+    assert not bool(jnp.isnan(lse_empty).any())
+    np.testing.assert_array_equal(
+        np.asarray(o_empty), np.zeros_like(np.asarray(o_valid))
+    )
+    assert bool(jnp.isneginf(lse_empty).all())
+
+
+def test_attend_over_vpage_groups_routes_rungs_and_multi_group(monkeypatch):
+    calls = []
+
+    def fake_single(_kv, q_scaled_hm, _plan, group_size, **_kwargs):
+        calls.append(("single", int(group_size)))
+        return jnp.full_like(q_scaled_hm, float(group_size), dtype=jnp.float32)
+
+    def fake_multi(_kv, q_scaled_hm, _plan, group_size, **_kwargs):
+        calls.append(("multi", int(group_size)))
+        return jnp.full_like(q_scaled_hm, -float(group_size), dtype=jnp.float32)
+
+    monkeypatch.setattr(pcp_kernel, "_attend_single_vpage_group", fake_single)
+    monkeypatch.setattr(pcp_kernel, "_attend_multi_vpage_groups", fake_multi)
+
+    q_scaled_hm = jnp.zeros((2, 128, 128), dtype=jnp.bfloat16)
+    kv_cache_local = jnp.zeros((8, 128, 1, 2, 128), dtype=jnp.bfloat16)
+    splash_cfg = pcp_kernel._splash_kernel.SplashConfig(
+        block_q=128,
+        block_kv=512,
+        block_kv_compute=256,
+        num_stacked_q_heads=2,
+        use_base2_exp=True,
+        q_prescaled_log2e=True,
+    )
+    common_kwargs = dict(
+        splash_cfg=splash_cfg,
+        kv_heads=1,
+        head_dim=128,
+        page_size=128,
+        pcp_size=2,
+        interleave_size=32,
+        kv_layout=pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE,
+        pcp_axis_name="pcp",
+    )
+
+    def make_plan(total_vpages: int, num_active_vpages: int):
+        return SimpleNamespace(
+            sorted_block_ids=jnp.zeros((total_vpages,), dtype=jnp.int32),
+            num_active_vpages=jnp.asarray(num_active_vpages, dtype=jnp.int32),
+        )
+
+    for active_vpages, expected_rung in [
+        (1, 32.0),
+        (32, 32.0),
+        (33, 64.0),
+        (128, 128.0),
+        (257, 512.0),
+        (512, 512.0),
+    ]:
+        out = pcp_kernel._attend_over_vpage_groups(
+            kv_cache_local,
+            q_scaled_hm,
+            make_plan(512, active_vpages),
+            vpage_group_size=128,
+            **common_kwargs,
+        )
+        assert float(out[0, 0, 0]) == expected_rung
+
+    out_513 = pcp_kernel._attend_over_vpage_groups(
+        kv_cache_local,
+        q_scaled_hm,
+        make_plan(640, 513),
+        vpage_group_size=128,
+        **common_kwargs,
+    )
+    assert float(out_513[0, 0, 0]) == -128.0
+
+    calls.clear()
+    out_g2 = pcp_kernel._attend_over_vpage_groups(
+        kv_cache_local,
+        q_scaled_hm,
+        make_plan(6, 6),
+        vpage_group_size=2,
+        **common_kwargs,
+    )
+    assert float(out_g2[0, 0, 0]) == -2.0
+    assert calls == [("multi", 2)]
+
+
+def test_attend_multi_vpage_groups_streams_causal_groups_and_sentinels(monkeypatch):
+    rng = np.random.default_rng(2027)
+    kv_heads, q_per_kv, head_dim = 1, 2, 128
+    q_heads = kv_heads * q_per_kv
+    q_tokens = 128
+    page_size, pcp_size = 128, 2
+    virtual_page_size = page_size * pcp_size
+    group_size = 2
+    total_vpages = 8
+
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    q_raw = rng.normal(size=(q_heads, q_tokens, head_dim)).astype(np.float32)
+    q_scaled_hm = jnp.asarray(
+        q_raw * (sm_scale * pcp_kernel._splash_kernel.LOG2E), dtype=jnp.float32
+    )
+
+    req0_kv_len, req1_kv_len = 652, 692
+    k_req0 = rng.normal(size=(kv_heads, req0_kv_len, head_dim)).astype(np.float32)
+    v_req0 = rng.normal(size=(kv_heads, req0_kv_len, head_dim)).astype(np.float32)
+    k_req1 = rng.normal(size=(kv_heads, req1_kv_len, head_dim)).astype(np.float32)
+    v_req1 = rng.normal(size=(kv_heads, req1_kv_len, head_dim)).astype(np.float32)
+
+    k_vpages = np.full(
+        (kv_heads, total_vpages, virtual_page_size, head_dim), 1e6, dtype=np.float32
+    )
+    v_vpages = np.full(
+        (kv_heads, total_vpages, virtual_page_size, head_dim), 1e6, dtype=np.float32
+    )
+    for vp in range(3):
+        s, e = vp * virtual_page_size, min((vp + 1) * virtual_page_size, req0_kv_len)
+        k_vpages[:, vp, : e - s, :] = k_req0[:, s:e, :]
+        v_vpages[:, vp, : e - s, :] = v_req0[:, s:e, :]
+    for vp in range(3):
+        s, e = vp * virtual_page_size, min((vp + 1) * virtual_page_size, req1_kv_len)
+        k_vpages[:, 3 + vp, : e - s, :] = k_req1[:, s:e, :]
+        v_vpages[:, 3 + vp, : e - s, :] = v_req1[:, s:e, :]
+    k_vpages_jnp = jnp.asarray(k_vpages)
+    v_vpages_jnp = jnp.asarray(v_vpages)
+
+    req0_abs = np.arange(592, 652, dtype=np.int32)
+    req1_abs = np.arange(632, 692, dtype=np.int32)
+    q_seg_ids = jnp.asarray(
+        np.concatenate(
+            [
+                np.zeros(60, dtype=np.int32),
+                np.ones(60, dtype=np.int32),
+                np.full(8, -1, dtype=np.int32),
+            ]
+        )
+    )
+    q_sequence = jnp.asarray(
+        np.concatenate(
+            [
+                req0_abs,
+                3 * virtual_page_size + req1_abs,
+                np.full(8, -1, dtype=np.int32),
+            ]
+        )
+    )
+    stage_plan = SimpleNamespace(
+        sorted_block_ids=jnp.arange(total_vpages, dtype=jnp.int32),
+        sorted_seg_ids=jnp.asarray([0, 0, 0, 1, 1, 1, 2, -2], dtype=jnp.int32),
+        sorted_vpage_valid_tokens=jnp.asarray(
+            [256, 256, 140, 256, 256, 180, 64, 0], dtype=jnp.int32
+        ),
+        num_active_vpages=jnp.asarray(7, dtype=jnp.int32),
+        q_seg_ids=q_seg_ids,
+        q_sequence=q_sequence,
+    )
+    splash_cfg = pcp_kernel._splash_kernel.SplashConfig(
+        block_q=128,
+        block_kv=512,
+        block_kv_compute=256,
+        num_stacked_q_heads=2,
+        use_base2_exp=True,
+        q_prescaled_log2e=True,
+    )
+    kv_cache_local = jnp.zeros(
+        (total_vpages, page_size, kv_heads, 2, head_dim), dtype=jnp.float32
+    )
+
+    def fake_gather(_kv_cache_local, block_ids, **_kwargs):
+        k_sel = k_vpages_jnp[:, block_ids, :, :].reshape(kv_heads, -1, head_dim)
+        v_sel = v_vpages_jnp[:, block_ids, :, :].reshape(kv_heads, -1, head_dim)
+        return k_sel, v_sel
+
+    class FakeSplashKernel:
+        def __init__(self, fwd_mask_info, dkv_mask_info, **kwargs):
+            self.fwd_mask_info = fwd_mask_info
+            self.dkv_mask_info = dkv_mask_info
+            self.kwargs = kwargs
+            self.mask_function = kwargs.get("mask_function")
+
+        def __call__(self, q_scaled, k_hm, v_hm, segment_ids, save_residuals=False):
+            assert save_residuals
+            q_rep_factor = q_scaled.shape[0] // k_hm.shape[0]
+            k_rep = jnp.repeat(k_hm.astype(jnp.float32), q_rep_factor, axis=0)
+            v_rep = jnp.repeat(v_hm.astype(jnp.float32), q_rep_factor, axis=0)
+            scores_b2 = jnp.einsum(
+                "hqd,hkd->hqk",
+                q_scaled.astype(jnp.float32),
+                k_rep,
+                precision="highest",
+            )
+            q_seq = jnp.asarray(self.fwd_mask_info.q_sequence, dtype=jnp.int32)[:, None]
+            kv_idx = jnp.arange(k_hm.shape[1], dtype=jnp.int32)[None, :]
+            causal_ok = self.mask_function(q_seq, kv_idx)
+            seg_ok = (segment_ids.q[:, None] == segment_ids.kv[None, :]) & (
+                segment_ids.q[:, None] >= 0
+            )
+            valid = (causal_ok & seg_ok)[None, :, :]
+            any_block_valid = jnp.any(valid)
+            sentinel = jnp.asarray(
+                pcp_kernel._splash_kernel.DEFAULT_MASK_VALUE
+                / pcp_kernel._splash_kernel.LOG2E,
+                dtype=jnp.float32,
+            )
+            masked_b2 = jnp.where(valid, scores_b2, -jnp.inf)
+            m_b2 = jnp.max(masked_b2, axis=-1)
+            m_safe = jnp.where(jnp.isneginf(m_b2), 0.0, m_b2)
+            weights = jnp.where(valid, jnp.exp2(masked_b2 - m_safe[..., None]), 0.0)
+            l_sum = jnp.sum(weights, axis=-1)
+            inv_l = 1.0 / jnp.where(l_sum > 0.0, l_sum, 1.0)
+            out_nonempty = jnp.einsum(
+                "hqk,hkd->hqd",
+                weights * inv_l[..., None],
+                v_rep,
+                precision="highest",
+            )
+            lse_nonempty = (m_b2 + jnp.log2(l_sum)) / jnp.asarray(
+                pcp_kernel._splash_kernel.LOG2E, dtype=jnp.float32
+            )
+            out = jnp.where(any_block_valid, out_nonempty, jnp.zeros_like(out_nonempty))
+            lse = jnp.where(
+                any_block_valid,
+                lse_nonempty,
+                jnp.full_like(lse_nonempty, sentinel),
+            )
+            return out, {"logsumexp": lse}
+
+    monkeypatch.setattr(pcp_kernel, "_gather_vpages_to_head_major", fake_gather)
+    monkeypatch.setattr(
+        pcp_kernel._splash_kernel, "SplashAttentionKernel", FakeSplashKernel
+    )
+
+    actual = np.asarray(
+        pcp_kernel._attend_multi_vpage_groups(
+            kv_cache_local,
+            q_scaled_hm,
+            stage_plan,
+            group_size,
+            splash_cfg=splash_cfg,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            pcp_size=pcp_size,
+            interleave_size=32,
+            kv_layout=pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE,
+            pcp_axis_name="pcp",
+        ),
+        dtype=np.float64,
+    )
+    assert not np.isnan(actual).any()
+    np.testing.assert_array_equal(actual[:, 120:, :], 0.0)
+
+    def ref_causal(q_slice, k_req, v_req, abs_pos, kv_cutoff=None):
+        if kv_cutoff is not None:
+            k_req = k_req[:, :kv_cutoff, :]
+            v_req = v_req[:, :kv_cutoff, :]
+        k_rep = np.repeat(k_req.astype(np.float64), q_per_kv, axis=0)
+        v_rep = np.repeat(v_req.astype(np.float64), q_per_kv, axis=0)
+        scores = np.einsum("hqd,hkd->hqk", q_slice.astype(np.float64), k_rep) * sm_scale
+        mask = abs_pos[:, None] >= np.arange(k_rep.shape[1])[None, :]
+        scores = np.where(mask[None, :, :], scores, -np.inf)
+        m = scores.max(axis=-1, keepdims=True)
+        w = np.exp(scores - m)
+        return np.einsum("hqk,hkd->hqd", w / w.sum(axis=-1, keepdims=True), v_rep)
+
+    ref_req0 = ref_causal(q_raw[:, :60, :], k_req0, v_req0, req0_abs)
+    ref_req1 = ref_causal(q_raw[:, 60:120, :], k_req1, v_req1, req1_abs)
+    ref_req0_g0_only = ref_causal(
+        q_raw[:, :60, :], k_req0, v_req0, req0_abs, kv_cutoff=512
+    )
+
+    u_f32 = 2.0**-24
+    max_abs_v = max(float(np.max(np.abs(v_req0))), float(np.max(np.abs(v_req1))))
+    # Omitted f32 terms: LOG2E prescale + QK dot + exp2/log2 over <=692 keys
+    # (32 * u_f32) plus 3 online LSE merge steps (24 * u_f32).
+    tol_stream = (32.0 + 24.0) * u_f32 * max_abs_v
+    assert float(np.max(np.abs(actual[:, :60, :] - ref_req0))) <= tol_stream
+    assert float(np.max(np.abs(actual[:, 60:120, :] - ref_req1))) <= tol_stream
+    assert float(np.max(np.abs(ref_req0_g0_only - ref_req0))) > 100.0 * tol_stream
