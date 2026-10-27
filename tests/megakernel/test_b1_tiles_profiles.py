@@ -270,11 +270,9 @@ def _pooled_outputs_uncached(
     mesh = _cpu_mesh(2)
     g, ex = _flip_exec(prof, T=T, B=B, **kw)
     spec = qwen35.qwen35_spec(g)
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
-        jax.random.key(31 + T + B), g, ex
-    )
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(31 + T + B), g, ex)
     st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
-    _, hid_mk, w_mk, _ = qwen35.pack_inputs(
+    _, hid_mk, w_mk, _ = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
     )
     pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
@@ -364,8 +362,8 @@ def test_exact_kv_scatter_vec_ns_non_paged():
             {"gqa": {"kv_scatter_vec_ns": ns}}
         )
         ex = mk.ExecSpec(B=B, T=1, R=R, ctx=256, tiles=tiles, interpret=True)
-        pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.key(5), g, ex)
-        pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(5), g, ex)
+        pos_mk, hid_mk, w_mk, st_mk = mk.pack_inputs(
             pos, hid_l, w_l, st_l, g, ex, mesh=mesh
         )
         step, _ = qwen35.make_step(mesh, g, ex)

@@ -64,6 +64,19 @@ def test_qwen35_baseline_tiles_match_frozen_kernel_schedule():
             assert _tile_value(tl, name) == getattr(tf, name), (B, name)
 
 
+def test_qwen35_baseline_tiles_schedule_invariants():
+    """Verify `qwen35-baseline` `tiles_for(B, R=8)` invariants across `B=1..64`."""
+    prof = mk.get_profile("qwen35-baseline")
+    for B in range(1, 65):
+        tl = prof.tiles_for(B, R=8)
+        assert tl == baseline_tiles(B, R=8)
+        assert tl.nbd >= 2 and tl.nbe >= 2
+        if B > 48:
+            assert tl.nbe == 6
+        assert tl.module("gqa").nkv >= 2
+        assert tl.module("gdn").gdn_bufs >= 2
+
+
 def test_profile_registry_and_default_profile():
     assert {"default", "qwen35-baseline", "qwen35-candidate30"} <= set(
         mk.list_profiles()

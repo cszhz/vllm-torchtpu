@@ -1043,6 +1043,31 @@ def test_step_meta_bitwise_parity_base_vs_head_and_jax() -> None:
                         ):
                             c0_in, c1_in, c2_in = c_set
                             c0_j, c1_j, c2_j = c_set_j
+                            if T > 1 and not use_ckpt_2d:
+                                with pytest.raises(
+                                    ValueError,
+                                    match="requires 2-D ckpt_indices with >= T=",
+                                ):
+                                    prepare_step_inputs_eager(
+                                        ids_in,
+                                        pos_in,
+                                        bt_in,
+                                        s0,
+                                        c0_in,
+                                        r_in,
+                                        s1,
+                                        c1_in,
+                                        r_in,
+                                        s2,
+                                        c2_in,
+                                        r_in,
+                                        bucket_t,
+                                        T,
+                                        max_pages_per_seq,
+                                        has_roff,
+                                        use_ckpt_2d,
+                                    )
+                                continue
                             ref_out = _ref_prepare_step_inputs_eager(
                                 ids_in,
                                 pos_in,
@@ -1178,6 +1203,30 @@ def test_step_meta_bitwise_parity_base_vs_head_and_jax() -> None:
     pos_64 = torch.arange(30, 42, dtype=torch.int64)
     bt_64 = bt_2d.to(torch.int64)
     for T_edge, bkt_edge in ((1, 4), (4, 8)):
+        if T_edge > 1:
+            with pytest.raises(
+                ValueError, match="requires 2-D ckpt_indices with >= T="
+            ):
+                prepare_step_inputs_eager(
+                    ids_64,
+                    pos_64,
+                    bt_64,
+                    s_edge,
+                    c_narrow,
+                    r_edge,
+                    s_edge,
+                    c_narrow,
+                    r_edge,
+                    s_edge,
+                    c_narrow,
+                    r_edge,
+                    bkt_edge,
+                    T_edge,
+                    max_pages_per_seq,
+                    True,
+                    True,
+                )
+            continue
         ref_edge = _ref_prepare_step_inputs_eager(
             ids_64,
             pos_64,
@@ -2067,7 +2116,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     # Generate independent logical weights and packed MK reference weights via pure-JAX
     # `qwen35` helpers, then construct the PyTorch backbone from `w_logical`.
     torch.manual_seed(42)
-    hf = dict(qwen35.random_hf_weights(jax.random.key(42), g))
+    hf = dict(mk.random_hf_weights(jax.random.key(42), g))
     jax_ops = mk.JaxArrayOps()
     b_bf16 = (
         jax.random.normal(jax.random.key(43), (g.NGDN, g.H, g.VH), dtype=jnp.bfloat16)
@@ -2083,14 +2132,14 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     w_logical["_ba_bf16"] = jnp.swapaxes(
         jnp.concatenate([b_bf16, a_bf16], axis=-1), -1, -2
     )[None, ...]
-    pos_init, hid_l_init, _, st_l = qwen35.random_logical_inputs(
+    pos_init, hid_l_init, _, st_l = mk.random_logical_inputs(
         jax.random.key(77), g, ex_base
     )
     st_l = dict(
         st_l,
         conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32),
     )
-    _, _, w_mk_ref, _ = qwen35.pack_inputs(
+    _, _, w_mk_ref, _ = mk.pack_inputs(
         pos_init,
         hid_l_init,
         w_logical,

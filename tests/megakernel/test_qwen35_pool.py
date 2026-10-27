@@ -104,14 +104,14 @@ def test_gdn_in_kernel_pool_io_rejects_mismatched_layout():
 
 def test_qwen35_pool_layout_matches_geometry():
     g = qwen35.Qwen35Geometry()
-    lay = mk.qwen35_pool_layout(g)
+    lay = qwen35.qwen35_pool.qwen35_pool_layout(g)
     assert (lay.num_pools, lay.slots_per_pool) == (g.NATT, g.att_every - 1)
     assert lay.num_recurrent_layers == g.NGDN
     for R in (1, 2, 8):
         gdn = mk.GDNModule.lin_in_layout(g, R)
         assert (lay.kh_per_rank(R), lay.vh_per_rank(R)) == (gdn.kh, gdn.vh)
         assert lay.qkv_per_rank(R) == gdn.QKV
-    assert mk.qwen35_pool_backend(g).layout == lay
+    assert qwen35.qwen35_pool.qwen35_pool_backend(g).layout == lay
 
 
 def test_check_pooled_step_hlo_uses_layout_page_shape():
@@ -152,11 +152,11 @@ def test_full_pooled_step_att_every_2():
         att_every=2,
     )
     ex = mk.with_cache(_exec(R=2, B=2, T=1), num_pages=96)
-    lay = mk.qwen35_pool_layout(g)
+    lay = qwen35.qwen35_pool.qwen35_pool_layout(g)
     assert (lay.num_pools, lay.slots_per_pool) == (2, 1)
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.key(5), g, ex)
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(5), g, ex)
     st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
-    _, hid_mk, w_mk, st_mk_paged = qwen35.pack_inputs(
+    _, hid_mk, w_mk, st_mk_paged = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
     )
     pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)

@@ -93,8 +93,8 @@ def _init_shared_weights_on_tpu(
     mesh: Mesh,
     g: qwen35.Qwen35Geometry,
     ex: ExecSpec,
-    f_lay: dict[str, tuple[int, int]],
-    f_S: int,
+    f_lay: dict[str, tuple[int, int]] | None = None,
+    f_S: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Allocate 60-layer hybrid FULL_EP (att_every=4) weights on TPU HBM once."""
     ms = qwen35.qwen35_spec(g)
@@ -102,6 +102,10 @@ def _init_shared_weights_on_tpu(
     nt, tk = p.nt, p.tk
     l_lay = p.smalls_layout
     l_S = p.smalls_width
+    if f_lay is None:
+        f_lay = l_lay
+    if f_S is None:
+        f_S = l_S
 
     R = ex.R
     L, H, E, HD, VD = g.L, g.H, g.E, g.HD, g.VD
@@ -2141,35 +2145,23 @@ def test_m5_tpu_v7x8_profile_ablation_bench():
     Per bucket, every variant is built through `Profile.exec_for` with donated
     pools, passes the pool-donation HLO guard (fused variants included: no
     separate gather/scatter and no full-pool copy), and is timed:
-      - `default`: frozen-parity profile (split pool I/O).
+      - `default`: baseline reference profile (split pool I/O).
       - `c30`: `qwen35-candidate30` as checked in (GPR auto, split).
       - `c30_gpr_off`: c30 with `pool_gather=False` (only where c30 used GPR).
       - `c30_fused`: c30 with experimental `fused_pool_io=True` at the buckets
         the `"auto"` policy would fuse (B <= 24 or B >= 56).
-    Numerics: `default` is the frozen-parity reference; c30 variants are
+    Numerics: `default` is the baseline reference; c30 variants are
     `approx` and are reported as cosine similarity vs `default`.
     """
     if not _has_tpu_v7x8():
         pytest.skip("Requires 8 TPU TensorCores (v7x-8)")
     tpu_devs = jax.devices("tpu")
-    frozen_mk = _load_frozen_mk()
     mesh = Mesh(tpu_devs[:8], ("tp",))
 
     g = dataclasses.replace(qwen35.FULL_EP, L=60, att_every=4)
     spec = qwen35.qwen35_spec(g)
     ex_init = ExecSpec(B=4, T=1, R=8, ctx=4096, stack_e=True)
-    c_f_init = frozen_mk.MKConfig(
-        R=8,
-        B=4,
-        T=1,
-        L=60,
-        att_every=4,
-        moe_tp=False,
-        ctx=4096,
-        stack_e=True,
-    )
-    f_lay, f_S = frozen_mk.smalls_layout(c_f_init)
-    w_lib, w_f = _init_shared_weights_on_tpu(mesh, g, ex_init, f_lay, f_S)
+    w_lib, w_f = _init_shared_weights_on_tpu(mesh, g, ex_init)
     del w_f
     gc.collect()
 
@@ -2343,14 +2335,14 @@ def test_fused_vs_split_t4_tpu_bitwise(tiles: str, B: int, seed: int):
         )
         key = 810 + B + 1000 * seed
     assert should_fuse_pool_io(spec, ex, fused_pool_io=True)
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.key(key), g, ex)
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(key), g, ex)
     pos_list = []
     for s_i in range(ex.NS):
         base_p = 126 if s_i == 0 else (20 + 10 * s_i)
         pos_list.extend(base_p + t_i for t_i in range(T))
     pos = jnp.asarray(pos_list, dtype=jnp.int32)
     st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
-    _, hid_mk, w_mk, _ = qwen35.pack_inputs(
+    _, hid_mk, w_mk, _ = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
     )
     pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
@@ -2386,3 +2378,67 @@ def test_fused_vs_split_t4_tpu_bitwise(tiles: str, B: int, seed: int):
     )
     np.testing.assert_array_equal(hf, hs)
     assert not summary, summary
+
+
+@pytest.mark.parametrize("T,B", [(1, 8), (4, 16)])
+def test_tpu_v7x8_repeatability_fused_and_seq_split(T: int, B: int):
+    """TPU repeatability gate: `R=8, L=4`, fused pool I/O + sequence-split (`GQ`),
+    `N=5` repeated runs from identical inputs produce identical bitwise hashes.
+    """
+    if not _has_tpu_v7x8():
+        pytest.skip("Requires 8 TPU TensorCores (v7x-8)")
+    R = 8
+    mesh = Mesh(np.array(jax.devices("tpu")[:R]), ("tp",))
+    tp = NamedSharding(mesh, P("tp"))
+    g = dataclasses.replace(qwen35.Qwen35.shrink(periods=1, R=R), NH=32, moe_tp=False)
+    spec = qwen35.qwen35_spec(g)
+    prof = get_profile("qwen35-candidate30-fused")
+    base = ExecSpec(
+        R=R,
+        B=B,
+        T=T,
+        ctx=1024,
+        stack_e=True,
+        cache=mk.CacheExec(paged_kv=True, num_pages=1024, pool_gather=False),
+    )
+    ex = prof.exec_for(base, B=B, T=T, g=g)
+    t = ex.resolve_tiles(g).with_modules({"gqa": {"kv_blk": 256, "kv_sub": 128}})
+    ex = mk.with_cache(
+        dataclasses.replace(ex, tiles=t, interpret=False), pool_gather=False
+    )
+    assert should_fuse_pool_io(spec, ex, fused_pool_io=True)
+
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(950 + T), g, ex)
+    pos = jnp.asarray([512 + (b % T) for b in range(B)], dtype=jnp.int32)
+    st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
+    _, hid_mk, w_mk, _ = mk.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
+    )
+    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+    step_f, info = mk.PallasWriter(fused_pool_io=True).make_step(
+        mesh, spec, ex, donate=True
+    )
+    ap = info["plan"].module_params["gqa"]
+    assert ap.SPLIT and ap.QV and (ap.GQ if T > 1 else ap.PACK)
+
+    def _run_once() -> tuple[str, list[str]]:
+        pools = tuple(
+            jax.device_put(np.asarray(r).copy(), tp)
+            for r in mk.states_to_pool(
+                g, ex, st_l, pt, ckpt[..., :T], jnp.maximum(roff, 0)
+            )
+        )
+        out, raw = step_f(pos, hid_mk, w_mk, pools, pt, ckpt, roff)
+        jax.block_until_ready(out)
+        h_out = hashlib.sha256(np.asarray(out).view(np.uint8).tobytes()).hexdigest()
+        h_pools = [
+            hashlib.sha256(np.asarray(r).view(np.uint8).tobytes()).hexdigest()
+            for r in raw
+        ]
+        return h_out, h_pools
+
+    ref_out, ref_pools = _run_once()
+    for step_idx in range(1, 5):
+        got_out, got_pools = _run_once()
+        assert got_out == ref_out, f"step {step_idx} hidden hash mismatch"
+        assert got_pools == ref_pools, f"step {step_idx} pool hash mismatch"

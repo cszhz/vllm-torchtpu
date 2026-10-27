@@ -218,6 +218,118 @@ def _arr_hash(arr: jax.Array) -> str:
     return f"{np_arr.dtype}:{list(np_arr.shape)}:{hashlib.sha256(raw).hexdigest()}"
 
 
+def _pinned_b1_golden_inputs(
+    key: jax.Array, g: qwen35.Qwen35Geometry, ex: mk.ExecSpec
+) -> tuple[jax.Array, jax.Array, dict[str, Any], dict[str, Any]]:
+    """Pinned input tensor stream matching `b1_bitexact.json` / `aaafa5d66`."""
+    from vllm_torchtpu.megakernel.modules.gdn import GDNModule
+    from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32
+
+    R_, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
+    L, H, E, HD = int(g.L), int(g.H), int(g.E), int(g.HD)
+    nh = int(g.nh(R_))
+    lay_gdn = GDNModule.lin_in_layout(g, ex)
+    vh, KD, VD = lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
+    qkv, z, nli = lay_gdn.QKV, lay_gdn.Z, lay_gdn.NLI
+    isr, ir = int(g.ISR(R_)), int(g.IR(R_))
+    er, ew = int(g.ER(R_)), int(g.EW(R_))
+    natt, ngdn = int(g.NATT), int(g.NGDN)
+    it = iter(jax.random.split(key, 36))
+
+    base_pos = jnp.arange(1, NS + 1, dtype=I32) * min(16, ctx // 4)
+    pos = (
+        base_pos
+        if T == 1
+        else (base_pos[:, None] + jnp.arange(T, dtype=I32)[None, :]).reshape(B)
+    )
+    hidden = jax.random.normal(next(it), (B, H), dtype=BF16) * 0.1
+
+    def rfp8(shape: tuple[int, ...]) -> jax.Array:
+        return (jax.random.normal(next(it), shape, dtype=F32) * 0.25).astype(FP8)
+
+    def rscale(shape: tuple[int, ...]) -> jax.Array:
+        return jnp.abs(jax.random.normal(next(it), shape, dtype=F32)) * 0.02 + 0.01
+
+    G, nkv, koff = int(g.G(R_)), int(g.NKV), nh * 2 * HD
+    att_q = rfp8((R_, natt, H, koff))
+    att_kv = jnp.repeat(rfp8((nkv, natt, H, 2 * HD)), G, axis=0)
+    att_in = jnp.concatenate([att_q, att_kv], axis=-1)
+    att_q_s = rscale((R_, natt, koff))
+    att_kv_s = jnp.repeat(rscale((nkv, natt, 2 * HD)), G, axis=0)
+    att_in_s = jnp.concatenate([att_q_s, att_kv_s], axis=-1)
+    kn = jnp.repeat(
+        jax.random.normal(next(it), (nkv, natt, HD), dtype=F32) * 0.05, G, axis=0
+    )
+    sh_gate = jnp.broadcast_to(
+        (jax.random.normal(next(it), (L, H), dtype=F32) * 0.1)[None, :, :], (R_, L, H)
+    )
+    e13, e13_s = rfp8((R_, L, ew, H, 2 * ir)), rscale((R_, L, ew, 2 * ir))
+    e2, e2_s = rfp8((R_, L, ew, ir, H)), rscale((R_, L, ew, H))
+    in_n = jax.random.normal(next(it), (L, H), dtype=F32) * 0.05
+    post_n_w = jax.random.normal(next(it), (L, H), dtype=F32) * 0.05
+    final_n_w = jax.random.normal(next(it), (H,), dtype=F32) * 0.05
+    att_out, att_out_s = rfp8((R_, natt, nh * HD, H)), rscale((R_, natt, H))
+    qn = jax.random.normal(next(it), (R_, natt, HD), dtype=F32) * 0.05
+    router = jax.random.normal(next(it), (L, H, E), dtype=BF16) * 0.1
+    sh13, sh13_s = rfp8((R_, L, H, 2 * isr)), rscale((R_, L, 2 * isr))
+    sh2, sh2_s = rfp8((R_, L, isr, H)), rscale((R_, L, H))
+    logical_weights: dict[str, Any] = dict(
+        in_norm=in_n, post_norm=post_n_w, final_norm=final_n_w, qn=qn, kn=kn
+    )
+    logical_weights.update(
+        att_in=att_in, att_in_s=att_in_s, att_out=att_out, att_out_s=att_out_s
+    )
+    logical_weights.update(
+        router=router, sh_gate=sh_gate, sh13=sh13, sh13_s=sh13_s, sh2=sh2, sh2_s=sh2_s
+    )
+    logical_weights.update(e13=e13, e13_s=e13_s, e2=e2, e2_s=e2_s)
+    if not g.moe_tp and ew > er and R_ > 1:
+        e_cores = mk.default_eplb_cores(g, R_)
+        for lyr in range(L):
+            for r1 in range(R_):
+                for k_idx, g_id in enumerate(e_cores[lyr][r1][er:ew]):
+                    r0, s0 = divmod(int(g_id), er)
+                    slot = er + k_idx
+                    e13 = e13.at[r1, lyr, slot].set(e13[r0, lyr, s0])
+                    e13_s = e13_s.at[r1, lyr, slot].set(e13_s[r0, lyr, s0])
+                    e2 = e2.at[r1, lyr, slot].set(e2[r0, lyr, s0])
+                    e2_s = e2_s.at[r1, lyr, slot].set(e2_s[r0, lyr, s0])
+        ecopy = mk.encode_eplb_ecopy(g, R_, e_cores)
+        logical_weights.update(
+            e13=e13, e13_s=e13_s, e2=e2, e2_s=e2_s, e_cores=e_cores, ecopy=ecopy
+        )
+    if ngdn > 0:
+        logical_weights.update(
+            {
+                "lin_in": rfp8((R_, ngdn, H, nli)),
+                "lin_in_s": rscale((R_, ngdn, nli)),
+                "lin_out": rfp8((R_, ngdn, z, H)),
+                "lin_out_s": rscale((R_, ngdn, H)),
+                "conv": jax.random.normal(next(it), (R_, ngdn, 4 * qkv), dtype=F32)
+                * 0.05,
+                "alog": jax.random.normal(next(it), (R_, ngdn, vh), dtype=F32) * 0.1
+                - 1.0,
+                "dtb": jax.random.normal(next(it), (R_, ngdn, vh), dtype=F32) * 0.1,
+                "gnorm": jnp.ones((R_, ngdn, VD), dtype=F32)
+                + jax.random.normal(next(it), (R_, ngdn, VD), dtype=F32) * 0.05,
+            }
+        )
+    kc_nkv = jax.random.normal(next(it), (nkv, natt, NS, ctx, HD), dtype=BF16) * 0.1
+    vc_nkv = jax.random.normal(next(it), (nkv, natt, NS, ctx, HD), dtype=BF16) * 0.1
+    logical_states: dict[str, Any] = {
+        "kc": jnp.repeat(kc_nkv, G, axis=0),
+        "vc": jnp.repeat(vc_nkv, G, axis=0),
+    }
+    if ngdn > 0:
+        logical_states["conv"] = (
+            jax.random.normal(next(it), (R_, ngdn, NS, 3, qkv), dtype=F32) * 0.05
+        )
+        logical_states["rec"] = (
+            jax.random.normal(next(it), (R_, ngdn, NS, vh, KD, VD), dtype=BF16) * 0.05
+        )
+    return pos, hidden, logical_weights, logical_states
+
+
 def run_ref_case(
     *,
     seed: int,
@@ -246,7 +358,7 @@ def run_ref_case(
             pytest.skip("GQATunables.rope_fp32 not supported at this ref")
         tiles = mk.Tiles(modules={"gqa": GQATunables(rope_fp32=True)})
     ex = mk.ExecSpec(R=R, B=B, T=T, ctx=ctx, cache=cache, tiles=tiles)
-    pos, hid, w_l, st_l = qwen35.random_logical_inputs(jax.random.PRNGKey(seed), g, ex)
+    pos, hid, w_l, st_l = _pinned_b1_golden_inputs(jax.random.PRNGKey(seed), g, ex)
     out, st = qwen35.reference_step(g, ex, pos, hid, w_l, st_l, pool_io=paged_pool)
     return {
         "out": _arr_hash(out),
@@ -301,11 +413,11 @@ def run_case(
     if pool_gather is not None:
         ex = mk.with_cache(ex, pool_gather=pool_gather)
     spec = qwen35.qwen35_spec(g)
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
+    pos, hid_l, w_l, st_l = _pinned_b1_golden_inputs(
         jax.random.key(900 + 10 * T + B), g, ex
     )
     st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
-    _, hid_mk, w_mk, _ = qwen35.pack_inputs(
+    _, hid_mk, w_mk, _ = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
     )
     pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)

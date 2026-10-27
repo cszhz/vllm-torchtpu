@@ -124,10 +124,8 @@ def test_exported_bridge_raiden_pointer_identity_and_bit_exact(T: int, B: int) -
     spec = qwen35.qwen35_spec(g)
     plan = planner.plan(spec, ex)
 
-    pos_j, hid_l, w_l, st_l = qwen35.random_logical_inputs(
-        jax.random.key(500 + T), g, ex
-    )
-    _, hid_mk, w_mk, _ = qwen35.pack_inputs(
+    pos_j, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(500 + T), g, ex)
+    _, hid_mk, w_mk, _ = mk.pack_inputs(
         pos_j, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
     )
     pt_j, ckpt_j, roff_j, _ = mk.default_pool_layout(g, ex)

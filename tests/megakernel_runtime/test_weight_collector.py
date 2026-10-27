@@ -522,13 +522,15 @@ def test_load_vllm_weights_value_parity(
         cache=CacheExec(paged_kv=True, num_pages=96, max_pages_per_seq=2),
     )
     j_ops = JaxArrayOps()
-    hf = dict(qwen35.random_hf_weights(jax.random.key(314), g))
-    b_bf16 = (hf["lin_b"].astype(jnp.float32) * hf["lin_b_s"][:, None, :]).astype(
-        jnp.bfloat16
-    )
-    a_bf16 = (hf["lin_a"].astype(jnp.float32) * hf["lin_a_s"][:, None, :]).astype(
-        jnp.bfloat16
-    )
+    hf = dict(mk.random_hf_weights(jax.random.key(314), g))
+    b_bf16 = (
+        jnp.transpose(hf["lin_b"], (0, 2, 1)).astype(jnp.float32)
+        * hf["lin_b_s"][:, None, :]
+    ).astype(jnp.bfloat16)
+    a_bf16 = (
+        jnp.transpose(hf["lin_a"], (0, 2, 1)).astype(jnp.float32)
+        * hf["lin_a_s"][:, None, :]
+    ).astype(jnp.bfloat16)
     b_qs = [j_ops.quantize_fp8(b_bf16[i]) for i in range(b_bf16.shape[0])]
     a_qs = [j_ops.quantize_fp8(a_bf16[i]) for i in range(a_bf16.shape[0])]
     hf["lin_b"] = jnp.stack([q for q, _ in b_qs], axis=0)

@@ -54,9 +54,7 @@ from vllm_torchtpu.megakernel.model_def import (
 )
 from vllm_torchtpu.megakernel.models import (
     qwen35,
-    qwen35_pack,
     qwen35_pool,
-    qwen35_weights,
 )
 from vllm_torchtpu.megakernel.models.qwen35 import DEFAULT_HF_CONFIG, Qwen35
 from vllm_torchtpu.megakernel.models.qwen35_profile import (
@@ -928,15 +926,9 @@ def test_synthetic_model_def_every2_dense_override_cpu_kernel_vs_reference(
     # Load HF weights via generic loaders on SynthHybrid (att_every=2 != 4, custom
     # norm prefixes attn_norm / ffn_norm / final_ln) and feed them into the CPU
     # kernel vs composed reference check.
-    hf_raw = qwen35.random_hf_weights(jax.random.PRNGKey(42), g_tiny)
-    hf_synth = {
-        k: v
-        for k, v in hf_raw.items()
-        if k not in ("in_norm", "post_norm", "final_norm")
-    }
-    hf_synth["attn_norm"] = hf_raw["in_norm"]
-    hf_synth["ffn_norm"] = hf_raw["post_norm"]
-    hf_synth["final_ln"] = hf_raw["final_norm"]
+    hf_synth = mk.random_hf_weights(jax.random.PRNGKey(42), g_tiny)
+    assert {"attn_norm", "ffn_norm", "final_ln"} <= set(hf_synth)
+    assert {"in_norm", "post_norm", "final_norm"}.isdisjoint(hf_synth)
 
     w_l_loaded = mk.load_logical_weights(SynthHybrid, ex, hf_synth, g=g_tiny)
     assert {"attn_norm", "ffn_norm", "final_ln"} <= set(w_l_loaded)
@@ -967,16 +959,14 @@ def test_synthetic_model_def_every2_dense_override_cpu_kernel_vs_reference(
                     err_msg=f"SynthHybrid rank {r} mismatch on {k}",
                 )
 
-    pos, hid_l, _, st_l = qwen35.random_logical_inputs(
-        jax.random.PRNGKey(42), g_tiny, ex
-    )
+    pos, hid_l, _, st_l = mk.random_logical_inputs(jax.random.PRNGKey(42), g_tiny, ex)
     ref_out, ref_st = SynthHybrid.reference_step(
         g_tiny, ex, pos, hid_l, w_l_loaded, st_l
     )
 
     devs = jax.devices("cpu")[: ex.R]
     mesh = jax.sharding.Mesh(np.asarray(devs), ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+    pos_mk, hid_mk, w_mk, st_mk = mk.pack_inputs(
         pos, hid_l, w_l_loaded, st_l, g_tiny, ex, mesh=mesh
     )
     step_fn, _ = mk.make_step(mesh, ms, ex)
@@ -1172,7 +1162,7 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     assert len(qwen_lines) <= 200, f"qwen35.py has {len(qwen_lines)} lines (> 200)"
     assert "fmt: skip" not in qwen_text, "qwen35.py contains fmt: skip"
     assert "noqa" not in qwen_text, "qwen35.py contains noqa"
-    for mod in (qwen35_weights, qwen35_pack, qwen35_pool, qwen35_profile):
+    for mod in (qwen35_pool, qwen35_profile):
         p = Path(mod.__file__)
         mod_text = p.read_text(encoding="utf-8")
         n_lines = len(mod_text.splitlines())
@@ -1252,7 +1242,14 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
 
     # Runner hf_config validation: consistent fail-closed policy (log differing fields
     # and return False / maybe_create returns None, never raising on mismatched configs)
-    from frozen_utils import dict_to_namespace
+    def dict_to_namespace(obj: Any) -> Any:
+        if isinstance(obj, Mapping):
+            return types.SimpleNamespace(
+                **{str(k): dict_to_namespace(v) for k, v in obj.items()}
+            )
+        if isinstance(obj, list):
+            return [dict_to_namespace(x) for x in obj]
+        return obj
 
     def _make_runner(hf_cfg: Any) -> Any:
         mc = types.SimpleNamespace(hf_config=hf_cfg)
@@ -1540,7 +1537,7 @@ def test_qwen35_model_def_composed_reference_matches_module_loop(
     """Composed `Qwen35.reference_step` is bitwise identical to explicit module loop."""
     g = dataclasses.replace(qwen35.TINY, moe_tp=moe_tp)
     ex = ExecSpec(R=2, B=2 * t_val, T=t_val, ctx=128)
-    pos, hid, w_l, st_l = qwen35.random_logical_inputs(
+    pos, hid, w_l, st_l = mk.random_logical_inputs(
         jax.random.PRNGKey(17 + t_val), g, ex
     )
     out_composed, st_composed = Qwen35.reference_step(

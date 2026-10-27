@@ -28,6 +28,7 @@ from jax.experimental import topologies
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+import vllm_torchtpu.megakernel as mk
 from vllm_torchtpu.megakernel import kernel, planner
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models import qwen35
@@ -46,7 +47,7 @@ def _can_compile_tpu7x() -> bool:
 
 
 def test_m2_recorded_full_ep_hybrid_build_invariants():
-    """Verify full hybrid `FULL_EP` (`L=60, att_every=4`) matches frozen constants."""
+    """Verify full hybrid `FULL_EP` (`L=60, att_every=4`) recorded build invariants."""
     g = qwen35.FULL_EP
     assert g.L == 60 and g.att_every == 4 and g.NGDN == 45 and g.NATT == 15
 
@@ -432,11 +433,11 @@ def test_m2_qwen35_hybrid_pack_and_step_vs_logical_reference(
     ex = ExecSpec(B=B, T=T, R=R, ctx=256, tiles=tiles, interpret=True)
 
     key = jax.random.PRNGKey(200 + R * 10 + T + gdn_rows)
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(key, g, ex)
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(key, g, ex)
     ref_hid, ref_st = qwen35.reference_step(g, ex, pos, hid_l, w_l, st_l)
 
     mesh = Mesh(devs[:R], ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+    pos_mk, hid_mk, w_mk, st_mk = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh
     )
     in_conv_shape = st_mk["conv"].shape
@@ -514,11 +515,11 @@ def test_m2_qwen35_hybrid_r8_multi_rank_interpret(T: int):
     ex = ExecSpec(B=2 * T, T=T, R=8, ctx=256, tiles=tiles, interpret=True)
 
     key = jax.random.PRNGKey(909 + T)
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(key, g, ex)
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(key, g, ex)
     ref_hid, ref_st = qwen35.reference_step(g, ex, pos, hid_l, w_l, st_l)
 
     mesh = Mesh(devs[:8], ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+    pos_mk, hid_mk, w_mk, st_mk = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh
     )
     step, _ = qwen35.make_step(mesh, g, ex, donate_states=True)
@@ -635,7 +636,7 @@ def test_m2_bit_exact_vs_frozen_qwen35_hybrid(B: int, T: int, gdn_rows: int):
         TINY_TILES, bank=256 << 10, inplace=not T > 1
     ).with_modules({"gdn": {"gdn_rows": gdn_rows, "gdn_bufs": 2}})
     ex = ExecSpec(B=B, T=T, R=1, ctx=256, tiles=tiles_lib, interpret=True)
-    pos, hid_lib, w_lib, st_lib = qwen35.random_inputs(
+    pos, hid_lib, w_lib, st_lib = mk.random_inputs(
         jax.random.PRNGKey(B * 10 + T), g, ex, mesh=mesh
     )
     step_lib, info_lib = qwen35.make_step(mesh, g, ex)

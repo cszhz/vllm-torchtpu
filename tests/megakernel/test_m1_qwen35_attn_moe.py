@@ -26,6 +26,7 @@ import pytest
 from jax.experimental import topologies
 from jax.sharding import Mesh
 
+import vllm_torchtpu.megakernel as mk
 from tests.megakernel.megakernel_fakes import with_tile_fields
 from vllm_torchtpu.megakernel import kernel
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
@@ -71,7 +72,7 @@ def test_m1_recorded_full_ep_build_invariants():
     assert info["T_TOTAL"] == 840
     assert p.module_params["moe"].TE == 12
     assert p.module_params["moe"].NSS == 3
-    # GDN-free M1 omits `recb`/`sbuf`/`convb` -> 48,033,792 < frozen's 49,178,624.
+    # GDN-free M1 omits `recb`/`sbuf`/`convb` -> 48,033,792 < full hybrid's 49,178,624.
     # (M4b: 48,031,744; +2,048 B of always-allocated M5 GQA scratch `rcs`. The
     # `rope` table and the QV staging slabs are allocated only under `gqa_qv`.)
     assert info["vmem_scratch_bytes"] == 48_033_792 < 49_178_624
@@ -125,11 +126,11 @@ def test_m1_qwen35_pack_and_step_vs_logical_reference(
     ex = ExecSpec(B=B, T=T, R=R, ctx=256, tiles=tiles, interpret=True)
 
     key = jax.random.PRNGKey(100 + R * 10 + T)
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(key, g, ex)
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(key, g, ex)
     ref_hid, ref_st = qwen35.reference_step(g, ex, pos, hid_l, w_l, st_l)
 
     mesh = Mesh(devs[:R], ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+    pos_mk, hid_mk, w_mk, st_mk = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh
     )
     step, _ = qwen35.make_step(mesh, g, ex)
@@ -189,13 +190,13 @@ def test_m1_qwen35_rows_above_64_vs_logical_reference(B: int):
         g.check(ExecSpec(B=132, T=T, R=R, ctx=256, tiles=tiles, interpret=True))
 
     key = jax.random.PRNGKey(7 + B)
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(key, g, ex)
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(key, g, ex)
     ref_hid, _ = qwen35.reference_step(g, ex, pos, hid_l, w_l, st_l)
     # The layer must move the rows, or a pass-through would match too.
     assert float(jnp.abs(ref_hid.astype(F32) - hid_l.astype(F32)).mean()) > 1e-2
 
     mesh = Mesh(devs[:R], ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+    pos_mk, hid_mk, w_mk, st_mk = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh
     )
     step, _ = qwen35.make_step(mesh, g, ex)
@@ -235,11 +236,11 @@ def test_m1_qwen35_r8_multi_rank_interpret():
     ex = ExecSpec(B=2, T=1, R=8, ctx=256, tiles=tiles, interpret=True)
 
     key = jax.random.PRNGKey(808)
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(key, g, ex)
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(key, g, ex)
     ref_hid, ref_st = qwen35.reference_step(g, ex, pos, hid_l, w_l, st_l)
 
     mesh = Mesh(devs[:8], ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+    pos_mk, hid_mk, w_mk, st_mk = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh
     )
     step, _ = qwen35.make_step(mesh, g, ex)
@@ -348,7 +349,7 @@ def test_m1_bit_exact_vs_frozen_qwen35():
     )
     tiles_lib = dataclasses.replace(TINY_TILES, bank=256 << 10)
     ex = ExecSpec(B=2, T=1, R=1, ctx=256, tiles=tiles_lib, interpret=True)
-    pos, hid_lib, w_lib, st_lib = qwen35.random_inputs(
+    pos, hid_lib, w_lib, st_lib = mk.random_inputs(
         jax.random.PRNGKey(0), g, ex, mesh=mesh
     )
     step_lib, info_lib = qwen35.make_step(mesh, g, ex)
@@ -462,12 +463,12 @@ _FLAG_TILES_BASE = dataclasses.replace(
 
 @pytest.fixture(scope="module")
 def m5_flag_base():
-    """Frozen-parity baseline run shared by the per-flag parity tests."""
+    """Default baseline run shared by the per-flag parity tests."""
     mesh1 = Mesh(jax.devices("cpu")[:1], ("tp",))
     g = qwen35.Qwen35Geometry(**_FLAG_GEOM)
     ex = ExecSpec(B=2, T=1, R=1, ctx=256, tiles=_FLAG_TILES_BASE, interpret=True)
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.PRNGKey(501), g, ex)
-    args = qwen35.pack_inputs(pos, hid_l, w_l, st_l, g, ex, mesh=mesh1)
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.PRNGKey(501), g, ex)
+    args = mk.pack_inputs(pos, hid_l, w_l, st_l, g, ex, mesh=mesh1)
     step, info = qwen35.make_step(mesh1, g, ex)
     p = info["plan"]
     assert info["T_TOTAL"] > _FLAG_TILES_BASE.nbd  # dynamic dense streaming
@@ -493,8 +494,8 @@ def test_m5_flags_cpu_bit_exact_vs_default(m5_flag_base, flags):
     """These opt-in M5 flags reproduce the default bitwise in CPU interpret mode.
 
     CPU bit-exactness is necessary, not sufficient: on TPU `moe_unroll` (and
-    `pipe_ep`, which implies it) changes MoE numerics vs frozen (the TPU bisect
-    `test_m5_tpu_v7x8_frozen_parity_bisect`), so their numerics class is `approx`.
+    `pipe_ep`, which implies it) reorders MoE tile accumulation vs the baseline
+    profile, so their numerics class is `approx`.
     """
     mesh1, g, ex, args, out_hid, out_st = m5_flag_base
     ex_opt = dataclasses.replace(ex, tiles=with_tile_fields(_FLAG_TILES_BASE, flags))
@@ -566,10 +567,10 @@ def test_m5_hier3_butterfly_all_reduce(R_test: int):
     tiles_h3 = dataclasses.replace(tiles_h0, hier=3)
     ex_h0 = ExecSpec(B=2, T=1, R=R_test, ctx=256, tiles=tiles_h0, interpret=True)
     ex_h3 = dataclasses.replace(ex_h0, tiles=tiles_h3)
-    pos_r, hid_lr, w_lr, st_lr = qwen35.random_logical_inputs(
+    pos_r, hid_lr, w_lr, st_lr = mk.random_logical_inputs(
         jax.random.PRNGKey(510 + R_test), g_r, ex_h0
     )
-    args_r = qwen35.pack_inputs(pos_r, hid_lr, w_lr, st_lr, g_r, ex_h0, mesh=mesh_r)
+    args_r = mk.pack_inputs(pos_r, hid_lr, w_lr, st_lr, g_r, ex_h0, mesh=mesh_r)
     step_h0, info_h0 = qwen35.make_step(mesh_r, g_r, ex_h0)
     step_h3, info_h3 = qwen35.make_step(mesh_r, g_r, ex_h3)
     assert info_h0["core_plan"].comm.HIER == 0
@@ -589,13 +590,13 @@ def test_gqa_rope_fp32_ref_vs_kernel_parity():
     tiles_fp32 = tiles_def.with_modules({"gqa": {"rope_fp32": True}})
     ex_def = ExecSpec(B=2, T=1, R=1, ctx=256, tiles=tiles_def, interpret=True)
     ex_fp32 = dataclasses.replace(ex_def, tiles=tiles_fp32)
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(
         jax.random.PRNGKey(509), g, ex_fp32
     )
     ref_hid_def, ref_st_def = qwen35.reference_step(g, ex_def, pos, hid_l, w_l, st_l)
     ref_hid, ref_st = qwen35.reference_step(g, ex_fp32, pos, hid_l, w_l, st_l)
     assert not jnp.array_equal(ref_st["kc"], ref_st_def["kc"])
-    args = qwen35.pack_inputs(pos, hid_l, w_l, st_l, g, ex_fp32, mesh=mesh1)
+    args = mk.pack_inputs(pos, hid_l, w_l, st_l, g, ex_fp32, mesh=mesh1)
     step_def, _ = qwen35.make_step(mesh1, g, ex_def)
     step, info = qwen35.make_step(mesh1, g, ex_fp32)
     assert info["plan"].module_params["gqa"].rope_fp32 is True

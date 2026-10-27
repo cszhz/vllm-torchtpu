@@ -120,9 +120,9 @@ def test_moe_forced_routing_and_row_mask_inputs_cpu_interpret(paged: bool):
     B = 2
     ex = _exec(B, paged)
     spec = qwen35.qwen35_spec(g)
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.key(7), g, ex)
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(7), g, ex)
     st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
-    _, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+    _, hid_mk, w_mk, st_mk = mk.pack_inputs(
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=paged
     )
     if paged:

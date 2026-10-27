@@ -224,9 +224,107 @@ def test_qwen35_hf_params_transforms_and_vllm_aliases():
         ("TINY_EP", qwen35.TINY_EP, None, ("default", "candidate30")),
         ("TINY_EP_EPLB72", g_eplb, e_cores_eplb, ("default",)),
     ]
+
+    def _pinned_b5_hf_weights(key: jax.Array, geom: Any) -> dict[str, jax.Array]:
+        from vllm_torchtpu.megakernel.ops import FP8
+        from vllm_torchtpu.megakernel.weights.logical import (
+            resolve_spec_and_norms,
+            switch_branch_for_layer,
+        )
+
+        r_p = max(int(getattr(geom, "NKV", 1)), 1)
+        ex_p = ExecSpec(R=r_p, B=r_p, T=1, ctx=2048)
+        ms, geom, pre_n, post_n, final_n = resolve_spec_and_norms(
+            qwen35.Qwen35, ex_p, g=geom
+        )
+        L_ = int(geom.L)
+        cnts: dict[str, int] = {m.name: 0 for m in ms.all_modules()}
+        for s in ms.layer_type.slots:
+            if isinstance(s, mk.SwitchSlot):
+                for lyr in range(L_):
+                    bm, _ = switch_branch_for_layer(s, lyr)
+                    cnts[bm.name] = cnts.get(bm.name, 0) + 1
+            else:
+                cnts[s.name] = cnts.get(s.name, 0) + L_
+        non_rec, rec = [], []
+        for m in ms.all_modules():
+            if (cnt := cnts.get(m.name, 0)) > 0:
+                (
+                    rec
+                    if isinstance(m.cache_decl(geom), RecurrentCacheDecl)
+                    else non_rec
+                ).append((m, cnt))
+        it = iter(jax.random.split(key, 56))
+
+        def _draw(d: Any, lead: tuple[int, ...]) -> jax.Array:
+            sh = (*lead, *d.shape)
+            if d.transform.scale_for is not None:
+                arr = jnp.abs(jax.random.normal(next(it), sh, dtype=F32)) * 0.02 + 0.01
+            elif d.transform.quantize is not None or jnp.dtype(d.dtype) == jnp.dtype(
+                FP8
+            ):
+                arr = (jax.random.normal(next(it), sh, dtype=F32) * 0.25).astype(FP8)
+            else:
+                mean = 0.0 if d.init is None else float(d.init.mean)
+                std = 0.05 if d.init is None else float(d.init.std)
+                raw = jax.random.normal(next(it), sh, dtype=d.dtype) * std
+                arr = jnp.ones(sh, dtype=d.dtype) + raw if mean == 1.0 else raw + mean
+            tp = d.transform.transpose
+            if d.hf_shape == d.shape and tp is not None:
+                n_l = len(lead)
+                arr = jnp.transpose(arr, (*range(n_l), *(n_l + i for i in tp)))
+            return arr
+
+        pre_drawn: dict[str, jax.Array] = {}
+        for mod, n_l in non_rec:
+            ds = mod.hf_params(g=geom)
+            by_n = {x.name: x for x in ds}
+            for d in ds:
+                t = by_n.get(d.transform.scale_for, d) if d.transform.scale_for else d
+                if t.transform.fuse_into is not None or bool(
+                    t.vllm_aliases and len(t.vllm_aliases[-1].targets) > 1
+                ):
+                    pre_drawn[d.name] = _draw(d, (n_l,))
+        out_hf: dict[str, jax.Array] = {}
+        for nm in (pre_n, post_n):
+            if nm is not None:
+                nd = nm.hf_params(g=geom)[0]
+                out_hf[nd.name] = _draw(nd, (L_,))
+        if final_n is not None:
+            fd = final_n.hf_params(g=geom)[0]
+            out_hf[fd.name] = _draw(fd, ())
+        for mod, n_l in (*non_rec, *rec):
+            for d in mod.hf_params(g=geom):
+                out_hf[d.name] = (
+                    pre_drawn[d.name] if d.name in pre_drawn else _draw(d, (n_l,))
+                )
+        return out_hf
+
+    # Verify mk.random_hf_weights draws at d.hf_shape and emits only decl names.
+    hf_decl_only = mk.random_hf_weights(jax.random.PRNGKey(0), qwen35.TINY)
+    expected_decl_names = {
+        d.name
+        for mod in (
+            in_norm_mod,
+            gqa_mod,
+            gdn_mod,
+            post_norm_mod,
+            moe_mod_tp,
+            final_norm_mod,
+        )
+        for d in mod.hf_params()
+    }
+    assert set(hf_decl_only) == expected_decl_names
+    for d in gqa_mod.hf_params():
+        assert hf_decl_only[d.name].shape == (qwen35.TINY.NATT, *d.hf_shape)
+    for d in gdn_mod.hf_params():
+        assert hf_decl_only[d.name].shape == (qwen35.TINY.NGDN, *d.hf_shape)
+    for d in moe_mod_tp.hf_params():
+        assert hf_decl_only[d.name].shape == (qwen35.TINY.L, *d.hf_shape)
+
     checked_packed = 0
     for g_name, g_case, e_cores, profiles in geom_cases:
-        hf = qwen35.random_hf_weights(jax.random.PRNGKey(0), g_case)
+        hf = _pinned_b5_hf_weights(jax.random.PRNGKey(0), g_case)
         w_l = mk.load_logical_weights(
             qwen35.Qwen35, ex_base, hf, g=g_case, e_cores=e_cores
         )
@@ -560,7 +658,7 @@ _TINY_STEP_TILES = Tiles(
     nbe=8,
     ebank=512 << 10,
     vmem_mib=64,
-    modules={"gqa": GQATunables(kv_blk=128, nkv=1)},
+    modules={"gqa": GQATunables(kv_blk=128, nkv=2)},
 )
 
 
@@ -595,9 +693,7 @@ def test_gqa_module_reference_matches_kernel_make_step_cpu(T: int, paged_kv: boo
     )
     mesh = _cpu_mesh(ex.R)
 
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
-        jax.random.PRNGKey(10 + T), g, ex
-    )
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.PRNGKey(10 + T), g, ex)
     gqa_mod = GQAModule(geometry=g)
     in_norm_mod = Norm(
         "input_layernorm", geometry=g, zero_centered=g.zero_centered_norm
@@ -679,7 +775,7 @@ def test_gdn_module_reference_matches_kernel_make_step_cpu(T: int):
     ex = ExecSpec(R=2, B=2, T=T, ctx=128, interpret=True, tiles=_TINY_STEP_TILES)
     mesh = _cpu_mesh(ex.R)
 
-    pos, hid_l, w_l4, st_l4 = qwen35.random_logical_inputs(
+    pos, hid_l, w_l4, st_l4 = mk.random_logical_inputs(
         jax.random.PRNGKey(20 + T), qwen35.TINY, ex
     )
     g = _SingleLayerGDNGeometry(
@@ -775,7 +871,7 @@ def test_moe_module_reference_matches_kernel_make_step_cpu(moe_tp: bool):
     ex = ExecSpec(R=2, B=2, T=1, ctx=128, interpret=True, tiles=_TINY_STEP_TILES)
     mesh = _cpu_mesh(ex.R)
 
-    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.PRNGKey(30), g, ex)
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.PRNGKey(30), g, ex)
     moe_mod = MoEModule(geometry=g, moe_tp=moe_tp)
     post_norm_mod = Norm(
         "post_attention_layernorm", geometry=g, zero_centered=g.zero_centered_norm
@@ -939,20 +1035,21 @@ def test_slice_alias_targets_jax_array_ops_and_loader_validations():
         resolve_spec_and_norms(g.to_model_spec(), ex, g=g)
 
     # 5. _coerce_canonical_hf_entry transposes hf_shape and rejects invalid shapes
-    hf_valid = qwen35.random_hf_weights(jax.random.PRNGKey(3), g)
+    hf_valid = mk.random_hf_weights(jax.random.PRNGKey(3), g)
     hf_bad = dict(hf_valid, sh2=jnp.zeros((g.L, g.H * g.IS, 1), dtype=FP8))
     with pytest.raises(ValueError, match="trailing shape"):
         mk.load_logical_weights(qwen35.Qwen35, ex, hf_bad, g=g)
 
     # Transposed 2D hf_shape (L, H, IS) on sh2 (shape=(IS, H), transpose=(1, 0)) works
     g_rect = dataclasses.replace(g, IS=512)
-    hf_rect = qwen35.random_hf_weights(jax.random.PRNGKey(30), g_rect)
-    sh2_nk = jnp.transpose(hf_rect["sh2"], (0, 2, 1))
-    assert sh2_nk.shape == (g_rect.L, g_rect.H, g_rect.IS)
-    w_l_trans = mk.load_logical_weights(
-        qwen35.Qwen35, ex, dict(hf_rect, sh2=sh2_nk), g=g_rect
+    hf_rect = mk.random_hf_weights(jax.random.PRNGKey(30), g_rect)
+    assert hf_rect["sh2"].shape == (g_rect.L, g_rect.H, g_rect.IS)
+    sh2_kn = jnp.transpose(hf_rect["sh2"], (0, 2, 1))
+    assert sh2_kn.shape == (g_rect.L, g_rect.IS, g_rect.H)
+    w_l_trans = mk.load_logical_weights(qwen35.Qwen35, ex, hf_rect, g=g_rect)
+    w_l_canon = mk.load_logical_weights(
+        qwen35.Qwen35, ex, dict(hf_rect, sh2=sh2_kn), g=g_rect
     )
-    w_l_canon = mk.load_logical_weights(qwen35.Qwen35, ex, hf_rect, g=g_rect)
     np.testing.assert_array_equal(
         np.asarray(w_l_trans["sh2"]).view(np.uint8),
         np.asarray(w_l_canon["sh2"]).view(np.uint8),
@@ -960,7 +1057,7 @@ def test_slice_alias_targets_jax_array_ops_and_loader_validations():
 
     # 6. EPLB branch validates expert dtype/shape
     g_eplb = dataclasses.replace(qwen35.TINY_EP, e_slots=72)
-    hf_ep = qwen35.random_hf_weights(jax.random.PRNGKey(4), g_eplb)
+    hf_ep = mk.random_hf_weights(jax.random.PRNGKey(4), g_eplb)
     with pytest.raises(ValueError, match="dtype"):
         mk.load_logical_weights(
             qwen35.Qwen35, ex, dict(hf_ep, e2=hf_ep["e2"].astype(BF16)), g=g_eplb

@@ -52,6 +52,12 @@ def load_frozen_qwen35_config_json(
     frozen_dir: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Verify SHA-256 and load the frozen Qwen3.5 `config.json` dict."""
+    if (
+        frozen_dir is None
+        and "MK_FROZEN_QWEN35_DIR" in os.environ
+        and not os.environ["MK_FROZEN_QWEN35_DIR"].strip()
+    ):
+        pytest.skip("MK_FROZEN_QWEN35_DIR is empty")
     cands: list[pathlib.Path] = []
     if frozen_dir is not None:
         cands.append(pathlib.Path(frozen_dir))
@@ -82,6 +88,12 @@ def load_frozen_qwen35(
     frozen_dir: str | os.PathLike[str] | None = None,
 ) -> tuple[Any, Any]:
     """Verify SHA-256 of all 3 frozen files and load `(frozen_mk, frozen_pio)`."""
+    if (
+        frozen_dir is None
+        and "MK_FROZEN_QWEN35_DIR" in os.environ
+        and not os.environ["MK_FROZEN_QWEN35_DIR"].strip()
+    ):
+        pytest.skip("MK_FROZEN_QWEN35_DIR is empty")
     resolved_dir = pathlib.Path(
         frozen_dir
         if frozen_dir is not None
