@@ -33,6 +33,351 @@ import numpy as np
 import torch
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.runner.tpu_runner_async_output import (
+    assemble_spec_next_tokens as assemble_spec_next_tokens,
+)
+from vllm_torchtpu.runner.tpu_runner_async_output import (
+    compute_num_rejected as compute_num_rejected,
+)
+from vllm_torchtpu.runner.tpu_runner_async_output import (
+    extract_draft_token_ids,
+    subtract_num_rejected_tokens,
+)
+
+INVALID_TOKEN_ID = -1
+
+
+def _unmark_dynamic_tensor(arg: Any) -> Any:
+    """Return a shallow slice view when `arg` carries Dynamo dynamic-dim marks."""
+    if isinstance(arg, torch.Tensor) and getattr(arg, "_dynamo_dynamic_indices", None):
+        return arg[:]
+    return arg
+
+
+def subtract_and_substitute_placeholder_token(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused rejected-draft subtraction and placeholder token substitution."""
+    seq_lens, positions = subtract_num_rejected_tokens(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+    )
+    token_in_tpu_cur_input_indices = substitution_indices[0]
+    token_in_tpu_pre_next_tokens_indices = substitution_indices[1]
+    mask = token_in_tpu_pre_next_tokens_indices > -1
+    safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
+    new_token_values = next_tokens_tpu[safe_idx].to(input_ids.dtype)
+    original_values = input_ids[token_in_tpu_cur_input_indices]
+    update_values = torch.where(mask, new_token_values, original_values)
+    input_ids = input_ids.scatter(0, token_in_tpu_cur_input_indices, update_values)
+    return seq_lens, positions, input_ids
+
+
+def subtract_and_substitute_draft_token_ids(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused rejected-draft subtraction, placeholder token substitution, and
+    draft token extraction in a single compiled TPU graph.
+    """
+    seq_lens, positions, input_ids = subtract_and_substitute_placeholder_token(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+        input_ids,
+        substitution_indices,
+        next_tokens_tpu,
+    )
+    draft_token_ids = extract_draft_token_ids(
+        input_ids, logits_indices, target_logits_indices
+    )
+    return seq_lens, positions, input_ids, draft_token_ids
+
+
+def _pad_dim0_repeat_last_tensor(
+    tensor_in: torch.Tensor, target_len: int
+) -> torch.Tensor:
+    """Pad 1-D tensor along dim 0 to `target_len` by repeating its last entry."""
+    cur_len = tensor_in.shape[0]
+    if target_len <= cur_len:
+        return tensor_in
+    filler = tensor_in[-1:].expand(target_len - cur_len)
+    return torch.cat((tensor_in, filler), dim=0)
+
+
+def fold_verify_and_draft_prep(
+    next_tokens: torch.Tensor,
+    chunk_input_ids: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    pad_req_idx: torch.Tensor,
+    positions: torch.Tensor,
+    base_seq_lens: torch.Tensor,
+    step0_pad_len: int,
+    advance_draft_positions: bool,
+    max_num_reqs: int,
+    read_offsets: torch.Tensor | None = None,
+    stacked_groups: torch.Tensor | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Folded post-rejection bookkeeping + first-pass draft input preparation."""
+    batch_size = next_tokens.shape[0]
+    knr = query_start_loc.shape[0] - 1
+    eff_b = min(batch_size, knr)
+    nt_eff = next_tokens[:eff_b]
+    num_valid_eff = (nt_eff != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1)
+    last_valid_col_eff = num_valid_eff - 1
+    next_token_ids_b = (
+        nt_eff.gather(1, last_valid_col_eff.unsqueeze(1))
+        .squeeze(1)
+        .to(chunk_input_ids.dtype)
+    )
+    num_draft_dev = draft_lengths[:eff_b].to(torch.int64)
+    accepted_drafts = torch.minimum((num_valid_eff - 1).clamp(min=0), num_draft_dev)
+    num_rejected_b = (num_draft_dev - accepted_drafts).to(torch.int32)
+    qsl_end = query_start_loc[1 : eff_b + 1].to(torch.int64)
+    last_token_indices_b = qsl_end - 1 - num_rejected_b.to(torch.int64)
+
+    gather_indices = torch.index_select(last_token_indices_b, 0, pad_req_idx)
+    seed_token_ids = torch.index_select(next_token_ids_b, 0, pad_req_idx)
+
+    shifted = chunk_input_ids
+    if chunk_input_ids.shape[0] > 1:
+        shifted = torch.cat((chunk_input_ids[1:], chunk_input_ids[-1:]), dim=0)
+    draft_input_ids = shifted.index_put((gather_indices,), seed_token_ids)
+
+    num_rejected_knr = (
+        torch.nn.functional.pad(num_rejected_b, (0, knr - eff_b))
+        if eff_b < knr
+        else num_rejected_b
+    )
+    pos_carry = (
+        torch.index_select(positions, 1, gather_indices)
+        if positions.ndim == 2
+        else torch.index_select(positions, 0, gather_indices)
+    )
+    pos_step1 = pos_carry + 1 if advance_draft_positions else pos_carry
+    sl_delta = 1 if advance_draft_positions else 0
+    seq_lens_step1 = base_seq_lens + sl_delta - num_rejected_knr
+    step0_gather_indices = (
+        _pad_dim0_repeat_last_tensor(gather_indices, step0_pad_len)
+        if step0_pad_len > 0
+        else gather_indices
+    )
+
+    num_valid_full = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    last_valid_col_full = num_valid_full.clamp(min=1) - 1
+    bonus_full = next_tokens.gather(1, last_valid_col_full.unsqueeze(1))
+    spec_num_rejected = (
+        (draft_lengths - num_valid_full + 1).clamp(min=0).to(torch.int32)
+    )
+    if max_num_reqs > batch_size:
+        spec_num_rejected = torch.nn.functional.pad(
+            spec_num_rejected, (0, max_num_reqs - batch_size)
+        )
+
+    if read_offsets is not None and stacked_groups is not None:
+        groups_2d = (
+            stacked_groups.unsqueeze(0) if stacked_groups.ndim == 1 else stacked_groups
+        )
+        width = groups_2d.shape[1]
+        offsets = last_valid_col_full.to(read_offsets.dtype)
+        if offsets.shape[0] < width:
+            offsets = torch.nn.functional.pad(offsets, (0, width - offsets.shape[0]))
+        elif offsets.shape[0] > width:
+            offsets = offsets[:width]
+        all_indices = groups_2d.reshape(-1).long()
+        zero_val = torch.zeros((), dtype=read_offsets.dtype, device=read_offsets.device)
+        all_offsets = torch.where(
+            all_indices != 0,
+            offsets.unsqueeze(0).expand_as(groups_2d).reshape(-1),
+            zero_val,
+        )
+        read_offsets.index_put_((all_indices,), all_offsets)
+
+    return (
+        draft_input_ids,
+        gather_indices,
+        num_rejected_knr,
+        step0_gather_indices,
+        pos_step1,
+        seq_lens_step1,
+        bonus_full,
+        spec_num_rejected,
+    )
+
+
+def fold_draft_loop_spec_bookkeeping(
+    drafts: torch.Tensor,
+    pos_step1: torch.Tensor,
+    seq_lens_end: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    assemble_bound: int,
+    num_loop_steps: int,
+    pos_req_expand_idx: torch.Tensor | None = None,
+    pos_step1_offsets: torch.Tensor | None = None,
+    valid_token_mask: torch.Tensor | None = None,
+    valid_req_mask: torch.Tensor | None = None,
+    valid_draft_mask: torch.Tensor | None = None,
+    seq_lens_is_step1: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """Fold substitution source assembly (`src_padded`) and optional next-step
+    steady-state `(next_seq_lens, next_positions, next_input_ids,
+    next_draft_token_ids)` preparation into the end of the draft loop.
+    """
+    batch_rows = bonus_tokens.shape[0]
+    drafts_b = (
+        torch.nn.functional.pad(drafts, (0, 0, 0, batch_rows - drafts.shape[0]))
+        if drafts.shape[0] < batch_rows
+        else drafts[:batch_rows]
+    )
+    src_rows = torch.cat([bonus_tokens.to(drafts_b.dtype), drafts_b], dim=1)
+    src_flat = src_rows.reshape(-1)
+    src_padded = (
+        torch.nn.functional.pad(src_flat, (0, assemble_bound - src_flat.shape[0]))
+        if src_flat.shape[0] < assemble_bound
+        else src_flat
+    )
+    if (
+        pos_req_expand_idx is None
+        or pos_step1_offsets is None
+        or valid_token_mask is None
+        or valid_req_mask is None
+        or valid_draft_mask is None
+    ):
+        return (drafts, src_padded)
+
+    remaining_seq_delta = (
+        num_loop_steps + 1
+        if seq_lens_is_step1
+        else (num_loop_steps + 1) - max(0, num_loop_steps - 1)
+    )
+    next_seq_lens = (seq_lens_end + remaining_seq_delta) * valid_req_mask
+
+    pos_expanded = (
+        torch.index_select(pos_step1, -1, pos_req_expand_idx) + pos_step1_offsets
+    )
+    next_positions = pos_expanded * valid_token_mask
+
+    padded_total_tokens = valid_token_mask.shape[0]
+    if src_flat.shape[0] < padded_total_tokens:
+        next_input_ids_raw = torch.nn.functional.pad(
+            src_flat, (0, padded_total_tokens - src_flat.shape[0])
+        )
+    else:
+        next_input_ids_raw = src_flat[:padded_total_tokens]
+    next_input_ids = next_input_ids_raw.to(torch.int32) * valid_token_mask
+
+    if valid_draft_mask.ndim == 1:
+        drafts_flat = drafts_b.to(torch.int32).reshape(-1)
+        target_draft_len = valid_draft_mask.shape[0]
+        if drafts_flat.shape[0] < target_draft_len:
+            drafts_flat = torch.nn.functional.pad(
+                drafts_flat, (0, target_draft_len - drafts_flat.shape[0])
+            )
+        else:
+            drafts_flat = drafts_flat[:target_draft_len]
+        next_draft_token_ids = drafts_flat * valid_draft_mask
+    else:
+        next_draft_token_ids = (drafts_b.to(torch.int32) * valid_draft_mask).reshape(-1)
+
+    return (
+        drafts,
+        src_padded,
+        next_seq_lens,
+        next_positions,
+        next_input_ids,
+        next_draft_token_ids,
+    )
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_fold_draft_loop_spec_bookkeeping_raw(
+    drafts: torch.Tensor,
+    pos_step1: torch.Tensor,
+    seq_lens_end: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    assemble_bound: int,
+    num_loop_steps: int,
+    pos_req_expand_idx: torch.Tensor | None = None,
+    pos_step1_offsets: torch.Tensor | None = None,
+    valid_token_mask: torch.Tensor | None = None,
+    valid_req_mask: torch.Tensor | None = None,
+    valid_draft_mask: torch.Tensor | None = None,
+    seq_lens_is_step1: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    return fold_draft_loop_spec_bookkeeping(
+        drafts=drafts,
+        pos_step1=pos_step1,
+        seq_lens_end=seq_lens_end,
+        bonus_tokens=bonus_tokens,
+        assemble_bound=assemble_bound,
+        num_loop_steps=num_loop_steps,
+        pos_req_expand_idx=pos_req_expand_idx,
+        pos_step1_offsets=pos_step1_offsets,
+        valid_token_mask=valid_token_mask,
+        valid_req_mask=valid_req_mask,
+        valid_draft_mask=valid_draft_mask,
+        seq_lens_is_step1=seq_lens_is_step1,
+    )
+
+
+def _compiled_fold_draft_loop_spec_bookkeeping(
+    drafts: torch.Tensor,
+    pos_step1: torch.Tensor,
+    seq_lens_end: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    assemble_bound: int,
+    num_loop_steps: int,
+    pos_req_expand_idx: torch.Tensor | None = None,
+    pos_step1_offsets: torch.Tensor | None = None,
+    valid_token_mask: torch.Tensor | None = None,
+    valid_req_mask: torch.Tensor | None = None,
+    valid_draft_mask: torch.Tensor | None = None,
+    seq_lens_is_step1: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    return _compiled_fold_draft_loop_spec_bookkeeping_raw(
+        _unmark_dynamic_tensor(drafts),
+        _unmark_dynamic_tensor(pos_step1),
+        _unmark_dynamic_tensor(seq_lens_end),
+        _unmark_dynamic_tensor(bonus_tokens),
+        assemble_bound,
+        num_loop_steps,
+        _unmark_dynamic_tensor(pos_req_expand_idx),
+        _unmark_dynamic_tensor(pos_step1_offsets),
+        _unmark_dynamic_tensor(valid_token_mask),
+        _unmark_dynamic_tensor(valid_req_mask),
+        _unmark_dynamic_tensor(valid_draft_mask),
+        seq_lens_is_step1,
+    )
 
 
 class StaticDecodeBufferTracker:

@@ -24,6 +24,15 @@ import torch
 from torch import nn
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.runner.static_decode_buffers import (
+    INVALID_TOKEN_ID,
+    assemble_spec_next_tokens,
+    compute_num_rejected,
+    extract_draft_token_ids,
+    fold_draft_loop_spec_bookkeeping,
+    fold_verify_and_draft_prep,
+    subtract_and_substitute_draft_token_ids,
+)
 from vllm_torchtpu.spec_decode.mtp_fused_loop import (
     _MtpFullDraftLoop,
     _MtpFusedLoop,
@@ -189,6 +198,571 @@ def test_mtp_full_draft_loop_matches_separate_step0_and_fused_loop() -> None:
     assert torch.equal(full_drafts, ref_drafts)
 
 
+def test_fold_spec_bookkeeping_env_default_false() -> None:
+    """TPU_FOLD_SPEC_BOOKKEEPING defaults to False."""
+    assert envs.TPU_FOLD_SPEC_BOOKKEEPING is False
+
+
+@pytest.mark.parametrize(
+    "accepted_counts",
+    [(0, 3, 1, 2), (3, 3, 3, 3), (0, 0, 0, 0), (2, 1, 0, 3)],
+)
+def test_fold_verify_and_draft_prep_matches_unfolded(
+    accepted_counts: tuple[int, int, int, int],
+) -> None:
+    """Verify `fold_verify_and_draft_prep` produces bit-identical tensors to
+    the separate `_draft_async_prepare_inputs` + `compute_num_rejected` +
+    mamba read-offset scatter paths across 0..K accepted draft tokens."""
+    num_reqs = 4
+    batch_bucket = 8
+    knr = 8
+    loop_bucket = 16
+    step0_pad_len = 16
+    max_num_reqs = 8
+    spec_k = 3
+    query_len = 1 + spec_k
+    total_tokens = batch_bucket * query_len
+
+    next_tokens = torch.full(
+        (batch_bucket, spec_k + 1), INVALID_TOKEN_ID, dtype=torch.int32
+    )
+    for req_idx, num_acc in enumerate(accepted_counts):
+        for col_idx in range(num_acc + 1):
+            next_tokens[req_idx, col_idx] = 1000 + req_idx * 10 + col_idx
+
+    draft_lengths = torch.zeros(batch_bucket, dtype=torch.int32)
+    draft_lengths[:num_reqs] = spec_k
+
+    qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), num_reqs) * query_len
+    query_start_loc = torch.from_numpy(qsl_np)
+
+    pad_req_idx_np = np.minimum(np.arange(loop_bucket, dtype=np.int64), num_reqs - 1)
+    pad_req_idx = torch.from_numpy(pad_req_idx_np)
+
+    chunk_input_ids = torch.arange(100, 100 + total_tokens, dtype=torch.int32)
+    base_positions_per_req = np.array([20, 40, 60, 80, 0, 0, 0, 0], dtype=np.int32)
+    positions_np = np.repeat(base_positions_per_req, query_len) + np.tile(
+        np.arange(query_len, dtype=np.int32), batch_bucket
+    )
+    positions = torch.from_numpy(positions_np)
+    base_seq_lens = torch.from_numpy(base_positions_per_req + query_len)
+
+    read_offsets_folded = torch.zeros(32, dtype=torch.int32)
+    read_offsets_ref = torch.zeros(32, dtype=torch.int32)
+    stacked_groups = torch.tensor(
+        [[2, 5, 8, 11, 0, 0, 0, 0], [3, 6, 9, 12, 0, 0, 0, 0]],
+        dtype=torch.int32,
+    )
+
+    (
+        draft_input_ids,
+        gather_indices,
+        num_rejected_knr,
+        step0_gather_indices,
+        pos_step1,
+        seq_lens_step1,
+        bonus_full,
+        spec_num_rejected,
+    ) = fold_verify_and_draft_prep(
+        next_tokens=next_tokens,
+        chunk_input_ids=chunk_input_ids,
+        draft_lengths=draft_lengths,
+        query_start_loc=query_start_loc,
+        pad_req_idx=pad_req_idx,
+        positions=positions,
+        base_seq_lens=base_seq_lens,
+        step0_pad_len=step0_pad_len,
+        advance_draft_positions=True,
+        max_num_reqs=max_num_reqs,
+        read_offsets=read_offsets_folded,
+        stacked_groups=stacked_groups,
+    )
+
+    expected_rejected = torch.tensor(
+        [spec_k - acc for acc in accepted_counts], dtype=torch.int32
+    )
+    ref_rejected = compute_num_rejected(
+        next_tokens[:num_reqs], draft_lengths[:num_reqs]
+    )
+    assert torch.equal(ref_rejected, expected_rejected)
+    assert torch.equal(num_rejected_knr[:num_reqs], expected_rejected)
+    assert torch.equal(spec_num_rejected[:num_reqs], expected_rejected)
+    assert int(num_rejected_knr[num_reqs:].abs().sum()) == 0
+
+    for req_idx, num_acc in enumerate(accepted_counts):
+        expected_last_tok_idx = (req_idx + 1) * query_len - 1 - (spec_k - num_acc)
+        assert int(gather_indices[req_idx]) == expected_last_tok_idx
+        expected_bonus = 1000 + req_idx * 10 + num_acc
+        assert int(bonus_full[req_idx, 0]) == expected_bonus
+        assert int(draft_input_ids[expected_last_tok_idx]) == expected_bonus
+        expected_pos_step1 = int(base_positions_per_req[req_idx]) + num_acc + 1
+        assert int(pos_step1[req_idx]) == expected_pos_step1
+        expected_sl_step1 = int(base_positions_per_req[req_idx]) + num_acc + 1 + 1
+        assert int(seq_lens_step1[req_idx]) == expected_sl_step1
+
+    assert step0_gather_indices.shape[0] == step0_pad_len
+    for req_idx, num_acc in enumerate(accepted_counts):
+        slot_g0 = int(stacked_groups[0, req_idx])
+        slot_g1 = int(stacked_groups[1, req_idx])
+        read_offsets_ref[slot_g0] = num_acc
+        read_offsets_ref[slot_g1] = num_acc
+    assert torch.equal(read_offsets_folded, read_offsets_ref)
+
+
+def test_fold_draft_loop_epilogue_matches_next_step_subtraction_and_substitution() -> (
+    None
+):
+    """Verify `fold_draft_loop_spec_bookkeeping` produces the exact same
+    `src_padded`, `next_seq_lens`, `next_positions`, `next_input_ids`, and
+    `next_draft_token_ids` as the unfolded assemble + next-step
+    `subtract_and_substitute_draft_token_ids` pipeline."""
+    num_reqs = 4
+    batch_bucket = 8
+    knr = 8
+    loop_bucket = 16
+    max_num_reqs = 8
+    spec_k = 3
+    query_len = 1 + spec_k
+    padded_total_tokens = batch_bucket * query_len
+    assemble_bound = max_num_reqs * query_len
+
+    accepted_counts = (2, 0, 3, 1)
+    next_tokens = torch.full(
+        (batch_bucket, spec_k + 1), INVALID_TOKEN_ID, dtype=torch.int32
+    )
+    for req_idx, num_acc in enumerate(accepted_counts):
+        for col_idx in range(num_acc + 1):
+            next_tokens[req_idx, col_idx] = 500 + req_idx * 10 + col_idx
+
+    draft_lengths = torch.zeros(batch_bucket, dtype=torch.int32)
+    draft_lengths[:num_reqs] = spec_k
+    qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), num_reqs) * query_len
+    query_start_loc = torch.from_numpy(qsl_np)
+    pad_req_idx = torch.from_numpy(
+        np.minimum(np.arange(loop_bucket, dtype=np.int64), num_reqs - 1)
+    )
+    chunk_input_ids = torch.arange(1, 1 + padded_total_tokens, dtype=torch.int32)
+    base_computed = np.array([12, 28, 44, 60, 0, 0, 0, 0], dtype=np.int32)
+    positions_step_t = torch.from_numpy(
+        np.repeat(base_computed, query_len)
+        + np.tile(np.arange(query_len, dtype=np.int32), batch_bucket)
+    )
+    seq_lens_step_t = torch.from_numpy(base_computed + query_len)
+
+    (
+        _draft_in,
+        _gather_idx,
+        _num_rej_knr,
+        _step0_gather,
+        pos_step1,
+        seq_lens_step1,
+        bonus_full,
+        spec_num_rejected,
+    ) = fold_verify_and_draft_prep(
+        next_tokens=next_tokens,
+        chunk_input_ids=chunk_input_ids,
+        draft_lengths=draft_lengths,
+        query_start_loc=query_start_loc,
+        pad_req_idx=pad_req_idx,
+        positions=positions_step_t,
+        base_seq_lens=seq_lens_step_t,
+        step0_pad_len=loop_bucket,
+        advance_draft_positions=True,
+        max_num_reqs=max_num_reqs,
+    )
+
+    seq_lens_end = seq_lens_step1 + (spec_k - 2)
+    drafts = torch.arange(2000, 2000 + loop_bucket * spec_k, dtype=torch.int32).reshape(
+        loop_bucket, spec_k
+    )
+
+    req_expand_np = np.zeros(padded_total_tokens, dtype=np.int64)
+    offsets_np = np.zeros(padded_total_tokens, dtype=np.int32)
+    valid_tok_np = np.zeros(padded_total_tokens, dtype=np.int32)
+    for req_idx in range(num_reqs):
+        tok_start = req_idx * query_len
+        tok_end = tok_start + query_len
+        req_expand_np[tok_start:tok_end] = req_idx
+        offsets_np[tok_start:tok_end] = np.arange(query_len, dtype=np.int32)
+    valid_tok_np[: num_reqs * query_len] = 1
+    valid_req_np = np.zeros(knr, dtype=np.int32)
+    valid_req_np[:num_reqs] = 1
+    valid_draft_np = np.zeros((batch_bucket, spec_k), dtype=np.int32)
+    valid_draft_np[:num_reqs, :] = 1
+
+    (
+        drafts_out,
+        src_padded,
+        next_seq_lens,
+        next_positions,
+        next_input_ids,
+        next_draft_token_ids,
+    ) = fold_draft_loop_spec_bookkeeping(
+        drafts=drafts,
+        pos_step1=pos_step1,
+        seq_lens_end=seq_lens_end,
+        bonus_tokens=bonus_full,
+        assemble_bound=assemble_bound,
+        num_loop_steps=spec_k - 1,
+        pos_req_expand_idx=torch.from_numpy(req_expand_np),
+        pos_step1_offsets=torch.from_numpy(offsets_np),
+        valid_token_mask=torch.from_numpy(valid_tok_np),
+        valid_req_mask=torch.from_numpy(valid_req_np),
+        valid_draft_mask=torch.from_numpy(valid_draft_np),
+    )
+    assert torch.equal(drafts_out, drafts)
+
+    ref_src_unpadded = assemble_spec_next_tokens(next_tokens, drafts, num_reqs)
+    assert torch.equal(src_padded[: num_reqs * query_len], ref_src_unpadded)
+
+    optimistic_computed_next = base_computed.copy()
+    optimistic_computed_next[:num_reqs] += query_len
+    optimistic_seq_lens = torch.zeros(knr, dtype=torch.int32)
+    optimistic_seq_lens[:num_reqs] = torch.from_numpy(
+        optimistic_computed_next[:num_reqs] + query_len
+    )
+    optimistic_positions = torch.zeros(padded_total_tokens, dtype=torch.int32)
+    for req_idx in range(num_reqs):
+        for offset in range(query_len):
+            optimistic_positions[req_idx * query_len + offset] = (
+                int(optimistic_computed_next[req_idx]) + offset
+            )
+    optimistic_input_ids = torch.zeros(padded_total_tokens, dtype=torch.int32)
+
+    seq_sub_idx = torch.full((knr,), -1, dtype=torch.int32)
+    seq_sub_idx[:num_reqs] = torch.arange(num_reqs, dtype=torch.int32)
+    pos_sub_idx = torch.full((padded_total_tokens,), -1, dtype=torch.int32)
+    for req_idx in range(num_reqs):
+        pos_sub_idx[req_idx * query_len : (req_idx + 1) * query_len] = req_idx
+
+    cur_in_idx = torch.arange(padded_total_tokens, dtype=torch.int64)
+    pre_nt_idx = torch.full((padded_total_tokens,), -1, dtype=torch.int64)
+    pre_nt_idx[: num_reqs * query_len] = torch.arange(
+        num_reqs * query_len, dtype=torch.int64
+    )
+    substitution_indices = torch.stack([cur_in_idx, pre_nt_idx], dim=0)
+
+    logits_indices = torch.arange(padded_total_tokens, dtype=torch.int32)
+    target_logits_list: list[int] = []
+    for req_idx in range(batch_bucket):
+        for offset in range(spec_k):
+            if req_idx < num_reqs:
+                target_logits_list.append(req_idx * query_len + offset)
+            else:
+                target_logits_list.append(num_reqs * query_len)
+    target_logits_indices = torch.tensor(target_logits_list, dtype=torch.int32)
+
+    (
+        ref_next_seq_lens,
+        ref_next_positions,
+        ref_next_input_ids,
+        ref_next_draft_token_ids,
+    ) = subtract_and_substitute_draft_token_ids(
+        seq_lens=optimistic_seq_lens,
+        positions=optimistic_positions,
+        num_rejected=spec_num_rejected,
+        seq_lens_subtract_indices=seq_sub_idx,
+        positions_subtract_indices=pos_sub_idx,
+        input_ids=optimistic_input_ids,
+        substitution_indices=substitution_indices,
+        next_tokens_tpu=src_padded,
+        logits_indices=logits_indices,
+        target_logits_indices=target_logits_indices,
+    )
+
+    assert torch.equal(next_seq_lens, ref_next_seq_lens)
+    assert torch.equal(next_positions, ref_next_positions)
+    assert torch.equal(next_input_ids, ref_next_input_ids)
+    assert torch.equal(next_draft_token_ids, ref_next_draft_token_ids)
+
+
+def test_fold_draft_loop_epilogue_src_only_fallback() -> None:
+    """When steady-state next-step masks are omitted (e.g. MRoPE or non-zero
+    start_index chunk), `fold_draft_loop_spec_bookkeeping` still folds
+    `src_padded` assembly and returns a 2-tuple `(drafts, src_padded)`."""
+    drafts = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
+    pos_step1 = torch.tensor([5, 9], dtype=torch.int32)
+    seq_lens_end = torch.tensor([6, 10], dtype=torch.int32)
+    bonus_tokens = torch.tensor([[10], [20]], dtype=torch.int32)
+    out = fold_draft_loop_spec_bookkeeping(
+        drafts=drafts,
+        pos_step1=pos_step1,
+        seq_lens_end=seq_lens_end,
+        bonus_tokens=bonus_tokens,
+        assemble_bound=12,
+        num_loop_steps=2,
+    )
+    assert len(out) == 2
+    assert torch.equal(out[0], drafts)
+    expected_src = torch.tensor(
+        [10, 11, 12, 13, 20, 21, 22, 23, 0, 0, 0, 0], dtype=torch.int32
+    )
+    assert torch.equal(out[1], expected_src)
+
+
+def test_fold_draft_loop_epilogue_mrope_2d_positions_and_step1_seq_lens() -> None:
+    """Verify `fold_draft_loop_spec_bookkeeping` supports 2D MRoPE positions
+    `(3, p) -> (3, T)` and `seq_lens_is_step1=True` (used when
+    `TPU_DRAFT_STEP0_IN_LOOP=1` runs alongside `TPU_FOLD_SPEC_BOOKKEEPING=1`)."""
+    num_reqs = 2
+    batch_bucket = 4
+    loop_bucket = 4
+    spec_k = 3
+    query_len = 1 + spec_k
+    padded_total_tokens = batch_bucket * query_len
+    assemble_bound = batch_bucket * query_len
+
+    drafts = torch.tensor(
+        [[101, 102, 103], [201, 202, 203], [0, 0, 0], [0, 0, 0]],
+        dtype=torch.int32,
+    )
+    pos_1d = np.array([15, 32, 32, 32], dtype=np.int32)
+    pos_step1_2d = torch.from_numpy(np.stack([pos_1d, pos_1d, pos_1d], axis=0))
+    seq_lens_step1 = torch.tensor([16, 33, 0, 0], dtype=torch.int32)
+    bonus_tokens = torch.tensor([[100], [200], [-1], [-1]], dtype=torch.int32)
+
+    req_expand_np = np.zeros(padded_total_tokens, dtype=np.int64)
+    offsets_np = np.zeros(padded_total_tokens, dtype=np.int32)
+    valid_tok_np = np.zeros(padded_total_tokens, dtype=np.int32)
+    for req_idx in range(num_reqs):
+        tok_start = req_idx * query_len
+        tok_end = tok_start + query_len
+        req_expand_np[tok_start:tok_end] = min(req_idx, loop_bucket - 1)
+        offsets_np[tok_start:tok_end] = np.arange(query_len, dtype=np.int32)
+    valid_tok_np[: num_reqs * query_len] = 1
+    valid_req_np = np.array([1, 1, 0, 0], dtype=np.int32)
+    valid_draft_np = np.zeros((batch_bucket, spec_k), dtype=np.int32)
+    valid_draft_np[:num_reqs, :] = 1
+
+    (
+        drafts_out,
+        src_padded,
+        next_seq_lens,
+        next_positions,
+        next_input_ids,
+        next_draft_token_ids,
+    ) = fold_draft_loop_spec_bookkeeping(
+        drafts=drafts,
+        pos_step1=pos_step1_2d,
+        seq_lens_end=seq_lens_step1,
+        bonus_tokens=bonus_tokens,
+        assemble_bound=assemble_bound,
+        num_loop_steps=spec_k - 1,
+        pos_req_expand_idx=torch.from_numpy(req_expand_np),
+        pos_step1_offsets=torch.from_numpy(offsets_np),
+        valid_token_mask=torch.from_numpy(valid_tok_np),
+        valid_req_mask=torch.from_numpy(valid_req_np),
+        valid_draft_mask=torch.from_numpy(valid_draft_np),
+        seq_lens_is_step1=True,
+    )
+
+    assert torch.equal(drafts_out, drafts)
+    assert next_positions.shape == (3, padded_total_tokens)
+    expected_pos_row = torch.tensor(
+        [15, 16, 17, 18, 32, 33, 34, 35, 0, 0, 0, 0, 0, 0, 0, 0],
+        dtype=torch.int32,
+    )
+    for row_idx in range(3):
+        assert torch.equal(next_positions[row_idx], expected_pos_row)
+    expected_next_seq_lens = torch.tensor(
+        [16 + spec_k, 33 + spec_k, 0, 0], dtype=torch.int32
+    )
+    assert torch.equal(next_seq_lens, expected_next_seq_lens)
+    expected_next_input_ids = torch.tensor(
+        [100, 101, 102, 103, 200, 201, 202, 203, 0, 0, 0, 0, 0, 0, 0, 0],
+        dtype=torch.int32,
+    )
+    assert torch.equal(next_input_ids, expected_next_input_ids)
+    expected_next_drafts = torch.tensor(
+        [101, 102, 103, 201, 202, 203, 0, 0, 0, 0, 0, 0],
+        dtype=torch.int32,
+    )
+    assert torch.equal(next_draft_token_ids, expected_next_drafts)
+    assert torch.equal(src_padded[:8], expected_next_input_ids[:8])
+
+
+def test_fold_draft_loop_epilogue_warmup_mismatched_num_reqs_and_token_paddings() -> (
+    None
+):
+    """Verify 1D `valid_draft_mask` of length `padded_total_tokens` produces
+    `next_draft_token_ids` of shape `(4,)` when `num_reqs = 1`,
+    `padded_num_reqs = 8`, `spec_k = 3`, and `padded_total_tokens = 4`."""
+    num_reqs = 1
+    padded_num_reqs = 8
+    knr = 8
+    spec_k = 3
+    query_len = 1 + spec_k
+    padded_total_tokens = 4
+    assemble_bound = padded_num_reqs * query_len
+
+    drafts = torch.tensor(
+        [[11, 12, 13], [99, 98, 97], [0, 0, 0], [0, 0, 0]],
+        dtype=torch.int32,
+    )
+    pos_1d = np.array([20, 20, 20, 20], dtype=np.int32)
+    pos_step1_2d = torch.from_numpy(np.stack([pos_1d, pos_1d, pos_1d], axis=0))
+    seq_lens_end = torch.tensor([22, 0, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
+    bonus_tokens = torch.tensor(
+        [[10], [-1], [-1], [-1], [-1], [-1], [-1], [-1]], dtype=torch.int32
+    )
+
+    req_expand_np = np.zeros(padded_total_tokens, dtype=np.int64)
+    offsets_np = np.arange(padded_total_tokens, dtype=np.int32)
+    valid_tok_np = np.ones(padded_total_tokens, dtype=np.int32)
+    valid_req_np = np.zeros(knr, dtype=np.int32)
+    valid_req_np[:num_reqs] = 1
+    valid_draft_np = np.zeros(padded_total_tokens, dtype=np.int32)
+    valid_draft_np[: min(num_reqs * spec_k, padded_total_tokens)] = 1
+
+    (
+        drafts_out,
+        src_padded,
+        next_seq_lens,
+        next_positions,
+        next_input_ids,
+        next_draft_token_ids,
+    ) = fold_draft_loop_spec_bookkeeping(
+        drafts=drafts,
+        pos_step1=pos_step1_2d,
+        seq_lens_end=seq_lens_end,
+        bonus_tokens=bonus_tokens,
+        assemble_bound=assemble_bound,
+        num_loop_steps=spec_k - 1,
+        pos_req_expand_idx=torch.from_numpy(req_expand_np),
+        pos_step1_offsets=torch.from_numpy(offsets_np),
+        valid_token_mask=torch.from_numpy(valid_tok_np),
+        valid_req_mask=torch.from_numpy(valid_req_np),
+        valid_draft_mask=torch.from_numpy(valid_draft_np),
+        seq_lens_is_step1=False,
+    )
+
+    assert torch.equal(drafts_out, drafts)
+    assert src_padded.shape == (assemble_bound,)
+    assert next_seq_lens.shape == (knr,)
+    assert next_positions.shape == (3, padded_total_tokens)
+    assert next_input_ids.shape == (padded_total_tokens,)
+    assert next_draft_token_ids.shape == (padded_total_tokens,)
+    assert torch.equal(
+        next_draft_token_ids, torch.tensor([11, 12, 13, 0], dtype=torch.int32)
+    )
+
+    target_logits_argmax = torch.tensor([11, 12, 99, 10], dtype=torch.int32)
+    accepted = next_draft_token_ids == target_logits_argmax
+    assert torch.equal(
+        accepted, torch.tensor([True, True, False, False], dtype=torch.bool)
+    )
+
+    logits_indices = torch.arange(padded_total_tokens, dtype=torch.int32)
+    target_logits_indices = torch.tensor([0, 1, 2, 0], dtype=torch.int32)
+    ref_extracted = extract_draft_token_ids(
+        next_input_ids, logits_indices, target_logits_indices
+    )
+    assert torch.equal(
+        next_draft_token_ids[: num_reqs * spec_k],
+        ref_extracted[: num_reqs * spec_k],
+    )
+
+
+def test_sample_spec_verify_chunk_non_greedy_skips_fold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `_sample_spec_verify_chunk` does not run greedy fold prep when
+    `all_greedy=False` (e.g. temperature > 0) even with
+    `TPU_FOLD_SPEC_BOOKKEEPING=True`."""
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    monkeypatch.setattr(envs, "TPU_FOLD_SPEC_BOOKKEEPING", True)
+    draft_chunk = types.SimpleNamespace(
+        num_reqs=1,
+        input_ids=torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+        position_ids=torch.tensor([10, 11, 12, 13], dtype=torch.int32),
+        attn_ctx=types.SimpleNamespace(
+            seq_lens=torch.tensor([14], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        ),
+        sequence_layout_plan=None,
+    )
+    expected_out = torch.tensor([[5, 6, -1, -1]], dtype=torch.int32)
+    build_called = False
+    non_greedy_branch_entered = False
+
+    def _fail_if_called(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal build_called
+        build_called = True
+        raise AssertionError("Should not build greedy fold prep when all_greedy=False")
+
+    def _build_padded_params(
+        cur_start: int, cur_end: int, bonus_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        nonlocal non_greedy_branch_entered
+        non_greedy_branch_entered = True
+        n = cur_end - cur_start
+        dev = bonus_logits.device
+        return (
+            torch.full((n,), 0.8, dtype=torch.float32, device=dev),
+            torch.full((n,), -1, dtype=torch.int32, device=dev),
+            torch.full((n,), 1.0, dtype=torch.float32, device=dev),
+        )
+
+    class _FakeRejectionSampler:
+        synthetic_mode = False
+        synthetic_conditional_rates = None
+
+        def __call__(self, *_a: Any, **_kw: Any) -> torch.Tensor:
+            return expected_out
+
+    monkeypatch.setattr(
+        TPUModelRunner, "_build_fold_verify_and_draft_prep_inputs", _fail_if_called
+    )
+    fake_runner = types.SimpleNamespace(
+        rejection_sampler=_FakeRejectionSampler(),
+        speculative_config=types.SimpleNamespace(num_speculative_tokens=3),
+        scheduler_config=types.SimpleNamespace(async_scheduling=True),
+        _is_async_drafter=True,
+        input_batch=types.SimpleNamespace(top_k_cpu=np.array([0], dtype=np.int32)),
+        spec_gather_bonus_and_target_logits=lambda logits, b_idx, t_idx: (
+            logits[b_idx],
+            logits[t_idx],
+        ),
+        _build_padded_sampling_params=_build_padded_params,
+        _sampler_topk_candidates=lambda *_a, **_kw: 0,
+        _sampler_applies_topk_topp=lambda *_a, **_kw: False,
+        sample_from_logits_func=lambda *_a, **_kw: torch.tensor([6], dtype=torch.int32),
+        spec_prepare_non_greedy_rejection_inputs=lambda *_a, **_kw: (
+            torch.zeros((3, 8), dtype=torch.float32),
+            torch.zeros((3, 8), dtype=torch.float32),
+        ),
+    )
+    md = types.SimpleNamespace(
+        draft_token_ids=torch.tensor([2, 3, 4], dtype=torch.int32),
+        draft_lengths=torch.tensor([3], dtype=torch.int32),
+        bonus_logits_indices=torch.tensor([3], dtype=torch.int32),
+        target_logits_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+        segment_ids=torch.tensor([0, 0, 0], dtype=torch.int32),
+        group_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+    )
+    logits = torch.zeros((4, 8), dtype=torch.float32)
+    out = TPUModelRunner._sample_spec_verify_chunk(
+        fake_runner,
+        logits=logits,
+        md=md,
+        grammar_output=None,
+        scheduler_output=cast(Any, None),
+        cur_start_idx=0,
+        cur_end_idx=1,
+        all_greedy=False,
+        sampling_generator=None,
+        top_tokens=False,
+        draft_chunk=draft_chunk,
+        mamba_indices=None,
+        can_defer_mamba_offsets=True,
+    )
+    assert not build_called
+    assert non_greedy_branch_entered
+    assert getattr(draft_chunk, "_precomputed_draft_prep", None) is None
+    assert torch.equal(out, expected_out)
+
+
 class _FakeWarmCompiledProgram:
     def __init__(self, output_tensor: torch.Tensor) -> None:
         self.first_compile = True
@@ -251,10 +825,8 @@ def test_run_mtp_full_draft_loop_executes_once_when_warm_even_if_first_compile_t
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
     )
     proposer._build_draft_attn_metadata = cast(Any, lambda **_kw: {"layer.0": md_obj})
-    chunk = cast(Any, types.SimpleNamespace(num_reqs=1))
+    chunk = cast(Any, types.SimpleNamespace(num_reqs=1, _precomputed_draft_prep=None))
 
-    # First call when cold runs warm-up + actual call (2 invocations),
-    # and preserves step0_seq_lens.
     out1 = proposer._run_mtp_full_draft_loop(
         chunk=chunk,
         step0_input_ids=torch.zeros(4, dtype=torch.int32),
@@ -278,8 +850,6 @@ def test_run_mtp_full_draft_loop_executes_once_when_warm_even_if_first_compile_t
         torch.tensor([10, 0, 0, 0], dtype=torch.int32),
     )
 
-    # Reset seq_lens for step 2: even though fake_program.first_compile is STILL True,
-    # _mtp_full_draft_loop_warm is True so program must only run ONCE!
     md_obj.seq_lens = torch.tensor([14, 0, 0, 0], dtype=torch.int32)
     out2 = proposer._run_mtp_full_draft_loop(
         chunk=chunk,
@@ -313,13 +883,10 @@ def test_prepare_draft_inputs_repeats_last_token_index_to_loop_bucket() -> None:
 
     num_reqs = 4
     padded_width = 8
-    # 4 requests x 4 tokens = 16 tokens
     chunk_input_ids = torch.arange(100, 116, dtype=torch.int32)
     chunk_positions = torch.arange(16, dtype=torch.int64)
     query_start_loc_np = np.array([0, 4, 8, 12, 16], dtype=np.int32)
-    # Next tokens from rejection sampler padded to width=8 (< p=16).
     next_tokens_dev = torch.full((padded_width, 4), -1, dtype=torch.int32)
-    # Req 0: 2 (idx 1), Req 1: 4 (idx 7), Req 2: 1 (idx 8), Req 3: 3 (idx 14).
     next_tokens_dev[0, :2] = torch.tensor([201, 202], dtype=torch.int32)
     next_tokens_dev[1, :4] = torch.tensor([301, 302, 303, 304], dtype=torch.int32)
     next_tokens_dev[2, :1] = torch.tensor([401], dtype=torch.int32)
@@ -362,8 +929,126 @@ def test_prepare_draft_inputs_repeats_last_token_index_to_loop_bucket() -> None:
     )
     assert gather_indices.shape == (16,)
     assert gather_indices[:4].tolist() == [1, 7, 8, 14]
-    # Padded entries [4..15] must repeat the last valid request's index (14), NOT 0!
     assert gather_indices[4:].tolist() == [14] * 12
+
+
+def test_real_eagle3_proposer_fold_verify_attribute_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Instantiate real Eagle3Proposer and run fold-verify builder."""
+    import vllm_torchtpu.envs as tpu_envs
+    from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    monkeypatch.setattr(tpu_envs, "TPU_FOLD_SPEC_BOOKKEEPING", True)
+
+    fake_vllm_config = types.SimpleNamespace(
+        speculative_config=types.SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=3,
+            draft_tensor_parallel_size=8,
+            draft_model_config=types.SimpleNamespace(
+                max_model_len=2048,
+                get_hidden_size=lambda: 64,
+                hf_text_config=types.SimpleNamespace(model_type="qwen3_5_moe_mtp"),
+            ),
+            draft_parallel_config=types.SimpleNamespace(tensor_parallel_size=8),
+        ),
+        model_config=types.SimpleNamespace(
+            dtype=torch.bfloat16,
+            max_model_len=2048,
+            hf_text_config=types.SimpleNamespace(model_type="qwen3_5_moe"),
+        ),
+        cache_config=types.SimpleNamespace(block_size=16),
+        scheduler_config=types.SimpleNamespace(
+            max_num_seqs=8,
+            max_num_batched_tokens=64,
+            async_scheduling=True,
+        ),
+        parallel_config=types.SimpleNamespace(tensor_parallel_size=8),
+        compilation_config=types.SimpleNamespace(),
+    )
+    fake_runner_for_init = types.SimpleNamespace(
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_model_len=2048,
+        max_num_reqs=8,
+        max_num_tokens=64,
+        num_tokens_paddings=[16, 32, 64],
+        _dp_lockstep_enabled=lambda: False,
+    )
+
+    real_proposer = Eagle3Proposer(
+        vllm_config=cast(Any, fake_vllm_config),
+        runner=cast(Any, fake_runner_for_init),
+    )
+
+    # Assert every attribute read by C1/C2/C3 on Eagle3Proposer exists after __init__
+    required_proposer_attrs = (
+        "_async_pad_req_idx_cache",
+        "_zero_rej_dev_cache",
+        "_loop_qsl_reqdist_cache",
+        "_mtp_full_draft_loop",
+        "_mtp_full_draft_loop_warm",
+        "_mtp_fused_loop",
+        "_mtp_fused_loop_warm",
+        "_last_step0_gather_indices",
+        "_last_prep_step1",
+        "_share_mtp_indices",
+        "_draft_kv_shared",
+    )
+    proposer_vars = vars(real_proposer)
+    for attr_name in required_proposer_attrs:
+        assert attr_name in proposer_vars, f"Missing {attr_name} on Eagle3Proposer"
+    assert isinstance(real_proposer._async_pad_req_idx_cache, dict)
+
+    # Run _build_fold_verify_and_draft_prep_inputs with the real Eagle3Proposer
+    draft_chunk = types.SimpleNamespace(
+        num_reqs=2,
+        start_index=0,
+        req_ids=["r0", "r1"],
+        input_ids=torch.arange(100, 116, dtype=torch.int32),
+        position_ids=torch.arange(16, dtype=torch.int64),
+        query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
+        sequence_layout_plan=types.SimpleNamespace(kind=SequenceLayoutKind.ALL),
+        attn_ctx=types.SimpleNamespace(
+            use_max_model_len=False,
+            seq_lens_cpu=np.array([20, 30, 0, 0, 0, 0, 0, 0], dtype=np.int32),
+            seq_lens=torch.tensor([20, 30, 0, 0, 0, 0, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.tensor(
+                [0, 4, 8, 8, 8, 8, 8, 8, 8], dtype=torch.int32
+            ),
+        ),
+        _precomputed_draft_prep=None,
+    )
+    runner_ns = types.SimpleNamespace(
+        device=torch.device("cpu"),
+        drafter=real_proposer,
+        _is_async_drafter=True,
+        max_num_reqs=8,
+        uses_mrope=False,
+        requests={},
+        input_batch=types.SimpleNamespace(req_ids=["r0", "r1"]),
+        speculative_config=types.SimpleNamespace(num_speculative_tokens=3),
+        scheduler_config=types.SimpleNamespace(async_scheduling=True),
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=8,
+        mamba_slot_read_offsets=None,
+        _mamba_state_pos=None,
+        _last_step_used_static_decode=False,
+        _folded_steady_state_prep=None,
+        _fold_epilogue_mask_cache={},
+    )
+
+    fold_inputs = TPUModelRunner._build_fold_verify_and_draft_prep_inputs(
+        cast(Any, runner_ns),
+        draft_chunk=cast(Any, draft_chunk),
+        mamba_indices=None,
+        can_defer_mamba_offsets=False,
+    )
+    assert fold_inputs is not None
+    assert (16, 2, "cpu") in real_proposer._async_pad_req_idx_cache
 
 
 _FAKE_FORWARD_CTX = types.SimpleNamespace(attn_metadata=None)
@@ -462,11 +1147,15 @@ def _make_b8_test_proposer(
     proposer._share_mtp_indices = False
     proposer._draft_kv_shared = False
     proposer._draft_replicated = False
+    proposer._draft_tp_matches_target = True
     proposer._draft_has_moe_cache = False
     proposer._draft_attn_layer_names = {"layer.0"}
     proposer._draft_md_cache = {}
     proposer._zero_rej_dev_cache = {}
     proposer._loop_qsl_reqdist_cache = {}
+    proposer._async_pad_req_idx_cache = {}
+    proposer._last_step0_gather_indices = None
+    proposer._last_prep_step1 = None
     proposer._mtp_loop_model = None
     proposer._mtp_loop_model_warm = True
     proposer._draft_moe_ctx = contextlib.nullcontext
@@ -662,7 +1351,6 @@ def test_propose_multi_request_b8_step0_in_loop_matches_separate_after_b1_warmup
     )
     assert specializer is not None
 
-    # 1. Warmup proposer_test at B=1 (4 tokens), just like _warmup_spec_decode.
     monkeypatch.setattr(envs, "TPU_DRAFT_STEP0_IN_LOOP", True)
     proposer_test.runner.input_batch.num_reqs = 1
     warmup_chunk = _build_b8_chunk(
@@ -683,10 +1371,8 @@ def test_propose_multi_request_b8_step0_in_loop_matches_separate_after_b1_warmup
     )
     assert isinstance(warmup_out, torch.Tensor)
     assert warmup_out.shape == (1, spec_k)
-    # PiecewiseBackend specialization width captured at B=1 must be 8, NOT 4!
     assert specializer.specialized_gather_width == 8
 
-    # 2. Run B=8 (num_reqs=8 > 4) on sync path: compare step0_in_loop=False vs True.
     proposer_ref.runner.input_batch.num_reqs = max_num_reqs
     proposer_test.runner.input_batch.num_reqs = max_num_reqs
     sampled_ids = [[30 + req_i] for req_i in range(max_num_reqs)]
@@ -730,7 +1416,6 @@ def test_propose_multi_request_b8_step0_in_loop_matches_separate_after_b1_warmup
     assert isinstance(ref_sync, list) and len(ref_sync) == max_num_reqs
     assert test_sync == ref_sync
 
-    # 3. Run B=8 on async path (`next_tokens_per_chunk`, `return_device=True`).
     next_tokens_dev = torch.full((max_num_reqs, spec_k + 1), -1, dtype=torch.int32)
     for req_i in range(max_num_reqs):
         draft_cnt = max(0, token_counts_per_req[req_i] - 1)
@@ -782,3 +1467,219 @@ def test_propose_multi_request_b8_step0_in_loop_matches_separate_after_b1_warmup
     assert test_async.shape == (max_num_reqs, spec_k)
     assert torch.equal(test_async, ref_async)
     assert test_async.tolist() == ref_sync
+
+
+def test_fold_spec_bookkeeping_b8_with_step0_in_loop_equivalence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify C2 + C3 (`TPU_DRAFT_STEP0_IN_LOOP=True` and
+    `TPU_FOLD_SPEC_BOOKKEEPING=True`) at `B = 8 > 4` after `B = 1` warmup
+    produces bit-identical `[8, 3]` draft tokens, `src_padded` (all 8 requests,
+    32 tokens), `next_seq_lens`, `next_positions`, `next_input_ids`, and
+    `next_draft_token_ids` as the unfolded baseline."""
+    import vllm.forward_context as vllm_fwd_ctx
+
+    import vllm_torchtpu.spec_decode.eagle3 as eagle3_mod
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner, _PrecomputedDraftPrep
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    monkeypatch.setattr(
+        eagle3_mod, "set_model_tag", lambda *_a, **_kw: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(eagle3_mod, "set_forward_context", _fake_set_forward_context)
+    monkeypatch.setattr(vllm_fwd_ctx, "get_forward_context", _fake_get_forward_context)
+    monkeypatch.setattr(
+        eagle3_mod,
+        "set_vllm_model_wrapper_context",
+        lambda *_a, **_kw: contextlib.nullcontext(),
+    )
+    for method_name in (
+        "_draft_seed_input_ids",
+        "_draft_gather_carries",
+        "_draft_propose_token",
+    ):
+        wrapped_fn = vars(Eagle3Proposer)[method_name].__wrapped__.__wrapped__
+        monkeypatch.setattr(Eagle3Proposer, method_name, wrapped_fn)
+
+    max_num_reqs = 8
+    spec_k = 3
+    query_len = 1 + spec_k
+    hidden_size = 4
+    draft_model = _DummyMtpDraft(hidden_size=hidden_size, vocab_size=64)
+
+    proposer_ref, _ = _make_b8_test_proposer(
+        draft_model=draft_model,
+        max_num_reqs=max_num_reqs,
+        spec_k=spec_k,
+        step0_in_loop=False,
+    )
+    proposer_test, specializer = _make_b8_test_proposer(
+        draft_model=draft_model,
+        max_num_reqs=max_num_reqs,
+        spec_k=spec_k,
+        step0_in_loop=True,
+    )
+    assert specializer is not None
+
+    # Warmup proposer_test at B=1 first.
+    monkeypatch.setattr(envs, "TPU_DRAFT_STEP0_IN_LOOP", True)
+    monkeypatch.setattr(envs, "TPU_FOLD_SPEC_BOOKKEEPING", True)
+    proposer_test.runner.input_batch.num_reqs = 1
+    warmup_chunk = _build_b8_chunk(
+        num_reqs=1,
+        max_num_reqs=max_num_reqs,
+        token_counts_per_req=(4,),
+        padded_total_tokens=4,
+        hidden_size=hidden_size,
+        spec_k=spec_k,
+    )
+    proposer_test.draft_chunks = [warmup_chunk]
+    _ = proposer_test.propose(
+        sampled_token_ids=[[15]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=np.array([0], dtype=np.int32),
+        scheduler_output=None,
+        return_device=True,
+    )
+    assert specializer.specialized_gather_width == 8
+
+    # Now run B=8 with fold_verify_and_draft_prep + propose + epilogue.
+    token_counts = (4, 4, 4, 4, 4, 4, 4, 4)
+    rejected_counts = (0, 1, 2, 3, 1, 0, 2, 3)
+    next_tokens_dev = torch.full(
+        (max_num_reqs, spec_k + 1), INVALID_TOKEN_ID, dtype=torch.int32
+    )
+    for req_i in range(max_num_reqs):
+        acc_cnt = spec_k - rejected_counts[req_i]
+        for col_i in range(acc_cnt):
+            next_tokens_dev[req_i, col_i] = 200 + req_i * 10 + col_i
+        next_tokens_dev[req_i, acc_cnt] = 30 + req_i
+
+    chunk_ref = _build_b8_chunk(
+        num_reqs=max_num_reqs,
+        max_num_reqs=max_num_reqs,
+        token_counts_per_req=token_counts,
+        padded_total_tokens=32,
+        hidden_size=hidden_size,
+        spec_k=spec_k,
+    )
+    chunk_test = _build_b8_chunk(
+        num_reqs=max_num_reqs,
+        max_num_reqs=max_num_reqs,
+        token_counts_per_req=token_counts,
+        padded_total_tokens=32,
+        hidden_size=hidden_size,
+        spec_k=spec_k,
+    )
+
+    runner_ns = types.SimpleNamespace(
+        device=torch.device("cpu"),
+        drafter=proposer_test,
+        _is_async_drafter=True,
+        max_num_reqs=max_num_reqs,
+        uses_mrope=False,
+        requests={},
+        input_batch=types.SimpleNamespace(
+            req_ids=[f"req_{req_i}" for req_i in range(max_num_reqs)]
+        ),
+        speculative_config=types.SimpleNamespace(num_speculative_tokens=spec_k),
+        scheduler_config=types.SimpleNamespace(async_scheduling=True),
+        num_reqs_max_model_len=max_num_reqs,
+        num_reqs_most_model_len=max_num_reqs,
+        mamba_slot_read_offsets=None,
+        _mamba_state_pos=None,
+        _last_step_used_static_decode=False,
+        _folded_steady_state_prep=None,
+        _fold_epilogue_mask_cache={},
+    )
+    fold_inputs = TPUModelRunner._build_fold_verify_and_draft_prep_inputs(
+        cast(Any, runner_ns),
+        draft_chunk=cast(Any, chunk_test),
+        mamba_indices=None,
+        can_defer_mamba_offsets=False,
+    )
+    assert fold_inputs is not None
+    (
+        f_chunk_ids,
+        f_qsl,
+        f_pad_req_idx,
+        f_positions,
+        f_base_sl,
+        f_step0_pad_len,
+        f_adv_pos,
+        f_max_reqs,
+        _f_ro,
+        _f_sg,
+        f_epilogue_tensors,
+        f_steady_key,
+    ) = fold_inputs
+    assert f_step0_pad_len == 8
+    assert f_pad_req_idx.shape == (8,)
+
+    prep_out = fold_verify_and_draft_prep(
+        next_tokens=next_tokens_dev,
+        chunk_input_ids=f_chunk_ids,
+        draft_lengths=chunk_test.draft_lengths,
+        query_start_loc=f_qsl,
+        pad_req_idx=f_pad_req_idx,
+        positions=f_positions,
+        base_seq_lens=f_base_sl,
+        step0_pad_len=f_step0_pad_len,
+        advance_draft_positions=f_adv_pos,
+        max_num_reqs=f_max_reqs,
+    )
+    chunk_test._precomputed_draft_prep = _PrecomputedDraftPrep(
+        draft_input_ids=prep_out[0],
+        gather_indices=prep_out[1],
+        num_rejected_knr=prep_out[2],
+        step0_gather_indices=prep_out[3],
+        pos_step1=prep_out[4],
+        seq_lens_step1=prep_out[5],
+        bonus_full=prep_out[6],
+        spec_num_rejected=prep_out[7],
+        mamba_offsets_updated=False,
+        pos_req_expand_idx=f_epilogue_tensors[0],
+        pos_step1_offsets=f_epilogue_tensors[1],
+        valid_token_mask=f_epilogue_tensors[2],
+        valid_req_mask=f_epilogue_tensors[3],
+        valid_draft_mask=f_epilogue_tensors[4],
+        steady_state_key=f_steady_key,
+    )
+
+    proposer_ref.runner.input_batch.num_reqs = max_num_reqs
+    proposer_test.runner.input_batch.num_reqs = max_num_reqs
+    proposer_ref.draft_chunks = [chunk_ref]
+    proposer_test.draft_chunks = [chunk_test]
+
+    monkeypatch.setattr(envs, "TPU_DRAFT_STEP0_IN_LOOP", False)
+    monkeypatch.setattr(envs, "TPU_FOLD_SPEC_BOOKKEEPING", False)
+    drafts_ref = proposer_ref.propose(
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=None,
+        return_device=True,
+        next_tokens_per_chunk=[next_tokens_dev],
+    )
+
+    monkeypatch.setattr(envs, "TPU_DRAFT_STEP0_IN_LOOP", True)
+    monkeypatch.setattr(envs, "TPU_FOLD_SPEC_BOOKKEEPING", True)
+    drafts_test = proposer_test.propose(
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=None,
+        return_device=True,
+        next_tokens_per_chunk=[next_tokens_dev],
+    )
+    assert isinstance(drafts_ref, torch.Tensor)
+    assert isinstance(drafts_test, torch.Tensor)
+    assert torch.equal(drafts_test, drafts_ref)
+
+    prep_after = chunk_test._precomputed_draft_prep
+    assert prep_after is not None
+    assert prep_after.src_padded is not None
+    ref_src = assemble_spec_next_tokens(next_tokens_dev, drafts_ref, max_num_reqs)
+    assert torch.equal(prep_after.src_padded[: max_num_reqs * query_len], ref_src)
+    assert prep_after.next_input_ids is not None
+    assert torch.equal(prep_after.next_input_ids[: max_num_reqs * query_len], ref_src)

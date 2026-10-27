@@ -287,6 +287,9 @@ class Eagle3Proposer:
         self._loop_qsl_reqdist_cache: dict[
             tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]
         ] = {}
+        self._async_pad_req_idx_cache: dict[tuple[int, int, str], torch.Tensor] = {}
+        self._last_step0_gather_indices: torch.Tensor | None = None
+        self._last_prep_step1: tuple[torch.Tensor, torch.Tensor] | None = None
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -596,6 +599,11 @@ class Eagle3Proposer:
         try:
             from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mtp_fused_loop
 
+            fold_loop_kwargs: dict[str, Any] = {}
+            if envs.TPU_DRAFT_STEP0_IN_LOOP:
+                fold_loop_kwargs["advance_draft_positions"] = (
+                    self.advance_draft_positions
+                )
             with (
                 set_model_tag("eagle_head"),
                 set_vllm_model_wrapper_context(
@@ -603,18 +611,13 @@ class Eagle3Proposer:
                 ),
                 set_current_vllm_config(self.draft_vllm_config),
             ):
-                fused_loop_kwargs: dict[str, Any] = {}
-                if envs.TPU_DRAFT_STEP0_IN_LOOP:
-                    fused_loop_kwargs["advance_draft_positions"] = (
-                        self.advance_draft_positions
-                    )
                 self._mtp_fused_loop = build_mtp_fused_loop(
                     vllm_config=self.draft_vllm_config,
                     prefix=f"mtp_fused_loop_k{K}",
                     mtp=draft_model,
                     num_steps=K - 1,
                     dynamic_arg_dims=draft_dims,
-                    **fused_loop_kwargs,
+                    **fold_loop_kwargs,
                 )
             self._mtp_full_draft_loop = None
             self._mtp_full_draft_loop_warm = False
@@ -721,7 +724,80 @@ class Eagle3Proposer:
                 self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
                 seq_lens.copy_(seq_lens_step1)
                 self._mtp_fused_loop_warm = True
-            return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+            loop_out = self._mtp_fused_loop(
+                input_ids, positions, hidden_states, seq_lens
+            )
+            cast(Any, chunk)._last_fused_loop_pos_sl = (positions, seq_lens)
+            return loop_out
+
+    def _unpack_fold_epilogue_output(
+        self,
+        chunk: DraftChunkInputs,
+        loop_out: tuple[torch.Tensor, ...] | torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(loop_out, tuple):
+            prep = getattr(chunk, "_precomputed_draft_prep", None)
+            if prep is not None and len(loop_out) >= 2:
+                prep.src_padded = loop_out[1]
+                if len(loop_out) >= 6:
+                    prep.next_seq_lens = loop_out[2]
+                    prep.next_positions = loop_out[3]
+                    prep.next_input_ids = loop_out[4]
+                    prep.next_draft_token_ids = loop_out[5]
+            return loop_out[0]
+        return loop_out
+
+    def _apply_fold_epilogue(
+        self,
+        chunk: DraftChunkInputs,
+        loop_out: tuple[torch.Tensor, ...] | torch.Tensor,
+        pos_step1: torch.Tensor | None,
+        seq_lens_end: torch.Tensor,
+        *,
+        seq_lens_is_step1: bool = False,
+    ) -> torch.Tensor:
+        if isinstance(loop_out, tuple):
+            return self._unpack_fold_epilogue_output(chunk, loop_out)
+        prep = getattr(chunk, "_precomputed_draft_prep", None)
+        if (
+            not envs.TPU_FOLD_SPEC_BOOKKEEPING
+            or prep is None
+            or prep.bonus_full is None
+        ):
+            return loop_out
+        eff_pos_step1 = prep.pos_step1 if prep.pos_step1 is not None else pos_step1
+        if eff_pos_step1 is None:
+            return loop_out
+        spec_k = int(self.speculative_config.num_speculative_tokens)
+        max_reqs = int(getattr(self.runner, "max_num_reqs", 0) or 0)
+        assemble_bound = max_reqs * (1 + spec_k)
+        if assemble_bound <= 0:
+            return loop_out
+        from vllm_torchtpu.runner.static_decode_buffers import (
+            _compiled_fold_draft_loop_spec_bookkeeping,
+            fold_draft_loop_spec_bookkeeping,
+        )
+
+        epilogue_fn = (
+            _compiled_fold_draft_loop_spec_bookkeeping
+            if loop_out.device.type == "tpu"
+            else fold_draft_loop_spec_bookkeeping
+        )
+        epilogue_out = epilogue_fn(
+            loop_out,
+            eff_pos_step1,
+            seq_lens_end,
+            prep.bonus_full,
+            assemble_bound,
+            spec_k - 1,
+            prep.pos_req_expand_idx,
+            prep.pos_step1_offsets,
+            prep.valid_token_mask,
+            prep.valid_req_mask,
+            prep.valid_draft_mask,
+            seq_lens_is_step1,
+        )
+        return self._unpack_fold_epilogue_output(chunk, epilogue_out)
 
     def _run_mtp_full_draft_loop(
         self,
@@ -833,7 +909,7 @@ class Eagle3Proposer:
                     loop_request_distribution,
                 )
                 self._mtp_full_draft_loop_warm = True
-            return program(
+            loop_out = program(
                 step0_input_ids,
                 step0_positions,
                 target_hidden_states,
@@ -844,6 +920,26 @@ class Eagle3Proposer:
                 num_rejected_dev,
                 loop_query_start_loc,
                 loop_request_distribution,
+            )
+            if not envs.TPU_FOLD_SPEC_BOOKKEEPING and not isinstance(loop_out, tuple):
+                return loop_out
+            prep = getattr(chunk, "_precomputed_draft_prep", None)
+            eff_pos1 = (
+                prep.pos_step1
+                if prep is not None and prep.pos_step1 is not None
+                else None
+            )
+            eff_sl1 = (
+                prep.seq_lens_step1
+                if prep is not None and prep.seq_lens_step1 is not None
+                else step0_seq_lens
+            )
+            return self._apply_fold_epilogue(
+                chunk,
+                loop_out,
+                eff_pos1,
+                eff_sl1,
+                seq_lens_is_step1=True,
             )
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
@@ -1733,12 +1829,24 @@ class Eagle3Proposer:
         # to the real num_reqs at the end. Sync slices on the host (the [p, K] D2H
         # is constant-shape, so no recompile); async keeps the device slice
         # (matches prior behaviour for the substitution source).
-        per_chunk_stacked = [
-            toks[0]
-            if len(toks) == 1 and toks[0].ndim == 2
-            else torch.stack(toks, dim=1)
-            for toks in draft_tokens_per_chunk
-        ]
+        per_chunk_stacked: list[torch.Tensor] = []
+        for chunk_obj, toks in zip(chunks, draft_tokens_per_chunk):
+            if len(toks) == 1 and toks[0].ndim == 2:
+                per_chunk_stacked.append(toks[0])
+            else:
+                stacked_chunk = torch.stack(toks, dim=1)
+                last_pos_sl = getattr(chunk_obj, "_last_fused_loop_pos_sl", None)
+                if last_pos_sl is not None:
+                    cast(Any, chunk_obj)._last_fused_loop_pos_sl = None
+                if last_pos_sl is not None and envs.TPU_FOLD_SPEC_BOOKKEEPING:
+                    stacked_chunk = self._apply_fold_epilogue(
+                        chunk_obj,
+                        stacked_chunk,
+                        last_pos_sl[0],
+                        last_pos_sl[1],
+                        seq_lens_is_step1=False,
+                    )
+                per_chunk_stacked.append(stacked_chunk)
         if return_device:
             return torch.cat(
                 [s[: c.num_reqs] for s, c in zip(per_chunk_stacked, chunks)], dim=0
@@ -1836,6 +1944,33 @@ class Eagle3Proposer:
         discard_set = set(discard_sampled_tokens_req_indices)
         req_ids = runner.input_batch.req_ids[start : start + num_reqs]
         if next_tokens_device is not None:
+            precomputed_prep = getattr(chunk, "_precomputed_draft_prep", None)
+            if (
+                precomputed_prep is not None
+                and not discard_set
+                and precomputed_prep.draft_input_ids is not None
+            ):
+                draft_input_ids = precomputed_prep.draft_input_ids
+                gather_indices = precomputed_prep.gather_indices
+                num_rejected_out = precomputed_prep.num_rejected_knr
+                self._last_step0_gather_indices = precomputed_prep.step0_gather_indices
+                self._last_prep_step1 = (
+                    precomputed_prep.pos_step1,
+                    precomputed_prep.seq_lens_step1,
+                )
+                draft_input_ids, gather_indices = (
+                    chunk.sequence_layout_plan.localize_token_tensor_and_gather_indices(
+                        draft_input_ids,
+                        gather_indices,
+                        num_valid_gathers=num_reqs,
+                    )
+                )
+                return (
+                    draft_input_ids,
+                    chunk.position_ids,
+                    gather_indices,
+                    num_rejected_out,
+                )
             # Async path: derive the seed token, the seed *position*
             # (last_token_indices) and the rejected count from the on-device
             # rejection-sampler output instead of the host num_rejected /
