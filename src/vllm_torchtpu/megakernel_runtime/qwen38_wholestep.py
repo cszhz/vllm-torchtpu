@@ -29,10 +29,14 @@ from typing import Any
 import torch
 from torch import nn
 
+from vllm_torchtpu.logger import init_logger
+
 from .qwen38_segment_call import T_VERIFY
 from .qwen38_wholestep_call import LONG_CONTEXT, wholestep_tiles
 
 from .qwen38_wholestep_cache import QSALayerCache
+
+logger = init_logger(__name__)
 
 FIRST_LAYER, LAST_LAYER = 3, 47  # kernel covers model layers [FIRST_LAYER, LAST_LAYER)
 L_WHOLE = LAST_LAYER - FIRST_LAYER
@@ -116,6 +120,12 @@ class Qwen38WholeStep(nn.Module):
         )
         ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=wholestep_tiles(buckets[0]))
         ops = pack_wholestep_operands(model, g, spec, ex, ids)
+        # Host round-trip of the small packed operands (operand_hold): w08r c1's whole-step
+        # steps ran 18 per-call execute_as_strided programs more than stock (+0.85 ms/step).
+        from .operand_hold import host_round_trip_small
+
+        n_trip = host_round_trip_small(ops)
+        logger.info("Qwen3.8 whole-step: %d of %d operands host round-tripped", n_trip, len(ops))
         self.n_w = len(ops)
         # How the operands are held decides what the compiled program sees: registered
         # buffers are re-materialised by `execute_as_strided` every step in the served segment
