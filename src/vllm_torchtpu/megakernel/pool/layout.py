@@ -259,12 +259,19 @@ class PoolLayout:
             )
         if not self.has_recurrent:
             return
+        rec_hint = (
+            "; per-rank recurrent state exceeds 4 pages, increase tensor-parallel R"
+            if self.rec_pages_per_slot > VALIDATED_REC_PAGES_PER_SLOT
+            else ""
+        )
         _need(
             self.rec_pages_per_slot == VALIDATED_REC_PAGES_PER_SLOT
             and self.conv_pages_per_slot == VALIDATED_CONV_PAGES_PER_SLOT,
             "pool kernels are only validated for "
             f"{VALIDATED_REC_PAGES_PER_SLOT} recurrent + "
-            f"{VALIDATED_CONV_PAGES_PER_SLOT} conv page(s) per slot",
+            f"{VALIDATED_CONV_PAGES_PER_SLOT} conv page(s) per slot "
+            f"(got rec_pages_per_slot={self.rec_pages_per_slot}, "
+            f"conv_pages_per_slot={self.conv_pages_per_slot}{rec_hint})",
         )
         _need(
             self.KD == LANES and self.VD == LANES,

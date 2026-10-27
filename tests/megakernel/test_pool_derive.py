@@ -97,11 +97,27 @@ def test_derive_kv_only_and_explicit_overrides():
 
 
 def test_derive_recurrent_page_sizing_and_explicit_fields():
-    """`rec_pages_per_slot=None` scales with per-rank state size; explicit wins."""
+    """`rec_pages_per_slot=None` scales layout geometry; `validate()` gates >4 pages."""
     kv = KVCacheDecl(hd=256)
+    shrunk_rec = RecurrentCacheDecl(kh=2, vh=4, KD=128, VD=128)
+    assert (
+        derive_pool_layout([shrunk_rec, kv], R=8).rec_pages_per_slot
+        == VALIDATED_REC_PAGES_PER_SLOT
+    )
+
+    # Layout derivation scales page counts beyond 4 for wider per-rank state,
+    # while `PoolLayout.validate()` enforces the currently validated 4-page TPU
+    # pool-kernel constraint with an actionable tensor-parallel `R` hint.
     wide_rec = RecurrentCacheDecl(kh=32, vh=128, KD=128, VD=128)
-    assert derive_pool_layout([wide_rec, kv], R=8).rec_pages_per_slot == 8
-    assert derive_pool_layout([wide_rec, kv], R=4).rec_pages_per_slot == 16
+    wide_r8 = derive_pool_layout([wide_rec, kv], R=8)
+    wide_r4 = derive_pool_layout([wide_rec, kv], R=4)
+    assert wide_r8.rec_pages_per_slot == 8
+    assert wide_r4.rec_pages_per_slot == 16
+    with pytest.raises(
+        MegakernelConfigError,
+        match=r"rec_pages_per_slot=8.*increase tensor-parallel R",
+    ):
+        wide_r8.validate()
 
     explicit_kv = KVCacheDecl(hd=256, kvh=2, page_size=64, page_dtype=BF16)
     explicit_rec = RecurrentCacheDecl(
@@ -141,12 +157,26 @@ def test_derive_rejects_invalid_declarations():
         derive_pool_layout([rec, kv, rec, rec, kv], R=8)
     with pytest.raises(MegakernelConfigError, match="explicit num_pools"):
         derive_pool_layout(kv)
+    with pytest.raises(MegakernelConfigError, match="requires explicit slots_per_pool"):
+        derive_pool_layout(kv, rec, num_pools=3)
+    with pytest.raises(MegakernelConfigError, match="requires explicit slots_per_pool"):
+        derive_pool_layout([kv, kv], rec)
+    with pytest.raises(MegakernelConfigError, match="without a RecurrentCacheDecl"):
+        derive_pool_layout([kv, kv], slots_per_pool=2)
+    with pytest.raises(MegakernelConfigError, match="num_pools >= 1"):
+        derive_pool_layout(kv, num_pools=0)
+    with pytest.raises(MegakernelConfigError, match="slots_per_pool >= 0"):
+        derive_pool_layout(kv, rec, num_pools=1, slots_per_pool=-1, R=8)
     with pytest.raises(MegakernelConfigError, match="requires a KVCacheDecl"):
         derive_pool_layout("not_a_sequence_of_decls", num_pools=1)
     with pytest.raises(
         MegakernelConfigError, match="requires a RecurrentCacheDecl or None"
     ):
         derive_pool_layout(kv, "not_rec", num_pools=1, slots_per_pool=1)
+    with pytest.raises(
+        MegakernelConfigError, match="requires a RecurrentCacheDecl or None"
+    ):
+        derive_pool_layout(kv, "not_rec", num_pools=1, slots_per_pool=0)
     for bad_r in (None, 0, -2):
         with pytest.raises(MegakernelConfigError, match="requires explicit R > 0"):
             PoolLayout.from_cache_decls([rec, kv], R=bad_r)
