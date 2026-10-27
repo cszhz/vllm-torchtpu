@@ -197,6 +197,9 @@ def _dequant_cache_page(nope_words: jax.Array, rope_words: jax.Array):
 # Smallest padded batch that compiles the shared-KV path: decode-only batches
 # (at most max-num-seqs tokens) skip its per-chunk launch.
 SHARED_KV_MIN_TOKENS = 512
+# Query tokens stacked into one matmul on the shared-KV path: 4 x 64 heads
+# fill the MXU's 256 rows.
+SHARED_KV_TOKENS_PER_MATMUL = 4
 
 
 def _selects_leading_rows(topk_indices: jax.Array, kv_lens: jax.Array) -> jax.Array:
@@ -543,10 +546,6 @@ def _attention_kernel(
             )
 
     def load_bkv(bkv_sem_idx, batch_idx):
-        if shared_kv:
-            # Rows in [kv_len, kv_rows) get exactly zero weight from the
-            # score mask, so they need no per-token zeroing.
-            return shared_bkv_ref[...]
         bkv_nope = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx][...]
         # The gather nope is (4, 128) u8, reshape it to (1, 512) u8.
         bkv_nope = bkv_nope.reshape(bkv_sz, -1)
@@ -580,6 +579,58 @@ def _attention_kernel(
         swa_l = bl_x2_ref[bq_sem_idx, batch_idx, :num_q_heads][..., None]
         swa_m = bm_x2_ref[bq_sem_idx, batch_idx, :num_q_heads][..., None]
         return swa_acc, swa_l, swa_m
+
+    def process_shared_kv_batch(bi_sem_idx, bo_sem_idx, attention_sinks):
+        # Every token reads the same KV, so a group of tokens shares each
+        # matmul's weights instead of loading them once per token. Rows in
+        # [kv_len, kv_rows) get exactly zero weight from the score mask, so
+        # they need no per-token zeroing.
+        bkv = shared_bkv_ref[...]
+        group = _largest_divisor(batch_size, SHARED_KV_TOKENS_PER_MATMUL)
+        pending = None  # (first, step-2 args) of the previous group
+
+        def finish(first, args):
+            out = flash_attention_step2_pv(*args)
+            bo_x2_ref[bo_sem_idx, pl.ds(first, group)] = out.reshape(
+                group, num_q_heads, head_dim
+            )
+
+        for first in range(0, batch_size, group):
+            tokens = range(first, first + group)
+            bq = bq_x2_ref[bi_sem_idx, pl.ds(first, group)].reshape(-1, head_dim)
+            swa_acc = swa_acc_x2_ref[bi_sem_idx, pl.ds(first, group)].reshape(
+                -1, head_dim
+            )
+            swa_l = jnp.concatenate(
+                [bl_x2_ref[bi_sem_idx, t, :num_q_heads][..., None] for t in tokens]
+            )
+            swa_m = jnp.concatenate(
+                [bm_x2_ref[bi_sem_idx, t, :num_q_heads][..., None] for t in tokens]
+            )
+            kv_len = jnp.concatenate(
+                [
+                    jnp.full(
+                        (num_q_heads, 1),
+                        kv_lens_ref[batch_start_seq_idx + t],
+                        jnp.int32,
+                    )
+                    for t in tokens
+                ]
+            )
+            p, exp_m_diff, l_total = flash_attention_step1_qk_softmax(
+                bq,
+                bkv,
+                kv_len,
+                swa_m,
+                swa_l,
+                jnp.concatenate([attention_sinks] * group),
+            )
+            # As in `process`, the previous group's PV goes after this group's
+            # QK, so the MXU works while the VPU does the softmax.
+            if pending is not None:
+                finish(*pending)
+            pending = (first, (p, bkv, exp_m_diff, swa_acc, l_total))
+        finish(*pending)
 
     def process():
         def get_next_seq_ids(seq_idx, bi_sem_idx):
@@ -619,6 +670,11 @@ def _attention_kernel(
         @pl.when(pl.program_id(0) >= 2)
         def _wait_send():
             wait_send_bo_batch(bo_sem_idx)
+
+        if shared_kv:
+            process_shared_kv_batch(bi_sem_idx, bo_sem_idx, attention_sinks)
+            start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
+            return
 
         for batch_idx in range(batch_size):
             bkv = load_bkv(bi_sem_idx, batch_idx)
