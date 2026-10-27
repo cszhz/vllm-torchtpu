@@ -88,10 +88,13 @@ def _mhc_pre_jax(
     gates_in_kernel: bool,
     gates_max_tokens: int = -1,
     token_block_size: int = 0,
+    single_stream: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Mix GEMM + stream collapse in Pallas, gates/Sinkhorn in XLA (or in
-    the kernel, with ``gates_in_kernel``)."""
-    return pre_kernel.mhc_pre(
+    the kernel, with ``gates_in_kernel``). With ``single_stream``,
+    ``residual`` is the one (..., hidden_size) stream that all hc_mult
+    streams are copies of."""
+    return _pre_kernel_fn(single_stream)(
         residual,
         utils.SplitFn(fn_hi, fn_mid, fn_lo),
         hc_scale,
@@ -123,10 +126,11 @@ def _mhc_pre_norm_jax(
     gates_in_kernel: bool,
     gates_max_tokens: int = -1,
     token_block_size: int = 0,
+    single_stream: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``_mhc_pre_jax`` emitting the layer input RMS-normalized with
     ``norm_weight`` (the sublayer's input norm, which shares ``rms_eps``)."""
-    return pre_kernel.mhc_pre(
+    return _pre_kernel_fn(single_stream)(
         residual,
         utils.SplitFn(fn_hi, fn_mid, fn_lo),
         hc_scale,
@@ -252,6 +256,7 @@ def _mhc_pre_cat_jax(
     gates_in_kernel: bool,
     gates_max_tokens: int = -1,
     token_block_size: int = 0,
+    single_stream: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``_mhc_pre_jax`` taking fn as its stacked (3 * M3, K) bf16 chunks."""
     return _pre_call(
@@ -262,6 +267,7 @@ def _mhc_pre_cat_jax(
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
         gates_in_kernel=gates_in_kernel,
+        single_stream=single_stream,
         **_kernel_kw(gates_max_tokens, token_block_size),
     )
 
@@ -281,6 +287,7 @@ def _mhc_pre_cat_norm_jax(
     gates_in_kernel: bool,
     gates_max_tokens: int = -1,
     token_block_size: int = 0,
+    single_stream: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``_mhc_pre_cat_jax`` emitting the RMS-normalized layer input."""
     return _pre_call(
@@ -291,8 +298,14 @@ def _mhc_pre_cat_norm_jax(
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
         gates_in_kernel=gates_in_kernel,
+        single_stream=single_stream,
         **_kernel_kw(gates_max_tokens, token_block_size),
     )
+
+
+def _pre_kernel_fn(single_stream: bool):
+    """``mhc_pre``, or its one-stream twin for the chain's first pre."""
+    return pre_kernel.mhc_pre_single_stream if single_stream else pre_kernel.mhc_pre
 
 
 def _kernel_kw(gates_max_tokens: int, token_block_size: int) -> dict:
@@ -305,9 +318,10 @@ def _kernel_kw(gates_max_tokens: int, token_block_size: int) -> dict:
 
 
 def _pre_call(residual, fn, hc_scale, hc_base, norm_weight, *, rms_eps, hc_pre_eps,
-              hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, **kernel_opts):
+              hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+              single_stream=False, **kernel_opts):
     norm = {} if norm_weight is None else dict(norm_weight=norm_weight, norm_eps=rms_eps)
-    return pre_kernel.mhc_pre(
+    return _pre_kernel_fn(single_stream)(
         residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
         hc_post_mult_value, sinkhorn_repeat, **norm, **kernel_opts,
     )
@@ -419,13 +433,30 @@ def _fake_mhc_pre(residual, *args, **kwargs):
     return _fake_pre_outputs(residual)
 
 
+def _as_streams(x: torch.Tensor, fn: torch.Tensor) -> torch.Tensor:
+    """A (..., hc_mult, hidden) stand-in for a single (..., hidden) stream.
+
+    ``fn`` is any fn operand: its last dim is hc_mult * hidden.
+    """
+    hc_mult = fn.shape[-1] // x.shape[-1]
+    return x.unsqueeze(-2).expand(*x.shape[:-1], hc_mult, x.shape[-1])
+
+
+def _fake_mhc_pre_single_stream(x, fn, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return _fake_pre_outputs(_as_streams(x, fn))
+
+
 def _fake_mhc_post(x, residual, post_layer_mix, comb_res_mix, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty_like(residual)
 
 
-def _fake_mhc_fused_post_pre(x, residual, *args, **kwargs):
+def _fake_mhc_fused_post_pre(x, residual, post_layer_mix, comb_res_mix, fn, *args,
+                             **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
+    if residual.dim() == x.dim():
+        residual = _as_streams(residual, fn)
     return (torch.empty_like(residual), *_fake_pre_outputs(residual))
 
 
@@ -479,9 +510,12 @@ def _mhc_pre_op(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     opts: KernelOpts,
+    *,
+    single_stream: bool = False,
 ):
     op_name = (
-        "pallas::deepseek_v4_mhc_pre_v2"
+        ("pallas::deepseek_v4_mhc_pre_res1_v2" if single_stream
+         else "pallas::deepseek_v4_mhc_pre_v2")
         + _gate_suffix(
             rms_eps,
             hc_pre_eps,
@@ -511,17 +545,22 @@ def _mhc_pre_op(
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
                 **opts.kernel_kwargs(fused=False),
+                **({"single_stream": True} if single_stream else {}),
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
-                P(ATTN_DATA_AXIS, None, None),  # residual
+                # residual (or the one stream)
+                P(ATTN_DATA_AXIS, None) if single_stream
+                else P(ATTN_DATA_AXIS, None, None),
                 *opts.fn_specs(),  # fn chunks (or the stacked chunks)
                 P(),  # hc_scale
                 P(),  # hc_base
                 *([P()] if opts.fuse_norm else []),  # norm weight
             ),
         )
-        op.register_fake(_fake_mhc_pre)
+        op.register_fake(
+            _fake_mhc_pre_single_stream if single_stream else _fake_mhc_pre
+        )
         _mhc_op_cache[op_name] = op
     return op
 
@@ -558,9 +597,12 @@ def _mhc_fused_post_pre_op(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     opts: KernelOpts,
+    *,
+    single_stream_residual: bool = False,
 ):
     op_name = (
-        "pallas::deepseek_v4_mhc_fused_post_pre_v2"
+        ("pallas::deepseek_v4_mhc_fused_post_pre_res1_v2" if single_stream_residual
+         else "pallas::deepseek_v4_mhc_fused_post_pre_v2")
         + _gate_suffix(
             rms_eps,
             hc_pre_eps,
@@ -594,7 +636,9 @@ def _mhc_fused_post_pre_op(
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None),  # x
-                P(ATTN_DATA_AXIS, None, None),  # residual
+                # residual (or the one stream it is hc_mult copies of)
+                P(ATTN_DATA_AXIS, None) if single_stream_residual
+                else P(ATTN_DATA_AXIS, None, None),
                 P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
                 P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
                 *opts.fn_specs(),  # fn chunks (or the stacked chunks)
@@ -761,11 +805,17 @@ class MHCOps(NamedTuple):
     per-call relayout, (1, hidden_size)), and return layer_input already
     RMS-normalized with it. With ``KernelOpts.stacked_fn`` ``fn3`` is the
     single stacked array from ``get_mhc_stack_fn_op``.
+
+    ``pre_single_stream`` / ``fused_from_single_stream`` are ``pre`` /
+    ``fused`` for a residual whose hc_mult streams are copies of one
+    (..., hidden_size) stream (the embedding), which is passed instead.
     """
 
     pre: Any
     fused: Any
     post: Any
+    pre_single_stream: Any = None
+    fused_from_single_stream: Any = None
 
 
 def get_mhc_ops(
@@ -801,4 +851,8 @@ def get_mhc_ops(
         pre=_mhc_pre_op(*consts),
         fused=_mhc_fused_post_pre_op(*consts),
         post=get_mhc_post_op(),
+        pre_single_stream=_mhc_pre_op(*consts, single_stream=True),
+        fused_from_single_stream=_mhc_fused_post_pre_op(
+            *consts, single_stream_residual=True
+        ),
     )

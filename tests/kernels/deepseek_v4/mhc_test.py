@@ -787,6 +787,62 @@ class MhcGatesInKernelTpuTest(parameterized.TestCase):
         for out in outs:
             self.assertTrue(bool(jnp.isfinite(out.astype(jnp.float32)).all()))
 
+    @parameterized.product(
+        num_tokens=[8, 17, 128],
+        gates_in_kernel=[False, True],
+        stacked_fn=[False, True],
+    )
+    def test_single_stream_pre_and_fused(self, num_tokens, gates_in_kernel, stacked_fn):
+        """Layer 0 on the one embedding stream vs hc_mult repeated copies.
+
+        Bit-identical in interpret mode; on TPU the one-stream block is tiled
+        differently, so the f32 gates may move by an ulp (gates tier). The
+        seam's new residual only recombines identical values: exact.
+        """
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import (
+            fused_post_pre_kernel,
+            pre_kernel,
+            utils,
+        )
+
+        rng = np.random.default_rng(15)
+        _, fn, hc_scale, hc_base = _make_pre_inputs(rng, num_tokens, 7168)
+        fn = jnp.asarray(fn)
+        fn = utils.cat_fn3(fn) if stacked_fn else utils.split_fn3(fn)
+        x1 = jnp.asarray(
+            rng.standard_normal((num_tokens, 7168), dtype=np.float32)
+        ).astype(jnp.bfloat16)
+        rep = jnp.repeat(x1[:, None, :], HC_MULT, axis=1)
+        sc, hb = jnp.asarray(hc_scale), jnp.asarray(hc_base)
+        w = jnp.asarray(rng.uniform(0.5, 1.5, (7168,)), jnp.float32)
+        gates = (RMS_EPS, HC_PRE_EPS, HC_SINKHORN_EPS, HC_POST_MULT_VALUE, 20)
+        kw = dict(gates_in_kernel=gates_in_kernel, norm_weight=w, norm_eps=RMS_EPS)
+
+        def check_layer(got, want):
+            got, want = _to_np(got), _to_np(want)
+            np.testing.assert_allclose(got, want, rtol=BF16_RTOL, atol=BF16_ATOL)
+            self.assertLessEqual(np.mean(got != want), 1e-3)
+
+        want = pre_kernel.mhc_pre(rep, fn, sc, hb, *gates, **kw)
+        got = pre_kernel.mhc_pre_single_stream(x1, fn, sc, hb, *gates, **kw)
+        for g, ww in zip(got, want):
+            self.assertEqual(g.shape, ww.shape)
+        self._check_gates(got[0], got[1], want[0], want[1])
+        check_layer(got[2], want[2])
+
+        sub = jnp.asarray(
+            rng.standard_normal((num_tokens, 7168), dtype=np.float32)
+        ).astype(jnp.bfloat16)
+        post_mix, comb_mix = want[0], want[1]
+        fused = fused_post_pre_kernel.mhc_fused_post_pre
+        want = fused(sub, rep, post_mix, comb_mix, fn, sc, hb, *gates, **kw)
+        got = fused(sub, x1, post_mix, comb_mix, fn, sc, hb, *gates, **kw)
+        for g, ww in zip(got, want):
+            self.assertEqual(g.shape, ww.shape)
+        np.testing.assert_array_equal(_to_np(got[0]), _to_np(want[0]))
+        self._check_gates(got[1], got[2], want[1], want[2])
+        check_layer(got[3], want[3])
+
 
 @pytest.mark.tpu_test
 class MhcStackedFnTpuTest(parameterized.TestCase):

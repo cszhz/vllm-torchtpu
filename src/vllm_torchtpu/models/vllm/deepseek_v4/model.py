@@ -444,7 +444,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         still owes. The chain is opened by the layer-0 attention pre, which
         has no preceding post, and closed by the caller.
         """
-        if residual is None:
+        if residual is None and x.dim() == 2:
+            # Chain start on the embedding: its hc_mult streams are copies
+            # of x, so the pre (and the ffn seam below) read x once.
+            residual = x
+            post_mix, res_mix, x = self.mhc_ops.pre_single_stream(
+                x,
+                *self._fn3("hc_attn_fn"),
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                *self._norm_arg(self.attn_norm),
+            )
+        elif residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
             x, post_mix, res_mix = self.hc_pre(
@@ -481,8 +492,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         x = self._norm(self.attn_norm, x)
-        if self.__dict__.get("_ar_seam_op") is not None and (
-            not self.seq_parallel or SP_GATE["replicated"]
+        # A single-stream residual (layer 0) has no all-reduce seam variant.
+        single_stream = residual.dim() == x.dim()
+        if (
+            self.__dict__.get("_ar_seam_op") is not None
+            and not single_stream
+            and (not self.seq_parallel or SP_GATE["replicated"])
         ):
             residual, post_mix, res_mix, x = self._attn_seam(
                 positions, x, residual, post_mix, res_mix
@@ -507,7 +522,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             x = self.attn(positions, x)
 
-        residual, post_mix, res_mix, x = self._seam("hc_ffn_fn")(
+        ffn_seam = (
+            self.mhc_ops.fused_from_single_stream
+            if single_stream
+            else self._seam("hc_ffn_fn")
+        )
+        residual, post_mix, res_mix, x = ffn_seam(
             x,
             residual,
             post_mix,
@@ -792,7 +812,12 @@ class DeepseekV4Model(nn.Module):
 
                 sp_rank = tp_rank_as_data(get_tp_group(), hidden_states.device)
                 (hidden_states,) = self._sp_local_rows([hidden_states], sp_rank)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            if self.end_layer == self.start_layer:
+                # No layer here to read the one stream: hand the next stage
+                # the hc_mult streams it expects.
+                hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            # Otherwise left as the one stream the hc_mult streams start as
+            # copies of; the first layer reads it as such (see the layer).
         else:
             assert intermediate_tensors is not None
             hidden_states = typing.cast(
