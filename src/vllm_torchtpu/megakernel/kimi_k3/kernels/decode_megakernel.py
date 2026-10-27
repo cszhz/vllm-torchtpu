@@ -5224,6 +5224,9 @@ def mla_dcp_shards(
                                          chunk_rows=chunk_rows)
         if len(splits) > 1:
             attention.force_chunked = mla_dcp.chunked(rows)
+            if chunk_rows is not None:
+                attention.ring_chunks = rows // chunk_rows
+                attention.ring_offset = first // chunk_rows
         return attention
 
     dcp_attention = split_attention(0)

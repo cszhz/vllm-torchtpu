@@ -964,6 +964,10 @@ class DcpAttention:
     # bound the exchange); the merged partials round to BF16 once more.
     host_combine: Any = None
     force_chunked = False  # run even one chunk through _attend_chunked (scratch: force_chunks)
+    # Sub-calls of one layer: chunks per layer over all of them, and the chunks
+    # of the earlier ones (None / 0: one call per layer).
+    ring_chunks = None
+    ring_offset = 0
     # FP8 explicit-keys sequences: QK/PV for several rows in one
     # dot (the grouped path's arithmetic, per row as the ungrouped fold).
     group_fold = False
@@ -1340,8 +1344,12 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
             total = total + jnp.where(b < first, steps[b], 0)
         return total
 
+    # Chunk slots rotate across layers and, with several sub-calls per layer
+    # (ring_chunks / ring_offset), across the layer's sub-calls.
+    stride = self.ring_chunks if self.ring_chunks is not None else count
+
     def ring(c):
-        return (layer * count + c) % ring_slots
+        return (layer * stride + self.ring_offset + c) % ring_slots
 
     def send_queries(c):
         slot = ring(c)
