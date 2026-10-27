@@ -29,10 +29,11 @@ SUBLANE = 16
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 # Tokens whose post/comb gates the kernels' epilogue computes together,
-# tokens on lanes. Wider groups amortize the epilogue's serial Sinkhorn
-# chain over more lanes (deviceless tpu7x LLO at T=1024: 8x565 bundles
-# per call at 128, 4x972 at 256).
-GATE_GROUP_TOKENS = 256
+# tokens on lanes. The epilogue's serial Sinkhorn chain costs about the
+# same for any group up to 1024 tokens (one dense vreg per gate plane), so
+# wider groups run it fewer times (deviceless tpu7x LLO, seam at T=1024:
+# 1 x 1258 bundles per call vs 4 x 1134 for the sublane-slab epilogue at 256).
+GATE_GROUP_TOKENS = 1024
 
 
 def round_up(x: int, multiple: int) -> int:
@@ -168,7 +169,7 @@ def mhc_pre_gates(
     """Gating / softmax / Sinkhorn on the tiny (T, hc_mult3) mix logits.
 
     The XLA reference for the gates the kernels compute in-block
-    (``gate_epilogue``).
+    (``gate_epilogue_planes``).
     Returns (pre_mix (T, M), post_mix (T, M), comb_mix (T, M, M)).
     """
     num_tokens = mixes.shape[0]
@@ -199,50 +200,65 @@ def mhc_pre_gates(
 
 
 def gate_group_blocks(num_blocks: int, token_block: int) -> int:
-    """Grid blocks per gate group; divides ``num_blocks`` so groups tile the grid."""
+    """Grid blocks per gate group; divides ``num_blocks`` so groups tile the grid.
+
+    Blocks group only when ``token_block`` is lane-aligned, so each block's
+    logits land at a 128-aligned lane offset of the staging scratch.
+    """
+    if token_block % 128:
+        return 1
     return math.gcd(num_blocks, max(1, GATE_GROUP_TOKENS // token_block))
 
 
-def gate_epilogue(
-    logits_t: jax.Array,
+def gate_epilogue_planes(
+    planes: list[jax.Array],
     *,
     hc_mult: int,
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-) -> tuple[jax.Array, jax.Array]:
-    """In-kernel post/comb half of ``mhc_pre_gates``, tokens on lanes.
+) -> tuple[list[jax.Array], list[jax.Array]]:
+    """In-kernel post/comb half of ``mhc_pre_gates``, one plane per logit.
 
-    ``logits_t`` is (hc_mult3, G): the gate logits (scaled mixes times
-    hc_scale plus hc_base), one token per lane. Same op order as
-    ``mhc_pre_gates``; comb row ``i`` is the (hc_mult, G) slab of rows
-    ``i * hc_mult + j``, so the softmax and row sums run down sublanes and
-    the column sums add the slabs.
+    ``planes[c]`` holds gate logit column ``c`` (scaled mixes times hc_scale
+    plus hc_base) for a group of tokens as a dense (sublanes, lanes) array,
+    so the softmax and the Sinkhorn row/column sums are adds of whole
+    planes, with no cross-sublane reductions. Same ops as
+    ``mhc_pre_gates``; comb entry (i, j) is plane ``2 * hc_mult + i * hc_mult + j``.
 
-    Returns post (hc_mult, G) and comb (hc_mult * hc_mult, G), row-major (i, j).
+    Returns post (hc_mult planes) and comb (hc_mult * hc_mult planes,
+    row-major (i, j)).
     """
     m = hc_mult
-    post = jax.nn.sigmoid(logits_t[m : 2 * m]) * hc_post_mult_value
+    post = [jax.nn.sigmoid(planes[m + q]) * hc_post_mult_value for q in range(m)]
+
+    def plane_sum(xs):
+        s = xs[0]
+        for x in xs[1:]:
+            s = s + x
+        return s
 
     rows = []
     for i in range(m):
-        lo = 2 * m + i * m
-        rows.append(jax.nn.softmax(logits_t[lo : lo + m], axis=0) + hc_sinkhorn_eps)
+        logits = planes[2 * m + i * m : 2 * m + (i + 1) * m]
+        mx = logits[0]
+        for x in logits[1:]:
+            mx = jnp.maximum(mx, x)
+        e = [jnp.exp(x - mx) for x in logits]
+        s = plane_sum(e)
+        rows.append([x / s + hc_sinkhorn_eps for x in e])
 
     def col_norm(rows):
-        col = rows[0]
-        for r in rows[1:]:
-            col = col + r
-        col = col + hc_sinkhorn_eps
-        return [r / col for r in rows]
+        cols = [plane_sum([r[j] for r in rows]) + hc_sinkhorn_eps for j in range(m)]
+        return [[r[j] / cols[j] for j in range(m)] for r in rows]
 
     def row_norm(rows):
-        return [r / (jnp.sum(r, axis=0, keepdims=True) + hc_sinkhorn_eps) for r in rows]
+        return [[x / (plane_sum(r) + hc_sinkhorn_eps) for x in r] for r in rows]
 
     rows = col_norm(rows)
     for _ in range(sinkhorn_repeat - 1):
         rows = col_norm(row_norm(rows))
-    return post, jnp.concatenate(rows, axis=0)
+    return post, [x for r in rows for x in r]
 
 
 def stage_mixes_and_gates(
@@ -259,11 +275,12 @@ def stage_mixes_and_gates(
 ) -> None:
     """Stage this block's gate logits; the group's last block writes its gates.
 
-    ``mix_scr`` is a (G, hc_mult3) f32 scratch, G = gate_blocks * tb; the
-    gate outputs are (G, hc_mult) / (G, hc_mult * hc_mult) blocks indexed
-    by group, so they are written back once per group. The logits are
-    formed tokens-on-sublanes so hc_base is read as the (1, hc_mult3) row
-    it already is; a (hc_mult3, 1) column costs an XLA relayout per call.
+    ``mix_scr`` is a (hc_mult3, G) f32 scratch, G = gate_blocks * tb, tokens
+    on lanes; the gate outputs are (G, hc_mult) / (G, hc_mult * hc_mult)
+    blocks indexed by group, so they are written back once per group. The
+    logits are formed tokens-on-sublanes so hc_base is read as the
+    (1, hc_mult3) row it already is (a (hc_mult3, 1) column costs an XLA
+    relayout per call), then transposed into the scratch.
     """
     tb = mixes.shape[0]
     m = hc_mult
@@ -272,10 +289,22 @@ def stage_mixes_and_gates(
         col < m, sc_ref[0, 0], jnp.where(col < 2 * m, sc_ref[0, 1], sc_ref[0, 2])
     )
     j = pl.program_id(0) % gate_blocks
-    mix_scr[pl.ds(pl.multiple_of(j * tb, tb), tb), :] = mixes * scale + hb_ref[...]
+    logits = mixes * scale + hb_ref[...]
+    mix_scr[:, pl.ds(pl.multiple_of(j * tb, tb), tb)] = logits.T
 
     @pl.when(j == gate_blocks - 1)
     def _():
-        post, comb = gate_epilogue(mix_scr[...].T, hc_mult=m, **gate_kwargs)
-        post_out_ref[...] = post.T
-        comb_out_ref[...] = comb.T
+        # Plane c gets token s * lanes + l at (s, l).
+        group = mix_scr.shape[1]
+        lanes = group if group <= 128 else math.gcd(group, 128)
+        n_sub = group // lanes
+        blocks_t = [mix_scr[:, b * lanes : (b + 1) * lanes] for b in range(n_sub)]
+        planes = [
+            jnp.concatenate([blk[c : c + 1] for blk in blocks_t], axis=0)
+            for c in range(mixes.shape[1])
+        ]
+        post, comb = gate_epilogue_planes(planes, hc_mult=m, **gate_kwargs)
+        for b in range(n_sub):
+            rows = pl.ds(b * lanes, lanes)
+            post_out_ref[rows, :] = jnp.concatenate([q[b : b + 1] for q in post], 0).T
+            comb_out_ref[rows, :] = jnp.concatenate([q[b : b + 1] for q in comb], 0).T

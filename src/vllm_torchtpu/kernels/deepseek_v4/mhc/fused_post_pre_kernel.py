@@ -245,7 +245,7 @@ def fused_post_pre_2d(
             jax.ShapeDtypeStruct((padded_tokens, hc_mult * hc_mult), jnp.float32),
         ],
         scratch_shapes=[
-            pltpu.VMEM((group, hc_mult3), jnp.float32),
+            pltpu.VMEM((hc_mult3, group), jnp.float32),
             pltpu.VMEM((n_chunks * hc_mult3, hc_hidden), jnp.bfloat16),
         ],
         compiler_params=compiler_params,
