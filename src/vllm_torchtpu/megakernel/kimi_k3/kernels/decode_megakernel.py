@@ -5136,6 +5136,27 @@ def mla(
     )
 
 
+def _attention_splits(rows, sequence_rows):
+    """KernelConfig.mla_dp_split sub-calls of whole sequences over a verify's
+    group rows (None: one call)."""
+    count = _config().mla_dp_split
+    sequences = rows // sequence_rows
+    if count <= 1 or sequence_rows == 1 or sequences < count:
+        return None
+    bounds = [sequences * part // count * sequence_rows for part in range(count + 1)]
+    return tuple((bounds[part], bounds[part + 1] - bounds[part], sequence_rows) for part in range(count))
+
+
+class _OffsetRows:
+    """``ref[row + offset]`` for a sub-call over rows ``offset ..``."""
+
+    def __init__(self, ref, offset):
+        self.ref, self.offset = ref, offset
+
+    def __getitem__(self, row):
+        return self.ref[row + self.offset]
+
+
 def mla_dcp_shards(
     position_ref: TensorLike,  # [rows]
     hidden_ref: TensorLike,  # [rows, hidden_size]
@@ -5149,6 +5170,7 @@ def mla_dcp_shards(
     dcp,
     epsilon: float = 1e-5,
     sequence_rows: int = 1,
+    splits: tuple[tuple[int, int, int], ...] | None = None,
 ) -> None:
     """One MLA layer of attention DP under DCP: the rank's held TP32 shards
     (3 heads each) attend in one ``mla_dcp.DcpAttention`` call over the DP
@@ -5178,9 +5200,22 @@ def mla_dcp_shards(
 
     for name in ("query_up", "key_value_up", "output_gate"):
         start_copy(name)
-    dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, rows, skip=_config().dcp_skip, heads=3 * shards,
-                                         sequence_rows=sequence_rows,
-                                         chunk_rows=_verify_chunk(rows, 3 * shards, sequence_rows))
+    # ``splits``: (first row, rows, sequence_rows) sub-calls of whole sequences,
+    # attended one after another over the same workspace.
+    splits = splits or ((0, rows, sequence_rows),)
+
+    def split_attention(index):
+        first, count, split_rows = splits[index]
+        cache = dcp[0]
+        if first:
+            base_row = cache.table_row
+            cache = dataclasses.replace(
+                cache, table_row=lambda row: (row + first if base_row is None else base_row(row + first)))
+        return mla_dcp.DcpAttention(cache, dcp[1], _OffsetRows(position_ref, first), count,
+                                    skip=_config().dcp_skip, heads=3 * shards, sequence_rows=split_rows,
+                                    chunk_rows=_verify_chunk(count, 3 * shards, split_rows))
+
+    dcp_attention = split_attention(0)
     dcp_attention.prime()
     scope = _phase_start("q6_mla_projections")
     if "query_down" in streams:
@@ -5241,9 +5276,22 @@ def mla_dcp_shards(
                 jnp.bfloat16
             )
 
-    merged = dcp_attention.attend(
-        jnp.stack(absorbed, axis=1), new_latent.astype(jnp.float32), dcp[0].layer % 2, between=output_gates
-    )
+    queries = jnp.stack(absorbed, axis=1)
+    new_latents = new_latent.astype(jnp.float32)
+    if len(splits) == 1:
+        merged = dcp_attention.attend(queries, new_latents, dcp[0].layer % 2, between=output_gates)
+    else:
+        # Every layer runs the same sub-calls, so the sub-call index alternates
+        # the exchange buffers between consecutive invocations.
+        parts = []
+        for index, (first, count, _) in enumerate(splits):
+            if index:
+                dcp_attention = split_attention(index)
+                dcp_attention.prime()
+            parts.append(dcp_attention.attend(
+                queries[first:first + count], new_latents[first:first + count], index % 2,
+                between=output_gates if index == 0 else None))
+        merged = jnp.concatenate(parts, axis=0)
     for shard in range(shards):
         up = up_stream.view(shard)
         outputs = []
@@ -8554,6 +8602,7 @@ def stack(
                             ),
                             epsilon=eps,
                             sequence_rows=sequence_rows,
+                            splits=_attention_splits(group_rows, sequence_rows),
                         )
                     else:
                         mla(

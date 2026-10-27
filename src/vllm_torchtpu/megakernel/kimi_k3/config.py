@@ -61,6 +61,8 @@ class KernelConfig:
     # Prefill MLA flash tiles (queries x keys per step).
     mla_flash_qtile: int = 1024
     mla_flash_ktile: int = 2048
+    # Attention DP verify: MLA attend sub-calls of whole sequences (0/1: one call).
+    mla_dp_split: int = 0
     # Prefix keys in mla_flash_ktile tiles and a whole-window query tile under
     # mla_flash_qtile rows (False: the window's key tile, as before).
     mla_flash_prefix_tiles: bool = True
