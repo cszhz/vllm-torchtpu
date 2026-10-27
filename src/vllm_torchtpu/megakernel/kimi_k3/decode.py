@@ -443,7 +443,7 @@ class KimiDecoder:
         return self.ops.cached_op(key, build)
 
     def _enter_batched(self, requests: int, rows_per: int) -> Any:
-        """``(control, vector_0.., modes) -> ids``: the batched verify operand
+        """``(control, vectors, modes) -> ids``: the batched verify operand
         (``DecodeOps.verify_batched``) of plan rows 0..requests-1: per
         request its next token, then the first drafts of its draft vector
         (``modes`` 1) or placeholders (0), at its next positions; every row
@@ -451,7 +451,7 @@ class KimiDecoder:
         per request."""
         layout, k = self.layout, rows_per
         assert layout is not None
-        key = ("enter_batched", layout.key(), requests, k)
+        key = ("enter_batched_stacked", layout.key(), requests, k)
 
         def build():
             import jax.numpy as jnp
@@ -459,15 +459,14 @@ class KimiDecoder:
             (dspark,) = kernel_modules("dspark")
             R = requests
 
-            def fn(control, *rest):
-                vectors, modes = rest[:R], rest[R]
+            def fn(control, vectors, modes):
+                # vectors: the R draft vectors stacked [R, 128] (op schemas take
+                # at most 64 arguments).
                 slot, token, position, row, _, tables = layout.inputs(control, R)
                 others = jnp.arange(1, layout.BANK + 1, dtype=jnp.int32)
                 tokens, positions, slots, indices = [], [], [], []
                 for j in range(R):
-                    drafts = vectors[j][
-                        0, dspark.OUT_DRAFTS : dspark.OUT_DRAFTS + k - 1
-                    ]
+                    drafts = vectors[j, dspark.OUT_DRAFTS : dspark.OUT_DRAFTS + k - 1]
                     tokens.append(
                         jnp.where(
                             modes[j] != 0,
@@ -489,7 +488,7 @@ class KimiDecoder:
                 f"pallas::k3_decode_dspark_enter{requests}x{k}",
                 self.ops.mesh,
                 fn,
-                (P(),) * (R + 2),
+                (P(),) * 3,
                 (P(),),
                 export_key=repr(key),
             )
@@ -864,7 +863,7 @@ class KimiDecoder:
             )
         modes_t = self._modes_for(tuple(modes))
         (ids,) = self._enter_batched(compiled, k)(
-            self.control, *(s.vector for s in states), modes_t
+            self.control, torch.cat([s.vector for s in states]), modes_t
         )
         sharded, aux, decisions = self.ops.verify_batched(
             ids,
@@ -1027,7 +1026,7 @@ class KimiDecoder:
                 )
                 modes = self._modes_for((min(step, 1),) * requests)
                 (ids,) = self._enter_batched(requests, rows_per)(
-                    self.control, *(s.vector for s in states), modes
+                    self.control, torch.cat([s.vector for s in states]), modes
                 )
                 sharded, aux, decisions = self.ops.verify_batched(
                     ids,
