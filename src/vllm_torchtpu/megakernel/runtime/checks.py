@@ -323,7 +323,8 @@ def build_warmup_plan(
     n_var = len(
         {(k[0], bool(fio.get(k, False)), bool(gpr.get(k, False))) for k in all_bkts}
     )
-    n_save = min(num_pages, max(80, pps * (1 + spv * max(n_var - 1, 0) + spv)))
+    base_s = max(1, spp, (n_var + pps) // pps)
+    n_save = min(num_pages, max(80, pps * (base_s + spv * max(n_var - 1, 0) + spv)))
     checked: set[tuple[int, bool, bool]] = set()
     warmed_buckets, steps = [], []
     for T, b in all_bkts:
@@ -343,12 +344,14 @@ def build_warmup_plan(
             if eager_skip and v_key in checked:
                 break
             v_idx, has_t1 = len(checked), any(k[0] == 1 for k in checked)
-            kv_page, gdn_base = v_idx, 1 + v_idx * spv
-            if kv_page >= num_pages or num_pages < pps * (gdn_base + spp * T):
-                kv_page, gdn_base = (1, 1 + spp) if (T > 1 and has_t1) else (0, 1)
+            kv_page, gdn_base = 1 + v_idx, base_s + v_idx * spv
+            if kv_page >= pps * gdn_base or num_pages < pps * (gdn_base + spp * T):
+                kv_page, gdn_base = (
+                    (2, base_s + spp) if (T > 1 and has_t1) else (1, base_s)
+                )
             disjoint = num_pages >= pps * (gdn_base + spp * T)
             if not disjoint:
-                kv_page, gdn_base = 0, 1
+                kv_page, gdn_base = 1, 1
             sent: SentinelVariantPlan | None = None
             if v_key not in checked and num_pages >= pps * (gdn_base + T):
                 checked.add(v_key)

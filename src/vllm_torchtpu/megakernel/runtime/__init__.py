@@ -64,6 +64,7 @@ from .step_meta import (
     JaxStepMetaOps,
     StepMeta,
     StepMetaOps,
+    check_ckpt_write_cols_distinct,
     pack_step_meta,
     resolve_step_positions,
 )
@@ -91,6 +92,7 @@ __all__ = [
     "bucket_exec_spec",
     "build_global_avals",
     "build_warmup_plan",
+    "check_ckpt_write_cols_distinct",
     "check_compile_hlo_mesh",
     "check_mrope_uniform",
     "check_post_mesh_eligibility",

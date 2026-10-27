@@ -208,10 +208,17 @@ def build(
                     m.on_layer_start(ctx, l, slot)
 
             stream.begin_layer(l)
+            ar_parity = (
+                sum(1 for a in p.slot_ar_index if a is not None) == 1
+                and ex.R > 1
+                and g.L > 1
+            )
+            ar_first = (l < 2) if ar_parity else first
 
             for slot_entry, ar_slot in zip(
                 model_spec.layer_type.slots, p.slot_ar_index
             ):
+                eff_ar = slot if (ar_slot is not None and ar_parity) else ar_slot
                 if isinstance(slot_entry, SwitchSlot):
                     active = slot_entry.active_branches
                     norm_names = {m.input_norm for m in active}
@@ -219,8 +226,8 @@ def build(
                     ctx.apply_input_norm(active[0].input_norm, slot)
                     if len(active) == 1:
                         part = _emit_mod(active[0], l, slot)
-                        if ar_slot is not None:
-                            comm.add_residual(comm.allreduce(ar_slot, part, first))
+                        if eff_ar is not None:
+                            comm.add_residual(comm.allreduce(eff_ar, part, ar_first))
                     elif len(active) == 2:
                         c0 = slot_entry.active_counts[0]
                         is_b1 = (l % slot_entry.period) >= c0
@@ -230,10 +237,12 @@ def build(
                         # the lowered `scf.if` yields `()` instead of returning
                         # a `vector<MBxHxf32>` tensor across the branch boundary
                         # (which would keep 64 VRegs live across `scf.if`).
-                        def _emit_branch(mod, ar_slot=ar_slot):
+                        def _emit_branch(mod, eff_ar=eff_ar):
                             part = _emit_mod(mod, l, slot)
-                            if ar_slot is not None:
-                                comm.add_residual(comm.allreduce(ar_slot, part, first))
+                            if eff_ar is not None:
+                                comm.add_residual(
+                                    comm.allreduce(eff_ar, part, ar_first)
+                                )
 
                         stream.cond_branches(
                             is_b1,
@@ -250,8 +259,8 @@ def build(
                 else:
                     ctx.apply_input_norm(slot_entry.input_norm, slot)
                     part = _emit_mod(slot_entry, l, slot)
-                    if ar_slot is not None:
-                        comm.add_residual(comm.allreduce(ar_slot, part, first))
+                    if eff_ar is not None:
+                        comm.add_residual(comm.allreduce(eff_ar, part, ar_first))
 
             return carry
 

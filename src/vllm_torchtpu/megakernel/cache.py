@@ -51,14 +51,51 @@ import abc
 from dataclasses import dataclass
 from typing import Any
 
-from . import kernel
+from . import kernel, pool
 from .cache_common import resolve_model_spec, should_use_pool_gather
 from .cache_experimental import should_fuse_pool_io
 from .cache_flat import make_flat_pooled_step
 from .cache_hlo import check_pooled_step_hlo
 from .cache_pooled import make_pooled_step
 from .exec_spec import ExecSpec
+from .model_def import get_model
 from .pool.config import with_cache
+
+
+def _resolve_pool_layout(g_or_lay: Any, ex: ExecSpec) -> pool.PoolLayout:
+    if isinstance(g_or_lay, pool.PoolLayout):
+        return g_or_lay
+    ms = resolve_model_spec(g_or_lay)
+    return get_model(ms.name).pool_layout(ms.config, R=ex.R)
+
+
+def default_pool_layout(g: Any, ex: ExecSpec) -> tuple[Any, ...]:
+    """Allocate a collision-free test layout for `g`: `(pt, ckpt, roff, min_pages)`."""
+    return pool.allocate_test_layout(_resolve_pool_layout(g, ex), ex)
+
+
+def states_to_pool(g: Any, ex: ExecSpec, *args: Any, **kw: Any) -> Any:
+    """Pack logical states into raw pools for `g`'s resolved `PoolLayout`."""
+    return pool.states_to_pool(_resolve_pool_layout(g, ex), ex, *args, **kw)
+
+
+def pool_to_states(g: Any, ex: ExecSpec, *args: Any, **kw: Any) -> Any:
+    """Unpack raw pools into unfolded logical states for `g`'s `PoolLayout`."""
+    return pool.pool_to_states(_resolve_pool_layout(g, ex), ex, *args, **kw)
+
+
+def gather_gdn_states(g: Any, ex: ExecSpec, *args: Any, **kw: Any) -> Any:
+    """Gather per-rank GDN `conv` and `rec` states from `g`'s raw pools."""
+    if hasattr(g, "check"):
+        g.check(ex)
+    return pool.gather_gdn_states(_resolve_pool_layout(g, ex), ex, *args, **kw)
+
+
+def scatter_pool_states(g: Any, ex: ExecSpec, *args: Any, **kw: Any) -> Any:
+    """Scatter KV and GDN checkpoint states into `g`'s raw pools."""
+    if hasattr(g, "check"):
+        g.check(ex)
+    return pool.scatter_pool_states(_resolve_pool_layout(g, ex), ex, *args, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +172,13 @@ __all__ = [
     "DirectHBM",
     "PallasWriter",
     "check_pooled_step_hlo",
+    "default_pool_layout",
+    "gather_gdn_states",
     "make_flat_pooled_step",
     "make_pooled_step",
+    "pool_to_states",
+    "scatter_pool_states",
     "should_fuse_pool_io",
     "should_use_pool_gather",
+    "states_to_pool",
 ]

@@ -26,11 +26,12 @@ from jax.experimental.pallas import tpu as pltpu
 from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, FP8, I32, U32, rup
 from .backend import check_ckpt_bounds, kernel_debug_check, resolve_active_seqs
+from .checks import safe_page_base
 from .config import cache_exec
 from .layout import LANES, PoolLayout
 
-# Pallas kernel name (`GATHER_KERNEL_NAME` is a substring of it).
-_PALLAS_NAME = "qwen3_5_gather_gdn_states"
+# Pallas kernel name (`GATHER_KERNEL_NAME`).
+_PALLAS_NAME = "gather_gdn_states"
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +189,7 @@ def gather_gdn_states(
                 "GDN gather checkpoint slot maps outside [0, num_pages)",
                 interpret=bool(interpret),
             )
-            return jnp.clip(pb, 0, cache_exec(ex).num_pages - pps)
+            return safe_page_base(pb, pps, cache_exec(ex).num_pages)
 
         def start_page_read(raw_ref, sub, s, p_slot):
             @pl.when(has_input_state(sub, s))

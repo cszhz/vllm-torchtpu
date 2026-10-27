@@ -184,7 +184,10 @@ def derive_params(
     NF, TR = divmod(B, CB)
     NCH = NF + int(TR > 0)
     NRB = min(tt.gdn_bufs, NCH)
-    assert not GCH or NCH == 1 or NRB >= 2, ("gdn_bufs >= 2", tt.gdn_bufs)
+    if GCH and NCH > 1 and NRB < 2:
+        raise MegakernelConfigError(
+            f"GDN state ring requires gdn_bufs >= 2 (got {tt.gdn_bufs})"
+        )
     CBV = CB * lay.vh
 
     GPR = bool(cache_exec(ex).GPR and GCH and ex.VER)

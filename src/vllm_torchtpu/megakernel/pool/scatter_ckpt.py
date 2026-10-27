@@ -24,6 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..ops import BF16, FP8, U32
 from .backend import kernel_debug_check
+from .checks import safe_page_base
 from .config import cache_exec
 from .layout import LANES, PoolLayout
 from .scatter_ctx import ScatterKernel, is_active
@@ -48,6 +49,11 @@ def prepare_ckpt(
             raise ValueError(
                 "scatter_pool_states requires conv, rec, and ckpt_indices when "
                 f"layout.slots_per_pool ({layout.slots_per_pool}) > 0"
+            )
+        if layout.pages_per_slot > layout.reserved_pages:
+            raise ValueError(
+                f"PoolLayout.pages_per_slot ({layout.pages_per_slot}) exceeds "
+                f"reserved_pages ({layout.reserved_pages})"
             )
         vh, KD, VD = layout.vh_per_rank(ex.R), layout.KD, layout.VD
         QKV = layout.qkv_per_rank(ex.R)
@@ -148,11 +154,16 @@ def pb_for(kc: ScatterKernel, sub: Any, s: Any, t: Any, span: int) -> Any:
         "GDN scatter checkpoint slot maps outside [0, num_pages)",
         interpret=bool(interpret),
     )
-    return jnp.clip(pb, 0, cache_exec(ex).num_pages - span)
+    return safe_page_base(pb, span, cache_exec(ex).num_pages)
 
 
 def is_contig_ckpt(kc: ScatterKernel, sub: Any, s: Any) -> Any:
-    """Whether sequence `s`'s `T` checkpoint slots are consecutive."""
+    """Whether sequence `s`'s `T` checkpoint slots are consecutive and in-bounds.
+
+    When `pps * T > layout.reserved_pages`, also require `pb0` to be in
+    `[reserved_pages, num_pages - pps * T]` so out-of-range slots fall back to
+    per-token writes of length `pps <= reserved_pages` on shared null page `0`.
+    """
     sg, ckpt_ref = kc.sg, kc.ckpt_ref
     T, ckpt_is_3d, ckpt_t_off = sg.T, sg.ckpt_is_3d, sg.ckpt_t_off
     if not ckpt_is_3d or T <= 1:
@@ -161,6 +172,15 @@ def is_contig_ckpt(kc: ScatterKernel, sub: Any, s: Any) -> Any:
     ok = jnp.bool_(True)
     for t in range(1, T):
         ok = jnp.logical_and(ok, ckpt_ref[sub, s, t + ckpt_t_off] == s0 + t)
+    if sg.pps * T > sg.layout.reserved_pages:
+        pb0 = sg.layout.page_base(s0, sub, sg.ckpt_ndim)
+        ok = jnp.logical_and(
+            ok,
+            jnp.logical_and(
+                pb0 >= sg.layout.reserved_pages,
+                pb0 + sg.pps * T <= cache_exec(sg.ex).num_pages,
+            ),
+        )
     return ok
 
 

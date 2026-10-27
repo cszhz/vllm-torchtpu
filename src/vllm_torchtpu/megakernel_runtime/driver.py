@@ -47,6 +47,9 @@ from vllm_torchtpu.megakernel import (
     with_cache,
 )
 from vllm_torchtpu.megakernel import (
+    pool as pool_pkg,
+)
+from vllm_torchtpu.megakernel import (
     runtime as _rt,
 )
 from vllm_torchtpu.megakernel_runtime.exported_bridge import (
@@ -226,6 +229,11 @@ class TorchStepMetaOps:
 
     def logical_and(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return a & b
+
+    def check_distinct_cols_2d(self, ckpt_g: torch.Tensor, T: int) -> None:
+        if torch.compiler.is_compiling() or ckpt_g.device.type != "cpu":
+            return
+        _rt.check_ckpt_write_cols_distinct(ckpt_g, T)
 
 
 _TORCH_STEP_META_OPS = TorchStepMetaOps()
@@ -1086,6 +1094,40 @@ class MegakernelDriver:
                                 b0, b0 + n_c, dtype=torch.int32, device=dev
                             )
                     r_call = torch.full_like(r_raw, -1)
+                    if sent.disjoint_subs and self.spec.cache_backend is not None:
+                        meta_s = _rt.pack_step_meta(
+                            ids_b.cpu(),
+                            pos_b.cpu(),
+                            bt_b.cpu(),
+                            tuple(
+                                (s_t.cpu(), c_t.cpu(), r_call.cpu())
+                                for s_t, c_t in zip(s_list, c_list, strict=True)
+                            ),
+                            bucket_t=b,
+                            tokens_per_seq=T,
+                            max_pages_per_seq=self.max_pages_per_seq,
+                            has_roff=True,
+                            use_ckpt_2d=c_cols > 1,
+                            ops=TorchStepMetaOps(),
+                        )
+                        ex_s, _, _ = _rt.bucket_exec_spec(
+                            self.spec,
+                            self.base_exec,
+                            self.profile,
+                            bucket_t=b,
+                            tokens_per_seq=T,
+                            fused_pool_io=self.fused_pool_io,
+                            fused_pool_io_max_b=self.fused_pool_io_max_b,
+                            fused_pool_io_min_b_hi=self.fused_pool_io_min_b_hi,
+                        )
+                        pool_pkg.check_step_pool_metadata(
+                            self.spec.cache_backend.layout,
+                            ex_s,
+                            meta_s.pt_b.numpy(),
+                            meta_s.pos_b.numpy(),
+                            ckpt_indices=meta_s.ckpt_b.numpy(),
+                            read_offsets=meta_s.roff_b.numpy(),
+                        )
 
                 sc_args = [
                     val for pair in zip(s_list, c_list, strict=True) for val in pair

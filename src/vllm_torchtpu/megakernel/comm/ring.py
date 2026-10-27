@@ -126,7 +126,7 @@ class AllReduceRing:
 
     def allreduce(self, slot, x, first):
         """Reduce-sum `x [MB, H]` f32 partial across all `R` ranks on `slot`."""
-        self._used_slots.add(int(slot))
+        self._used_slots.update((slot,) if isinstance(slot, int) else (0, 1))
         cp, scr, me, sc = self.cp, self.scr, self.me, self.sc
         WAR, MR, B, HPC, PR, PC = cp.WAR, cp.MR, cp.B, cp.HPC, cp.PR, cp.PC
         HIER, RSAG, R, CW, HC2 = cp.HIER, cp.RSAG, cp.R, cp.CW, cp.HC2

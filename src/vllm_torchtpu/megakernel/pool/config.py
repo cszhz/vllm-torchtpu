@@ -73,7 +73,8 @@ class CacheExec:
     ckpt_k: int = 0  # Last-axis width of ckpt_indices (0 -> T)
     roff_1d: bool = False  # True: 1D (NS,); False: 2D (slots_per_pool, NS)
     # Host-side ckpt_indices bounds validation on every eager pooled-step call
-    # (device-to-host sync + Python loop). In-kernel clamps always apply.
+    # (device-to-host sync + Python loop). In-kernel routing to shared null
+    # page 0 always applies.
     check_ckpt_bounds: bool = False
 
     def __post_init__(self) -> None:

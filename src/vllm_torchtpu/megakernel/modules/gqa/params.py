@@ -31,8 +31,8 @@ NT = (((1,), (1,)), ((), ()))
 
 # Geometry (layout) requirements, not per-bucket tuning:
 # - KVE views each KV ring stage as `(2, HD // 4, BLK)` u32 rows of the untyped
-#   expert pool; that view is validated for HD == 256 only (the Qwen3.5
-#   layout). Other head dims keep the separate `kvbuf` ring.
+#   expert pool; that view is validated for HD == 256 only. Other head dims
+#   keep the separate `kvbuf` ring.
 # - GQ sends the partial-softmax `(m | l)` pair as two 128-lane halves of one
 #   HD-wide row of the exchange buffer, so it needs HD == 2 * 128.
 KVE_HD = 256
@@ -167,7 +167,16 @@ def derive_params(g: Any, ex: ExecSpec, plan: Any, tt: GQATunables) -> GQAParams
         and tiles.ebank >= KV_ITEM
         and g.HD == KVE_HD
     )
+    if KVE:
+        dyn_owners = {plan.weight_owners[k] for k in plan.dynamic_kinds}
+        if not all(plan.module_layer_counts.get(m, 0) == g.L for m in dyn_owners):
+            raise MegakernelConfigError(
+                "GQATunables.kv_ering (KVE) requires dynamic-ring owner(s) "
+                f"{sorted(dyn_owners)} to run on every layer (L={g.L})"
+            )
     NKVR = tiles.nbe if KVE else NKV
+    if NKV < 2:
+        raise MegakernelConfigError(f"GQA KV ring requires nkv >= 2 (got {NKV})")
     SUB = tt.kv_sub or BLK
     assert BLK % SUB == 0 and SUB % 128 == 0, (BLK, SUB)
     SPLIT = tt.split and G > 1

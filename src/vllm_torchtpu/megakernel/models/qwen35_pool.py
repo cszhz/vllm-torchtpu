@@ -23,11 +23,14 @@ from __future__ import annotations
 
 from typing import Any
 
-import jax
-
-from .. import pool
+from ..cache import (
+    default_pool_layout,
+    gather_gdn_states,
+    pool_to_states,
+    scatter_pool_states,
+    states_to_pool,
+)
 from ..decls import KVCacheDecl, RecurrentCacheDecl
-from ..exec_spec import ExecSpec
 from ..pool import (
     PoolLayout,
     conv_to_raw_page,
@@ -61,33 +64,6 @@ def qwen35_pool_backend(g: Any, *, R: int = 8) -> PoolBackend:
     from .qwen35 import Qwen35
 
     return Qwen35.pool_backend(g, R=R)
-
-
-def default_pool_layout(g: Any, ex: ExecSpec) -> tuple[Any, ...]:
-    """`pool.allocate_test_layout` for `g`: `(page_table, ckpt, roff, min_pages)`."""
-    return pool.allocate_test_layout(qwen35_pool_layout(g), ex)
-
-
-def states_to_pool(
-    g: Any, ex: ExecSpec, *args: Any, **kw: Any
-) -> tuple[jax.Array, ...]:
-    return pool.states_to_pool(qwen35_pool_layout(g), ex, *args, **kw)
-
-
-def pool_to_states(g: Any, ex: ExecSpec, *args: Any, **kw: Any) -> dict[str, jax.Array]:
-    return pool.pool_to_states(qwen35_pool_layout(g), ex, *args, **kw)
-
-
-def gather_gdn_states(g: Any, ex: ExecSpec, *args: Any, **kw: Any) -> Any:
-    if hasattr(g, "check"):
-        g.check(ex)
-    return pool.gather_gdn_states(qwen35_pool_layout(g), ex, *args, **kw)
-
-
-def scatter_pool_states(g: Any, ex: ExecSpec, *args: Any, **kw: Any) -> Any:
-    if hasattr(g, "check"):
-        g.check(ex)
-    return pool.scatter_pool_states(qwen35_pool_layout(g), ex, *args, **kw)
 
 
 __all__ = [

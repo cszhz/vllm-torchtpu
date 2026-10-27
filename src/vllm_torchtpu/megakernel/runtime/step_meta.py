@@ -19,7 +19,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.experimental import pallas as pl
 
 
 @dataclass(frozen=True)
@@ -189,6 +192,40 @@ def resolve_step_positions(
     return eff_ops.clip(seq_l - 1, 0)
 
 
+def check_ckpt_write_cols_distinct(ckpt_2d: Any, tokens_per_seq: int) -> None:
+    """Raise `ValueError` if any active row lacks `T` distinct positive slots."""
+    T = int(tokens_per_seq)
+    if T <= 1:
+        return
+    rows = (
+        ckpt_2d.tolist() if hasattr(ckpt_2d, "tolist") else np.asarray(ckpt_2d).tolist()
+    )
+    for row in rows:
+        r_t = [int(x) for x in row[:T]]
+        if r_t[0] > 0 and (any(x <= 0 for x in r_t) or len(set(r_t)) < T):
+            raise ValueError(
+                f"pack_step_meta requires {T} distinct positive checkpoint "
+                f"slots per active sequence when tokens_per_seq={T} > 1 "
+                f"(got row {r_t})"
+            )
+
+
+def _assert_distinct_ckpt_cols_if_host(
+    ckpt_g: Any, T: int, eff_ops: Any, *, validate: bool
+) -> None:
+    chk = getattr(eff_ops, "check_distinct_cols_2d", None)
+    if chk is not None:
+        chk(ckpt_g, T)
+        return
+    if not (validate or pl.enable_debug_checks.value):
+        return
+    if isinstance(ckpt_g, jax.core.Tracer) or not isinstance(
+        ckpt_g, (np.ndarray, jax.Array)
+    ):
+        return
+    check_ckpt_write_cols_distinct(np.asarray(ckpt_g), T)
+
+
 def pack_step_meta(
     input_ids: Any,
     positions: Any,
@@ -201,6 +238,7 @@ def pack_step_meta(
     has_roff: bool,
     use_ckpt_2d: bool,
     ops: StepMetaOps | None = None,
+    validate: bool = False,
 ) -> StepMeta:
     """Pack `(ids_b, pos_b, pt_b, ckpt_b, roff_b)` for a bucket of `bucket_t` tokens."""
     eff_ops = _JAX_STEP_META_OPS if ops is None else ops
@@ -237,22 +275,16 @@ def pack_step_meta(
             roff_g = eff_ops.zeros_i32((nseq_bkt,), like=s_b)
         if T > 1:
             if (
-                use_ckpt_2d
-                and eff_ops.ndim(c_raw) == 2
-                and eff_ops.shape(c_raw)[1] >= T
+                not use_ckpt_2d
+                or eff_ops.ndim(c_raw) != 2
+                or eff_ops.shape(c_raw)[1] < T
             ):
-                ckpt_g = eff_ops.slice_or_pad_2d(c_raw, nseq_bkt, T)
-            else:
-                src_1d = (
-                    c_raw[:, 0]
-                    if eff_ops.ndim(c_raw) == 2
-                    else eff_ops.reshape(c_raw, (-1,))
+                raise ValueError(
+                    f"pack_step_meta requires 2-D ckpt_indices with >= T={T} "
+                    f"columns when tokens_per_seq={T} > 1 (got shape "
+                    f"{eff_ops.shape(c_raw)}, use_ckpt_2d={use_ckpt_2d})"
                 )
-                ckpt_1d = eff_ops.slice_or_pad_1d(src_1d, nseq_bkt)
-                ckpt_g = eff_ops.expand_1d_to_2d(ckpt_1d, T, contiguous=True)
-                roff_g = eff_ops.where(
-                    eff_ops.lt_zero(roff_g), roff_g, eff_ops.zeros_like_i32(roff_g)
-                )
+            ckpt_g = eff_ops.slice_or_pad_2d(c_raw, nseq_bkt, T)
         else:
             if (
                 use_ckpt_2d
@@ -278,6 +310,10 @@ def pack_step_meta(
             ckpt_g,
             eff_ops.zeros_like_i32(ckpt_g),
         )
+        if T > 1:
+            _assert_distinct_ckpt_cols_if_host(
+                ckpt_g, T, eff_ops, validate=bool(validate)
+            )
         roff_g = eff_ops.where(act_g, roff_g, eff_ops.zeros_like_i32(roff_g))
         ckpt_rows.append(ckpt_g)
         roff_rows.append(roff_g)
