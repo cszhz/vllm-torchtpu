@@ -28,7 +28,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
 
 PCP_AXIS_NAME = "pcp"
 PCP_STREAMING_RPA_VPAGE_GROUP_SIZE = 128
-PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS = (32, 64, 128, 256, 512)
+PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS = (32, 64, 96, 128, 256, 512)
 
 KVLayout = batched_rpa_configs.KVLayout
 

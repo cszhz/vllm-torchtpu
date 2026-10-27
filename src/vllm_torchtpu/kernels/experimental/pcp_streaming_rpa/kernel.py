@@ -2825,10 +2825,11 @@ def _attend_over_vpage_groups(
         )
 
     if vpage_group_size == PCP_STREAMING_RPA_VPAGE_GROUP_SIZE:
+        virtual_page_size = page_size * pcp_size
         rungs = tuple(
             r
             for r in PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS
-            if r <= total_vpages and total_vpages % r == 0
+            if r <= total_vpages and (r * virtual_page_size) % splash_cfg.block_kv == 0
         )
         if rungs:
             return _dispatch_single_group_rungs(
@@ -3113,9 +3114,10 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
     )
     q_hm = jnp.transpose(q_local, (1, 2, 0, 3)).reshape(q_heads, local_tokens, head_dim)
     q_scaled_hm = q_hm * jnp.asarray(eff_q_scale, dtype=q_hm.dtype)
+    virtual_page_size = page_size * pcp_size
     splash_cfg = _splash_kernel.SplashConfig(
         block_q=min(128, local_tokens),
-        block_kv=512,
+        block_kv=max(512, math.gcd(virtual_page_size, 1024)),
         block_kv_compute=256,
         num_stacked_q_heads=math.gcd(16, q_per_kv),
         use_base2_exp=True,

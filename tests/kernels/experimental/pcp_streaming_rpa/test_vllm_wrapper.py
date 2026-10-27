@@ -14,6 +14,7 @@
 
 import importlib.util
 import inspect
+import json
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -1925,7 +1926,9 @@ def test_extract_profiled_kernel_summary_with_unified_splash_ops(tmp_path, monke
                 if inject_copy_ns > 0:
                     events_txt.append(
                         f"events {{ metadata_id: 3 offset_ps: {base_ps + 1_200_000_000}"
-                        f" duration_ps: {inject_copy_ns * 1000} }}"
+                        f" duration_ps: {inject_copy_ns * 1000} "
+                        "stats { metadata_id: 1 str_value: "
+                        '"f8e4m3fn[128,256,1,4,256]{4,3,1,0,2:T(4,128)(4,1)}" } }'
                     )
                 # Three splash groups (2.0 ms + 3.0 ms + 4.0 ms + 0.1*dev_idx ms)
                 extra_ps = dev_idx * 100_000_000
@@ -1952,6 +1955,7 @@ def test_extract_profiled_kernel_summary_with_unified_splash_ops(tmp_path, monke
   event_metadata {{ key: 4 value {{ id: 4 name: "{copy_start_name}" }} }}
   event_metadata {{ key: 5 value {{ id: 5 name: "{copy_s32_name}" }} }}
   event_metadata {{ key: 6 value {{ id: 6 name: "{copy_vmem_name}" }} }}
+  stat_metadata {{ key: 1 value {{ id: 1 name: "shape_with_layout" }} }}
   lines {{
     id: 1
     name: "XLA Ops"
@@ -1996,7 +2000,33 @@ def test_extract_profiled_kernel_summary_with_unified_splash_ops(tmp_path, monke
         2.5,
         abs_tol=1e-6,
     )
-    assert bench_mod._is_donated_kv_cache_hbm_copy_event("%copy.198")
+    assert not bench_mod._is_donated_kv_cache_hbm_copy_event("%copy.198")
+    assert not bench_mod._is_donated_kv_cache_hbm_copy_event(
+        "%copy.198", [("shape_with_layout", "s32[64]{0}")]
+    )
+    assert not bench_mod._is_donated_kv_cache_hbm_copy_event(
+        "%copy.168",
+        [
+            (
+                "shape_with_layout",
+                "f8e4m3fn[128,256,1,4,256]{4,1,3,0,2:T(8,128)(4,1)}S(1)",
+            )
+        ],
+    )
+    assert bench_mod._is_donated_kv_cache_hbm_copy_event(
+        "%copy.168",
+        [("shape_with_layout", "f8e4m3fn[128,256,1,4,256]{4,1,3,0,2:T(8,128)(4,1)}")],
+    )
+    assert bench_mod._is_donated_kv_cache_hbm_copy_event(
+        "%copy.198",
+        [("shape_with_layout", "f8e4m3fn[128,256,1,4,256]{4,3,2,1,0:T(4,128)(4,1)}")],
+    )
+    summary_override = bench_mod._extract_profiled_kernel_summary(bad_dir)
+    assert math.isclose(
+        float(summary_override["profiled_kernel_copy_core_step_median_ms"]),
+        2.5,
+        abs_tol=1e-6,
+    )
     assert math.isclose(
         float(summary_bad["profiled_kernel_critical_step_median_ms"]),
         13.2,
@@ -2092,3 +2122,473 @@ def test_extract_profiled_kernel_summary_with_unified_splash_ops(tmp_path, monke
         ref_out = np.where(valid_p, safe_abs / (safe_abs + 1.0), 0.0).astype(np.float32)
         got_out = bench_mod._expected_local_output(torch, rank).numpy()
         np.testing.assert_allclose(got_out, ref_out, rtol=0.0, atol=1e-7)
+
+
+def test_attend_over_vpage_groups_routes_rung_96_on_nondivisible_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert pcp_stage_plan.PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS == (
+        32,
+        64,
+        96,
+        128,
+        256,
+        512,
+    )
+
+    def _fake_single_group(
+        _kv_cache_local,
+        q_scaled_hm,
+        _stage_plan,
+        rung_vpages: int,
+        **_kwargs,
+    ):
+        return jnp.full_like(q_scaled_hm, float(rung_vpages), dtype=jnp.float32)
+
+    monkeypatch.setattr(pcp_kernel, "_attend_single_vpage_group", _fake_single_group)
+    monkeypatch.setattr(
+        pcp_kernel,
+        "_attend_multi_vpage_groups",
+        lambda _kv, q_scaled_hm, _plan, _vpg, **_kw: jnp.full_like(
+            q_scaled_hm, -1.0, dtype=jnp.float32
+        ),
+    )
+    cfg = pcp_kernel._splash_kernel.SplashConfig(
+        block_q=128,
+        block_kv=1024,
+        block_kv_compute=256,
+        num_stacked_q_heads=16,
+        use_base2_exp=True,
+        q_prescaled_log2e=True,
+    )
+    for total_vpages in (512, 8192):
+        assert total_vpages % 96 != 0
+        for active_vpages, expected_rung in (
+            (8, 32),
+            (40, 64),
+            (80, 96),
+            (96, 96),
+            (124, 128),
+            (508, 512),
+        ):
+            plan = pcp_stage_plan.PCPStagePlan(
+                segment_descriptors=jnp.zeros((3, 8), dtype=jnp.int32),
+                num_segments=jnp.asarray(0, dtype=jnp.int32),
+                sorted_block_ids=jnp.zeros((total_vpages,), dtype=jnp.int32),
+                sorted_seg_ids=jnp.zeros((total_vpages,), dtype=jnp.int32),
+                sorted_vpage_valid_tokens=jnp.full(
+                    (total_vpages,), 2048, dtype=jnp.int32
+                ),
+                num_active_vpages=jnp.asarray(active_vpages, dtype=jnp.int32),
+                q_seg_ids=jnp.zeros((128,), dtype=jnp.int32),
+                q_sequence=jnp.arange(128, dtype=jnp.int32),
+                query_row_valid=jnp.ones((128,), dtype=bool),
+                needs_reroute=jnp.asarray(False),
+            )
+            out = pcp_kernel._attend_over_vpage_groups(
+                jnp.zeros((128, 256, 1, 4, 256), dtype=jnp.float8_e4m3fn),
+                jnp.zeros((32, 128, 256), dtype=jnp.bfloat16),
+                plan,
+                splash_cfg=cfg,
+                vpage_group_size=128,
+                kv_heads=2,
+                head_dim=256,
+                page_size=256,
+                pcp_size=8,
+                interleave_size=256,
+                kv_layout=pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE,
+                pcp_axis_name="pcp",
+            )
+            assert float(out[0, 0, 0]) == float(expected_rung)
+
+
+def test_pcp_streaming_attention_selects_block_kv_1024_for_aligned_vpages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_block_kv: list[int] = []
+    monkeypatch.setattr(
+        pcp_kernel,
+        "_route_current_kv_to_captured_kv",
+        lambda kv_in, *_args, **_kwargs: kv_in,
+    )
+    monkeypatch.setattr(
+        pcp_kernel,
+        "write_captured_kv_to_local_cache",
+        lambda cache, *_args, **_kwargs: cache,
+    )
+
+    def _fake_attend(
+        _kv_cache_local, q_scaled_hm, _stage_plan, *, splash_cfg, **_kwargs
+    ):
+        seen_block_kv.append(int(splash_cfg.block_kv))
+        return jnp.zeros_like(q_scaled_hm, dtype=jnp.float32)
+
+    monkeypatch.setattr(pcp_kernel, "_attend_over_vpage_groups", _fake_attend)
+    stage_plan = SimpleNamespace(
+        needs_reroute=jnp.asarray(False),
+        q_seg_ids=jnp.zeros((128,), dtype=jnp.int32),
+        block_tables=None,
+    )
+    for page_size, expected_bkv in ((256, 1024), (128, 1024), (64, 512)):
+        seen_block_kv.clear()
+        pcp_kernel.pcp_streaming_attention_page_groups_packed_local_from_metadata(
+            jnp.zeros((128, 2, 16, 256), dtype=jnp.bfloat16),
+            jnp.zeros((128, 1, 4, 256), dtype=jnp.float8_e4m3fn),
+            jnp.zeros((4, page_size, 1, 4, 256), dtype=jnp.float8_e4m3fn),
+            jnp.asarray([128], dtype=jnp.int32),
+            jnp.asarray([0, 128], dtype=jnp.int32),
+            jnp.asarray([0, 0, 1], dtype=jnp.int32),
+            jnp.zeros((3, 8), dtype=jnp.int32),
+            jnp.asarray(0, dtype=jnp.int32),
+            k_scale=1.0,
+            v_scale=1.0,
+            stage_plan=stage_plan,
+            vpage_group_size=128,
+            pcp_size=8,
+            interleave_size=page_size,
+        )
+        assert seen_block_kv == [expected_bkv]
+
+
+def test_ab_bench_helpers_and_tpu7x_compile_only_rung_96(tmp_path: Path) -> None:
+    bench_mod = _load_pcp8_bench_module()
+
+    expected_vpages = {
+        "qwen35_160k_80vp": 80,
+        "qwen38_p2_8vp": 8,
+        "qwen38_p1_40vp": 40,
+        "qwen38_p3b_124vp": 124,
+        "qwen38_p4_508vp": 508,
+    }
+    for wl_name, spec in bench_mod.AB_WORKLOAD_SPECS.items():
+        requests = spec["requests"]
+        local_q = int(spec["local_query_tokens"])
+        interleave = int(spec["interleave_size"])
+        meta = bench_mod._build_pcp8_workload_host_metadata(
+            requests,
+            max_num_seqs=bench_mod.MAX_NUM_SEQS,
+            max_local_pages_per_seq=int(spec["max_local_pages_per_seq"]),
+            page_size=int(spec["page_size"]),
+            interleave_size=interleave,
+            local_query_tokens=local_q,
+            pcp_size=bench_mod.WORLD_SIZE,
+        )
+        assert meta["active_vpages"] == expected_vpages[wl_name]
+        q_lens = jnp.asarray(
+            [q for q, _ in requests] + [0] * (bench_mod.MAX_NUM_SEQS - len(requests)),
+            dtype=jnp.int32,
+        )
+        owner_starts = jnp.asarray(meta["query_start_loc"][:-1], dtype=jnp.int32)
+        hist_starts = jnp.asarray(
+            [h for _, h in requests] + [0] * (bench_mod.MAX_NUM_SEQS - len(requests)),
+            dtype=jnp.int32,
+        )
+        for rank in (0, 3, 7):
+            mapping = pcp_stage_plan._compute_pcp_local_query_row_mapping(
+                q_lens,
+                token_owner_starts=owner_starts,
+                request_absolute_starts=hist_starts,
+                local_padded_tokens=local_q,
+                pcp_size=bench_mod.WORLD_SIZE,
+                pcp_rank=rank,
+                interleave_size=interleave,
+            )
+            valid = np.asarray(mapping.is_valid, dtype=bool)
+            np.testing.assert_array_equal(valid, meta["valid_mask_by_rank"][rank])
+            req_ids = np.clip(np.asarray(mapping.request_indices), 0, len(requests) - 1)
+            abs_pos = np.asarray(mapping.absolute_positions, dtype=np.float64)
+            hist_np = np.asarray([h for _, h in requests], dtype=np.float64)[req_ids]
+            v_scales = np.asarray(
+                [bench_mod._request_value_scale(i) for i in range(len(requests))],
+                dtype=np.float64,
+            )[req_ids]
+            q_off = np.where(valid, abs_pos - hist_np, 0.0)
+            denom = np.where(valid, abs_pos + 1.0, 1.0)
+            ref = np.where(valid, v_scales * (q_off + 1.0) / denom, 0.0).astype(
+                np.float32
+            )
+            np.testing.assert_allclose(
+                meta["expected_by_rank"][rank], ref, rtol=0.0, atol=1e-7
+            )
+
+    # Incremental per-workload flush aggregation check (complete + interrupted runs).
+    flush_dir = tmp_path / "ab_flush"
+    flush_dir.mkdir(parents=True, exist_ok=True)
+    for rank in range(2):
+        (flush_dir / f"ab_rank_{rank}_wl_a.json").write_text(
+            json.dumps({"rank": rank, "workload": "wl_a", "active_vpages": 80}),
+            encoding="utf-8",
+        )
+    by_wl_partial, errs_partial = bench_mod._collect_ab_workload_payloads(
+        flush_dir, ("wl_a", "wl_b"), world_size=2
+    )
+    assert len(by_wl_partial["wl_a"]) == 2
+    assert len(errs_partial) == 2 and all(e["workload"] == "wl_b" for e in errs_partial)
+    for rank in range(2):
+        (flush_dir / f"ab_rank_{rank}_wl_b.json").write_text(
+            json.dumps({"rank": rank, "workload": "wl_b", "active_vpages": 8}),
+            encoding="utf-8",
+        )
+    by_wl_full, errs_full = bench_mod._collect_ab_workload_payloads(
+        flush_dir, ("wl_a", "wl_b"), world_size=2
+    )
+    assert not errs_full and len(by_wl_full["wl_b"]) == 2
+
+    # Negative control: dropping history tokens on Qwen3.5 160K exceeds AB_PARITY_ATOL.
+    q35_meta = bench_mod._build_pcp8_workload_host_metadata(
+        ((32768, 131072),),
+        max_num_seqs=64,
+        max_local_pages_per_seq=128,
+        page_size=256,
+        interleave_size=256,
+        local_query_tokens=4096,
+    )
+    corrupted_meta = bench_mod._build_pcp8_workload_host_metadata(
+        ((32768, 131072 - 1024),),
+        max_num_seqs=64,
+        max_local_pages_per_seq=128,
+        page_size=256,
+        interleave_size=256,
+        local_query_tokens=4096,
+    )
+    valid = q35_meta["valid_mask_by_rank"]
+    exp_v = q35_meta["expected_by_rank"][valid]
+    cor_v = corrupted_meta["expected_by_rank"][valid]
+    assert np.all(np.abs(exp_v - cor_v) > bench_mod.AB_PARITY_RTOL * np.abs(exp_v))
+
+    ok_fast, t_fast, _ = bench_mod._one_sided_welch_non_regression(
+        [42.70, 42.68, 42.75, 42.71, 42.85],
+        [38.10, 38.05, 38.12, 38.08, 38.15],
+    )
+    assert ok_fast and t_fast < 0.0
+    ok_reg, t_reg, t_crit_reg = bench_mod._one_sided_welch_non_regression(
+        [5.10, 5.12, 5.11, 5.09, 5.13],
+        [5.80, 5.82, 5.79, 5.85, 5.81],
+    )
+    assert (not ok_reg) and t_reg > t_crit_reg
+
+    # Compile-only tpu7x:2x2x1 check of base override and candidate rung-96.
+    if jax.default_backend() == "tpu" and len(jax.devices()) >= 8:
+        tpu_devices = np.asarray(jax.devices()[:8])
+    else:
+        topo = topologies.get_topology_desc(topology_name="tpu7x:2x2x1", platform="tpu")
+        tpu_devices = np.asarray(topo.devices).reshape(-1)[:8]
+    mesh = Mesh(tpu_devices, ("pcp",))
+
+    def _compile_q35_hlo() -> str:
+        @jax.shard_map(
+            mesh=mesh,
+            in_specs=(
+                P("pcp", None, None, None),
+                P("pcp", None, None, None),
+                P("pcp", None, None, None, None, None),
+                P(None),
+                P(None),
+                P(None),
+                P(None),
+            ),
+            out_specs=(
+                P("pcp", None, None, None),
+                P("pcp", None, None, None, None, None),
+            ),
+            check_vma=False,
+        )
+        def _q35_rung96_fn(q_sh, kv_sh, cache_sh, kv_lens, pages, cu_q, dist):
+            cache_loc = jnp.squeeze(cache_sh, axis=0)
+            plan = pcp_stage_plan.build_pcp_local_stage_plan(
+                kv_lens,
+                pages,
+                cu_q,
+                dist,
+                local_tokens=128,
+                local_kv_cache_num_blocks=128,
+                page_size=256,
+                pcp_size=8,
+                interleave_size=256,
+                vpage_group_size=128,
+                kv_layout=pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE,
+                pcp_axis_name="pcp",
+            )
+            out_sh, cache_out = (
+                pcp_kernel.pcp_streaming_attention_page_groups_packed_local_from_metadata(
+                    q_sh,
+                    kv_sh,
+                    cache_loc,
+                    kv_lens,
+                    cu_q,
+                    dist,
+                    plan.segment_descriptors,
+                    plan.num_segments,
+                    pcp_size=8,
+                    interleave_size=256,
+                    sm_scale=1.0,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    kv_layout=pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE,
+                    mesh_axis_names=("pcp",),
+                    pcp_axis_name="pcp",
+                    stage_plan=plan,
+                    vpage_group_size=128,
+                )
+            )
+            return out_sh, jnp.expand_dims(cache_out, axis=0)
+
+        return (
+            jax.jit(_q35_rung96_fn, donate_argnums=(2,))
+            .lower(
+                jax.ShapeDtypeStruct((8 * 128, 2, 16, 256), jnp.bfloat16),
+                jax.ShapeDtypeStruct((8 * 128, 1, 4, 256), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((8, 128, 256, 1, 4, 256), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((4,), jnp.int32),
+                jax.ShapeDtypeStruct((4, 128), jnp.int32),
+                jax.ShapeDtypeStruct((5,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            )
+            .compile()
+            .as_text()
+        )
+
+    orig_sp_rungs = pcp_stage_plan.PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS
+    orig_k_rungs = pcp_kernel.PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS
+    orig_cfg_cls = pcp_kernel._splash_kernel.SplashConfig
+    try:
+        with bench_mod._override_pcp_splash_arm(
+            pcp_stage_plan, pcp_kernel, (32, 64), force_bkv_512=True
+        ):
+            raise RuntimeError("verify finally restore")
+    except RuntimeError:
+        pass
+    assert tuple(pcp_stage_plan.PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS) == orig_sp_rungs
+    assert tuple(pcp_kernel.PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS) == orig_k_rungs
+    assert pcp_kernel._splash_kernel.SplashConfig is orig_cfg_cls
+
+    with bench_mod._override_pcp_splash_arm(
+        pcp_stage_plan,
+        pcp_kernel,
+        (32, 64, 128, 256, 512),
+        force_bkv_512=True,
+    ):
+        base_hlo_txt = _compile_q35_hlo()
+    assert tuple(pcp_stage_plan.PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS) == orig_sp_rungs
+    assert tuple(pcp_kernel.PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS) == orig_k_rungs
+    assert pcp_kernel._splash_kernel.SplashConfig is orig_cfg_cls
+    assert "f8e4m3fn[4,128,1,2048,256]" in base_hlo_txt
+    assert ".active_cols_ref = s16[2048]" in base_hlo_txt
+    assert "f8e4m3fn[4,96,1,2048,256]" not in base_hlo_txt
+    assert '\\"block_kv\\": 512' in base_hlo_txt
+    assert '\\"block_kv\\": 1024' not in base_hlo_txt
+
+    hlo_txt = _compile_q35_hlo()
+    assert "{1}: (2, {}, may-alias)" in hlo_txt
+    assert "f8e4m3fn[4,96,1,2048,256]" in hlo_txt
+    assert ".active_cols_ref = s16[64]" in hlo_txt
+    assert ".active_cols_ref = s16[192]" in hlo_txt
+    assert ".active_cols_ref = s16[2048]" not in hlo_txt
+    assert '\\"block_kv\\": 1024' in hlo_txt
+    assert '\\"block_kv\\": 512' not in hlo_txt
+    hlo_lines = hlo_txt.splitlines()
+    entry_idx = next(i for i, ln in enumerate(hlo_lines) if ln.startswith("ENTRY "))
+    entry_copies = [
+        ln.strip()
+        for ln in hlo_lines[entry_idx:]
+        if " copy(" in ln and "f8e4m3fn[128,256," in ln
+    ]
+    assert entry_copies == [], f"Unexpected ENTRY 5D KV-cache copies: {entry_copies}"
+    base_5d_copies = [
+        ln.strip()
+        for ln in base_hlo_txt.splitlines()
+        if " copy(" in ln and "f8e4m3fn[128,256," in ln
+    ]
+    cand_5d_copies = [
+        ln.strip() for ln in hlo_lines if " copy(" in ln and "f8e4m3fn[128,256," in ln
+    ]
+    assert len(cand_5d_copies) <= len(base_5d_copies) and len(cand_5d_copies) <= 2, (
+        f"Unexpected 5D KV-cache copies: cand={cand_5d_copies} vs base={base_5d_copies}"
+    )
+
+    # Verify _build_arm_attention registers annotated custom ops and exports
+    # TPU StableHLO across Qwen3.5 (2KV, p=256) and Qwen3.8 (4KV, p=128).
+    from torch_tpu._internal.pallas import pallas as pallas_impl
+
+    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import (
+        vllm_adapter as pcp_vllm_adapter,
+    )
+
+    ab_mesh = Mesh(
+        tpu_devices.reshape(8, 1),
+        (pcp_wrapper.PCP_AXIS_NAME, pcp_wrapper.TP_AXIS_NAME),
+    )
+    captured_callables: list[object] = []
+
+    def _capturing_jax_op(name, fn, **kwargs):
+        captured_callables.append(
+            pcp_vllm_adapter.build_pcp_streaming_callable(name, fn, **kwargs)
+        )
+        return pcp_vllm_adapter.pcp_streaming_jax_op(name, fn, **kwargs)
+
+    mlir_by_tag: dict[str, str] = {}
+    for tag, wl_name, rungs_ov, force_512 in (
+        ("q35_b512", "qwen35_160k_80vp", (32, 64, 128, 256, 512), True),
+        ("q35_c1024", "qwen35_160k_80vp", (32, 64, 96, 128, 256, 512), False),
+        ("q38_c1024", "qwen38_p4_508vp", (32, 64, 96, 128, 256, 512), False),
+    ):
+        spec = bench_mod.AB_WORKLOAD_SPECS[wl_name]
+        nq = int(spec["num_q_heads"])
+        nkv = int(spec["num_kv_heads"])
+        ps = int(spec["page_size"])
+        ilv = int(spec["interleave_size"])
+        lq = int(spec["local_query_tokens"])
+        mp = int(spec["max_local_pages_per_seq"])
+        pg = math.ceil(2 * nkv / bench_mod.KV_PACKING)
+        arm_op = bench_mod._build_arm_attention(
+            jax,
+            pcp_stage_plan,
+            pcp_kernel,
+            pcp_vllm_adapter.make_pcp_streaming_rpa_kernel,
+            _capturing_jax_op,
+            pcp_vllm_adapter.PCP_STREAMING_RPA_INPUT_PARTITION_SPECS,
+            mesh=ab_mesh,
+            kv_layout=pcp_kernel.KVLayout.HEAD_ALONG_SUBLANE,
+            op_tag=f"unit_{tag}",
+            interleave_size=ilv,
+            rungs_override=rungs_ov,
+            force_bkv_512=force_512,
+        )
+        assert callable(arm_op)
+        jc = captured_callables[-1]
+        t_cache = torch.empty(
+            (mp, ps, pg, bench_mod.KV_PACKING, bench_mod.HEAD_DIM),
+            dtype=torch.float8_e4m3fn,
+        )
+        t_q = torch.empty((lq, nq, bench_mod.HEAD_DIM), dtype=torch.bfloat16)
+        t_k = torch.empty((lq, nkv, bench_mod.HEAD_DIM), dtype=torch.bfloat16)
+        t_v = torch.empty((lq, nkv, bench_mod.HEAD_DIM), dtype=torch.bfloat16)
+        t_sl = torch.empty((bench_mod.MAX_NUM_SEQS,), dtype=torch.int32)
+        t_bt = torch.empty((bench_mod.MAX_NUM_SEQS, mp), dtype=torch.int32)
+        t_qsl = torch.empty((bench_mod.MAX_NUM_SEQS + 1,), dtype=torch.int32)
+        t_dist = torch.empty((3,), dtype=torch.int32)
+        jax_args = pallas_impl.jax_placeholders(
+            (t_cache, t_q, t_k, t_v, t_sl, t_bt, t_qsl, t_dist),
+            mesh=ab_mesh,
+            partition_specs=pcp_vllm_adapter.PCP_STREAMING_RPA_INPUT_PARTITION_SPECS,
+        )
+        with jax._src.config.export_ignore_forward_compatibility(True):
+            lowered = jc.exported(*jax_args)
+        local_shapes = [
+            pallas_impl.get_local_shape(aval.shape, ab_mesh, out_spec)
+            for aval, out_spec in zip(
+                lowered.out_avals,
+                pcp_vllm_adapter.PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS,
+            )
+        ]
+        assert local_shapes == [tuple(t_cache.shape), tuple(t_q.shape)]
+        mlir_by_tag[tag] = str(lowered.mlir_module())
+        assert (
+            tuple(pcp_stage_plan.PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS) == orig_sp_rungs
+        )
+        assert tuple(pcp_kernel.PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS) == orig_k_rungs
+        assert pcp_kernel._splash_kernel.SplashConfig is orig_cfg_cls
+
+    assert mlir_by_tag["q35_b512"] != mlir_by_tag["q35_c1024"]
+    assert "4x96x1x2048x256xf8E4M3FN" not in mlir_by_tag["q35_b512"]
+    assert "4x96x1x2048x256xf8E4M3FN" in mlir_by_tag["q35_c1024"]
