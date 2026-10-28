@@ -686,6 +686,10 @@ def _attention_kernel(
         tile_rows = SHARED_KV_TILE_ROWS
         mask_value = jnp.finfo(jnp.float32).min
         firsts = range(0, batch_size, group)
+        # The softmax runs in base 2: m holds max(s) * log2(e), so each score
+        # takes one multiply (sm_scale * log2(e)) before exp2.
+        log2_e = 1.4426950408889634
+        score_scale = sm_scale * log2_e
 
         def stats(ref, t):
             return ref[bi_sem_idx, t, :num_q_heads][..., None]
@@ -697,7 +701,7 @@ def _attention_kernel(
             tokens = range(first, first + group)
             state = pl.ds(g * rows, rows)
             m_ref[state] = jnp.broadcast_to(
-                jnp.concatenate([stats(bm_x2_ref, t) for t in tokens]),
+                jnp.concatenate([stats(bm_x2_ref, t) for t in tokens]) * log2_e,
                 (rows, m_ref.shape[1]),
             )
             l_ref[state] = jnp.broadcast_to(
@@ -719,7 +723,7 @@ def _attention_kernel(
                 state = pl.ds(g * rows, rows)
                 bq = bq_x2_ref[bi_sem_idx, pl.ds(first, group)].reshape(rows, head_dim)
                 s = jnp.einsum("nd,md->nm", bq, bkv, preferred_element_type=jnp.float32)
-                s *= sm_scale
+                s *= score_scale
                 selected = bmask_x2_ref[
                     bi_sem_idx, pl.ds(first, group), pl.ds(row0, tile_rows)
                 ]
@@ -729,8 +733,8 @@ def _attention_kernel(
                 s = jnp.where(selected != 0, s, mask_value)
                 m_prev = m_ref[state][:, :1]
                 m_curr = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
-                p = jnp.exp(s - m_curr)
-                exp_m_diff = jnp.exp(m_prev - m_curr)
+                p = jnp.exp2(s - m_curr)
+                exp_m_diff = jnp.exp2(m_prev - m_curr)
                 l_curr = exp_m_diff * l_ref[state][:, :1] + jnp.sum(
                     p, axis=1, keepdims=True
                 )
@@ -755,8 +759,8 @@ def _attention_kernel(
         for g, first in enumerate(firsts):
             state = pl.ds(g * rows, rows)
             m = m_ref[state][:, :1]
-            l_total = l_ref[state][:, :1] + jnp.exp(
-                jnp.concatenate([attention_sinks] * group) - m
+            l_total = l_ref[state][:, :1] + jnp.exp2(
+                jnp.concatenate([attention_sinks] * group) * log2_e - m
             )
             acc = acc_ref[state]
             out = (
