@@ -29,7 +29,7 @@ RECORD_SLOTS = 2 * UNROLL
 FILL_BATCH = 8
 MXU_PAGES = 2
 SUBLANES = 8
-DESC_FIELDS = 4
+DESC_FIELDS = 6  # Key tile, output tile, Q row, record flags, two live key counts.
 
 
 def pack_query_records(q: jax.Array, weights: jax.Array) -> jax.Array:
@@ -76,11 +76,15 @@ def _kernel(
     fill_sem,
     *,
     heads,
+    membership_block_size,
 ):
     pair_steps, total_steps, dead_count = meta[0], meta[1], meta[2]
     pair_iters, total_iters = pair_steps // UNROLL, total_steps // UNROLL
     q_rows = heads // 4
     sub = lax.broadcasted_iota(jnp.int32, (SUBLANES, PAGE_RECORDS), 0)
+    position = sub * PAGE_RECORDS + lax.broadcasted_iota(
+        jnp.int32, (SUBLANES, PAGE_RECORDS), 1
+    )
 
     def field(x, f):
         return desc[x * DESC_FIELDS + f]
@@ -182,11 +186,24 @@ def _kernel(
                 axis=0,
             )
             scale = lax.bitcast_convert_type(scale_words, jnp.float32)
-            bits = visibility_buf[slot, pl.ds(group * SUBLANES, SUBLANES), :]
+            token = group * SUBLANES * PAGE_RECORDS + position
+            if membership_block_size == 1:
+                bits = visibility_buf[slot, pl.ds(group * SUBLANES, SUBLANES), :]
+            else:
+                block = token // membership_block_size
+                bits = jnp.zeros((SUBLANES, PAGE_RECORDS), jnp.int32)
+                # Expand only the native score VREG, never a key-level HBM mask.
+                first_row = group * SUBLANES // membership_block_size
+                for part in range(pl.cdiv(SUBLANES, membership_block_size)):
+                    source_row = first_row + part
+                    flags = visibility_buf[slot, pl.ds(source_row, 1), :]
+                    flags = jnp.broadcast_to(flags, (SUBLANES, PAGE_RECORDS))
+                    flags = jnp.take_along_axis(flags, block % PAGE_RECORDS, axis=1)
+                    bits |= jnp.where(block // PAGE_RECORDS == source_row, flags, 0)
             rows = slice(group * SUBLANES, (group + 1) * SUBLANES)
             for m in range(members):
                 values = _combine(pending[m][0], pending[m][1], 4, sub)
-                visible = (bits & (1 << m)) != 0
+                visible = ((bits & (1 << m)) != 0) & (token < field(x, 4 + m))
                 score_buf[slot, m, rows, :] = jnp.where(
                     visible, values * scale, -jnp.inf
                 )
@@ -256,14 +273,19 @@ def score_tiles(
     heads: int,
     rows: int,
     pair_rows: int,
+    membership_block_size: int,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """Return single [rows,32,128] and pair [pair_rows,2,32,128] FP32 tiles."""
+    """Return single [rows,32,128] and pair [pair_rows,2,32,128] FP32 tiles.
+
+    Visibility contains two membership bits per sparse block, padded to 128
+    words per row. Descriptor fields 4/5 bound each member's live keys in a tile.
+    """
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     tile = (TILE_PAGES, PAGE_RECORDS)
     scratch = (
         pltpu.VMEM((KEY_SLOTS, TILE_ROWS, PAGE_RECORDS), jnp.int32),
-        pltpu.VMEM((KEY_SLOTS, TILE_PAGES, PAGE_RECORDS), jnp.int32),
+        pltpu.VMEM((KEY_SLOTS, *visibility.shape[1:]), jnp.int32),
         pltpu.VMEM((RECORD_SLOTS, 2, *records.shape[1:]), jnp.int32),
         pltpu.VMEM((KEY_SLOTS, 2, *tile), jnp.float32),
         pltpu.VMEM((FILL_BATCH, *tile), jnp.float32),
@@ -275,7 +297,7 @@ def score_tiles(
         pltpu.SemaphoreType.DMA,
     )
     return pl.pallas_call(
-        partial(_kernel, heads=heads),
+        partial(_kernel, heads=heads, membership_block_size=membership_block_size),
         out_shape=(
             jax.ShapeDtypeStruct((rows, *tile), jnp.float32),
             jax.ShapeDtypeStruct((pair_rows, 2, *tile), jnp.float32),

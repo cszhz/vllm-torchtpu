@@ -9,6 +9,11 @@ import pytest
 import torch
 
 from tests.kernels.deepseek_v41.test_fp8_paged_mqa_logits import _pack_fp8_cache
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_mqa_tile_stream import (
+    TILE_ROWS,
+    pack_query_records,
+    score_tiles,
+)
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_paged_mqa_logits_sparse import (  # noqa: E501
     _query_scores,
     fp8_gathered_mqa_logits,
@@ -16,6 +21,38 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_paged_mqa_logits_spa
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
     PackedFP8Layout,
 )
+
+
+@pytest.mark.parametrize("block", [1, 2, 4, 8, 128])
+def test_compact_membership_and_partial_tail_inside_score_tile(block):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Requires the TensorCore scorer")
+    q = jnp.ones((2, 32, 128), jnp.float8_e4m3fn)
+    weights = jnp.broadcast_to(jnp.array([1.0, 2.0])[:, None], (2, 32))
+    keys = jnp.full((1, TILE_ROWS, 128), 0x38383838, jnp.int32)
+    keys = keys.at[:, 32::33, :].set(0x3F800000)
+    flags = np.random.default_rng(831).integers(0, 4, 4096 // block, dtype=np.int32)
+    visibility = jnp.pad(jnp.asarray(flags), (0, -flags.size % 128)).reshape(1, -1, 128)
+    limits = np.array([13, 4089], np.int32)
+    descriptor = jnp.array(
+        [[0, 0, 0, int(i == 0), *limits] for i in range(4)], jnp.int32
+    ).reshape(-1)
+    _, pairs = score_tiles(
+        jnp.array([4, 4, 0], jnp.int32),
+        descriptor,
+        jnp.zeros((8,), jnp.int32),
+        pack_query_records(q, weights),
+        keys,
+        visibility,
+        heads=32,
+        rows=1,
+        pair_rows=1,
+        membership_block_size=block,
+    )
+    visible = (np.repeat(flags, block)[None] & (1 << np.arange(2)[:, None])) != 0
+    visible &= np.arange(4096)[None] < limits[:, None]
+    expected = np.where(visible, np.array([4096.0, 8192.0])[:, None], -np.inf)
+    np.testing.assert_array_equal(np.asarray(pairs).reshape(2, 4096), expected)
 
 
 @pytest.mark.parametrize("count", [17, 2048])
