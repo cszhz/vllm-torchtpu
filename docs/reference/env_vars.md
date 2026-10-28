@@ -14,6 +14,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_MULTIHOST_BACKEND` | `""` (`mp` default, or `"ray"`) | Selects the multi-host execution backend (`"ray"` uses `RayDistributedExecutor`; unset uses native multiprocessing `mp`). See [Multi-Host Serving](../user_guide/multihost.md). |
 | `TORCH_TPU_BASE_PORT` | `8070` | Base TCP port for `torch_tpu` worker slice-builder communication. |
 | `TORCH_TPU_MP_RENDEZVOUS_PORT` | `None` | Optional explicit TCP port for multi-host `mp` `TCPStore` rendezvous. |
+| `TPU_MULTIPORT_DP_LOCAL_SIZE` | `0` | Number of DP ranks of a `vllm serve --data-parallel-multi-port-external-lb` server on this host (must equal `--data-parallel-size`; single host only). Makes each rank derive the shared slice bootstrap (DP master port, slicebuilder list) and its real local DP rank. `0` = off. |
 | `TPU_ACCELERATOR_TYPE` | `None` | Explicit accelerator type override (e.g., `"tpu7x"`, `"v6e-8"`) when running offline compilation or CPU tests. |
 
 ---
