@@ -591,7 +591,7 @@ def _make_chunk(
         ),
         start_index=start_index,
         num_reqs=num_reqs,
-        aux_hidden_states=aux_hidden_states,
+        aux_hidden_states=[] if aux_hidden_states is None else aux_hidden_states,
         attn_metadata={
             "dummy_layer": SimpleNamespace(
                 block_tables=torch.ones(10, dtype=torch.int32, device=device),
@@ -691,8 +691,8 @@ def test_update_draft_kv_cache_from_target_unit(device):
 
     proposer._tpu_precompute_and_update_kv_cache.assert_called_once()
 
-    # No aux hidden states (e.g. a chunk with no verified tokens): nothing to
-    # project, and the KV update must not run.
+    # When the runner substitutes [] for missing aux_hidden_states, the guard
+    # skips the KV update rather than indexing target_hidden[0].
     proposer._tpu_precompute_and_update_kv_cache.reset_mock()
     empty = _make_chunk(
         num_reqs=1,

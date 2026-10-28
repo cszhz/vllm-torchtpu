@@ -513,7 +513,7 @@ class DFlashProposer:
             draft_md_list.append(md)
         return tuple(draft_md_list)
 
-    def _update_draft_kv_cache_from_target(self, chunk) -> None:
+    def _update_draft_kv_cache_from_target(self, chunk: DraftChunkInputs) -> None:
         """
         Projects the target model's hidden states into the draft model's KV cache.
 
@@ -565,8 +565,7 @@ class DFlashProposer:
         if not chunks:
             raise RuntimeError("PD context update requires captured prefill chunks.")
         for chunk in chunks:
-            aux = chunk.aux_hidden_states
-            if aux is None or (isinstance(aux, (list, tuple)) and not aux):
+            if not chunk.aux_hidden_states:
                 raise RuntimeError(
                     "PD context update requires target aux hidden states."
                 )
