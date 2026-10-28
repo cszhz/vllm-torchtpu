@@ -631,3 +631,49 @@ def test_comm_params_derives_pc_hpc_pr() -> None:
     assert (cp_hc.PC, cp_hc.HPC, cp_hc.PR) == (128, 1, 16)
     scr = mk.comm.ring_scratch(cp_hc)
     assert "send" in scr and "recv" in scr and "ar_ssem" in scr and "ar_rsem" in scr
+
+
+def test_tile_rule_context_and_legacy_callable() -> None:
+    def ctx_rule(tc: mk.TileContext) -> mk.Tiles:
+        assert isinstance(tc, mk.TileContext)
+        assert tc.NS == tc.B // tc.T
+        base = mk.default_tiles(tc.B, moe_tp=tc.moe_tp, R=tc.R)
+        return dataclasses.replace(base, nbd=8 if tc.T > 1 else 14)
+
+    prof_ctx = mk.Profile(
+        name="b8_ctx_tiles",
+        numerics="exact",
+        tiles=ctx_rule,
+    )
+    base_ex = mk.ExecSpec(R=8, B=4, T=1, ctx=4096)
+    ex_t1 = prof_ctx.exec_for(base_ex, B=16, T=1)
+    ex_t4 = prof_ctx.exec_for(base_ex, B=16, T=4)
+    assert ex_t1.resolved_tiles.nbd == 14
+    assert ex_t4.resolved_tiles.nbd == 8
+    assert prof_ctx.tiles_for(mk.TileContext(B=16, T=4, R=8)).nbd == 8
+    assert prof_ctx.tiles_for(16, R=8, T=4).nbd == 8
+
+    # Legacy (B, *, moe_tp, R) callable remains working
+    def legacy_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
+        base = mk.default_tiles(B, moe_tp=moe_tp, R=R)
+        return dataclasses.replace(base, nbd=10 if B >= 16 else 12)
+
+    prof_leg = mk.Profile(
+        name="b8_legacy_tiles",
+        numerics="exact",
+        tiles=legacy_rule,
+    )
+    assert prof_leg.exec_for(base_ex, B=4, T=1).resolved_tiles.nbd == 12
+    assert prof_leg.exec_for(base_ex, B=16, T=4).resolved_tiles.nbd == 10
+
+    # Approx knob enabled only at T=4 is caught by approx_features / _check_exact
+    def verify_only_approx(tc: mk.TileContext) -> mk.Tiles:
+        base = mk.default_tiles(tc.B, moe_tp=tc.moe_tp, R=tc.R)
+        return dataclasses.replace(base, dense_acc_pair=(tc.T > 1))
+
+    with pytest.raises(ValueError, match="tiles.dense_acc_pair"):
+        mk.Profile(name="b8_bad_exact", numerics="exact", tiles=verify_only_approx)
+    prof_approx = mk.Profile(
+        name="b8_ok_approx", numerics="approx", tiles=verify_only_approx
+    )
+    assert "tiles.dense_acc_pair" in mk.profile.approx_features(prof_approx)
