@@ -19,6 +19,10 @@ from vllm_torchtpu.layers.adapter.vision_attention import TpuMMEncoderAttention
 
 def make_attention(num_heads=2, head_size=4, scale=1.0, num_kv_heads=None):
     attn = TpuMMEncoderAttention.__new__(TpuMMEncoderAttention)
+    # Skip MMEncoderAttention's own __init__ but keep the nn.Module state:
+    # monkeypatch undoes an instance attribute by deleting it, which goes
+    # through Module.__delattr__.
+    torch.nn.Module.__init__(attn)
     attn.num_heads = num_heads
     attn.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
     attn.head_size = head_size
