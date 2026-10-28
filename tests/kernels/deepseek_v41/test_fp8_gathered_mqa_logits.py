@@ -98,6 +98,7 @@ def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, cou
         np.repeat(selected_slots >= 0, block, axis=1), expected, -np.inf
     )
     assert actual.shape == (count, width // 2)
+    assert actual.dtype == jnp.float32
     actual = np.asarray(actual)
     np.testing.assert_array_equal(np.isfinite(actual), np.isfinite(expected))
     live = np.isfinite(expected)

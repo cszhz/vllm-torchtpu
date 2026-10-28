@@ -130,13 +130,10 @@ def prepare_candidate_metadata(
         page_size=layout.page_size,
     )
     canonical = canonical[groups]
-    membership = candidate_membership(candidates, canonical, pl.cdiv(width, block))
-    slots, output_candidates = candidate_output_slots(candidates, canonical)
-    output_slots = (
-        jnp.full_like(canonical, -1)
-        .at[jnp.arange(tokens)[:, None], jnp.maximum(slots, 0)]
-        .max(jnp.where(slots >= 0, jnp.arange(count)[None, :], -1))
+    slots, output_candidates, output_slots = candidate_output_slots(
+        candidates, canonical, pl.cdiv(width, block)
     )
+    membership = output_slots >= 0
     # SparseCore metadata only initializes live group rows.
     physical = jnp.where(sizes[:, None] > 0, physical, -1)
     fragment = min(block, layout.page_size)
@@ -158,7 +155,7 @@ def prepare_candidate_metadata(
     )
 
 
-def candidate_output_slots(candidates, canonical):
+def _candidate_output_slots_reference(candidates, canonical):
     """Map original per-query slots to the union; retain only the first duplicate."""
     sentinel = jnp.iinfo(jnp.int32).max
     sorted_union = jnp.where(canonical >= 0, canonical, sentinel)
@@ -180,6 +177,124 @@ def candidate_output_slots(candidates, canonical):
     first = jnp.take_along_axis(first, jnp.argsort(order, axis=1), axis=1)
     valid &= first
     return jnp.where(valid, slots, -1), jnp.where(valid, candidates, -1)
+
+
+def candidate_output_slots(candidates, canonical, blocks):
+    """Build both slot maps, keeping the first occurrence in original query order."""
+    rows, count = candidates.shape
+    union_count = canonical.shape[1]
+    columns = pl.cdiv(count, 128) * 128
+    union_columns = pl.cdiv(union_count, 128) * 128
+    histogram_width = pl.cdiv(blocks, 128) * 128
+    words = histogram_width + 2 * columns + 2 * union_columns
+    if (
+        jax.default_backend() != "tpu"
+        or words * 4 > plsc.get_sparse_core_info().vmem_capacity_bytes // 2
+    ):
+        slots, ids = _candidate_output_slots_reference(candidates, canonical)
+        inverse = (
+            jnp.full_like(canonical, -1)
+            .at[jnp.arange(rows)[:, None], jnp.maximum(slots, 0)]
+            .max(jnp.where(slots >= 0, jnp.arange(count)[None, :], -1))
+        )
+        return slots, ids, inverse
+    info = plsc.get_sparse_core_info()
+    lanes, units = info.num_lanes, info.num_cores * info.num_subcores
+    candidates = jnp.pad(candidates, ((0, 0), (0, columns - count)), constant_values=-1)
+    canonical = jnp.pad(
+        canonical, ((0, 0), (0, union_columns - union_count)), constant_values=-1
+    )
+    mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
+
+    @pl.kernel(
+        out_type=(
+            jax.ShapeDtypeStruct((rows, columns), jnp.int32),
+            jax.ShapeDtypeStruct((rows, columns), jnp.int32),
+            jax.ShapeDtypeStruct((rows, union_columns), jnp.int32),
+        ),
+        scratch_types=(
+            pltpu.VMEM((histogram_width,), jnp.int32),
+            pltpu.VMEM((columns,), jnp.int32),
+            pltpu.VMEM((union_columns,), jnp.int32),
+            pltpu.VMEM((columns,), jnp.int32),
+            pltpu.VMEM((union_columns,), jnp.int32),
+            pltpu.SemaphoreType.DMA((5,)),
+        ),
+        mesh=mesh,
+        compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
+        name="fp8_query_candidate_slots",
+    )
+    def build(
+        src,
+        unions,
+        forward_out,
+        ids_out,
+        reverse_out,
+        hist,
+        ids,
+        union_ids,
+        forward,
+        reverse,
+        sem,
+    ):
+        unit = lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
+
+        @pl.loop(unit, rows, step=units)
+        def row(row_id):
+            read_ids = pltpu.async_copy(src.at[row_id], ids, sem.at[0])
+            read_union = pltpu.async_copy(unions.at[row_id], union_ids, sem.at[1])
+
+            @plsc.parallel_loop(0, histogram_width, lanes, unroll=4)
+            def clear(i):
+                hist[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
+
+            read_union.wait()
+
+            @plsc.parallel_loop(0, union_columns, lanes, unroll=4)
+            def index_union(i):
+                keys = union_ids[pl.ds(i, lanes)]
+                plsc.store_scatter(
+                    hist,
+                    [jnp.clip(keys, 0, blocks - 1)],
+                    i + jnp.arange(lanes) + 1,
+                    mask=(keys >= 0) & (keys < blocks),
+                )
+
+            read_ids.wait()
+
+            # Sequential vectors preserve the first original slot across vectors.
+            @pl.loop(0, columns, step=lanes)
+            def query_slots(i):
+                keys = ids[pl.ds(i, lanes)]
+                addresses = jnp.clip(keys, 0, blocks - 1)
+                found = plsc.load_gather(hist, [addresses])
+                valid = (keys >= 0) & (keys < blocks) & (found > 0)
+                occurrences, _ = plsc.scan_count(keys, mask=valid)
+                first = valid & (occurrences == 1)
+                forward[pl.ds(i, lanes)] = jnp.where(first, found - 1, -1)
+                ids[pl.ds(i, lanes)] = jnp.where(first, keys, -1)
+                plsc.store_scatter(
+                    hist, [addresses], -(i + jnp.arange(lanes) + 1), mask=first
+                )
+
+            @plsc.parallel_loop(0, union_columns, lanes, unroll=4)
+            def inverse(i):
+                keys = union_ids[pl.ds(i, lanes)]
+                value = plsc.load_gather(hist, [jnp.clip(keys, 0, blocks - 1)])
+                reverse[pl.ds(i, lanes)] = jnp.where(
+                    (keys >= 0) & (keys < blocks) & (value < 0), -value - 1, -1
+                )
+
+            writes = (
+                pltpu.async_copy(forward, forward_out.at[row_id], sem.at[2]),
+                pltpu.async_copy(ids, ids_out.at[row_id], sem.at[3]),
+                pltpu.async_copy(reverse, reverse_out.at[row_id], sem.at[4]),
+            )
+            for transfer in writes:
+                transfer.wait()
+
+    forward, ids, reverse = build(candidates, canonical)
+    return forward[:, :count], ids[:, :count], reverse[:, :union_count]
 
 
 def candidate_membership(candidates, canonical, blocks):

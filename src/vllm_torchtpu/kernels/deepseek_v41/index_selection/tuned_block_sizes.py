@@ -42,7 +42,7 @@ class PagedMQAConfig:
 
 # TPU v7, H32/D128, transposed packed FP8 pages; measured at P-state 7.
 PACKED_FP8_MQA_CONFIG = PagedMQAConfig(6, 65536, 8, 4)
-PACKED_FP8_PREPARED_MQA_CONFIG = PagedMQAConfig(2, 32768, 4, 4)
+PACKED_FP8_PREPARED_MQA_CONFIG = PagedMQAConfig(2, 8192, 4, 4)
 
 # Dense tiles follow configured decode width, capped at one 256-row H32 MXU tile.
 PACKED_FP8_MAX_QUERY_TILE = 8

@@ -11,6 +11,7 @@ import pytest
 
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_candidate_cache import (
     candidate_membership,
+    candidate_output_slots,
     gather_candidate_keys,
     prepare_candidates,
 )
@@ -135,3 +136,38 @@ def test_gather_skips_empty_tiles_without_changing_live_slots(page_size, bank_co
             np.asarray(read_fp8_records(banks, jnp.asarray(source), layout)),
         )
     run(banks, jnp.full_like(physical, -1), offsets).block_until_ready()
+
+
+@pytest.mark.parametrize("rows,count", [(1, 3), (7, 129), (288, 2048)])
+def test_query_slot_maps_preserve_first_original_candidate(rows, count):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Requires SparseCore")
+    rng = np.random.default_rng(938)
+    blocks = 12352
+    candidates = rng.integers(-3, blocks + 3, (rows, count), dtype=np.int32)
+    candidates[:, 1] = candidates[:, 0]
+    if count > 128:
+        candidates[:, 128] = candidates[:, 0]
+    unions = np.full((rows, 2 * count), -1, np.int32)
+    expected_forward = np.full_like(candidates, -1)
+    expected_ids = np.full_like(candidates, -1)
+    expected_reverse = np.full_like(unions, -1)
+    for row in range(rows):
+        keys = sorted(set(candidates[row]) & set(range(blocks)))
+        keys = [key for i, key in enumerate(keys) if i % 7 != 3]
+        unions[row, : len(keys)] = keys
+        lookup = {key: i for i, key in enumerate(keys)}
+        seen = set()
+        for slot, key in enumerate(candidates[row]):
+            if key in lookup and key not in seen:
+                expected_forward[row, slot] = lookup[key]
+                expected_ids[row, slot] = key
+                expected_reverse[row, lookup[key]] = slot
+                seen.add(key)
+    actual = jax.jit(functools.partial(candidate_output_slots, blocks=blocks))(
+        jnp.asarray(candidates), jnp.asarray(unions)
+    )
+    for result, expected in zip(
+        actual, (expected_forward, expected_ids, expected_reverse)
+    ):
+        np.testing.assert_array_equal(np.asarray(result), expected)

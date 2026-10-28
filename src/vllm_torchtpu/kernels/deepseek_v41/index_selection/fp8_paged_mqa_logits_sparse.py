@@ -38,7 +38,7 @@ def _kernel(
     mxu_size, sublanes = info.mxu_column_size, info.num_sublanes
     q, weights, pool, membership, output_map = inputs
     buffers, semaphores = scratch
-    queries, keys, counts, projected, maps, packed = buffers
+    queries, keys, counts, projected, maps = buffers
     read_sem, write_sem, q_sem, map_sem = semaphores
     weights = pltpu.annotate(weights, no_store=True)
     keys = pltpu.annotate(keys, no_store=True)
@@ -59,7 +59,7 @@ def _kernel(
         _dma_rows(q, dst, q_sem.at[slot], query.count, wait, src_start=query.start)
 
     def release_outputs(pair):
-        src = packed.at[pair]
+        src = projected.at[pair]
         _dma_rows(src, src, write_sem.at[pair], counts[pair], wait=True)
 
     def copy_map(query, slot, wait=False):
@@ -136,7 +136,7 @@ def _kernel(
             )
 
         release_outputs(q_slot)
-        projected[...] = jnp.full(projected.shape, -jnp.inf, jnp.float32)
+        projected[q_slot] = jnp.full(projected.shape[1:], -jnp.inf, jnp.float32)
         copy_map(query, q_slot)
         for i in range(2):
 
@@ -228,9 +228,25 @@ def _kernel(
                             def write(
                                 i=i, start=start, destination=destination, scaled=scaled
                             ):
-                                projected[i, pl.ds(destination, 1), :] = scaled[
+                                output_column = destination * membership_block_size
+                                page = output_column // PAGE_RECORDS * PAGE_RECORDS
+                                previous = projected[
+                                    q_slot, pl.ds(i, 1), pl.ds(page, PAGE_RECORDS)
+                                ]
+                                part = scaled[
                                     i : i + 1, start : start + membership_block_size
                                 ]
+                                repeated = jnp.tile(
+                                    part, (1, PAGE_RECORDS // membership_block_size)
+                                )
+                                active = jnp.arange(
+                                    PAGE_RECORDS
+                                ) // membership_block_size == destination % (
+                                    PAGE_RECORDS // membership_block_size
+                                )
+                                projected[
+                                    q_slot, pl.ds(i, 1), pl.ds(page, PAGE_RECORDS)
+                                ] = jnp.where(active[None, :], repeated, previous)
 
             pending = {}
             for stage in range(fragments + config.issue_depth):
@@ -263,21 +279,8 @@ def _kernel(
         else:
             lax.fori_loop(0, tile_count, step_tile, None)
 
-        for i in range(q_tile):
-
-            @pl.when(i < query.count)
-            def pack(i=i):
-                def page(index, _):
-                    blocks = PAGE_RECORDS // membership_block_size
-                    values = projected[i, pl.ds(index * blocks, blocks), :]
-                    packed[
-                        q_slot, pl.ds(i, 1), pl.ds(index * PAGE_RECORDS, PAGE_RECORDS)
-                    ] = values.reshape(1, PAGE_RECORDS)
-
-                lax.fori_loop(0, out.shape[1] // PAGE_RECORDS, page, None)
-
         _dma_rows(
-            packed.at[q_slot],
+            projected.at[q_slot],
             out,
             write_sem.at[q_slot],
             query.count,
@@ -402,16 +405,8 @@ def fp8_gathered_mqa_logits(
                 (config.key_buffers, tile // PAGE_RECORDS * PAGE_ROWS, dim), jnp.int32
             ),
             pltpu.SMEM((2,), jnp.int32),
-            pltpu.VMEM(
-                (
-                    q_tile,
-                    output_padded // membership_block_size,
-                    membership_block_size,
-                ),
-                jnp.float32,
-            ),
-            pltpu.SMEM((2 * q_tile * map_columns,), jnp.int32),
             pltpu.VMEM((2, q_tile, output_padded), jnp.float32),
+            pltpu.SMEM((2 * q_tile * map_columns,), jnp.int32),
         ),
         tuple(
             pltpu.SemaphoreType.DMA(shape)
