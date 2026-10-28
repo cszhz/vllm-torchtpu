@@ -111,6 +111,7 @@ def main():
     parser.add_argument("--topk", type=int, default=512)
     parser.add_argument("--overlap", type=float, default=0.7)
     parser.add_argument("--repeats", type=int, default=15)
+    parser.add_argument("--gather-sweep", action="store_true")
     args = parser.parse_args()
     if not 0 <= args.overlap <= 1 or args.width % args.page_size:
         raise ValueError("Use overlap in [0,1] and a page-aligned width")
@@ -265,6 +266,63 @@ def main():
     np.testing.assert_array_equal(
         np.asarray(gathered).reshape(-1, min(args.block, args.page_size))[valid],
         np.asarray(prepared.keys).reshape(-1, min(args.block, args.page_size))[valid],
+    )
+    if args.gather_sweep:
+        from jax.experimental.pallas import tpu_sc as plsc
+
+        from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+            tuned_block_sizes,
+        )
+
+        info = plsc.get_sparse_core_info()
+        key = (min(args.block, args.page_size), len(banks))
+        tuning = tuned_block_sizes.PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG
+        original = tuning[key]
+        expected_keys = np.asarray(gathered).reshape(-1, key[0])[valid]
+        for group in (16, 32, 48, 64, 96):
+            for buffers in (1, 2, 3, 4):
+                scratch = (
+                    buffers
+                    * group
+                    * (layout.page_rows * 128 + 33 * key[0] + len(banks))
+                    * 4
+                )
+                if scratch > info.vmem_capacity_bytes * 0.9:
+                    continue
+                tuning[key] = (group, buffers)
+                result = measure(
+                    f"gather_g{group}_b{buffers}",
+                    functools.partial(
+                        gather_candidate_keys, block=key[0], layout=layout
+                    ),
+                    (banks, physical, prepared.offsets),
+                    root,
+                    args.repeats,
+                    dimensions,
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(result).reshape(-1, key[0])[valid], expected_keys
+                )
+        tuning[key] = original
+    live_blocks = int(np.count_nonzero(np.asarray(physical) >= 0))
+    (root / "gather-traffic.json").write_text(
+        json.dumps(
+            {
+                "valid_blocks": live_blocks,
+                "valid_input_bytes": live_blocks
+                * 33
+                * min(args.block, args.page_size)
+                * 4,
+                "whole_page_input_bytes": live_blocks * layout.page_rows * 128 * 4,
+                "allocated_output_bytes": prepared.keys.size * 4,
+                "active_group_capacity_bytes": int(np.count_nonzero(np.diff(offsets)))
+                * physical.shape[1]
+                * min(args.block, args.page_size)
+                * 33
+                * 4,
+            },
+            indent=2,
+        )
     )
     score = functools.partial(
         _score_prepared,

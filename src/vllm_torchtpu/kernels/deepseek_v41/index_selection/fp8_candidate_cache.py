@@ -520,7 +520,8 @@ def gather_candidate_keys(
     )
     group, buffers = PAGED_MQA_GATHER_CONFIG.get((block, len(banks)), (group, buffers))
     whole_pages = (
-        block == layout.page_size == 8
+        (block, len(banks)) in PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG
+        and block == layout.page_size == 8
         and layout.page_offset % layout.page_rows == 0
         and layout.page_stride % layout.page_rows == 0
         and all(bank.shape[0] % layout.page_rows == 0 for bank in banks)
@@ -705,7 +706,9 @@ def gather_candidate_keys(
 
         def write(step, wait=False):
             slot = step % buffers
-            destination = destination_ids[step]
+            destination = plsc.load_gather(
+                destination_ids, [jnp.full((lanes,), step, jnp.int32)]
+            )[0]
 
             @pl.when(destination >= 0)
             def copy_tile():
