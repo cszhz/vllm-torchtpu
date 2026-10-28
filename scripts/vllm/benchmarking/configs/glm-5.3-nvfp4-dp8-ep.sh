@@ -53,8 +53,8 @@ RANDOM_RANGE_RATIO="0.0"
 # the GLM-5.2 NVFP4 recipe.
 export MOE_REQUANTIZE_BLOCK_SIZE="${MOE_REQUANTIZE_BLOCK_SIZE:-512}"
 
-# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+57.39% output tok/s/device:
-# 139.72 -> 219.91 tok/s/device at ISL=8192, OSL=1024, c=512):
+# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+65.07% output tok/s/device:
+# 139.72 -> 230.63 tok/s/device at ISL=8192, OSL=1024, c=512):
 # 1. Fused EP MoE v2 with W4A8 MXU matmuls + sharded schedule plan + padded-row skip
 export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
 export MOE_FUSED_EP_ENABLE_W4A8="${MOE_FUSED_EP_ENABLE_W4A8:-1}"
