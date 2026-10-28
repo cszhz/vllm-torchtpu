@@ -220,8 +220,7 @@ def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_seqs]
     # [3] (start_seq_idx, end_seq_idx, num_valid_tokens); with `shared_kv`,
-    # then (kv_rows, page_0, page_1, ...): the sequence's first pages and how
-    # many of their rows any query token of the launch reads.
+    # then (page_0, page_1, ...): the sequence's first pages.
     start_end_seq_idx_ref,
     sem_ids_ref,  # [2] (bi_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [2] seq_idx_start of the in-flight bo DMA per bo sem
@@ -486,10 +485,17 @@ def _attention_kernel(
 
     def load_shared_kv():
         num_pages, page_size, _ = bkv_nope_x2_ref.shape
-        kv_rows = start_end_seq_idx_ref[3]
+        # The most rows any valid query token of the launch reads; a shared-KV
+        # launch covers one chunk, so this is the chunk's valid tokens.
+        kv_rows = lax.fori_loop(
+            start_seq_idx,
+            jnp.minimum(end_seq_idx, num_valid_tokens),
+            lambda t, rows: jnp.maximum(rows, kv_lens_ref[t]),
+            jnp.int32(0),
+        )
 
         def page_copies(p):
-            page = start_end_seq_idx_ref[4 + p]
+            page = start_end_seq_idx_ref[3 + p]
             return (
                 pltpu.make_async_copy(
                     cache_kv_nope_hbm_ref.at[page], bkv_nope_x2_ref.at[p], sems.at[0, p]
@@ -898,7 +904,6 @@ def sparse_ragged_paged_attention(
         # With these, cache_kv_* are the whole caches and every token attends
         # over the first kv_lens rows of these pages (`_attention_kernel`).
         shared_kv_pages: jax.Array | None = None,  # i32[shared_pages]
-        shared_kv_rows: jax.Array | None = None,  # i32
     ):
         batch_size = kernel_batch_size
         shared_kv = shared_kv_pages is not None
@@ -978,7 +983,7 @@ def sparse_ragged_paged_attention(
 
         launch = [start_seq_idx, end_seq_idx, num_valid_tokens]
         if shared_kv:
-            launch += [shared_kv_rows, *shared_kv_pages]
+            launch += [*shared_kv_pages]
         scalar_prefetches = (
             kv_lens,
             jnp.array(launch, jnp.int32),
@@ -1093,11 +1098,18 @@ def sparse_ragged_paged_attention(
         qualifies = by_chunk(_selects_leading_rows(topk_indices, kv_lens)) & (
             by_chunk(seq_ids_segment) == chunk_seqs[:, None]
         )
-        use_shared_chunks = jnp.all(~is_valid | qualifies, axis=1)
-        shared_rows_chunks = jnp.max(jnp.where(is_valid, by_chunk(kv_lens), 0), axis=1)
-        shared_pages_chunks = page_indices.reshape(max_num_seqs, pages_per_seq)[
-            chunk_seqs, :shared_pages
-        ]
+        # One small table, (use_shared, pages...) per chunk, so its per-chunk
+        # scalars cost one copy to scalar memory, not one per value.
+        shared_kv_table = jnp.concatenate(
+            [
+                jnp.all(~is_valid | qualifies, axis=1, keepdims=True),
+                page_indices[
+                    chunk_seqs[:, None] * pages_per_seq + jnp.arange(shared_pages)
+                ],
+            ],
+            axis=1,
+            dtype=jnp.int32,
+        )
 
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
@@ -1138,7 +1150,7 @@ def sparse_ragged_paged_attention(
         # sequences, we use this gather-and-attention kernel.
         gather_end = batch_end
         if shared_kv_path:
-            use_shared = (start_pos < num_valid_tokens) & use_shared_chunks[i]
+            use_shared = (start_pos < num_valid_tokens) & (shared_kv_table[i, 0] != 0)
             num_valid_indices = jnp.where(use_shared, 0, num_valid_indices)
             gather_end = jnp.where(use_shared, start_pos, batch_end)
 
@@ -1180,8 +1192,7 @@ def sparse_ragged_paged_attention(
                 end_seq_idx=jnp.where(use_shared, batch_end, start_pos),
                 num_valid_tokens=num_valid_tokens,
                 kernel_batch_size=kernel_batch_size,
-                shared_kv_pages=shared_pages_chunks[i],
-                shared_kv_rows=shared_rows_chunks[i],
+                shared_kv_pages=shared_kv_table[i, 1:],
             )
     return prepare_outputs(
         q, actual_num_q_heads, actual_head_dim
