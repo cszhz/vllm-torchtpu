@@ -1563,7 +1563,7 @@ def initialize_fp8_indexer() -> None:
             candidates.new_empty((tokens, count)),
             requests.new_empty((groups + 1,)),
             requests.new_empty((tokens,), dtype=torch.bool),
-            requests.new_empty((tokens, count), dtype=torch.bool),
+            requests.new_empty((groups, count), dtype=torch.int32),
         )
 
     def fake_prepared(
@@ -1671,7 +1671,7 @@ def _select_candidate_tokens(
 
 
 def _score_prepared(q, weights, lengths, prepared, topk, block, unordered, width):
-    keys, canonical, offsets, valid_queries, membership = prepared
+    keys, canonical, offsets, valid_queries, block_owners = prepared
     k = min(topk, width, canonical.shape[1] * block)
     lengths = jnp.where(valid_queries, jnp.clip(lengths, 0, width), 0)
     compact_lengths = jnp.sum(
@@ -1698,10 +1698,9 @@ def _score_prepared(q, weights, lengths, prepared, topk, block, unordered, width
             keys,
             weights.astype(jnp.float32),
             compact_lengths,
-            membership,
+            block_owners,
             query_start_loc=offsets,
             membership_block_size=block,
-            max_model_len=capacity,
             query_start=start,
             query_count=chunk,
         )

@@ -48,6 +48,12 @@ def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, cou
     gathered = cache.reshape(layout.pages, 33, 128)[pages].reshape(-1, 128)
     membership = rng.random((7, width // block)) > 0.5
     membership[6] = False
+    block_owners = np.zeros((6, width // block), dtype=np.int32)
+    for group, (begin, end) in enumerate(zip(offsets[:-1], offsets[1:], strict=True)):
+        for query in range(int(begin), int(end)):
+            block_owners[group] |= membership[query].astype(np.int32) << (
+                query - int(begin)
+            )
     baseline = fp8_paged_mqa_logits(
         q,
         cache,
@@ -67,9 +73,8 @@ def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, cou
         gathered,
         weights,
         lengths,
-        jnp.asarray(membership),
+        jnp.asarray(block_owners),
         query_start_loc=offsets,
-        max_model_len=width,
         membership_block_size=block,
         query_start=jnp.int32(start),
         query_count=count,

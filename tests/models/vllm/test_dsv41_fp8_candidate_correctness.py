@@ -67,10 +67,15 @@ def _cpu_logits(q, keys, weights, lengths, pages, **kwargs):
     return jnp.where(allowed, scores, -jnp.inf)
 
 
-def _cpu_gathered_logits(q, keys, weights, lengths, membership, **kwargs):
-    groups = kwargs["query_start_loc"].shape[0] - 1
+def _cpu_gathered_logits(q, keys, weights, lengths, block_owners, **kwargs):
+    offsets = kwargs["query_start_loc"]
+    groups = offsets.shape[0] - 1
     pages_per_group = keys.shape[0] // groups // PAGE_ROWS
     pages = jnp.arange(groups * pages_per_group).reshape(groups, pages_per_group)
+    # Expand packed per-group ownership to each row: bit (row - group start).
+    rows = jnp.arange(q.shape[0])
+    group = jnp.clip(jnp.searchsorted(offsets[1:], rows, side="right"), 0, groups - 1)
+    membership = (block_owners[group] >> (rows - offsets[group])[:, None] & 1) != 0
     return _cpu_logits(
         q,
         keys,
@@ -79,6 +84,7 @@ def _cpu_gathered_logits(q, keys, weights, lengths, membership, **kwargs):
         pages,
         cache_layout=PackedFP8Layout(groups * pages_per_group),
         block_membership=membership,
+        max_model_len=block_owners.shape[1] * kwargs["membership_block_size"],
         **kwargs,
     )
 
@@ -143,15 +149,19 @@ def test_paired_gather_preserves_each_query(
     prepared = prepare(banks, pages, candidates, requests)
     np.testing.assert_array_equal(np.diff(prepared.offsets)[: len(sizes)], sizes)
     assert np.all(np.diff(prepared.offsets)[len(sizes) :] == 0)
+    offsets = np.asarray(prepared.offsets)
     for row, owner in enumerate(np.asarray(requests)):
         expected = set(np.asarray(candidates[row]).tolist()) & set(
             range(width // block)
         )
         if owner < 0:
             expected = set()
-        actual = np.asarray(prepared.block_ids[row])[
-            np.asarray(prepared.membership[row])
-        ]
+        # block_owners is per-group; bit (row - group start) selects this query.
+        group = np.searchsorted(offsets[1:], row, side="right")
+        query = row - int(offsets[group])
+        member = (np.asarray(prepared.block_owners[group]) >> query & 1).astype(bool)
+        block_ids = np.asarray(prepared.block_ids[row])
+        actual = block_ids[member & (block_ids >= 0)]
         assert set(actual.tolist()) == expected
 
     if unordered:

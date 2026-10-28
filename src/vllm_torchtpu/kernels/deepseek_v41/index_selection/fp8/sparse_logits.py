@@ -36,7 +36,7 @@ def _kernel(
     membership_block_size,
 ):
     mxu_size, sublanes = info.mxu_column_size, info.num_sublanes
-    q, weights, pool, membership = inputs
+    q, weights, pool, block_owners = inputs
     buffers, semaphores = scratch
     queries, keys, scores, counts = buffers
     read_sem, write_sem, q_sem = semaphores
@@ -109,6 +109,9 @@ def _kernel(
 
         copy_queries(following, 1 - q_slot, zero=True)
         lengths_vector = jnp.stack(row_lengths(query))
+        query_bits = 1 << jnp.minimum(
+            query.start - offsets[query.page_row] + jnp.arange(q_tile), 1
+        )
 
         def publish(tile, wait=False, slot=None):
             slot = output_slot(tile) if slot is None else slot
@@ -179,7 +182,6 @@ def _kernel(
                     )
                     scaled = values[:, offset : offset + PAGE_RECORDS] * scale
                     column = local_page * PAGE_RECORDS
-                    scaled = jnp.where(remaining > column, scaled, -jnp.inf)
                     columns = (
                         tile * key_tile + column + jnp.arange(PAGE_RECORDS)
                     ) // membership_block_size
@@ -189,29 +191,23 @@ def _kernel(
                         // info.num_lanes
                         * info.num_lanes
                     )
-                    local_flags = jnp.stack(
-                        [
-                            membership[
-                                r,
-                                pl.ds(
-                                    pl.multiple_of(first_flag, info.num_lanes),
-                                    info.num_lanes,
-                                ),
-                            ]
-                            for r in row_ids(query)
-                        ]
+                    local_flags = block_owners[
+                        query.page_row,
+                        0,
+                        pl.ds(
+                            pl.multiple_of(first_flag, info.num_lanes),
+                            info.num_lanes,
+                        ),
+                    ]
+                    flags = jnp.take_along_axis(
+                        jnp.broadcast_to(local_flags, (q_tile, info.num_lanes)),
+                        jnp.broadcast_to(
+                            (columns - first_flag)[None, :], (q_tile, PAGE_RECORDS)
+                        ),
+                        axis=1,
                     )
-                    allowed = (
-                        jnp.take_along_axis(
-                            local_flags,
-                            jnp.broadcast_to(
-                                (columns - first_flag)[None, :], (q_tile, PAGE_RECORDS)
-                            ),
-                            axis=1,
-                        )
-                        != 0
-                    )
-                    scaled = jnp.where(allowed, scaled, -jnp.inf)
+                    allowed = (flags & query_bits[:, None]) != 0
+                    scaled = jnp.where(allowed & (remaining > column), scaled, -jnp.inf)
                     scores[output_slot(tile), :, pl.ds(column, PAGE_RECORDS)] = scaled
 
             valid_keys = jnp.minimum(key_tile, query_limit(query) - tile * key_tile)
@@ -317,7 +313,6 @@ def _kernel(
 
 @jax.jit(
     static_argnames=(
-        "max_model_len",
         "membership_block_size",
         "query_count",
         "key_tile",
@@ -328,16 +323,15 @@ def fp8_gathered_mqa_logits(
     keys: jax.Array,
     weights: jax.Array,
     context_lens: jax.Array,
-    block_membership: jax.Array,
+    block_owners: jax.Array,
     *,
     query_start_loc: jax.Array,
-    max_model_len: int,
     membership_block_size: int,
     query_start: jax.Array | int = 0,
     query_count: int | None = None,
     key_tile: int | None = None,
 ) -> jax.Array:
-    """Score gathered FP8 K with per-query candidate masks.
+    """Score gathered FP8 K with packed block ownership for query pairs.
 
     Args:
         q: FP8 queries [queries, heads, dim].
@@ -345,50 +339,55 @@ def fp8_gathered_mqa_logits(
             regions per group; each 33x128 page includes FP8 K and FP32 scales.
         weights: Per-head weights [queries, heads], including query scales.
         context_lens: Visible token counts [queries] in sorted union order.
-        block_membership: Mask [queries, union_blocks]; nonzero means the
-            union block belongs to that query's original candidates.
+        block_owners: Int32 [groups, union_blocks]; bit 0/1 marks membership
+            for the first/second query of each group. Padding has no bits set.
         query_start_loc: Query offsets [groups + 1]; group g owns queries
             [query_start_loc[g], query_start_loc[g + 1]) and shares gathered K.
-        max_model_len: Output width in gathered token positions.
+            Each nonempty group contains one or two queries.
         membership_block_size: Tokens covered by each membership column.
         query_start: First query row to score.
         query_count: Number of query rows to score; None uses q.shape[0].
         key_tile: K tokens per tile; None uses the tuned configuration.
 
     Returns:
-        Float32 logits [rows, max_model_len] in gathered union order, where
-        rows is query_count if provided, else q.shape[0]. Invisible or
-        nonmember tokens are set to -inf.
+        Float32 logits [rows, union_blocks * membership_block_size] in gathered
+        union order, where rows is query_count if provided, else q.shape[0].
+        Invisible or nonmember tokens are set to -inf.
     """
     rows = q.shape[0] if query_count is None else query_count
-    if rows == 0 or max_model_len == 0:
-        return jnp.empty((rows, max_model_len), jnp.float32)
+    score_width = block_owners.shape[1] * membership_block_size
+    if rows == 0 or score_width == 0:
+        return jnp.empty((rows, score_width), jnp.float32)
     info = cast(pltpu.TpuInfo, pltpu.get_tpu_info())
     groups = query_start_loc.shape[0] - 1
+    if block_owners.dtype != jnp.int32 or block_owners.shape[0] != groups:
+        raise ValueError("Block ownership must be int32 [groups, union_blocks]")
     group_rows = keys.shape[0] // groups
     capacity = group_rows // PAGE_ROWS * PAGE_RECORDS
     if keys.shape != (groups * group_rows, PAGE_RECORDS) or group_rows % PAGE_ROWS:
         raise ValueError("Gathered K must contain equal packed regions per group")
-    if max_model_len > capacity:
+    if score_width > capacity:
         raise ValueError("Score width exceeds gathered K capacity")
     config = PACKED_FP8_PREPARED_MQA_CONFIG
     tile = min(
         config.key_tile if key_tile is None else key_tile,
-        pl.cdiv(max_model_len, info.mxu_column_size) * info.mxu_column_size,
+        pl.cdiv(score_width, info.mxu_column_size) * info.mxu_column_size,
     )
     if tile % info.mxu_column_size or tile % membership_block_size:
         raise ValueError("K tile must align to MXU columns and membership blocks")
     config = replace(config, key_tile=tile)
-    width = pl.cdiv(max_model_len, tile) * tile
+    width = pl.cdiv(score_width, tile) * tile
     padded_rows = width // PAGE_RECORDS * PAGE_ROWS
     keys = keys.reshape(groups, group_rows, PAGE_RECORDS)[:, :padded_rows]
     keys = jnp.pad(keys, ((0, 0), (0, max(0, padded_rows - group_rows)), (0, 0)))
     keys = keys.reshape(-1, PAGE_RECORDS)
     columns = pl.cdiv(width // membership_block_size, info.num_lanes) * info.num_lanes
-    membership = jnp.pad(
-        block_membership[:, :columns].astype(jnp.int32),
-        ((0, 0), (0, max(0, columns - block_membership.shape[1]))),
+    block_owners = jnp.pad(
+        block_owners[:, :columns],
+        ((0, 0), (0, max(0, columns - block_owners.shape[1]))),
     )
+    # Keep the dynamic group index outside the tiled sublane/lane dimensions.
+    block_owners = block_owners[:, None, :]
     q_tile, heads, dim = config.query_tile, q.shape[1], q.shape[2]
     scratch = (
         (
@@ -430,5 +429,5 @@ def fp8_gathered_mqa_logits(
         query_start_loc,
         context_lens,
         jnp.asarray(query_start, jnp.int32),
-        (q, weights, keys, membership),
-    )[:, :max_model_len]
+        (q, weights, keys, block_owners),
+    )[:, :score_width]

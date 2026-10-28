@@ -15,41 +15,48 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
     write_fp8_records,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.candidates import (
-    candidate_membership,
     canonical_candidate_blocks,
     gather_candidate_keys,
     prepare_candidates,
 )
 
 
-@pytest.mark.parametrize(
-    "rows,count,columns,blocks",
-    [
-        (1, 3, 7, 17),
-        (7, 129, 258, 257),
-        (288, 2048, 4096, 12352),
-    ],
-)
-def test_candidate_membership_matches_per_query_set(rows, count, columns, blocks):
+def _owner_membership(owners, query):
+    """Recover query ``query``'s per-union membership from packed ownership."""
+    return ((np.asarray(owners) >> query) & 1).astype(bool)
+
+
+@pytest.mark.parametrize("page_size", [8, 128])
+def test_canonical_blocks_tag_per_query_ownership(page_size):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Exercises real SparseCore metadata")
+    width, block = 1024, 16
+    blocks = width // block
     rng = np.random.default_rng(891)
-    candidates = rng.integers(-3, blocks + 3, (rows, count), dtype=np.int32)
-    canonical = rng.integers(-3, blocks + 3, (rows, columns), dtype=np.int32)
-    candidates[0] = -1
-    if rows > 1:
-        candidates[1] = 0
-        canonical[1, :3] = [0, -1, blocks]
-    expected = np.stack(
-        [
-            np.isin(union, source) & (union >= 0) & (union < blocks)
-            for source, union in zip(candidates, canonical, strict=True)
-        ]
-    )
-    run = jax.jit(functools.partial(candidate_membership, blocks=blocks))
-    actual = run(jnp.asarray(candidates), jnp.asarray(canonical))
-    np.testing.assert_array_equal(np.asarray(actual), expected)
-    # Reuse the same executable with changed data: no stale per-row histogram.
-    actual = run(jnp.full_like(candidates, -1), jnp.asarray(canonical))
-    assert not np.any(np.asarray(actual))
+    # Two groups, each pairing two queries that share one sorted union.
+    first = rng.integers(-3, blocks + 3, (2, 48), dtype=np.int32)
+    second = rng.integers(-3, blocks + 3, (2, 48), dtype=np.int32)
+    first[1] = -1
+    candidates = jnp.asarray(np.stack((first, second), axis=1))
+    table = jnp.asarray(rng.integers(0, 7, (2, width // page_size), dtype=np.int32))
+    canonical, _, owners = jax.jit(
+        functools.partial(
+            canonical_candidate_blocks,
+            block=block,
+            width=width,
+            cache_pages=1 << 30,
+            page_size=page_size,
+        )
+    )(candidates, table, jnp.array([0, 1, 2], jnp.int32))
+    canonical = np.asarray(canonical)
+    for group in range(2):
+        union = canonical[group]
+        live = union >= 0
+        for query, source in enumerate((first[group], second[group])):
+            expected = np.isin(union, source) & live
+            np.testing.assert_array_equal(
+                _owner_membership(owners[group], query) & live, expected
+            )
 
 
 @pytest.mark.parametrize("owners", [[0, 0], [0, 0, 1, 1, 1, 2, -1]])
@@ -79,8 +86,11 @@ def test_prepared_keys_and_membership_keep_original_token_mapping(owners, page_s
         expected_ids = set(np.asarray(candidates[row])) & set(range(width // block))
         if owner < 0:
             expected_ids = set()
-        assert set(canonical[np.asarray(prepared.membership[row])]) == expected_ids
         group = np.searchsorted(offsets[1:], row, side="right")
+        # block_owners is per-group; bit (row - group start) selects this query.
+        query = row - int(offsets[group])
+        member = (np.asarray(prepared.block_owners[group]) >> query & 1).astype(bool)
+        assert set(canonical[member & (canonical >= 0)]) == expected_ids
         live = np.flatnonzero(canonical >= 0)
         if not len(live):
             continue
@@ -138,9 +148,9 @@ def test_gather_skips_empty_tiles_without_changing_live_slots(page_size, bank_co
 def test_candidate_addresses_deduplicate_and_drop_invalid_pages(monkeypatch, page_size):
     monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
     with jax.default_device(jax.devices("cpu")[0]):
-        candidates = jnp.array([[2, 0, 2, 3, -1, 999]], jnp.int32)
+        candidates = jnp.array([[[2, 0, 2, 3, -1, 999]]], jnp.int32)
         table = [[2, 3, -1, 4, 5, 6, -1, -1]] if page_size == 8 else [[2]]
-        canonical, physical = canonical_candidate_blocks(
+        canonical, physical, _ = canonical_candidate_blocks(
             candidates,
             jnp.array(table, jnp.int32),
             jnp.array([0, 1], jnp.int32),
@@ -164,8 +174,8 @@ def test_candidate_long_context_partial_block(page_size):
     last = width // block
     table = np.zeros((1, (width + page_size - 1) // page_size), np.int32)
     table[0, 0] = -1
-    ids = jnp.array([[last, 0, last, last + 1, -1]], jnp.int32)
-    canonical, physical = canonical_candidate_blocks(
+    ids = jnp.array([[[last, 0, last, last + 1, -1]]], jnp.int32)
+    canonical, physical, _ = canonical_candidate_blocks(
         ids,
         jnp.asarray(table),
         jnp.array([0, 1]),
