@@ -395,7 +395,7 @@ def _canonical_candidate_blocks(
         pltpu.async_copy(control_ref, active, sem.at[0]).wait()
         unit = lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
 
-        @pl.loop(unit, active[...][0], step=units)
+        @pl.loop(unit, active[pl.ds(0, lanes)][0], step=units)
         def row(row_id):
             read_ids = pltpu.async_copy(src.at[row_id], ids, sem.at[0])
             read_pages = pltpu.async_copy(pages.at[row_id], page_ids, sem.at[1])

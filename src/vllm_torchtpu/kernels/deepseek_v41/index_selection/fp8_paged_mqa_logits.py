@@ -274,7 +274,7 @@ def _kernel(
             def key_rows(start, count):
                 return keys[key_slot(tile), pl.ds(start, count)]
 
-            allowed = None
+            block_flags = None
             if membership is not None:
                 blocks_per_tile = key_tile // membership_block_size
                 block_flags = jnp.stack(
@@ -283,7 +283,7 @@ def _kernel(
                         for r in row_ids(query)
                     ]
                 )
-                allowed = jnp.repeat(block_flags, membership_block_size, axis=1)
+                block_flags = block_flags.astype(jnp.int32)
             base = tile * key_tile + jnp.arange(PAGE_RECORDS)
             remaining = jnp.maximum(lengths_vector, 0)[:, None] - base[None, :]
 
@@ -363,12 +363,12 @@ def _kernel(
                             scaled,
                             -jnp.inf,
                         )
-                    if allowed is not None:
-                        scaled = jnp.where(
-                            allowed[:, fragment * mxu_size : (fragment + 1) * mxu_size],
-                            scaled,
-                            -jnp.inf,
-                        )
+                    if block_flags is not None:
+                        columns = (
+                            fragment * mxu_size + jnp.arange(mxu_size)
+                        ) // membership_block_size
+                        allowed = jnp.take(block_flags, columns, axis=1) != 0
+                        scaled = jnp.where(allowed, scaled, -jnp.inf)
                     scores[
                         output_slot(tile), :, pl.ds(fragment * mxu_size, mxu_size)
                     ] = scaled
@@ -385,10 +385,12 @@ def _kernel(
                     if not full:
                         bound = jnp.where(valid, column, jnp.iinfo(jnp.int32).max)
                         scaled = jnp.where(remaining > bound, scaled, -jnp.inf)
-                    if allowed is not None:
-                        scaled = jnp.where(
-                            allowed[:, column : column + PAGE_RECORDS], scaled, -jnp.inf
-                        )
+                    if block_flags is not None:
+                        columns = (
+                            column + jnp.arange(PAGE_RECORDS)
+                        ) // membership_block_size
+                        allowed = jnp.take(block_flags, columns, axis=1) != 0
+                        scaled = jnp.where(allowed, scaled, -jnp.inf)
                     scores[output_slot(tile), :, pl.ds(column, PAGE_RECORDS)] = scaled
 
             pending = {}
