@@ -20,6 +20,7 @@ gate, SharedExperts, VllmFp8MoEMethodTPU.apply_monolithic and the runner's
 scale, add and all-reduce decisions.
 """
 
+import dataclasses
 import math
 from types import SimpleNamespace
 
@@ -335,6 +336,34 @@ def test_armed_runner_with_skip_final_all_reduce_is_not_reduced(harness):
     runner = model.layers[0]
     runner.moe_config.skip_final_all_reduce = True
     assert not runner._fused_output_is_reduced
+
+
+@pytest.mark.parametrize(
+    ("dma_granule_bytes", "expected"), [(32, True), (64, False)], ids=["32B", "64B"]
+)
+def test_op_uses_sparse_core_only_where_supported(
+    harness, monkeypatch, dma_granule_bytes, expected
+):
+    """USE_MOE_SPARSE_CORE=1 on a TPU whose SparseCore has 64-byte DMA
+    granules (TPU8i) builds the op on the plain-JAX MoE path."""
+    monkeypatch.setattr(envs, "USE_MOE_SPARSE_CORE", True)
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    info = dataclasses.replace(
+        info,
+        sparse_core=dataclasses.replace(
+            info.sparse_core, dma_granule_size_bytes=dma_granule_bytes
+        ),
+    )
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    statics = []
+
+    def get_op(mesh, st):
+        statics.append(st)
+        return harness.op
+
+    monkeypatch.setattr(moe_tp_decode, "_get_op", get_op)
+    assert moe_tp_decode.arm(harness.model({})) == 1
+    assert [st.use_sparse_core for st in statics] == [expected]
 
 
 @pytest.mark.parametrize(

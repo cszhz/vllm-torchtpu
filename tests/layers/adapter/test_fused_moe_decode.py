@@ -182,3 +182,44 @@ def test_glm_fallback_scales_routed_only(monkeypatch):
     shared = (np.asarray(jax.nn.silu(gate_up[:, :2])) * gate_up[:, 2:]) @ w2s
     np.testing.assert_allclose(got, 2.5 * x + shared, rtol=1e-4, atol=1e-4)
     assert not np.allclose(got, 2.5 * (x + shared), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("use_sparse_core", [True, False])
+def test_gmm_fallback_takes_sparse_core_flag_from_resolver(
+    monkeypatch, use_sparse_core
+):
+    """Above the cap, the routed GMM uses resolve_use_sparse_core(), which turns
+    the SparseCore path off on TPUs whose SparseCore the kernels do not support
+    (TPU8i)."""
+    seen = []
+
+    def fused_moe_func(x, *args, **kwargs):
+        seen.append(kwargs["use_sparse_core"])
+        return x
+
+    monkeypatch.setattr(bridge, "fused_moe_func", fused_moe_func)
+    monkeypatch.setattr(bridge, "_quantized_matmul_jax", lambda a, w, s: a @ (w * s))
+    monkeypatch.setattr(bridge, "resolve_onehot_permute_threshold", lambda: 0)
+    monkeypatch.setattr(bridge, "resolve_use_sparse_core", lambda: use_sparse_core)
+    x = np.ones((4, H), np.float32)
+    w = np.zeros((1, 1), np.float32)
+
+    def body(x):
+        return bridge._gmm_layer(
+            x,
+            *([w] * 4),
+            np.zeros((H, 4), np.float32),
+            np.ones(4, np.float32),
+            np.zeros((2, H), np.float32),
+            np.ones(H, np.float32),
+            w,
+            np.zeros((4, 2), np.float32),
+            np.zeros((4, 2), np.int32),
+            None,
+            topk=2,
+            shared_gated=False,
+            routed_scale=1.0,
+        )
+
+    jax.vmap(body, axis_name=EP_AXIS_NAME)(x[None])
+    assert seen == [use_sparse_core]

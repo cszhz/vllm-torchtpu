@@ -29,6 +29,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
+from vllm_torchtpu.kernels.sparse_core.support import is_supported_sparse_core
 
 _TOKEN_SUBCHUNK = 16
 _NUM_TOKEN_SUBCHUNKS = 4
@@ -339,7 +340,7 @@ def ragged_gather_reduce(
     """Destination-major prototype for MoE output combine."""
     sc_info = pltpu.get_tpu_info().sparse_core
     if (
-        sc_info is None
+        not is_supported_sparse_core(sc_info)
         or x.dtype != jnp.bfloat16
         or x.shape[-1] % pltpu.get_tpu_info().num_lanes != 0
     ):

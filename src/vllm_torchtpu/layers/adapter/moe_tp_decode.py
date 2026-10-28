@@ -56,6 +56,7 @@ from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     resolve_onehot_permute_threshold,
+    resolve_use_sparse_core,
 )
 from vllm_torchtpu.logger import init_logger
 
@@ -281,7 +282,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         topk=topk,
         routed_scale=float(runner.routed_scaling_factor),
         activation=qm._tpu_activation_str,
-        use_sparse_core=envs.USE_MOE_SPARSE_CORE,
+        use_sparse_core=resolve_use_sparse_core(),
         onehot_threshold=resolve_onehot_permute_threshold(),
     )
     return _Admitted(shared=shared, rows=rows, hidden=hidden, statics=statics)

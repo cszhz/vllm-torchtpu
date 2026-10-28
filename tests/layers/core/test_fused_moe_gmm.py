@@ -1014,6 +1014,18 @@ def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
 
+def test_onehot_threshold_auto_zero_for_unsupported_dma_granule(monkeypatch):
+    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    # TPU8i reports a SparseCore with 64-byte DMA granules, which the
+    # SparseCore gather/reduce kernels do not support.
+    sc_info = _fake_sc_info(16, 1, 4)
+    sc_info.dma_granule_size_bytes = 64
+    monkeypatch.setattr(
+        fused_moe_gmm.pltpu, "get_tpu_info", lambda: _fake_tpu_info(sc_info)
+    )
+    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
+
+
 def test_onehot_threshold_auto_zero_on_non_tpu_host(monkeypatch):
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
 
@@ -1022,6 +1034,51 @@ def test_onehot_threshold_auto_zero_on_non_tpu_host(monkeypatch):
 
     monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _raise)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
+
+
+def test_use_sparse_core_env_off_skips_tpu_info(monkeypatch):
+    def _fail():
+        raise AssertionError("get_tpu_info must not be called")
+
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _fail)
+    monkeypatch.setattr(envs, "USE_MOE_SPARSE_CORE", False, raising=False)
+    assert fused_moe_gmm.resolve_use_sparse_core() is False
+
+
+@pytest.mark.parametrize(
+    "granule,expected",
+    [(None, True), (32, True), (64, False)],
+    ids=["no-granule-attr", "32-byte", "64-byte"],
+)
+def test_use_sparse_core_follows_dma_granule_support(monkeypatch, granule, expected):
+    monkeypatch.setattr(envs, "USE_MOE_SPARSE_CORE", True, raising=False)
+    sc_info = _fake_sc_info(16, 2, 16)
+    if granule is not None:
+        sc_info.dma_granule_size_bytes = granule
+    monkeypatch.setattr(
+        fused_moe_gmm.pltpu, "get_tpu_info", lambda: _fake_tpu_info(sc_info)
+    )
+    assert fused_moe_gmm.resolve_use_sparse_core() is expected
+
+
+def test_use_sparse_core_keeps_env_without_sparse_core(monkeypatch):
+    # The kernels fall back internally there; only an unsupported SparseCore
+    # changes the configured value.
+    monkeypatch.setattr(envs, "USE_MOE_SPARSE_CORE", True, raising=False)
+    monkeypatch.setattr(
+        fused_moe_gmm.pltpu, "get_tpu_info", lambda: _fake_tpu_info(None)
+    )
+    assert fused_moe_gmm.resolve_use_sparse_core() is True
+
+
+def test_use_sparse_core_keeps_env_on_non_tpu_host(monkeypatch):
+    monkeypatch.setattr(envs, "USE_MOE_SPARSE_CORE", True, raising=False)
+
+    def _raise():
+        raise ValueError("Unsupported TPU device kind: cpu")
+
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _raise)
+    assert fused_moe_gmm.resolve_use_sparse_core() is True
 
 
 def test_prepare_routed_onehot_permute_matches_plain_gather():

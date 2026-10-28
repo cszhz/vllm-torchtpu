@@ -70,6 +70,7 @@ from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     resolve_onehot_permute_threshold,
+    resolve_use_sparse_core,
 )
 from vllm_torchtpu.logger import init_logger
 
@@ -138,7 +139,7 @@ def _gmm_layer(
         topk=topk,
         activation="silu",
         use_ep=start is not None,
-        use_sparse_core=envs.USE_MOE_SPARSE_CORE,
+        use_sparse_core=resolve_use_sparse_core(),
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=None,
         skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,

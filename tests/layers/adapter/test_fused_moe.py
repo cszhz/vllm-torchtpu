@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_torchtpu.layers.adapter import fused_moe
 from vllm_torchtpu.layers.adapter.fused_moe import get_fused_moe_activation
 
 
@@ -67,3 +68,27 @@ def test_get_fused_moe_activation_compiles():
 
     res = compiled_fn(torch.ones(1).to("tpu"), _Activation.SILU)
     assert res.cpu() == 2.0
+
+
+@pytest.mark.parametrize("use_sparse_core", [True, False])
+def test_custom_op_takes_sparse_core_flag_from_resolver(monkeypatch, use_sparse_core):
+    """The op binds resolve_use_sparse_core(), which turns the SparseCore path
+    off on TPUs whose SparseCore the kernels do not support (TPU8i)."""
+    built = {}
+
+    class _Op:
+        def register_fake(self, fn):
+            pass
+
+    def jax_op(name, fn):
+        built["fn"] = fn
+        return _Op()
+
+    monkeypatch.setattr(fused_moe.pallas, "jax_op", jax_op)
+    monkeypatch.setattr(fused_moe, "resolve_use_sparse_core", lambda: use_sparse_core)
+    monkeypatch.setattr(fused_moe, "resolve_onehot_permute_threshold", lambda: 0)
+    monkeypatch.setattr(fused_moe, "_fused_moe_kernel_cache", {})
+    fused_moe._build_fused_moe_custom_op(
+        topk=2, activation="silu", use_ep=False, skip_padded_tokens=False
+    )
+    assert built["fn"].keywords["use_sparse_core"] is use_sparse_core

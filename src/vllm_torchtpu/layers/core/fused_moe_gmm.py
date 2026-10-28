@@ -41,6 +41,7 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     token_block_alignment,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.kernels.sparse_core.support import is_supported_sparse_core
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -87,12 +88,30 @@ def resolve_onehot_permute_threshold() -> int:
     except ValueError:
         # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
         return 0
-    if sc_info is None:
+    if not is_supported_sparse_core(sc_info):
         return 0
     block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
     threshold = min(block_rows - 1, _ONEHOT_AUTO_CAP)
 
     return threshold
+
+
+def resolve_use_sparse_core() -> bool:
+    """Whether MoE permute/combine use the SparseCore gather/reduce kernels.
+
+    ``USE_MOE_SPARSE_CORE`` opts in. On a TPU whose SparseCore these kernels do
+    not support (e.g. TPU8i, which has 64-byte DMA granules) MoE uses the
+    plain-JAX path instead, so it runs there without ``USE_MOE_SPARSE_CORE=0``.
+    TPUs without a SparseCore and non-TPU hosts keep the configured value.
+    """
+    if not envs.USE_MOE_SPARSE_CORE:
+        return False
+    try:
+        sc_info = pltpu.get_tpu_info().sparse_core
+    except ValueError:
+        # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
+        return True
+    return sc_info is None or is_supported_sparse_core(sc_info)
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:

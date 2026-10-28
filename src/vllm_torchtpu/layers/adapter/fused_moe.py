@@ -27,6 +27,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
     quantize_to_native_fp4_kmajor,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
+    resolve_use_sparse_core,
     unpack_fp4_to_e2m1,
 )
 
@@ -167,7 +168,7 @@ def _build_fused_moe_custom_op(
     # instead of this env flag -- the MoE analog of how #191 moved batched
     # RPA onto --attention-backend CUSTOM. Note MoEBackend has no CUSTOM slot
     # yet, so that also needs an upstream OOT-backend hook.
-    use_sparse_core = envs.USE_MOE_SPARSE_CORE
+    use_sparse_core = resolve_use_sparse_core()
 
     # Pass experts_start as a runtime tensor rather than static closure arg so every EP
     # rank compiles an identical program.
