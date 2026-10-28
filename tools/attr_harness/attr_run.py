@@ -34,6 +34,8 @@ from vllm_torchtpu.kernels.attention_preprocessing import (
 )
 
 MODE = sys.argv[1]
+if MODE not in {"formal", "diag-light"}:
+    raise SystemExit(f"unsupported mode: {MODE}")
 OUT = L.OUT
 OUT.mkdir(parents=True, exist_ok=True)
 # keep original + every post-RA pass in addition to gap_lib's final bundles / packed / utilization
@@ -43,42 +45,12 @@ D, R, KV, H, HD = L.D, L.R, L.KV, L.H, L.HD
 
 QAC, QBC, CC = L.TBS.QARopeConfig, L.TBS.QBRopeConfig, L.TBS.CompressConfig
 CASES = [
-    dict(id="A_2048", kind="A", T=2048, exp=QAC(token_block=512, weight_chunk=896)),
-    dict(id="A_288", kind="A", T=288, exp=QAC(token_block=288, weight_chunk=896)),
     dict(id="B_2048", kind="B", T=2048, exp=QBC(token_block=512)),
     dict(
         id="B_288",
         kind="B",
         T=288,
         exp=QBC(token_block=288, head_block=8, output_slots=4, quant_fragment=32),
-    ),
-    dict(
-        id="C2_2048",
-        kind="C2",
-        T=2048,
-        exp=CC(token_block=512, weight_chunk=512),
-        structure=("single", "odd"),
-    ),
-    dict(
-        id="C2_288",
-        kind="C2",
-        T=288,
-        exp=CC(token_block=288, weight_chunk=512),
-        structure=("many6", "mixed"),
-    ),
-    dict(
-        id="C1_2048",
-        kind="C1",
-        T=2048,
-        exp=CC(token_block=256),
-        structure=("single", "odd"),
-    ),
-    dict(
-        id="C1_288",
-        kind="C1",
-        T=288,
-        exp=CC(token_block=144),
-        structure=("many6", "mixed"),
     ),
 ]
 

@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# ruff: noqa: E501  (diagnostic branch, not for merge)
 """Q-B projection and interleaved RoPE for integration into the model.
 
 Same pipeline and numerics as ``qb_overlap3``. RoPE input is the per-step
@@ -39,7 +38,7 @@ from vllm_torchtpu.kernels.attention_preprocessing.tuned_block_sizes import (
 _ROW_ALIGN = 32
 
 
-def _qb_rope_kernel_inner(
+def _qb_rope_kernel(
     qr_ref,
     weight_hbm,
     scale_ref,
@@ -97,22 +96,21 @@ def _qb_rope_kernel_inner(
         def issue(pair, _):
             weight_copy(0, pair).start(priority=1)
 
-        with jax.named_scope("attr_b/weight_issue_prologue"):
-            jax.lax.fori_loop(0, pairs, issue, None)
+        jax.lax.fori_loop(0, pairs, issue, None)
 
     @pl.when(window == 0)
     def prepare_rows():
-        def quantize_fragment(fragment, _):
-            start = pl.multiple_of(fragment * quant_fragment, quant_fragment)
-            rows = pl.ds(start, quant_fragment)
-            cached = pl.ds(token_start + start, quant_fragment)
-            encoded, scale = _quantize_rows(qr_ref[rows, :])
-            encoded_ref[cached, :] = encoded
-            row_scale_ref[cached, :] = scale
+        with jax.named_scope("attr_b/prepare_rows"):
 
-        with jax.named_scope("attr_b/prepare_quant"):
+            def quantize_fragment(fragment, _):
+                start = pl.multiple_of(fragment * quant_fragment, quant_fragment)
+                rows = pl.ds(start, quant_fragment)
+                cached = pl.ds(token_start + start, quant_fragment)
+                encoded, scale = _quantize_rows(qr_ref[rows, :])
+                encoded_ref[cached, :] = encoded
+                row_scale_ref[cached, :] = scale
+
             jax.lax.fori_loop(0, tb // quant_fragment, quantize_fragment, None)
-        with jax.named_scope("attr_b/prepare_coeff"):
             cos_lanes, sin_lanes = rope_gather.coefficients(rope_rows_ref[...])
             coeff_ref[0, pl.ds(token_start, tb), :] = cos_lanes
             coeff_ref[1, pl.ds(token_start, tb), :] = sin_lanes
@@ -133,26 +131,23 @@ def _qb_rope_kernel_inner(
 
             @pl.when(g - slots >= 0)
             def _(g=g):
-                with jax.named_scope("attr_b/reclaim_wait"):
-                    copy(g - slots).wait()
+                copy(g - slots).wait()
 
     def matmul(pair, parity):
         """FP32 products of this step's head pair into its parity buffer."""
 
-        # Later tiles of a window find its weights already resident.
-        @pl.when(tile == 0)
-        def _():
-            @pl.when(window + 1 < windows)
+        with jax.named_scope("attr_b/matmul_loop"):
+            # Later tiles of a window find its weights already resident.
+            @pl.when(tile == 0)
             def _():
-                with jax.named_scope("attr_b/weight_next_start"):
+                @pl.when(window + 1 < windows)
+                def _():
                     weight_copy(window + 1, pair).start(priority=1)
 
-            with jax.named_scope("attr_b/weight_wait"):
                 weight_copy(window, pair).wait()
 
-        tokens = pl.ds(token_start, tb)
-        weights = weight_ref.at[window % 2, pair]
-        with jax.named_scope("attr_b/matmul_pair"):
+            tokens = pl.ds(token_start, tb)
+            weights = weight_ref.at[window % 2, pair]
             for half in range(2):
                 products[parity][half] = jnp.dot(
                     encoded_ref[tokens, :],
@@ -162,14 +157,14 @@ def _qb_rope_kernel_inner(
 
     def post(g, parity):
         """Scale, round, rotate and pack global pair g, then start its DMA."""
-        valid = g >= 0
-        g = jnp.maximum(g, 0)  # step 0's "previous pair": compute on safe rows
-        t, q = g // pairs, g % pairs
-        rows0 = pl.multiple_of((t % tiles) * tb, _ROW_ALIGN)
-        head0 = ((t // tiles) * pairs + q) * 2
-        slot = g % slots
-        source = products[parity]
-        with jax.named_scope("attr_b/post_pair"):
+        with jax.named_scope("attr_b/post_loop"):
+            valid = g >= 0
+            g = jnp.maximum(g, 0)  # step 0's "previous pair": compute on safe rows
+            t, q = g // pairs, g % pairs
+            rows0 = pl.multiple_of((t % tiles) * tb, _ROW_ALIGN)
+            head0 = ((t // tiles) * pairs + q) * 2
+            slot = g % slots
+            source = products[parity]
             for f in range(tb // post_fragment):
                 local = pl.ds(f * post_fragment, post_fragment)
                 tokens = pl.ds(rows0 + f * post_fragment, post_fragment)
@@ -205,9 +200,8 @@ def _qb_rope_kernel_inner(
                     )
                 )
 
-        @pl.when(valid)
-        def _():
-            with jax.named_scope("attr_b/out_copy_start"):
+            @pl.when(valid)
+            def _():
                 copy(g).start()
 
     first = step * pairs  # global index of this step's pair 0
@@ -232,9 +226,9 @@ def _qb_rope_kernel_inner(
 
     @pl.when(step == windows * tiles - 1)
     def finish():
-        reclaim(last)
-        post(last, 1)
-        with jax.named_scope("attr_b/finish_drain"):
+        with jax.named_scope("attr_b/finish"):
+            reclaim(last)
+            post(last, 1)
             for back in range(slots):
                 copy(last - back).wait()
 
@@ -473,8 +467,3 @@ def supported(qr, weight, weight_scale, rope_rows, head_dim=512) -> bool:
     except ValueError:
         return False
     return weight.shape[1] % head_dim == 0 and (weight.shape[1] // head_dim) % 4 == 0
-
-
-def _qb_rope_kernel(*args, **kwargs):
-    with jax.named_scope("attr_b/body"):
-        return _qb_rope_kernel_inner(*args, **kwargs)
