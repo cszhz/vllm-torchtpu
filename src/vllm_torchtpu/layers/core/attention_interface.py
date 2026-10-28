@@ -917,9 +917,11 @@ def sparse_mla_attention(
         - The sparse attention output (`[num_tokens, num_heads, lkv_dim]`).
 
     Contract notes:
-      * The kernel takes a SINGLE `q` of shape (T, N, nope+rope) in
-        token-major order -- no separate rope argument, and no head-major
-        transpose (the v2 kernel wants (N, T, L); this one does not).
+      * By default (`TPU_MLA_SPARSE_SPLIT_Q=0`), the kernel takes a single
+        concatenated `q` of shape (T, N, nope+rope) in token-major order;
+        when `TPU_MLA_SPARSE_SPLIT_Q=1` (and per-device heads are packed and
+        `lkv_dim % 128 == 0`), `ql_nope` and `q_pe` are passed separately so
+        the kernel joins them in VMEM without a padded `[T, N, 640]` concat.
       * `q` must be bf16 (pre-quantization): the kernel dequantizes the
         gathered KV to bf16 and has no q-scale plumbing.
       * Fused KV-cache insert: writes current step's `kv_c_normed` and `k_pe`
@@ -967,6 +969,11 @@ def sparse_mla_attention(
         )
     cache_layout = nope_spec.layout.value
     chunk_kwargs = sparse_mla_chunk_kwargs()
+    split_q = (
+        envs.TPU_MLA_SPARSE_SPLIT_Q
+        and lkv_dim % 128 == 0
+        and ql_nope.shape[1] % sparse_mla_kernel.get_dtype_packing(ql_nope.dtype) == 0
+    )
 
     def _sparse_mla_ragged_paged_attention(
         ql_nope,
@@ -1012,7 +1019,7 @@ def sparse_mla_attention(
             )
             return output, kv_cache_nope, kv_cache_rope
 
-        if envs.TPU_MLA_SPARSE_SPLIT_Q:
+        if split_q:
             q, split_kwargs = ql_nope, {"q_pe": q_pe}
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
@@ -1032,9 +1039,9 @@ def sparse_mla_attention(
         )
 
         lkv_dim = ql_nope.shape[-1]
-        # The kernel's output is lkv_dim + rope_dim wide because it attends
-        # over concatenated (nope + rope) keys. Only the nope part is the MLA
-        # value (P @ latent); drop the rope tail before the W_UV projection.
+        # On the concat path, the kernel's output is lkv_dim + rope_dim wide
+        # (on the split-q path it is already lkv_dim wide); drop any rope tail
+        # before the W_UV projection.
         return output[..., :lkv_dim], kv_cache_nope, kv_cache_rope
 
     output, new_kv_cache_nope, new_kv_cache_rope = jax.jit(

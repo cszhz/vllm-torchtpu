@@ -280,13 +280,20 @@ class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
                 ROPE_SC_SPEC,
             )
 
-    @parameterized.parameters(False, True)
-    def test_split_q_plumbing(self, split_q: bool):
-        """`TPU_MLA_SPARSE_SPLIT_Q` passes `q_pe` separately instead of
-        concatenating `[ql_nope, q_pe]` before the kernel call."""
+    @parameterized.parameters(
+        (False, 2, False),
+        (True, 2, True),
+        # Unpacked per-device head count (1 < bf16 packing 2) falls back to the
+        # concat path (`prepare_q_inputs` pads heads) instead of raising in
+        # `static_validate_inputs`.
+        (True, 1, False),
+    )
+    def test_split_q_plumbing(self, split_q: bool, num_heads: int, expect_split: bool):
+        """`TPU_MLA_SPARSE_SPLIT_Q` passes `q_pe` separately when heads are
+        packed, and falls back to `[ql_nope, q_pe]` concat when unpacked."""
         mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x",))
-        ql_nope = jnp.ones((4, 2, LKV_DIM), jnp.bfloat16)
-        q_pe = jnp.ones((4, 2, ROPE_DIM), jnp.bfloat16)
+        ql_nope = jnp.ones((4, num_heads, LKV_DIM), jnp.bfloat16)
+        q_pe = jnp.ones((4, num_heads, ROPE_DIM), jnp.bfloat16)
         recorded: dict[str, object] = {}
 
         def fake_kernel(q, kv_nope, kv_rope, *args, **kwargs):
@@ -329,10 +336,10 @@ class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
                 ROPE_SPEC,
             )
 
-        self.assertEqual(out.shape, (4, 2, LKV_DIM))
-        self.assertEqual(recorded["has_q_pe"], split_q)
-        if split_q:
-            self.assertEqual(recorded["q_shape"], (4, 2, LKV_DIM))
-            self.assertEqual(recorded["q_pe_shape"], (4, 2, ROPE_DIM))
+        self.assertEqual(out.shape, (4, num_heads, LKV_DIM))
+        self.assertEqual(recorded["has_q_pe"], expect_split)
+        if expect_split:
+            self.assertEqual(recorded["q_shape"], (4, num_heads, LKV_DIM))
+            self.assertEqual(recorded["q_pe_shape"], (4, num_heads, ROPE_DIM))
         else:
-            self.assertEqual(recorded["q_shape"], (4, 2, LKV_DIM + ROPE_DIM))
+            self.assertEqual(recorded["q_shape"], (4, num_heads, LKV_DIM + ROPE_DIM))
