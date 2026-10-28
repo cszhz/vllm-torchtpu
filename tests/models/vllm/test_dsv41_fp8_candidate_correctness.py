@@ -161,7 +161,9 @@ def test_paired_gather_preserves_each_query(
             (q.shape[0], prepared.block_ids.shape[1] * block, topk),
             1,
         )
-        monkeypatch.setattr(_cpu_logits, "__wrapped__", _cpu_logits, raising=False)
+        monkeypatch.setattr(
+            _cpu_gathered_logits, "__wrapped__", _cpu_gathered_logits, raising=False
+        )
     actual = indexer_impl._score_prepared(
         q, weights, lengths, prepared, topk, block, unordered, width
     )
@@ -192,7 +194,9 @@ def test_source_publishes_per_query_across_score_chunks(
 ):
     width, topk = (1024, 512) if streaming else (64, 5)
     if streaming:
-        monkeypatch.setattr(_cpu_logits, "__wrapped__", _cpu_logits, raising=False)
+        monkeypatch.setattr(
+            _cpu_gathered_logits, "__wrapped__", _cpu_gathered_logits, raising=False
+        )
 
         def select(scores, *, k, valid_lengths, **kwargs):
             scores = jnp.where(

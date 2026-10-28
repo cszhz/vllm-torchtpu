@@ -48,7 +48,7 @@ def _kernel(
     q_tile, key_tile = config.query_tile, config.key_tile
     tile_rows = key_tile // PAGE_RECORDS * PAGE_ROWS
     group_rows = out.shape[1] // PAGE_RECORDS * PAGE_ROWS
-    tiles, fragments = out.shape[1] // key_tile, key_tile // mxu_size
+    tiles = out.shape[1] // key_tile
 
     def copy_queries(query, slot, wait=False, zero=False):
         dst = queries.at[pl.ds(slot * q_tile, q_tile)]
@@ -154,25 +154,13 @@ def _kernel(
             def key_rows(start, count):
                 return keys[key_slot(tile), pl.ds(start, count)]
 
-            block_flags = None
-            if membership is not None:
-                blocks_per_tile = key_tile // membership_block_size
-                block_flags = jnp.stack(
-                    [
-                        membership[r, pl.ds(tile * blocks_per_tile, blocks_per_tile)]
-                        for r in row_ids(query)
-                    ]
-                )
-                block_flags = block_flags.astype(jnp.int32)
             base = tile * key_tile + jnp.arange(PAGE_RECORDS)
             remaining = jnp.maximum(lengths_vector, 0)[:, None] - base[None, :]
 
             def qk(fragment):
                 parts = []
-                for page in range(
-                    fragment * mxu_size // PAGE_RECORDS,
-                    (fragment + 1) * mxu_size // PAGE_RECORDS,
-                ):
+                for offset in range(0, mxu_size, PAGE_RECORDS):
+                    page = (fragment * mxu_size + offset) // PAGE_RECORDS
                     words = key_rows(page * PAGE_ROWS, PAGE_ROWS - 1)
                     parts.append(pltpu.bitcast(words, q.dtype))
                 logits = lax.dot(
@@ -192,39 +180,71 @@ def _kernel(
                     scaled = values[:, offset : offset + PAGE_RECORDS] * scale
                     column = local_page * PAGE_RECORDS
                     scaled = jnp.where(remaining > column, scaled, -jnp.inf)
-                    if block_flags is not None:
-                        columns = (
-                            column + jnp.arange(PAGE_RECORDS)
-                        ) // membership_block_size
-                        first_flag = (column // membership_block_size // 128) * 128
-                        local_flags = block_flags[:, first_flag : first_flag + 128]
-                        allowed = (
-                            jnp.take_along_axis(
-                                local_flags,
-                                jnp.broadcast_to(
-                                    (columns - first_flag)[None, :],
-                                    (block_flags.shape[0], columns.shape[0]),
+                    columns = (
+                        tile * key_tile + column + jnp.arange(PAGE_RECORDS)
+                    ) // membership_block_size
+                    first_flag = (
+                        (tile * key_tile + column)
+                        // membership_block_size
+                        // info.num_lanes
+                        * info.num_lanes
+                    )
+                    local_flags = jnp.stack(
+                        [
+                            membership[
+                                r,
+                                pl.ds(
+                                    pl.multiple_of(first_flag, info.num_lanes),
+                                    info.num_lanes,
                                 ),
-                                axis=1,
-                            )
-                            != 0
+                            ]
+                            for r in row_ids(query)
+                        ]
+                    )
+                    allowed = (
+                        jnp.take_along_axis(
+                            local_flags,
+                            jnp.broadcast_to(
+                                (columns - first_flag)[None, :], (q_tile, PAGE_RECORDS)
+                            ),
+                            axis=1,
                         )
-                        scaled = jnp.where(allowed, scaled, -jnp.inf)
+                        != 0
+                    )
+                    scaled = jnp.where(allowed, scaled, -jnp.inf)
                     scores[output_slot(tile), :, pl.ds(column, PAGE_RECORDS)] = scaled
 
-            pending = {}
-            for stage in range(fragments + config.issue_depth):
-                if stage < fragments:
-                    pending[stage] = qk(stage)
-                if stage >= config.issue_depth:
-                    fragment = stage - config.issue_depth
-                    values = _reduce_heads(
-                        pending.pop(fragment) * head_weights,
-                        selector,
-                        sublanes=sublanes,
-                        use_mxu=False,
-                    )
-                    store(fragment, values)
+            valid_keys = jnp.minimum(key_tile, query_limit(query) - tile * key_tile)
+            fragments = pl.cdiv(valid_keys, mxu_size)
+            scores[output_slot(tile)] = jnp.full(
+                scores.shape[1:], -jnp.inf, jnp.float32
+            )
+
+            def emit_fragments(base, count):
+                pending = {}
+                for stage in range(count + config.issue_depth):
+                    if stage < count:
+                        pending[stage] = qk(base + stage)
+                    if stage >= config.issue_depth:
+                        fragment = stage - config.issue_depth
+                        values = _reduce_heads(
+                            pending.pop(fragment) * head_weights,
+                            selector,
+                            sublanes=sublanes,
+                            use_mxu=False,
+                        )
+                        store(base + fragment, values)
+
+            # Unroll only a short MXU pipeline, while the loop bound follows
+            # this pair's visible union. The remainder computes no extra fragments.
+            batch = 2 * config.issue_depth
+            complete = fragments // batch
+            lax.fori_loop(
+                0, complete, lambda i, _: emit_fragments(i * batch, batch), None
+            )
+            lax.fori_loop(
+                complete * batch, fragments, lambda i, _: emit_fragments(i, 1), None
+            )
 
         def step_tile(tile, _):
             count = key_rows_to_read(tile, query_limit(query))
@@ -323,6 +343,7 @@ def fp8_gathered_mqa_logits(
     format. Offsets map one or two adjacent queries to that region; membership
     is per query, in union-block order. Weights already include query scales.
     DMA reads only the visible union prefix, rounded to a packed 128-token page.
+    Only its MXU fragments are computed; the remaining output stays negative infinity.
     Context lengths count visible tokens in the sorted union. Returned column
     IDs remain compact; the outer top-k maps them through canonical block IDs.
     """
@@ -350,7 +371,7 @@ def fp8_gathered_mqa_logits(
     keys = keys.reshape(groups, group_rows, PAGE_RECORDS)[:, :padded_rows]
     keys = jnp.pad(keys, ((0, 0), (0, max(0, padded_rows - group_rows)), (0, 0)))
     keys = keys.reshape(-1, PAGE_RECORDS)
-    columns = width // membership_block_size
+    columns = pl.cdiv(width // membership_block_size, info.num_lanes) * info.num_lanes
     membership = jnp.pad(
         block_membership[:, :columns].astype(jnp.int32),
         ((0, 0), (0, max(0, columns - block_membership.shape[1]))),
