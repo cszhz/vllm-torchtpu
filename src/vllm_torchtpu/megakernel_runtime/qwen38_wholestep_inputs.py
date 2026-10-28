@@ -56,6 +56,13 @@ def carrier_pages_per_block(pool: Any) -> int:
     return math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * width * 2)
 
 
+def _physical_pages(pool: Any) -> int:
+    """Kernel pages per pool block column (`compressed_kernel_pages`' column stride)."""
+    import math
+
+    return math.prod(pool.shape[1:]) * pool.dtype.itemsize // ((128 // GROUP) * pool.shape[-1] * 2)
+
+
 def qsa_step_inputs(
     pool: Any,
     tables: list[tuple[Any, Any, Any]],
@@ -72,6 +79,7 @@ def qsa_step_inputs(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     layer_major_tables: bool = False,
+    manager_pages: int = 0,
 ) -> dict[str, Any]:
     """`{name: array}` of the stage-C QSA extras for `len(tables)` QSA layers.
 
@@ -106,7 +114,15 @@ def qsa_step_inputs(
         cols = -(-n_ck // lp)
         comp = jnp.pad(comp, ((0, 0), (0, max(0, cols - comp.shape[1]))))[:, :cols]
         pages = compressed_kernel_pages(comp, pool, cslot, GROUP).reshape(nreq, cols * lp)
-        cktab.append(pages[:, :n_ck].astype(jnp.int32))
+        if manager_pages:
+            # One key-stream DMA per block column: its `lp` kernel pages are consecutive
+            # (`compressed_kernel_pages`), so the table holds `first page // lp` per column and the
+            # kernel copies pages `[id * lp, id * lp + lp)` (`QSAFullIndexedBlock.manager_pages`).
+            assert manager_pages == lp, (manager_pages, lp)
+            assert _physical_pages(pool) % lp == 0, (_physical_pages(pool), lp)
+            cktab.append((pages.reshape(nreq, cols, lp)[:, : n_ck // lp, 0] // lp).astype(jnp.int32))
+        else:
+            cktab.append(pages[:, :n_ck].astype(jnp.int32))
         ring, _ = read_ring_and_tags(pool, ids, RING_ROWS * IDX_DIM, RING_ROWS * 2)
         ring = ring.reshape(nreq, RING_ROWS, IDX_DIM)
         rings.append(jnp.where((ctx > 0)[:, None, None], ring, 0).astype(jnp.bfloat16))

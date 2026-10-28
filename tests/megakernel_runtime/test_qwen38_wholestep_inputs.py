@@ -116,3 +116,36 @@ def test_shared_addressing_is_the_former_inline_stock_formula():
             first = jnp.arange(logical) + (slot * logical if slot else 0)
             want = (pages[..., None] * physical + first).reshape(-1)
             np.testing.assert_array_equal(compressed_kernel_pages(pages, pool, slot), want)
+
+
+def test_manager_page_table_expands_to_the_per_page_table(monkeypatch):
+    """`wholekeymp=4` (manager_pages = kernel pages per 512-token block column): each table entry
+    m addresses kernel pages [4m, 4m + 4), and expanding it gives exactly the per-page table of the
+    same request (slot 1 packed, a 100K and a short context); a wrong manager size is refused."""
+    monkeypatch.setattr(
+        wsi, "read_ring_and_tags",
+        lambda pool, ids, n, m: (jnp.zeros((len(ids), n), jnp.bfloat16), None),
+    )
+    pool = jnp.zeros((4096, 512, 1, 4, 256), jnp.float8_e4m3fn)
+    nreq, T, max_groups, slot = 2, 4, 32768, 1
+    ctx = np.array([100_000, 3_000], np.int32)
+    rng = np.random.default_rng(3)
+    comp = np.zeros((nreq, 260), np.int32)
+    for q, b in enumerate(-(-ctx // 512)):
+        comp[q, :b] = rng.choice(np.arange(1, 4096), size=b, replace=False)
+    tables = [(jnp.ones((nreq, 1), jnp.int32), jnp.ones((nreq, 1024), jnp.int32), jnp.asarray(comp))]
+
+    def run(mp):
+        return np.asarray(qsa_step_inputs(
+            pool, tables, [(0, slot)], jnp.zeros((200_000, 128), jnp.float32),
+            jnp.arange(nreq * T, dtype=jnp.int32), jnp.arange(0, nreq * T + 1, T, dtype=jnp.int32),
+            jnp.asarray(ctx), M=nreq * T, T=T, pages_per_seq=1024, max_groups=max_groups,
+            layer_major_tables=True, manager_pages=mp,
+        )["qsa_cktab"])[0]
+
+    per_page, managed = run(0), run(4)
+    assert managed.shape[1] * 4 == per_page.shape[1]
+    expanded = (managed[:, :, None] * 4 + np.arange(4)).reshape(nreq, -1)
+    np.testing.assert_array_equal(expanded, per_page)
+    with pytest.raises(AssertionError):
+        run(8)

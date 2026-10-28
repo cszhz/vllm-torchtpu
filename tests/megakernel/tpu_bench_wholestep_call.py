@@ -63,10 +63,13 @@ def main():
     ap.add_argument("--phys", action="store_true",
                     help="union ids -> physical page ids per request (VLLM_TPU_MEGAKERNEL wholephys=1)")
     ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
+    ap.add_argument("--key-mp", type=int, default=0,
+                    help="key-stream kernel pages per DMA (VLLM_TPU_MEGAKERNEL wholekeymp=N; 4 = one block column)")
     a = ap.parse_args()
     _apply_removals(a.remove)
     wsc.SHARD_INDEX, wsc.UNION_ATTN, wsc.LOOP_REQUESTS = a.shard, a.union, a.loop
     wsc.UNION_PHYS = a.phys
+    wsc.KEY_MP = a.key_mp
     if a.slots:
         from vllm_torchtpu.megakernel.wholestep import qsa_full_b
 

@@ -61,6 +61,9 @@ LOOP_REQUESTS = False
 # `...,wholephys=1` (with `wholeunion=1`): union ids -> physical micro-page ids in one vector pass
 # per request, so each attention copy issues from one SMEM load (same addresses; RPAd's recipe).
 UNION_PHYS = False
+# `...,wholekeymp=4`: the key stream copies each block column's 4 consecutive kernel pages in one DMA
+# (`QSAFullIndexedBlock.manager_pages`; per-kernel-page 16 KiB descriptors are issue-bound). 0 = per page.
+KEY_MP = 0
 
 
 def union_stats_on() -> bool:
@@ -71,7 +74,7 @@ def indexed_options() -> dict:
     """The served indexer options (`LONG_CONTEXT`, the request-sharded selection, union attention)."""
     return dict(
         LONG_CONTEXT, shard_index=SHARD_INDEX, union_attn=UNION_ATTN, union_stats=union_stats_on(),
-        loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS,
+        loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS, manager_pages=KEY_MP,
     )
 
 
@@ -165,7 +168,7 @@ def build_wholestep_call(
         d = qsa_step_inputs(
             pool, tables, slots, trig, positions, starts, context, M=M, T=T,
             pages_per_seq=pps, max_groups=max_groups, k_scale=scales[0], v_scale=scales[1],
-            layer_major_tables=LONG_CONTEXT["hbm_tables"],
+            layer_major_tables=LONG_CONTEXT["hbm_tables"], manager_pages=KEY_MP,
         )
         return tuple(d[n] for n in names)
 

@@ -667,6 +667,11 @@ class Qwen38SegmentDriver:
             from . import qwen38_wholestep_call
 
             qwen38_wholestep_call.UNION_ATTN = True
+        keymp = _parse_int(raw, "wholekeymp")
+        if keymp:
+            from . import qwen38_wholestep_call
+
+            qwen38_wholestep_call.KEY_MP = keymp
         if _parse_flag(raw, "wholephys", False):
             from . import qwen38_wholestep_call
 
