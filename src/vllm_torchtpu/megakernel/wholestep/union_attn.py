@@ -131,6 +131,7 @@ def attend_request(
     interpret: bool,
     recent: tuple[jax.Array, jax.Array, list[jax.Array], jax.Array],
     phys: bool = False,
+    ablate: str = "",
 ) -> list[jax.Array]:
     """Gated sparse attention of one request's `T` rows over their union: `T` `[nh, 256]` F32.
 
@@ -139,6 +140,8 @@ def attend_request(
     maps a group to its micro-page as `attend_row`'s `table` does. `qs` / `gates` `[nh, 256]` and
     `phys`: `ids` already holds physical micro-page ids (`physical_ids`) for every slot a tile
     reads (`< ceil(n_union / 64) * 64`); each copy is then one SMEM load, no table, no clamp.
+    `ablate` (timing-only, wrong results): "dma" issues no copies (tiles read the ring as it is),
+    "compute" keeps the copies but skips unpack, scoring and softmax of every tile.
     `has` (the row has pool tokens) per row. `recent = (k [8, 256], v [8, 256], ok_rows, ok_any
     [8, 1])` in pool units, `ok_rows` `T` `[1, 8]` masks. Each tile is copied and unpacked once and
     scored per row (`[nh, 256]` queries, as `attend_row`); scaling follows `attend_row` without
@@ -171,10 +174,14 @@ def attend_request(
         return out
 
     def start(t: Any, s: Any) -> None:
+        if ablate == "dma":
+            return
         for cp in copies(t, s):
             cp.start()
 
     def wait(t: Any, s: Any) -> None:
+        if ablate == "dma":
+            return
         if interpret:
             for cp in copies(t, s):
                 cp.wait()
@@ -204,6 +211,8 @@ def attend_request(
         def _():
             start(ahead, jax.lax.rem(ahead, nslots))
 
+        if ablate == "compute":
+            return carry
         win = codes[:, pl.ds(pl.multiple_of((t // 2) * 128, 128), 128)].astype(F32).astype(BF16)
         tok_code = jnp.where(
             jax.lax.rem(t, 2) == 0,
