@@ -353,17 +353,22 @@ def main():
 
         info = plsc.get_sparse_core_info()
         key = (min(args.block, args.page_size), len(banks))
-        tuning = tuned_block_sizes.PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG
+        whole_pages = key in tuned_block_sizes.PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG
+        tuning = (
+            tuned_block_sizes.PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG
+            if whole_pages
+            else tuned_block_sizes.PAGED_MQA_GATHER_CONFIG
+        )
         original = tuning[key]
         expected_keys = np.asarray(gathered).reshape(-1, key[0])[valid]
-        for group in (16, 32, 48, 64, 96):
+        for group in (32, 64, 96, 128, 192, 256):
             for buffers in (1, 2, 3, 4):
-                scratch = (
-                    buffers
-                    * group
-                    * (layout.page_rows * 128 + 33 * key[0] + len(banks))
-                    * 4
+                words = (
+                    layout.page_rows * 128 + 33 * key[0] + len(banks)
+                    if whole_pages
+                    else 33 * (key[0] + len(banks))
                 )
+                scratch = buffers * group * words * 4
                 if scratch > info.vmem_capacity_bytes * 0.9:
                     continue
                 tuning[key] = (group, buffers)

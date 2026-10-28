@@ -787,6 +787,32 @@ def gather_candidate_keys(
                                     valid, source - bank_base, -1
                                 )
                                 bank_base += size
+                    elif per_page == lanes:
+
+                        @plsc.parallel_loop(0, group, lanes)
+                        def block_addresses(i):
+                            chosen = selected[pl.ds(index * group + i, lanes)]
+                            safe = jnp.maximum(chosen, 0)
+                            base = (
+                                layout.page_offset
+                                + safe // source_per_page * layout.page_stride
+                            ) * per_page + safe % source_per_page
+                            for field in range(PAGE_ROWS):
+                                source = base + field * source_per_page
+                                bank_base = 0
+                                for bank, ref in enumerate(pool):
+                                    size = ref.shape[0] * per_page
+                                    valid = (
+                                        (chosen >= 0)
+                                        & (source >= bank_base)
+                                        & (source < bank_base + size)
+                                    )
+                                    read_ids[
+                                        slot,
+                                        bank,
+                                        pl.ds(i * PAGE_ROWS + field * lanes, lanes),
+                                    ] = jnp.where(valid, source - bank_base, -1)
+                                    bank_base += size
                     else:
 
                         @plsc.parallel_loop(0, span, lanes, unroll=8)
