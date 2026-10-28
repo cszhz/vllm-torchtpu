@@ -353,6 +353,8 @@ def fp8_gathered_mqa_logits(
     DMA reads only the visible union prefix, rounded to a packed 128-token page.
     Context lengths count visible tokens in the sorted union. Returned column
     IDs are per-query candidate slots; the existing top-k maps them to tokens.
+    candidate_slots fixes the original per-query candidate count. output_slots
+    maps union blocks to those original slots; -1 means no write for this query.
     Each FP32 fragment writes directly into query-local VMEM candidate slots.
     No union score array is materialized; completed query rows are DMAed to HBM.
     """

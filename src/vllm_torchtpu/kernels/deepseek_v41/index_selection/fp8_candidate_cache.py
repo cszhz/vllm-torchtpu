@@ -20,6 +20,8 @@ from .tuned_block_sizes import (
 
 
 class PreparedCandidates(NamedTuple):
+    """Internal union storage and original per-query output-slot metadata."""
+
     keys: jax.Array
     block_ids: jax.Array
     offsets: jax.Array
@@ -32,6 +34,8 @@ class PreparedCandidates(NamedTuple):
 
 
 class CandidateMetadata(NamedTuple):
+    """Union IDs plus forward/reverse maps to each query's original slots."""
+
     physical: jax.Array
     block_ids: jax.Array
     offsets: jax.Array
@@ -179,7 +183,9 @@ def _candidate_output_slots_reference(candidates, canonical):
     return jnp.where(valid, slots, -1), jnp.where(valid, candidates, -1)
 
 
-def candidate_output_slots(candidates, canonical, blocks):
+def candidate_output_slots(
+    candidates: jax.Array, canonical: jax.Array, blocks: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Build both slot maps, keeping the first occurrence in original query order."""
     rows, count = candidates.shape
     union_count = canonical.shape[1]
