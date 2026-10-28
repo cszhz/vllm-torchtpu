@@ -529,6 +529,31 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
             )
             np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
 
+    @parameterized.product(num_tokens=[17, 300, 1024])
+    def test_embed_matches_repeated_residual(self, num_tokens):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        x, _, plm, crm, *rest = _fused_args(
+            np.random.default_rng(11), num_tokens, 4096
+        )
+        embed = jnp.asarray(
+            np.random.default_rng(12).standard_normal((num_tokens, 4096)),
+            dtype=jnp.bfloat16,
+        )
+        repeated = jnp.repeat(embed[:, None, :], HC_MULT, axis=1)
+
+        want = fused_post_pre_kernel.mhc_fused_post_pre(x, repeated, plm, crm, *rest)
+        got = fused_post_pre_kernel.mhc_fused_post_pre_embed(x, embed, plm, crm, *rest)
+
+        # (sum_k comb_kj) * e reassociates the recombine: f32 rounding only.
+        for g, w, tol in zip(got, want, ("bf16", "f32", "f32", "bf16")):
+            rtol, atol = (
+                (BF16_RTOL, BF16_ATOL)
+                if tol == "bf16"
+                else (FUSED_F32_RTOL, FUSED_F32_ATOL)
+            )
+            np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
+
 
 @pytest.mark.tpu_test
 class MhcPreMixesPallasSmallShapeTest(parameterized.TestCase):

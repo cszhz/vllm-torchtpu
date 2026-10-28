@@ -64,11 +64,16 @@ def _fused_kernel(
     streams are HBM refs moved by hand through two VMEM slots: block i+1 is
     fetched during block i and block i is written back during block i+1.
     Without it, res_ref/newres_ref are the pipelined (tb, hc_hidden) blocks.
+
+    A res_ref only hidden_size wide is a row every old stream repeats (the
+    chain start's embedding e): stream j recombines as
+    post_j * x + (sum_k comb_kj) * e, the same math reassociated.
     """
     i = pl.program_id(0)
     tb = x_ref.shape[0]
     h = hidden_size
     last = num_blocks - 1
+    embed = res_ref.shape[1] == h
 
     if dma_scratch:
         res_buf, new_buf, in_sem, out_sem = dma_scratch
@@ -96,13 +101,22 @@ def _fused_kernel(
         post = post_ref[r, :]  # (rows, hc_mult) f32
         comb = comb_ref[r, :]  # (rows, hc_mult * hc_mult) f32, row-major (i, j)
         x_bf = x_ref[r, :]  # (rows, hidden) bf16
-        old_bf = [res_blk[r, k * h : (k + 1) * h] for k in range(hc_mult)]
+        if embed:
+            e_bf = res_blk[r, :]
+        else:
+            old_bf = [res_blk[r, k * h : (k + 1) * h] for k in range(hc_mult)]
         streams_bf = []
         for j in range(hc_mult):
             acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
-            for k in range(hc_mult):
-                kj = k * hc_mult + j
-                acc = acc + comb[:, kj : kj + 1] * old_bf[k].astype(jnp.float32)
+            if embed:
+                csum = comb[:, j : j + 1]
+                for k in range(1, hc_mult):
+                    csum = csum + comb[:, k * hc_mult + j : k * hc_mult + j + 1]
+                acc = acc + csum * e_bf.astype(jnp.float32)
+            else:
+                for k in range(hc_mult):
+                    kj = k * hc_mult + j
+                    acc = acc + comb[:, kj : kj + 1] * old_bf[k].astype(jnp.float32)
             # Round to bf16 BEFORE the GEMM: the unfused path's pre reads the
             # bf16 residual that post stored, and parity requires matching it.
             new_bf = acc.astype(jnp.bfloat16)
@@ -204,7 +218,8 @@ def fused_post_pre_2d(
 
     Args:
         x2d: (num_tokens, hidden_size), bfloat16 — sublayer output.
-        res2d: (num_tokens, hc_mult * hidden_size), bfloat16 — old streams.
+        res2d: (num_tokens, hc_mult * hidden_size), bfloat16 — old streams;
+            or (num_tokens, hidden_size) when every old stream is that row.
         post2d: (num_tokens, hc_mult), float32.
         comb2d: (num_tokens, hc_mult * hc_mult), float32, row-major (i, j).
         fn: (hc_mult3, hc_mult * hidden_size), float32 — next sublayer's
@@ -233,11 +248,11 @@ def fused_post_pre_2d(
     assert fn.dtype == jnp.float32, fn.dtype
 
     num_tokens, hidden_size = x2d.shape
-    hc_hidden = res2d.shape[1]
+    hc_mult3, hc_hidden = fn.shape
     hc_mult = hc_hidden // hidden_size
-    hc_mult3 = fn.shape[0]
-    assert res2d.shape == (num_tokens, hc_mult * hidden_size)
-    assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, res2d.shape)
+    res_width = res2d.shape[1]
+    assert res2d.shape[0] == num_tokens
+    assert res_width in (hc_hidden, hidden_size), (fn.shape, res2d.shape)
     assert gemm_precision in ("highest", "default"), gemm_precision
 
     # This kernel keeps a fixed block: its default already fits the
@@ -271,11 +286,12 @@ def fused_post_pre_2d(
     # also tends to keep the streams in VMEM), so it keeps the pipelined
     # blocks; longer grids move the streams by hand.
     if num_blocks == 1:
-        res_spec = pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0))
+        res_spec = pl.BlockSpec((tb, res_width), lambda i: (i, 0))
+        new_spec = pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0))
     else:
-        res_spec = pl.BlockSpec(memory_space=pl.ANY)
+        res_spec = new_spec = pl.BlockSpec(memory_space=pl.ANY)
         scratch_shapes += [
-            pltpu.VMEM((2, tb, hc_hidden), jnp.bfloat16),
+            pltpu.VMEM((2, tb, res_width), jnp.bfloat16),
             pltpu.VMEM((2, tb, hc_hidden), jnp.bfloat16),
             pltpu.SemaphoreType.DMA((2,)),
             pltpu.SemaphoreType.DMA((2,)),
@@ -306,7 +322,7 @@ def fused_post_pre_2d(
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
         ],
         out_specs=[
-            res_spec,
+            new_spec,
             pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
             pl.BlockSpec((group, hc_mult), lambda i: (i // gate_blocks, 0)),
             pl.BlockSpec((group, hc_mult * hc_mult), lambda i: (i // gate_blocks, 0)),
@@ -374,6 +390,53 @@ def mhc_fused_post_pre(
         token_block_size=token_block_size,
         gemm_precision=gemm_precision,
         vmem_limit_bytes=vmem_limit_bytes,
+    )
+
+    return (
+        new_res2d.reshape(*outer_shape, hc_mult, hidden_size),
+        post_mix_cur.reshape(*outer_shape, hc_mult, 1),
+        comb_mix_cur.reshape(*outer_shape, hc_mult, hc_mult),
+        layer_input_cur.reshape(*outer_shape, hidden_size),
+    )
+
+
+def mhc_fused_post_pre_embed(
+    x: jax.Array,
+    embed: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``mhc_fused_post_pre`` whose old residual is ``embed`` in every stream.
+
+    embed (..., hidden_size) bf16 is read once instead of hc_mult copies;
+    outputs as ``mhc_fused_post_pre``, to f32 rounding.
+    """
+    assert embed.dtype == jnp.bfloat16
+    outer_shape = embed.shape[:-1]
+    hidden_size = embed.shape[-1]
+    hc_mult = fn.shape[1] // hidden_size
+
+    new_res2d, post_mix_cur, comb_mix_cur, layer_input_cur = fused_post_pre_2d(
+        x.reshape(-1, hidden_size).astype(jnp.bfloat16),
+        embed.reshape(-1, hidden_size),
+        post_layer_mix.reshape(-1, hc_mult),
+        comb_res_mix.reshape(-1, hc_mult * hc_mult),
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
     )
 
     return (

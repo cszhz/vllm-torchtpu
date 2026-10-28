@@ -212,6 +212,38 @@ def _mhc_fused_post_pre_jax(
     )
 
 
+def _mhc_fused_post_pre_embed_jax(
+    x: jax.Array,
+    embed: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``_mhc_fused_post_pre_jax`` whose old residual is ``embed`` in every stream."""
+    return fused_post_pre_kernel.mhc_fused_post_pre_embed(
+        x,
+        embed,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+
+
 def _fake_pre_outputs(
     residual: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -262,6 +294,14 @@ def _fake_mhc_fused_post_pre(
     x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, *args, **kwargs
 ):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return (torch.empty_like(residual), *_fake_pre_outputs(residual))
+
+
+def _fake_mhc_fused_post_pre_embed(x, embed, post_layer_mix, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    residual = embed.unsqueeze(-2).expand(
+        *embed.shape[:-1], post_layer_mix.shape[-2], -1
+    )
     return (torch.empty_like(residual), *_fake_pre_outputs(residual))
 
 
@@ -461,6 +501,44 @@ def _mhc_pre_embed_op(
     return op
 
 
+def _mhc_fused_post_pre_embed_op(
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+):
+    op_name = "pallas::deepseek_v4_mhc_fused_post_pre_embed_v1" + _gate_suffix(
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    )
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(
+                _mhc_fused_post_pre_embed_jax,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_repeat=sinkhorn_repeat,
+            ),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(ATTN_DATA_AXIS, None),  # embed
+                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+                P(),  # fn
+                P(),  # hc_scale
+                P(),  # hc_base
+            ),
+        )
+        op.register_fake(_fake_mhc_fused_post_pre_embed)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
 class MHCOps(NamedTuple):
     """The three registered mHC ops for one set of gate constants.
 
@@ -477,15 +555,16 @@ class MHCOps(NamedTuple):
     ``fused(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base)``
         residual_cur -- the ``post`` output -- then ``pre``'s three outputs
         computed from it.
-    ``pre_embed(embed, fn, hc_scale, hc_base)``
-        ``pre`` of a residual that repeats the (..., hidden_size) embedding
-        in every stream (the chain start), reading the embedding once.
+    ``pre_embed`` / ``fused_embed``
+        ``pre`` / ``fused`` with the (..., hidden_size) embedding in place of
+        a residual that repeats it in every stream (the chain start).
     """
 
     pre: Any
     fused: Any
     post: Any
     pre_embed: Any
+    fused_embed: Any
 
 
 def get_mhc_ops(
@@ -512,6 +591,9 @@ def get_mhc_ops(
         ),
         post=get_mhc_post_op(),
         pre_embed=_mhc_pre_embed_op(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        ),
+        fused_embed=_mhc_fused_post_pre_embed_op(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         ),
     )

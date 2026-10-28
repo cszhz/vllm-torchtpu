@@ -186,13 +186,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         the (tokens, hidden) embedding, or the (tokens, hc_mult, hidden)
         streams a previous pipeline stage handed over.
         """
+        ffn_seam = self.mhc_ops.fused
         if residual is None and x.dim() == 2:
             # Chain start on the embedding, which every stream repeats: the
-            # pre reads it once instead of hc_mult copies.
-            residual = x.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            # pre and the next seam read it once instead of hc_mult copies.
+            residual = x
             post_mix, res_mix, x = self.mhc_ops.pre_embed(
                 x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
             )
+            ffn_seam = self.mhc_ops.fused_embed
         elif residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
@@ -213,7 +215,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self.attn_norm(x)
         x = self.attn(positions, x)
 
-        residual, post_mix, res_mix, x = self.mhc_ops.fused(
+        residual, post_mix, res_mix, x = ffn_seam(
             x,
             residual,
             post_mix,
