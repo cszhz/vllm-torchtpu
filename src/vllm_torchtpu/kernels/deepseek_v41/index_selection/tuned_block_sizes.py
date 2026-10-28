@@ -89,7 +89,7 @@ PACKED_FP8_BLOCK_MAX_CONFIG = {(98816, 8): (8192, 4)}
 
 # Rolling SparseCore gather: three buffers overlap reads and writes for 8-token blocks.
 PAGED_MQA_GATHER_CONFIG = {(8, 1): (96, 3), (8, 2): (64, 3)}
-PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG = {(8, 1): (64, 3), (8, 2): (64, 3)}
+PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG = {(8, 1): (32, 3), (8, 2): (32, 3)}
 
 # Stage up to 128 touched pages, stopping at the sorted invalid-record tail.
 PACKED_FP8_WRITE_BATCH = 128
