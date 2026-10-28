@@ -143,7 +143,7 @@ def _mla_ragged_paged_attention_kernel(
         *,
         bq_idx,
         bkv_idx,
-        kv_lens_to_attend_segment,
+        kv_lens_to_attend_list,
     ):
         assert len(q.shape) == 3
         assert len(kv.shape) == 3
@@ -159,10 +159,27 @@ def _mla_ragged_paged_attention_kernel(
         s = jnp.einsum("bnd,bmd->bnm", q, kv, preferred_element_type=jnp.float32)
         s *= sm_scale
 
-        k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 2)
-        mask = kv_lens_to_attend_segment.reshape(s.shape) <= k_span
-
-        s = jnp.where(mask, jnp.finfo(s.dtype).min, s)
+        # Mask each query token's num_q_heads rows against its own scalar
+        # kv_lens_to_attend: kv_lens_to_attend <= k_span, with k_span =
+        # bkv_idx * bkv_sz + col, is col >= kv_lens_to_attend - bkv_idx * bkv_sz.
+        col = lax.broadcasted_iota(jnp.int32, (num_q_heads, bkv_sz), 1)
+        kv_start = bkv_idx * bkv_sz
+        s = jnp.stack(
+            [
+                jnp.concatenate(
+                    [
+                        jnp.where(
+                            col >= kv_lens_to_attend_list[b][i] - kv_start,
+                            jnp.finfo(s.dtype).min,
+                            s[b, i * num_q_heads : (i + 1) * num_q_heads],
+                        )
+                        for i in range(q.shape[1] // num_q_heads)
+                    ],
+                    axis=0,
+                )
+                for b in range(batch_size)
+            ]
+        )
         s_rowmax = jnp.max(s, axis=2)
         m_prev = head_m_ref[...]
         m_curr = jnp.maximum(m_prev, s_rowmax)
@@ -474,7 +491,7 @@ def _mla_ragged_paged_attention_kernel(
             for b in range(batch_size):
                 seq_idx = batch_start_seq_idx + b
                 q_start = cu_q_lens_ref[seq_idx]
-                tokens_attend = jnp.stack(
+                kv_lens_to_attend_list.append(
                     [
                         kv_lens_to_attend_ref[
                             jnp.minimum(
@@ -485,12 +502,6 @@ def _mla_ragged_paged_attention_kernel(
                         for i in range(bq_sz)
                     ]
                 )
-                tokens_attend_b = jnp.broadcast_to(
-                    tokens_attend[:, None, None],
-                    (bq_sz, num_q_heads, bkv_sz),
-                ).reshape(bq_sz * num_q_heads, bkv_sz)
-                kv_lens_to_attend_list.append(tokens_attend_b)
-            kv_lens_to_attend_segment = jnp.stack(kv_lens_to_attend_list, axis=0)
 
             # Prefetch next bq
             @pl.when(next_seq_idx < end_seq_idx)
@@ -499,9 +510,7 @@ def _mla_ragged_paged_attention_kernel(
                 start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
                 start_fetch_swa(next_seq_idx, next_bq_idx, next_bq_sem_idx)
 
-            def compute_with_bkv(bkv_idx, carry):
-                kv_lens_to_attend_segment = carry[0]
-
+            def compute_with_bkv(bkv_idx, _):
                 # Get next bkv ids.
                 bkv_sem_idx = sem_ids_ref[1]
                 next_seq_idx, _, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids(
@@ -530,9 +539,8 @@ def _mla_ragged_paged_attention_kernel(
                     bkv,
                     bq_idx=bq_idx,
                     bkv_idx=bkv_idx,
-                    kv_lens_to_attend_segment=kv_lens_to_attend_segment,
+                    kv_lens_to_attend_list=kv_lens_to_attend_list,
                 )
-                return (kv_lens_to_attend_segment,)
 
             # Wait for cur bq if not ready yet
             wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)
@@ -541,7 +549,7 @@ def _mla_ragged_paged_attention_kernel(
                 0,
                 num_bkv,
                 compute_with_bkv,
-                (kv_lens_to_attend_segment,),
+                None,
                 unroll=False,
             )
 
