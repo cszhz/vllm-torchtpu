@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Check query-local scores against an independent FP32 NumPy reference."""
+"""Check native FP8 dots, NumPy FP32 reduction, and query-local score slots."""
 
 import jax
 import jax.numpy as jnp
@@ -67,7 +67,9 @@ def test_query_slot_projection_preserves_all_blocks(count):
         (32768, 8192, 1, 5),
     ],
 )
-def test_gathered_logits_match_fp32_and_query_masks(width, key_tile, start, count):
+def test_gathered_logits_match_fp32_and_query_masks(
+    width, key_tile, start, count, record_property
+):
     if jax.default_backend() != "tpu":
         pytest.skip("Requires the TPU MQA kernels")
     rng = np.random.default_rng(821)
@@ -95,15 +97,27 @@ def test_gathered_logits_match_fp32_and_query_masks(width, key_tile, start, coun
     )
     scales = words[:, 32].view(np.float32).reshape(-1)
     host_q, host_w = np.asarray(q).astype(np.float32), np.asarray(weights)
-    baseline = []
+    baseline, ideal = [], []
+    native_dot = jax.jit(
+        lambda query, key: jax.lax.dot(query, key.T, preferred_element_type=jnp.float32)
+    )
     for row in range(start, start + count):
         group = np.searchsorted(np.asarray(offsets)[1:], row, side="right")
         records = (np.asarray(pages[group])[:, None] * 128 + np.arange(128)).reshape(-1)
-        products = host_q[row] @ raw_keys[records].T
+        # Native FP8 MXU arithmetic differs from ideal FP32 multiplication.
+        # Use an independent XLA dot, then do every remaining step in NumPy FP32.
+        products = np.asarray(
+            native_dot(q[row], jnp.asarray(raw_keys[records], dtype=q.dtype))
+        )
         values = (np.maximum(products, 0) * host_w[row, :, None]).sum(axis=0) * scales[
             records
         ]
         baseline.append(np.where(np.arange(width) < int(lengths[row]), values, -np.inf))
+        full_products = host_q[row] @ raw_keys[records].T
+        ideal.append(
+            (np.maximum(full_products, 0) * host_w[row, :, None]).sum(axis=0)
+            * scales[records]
+        )
     baseline = np.asarray(baseline)
     # Per-query candidates have different orders and half the union capacity.
     slots = np.stack(
@@ -147,3 +161,9 @@ def test_gathered_logits_match_fp32_and_query_masks(width, key_tile, start, coun
     np.testing.assert_array_equal(np.isfinite(actual), np.isfinite(expected))
     live = np.isfinite(expected)
     np.testing.assert_allclose(actual[live], expected[live], rtol=2e-5, atol=2e-5)
+    ideal = np.take_along_axis(np.asarray(ideal), columns, axis=1)[live]
+    x, y = actual[live].astype(np.float64), ideal.astype(np.float64)
+    diff = np.square(x - y).sum() / (np.square(x).sum() + np.square(y).sum())
+    record_property("fp32_reference_diff", diff)
+    # Same numerical acceptance criterion as the existing dense MQA test.
+    assert diff < 1e-3
