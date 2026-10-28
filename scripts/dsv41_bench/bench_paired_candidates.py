@@ -31,6 +31,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import 
     quantize_index_rows,
     read_fp8_records,
 )
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import _score_prepared
 
 
@@ -113,7 +114,9 @@ def main():
     parser.add_argument("--overlap", type=float, default=0.7)
     parser.add_argument("--repeats", type=int, default=15)
     parser.add_argument("--gather-sweep", action="store_true")
-    parser.add_argument("--stage", choices=("all", "prepare", "gather"), default="all")
+    parser.add_argument(
+        "--stage", choices=("all", "prepare", "gather", "score"), default="all"
+    )
     args = parser.parse_args()
     if not 0 <= args.overlap <= 1 or args.width % args.page_size:
         raise ValueError("Use overlap in [0,1] and a page-aligned width")
@@ -416,6 +419,72 @@ def main():
         width=args.width,
         grouped=True,
     )
+    if args.stage == "score":
+
+        def logits(q, weights, lengths, keys, canonical, pages, offsets):
+            compact_lengths = jnp.sum(
+                jnp.where(
+                    canonical >= 0,
+                    jnp.clip(lengths[:, None] - canonical * args.block, 0, args.block),
+                    0,
+                ),
+                axis=1,
+            )
+            return indexer_impl.fp8_paged_mqa_logits(
+                q,
+                keys,
+                weights.astype(jnp.float32),
+                compact_lengths,
+                pages,
+                query_start_loc=offsets,
+                query_size=indexer_impl.PACKED_FP8_MQA_CONFIG.query_tile,
+                max_model_len=canonical.shape[1] * args.block,
+                q_scale=jnp.ones_like(weights, dtype=jnp.float32),
+                cache_layout=PackedFP8Layout(keys.shape[0] // 33),
+                query_start=jnp.int32(0),
+                query_count=q.shape[0],
+            )
+
+        raw_scores = measure(
+            "logits",
+            logits,
+            (
+                q,
+                weights,
+                lengths,
+                prepared.keys,
+                prepared.block_ids,
+                prepared.pages,
+                prepared.offsets,
+            ),
+            root,
+            args.repeats,
+            dimensions,
+        )
+        masked_scores = measure(
+            "membership_mask",
+            lambda scores, allowed: jnp.where(
+                jnp.repeat(allowed, args.block, axis=1), scores, -jnp.inf
+            ),
+            (raw_scores, prepared.membership),
+            root,
+            args.repeats,
+            dimensions,
+        )
+        split_selected = measure(
+            "topk_and_token_mapping",
+            functools.partial(
+                indexer_impl.streaming_topk.select_candidate_tokens,
+                k=min(args.topk, args.width, prepared.block_ids.shape[1] * args.block),
+                block_size=args.block,
+                unordered=True,
+                sorted_indices=False,
+            ),
+            (masked_scores, prepared.block_ids),
+            root,
+            args.repeats,
+            dimensions,
+        )
     selected = measure(
         "score_topk",
         score,
@@ -424,6 +493,20 @@ def main():
         args.repeats,
         dimensions,
     )
+
+    if args.stage == "score":
+        np.testing.assert_array_equal(
+            np.sort(np.asarray(split_selected), axis=1),
+            np.sort(np.asarray(selected), axis=1),
+        )
+        (root / "correctness.json").write_text(
+            json.dumps(
+                {
+                    "split_vs_combined_score_topk": "passed",
+                }
+            )
+        )
+        return
 
     def layer(q, weights, lengths, banks, pages, candidates, owners):
         return score(q, weights, lengths, prepare(banks, pages, candidates, owners))
