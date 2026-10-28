@@ -323,19 +323,11 @@ def _hc_constructor_config(options, *, calibrated=False):
 
 
 @pytest.mark.parametrize(
-    "options,full,combine",
-    [
-        ({}, "auto", "auto"),
-        ({"hc_prefill_full_tile": 0}, 0, 0),
-        ({"hc_prefill_full_tile": 128}, 128, 128),
-        ({"hc_prefill_full_tile": 0, "hc_prefill_combine_tile": "auto"}, 0, "auto"),
-        ({"hc_prefill_full_tile": "auto", "hc_prefill_combine_tile": 0}, "auto", 0),
-        ({"hc_prefill_full_tile": 128, "hc_prefill_combine_tile": 32}, 128, 32),
-        ({"hc_prefill_combine_tile": 0}, "auto", 0),
-    ],
+    "value,expected",
+    [(None, "auto"), ("auto", "auto"), ("0", 0), ("128", 128), ("256", 256)],
 )
-def test_model_hc_local_implementation_and_independent_modes(
-    fake_sublayers, monkeypatch, options, full, combine
+def test_model_hc_reads_typed_debug_override(
+    fake_sublayers, monkeypatch, value, expected
 ):
     from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -348,6 +340,12 @@ def test_model_hc_local_implementation_and_independent_modes(
     from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
     from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import GatedResidual
 
+    if value is None:
+        monkeypatch.delenv("VLLM_TPU_HC_PREFILL_TILE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_TPU_HC_PREFILL_TILE", value)
+    TPUQwen4ExpConfig.verify_and_update_config(_vllm_config_for_checks(_text_config()))
+
     def forbidden(*args):
         pytest.fail("metadata-only model construction executed a fused operation")
 
@@ -356,39 +354,85 @@ def test_model_hc_local_implementation_and_independent_modes(
     monkeypatch.setattr(vllm_adapter, "build_gated_residual_op", lambda *a: forbidden)
     with torch.device("meta"), set_default_torch_dtype(torch.bfloat16):
         model = qwen4_model.Qwen4ExpModel(
-            vllm_config=_hc_constructor_config(options, calibrated=True), prefix="model"
+            vllm_config=_hc_constructor_config({}, calibrated=True), prefix="model"
         )
     connections = _hc_connections(model)
     x, block = route_inputs(1536)
     for i, connection in enumerate(connections):
         assert type(connection) is GatedResidual
-        assert connection.prefill_full_tile == full
-        assert connection.prefill_combine_tile == combine
-        assert mix_selected(connection, x) is bool(full)
+        assert connection.prefill_full_tile == expected
+        assert connection.prefill_combine_tile == expected
+        assert mix_selected(connection, x) is bool(expected)
         if i < len(connections) - 1:
-            assert combine_selected(connection, block, x, x) is bool(combine)
+            assert combine_selected(connection, block, x, x) is bool(expected)
         else:
             assert connection._prefill_combine_op is None
-            assert not hasattr(connection, "block_inject_weight")
+            assert not connection.use_combine
 
 
 @pytest.mark.parametrize(
-    "options",
-    [
-        {"hc_prefill_full_tile": True},
-        {"hc_prefill_full_tile": -128},
-        {"hc_prefill_full_tile": "128"},
-        {"hc_prefill_full_tile": None},
-        {"hc_prefill_combine_tile": False},
-        {"hc_prefill_combine_tile": -16},
-        {"hc_prefill_combine_tile": "invalid"},
-    ],
+    "value", ["true", "false", "-128", "127", "129", "128.0", "atuo"]
 )
-def test_model_hc_rejects_invalid_modes(fake_sublayers, options):
-    with pytest.raises(ValueError, match="HC prefill mode"):
-        qwen4_model.Qwen4ExpModel(
-            vllm_config=_hc_constructor_config(options), prefix="model"
+def test_config_rejects_invalid_hc_debug_override(monkeypatch, value):
+    monkeypatch.setenv("VLLM_TPU_HC_PREFILL_TILE", value)
+    with pytest.raises(ValueError):
+        TPUQwen4ExpConfig.verify_and_update_config(
+            _vllm_config_for_checks(_text_config())
         )
+
+
+@pytest.mark.parametrize("value", [True, False, -128, 127])
+def test_config_validates_typed_hc_debug_override(monkeypatch, value):
+    from vllm_torchtpu import envs
+
+    def invalid_tile():
+        return value
+
+    monkeypatch.setitem(
+        envs.environment_variables, "VLLM_TPU_HC_PREFILL_TILE", invalid_tile
+    )
+    with pytest.raises(ValueError, match="HC prefill"):
+        TPUQwen4ExpConfig.verify_and_update_config(
+            _vllm_config_for_checks(_text_config())
+        )
+
+
+def test_hc_cpu_fullgraph_has_no_policy_side_effects(monkeypatch):
+    from tests.models.vllm.test_qwen4_exp_hc_auto import MEASURED
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
+    from vllm_torchtpu.models.vllm.qwen4_exp import hyperconnection as hc
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("CPU forward reached fused HC or logged during tracing")
+
+    monkeypatch.setattr(vllm_adapter, "current_hc_hardware", lambda: MEASURED)
+    monkeypatch.setattr(vllm_adapter, "build_full_mix_op", lambda *a: forbidden)
+    monkeypatch.setattr(vllm_adapter, "build_gated_residual_op", lambda *a: forbidden)
+    with torch.device("cpu"):
+        module = hc.GatedResidual(
+            hc.HyperConnectionConfig(
+                hidden_size=128, hc_count=3, hc_lowrank=8, hc_per_branch_norm=True
+            ),
+            prefill_full_tile=128,
+        )
+        x = torch.randn(128, 384).bfloat16()
+        block = torch.randn(128, 128).bfloat16()
+    monkeypatch.setattr(hc.logger, "warning_once", forbidden)
+    monkeypatch.setitem(
+        envs.environment_variables, "VLLM_TPU_HC_PREFILL_TILE", forbidden
+    )
+
+    def chain(x, block):
+        mixed, residuals = module.mix(x)
+        return mixed, module.combine(block, residuals)
+
+    expected = chain(x, block)
+    actual = torch.compile(chain, backend="eager", fullgraph=True)(x, block)
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    assert not torch.tpu.is_initialized()
+    torch.compiler.reset()
 
 
 def test_model_hc_keeps_checkpoint_keys_and_single_registered_owners(
@@ -413,7 +457,8 @@ def test_model_hc_keeps_checkpoint_keys_and_single_registered_owners(
     connections = _hc_connections(model)
     for i, connection in enumerate(connections):
         assert type(connection) is GatedResidual
-        assert connection._prefill_full_op is connection._prefill_combine_op is None
+        assert not connection._prefill_full_ops
+        assert connection._prefill_combine_op is None
         reference = upstream.GatedResidual(
             connection.config, use_combine=i < len(connections) - 1
         )
@@ -451,6 +496,11 @@ def test_model_hc_hash_only_additional_config_keeps_defaults(fake_sublayers):
 
     config = _hc_constructor_config({})
     config.additional_config = HashOnlyOptions()
+    TPUQwen4ExpConfig.verify_and_update_config(
+        _vllm_config_for_checks(
+            _text_config(), additional_config=config.additional_config
+        )
+    )
     model = qwen4_model.Qwen4ExpModel(vllm_config=config, prefix="model")
     for connection in _hc_connections(model):
         assert connection.prefill_full_tile == "auto"
@@ -477,7 +527,7 @@ def test_model_owned_hc_uses_local_fp32_gate_precision(fake_sublayers):
         # Independent fixed BF16 result from the existing CUDA precision test.
         expected = torch.tensor(0.0030975341796875, dtype=torch.bfloat16)
         torch.testing.assert_close(actual[0, 1], expected, rtol=0, atol=0)
-        if hasattr(connection, "block_inject_weight"):
+        if connection.use_combine:
             with torch.no_grad():
                 connection.block_inject_weight.weight.zero_()
                 connection.block_inject_weight.weight[:, 0] = -8
