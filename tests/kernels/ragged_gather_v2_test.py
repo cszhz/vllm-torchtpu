@@ -24,8 +24,10 @@ from jax._src import test_util as jtu
 from vllm_torchtpu.kernels.sparse_core.ragged_gather import ragged_gather
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import (
     pack_row_pairs,
+    pack_row_quads,
     ragged_gather_v2,
     unpack_row_pairs,
+    unpack_row_quads,
 )
 
 pytestmark = pytest.mark.tpu_test
@@ -88,6 +90,25 @@ class GatherTest(jtu.JaxTestCase):
         np.testing.assert_array_equal(
             np.asarray(got[: 5 * in_size]).view(np.uint16),
             np.asarray(want[: 5 * in_size]).view(np.uint16),
+        )
+
+    @parameterized.product(in_size=[16, 1024], hidden_size=[128, 4224])
+    def test_sc_gather_row_quad_packed(self, in_size, hidden_size):
+        """int8 rows gathered from and into row quads keep their bits."""
+        key = jax.random.key(2)
+        x = jax.random.randint(key, (in_size, hidden_size), -128, 128, jnp.int8)
+        indices = jax.random.randint(key, (6 * in_size,), 0, in_size, jnp.int32)
+        start = jnp.array([0], jnp.int32)
+        end = jnp.array([5 * in_size], jnp.int32)
+
+        packed = pack_row_quads(x)
+        np.testing.assert_array_equal(np.asarray(unpack_row_quads(packed)), x)
+        got = ragged_gather_v2(
+            packed, indices, start, end, out_dtype=jnp.int8, packed_out=True
+        )
+        np.testing.assert_array_equal(
+            np.asarray(unpack_row_quads(got)[: 5 * in_size]),
+            np.asarray(x[indices][: 5 * in_size]),
         )
 
     @pytest.mark.nightly
