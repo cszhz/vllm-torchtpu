@@ -137,6 +137,8 @@ def prepare_candidate_metadata(
     )
     canonical = canonical[groups]
     membership = candidate_membership(candidates, canonical, pl.cdiv(width, block))
+    # SparseCore metadata only initializes live group rows.
+    physical = jnp.where(sizes[:, None] > 0, physical, -1)
     fragment = min(block, layout.page_size)
     per_page = PAGE_RECORDS // fragment
     padded = (physical.shape[1] + per_page - 1) // per_page * per_page
