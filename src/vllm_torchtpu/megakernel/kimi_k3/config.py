@@ -61,6 +61,11 @@ class KernelConfig:
     # Prefill MLA flash tiles (queries x keys per step).
     mla_flash_qtile: int = 1024
     mla_flash_ktile: int = 2048
+    # Attention DP verifies (sequence_rows > 1) take these plain B64/B128
+    # overlaps: "shared64"/"shared128" (shared-expert reduction), "router"
+    # (router latent, B128), "dense" (dense scatter rows), "sp8" (SP8
+    # residual rows, B128).
+    verify_overlaps: tuple[str, ...] = ()
     # Prefix keys in mla_flash_ktile tiles and a whole-window query tile under
     # mla_flash_qtile rows (False: the window's key tile, as before).
     mla_flash_prefix_tiles: bool = True
