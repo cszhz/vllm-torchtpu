@@ -367,11 +367,15 @@ def _kernel(
                         columns = (
                             fragment * mxu_size + jnp.arange(mxu_size)
                         ) // membership_block_size
+                        first_flag = (
+                            fragment * mxu_size // membership_block_size // 128
+                        ) * 128
+                        local_flags = block_flags[:, first_flag : first_flag + 128]
                         allowed = (
                             jnp.take_along_axis(
-                                block_flags,
+                                local_flags,
                                 jnp.broadcast_to(
-                                    columns[None, :],
+                                    (columns - first_flag)[None, :],
                                     (block_flags.shape[0], columns.shape[0]),
                                 ),
                                 axis=1,
@@ -399,11 +403,13 @@ def _kernel(
                         columns = (
                             column + jnp.arange(PAGE_RECORDS)
                         ) // membership_block_size
+                        first_flag = (column // membership_block_size // 128) * 128
+                        local_flags = block_flags[:, first_flag : first_flag + 128]
                         allowed = (
                             jnp.take_along_axis(
-                                block_flags,
+                                local_flags,
                                 jnp.broadcast_to(
-                                    columns[None, :],
+                                    (columns - first_flag)[None, :],
                                     (block_flags.shape[0], columns.shape[0]),
                                 ),
                                 axis=1,
@@ -597,7 +603,7 @@ def fp8_paged_mqa_logits(
             raise ValueError("Membership block size must divide the key tile")
         membership_columns = width // membership_block_size
         block_membership = jnp.pad(
-            block_membership[:, :membership_columns],
+            block_membership[:, :membership_columns].astype(jnp.int32),
             ((0, 0), (0, max(0, membership_columns - block_membership.shape[1]))),
             constant_values=False,
         )
