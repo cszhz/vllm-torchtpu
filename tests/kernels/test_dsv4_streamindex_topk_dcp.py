@@ -962,7 +962,7 @@ def test_lane_operand_is_kept_on_every_bucket(q_len):
 
 
 # ===================================================================== #
-# Exact scoring trims (TPU_STREAMIDX_Q_TRIM)
+# Exact scoring trims (TPU_STREAMIDX_Q_TRIM / NO_STEP_MASK)
 # ===================================================================== #
 
 _TRIM_PAGE, _TRIM_PPS, _TRIM_IL = 256, 40, 4
@@ -1033,6 +1033,14 @@ _TRIM_CASES = {
                 (60, 2)),
         blocks=dict(num_kv_pages_per_block=2, num_queries_per_block=128),
         pack=False),
+    # Decode rows plus packed q-block-4 MTP rows.
+    "drop_step_mask": dict(
+        T_list=(1,) * 6 + (4,) * 4 + (2,),
+        S_list=((600, 5), (90, 7), (3000, 0), (0, 9), (4000, 0), (256, 1),
+                (9000, 3), (2047, 1), (0, 9), (300, 21), (60, 2)),
+        blocks=dict(num_kv_pages_per_block=(2, 2, 32),
+                    num_queries_per_block=(1, 128, 4)),
+        pack=True),
 }
 # fmt: on
 

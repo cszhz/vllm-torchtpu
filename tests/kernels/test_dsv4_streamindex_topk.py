@@ -1754,6 +1754,42 @@ def test_q_block_trim_is_bitwise(T_list, S_list, cp_size, cp_rank, chunk, bkv_p)
                   cp_rank, chunk, bkv_p=bkv_p)
 
 
+# fmt: off
+_NO_MASK_CASES = [
+    # Decode pass (q block 1), batched (4 a tile) and ragged remainder.
+    pytest.param((1,) * 6 + (4, 21), (5000, 777, 3000, 9, 260, 2049, 9001, 3021),
+                 1, 0, 1, 2, False, None, id="decode_batched"),
+    pytest.param((1,) * 5 + (4, 21), (5000, 777, 3000, 9, 8 * 4000, 9001, 3021),
+                 8, 5, 1, 2, False, None, id="decode_dcp8_rank5"),
+    # Small-bucket q block 4, unpacked and packed (decode under MTP).
+    pytest.param((4, 4, 4), (9001, 2052, 260), 1, 0, 4, 8, False, None,
+                 id="bq4_bkvp8"),
+    pytest.param((4, 4, 4), (9001, 2052, 260), 1, 0, 4, 32, True, None,
+                 id="bq4_pack_bkvp32"),
+    pytest.param((4, 21), (5003, 3021), 1, 0, 4, 16, True, None,
+                 id="pack_partial_q"),
+    pytest.param((4, 4), (8 * 9000 + 3, 8 * 2047 + 1), 8, 3, 4, 32, True, None,
+                 id="pack_dcp8_rank3"),
+    pytest.param((4, 4), (2 * 2048 + 5, 2 * 1023), 2, 1, 4, 16, False, None,
+                 id="bq4_dcp2_rank1"),
+    pytest.param((1, 1, 4, 4, 54), (5000, 777, 9001, 260, 3021), 1, 0, 4, 8,
+                 True, 32, id="chunked_pack"),
+]
+# fmt: on
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "T_list,S_list,cp_size,cp_rank,bq_sz,bkv_p,pack,chunk", _NO_MASK_CASES
+)
+def test_drop_step_mask_is_bitwise(
+    T_list, S_list, cp_size, cp_rank, bq_sz, bkv_p, pack, chunk
+):
+    """TPU_STREAMIDX_NO_STEP_MASK: the per-step mask is never read."""
+    _flag_bitwise(dict(drop_step_mask=True), "-nm", T_list, S_list, cp_size,
+                  cp_rank, chunk, bq_sz=bq_sz, bkv_p=bkv_p, decode_pack=pack)
+
+
 def main(argv):
     del argv
 

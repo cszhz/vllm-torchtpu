@@ -223,6 +223,7 @@ def kernel(
     decode_pack: bool = False,
     decode_page_major: bool = False,
     q_block_trim: bool = False,
+    drop_step_mask: bool = False,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     scores_hbm_ref = score_refs[-1]
@@ -564,6 +565,11 @@ def kernel(
 
             s_summed = reduce_heads(bq, bkv, bq_weights, head_major=q_is_head_major)
             s_summed = s_summed * scale_val
+            if drop_step_mask:
+                # TPU_STREAMIDX_NO_STEP_MASK: left unmasked, as in
+                # `blocked_prefill_step`; the top-k stops at `row_lengths`.
+                ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
+                continue
             k_local = bkv_idx * bkv_sz + lax.broadcasted_iota(
                 jnp.int32, s_summed.shape, 1
             )
@@ -776,7 +782,10 @@ def kernel(
             mask = jnp.logical_and(k_span < kv_len, k_span <= (q_pos >> shift_comp))
             return jnp.where(mask, acc, -jnp.inf)
 
-        if _DECODE_PACK_OPTS["interior_skip"]:
+        if drop_step_mask:
+            # TPU_STREAMIDX_NO_STEP_MASK: the top-k stops at `row_lengths`.
+            store(acc)
+        elif _DECODE_PACK_OPTS["interior_skip"]:
             # Every key of a block before the last one a row can see is
             # visible to all rows: the mask would select `acc` everywhere.
             last_key = cp_local_to_global(
@@ -1389,6 +1398,7 @@ def _effective_row_lengths(
         "decode_page_major",
         "shared_meta",
         "q_block_trim",
+        "drop_step_mask",
         "dcp_axis_name",
     ),
 )
@@ -1425,6 +1435,7 @@ def streamindex_topk(
     decode_page_major: bool | None = None,
     shared_meta: bool = False,
     q_block_trim: bool = False,
+    drop_step_mask: bool = False,
     dcp_axis_name: str | None = None,
 ) -> jax.Array | tuple[Any, ...]:  # (out, [scores,] [tied])
     """StreamIndex Top-K retrieval.
@@ -1526,6 +1537,10 @@ def streamindex_topk(
         KV blocks of at least 8 lane tiles) one of at most 16 real rows only
         its first half, off a cache of its first 16 tokens. Padding rows are
         never copied out, so the same indices and scores bit for bit.
+      drop_step_mask: leave the per-step passes' (decode, small-bucket, packed)
+        scores past each token's causal and end-of-sequence limit unmasked, as
+        the multi-token pass already does. That limit is the token's
+        rank-local `row_lengths` entry, past which no top-k reads.
       dcp_axis_name: with `cp_size > 1`, inside a `shard_map` over this axis:
         each chunk's top-k is the exact top-k over every rank's shard
         (`sparsecore_topk_dcp`, which sums the radix histograms over the
@@ -1772,6 +1787,8 @@ def streamindex_topk(
         q_trim = q_block_trim and case == MlaCase.MIXED
         if q_trim and pcfg.enabled:
             layout_tag += "-qt"
+        if drop_step_mask and not pcfg.enabled:
+            layout_tag += "-nm"
         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}{layout_tag}"
         if chunked:
             # The chunk count is part of the kernel's identity, so a sweep over chunk
@@ -1795,6 +1812,7 @@ def streamindex_topk(
                     decode_pack=pack,
                     decode_page_major=pack_page_major,
                     q_block_trim=q_trim,
+                    drop_step_mask=drop_step_mask,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
@@ -2195,6 +2213,7 @@ SMALL_AG_MAX_TOKENS = 8
         "decode_pack",
         "shared_meta",
         "q_block_trim",
+        "drop_step_mask",
     ),
 )
 def streamindex_topk_dcp(
@@ -2235,6 +2254,7 @@ def streamindex_topk_dcp(
     decode_pack: bool = False,
     shared_meta: bool = False,
     q_block_trim: bool = False,
+    drop_step_mask: bool = False,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -2318,6 +2338,7 @@ def streamindex_topk_dcp(
       decode_pack: forwarded to `streamindex_topk`; see there. Same result.
       shared_meta: forwarded to `streamindex_topk`; see there. Same result.
       q_block_trim: forwarded to `streamindex_topk`; see there. Same result.
+      drop_step_mask: forwarded to `streamindex_topk`; see there. Same result.
       global_scheduling_group_id: XLA scheduling group of the cross-rank
         SparseCore merge (stage 2), which the layer's independent TensorCore
         work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
@@ -2499,6 +2520,7 @@ def streamindex_topk_dcp(
             decode_pack=decode_pack,
             shared_meta=shared_meta,
             q_block_trim=q_block_trim,
+            drop_step_mask=drop_step_mask,
             dcp_axis_name=dcp_axis_name if hist_merge else None,
         )
         scores = None

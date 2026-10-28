@@ -188,6 +188,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_DECODE_PACK: bool = True
     TPU_STREAMIDX_SHARED_META: bool = True
     TPU_STREAMIDX_Q_TRIM: bool = False
+    TPU_STREAMIDX_NO_STEP_MASK: bool = False
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = True
     TPU_SC_TOPK_COOP_V2: bool = True
     TPU_SC_TOPK_COOP_MERGE: bool = True
@@ -1573,6 +1574,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_STREAMIDX_MIXED_KV_PAGES >= 4 one with at most 16 only that half.
     # Padding rows are never copied out. Bit-identical indices and scores.
     "TPU_STREAMIDX_Q_TRIM": env_bool("TPU_STREAMIDX_Q_TRIM", default=False),
+    # StreamIdx per-step passes (decode, small-bucket and packed MTP bodies):
+    # skip the causal/end-of-sequence -inf mask, as the multi-token pass
+    # already does. Every top-k and DCP merge reads a row only up to its
+    # rank-local row_lengths, which is that limit. Bit-identical.
+    "TPU_STREAMIDX_NO_STEP_MASK": env_bool(
+        "TPU_STREAMIDX_NO_STEP_MASK", default=False
+    ),
     # KV pages per block of the StreamIndex top-k MIXED (multi-token) pass for
     # every bucket that does not take the small-bucket sizes (with
     # TPU_STREAMIDX_SMALL_BUCKET_BQ set, buckets above
