@@ -132,6 +132,17 @@ STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
 # 16 pages wins at 16 tokens and short contexts (32 regresses b3 at 9.4k keys).
 STREAMIDX_PACK_BKVP_CAP_TOKENS = 8
 STREAMIDX_PACK_BKVP = (32, 16)  # (T <= cap, T > cap)
+# TPU_STREAMIDX_CHUNK4: buckets of at least this many tokens run in 4 pieces.
+STREAMIDX_CHUNK4_MIN_TOKENS = 1024
+
+
+def _streamidx_chunk_tokens(
+    num_tokens: int, chunk_tokens: int | None, chunk4: bool
+) -> int | None:
+    """TPU_STREAMIDX_CHUNK_TOKENS, else T / 4 for large buckets under CHUNK4."""
+    if chunk_tokens is None and chunk4 and num_tokens >= STREAMIDX_CHUNK4_MIN_TOKENS:
+        return num_tokens // 4
+    return chunk_tokens
 
 
 def _streamidx_block_sizes(
@@ -593,6 +604,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
         q_trim = envs.TPU_STREAMIDX_Q_TRIM
         no_step_mask = envs.TPU_STREAMIDX_NO_STEP_MASK
+        chunk4 = envs.TPU_STREAMIDX_CHUNK4
         shared_meta = self._shared_meta
 
         def _streamidx_topk_jax(
@@ -667,7 +679,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 skip_empty_decode_chunked=skip_empty_decode_chunked,
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
-                chunk_tokens=chunk_tokens,
+                chunk_tokens=_streamidx_chunk_tokens(q.shape[0], chunk_tokens, chunk4),
                 decode_pack=decode_pack,
                 shared_meta=shared_meta,
                 q_block_trim=q_trim,
@@ -703,6 +715,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 kv_cache_mode,
                 q_trim,
                 no_step_mask,
+                chunk4,
             ),
             build_op,
         )
@@ -758,6 +771,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
         q_trim = envs.TPU_STREAMIDX_Q_TRIM
         no_step_mask = envs.TPU_STREAMIDX_NO_STEP_MASK
+        chunk4 = envs.TPU_STREAMIDX_CHUNK4
         shared_meta = self._shared_meta
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
@@ -856,7 +870,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 kv_layout=kv_layout,
                 skip_empty_decode=skip_empty_decode,
                 skip_empty_decode_chunked=skip_empty_decode_chunked,
-                chunk_tokens=chunk_tokens,
+                chunk_tokens=_streamidx_chunk_tokens(q.shape[0], chunk_tokens, chunk4),
                 a2a_merge=large and a2a_merge and not hist_merge,
                 hist_merge=large and hist_merge,
                 global_scheduling_group_id=global_group,

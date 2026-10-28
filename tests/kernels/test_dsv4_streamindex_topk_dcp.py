@@ -1068,3 +1068,17 @@ def test_scoring_trims_are_bitwise_under_dcp(flag, merge, dcp_size):
     on = np.asarray(streamindex_topk_dcp(*args, **kwargs, **{flag: True}))
     assert (off >= 0).sum() > 0, "vacuous: no index selected"
     np.testing.assert_array_equal(on, off, err_msg=f"{flag} changed the top-k")
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 8])
+@pytest.mark.parametrize("merge", ["all_gather", "a2a", "hist"])
+def test_chunk4_large_bucket_is_exact(dcp_size, merge):
+    """TPU_STREAMIDX_CHUNK4's 4 pieces of a 1024-token bucket, every merge."""
+    _need_devices(dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 13, q_len=1024)
+    kwargs["a2a_merge"] = merge == "a2a"
+    kwargs["hist_merge"] = merge == "hist"
+    unchunked = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    chunked = np.asarray(streamindex_topk_dcp(*args, **kwargs, chunk_tokens=256))
+    np.testing.assert_array_equal(chunked, unchunked)
