@@ -62,6 +62,7 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import (
+    DeepseekScalingRotaryEmbedding,
     MRotaryEmbedding,
     RotaryEmbedding,
 )
@@ -1371,13 +1372,17 @@ class TPUModelRunner(GPUModelRunner):
         num_truncated = 0
         for name, module in self.model.named_modules():
             # isinstance, not an exact type match: on TPU these are the
-            # out-of-tree subclasses from layers/adapter/rotary_embedding.py.
+            # out-of-tree subclasses from layers/adapter/rotary_embedding.py
+            # and layers/adapter/custom_ops/mla_attention_op.py. DeepSeek
+            # scaling (YaRN for MLA models, and DeepSeek-V4's subclass)
+            # derives from RotaryEmbeddingBase, not RotaryEmbedding.
             if not isinstance(
                 module,
                 (
                     RotaryEmbedding,
                     MRotaryEmbedding,
                     MRotaryEmbeddingInterleaved,
+                    DeepseekScalingRotaryEmbedding,
                 ),
             ):
                 continue

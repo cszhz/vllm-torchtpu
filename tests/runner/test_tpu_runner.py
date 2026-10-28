@@ -3650,3 +3650,51 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+def _bare_rope(cls, rows: int) -> torch.nn.Module:
+    """A `cls` instance holding only a `[rows, 8]` cos_sin_cache buffer;
+    `_truncate_rope_caches` dispatches on the type and reads only the buffer."""
+    module = cls.__new__(cls)
+    torch.nn.Module.__init__(module)
+    module.register_buffer("cos_sin_cache", torch.zeros(rows, 8), persistent=False)
+    return module
+
+
+def test_truncate_rope_caches_covers_deepseek_scaling():
+    """TPU_ROPE_CACHE_TRUNCATE also truncates DeepSeek-scaling caches (MLA
+    YaRN and DeepSeek-V4), which derive from RotaryEmbeddingBase rather than
+    RotaryEmbedding."""
+    from vllm.model_executor.layers.rotary_embedding import (
+        DeepseekScalingRotaryEmbedding,
+        RotaryEmbedding,
+    )
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
+    )
+
+    max_len = 32
+    model = torch.nn.ModuleDict(
+        {
+            "rope": _bare_rope(RotaryEmbedding, 128),
+            "deepseek": _bare_rope(DeepseekScalingRotaryEmbedding, 128),
+            "deepseek_v4": _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128),
+            "short": _bare_rope(DeepseekScalingRotaryEmbedding, 16),
+        }
+    )
+    other = torch.nn.Module()
+    other.register_buffer("cos_sin_cache", torch.zeros(128, 8), persistent=False)
+    model["other"] = other
+    runner = SimpleNamespace(
+        model=model,
+        model_config=SimpleNamespace(
+            is_multimodal_model=False, multimodal_config=None, max_model_len=max_len
+        ),
+    )
+
+    TPUModelRunner._truncate_rope_caches(runner)
+
+    for name in ("rope", "deepseek", "deepseek_v4"):
+        assert model[name].cos_sin_cache.shape == (max_len, 8), name
+    assert model["short"].cos_sin_cache.shape == (16, 8)
+    assert model["other"].cos_sin_cache.shape == (128, 8)
