@@ -87,6 +87,8 @@ def cpu_kernels(monkeypatch):
     monkeypatch.setattr(fp8_candidate_cache, "gather_candidate_keys", _cpu_gather)
     monkeypatch.setattr(indexer_impl, "fp8_paged_mqa_logits", _cpu_logits)
     monkeypatch.setattr(indexer_impl, "fp8_gathered_mqa_logits", _cpu_gathered_logits)
+    for scorer in (_cpu_logits, _cpu_gathered_logits):
+        monkeypatch.setattr(scorer, "__wrapped__", scorer, raising=False)
     with jax.default_device(jax.devices("cpu")[0]):
         yield
 
@@ -161,9 +163,6 @@ def test_paired_gather_preserves_each_query(
             (q.shape[0], prepared.block_ids.shape[1] * block, topk),
             1,
         )
-        monkeypatch.setattr(
-            _cpu_gathered_logits, "__wrapped__", _cpu_gathered_logits, raising=False
-        )
     actual = indexer_impl._score_prepared(
         q, weights, lengths, prepared, topk, block, unordered, width
     )
@@ -194,9 +193,6 @@ def test_source_publishes_per_query_across_score_chunks(
 ):
     width, topk = (1024, 512) if streaming else (64, 5)
     if streaming:
-        monkeypatch.setattr(
-            _cpu_gathered_logits, "__wrapped__", _cpu_gathered_logits, raising=False
-        )
 
         def select(scores, *, k, valid_lengths, **kwargs):
             scores = jnp.where(
