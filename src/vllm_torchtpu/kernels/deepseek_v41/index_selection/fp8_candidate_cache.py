@@ -634,7 +634,7 @@ def gather_candidate_keys(
     block: int,
     layout: PackedFP8Layout,
 ) -> jax.Array:
-    """Gather live tiles into their original compact-page slots."""
+    """Gather compact pages, skipping empty tiles inside SparseCore."""
     info = plsc.get_sparse_core_info()
     lanes, units = info.num_lanes, info.num_cores * info.num_subcores
     group = max(lanes, min(128, 1024 // block))
@@ -659,12 +659,12 @@ def gather_candidate_keys(
     count, per_page = physical.size, PAGE_RECORDS // block
     source_per_page = layout.page_size // block
     per_unit = pl.cdiv(count, units * group) * group
-    destination_width = pl.cdiv(per_unit // group, 128) * 128
+    flags_width = pl.cdiv(per_unit // group, 128) * 128
     scratch_words = (
         buffers * (group * PAGE_ROWS * block + read_span * len(banks))
         + (buffers * group * page_words if whole_pages else 0)
         + lanes
-        + destination_width
+        + flags_width
     )
     metadata_rows = min(
         per_unit,
@@ -681,19 +681,15 @@ def gather_candidate_keys(
     live_tiles = jnp.any(tiles >= 0, axis=1) & (
         jnp.arange(tiles.shape[0]) * group < live_rows * physical.shape[1]
     )
-    tile_count = jnp.sum(live_tiles, dtype=jnp.int32)
-    destinations = jnp.nonzero(live_tiles, size=tiles.shape[0], fill_value=-1)[0]
-    ids = jnp.where(destinations[:, None] >= 0, tiles[jnp.maximum(destinations, 0)], -1)
     ids = ids.reshape(-1, units, group).transpose(1, 0, 2).reshape(units, per_unit)
-    destinations = destinations.reshape(-1, units).T
-    destinations = jnp.pad(
-        destinations,
-        ((0, 0), (0, destination_width - destinations.shape[1])),
-        constant_values=-1,
+    tile_flags = live_tiles.astype(jnp.int32).reshape(-1, units).T
+    tile_flags = jnp.pad(
+        tile_flags,
+        ((0, 0), (0, flags_width - tile_flags.shape[1])),
     )
     ids = jnp.pad(ids, ((0, 0), (0, -per_unit % metadata_rows)), constant_values=-1)
 
-    active_steps = pl.cdiv(tile_count, units)
+    active_steps = pl.cdiv(live_rows * physical.shape[1], units * group)
     control = jnp.full((lanes,), active_steps, jnp.int32)
     span, steps = group * PAGE_ROWS, per_unit // group
     mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
@@ -705,7 +701,7 @@ def gather_candidate_keys(
         scratch_types=(
             pltpu.VMEM((metadata_rows,), jnp.int32),
             pltpu.VMEM((lanes,), jnp.int32),
-            pltpu.VMEM((destination_width,), jnp.int32),
+            pltpu.VMEM((flags_width,), jnp.int32),
             pltpu.VMEM((buffers, span, block), jnp.int32),
             pltpu.VMEM((buffers, len(banks), read_span), jnp.int32),
             pltpu.SemaphoreType.DMA,
@@ -727,11 +723,11 @@ def gather_candidate_keys(
         pool,
         physical_ref,
         control_ref,
-        destinations_ref,
+        tile_flags_ref,
         out,
         selected,
         control_vmem,
-        destination_ids,
+        flags,
         words,
         read_ids,
         metadata_sem,
@@ -742,13 +738,16 @@ def gather_candidate_keys(
         unit = lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
         pltpu.async_copy(control_ref, control_vmem, metadata_sem).wait()
         active = control_vmem[...][0]
-        pltpu.async_copy(
-            destinations_ref.at[unit], destination_ids, metadata_sem
-        ).wait()
+        pltpu.async_copy(tile_flags_ref.at[unit], flags, metadata_sem).wait()
         metadata = physical_ref.at[unit]
         if metadata_rows < per_unit:
             metadata = metadata.at[:metadata_rows]
         pltpu.async_copy(metadata, selected, metadata_sem).wait()
+
+        def tile_is_live(step):
+            return (
+                plsc.load_gather(flags, [jnp.full((lanes,), step, jnp.int32)])[0] != 0
+            )
 
         def read(step, slot, wait=False):
             if not wait:
@@ -764,78 +763,81 @@ def gather_candidate_keys(
                             metadata_sem,
                         ).wait()
 
-                if whole_pages:
+            @pl.when(tile_is_live(step))
+            def transfer():
+                if not wait:
+                    if whole_pages:
 
-                    @plsc.parallel_loop(0, group, lanes)
-                    def page_addresses(i):
-                        chosen = selected[pl.ds(index * group + i, lanes)]
-                        source = (
-                            layout.page_offset
-                            + jnp.maximum(chosen, 0) * layout.page_stride
-                        ) // layout.page_rows
-                        bank_base = 0
-                        for bank, ref in enumerate(pool):
-                            size = ref.shape[0] // layout.page_rows
-                            valid = (
-                                (chosen >= 0)
-                                & (source >= bank_base)
-                                & (source < bank_base + size)
-                            )
-                            read_ids[slot, bank, pl.ds(i, lanes)] = jnp.where(
-                                valid, source - bank_base, -1
-                            )
-                            bank_base += size
-                else:
-
-                    @plsc.parallel_loop(0, span, lanes, unroll=8)
-                    def addresses(i):
-                        segment = i + jnp.arange(lanes)
-                        field = segment // per_page % PAGE_ROWS
-                        column = (
-                            segment // (PAGE_ROWS * per_page) * per_page
-                            + segment % per_page
-                        )
-                        chosen = plsc.load_gather(selected, [index * group + column])
-                        safe = jnp.maximum(chosen, 0)
-                        source = (
-                            (
+                        @plsc.parallel_loop(0, group, lanes)
+                        def page_addresses(i):
+                            chosen = selected[pl.ds(index * group + i, lanes)]
+                            source = (
                                 layout.page_offset
-                                + safe // source_per_page * layout.page_stride
-                            )
-                            * per_page
-                            + field * source_per_page
-                            + safe % source_per_page
-                        )
-                        bank_base = 0
-                        for bank, ref in enumerate(pool):
-                            size = ref.shape[0] * per_page
-                            valid = (
-                                (chosen >= 0)
-                                & (source >= bank_base)
-                                & (source < bank_base + size)
-                            )
-                            read_ids[slot, bank, pl.ds(i, lanes)] = jnp.where(
-                                valid, source - bank_base, -1
-                            )
-                            bank_base += size
+                                + jnp.maximum(chosen, 0) * layout.page_stride
+                            ) // layout.page_rows
+                            bank_base = 0
+                            for bank, ref in enumerate(pool):
+                                size = ref.shape[0] // layout.page_rows
+                                valid = (
+                                    (chosen >= 0)
+                                    & (source >= bank_base)
+                                    & (source < bank_base + size)
+                                )
+                                read_ids[slot, bank, pl.ds(i, lanes)] = jnp.where(
+                                    valid, source - bank_base, -1
+                                )
+                                bank_base += size
+                    else:
 
-            for bank, ref in enumerate(pool):
-                copy = pltpu.make_async_copy(
-                    ref.reshape(-1, page_words if whole_pages else block).at[
-                        plsc.Indices(read_ids.at[slot, bank], ignored_value=-1)
-                    ],
-                    raw_pages[0].at[slot] if whole_pages else words.at[slot],
-                    read_sem.at[slot, bank],
-                )
-                (copy.wait if wait else copy.start)()
+                        @plsc.parallel_loop(0, span, lanes, unroll=8)
+                        def addresses(i):
+                            segment = i + jnp.arange(lanes)
+                            field = segment // per_page % PAGE_ROWS
+                            column = (
+                                segment // (PAGE_ROWS * per_page) * per_page
+                                + segment % per_page
+                            )
+                            chosen = plsc.load_gather(
+                                selected, [index * group + column]
+                            )
+                            safe = jnp.maximum(chosen, 0)
+                            source = (
+                                (
+                                    layout.page_offset
+                                    + safe // source_per_page * layout.page_stride
+                                )
+                                * per_page
+                                + field * source_per_page
+                                + safe % source_per_page
+                            )
+                            bank_base = 0
+                            for bank, ref in enumerate(pool):
+                                size = ref.shape[0] * per_page
+                                valid = (
+                                    (chosen >= 0)
+                                    & (source >= bank_base)
+                                    & (source < bank_base + size)
+                                )
+                                read_ids[slot, bank, pl.ds(i, lanes)] = jnp.where(
+                                    valid, source - bank_base, -1
+                                )
+                                bank_base += size
+
+                for bank, ref in enumerate(pool):
+                    copy = pltpu.make_async_copy(
+                        ref.reshape(-1, page_words if whole_pages else block).at[
+                            plsc.Indices(read_ids.at[slot, bank], ignored_value=-1)
+                        ],
+                        raw_pages[0].at[slot] if whole_pages else words.at[slot],
+                        read_sem.at[slot, bank],
+                    )
+                    (copy.wait if wait else copy.start)()
 
         def write(step, wait=False):
             slot = step % buffers
-            destination = plsc.load_gather(
-                destination_ids, [jnp.full((lanes,), step, jnp.int32)]
-            )[0]
+            destination = step * units + unit
 
-            @pl.when(destination >= 0)
+            @pl.when(tile_is_live(step))
             def copy_tile():
                 copy = pltpu.make_async_copy(
                     words.at[slot],
@@ -859,22 +861,31 @@ def gather_candidate_keys(
             read(step, slot, wait=True)
             if whole_pages:
 
-                @pl.loop(0, group // per_page)
-                def repack_page(compact_page):
-                    @plsc.parallel_loop(0, PAGE_ROWS * PAGE_RECORDS, lanes, unroll=8)
-                    def repack(i):
-                        element = i + jnp.arange(lanes)
-                        field = element // PAGE_RECORDS
-                        column = (
-                            compact_page * per_page + element % PAGE_RECORDS // block
+                @pl.when(tile_is_live(step))
+                def repack_tile():
+                    @pl.loop(0, group // per_page)
+                    def repack_page(compact_page):
+                        @plsc.parallel_loop(
+                            0, PAGE_ROWS * PAGE_RECORDS, lanes, unroll=8
                         )
-                        source = column * page_words + field * block + element % block
-                        words.reshape(buffers, -1)[
-                            slot,
-                            pl.ds(compact_page * PAGE_ROWS * PAGE_RECORDS + i, lanes),
-                        ] = plsc.load_gather(
-                            raw_pages[0].reshape(buffers, -1).at[slot], [source]
-                        )
+                        def repack(i):
+                            element = i + jnp.arange(lanes)
+                            field = element // PAGE_RECORDS
+                            column = (
+                                compact_page * per_page
+                                + element % PAGE_RECORDS // block
+                            )
+                            source = (
+                                column * page_words + field * block + element % block
+                            )
+                            words.reshape(buffers, -1)[
+                                slot,
+                                pl.ds(
+                                    compact_page * PAGE_ROWS * PAGE_RECORDS + i, lanes
+                                ),
+                            ] = plsc.load_gather(
+                                raw_pages[0].reshape(buffers, -1).at[slot], [source]
+                            )
 
             write(step)
             if buffers == 1:
@@ -893,4 +904,4 @@ def gather_candidate_keys(
                 lambda last=last: write(active - last - 1, wait=True)
             )
 
-    return gather(banks, ids, control, destinations)[: count // per_page * PAGE_ROWS]
+    return gather(banks, ids, control, tile_flags)[: count // per_page * PAGE_ROWS]
