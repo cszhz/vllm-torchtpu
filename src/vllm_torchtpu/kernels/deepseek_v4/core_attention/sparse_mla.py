@@ -1074,13 +1074,30 @@ def sparse_ragged_paged_attention(
     # leading cache rows, dequantized once per chunk, and skips the gather.
     pages_per_seq = num_page_indices // max_num_seqs
     shared_pages = cdiv(topk, page_size)
-    shared_kv_path = q.shape[0] >= SHARED_KV_MIN_TOKENS and shared_pages <= min(
-        2, pages_per_seq
-    )  # 2: the kernel's DMA semaphore slots per cache.
+    shared_kv_path = (
+        q.shape[0] >= SHARED_KV_MIN_TOKENS
+        # `by_chunk` below needs whole chunks; token buckets that compile the
+        # path are powers of two.
+        and q.shape[0] % gather_and_attention_chunk_size == 0
+        # 2: the kernel's DMA semaphore slots per cache.
+        and shared_pages <= min(2, pages_per_seq)
+    )
     num_valid_tokens = cu_q_lens[distribution[2]]
     if shared_kv_path:
-        leading_rows_only = _selects_leading_rows(topk_indices, kv_lens)
-        seq_pages = page_indices.reshape(max_num_seqs, pages_per_seq)
+        # Every chunk's decision in one pass, not a few small ops per chunk.
+        def by_chunk(x):
+            return x.reshape(num_chunks, gather_and_attention_chunk_size)
+
+        is_valid = by_chunk(jnp.arange(q.shape[0]) < num_valid_tokens)
+        chunk_seqs = seq_ids_segment[::gather_and_attention_chunk_size]
+        qualifies = by_chunk(_selects_leading_rows(topk_indices, kv_lens)) & (
+            by_chunk(seq_ids_segment) == chunk_seqs[:, None]
+        )
+        use_shared_chunks = jnp.all(~is_valid | qualifies, axis=1)
+        shared_rows_chunks = jnp.max(jnp.where(is_valid, by_chunk(kv_lens), 0), axis=1)
+        shared_pages_chunks = page_indices.reshape(max_num_seqs, pages_per_seq)[
+            chunk_seqs, :shared_pages
+        ]
 
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
@@ -1121,15 +1138,7 @@ def sparse_ragged_paged_attention(
         # sequences, we use this gather-and-attention kernel.
         gather_end = batch_end
         if shared_kv_path:
-            chunk_seq = seq_ids_segment[start_pos]
-            is_valid = jnp.arange(start_pos, end_pos) < num_valid_tokens
-            use_shared = jnp.any(is_valid) & jnp.all(
-                ~is_valid
-                | (
-                    leading_rows_only[start_pos:end_pos]
-                    & (seq_ids_segment[start_pos:end_pos] == chunk_seq)
-                )
-            )
+            use_shared = (start_pos < num_valid_tokens) & use_shared_chunks[i]
             num_valid_indices = jnp.where(use_shared, 0, num_valid_indices)
             gather_end = jnp.where(use_shared, start_pos, batch_end)
 
@@ -1171,10 +1180,8 @@ def sparse_ragged_paged_attention(
                 end_seq_idx=jnp.where(use_shared, batch_end, start_pos),
                 num_valid_tokens=num_valid_tokens,
                 kernel_batch_size=kernel_batch_size,
-                shared_kv_pages=seq_pages[chunk_seq, :shared_pages],
-                shared_kv_rows=jnp.max(
-                    jnp.where(is_valid, kv_lens[start_pos:end_pos], 0)
-                ),
+                shared_kv_pages=shared_pages_chunks[i],
+                shared_kv_rows=shared_rows_chunks[i],
             )
     return prepare_outputs(
         q, actual_num_q_heads, actual_head_dim
