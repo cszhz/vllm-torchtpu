@@ -62,10 +62,15 @@ def _kernel(
             src = scores.at[slot]
             _dma_rows(src, src, write_sem.at[slot], count, wait=True)
 
-    def load_keys(tile, group, slot):
+    def key_rows_to_read(tile, limit):
+        valid = jnp.minimum(key_tile, jnp.maximum(limit - tile * key_tile, 0))
+        return pl.cdiv(valid, PAGE_RECORDS) * PAGE_ROWS
+
+    def load_keys(tile, group, slot, limit):
+        count = key_rows_to_read(tile, limit)
         pltpu.make_async_copy(
-            pool.at[pl.ds(group * group_rows + tile * tile_rows, tile_rows)],
-            keys.at[slot],
+            pool.at[pl.ds(group * group_rows + tile * tile_rows, count)],
+            keys.at[slot, pl.ds(0, count)],
             read_sem.at[slot],
         ).start()
 
@@ -78,9 +83,12 @@ def _kernel(
         rows = enumerate(row_ids(query))
         return [jnp.where(i < query.count, lengths[r], 0) for i, r in rows]
 
-    def live_tiles(query):
+    def query_limit(query):
         limit = reduce(jnp.maximum, row_lengths(query), jnp.int32(0))
-        return pl.cdiv(jnp.minimum(limit, out.shape[1]), key_tile)
+        return jnp.minimum(limit, out.shape[1])
+
+    def live_tiles(query):
+        return pl.cdiv(query_limit(query), key_tile)
 
     owners = _head_order(
         jnp.repeat(jnp.arange(q_tile), heads)[:, None], q_tile, sublanes
@@ -118,6 +126,11 @@ def _kernel(
                     query.page_row,
                     jnp.where(third, lookahead.page_row, following.page_row),
                 ),
+                jnp.where(
+                    first,
+                    query_limit(query),
+                    jnp.where(third, query_limit(lookahead), query_limit(following)),
+                ),
             )
 
         release_outputs(q_slot)
@@ -125,8 +138,8 @@ def _kernel(
 
             @pl.when((i >= ready) & (i < tile_count + next_tiles + ahead_tiles))
             def prefill(i=i):
-                target, owner = tile_source(i)
-                load_keys(target, owner, key_slot(i))
+                target, owner, limit = tile_source(i)
+                load_keys(target, owner, key_slot(i), limit)
 
         copy_queries(query, q_slot, wait=True)
 
@@ -214,14 +227,15 @@ def _kernel(
                     store(fragment, values)
 
         def step_tile(tile, _):
-            src = keys.at[key_slot(tile)]
+            count = key_rows_to_read(tile, query_limit(query))
+            src = keys.at[key_slot(tile), pl.ds(0, count)]
             pltpu.make_async_copy(src, src, read_sem.at[key_slot(tile)]).wait()
             pl.when(tile >= 2)(lambda: publish(tile - 2, wait=True))
 
             @pl.when(tile + 2 < tile_count + next_tiles + ahead_tiles)
             def prefetch():
-                target, owner = tile_source(tile + 2)
-                load_keys(target, owner, key_slot(tile + 2))
+                target, owner, limit = tile_source(tile + 2)
+                load_keys(target, owner, key_slot(tile + 2), limit)
 
             emit_tile(tile)
             publish(tile)
@@ -308,6 +322,7 @@ def fp8_gathered_mqa_logits(
     Each group owns a contiguous, equally sized K region in packed 33x128
     format. Offsets map one or two adjacent queries to that region; membership
     is per query, in union-block order. Weights already include query scales.
+    DMA reads only the visible union prefix, rounded to a packed 128-token page.
     Context lengths count visible tokens in the sorted union. Returned column
     IDs remain compact; the outer top-k maps them through canonical block IDs.
     """

@@ -22,7 +22,13 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import 
 
 @pytest.mark.parametrize(
     "width,key_tile,start,count",
-    [(128, 256, 0, 7), (8192, 4096, 0, 7), (8192, 8192, 1, 5), (32768, 32768, 0, 7)],
+    [
+        (128, 256, 0, 7),
+        (8192, 4096, 0, 7),
+        (8192, 8192, 1, 5),
+        (32768, 32768, 0, 7),
+        (32768, 8192, 1, 5),
+    ],
 )
 def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, count):
     if jax.default_backend() != "tpu":
