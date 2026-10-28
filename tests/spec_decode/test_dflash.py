@@ -684,12 +684,26 @@ def test_update_draft_kv_cache_from_target_unit(device):
         device=device,
         query_start_loc_np=np.array([0, 3]),
         position_ids=torch.zeros(3),
-        aux_hidden_states=torch.zeros((3, 32), dtype=torch.float32, device=device),
+        aux_hidden_states=[torch.zeros((3, 32), dtype=torch.float32, device=device)],
     )
 
     proposer._update_draft_kv_cache_from_target(chunk)
 
     proposer._tpu_precompute_and_update_kv_cache.assert_called_once()
+
+    # No aux hidden states (e.g. a chunk with no verified tokens): nothing to
+    # project, and the KV update must not run.
+    proposer._tpu_precompute_and_update_kv_cache.reset_mock()
+    empty = _make_chunk(
+        num_reqs=1,
+        start_index=0,
+        device=device,
+        query_start_loc_np=np.array([0, 3]),
+        position_ids=torch.zeros(3),
+        aux_hidden_states=[],
+    )
+    proposer._update_draft_kv_cache_from_target(empty)
+    proposer._tpu_precompute_and_update_kv_cache.assert_not_called()
 
 
 @pytest.mark.tpu_test

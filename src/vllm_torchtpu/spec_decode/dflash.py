@@ -522,15 +522,11 @@ class DFlashProposer:
         It applies RoPE to the target's hidden states and scatters the tokens directly
         into the draft KV cache.
         """
-        if chunk.aux_hidden_states is None:
+        if not chunk.aux_hidden_states:
             return
 
         target_hidden = chunk.aux_hidden_states
-        aux_hidden = (
-            target_hidden[0]
-            if isinstance(target_hidden, (list, tuple))
-            else target_hidden
-        )
+        aux_hidden = target_hidden[0]
         num_tokens = aux_hidden.shape[0]
 
         positions = chunk.position_ids
