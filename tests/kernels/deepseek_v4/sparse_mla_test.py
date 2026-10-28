@@ -361,8 +361,11 @@ class CorrectnessTest(parameterized.TestCase):
         ("chunk_aligned", (256, 256), (700, 0)),
         # The chunk holding the sequence boundary keeps the gather path.
         ("chunk_mixed", (320, 192), (0, 300)),
+        # The first sequence's chunks take a two-tile softmax step, then a
+        # one-tile step.
+        ("long_and_short_steps", (256, 256), (1100, 0)),
         # The first sequence's chunks read past SHARED_KV_MAX_ROWS and gather.
-        ("past_shared_rows", (256, 256), (1100, 0)),
+        ("past_shared_rows", (256, 256), (1600, 0)),
     )
     def test_shared_kv_prefill(self, seq_lens, firsts):
         """Prefill tokens selecting a random top-k of their candidates, at a

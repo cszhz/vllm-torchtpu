@@ -206,7 +206,7 @@ SHARED_KV_TILE_ROWS = 512
 # Most cache rows a chunk may read and still take the shared-KV path. Its cost
 # grows with the rows read, the gather path's with top-k, so long contexts are
 # cheaper gathered.
-SHARED_KV_MAX_ROWS = 1024
+SHARED_KV_MAX_ROWS = 1536
 # SHARED_KV_TILE_ROWS tiles per online-softmax step while whole steps remain.
 SHARED_KV_TILES_PER_STEP = 2
 # Query tokens per grid step of `topk_row_mask`.
