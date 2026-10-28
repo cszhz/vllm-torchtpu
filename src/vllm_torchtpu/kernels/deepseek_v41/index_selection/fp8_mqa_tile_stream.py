@@ -101,16 +101,11 @@ def _kernel(
                 score_buf.at[slot, 0], out.at[field(x, 1)], out_sem.at[slot]
             ).start()
             return
-        # Member 0 keeps its own block order: union tile t is its output tile t.
         pltpu.make_async_copy(
-            score_buf.at[slot, 0], out.at[field(x, 4)], pair_sem.at[slot]
-        ).start()
-        pltpu.make_async_copy(
-            score_buf.at[slot, 1], pair_out.at[field(x, 1)], pair_sem.at[slot]
+            score_buf.at[slot], pair_out.at[field(x, 1)], pair_sem.at[slot]
         ).start()
 
     def wait_output(slot, members):
-        # Semaphores count bytes: one wait retires a pair's two 16 KiB copies.
         src = score_buf.at[slot] if members == 2 else score_buf.at[slot, 0]
         sem = pair_sem if members == 2 else out_sem
         pltpu.make_async_copy(src, src, sem.at[slot]).wait()
@@ -251,19 +246,19 @@ def _kernel(
 
 
 def score_tiles(
-    meta,
-    desc,
-    dead,
-    records,
-    keys,
-    visibility,
+    meta: jax.Array,
+    desc: jax.Array,
+    dead: jax.Array,
+    records: jax.Array,
+    keys: jax.Array,
+    visibility: jax.Array,
     *,
-    heads,
-    rows,
-    pair_rows,
-    interpret=False,
-):
-    """Run the TensorCore stream; returns ([rows,32,128], [pair_rows,32,128])."""
+    heads: int,
+    rows: int,
+    pair_rows: int,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Return single [rows,32,128] and pair [pair_rows,2,32,128] FP32 tiles."""
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     tile = (TILE_PAGES, PAGE_RECORDS)
     scratch = (
@@ -283,7 +278,7 @@ def score_tiles(
         partial(_kernel, heads=heads),
         out_shape=(
             jax.ShapeDtypeStruct((rows, *tile), jnp.float32),
-            jax.ShapeDtypeStruct((pair_rows, *tile), jnp.float32),
+            jax.ShapeDtypeStruct((pair_rows, 2, *tile), jnp.float32),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
@@ -293,7 +288,9 @@ def score_tiles(
             scratch_shapes=scratch,
         ),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+            vmem_limit_bytes=None
+            if interpret
+            else pltpu.get_tpu_info().vmem_capacity_bytes,
             disable_bounds_checks=True,
         ),
         interpret=pltpu.InterpretParams() if interpret else False,
