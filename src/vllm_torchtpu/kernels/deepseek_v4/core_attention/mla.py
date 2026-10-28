@@ -210,25 +210,21 @@ def _mla_ragged_paged_attention_kernel(
             page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
             if not wait:
-                # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
-                # utilize static for loop instead of dynamic for loop.
-                # Loop through all pages in a block
-                for i in range(bkv_p):
-                    # Ensure only effective kvs are copied and we don't go negative.
-                    sz = jnp.clip(
-                        kv_left - i * page_size,
-                        0,
-                        page_size,
-                    )
-                    # If the page index is out of bound, we set page_idx to the last
-                    # page. And there will be no copy since sz will be 0.
-                    page_idx = jnp.minimum(
-                        page_indices_offset + i, num_page_indices - 1
-                    )
+                # Issue DMAs only for the pages that hold data in this block.
+                def _fetch_page(
+                    i,
+                    _,
+                    kv_left=kv_left,
+                    page_indices_offset=page_indices_offset,
+                    bkv_vmem_ref=bkv_vmem_ref,
+                    reshaped_cache_hbm_ref=reshaped_cache_hbm_ref,
+                    sem=sem,
+                ):
+                    sz = jnp.minimum(kv_left - i * page_size, page_size)
                     _async_copy(
                         reshaped_cache_hbm_ref.at[
                             pl.ds(
-                                page_indices_ref[page_idx] * page_size,
+                                page_indices_ref[page_indices_offset + i] * page_size,
                                 sz,
                             ),
                         ],
@@ -236,6 +232,8 @@ def _mla_ragged_paged_attention_kernel(
                         sem,
                         wait,
                     )
+
+                lax.fori_loop(0, cdiv(dma_bkv_sz, page_size), _fetch_page, None)
 
             else:
                 # When we wait, we can use a dummy copy to wait for DMAs to complete
