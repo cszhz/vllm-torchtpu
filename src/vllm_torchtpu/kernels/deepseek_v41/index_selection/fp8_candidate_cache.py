@@ -28,6 +28,7 @@ class PreparedCandidates(NamedTuple):
     membership: jax.Array
     candidates: jax.Array
     candidate_slots: jax.Array
+    output_slots: jax.Array
 
 
 class CandidateMetadata(NamedTuple):
@@ -39,6 +40,7 @@ class CandidateMetadata(NamedTuple):
     membership: jax.Array
     candidates: jax.Array
     candidate_slots: jax.Array
+    output_slots: jax.Array
 
 
 def prepare_candidates(
@@ -130,6 +132,11 @@ def prepare_candidate_metadata(
     canonical = canonical[groups]
     membership = candidate_membership(candidates, canonical, pl.cdiv(width, block))
     slots, output_candidates = candidate_output_slots(candidates, canonical)
+    output_slots = (
+        jnp.full_like(canonical, -1)
+        .at[jnp.arange(tokens)[:, None], jnp.maximum(slots, 0)]
+        .max(jnp.where(slots >= 0, jnp.arange(count)[None, :], -1))
+    )
     # SparseCore metadata only initializes live group rows.
     physical = jnp.where(sizes[:, None] > 0, physical, -1)
     fragment = min(block, layout.page_size)
@@ -147,6 +154,7 @@ def prepare_candidate_metadata(
         membership,
         output_candidates,
         slots,
+        output_slots,
     )
 
 

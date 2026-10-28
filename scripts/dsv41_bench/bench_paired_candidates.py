@@ -428,7 +428,17 @@ def main():
     )
     if args.stage == "score":
 
-        def logits(q, weights, lengths, keys, canonical, membership, offsets, slots):
+        def logits(
+            q,
+            weights,
+            lengths,
+            keys,
+            canonical,
+            membership,
+            offsets,
+            slots,
+            output_slots,
+        ):
             compact_lengths = jnp.sum(
                 jnp.where(
                     canonical >= 0,
@@ -445,6 +455,7 @@ def main():
                 membership,
                 query_start_loc=offsets,
                 candidate_slots=slots,
+                output_slots=output_slots,
                 membership_block_size=args.block,
                 max_model_len=canonical.shape[1] * args.block,
             )
@@ -461,6 +472,7 @@ def main():
                 prepared.membership,
                 prepared.offsets,
                 prepared.candidate_slots,
+                prepared.output_slots,
             ),
             root,
             args.repeats,

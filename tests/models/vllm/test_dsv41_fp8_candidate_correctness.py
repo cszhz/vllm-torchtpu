@@ -70,6 +70,7 @@ def _cpu_gathered_logits(q, keys, weights, lengths, membership, **kwargs):
     pages_per_group = keys.shape[0] // groups // PAGE_ROWS
     pages = jnp.arange(groups * pages_per_group).reshape(groups, pages_per_group)
     slots = kwargs.pop("candidate_slots")
+    kwargs.pop("output_slots")
     start = kwargs.get("query_start", 0)
     count = kwargs.get("query_count", q.shape[0])
     slots = jax.lax.dynamic_slice_in_dim(slots, start, count)

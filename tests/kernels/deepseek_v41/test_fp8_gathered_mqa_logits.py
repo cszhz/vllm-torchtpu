@@ -67,6 +67,11 @@ def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, cou
         [rng.permutation(width // block)[: width // block // 2] for _ in range(7)]
     )
     slots[0, 0] = -1
+    output_slots = np.full((7, width // block), -1, np.int32)
+    for row in range(7):
+        for destination, source in enumerate(slots[row]):
+            if source >= 0:
+                output_slots[row, source] = destination
     actual = fp8_gathered_mqa_logits(
         q,
         gathered,
@@ -75,6 +80,7 @@ def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, cou
         jnp.asarray(membership),
         query_start_loc=offsets,
         candidate_slots=jnp.asarray(slots, jnp.int32),
+        output_slots=jnp.asarray(output_slots),
         max_model_len=width,
         membership_block_size=block,
         query_start=jnp.int32(start),

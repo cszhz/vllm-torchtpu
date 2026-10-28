@@ -1565,6 +1565,7 @@ def initialize_fp8_indexer() -> None:
             requests.new_empty((tokens, count), dtype=torch.bool),
             torch.empty_like(candidates),
             torch.empty_like(candidates),
+            candidates.new_empty((tokens, count)),
         )
 
     def fake_prepared(
@@ -1635,9 +1636,17 @@ def _read(
 def _score_prepared(
     q, weights, lengths, prepared, topk, block, unordered, width, *, grouped=False
 ):
-    keys, canonical, offsets, order, valid_queries, membership, candidates, slots = (
-        prepared
-    )
+    (
+        keys,
+        canonical,
+        offsets,
+        order,
+        valid_queries,
+        membership,
+        candidates,
+        slots,
+        output_slots,
+    ) = prepared
     k = min(topk, width, candidates.shape[1] * block)
     lengths = jnp.where(valid_queries, jnp.clip(lengths, 0, width), 0)
     if not grouped:
@@ -1671,6 +1680,7 @@ def _score_prepared(
             membership,
             query_start_loc=offsets,
             candidate_slots=slots,
+            output_slots=output_slots,
             membership_block_size=block,
             max_model_len=capacity,
             query_start=start,
