@@ -364,7 +364,9 @@ def main():
         for group in (32, 64, 96, 128, 192, 256):
             for buffers in (1, 2, 3, 4):
                 words = (
-                    layout.page_rows * 128 + 33 * key[0] + len(banks)
+                    layout.page_rows * 128
+                    + layout.page_rows * 128 // key[0]
+                    + len(banks)
                     if whole_pages
                     else 33 * (key[0] + len(banks))
                 )

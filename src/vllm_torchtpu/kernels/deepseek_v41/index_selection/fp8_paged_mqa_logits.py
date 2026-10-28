@@ -367,7 +367,17 @@ def _kernel(
                         columns = (
                             fragment * mxu_size + jnp.arange(mxu_size)
                         ) // membership_block_size
-                        allowed = jnp.take(block_flags, columns, axis=1) != 0
+                        allowed = (
+                            jnp.take_along_axis(
+                                block_flags,
+                                jnp.broadcast_to(
+                                    columns[None, :],
+                                    (block_flags.shape[0], columns.shape[0]),
+                                ),
+                                axis=1,
+                            )
+                            != 0
+                        )
                         scaled = jnp.where(allowed, scaled, -jnp.inf)
                     scores[
                         output_slot(tile), :, pl.ds(fragment * mxu_size, mxu_size)
@@ -389,7 +399,17 @@ def _kernel(
                         columns = (
                             column + jnp.arange(PAGE_RECORDS)
                         ) // membership_block_size
-                        allowed = jnp.take(block_flags, columns, axis=1) != 0
+                        allowed = (
+                            jnp.take_along_axis(
+                                block_flags,
+                                jnp.broadcast_to(
+                                    columns[None, :],
+                                    (block_flags.shape[0], columns.shape[0]),
+                                ),
+                                axis=1,
+                            )
+                            != 0
+                        )
                         scaled = jnp.where(allowed, scaled, -jnp.inf)
                     scores[output_slot(tile), :, pl.ds(column, PAGE_RECORDS)] = scaled
 

@@ -655,14 +655,15 @@ def gather_candidate_keys(
         group, buffers = PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG[block, len(banks)]
     page_words = layout.page_rows * PAGE_RECORDS
     read_span = group if whole_pages else group * PAGE_ROWS
+    storage_span = group * page_words // block if whole_pages else group * PAGE_ROWS
     distance = buffers - 1
     count, per_page = physical.size, PAGE_RECORDS // block
     source_per_page = layout.page_size // block
     per_unit = pl.cdiv(count, units * group) * group
     flags_width = pl.cdiv(per_unit // group, 128) * 128
     scratch_words = (
-        buffers * (group * PAGE_ROWS * block + read_span * len(banks))
-        + (buffers * group * page_words if whole_pages else 0)
+        buffers * (storage_span * block + read_span * len(banks))
+        + ((buffers + 1) * storage_span if whole_pages else 0)
         + lanes
         + flags_width
     )
@@ -692,6 +693,19 @@ def gather_candidate_keys(
     active_steps = pl.cdiv(live_rows * physical.shape[1], units * group)
     control = jnp.full((lanes,), active_steps, jnp.int32)
     span, steps = group * PAGE_ROWS, per_unit // group
+    if whole_pages:
+        segments = jnp.arange(storage_span, dtype=jnp.int32)
+        record, field = (
+            segments // (page_words // block),
+            segments % (page_words // block),
+        )
+        pattern = jnp.where(
+            field < PAGE_ROWS,
+            (record // per_page * PAGE_ROWS + field) * per_page + record % per_page,
+            -1,
+        )
+    else:
+        pattern = jnp.zeros((lanes,), jnp.int32)
     mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
 
     @pl.kernel(
@@ -702,14 +716,17 @@ def gather_candidate_keys(
             pltpu.VMEM((metadata_rows,), jnp.int32),
             pltpu.VMEM((lanes,), jnp.int32),
             pltpu.VMEM((flags_width,), jnp.int32),
-            pltpu.VMEM((buffers, span, block), jnp.int32),
+            pltpu.VMEM((buffers, storage_span, block), jnp.int32),
             pltpu.VMEM((buffers, len(banks), read_span), jnp.int32),
             pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA((buffers, len(banks))),
             pltpu.SemaphoreType.DMA((buffers,)),
         )
         + (
-            (pltpu.VMEM((buffers, group, page_words), jnp.int32),)
+            (
+                pltpu.VMEM((buffers, storage_span), jnp.int32),
+                pltpu.VMEM((storage_span,), jnp.int32),
+            )
             if whole_pages
             else ()
         ),
@@ -724,6 +741,7 @@ def gather_candidate_keys(
         physical_ref,
         control_ref,
         tile_flags_ref,
+        pattern_ref,
         out,
         selected,
         control_vmem,
@@ -733,12 +751,14 @@ def gather_candidate_keys(
         metadata_sem,
         read_sem,
         write_sem,
-        *raw_pages,
+        *scatter,
     ):
         unit = lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
         pltpu.async_copy(control_ref, control_vmem, metadata_sem).wait()
         active = control_vmem[...][0]
         pltpu.async_copy(tile_flags_ref.at[unit], flags, metadata_sem).wait()
+        if whole_pages:
+            pltpu.async_copy(pattern_ref, scatter[1], metadata_sem).wait()
         metadata = physical_ref.at[unit]
         if metadata_rows < per_unit:
             metadata = metadata.at[:metadata_rows]
@@ -854,7 +874,9 @@ def gather_candidate_keys(
                         ref.reshape(-1, page_words if whole_pages else block).at[
                             plsc.Indices(read_ids.at[slot, bank], ignored_value=-1)
                         ],
-                        raw_pages[0].at[slot] if whole_pages else words.at[slot],
+                        words.at[slot].reshape(group, page_words)
+                        if whole_pages
+                        else words.at[slot],
                         read_sem.at[slot, bank],
                     )
                     (copy.wait if wait else copy.start)()
@@ -865,13 +887,24 @@ def gather_candidate_keys(
 
             @pl.when(tile_is_live(step))
             def copy_tile():
-                copy = pltpu.make_async_copy(
-                    words.at[slot],
-                    out.reshape(-1, block).at[
+                if whole_pages:
+                    if not wait:
+
+                        @plsc.parallel_loop(0, storage_span, lanes, unroll=8)
+                        def scatter_addresses(i):
+                            local = scatter[1][pl.ds(i, lanes)]
+                            scatter[0][slot, pl.ds(i, lanes)] = jnp.where(
+                                local >= 0, destination * group * PAGE_ROWS + local, -1
+                            )
+
+                    target = out.reshape(-1, block).at[
+                        plsc.Indices(scatter[0].at[slot], ignored_value=-1)
+                    ]
+                else:
+                    target = out.reshape(-1, block).at[
                         pl.ds(destination * group * PAGE_ROWS, span)
-                    ],
-                    write_sem.at[slot],
-                )
+                    ]
+                copy = pltpu.make_async_copy(words.at[slot], target, write_sem.at[slot])
                 (copy.wait if wait else copy.start)()
 
         for step in range(min(distance, steps)):
@@ -885,33 +918,6 @@ def gather_candidate_keys(
             if buffers == 1:
                 read(step, slot)
             read(step, slot, wait=True)
-            if whole_pages:
-
-                @pl.when(tile_is_live(step))
-                def repack_tile():
-                    @pl.loop(0, group // per_page)
-                    def repack_page(compact_page):
-                        @plsc.parallel_loop(
-                            0, PAGE_ROWS * PAGE_RECORDS, lanes, unroll=8
-                        )
-                        def repack(i):
-                            element = i + jnp.arange(lanes)
-                            field = element // PAGE_RECORDS
-                            column = (
-                                compact_page * per_page
-                                + element % PAGE_RECORDS // block
-                            )
-                            source = (
-                                column * page_words + field * block + element % block
-                            )
-                            words.reshape(buffers, -1)[
-                                slot,
-                                pl.ds(
-                                    compact_page * PAGE_ROWS * PAGE_RECORDS + i, lanes
-                                ),
-                            ] = plsc.load_gather(
-                                raw_pages[0].reshape(buffers, -1).at[slot], [source]
-                            )
 
             write(step)
             if buffers == 1:
@@ -930,4 +936,6 @@ def gather_candidate_keys(
                 lambda last=last: write(active - last - 1, wait=True)
             )
 
-    return gather(banks, ids, control, tile_flags)[: count // per_page * PAGE_ROWS]
+    return gather(banks, ids, control, tile_flags, pattern)[
+        : count // per_page * PAGE_ROWS
+    ]
