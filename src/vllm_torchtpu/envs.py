@@ -81,6 +81,12 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PREPROCESS_BACKEND: str = "native"
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    TPU_EXPERT_PLACEMENT: str = ""
+    TPU_MOE_EPLB_DYNAMIC: bool = False
+    TPU_MOE_EPLB_WINDOW_STEPS: int = 64
+    TPU_MOE_EPLB_MIN_GAIN: float = 0.03
+    TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB: int = 16
+    TPU_SYNC_PATH: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -641,6 +647,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight-bandwidth bound and the per-device expert load is badly
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # A static expert layout for the fused EP MoE kernel (expert_placement.py):
+    # the path of a JSON naming, per MoE layer, which global
+    # experts each EP rank holds and in what slot order, with spare slots
+    # holding replicas and optional staging slots for the dynamic re-layout.
+    # Harness alias of additional_config.deepseek_v41.expert_layout. Empty:
+    # the checkpoint's contiguous blocks.
+    "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", ""),
+    # Dynamic expert re-layout (expert_relayout.py): on every clean window of
+    # WINDOW_STEPS coordinated steps, re-solve the layout from the kernel's
+    # load counts, re-lay a layer only when its slowest rank's rows drop by at
+    # least MIN_GAIN (relative), and copy the moved experts into the staging
+    # slots with tpu-sync raw transfers, at most STEP_BUDGET_MB of DMA per
+    # step. Needs a layout with staging slots and tpu-sync-torch. Default off.
+    "TPU_MOE_EPLB_DYNAMIC": env_bool("TPU_MOE_EPLB_DYNAMIC"),
+    "TPU_MOE_EPLB_WINDOW_STEPS": lambda: int(
+        os.getenv("TPU_MOE_EPLB_WINDOW_STEPS", "64") or 64
+    ),
+    "TPU_MOE_EPLB_MIN_GAIN": lambda: float(
+        os.getenv("TPU_MOE_EPLB_MIN_GAIN", "0.03") or 0.03
+    ),
+    "TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB": lambda: int(
+        os.getenv("TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB", "16") or 16
+    ),
+    # A directory holding a tpu_sync package (`pip install --target <dir>`)
+    # imported instead of the installed one, e.g. a build with fp4 raw
+    # transfers for the dynamic re-layout: env_override.py puts it first on
+    # sys.path at package import. Unset: the installed (pinned) package.
+    "TPU_SYNC_PATH": env_str("TPU_SYNC_PATH", ""),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(

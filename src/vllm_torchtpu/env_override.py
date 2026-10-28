@@ -2,10 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
 
 import os
+import sys
 
 # envs.py imports nothing from this package, so it is safe to load here,
 # while the package's own __init__ is still running.
 from vllm_torchtpu import envs
+
+# A tpu_sync build to use instead of the installed one (TPU_SYNC_PATH, a
+# `pip install --target` directory): first on sys.path before anything in
+# this package can import tpu_sync. expert_mover checks where it came from.
+if envs.TPU_SYNC_PATH:
+    _tpu_sync_root = os.path.realpath(envs.TPU_SYNC_PATH)
+    if _tpu_sync_root not in sys.path:
+        sys.path.insert(0, _tpu_sync_root)
 
 # Configure TorchTPU compilation cache environment variables directly
 if envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
