@@ -13,7 +13,9 @@
 # limitations under the License.
 import functools
 import glob
+import hashlib
 import os
+from importlib import metadata as importlib_metadata
 
 import requests
 from jax.experimental.pallas import tpu as pltpu
@@ -82,6 +84,50 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
             accelerator_type,
         )
         return pltpu.ChipVersion.TPU_7X
+
+
+def get_libtpu_version() -> str | None:
+    """Version of the pip ``libtpu`` package, or None if it is not installed.
+
+    Some environments load ``libtpu.so`` directly through ``TPU_LIBRARY_PATH``
+    (for example container images that ship a prebuilt library) and have no
+    ``libtpu`` package metadata.
+    """
+    try:
+        return importlib_metadata.version("libtpu")
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+@functools.cache
+def _libtpu_file_fingerprint(path: str, size: int, mtime_ns: int) -> str:
+    # Hash the size and the first/last MiB: cheap for a ~700 MB library, and
+    # it distinguishes builds even when images reset mtimes.
+    digest = hashlib.sha256(str(size).encode())
+    with open(path, "rb") as f:
+        digest.update(f.read(1 << 20))
+        if size > (1 << 20):
+            f.seek(max(size - (1 << 20), 1 << 20))
+            digest.update(f.read(1 << 20))
+    return digest.hexdigest()[:16]
+
+
+def get_libtpu_cache_key() -> str:
+    """Identify the libtpu build in use, for compilation cache keys.
+
+    Uses the ``libtpu`` package version when available, otherwise a
+    fingerprint of the library at ``TPU_LIBRARY_PATH``.
+    """
+    libtpu_version = get_libtpu_version()
+    if libtpu_version is not None:
+        return libtpu_version
+    path = envs.TPU_LIBRARY_PATH or ""
+    if path and os.path.isfile(path):
+        st = os.stat(path)
+        return "unpackaged-" + _libtpu_file_fingerprint(
+            path, st.st_size, st.st_mtime_ns
+        )
+    return "unpackaged-unknown"
 
 
 def get_node_name() -> str:
