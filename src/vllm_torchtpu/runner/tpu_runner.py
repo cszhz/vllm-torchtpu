@@ -1341,20 +1341,22 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
     def _relayout_tables(self, model: torch.nn.Module | None) -> None:
-        """Give ``model`` the row-major table layouts the env knobs ask for.
+        """Give ``model`` the table shapes and row-major layouts the env knobs ask for.
 
-        ``load_model`` relayouts the target inline; this applies the same to
-        the draft, which feeds the same cached Pallas ops and so must share
-        the target's table layout.
+        ``load_model`` truncates and relayouts the target inline; this applies
+        the same to the draft, which feeds the same cached Pallas ops and so
+        must share the target's table shape and layout.
         """
         if model is None:
             return
+        if envs.TPU_ROPE_CACHE_TRUNCATE:
+            self._truncate_rope_caches(model)
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
             runner_utils.relayout_rope_caches(model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(model)
 
-    def _truncate_rope_caches(self) -> None:
+    def _truncate_rope_caches(self, model: torch.nn.Module | None = None) -> None:
         """Slice rotary cos_sin caches to max_model_len which can reduce
         the overhead of xla layout data copy. Applicable to text-only.
         """
@@ -1367,10 +1369,12 @@ class TPUModelRunner(GPUModelRunner):
                 "not bounded by max_model_len"
             )
             return
+        target = self.model if model is None else model
         max_len = self.model_config.max_model_len
         num_eligible = 0
         num_truncated = 0
-        for name, module in self.model.named_modules():
+        truncated_by_id: dict[int, torch.Tensor] = {}
+        for name, module in target.named_modules():
             # isinstance, not an exact type match: on TPU these are the
             # out-of-tree subclasses from layers/adapter/rotary_embedding.py
             # and layers/adapter/custom_ops/mla_attention_op.py. DeepSeek
@@ -1392,9 +1396,13 @@ class TPUModelRunner(GPUModelRunner):
                     continue
                 num_eligible += 1
                 if buf.ndim >= 1 and buf.shape[0] > max_len:
-                    truncated = buf[:max_len].clone(
-                        memory_format=torch.contiguous_format
-                    )
+                    buf_id = id(buf)
+                    truncated = truncated_by_id.get(buf_id)
+                    if truncated is None:
+                        truncated = buf[:max_len].clone(
+                            memory_format=torch.contiguous_format
+                        )
+                        truncated_by_id[buf_id] = truncated
                     setattr(module, buf_name, truncated)
                     num_truncated += 1
                     logger.info(

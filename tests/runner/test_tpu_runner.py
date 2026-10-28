@@ -3673,18 +3673,33 @@ def test_truncate_rope_caches_covers_deepseek_scaling():
         DeepseekV4ScalingRotaryEmbedding,
     )
 
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmDeepseekScalingRotaryEmbedding,
+    )
+
     max_len = 32
+    shared_buf = torch.zeros(128, 8)
+    shared_a = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    shared_b = _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)
+    shared_a.cos_sin_cache = shared_buf
+    shared_b.cos_sin_cache = shared_buf
     model = torch.nn.ModuleDict(
         {
             "rope": _bare_rope(RotaryEmbedding, 128),
             "deepseek": _bare_rope(DeepseekScalingRotaryEmbedding, 128),
+            "tpu_deepseek": _bare_rope(VllmDeepseekScalingRotaryEmbedding, 128),
             "deepseek_v4": _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128),
+            "shared_a": shared_a,
+            "shared_b": shared_b,
             "short": _bare_rope(DeepseekScalingRotaryEmbedding, 16),
         }
     )
     other = torch.nn.Module()
     other.register_buffer("cos_sin_cache", torch.zeros(128, 8), persistent=False)
     model["other"] = other
+    draft_model = torch.nn.ModuleDict(
+        {"draft_rope": _bare_rope(DeepseekV4ScalingRotaryEmbedding, 128)}
+    )
     runner = SimpleNamespace(
         model=model,
         model_config=SimpleNamespace(
@@ -3693,8 +3708,18 @@ def test_truncate_rope_caches_covers_deepseek_scaling():
     )
 
     TPUModelRunner._truncate_rope_caches(runner)
+    TPUModelRunner._truncate_rope_caches(runner, draft_model)
 
-    for name in ("rope", "deepseek", "deepseek_v4"):
+    for name in (
+        "rope",
+        "deepseek",
+        "tpu_deepseek",
+        "deepseek_v4",
+        "shared_a",
+        "shared_b",
+    ):
         assert model[name].cos_sin_cache.shape == (max_len, 8), name
+    assert model["shared_a"].cos_sin_cache is model["shared_b"].cos_sin_cache
     assert model["short"].cos_sin_cache.shape == (16, 8)
     assert model["other"].cos_sin_cache.shape == (128, 8)
+    assert draft_model["draft_rope"].cos_sin_cache.shape == (max_len, 8)
