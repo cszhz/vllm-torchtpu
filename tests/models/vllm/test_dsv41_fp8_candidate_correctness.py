@@ -57,7 +57,12 @@ def _cpu_logits(q, keys, weights, lengths, pages, **kwargs):
     k = read_fp8_records(banks, records, layout).astype(jnp.float32)
     products = jnp.einsum("rhd,rkd->rhk", q[rows], k)
     scores = (jnp.maximum(products, 0) * weights[rows, :, None]).sum(axis=1)
-    return jnp.where(cols < lengths[rows, None], scores, -jnp.inf)
+    allowed = cols < lengths[rows, None]
+    if kwargs.get("block_membership") is not None:
+        allowed &= kwargs["block_membership"][
+            rows[:, None], cols // kwargs["membership_block_size"]
+        ]
+    return jnp.where(allowed, scores, -jnp.inf)
 
 
 @pytest.fixture

@@ -134,9 +134,10 @@ def _kernel(
     info,
     layout,
     reuse_keys,
+    membership_block_size,
 ):
     mxu_size, sublanes = info.mxu_column_size, info.num_sublanes
-    q, weights, pool, table = inputs
+    q, weights, pool, table, membership = inputs
     buffers, semaphores = scratch
     queries, keys, scores, counts, pages = buffers
     read_sem, write_sem, q_sem, page_sem = semaphores
@@ -273,6 +274,16 @@ def _kernel(
             def key_rows(start, count):
                 return keys[key_slot(tile), pl.ds(start, count)]
 
+            allowed = None
+            if membership is not None:
+                blocks_per_tile = key_tile // membership_block_size
+                block_flags = jnp.stack(
+                    [
+                        membership[r, pl.ds(tile * blocks_per_tile, blocks_per_tile)]
+                        for r in row_ids(query)
+                    ]
+                )
+                allowed = jnp.repeat(block_flags, membership_block_size, axis=1)
             base = tile * key_tile + jnp.arange(PAGE_RECORDS)
             remaining = jnp.maximum(lengths_vector, 0)[:, None] - base[None, :]
 
@@ -352,6 +363,12 @@ def _kernel(
                             scaled,
                             -jnp.inf,
                         )
+                    if allowed is not None:
+                        scaled = jnp.where(
+                            allowed[:, fragment * mxu_size : (fragment + 1) * mxu_size],
+                            scaled,
+                            -jnp.inf,
+                        )
                     scores[
                         output_slot(tile), :, pl.ds(fragment * mxu_size, mxu_size)
                     ] = scaled
@@ -368,6 +385,10 @@ def _kernel(
                     if not full:
                         bound = jnp.where(valid, column, jnp.iinfo(jnp.int32).max)
                         scaled = jnp.where(remaining > bound, scaled, -jnp.inf)
+                    if allowed is not None:
+                        scaled = jnp.where(
+                            allowed[:, column : column + PAGE_RECORDS], scaled, -jnp.inf
+                        )
                     scores[output_slot(tile), :, pl.ds(column, PAGE_RECORDS)] = scaled
 
             pending = {}
@@ -484,6 +505,8 @@ def _kernel(
         "query_size",
         "query_count",
         "reuse_keys",
+        "key_tile",
+        "membership_block_size",
     )
 )
 def fp8_paged_mqa_logits(
@@ -501,6 +524,9 @@ def fp8_paged_mqa_logits(
     query_start: jax.Array | int = 0,
     query_count: int | None = None,
     reuse_keys: bool = False,
+    key_tile: int | None = None,
+    block_membership: jax.Array | None = None,
+    membership_block_size: int = 1,
 ) -> jax.Array:
     """Return FP32 scores for the query window, with invalid positions set to -inf.
 
@@ -519,6 +545,9 @@ def fp8_paged_mqa_logits(
         query_count: Output rows; defaults to the full query batch.
         reuse_keys: Keep a single complete K tile resident across query groups
             belonging to the same request. Multi-tile outputs retain prefetching.
+        key_tile: Optional key-tile capacity for prepared sparse unions.
+        block_membership: Per-query allowed compact blocks, or None for dense scores.
+        membership_block_size: Tokens represented by each membership column.
     """
     tokens, heads, dim = q.shape
     tokens = tokens if query_count is None else query_count
@@ -532,11 +561,24 @@ def fp8_paged_mqa_logits(
     config = replace(
         config,
         query_tile=tile,
-        key_tile=paged_mqa_key_tile(max_model_len, layout.page_size, config.key_tile),
+        key_tile=paged_mqa_key_tile(
+            max_model_len,
+            layout.page_size,
+            config.key_tile if key_tile is None else key_tile,
+        ),
     )
     width = pl.cdiv(max_model_len, config.key_tile) * config.key_tile
     if tokens == 0 or width == 0:
         return jnp.empty((tokens, max_model_len), jnp.float32)
+    if block_membership is not None:
+        if config.key_tile % membership_block_size:
+            raise ValueError("Membership block size must divide the key tile")
+        membership_columns = width // membership_block_size
+        block_membership = jnp.pad(
+            block_membership[:, :membership_columns],
+            ((0, 0), (0, max(0, membership_columns - block_membership.shape[1]))),
+            constant_values=False,
+        )
     info = cast(pltpu.TpuInfo, pltpu.get_tpu_info())
     page_count = width // layout.page_size
     tile_pages = config.key_tile // layout.page_size
@@ -557,6 +599,14 @@ def fp8_paged_mqa_logits(
         * info.num_lanes
         * 4
     )
+    if block_membership is not None:
+        vector_bytes += (
+            pl.cdiv(block_membership.shape[0], info.num_sublanes)
+            * info.num_sublanes
+            * pl.cdiv(block_membership.shape[1], info.num_lanes)
+            * info.num_lanes
+            * block_membership.dtype.itemsize
+        )
     table_bytes = (
         pl.cdiv(page_ids.shape[0], info.num_sublanes)
         * info.num_sublanes
@@ -587,6 +637,18 @@ def fp8_paged_mqa_logits(
                 query_start=query_start,
                 query_count=query_count,
                 reuse_keys=reuse_keys,
+                key_tile=key_tile,
+                block_membership=(
+                    None
+                    if block_membership is None
+                    else lax.dynamic_slice_in_dim(
+                        block_membership,
+                        start // membership_block_size,
+                        config.key_tile // membership_block_size,
+                        axis=1,
+                    )
+                ),
+                membership_block_size=membership_block_size,
             )
             return lax.dynamic_update_slice_in_dim(output, values, start, axis=1)
 
@@ -612,7 +674,7 @@ def fp8_paged_mqa_logits(
         ),
     )
     hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
-    inputs = (q, weights * q_scale, banks, table)
+    inputs = (q, weights * q_scale, banks, table, block_membership)
     return pl.pallas_call(
         partial(
             _kernel,
@@ -620,12 +682,21 @@ def fp8_paged_mqa_logits(
             info=info,
             layout=layout,
             reuse_keys=reuse_keys and width == config.key_tile,
+            membership_block_size=membership_block_size,
         ),
         out_shape=jax.ShapeDtypeStruct((tokens, width), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             grid=(1,),
-            in_specs=((hbm, vmem, tuple(hbm for _ in banks), vmem),),
+            in_specs=(
+                (
+                    hbm,
+                    vmem,
+                    tuple(hbm for _ in banks),
+                    vmem,
+                    vmem if block_membership is not None else None,
+                ),
+            ),
             out_specs=hbm,
             scratch_shapes=(scratch,),
         ),

@@ -46,6 +46,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import
     PACKED_FP8_DENSE_TOPK_THRESHOLD,
     PACKED_FP8_INDEXER_QUERY_ROWS,
     PACKED_FP8_MQA_CONFIG,
+    PACKED_FP8_PREPARED_MQA_CONFIG,
     PACKED_FP8_PREPARED_QUERY_ROWS,
     paged_mqa_key_tile,
 )
@@ -1661,15 +1662,16 @@ def _score_prepared(
             compact_lengths,
             pages,
             query_start_loc=offsets,
-            query_size=PACKED_FP8_MQA_CONFIG.query_tile,
+            query_size=min(rows, PACKED_FP8_PREPARED_MQA_CONFIG.query_tile),
+            key_tile=PACKED_FP8_PREPARED_MQA_CONFIG.key_tile,
+            block_membership=membership,
+            membership_block_size=block,
             max_model_len=capacity,
             q_scale=jnp.ones_like(weights, dtype=jnp.float32),
             cache_layout=PackedFP8Layout(keys.shape[0] // PAGE_ROWS),
             query_start=start,
             query_count=chunk,
         )
-        allowed = jax.lax.dynamic_slice_in_dim(membership, start, chunk)
-        scores = jnp.where(jnp.repeat(allowed, block, axis=1), scores, -jnp.inf)
         return (
             scores
             if group is None

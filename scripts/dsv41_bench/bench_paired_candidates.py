@@ -437,7 +437,10 @@ def main():
                 compact_lengths,
                 pages,
                 query_start_loc=offsets,
-                query_size=indexer_impl.PACKED_FP8_MQA_CONFIG.query_tile,
+                query_size=min(
+                    q.shape[0], indexer_impl.PACKED_FP8_PREPARED_MQA_CONFIG.query_tile
+                ),
+                key_tile=indexer_impl.PACKED_FP8_PREPARED_MQA_CONFIG.key_tile,
                 max_model_len=canonical.shape[1] * args.block,
                 q_scale=jnp.ones_like(weights, dtype=jnp.float32),
                 cache_layout=PackedFP8Layout(keys.shape[0] // 33),
