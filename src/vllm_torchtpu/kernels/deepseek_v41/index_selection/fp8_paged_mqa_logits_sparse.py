@@ -245,13 +245,20 @@ def fp8_gathered_mqa_logits(
     first = jnp.minimum(query_start_loc[:-1], q.shape[0] - 1)
     second = jnp.minimum(first + 1, q.shape[0] - 1)
     positions = jnp.arange(width)[None, :]
-    a = jnp.repeat(allowed[first], membership_block_size, axis=1)
-    a &= (size[:, None] > 0) & (positions < context_lens[first, None])
-    b = jnp.repeat(allowed[second], membership_block_size, axis=1)
-    b &= (size[:, None] == 2) & (positions < context_lens[second, None])
-    visibility = (a.astype(jnp.int32) | (b.astype(jnp.int32) << 1)).reshape(
-        -1, TILE_PAGES, PAGE_RECORDS
+    block_flags = allowed[first].astype(jnp.int32) | (
+        allowed[second].astype(jnp.int32) << 1
     )
+    # Keep expansion rank two: repeat creates a padded [..., blocks, 8] array.
+    flags = jnp.take(
+        block_flags, jnp.arange(width) // membership_block_size, axis=1, mode="clip"
+    )
+    a = jnp.where(
+        (size[:, None] > 0) & (positions < context_lens[first, None]), flags & 1, 0
+    )
+    b = jnp.where(
+        (size[:, None] == 2) & (positions < context_lens[second, None]), flags & 2, 0
+    )
+    visibility = (a | b).reshape(-1, TILE_PAGES, PAGE_RECORDS)
     meta, desc, dead = _schedule(
         query_start_loc, context_lens, q.shape[0], query_start, rows, width
     )
