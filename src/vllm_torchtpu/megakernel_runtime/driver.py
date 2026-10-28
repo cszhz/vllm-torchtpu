@@ -53,6 +53,7 @@ from vllm_torchtpu.megakernel_runtime.exported_bridge import (
     build_pooled_step_op,
     execute_pooled_step_inplace,
 )
+from vllm_torchtpu.megakernel_runtime.hooks import is_suppressed
 from vllm_torchtpu.megakernel_runtime.weight_collector import (
     find_backbone,
     get_routed_experts,
@@ -1488,8 +1489,13 @@ class MegakernelDriver:
 
         Returns `(True, hidden_states)` when handled by the megakernel (or timed
         by the A/B calibrator), or `(False, None)` to fall through to the runner's
-        default model forward.
+        default model forward. Always `(False, None)` inside
+        `megakernel_runtime.suppressed(runner)` (dummy / precompile / profile
+        runs), so those runs compile the stock graphs.
         """
+        if is_suppressed(runner):
+            self._prepared_step = None
+            return False, None
         use_mk = self.can_run(
             input_ids,
             positions,
