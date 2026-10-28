@@ -350,33 +350,33 @@ def _mla_ragged_paged_attention_kernel(
                     wait,
                 )
 
-        if wait:
-            acc_ref[...] = (
-                swa_acc_x2_ref[bq_sem_idx, ...]
-                .astype(jnp.float32)
-                .reshape(batch_size, bq_sz * num_q_heads, head_dim)
+    def init_acc_from_swa(bq_sem_idx):
+        acc_ref[...] = (
+            swa_acc_x2_ref[bq_sem_idx, ...]
+            .astype(jnp.float32)
+            .reshape(batch_size, bq_sz * num_q_heads, head_dim)
+        )
+        bl_list = []
+        bm_list = []
+        for b in range(batch_size):
+            bl_list.append(
+                jnp.concat(
+                    [
+                        bl_x2_ref[bq_sem_idx, b, i, :num_q_heads]
+                        for i in range(bq_sz)
+                    ]
+                )
             )
-            bl_list = []
-            bm_list = []
-            for b in range(batch_size):
-                bl_list.append(
-                    jnp.concat(
-                        [
-                            bl_x2_ref[bq_sem_idx, b, i, :num_q_heads]
-                            for i in range(bq_sz)
-                        ]
-                    )
+            bm_list.append(
+                jnp.concat(
+                    [
+                        bm_x2_ref[bq_sem_idx, b, i, :num_q_heads]
+                        for i in range(bq_sz)
+                    ]
                 )
-                bm_list.append(
-                    jnp.concat(
-                        [
-                            bm_x2_ref[bq_sem_idx, b, i, :num_q_heads]
-                            for i in range(bq_sz)
-                        ]
-                    )
-                )
-            l_ref[...] = jnp.stack(bl_list)
-            m_ref[...] = jnp.stack(bm_list)
+            )
+        l_ref[...] = jnp.stack(bl_list)
+        m_ref[...] = jnp.stack(bm_list)
 
     def start_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx):
         return _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
@@ -426,16 +426,68 @@ def _mla_ragged_paged_attention_kernel(
         ).reshape(batch_size, bq_sz * num_q_heads, head_dim)
         return q
 
+    def load_bkv_b(bkv_sem_idx, b):
+        bkv_u8 = pltpu.bitcast(bkv_x2_ref.at[bkv_sem_idx, b][...], jnp.uint8)
+        assert bkv_u8.shape[-1] == cache_kv_hbm_ref.shape[-1]
+        bkv_bf16 = pltpu.bitcast(bkv_u8, jnp.bfloat16)
+        bkv = bkv_bf16.reshape(-1, head_dim)
+        assert bkv.shape == (bkv_sz, head_dim)
+        return bkv
+
     def load_bkv(bkv_sem_idx, bkv_idx):
-        bkv_vecs = []
-        for b in range(batch_size):
-            bkv_u8 = pltpu.bitcast(bkv_x2_ref.at[bkv_sem_idx, b][...], jnp.uint8)
-            assert bkv_u8.shape[-1] == cache_kv_hbm_ref.shape[-1]
-            bkv_bf16 = pltpu.bitcast(bkv_u8, jnp.bfloat16)
-            bkv = bkv_bf16.reshape(-1, head_dim)
-            assert bkv.shape == (bkv_sz, head_dim)
-            bkv_vecs.append(bkv)
-        return jnp.stack(bkv_vecs)
+        return jnp.stack([load_bkv_b(bkv_sem_idx, b) for b in range(batch_size)])
+
+    def single_block_attention(bq_idx, bq_sem_idx, bkv_sem_idx, bo_sem_idx):
+        """flash_attention plus the output epilogue for a sequence whose kv is
+        one block: the same ops in the same order, without round-tripping acc,
+        l and m through acc_ref, l_ref and m_ref."""
+        q = load_bq(bq_sem_idx)
+        attention_sinks = jnp.concat([attention_sinks_ref[...] for _ in range(bq_sz)])
+        col = lax.broadcasted_iota(jnp.int32, (num_q_heads, bkv_sz), 1)
+        assert batch_size == 1, "see compute_with_bq"
+        b = 0
+        kv = load_bkv_b(bkv_sem_idx, b)
+        s = jnp.einsum("nd,md->nm", q[b], kv, preferred_element_type=jnp.float32)
+        s *= sm_scale
+        q_start = cu_q_lens_ref[batch_start_seq_idx + b] + bq_idx * bq_sz
+        s = jnp.concatenate(
+            [
+                jnp.where(
+                    col
+                    >= kv_lens_to_attend_ref[
+                        jnp.minimum(q_start + i, kv_lens_to_attend_ref.shape[0] - 1)
+                    ],
+                    jnp.finfo(s.dtype).min,
+                    s[i * num_q_heads : (i + 1) * num_q_heads],
+                )
+                for i in range(bq_sz)
+            ],
+            axis=0,
+        )
+        m_prev = jnp.concat(
+            [bm_x2_ref[bq_sem_idx, b, i, :num_q_heads] for i in range(bq_sz)]
+        )
+        l_prev = jnp.concat(
+            [bl_x2_ref[bq_sem_idx, b, i, :num_q_heads] for i in range(bq_sz)]
+        )
+        m_curr = jnp.maximum(m_prev, jnp.max(s, axis=1))
+        p = jnp.exp(s - m_curr[:, None])
+        pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
+        exp_m_diff = jnp.exp(m_prev - m_curr)
+        l_curr = exp_m_diff * l_prev + jnp.sum(p, axis=1)
+        o_prev = (
+            swa_acc_x2_ref[bq_sem_idx, b]
+            .astype(jnp.float32)
+            .reshape(bq_sz * num_q_heads, head_dim)
+        )
+        acc = exp_m_diff[:, None] * o_prev + pv
+        l_sum = l_curr + jnp.exp(attention_sinks - m_curr)
+        out = (
+            lax.div(acc, l_sum[:, None])
+            if q_dtype == jnp.float32
+            else (acc * pl.reciprocal(l_sum[:, None], approx=True)).astype(q_dtype)
+        )
+        bo_x2_ref[bo_sem_idx, b] = out.reshape(bq_sz, num_q_heads, head_dim)
 
     def process():
         kv_len_max = kv_lens_ref[batch_start_seq_idx]
@@ -510,7 +562,7 @@ def _mla_ragged_paged_attention_kernel(
                 start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
                 start_fetch_swa(next_seq_idx, next_bq_idx, next_bq_sem_idx)
 
-            def compute_with_bkv(bkv_idx, _):
+            def wait_and_prefetch_bkv(bkv_idx):
                 # Get next bkv ids.
                 bkv_sem_idx = sem_ids_ref[1]
                 next_seq_idx, _, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids(
@@ -538,6 +590,11 @@ def _mla_ragged_paged_attention_kernel(
                 def _():
                     wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
 
+                return bkv_sem_idx
+
+            def compute_with_bkv(bkv_idx, _):
+                bkv_sem_idx = wait_and_prefetch_bkv(bkv_idx)
+
                 # Load bkv into vreg. There is no need to mask out invalid k/v entries,
                 # because the score of invalid Q.K^T pairs are masked (to be zero) in
                 # flash attention, so that the invalid kv entries
@@ -554,50 +611,72 @@ def _mla_ragged_paged_attention_kernel(
                     kv_lens_to_attend_list=kv_lens_to_attend_list,
                 )
 
+            def next_bo_sem_idx():
+                # Wait for previous bo to be fully sent before storing new bo.
+                bo_sem_idx = sem_ids_ref[2]
+                sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
+                wait_send_bo(bo_sem_idx)
+                return bo_sem_idx
+
             # Wait for cur bq if not ready yet
             wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)
             wait_fetch_swa(batch_start_seq_idx, bq_idx, bq_sem_idx)
-            jax.lax.fori_loop(
-                0,
-                num_bkv,
-                compute_with_bkv,
-                None,
-                unroll=False,
-            )
 
-            # Load acc and calculate final output.
-            acc = acc_ref[...]
-            attention_sinks = jnp.concat(
-                [attention_sinks_ref[...] for _ in range(bq_sz)]
-            )
-            exp_attention_sinks = jnp.exp(attention_sinks[None, :] - m_ref[...])
-            l_sum = l_ref[...] + exp_attention_sinks
-            out = (
-                lax.div(acc, l_sum[:, :, None])
-                if q_dtype == jnp.float32
-                else (acc * pl.reciprocal(l_sum[:, :, None], approx=True)).astype(
-                    q_dtype
+            def multi_block():
+                init_acc_from_swa(bq_sem_idx)
+                jax.lax.fori_loop(
+                    0,
+                    num_bkv,
+                    compute_with_bkv,
+                    None,
+                    unroll=False,
                 )
-            )
 
-            # Wait for previous bo to be fully sent before storing new bo.
-            bo_sem_idx = sem_ids_ref[2]
-            sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
-            wait_send_bo(bo_sem_idx)
+                # Load acc and calculate final output.
+                acc = acc_ref[...]
+                attention_sinks = jnp.concat(
+                    [attention_sinks_ref[...] for _ in range(bq_sz)]
+                )
+                exp_attention_sinks = jnp.exp(attention_sinks[None, :] - m_ref[...])
+                l_sum = l_ref[...] + exp_attention_sinks
+                out = (
+                    lax.div(acc, l_sum[:, :, None])
+                    if q_dtype == jnp.float32
+                    else (acc * pl.reciprocal(l_sum[:, :, None], approx=True)).astype(
+                        q_dtype
+                    )
+                )
 
-            # Store output from acc to bo.
-            bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
-                batch_size,
-                bq_sz * num_q_heads_per_q_packing,
-                head_dim,
-            )[...] = pltpu.bitcast(out, jnp.int32).reshape(
-                batch_size,
-                bq_sz * num_q_heads_per_q_packing,
-                head_dim,
-            )
+                bo_sem_idx = next_bo_sem_idx()
 
-            # Send cur bo
-            start_send_bo(batch_start_seq_idx, bq_idx, bo_sem_idx)
+                # Store output from acc to bo.
+                bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
+                    batch_size,
+                    bq_sz * num_q_heads_per_q_packing,
+                    head_dim,
+                )[...] = pltpu.bitcast(out, jnp.int32).reshape(
+                    batch_size,
+                    bq_sz * num_q_heads_per_q_packing,
+                    head_dim,
+                )
+
+                # Send cur bo
+                start_send_bo(batch_start_seq_idx, bq_idx, bo_sem_idx)
+
+            # The batched-decode pass keeps the batched multi-block path: its
+            # per-sequence matmuls are too small for the single-block path to pay.
+            if batch_size == 1:
+
+                @pl.when(num_bkv == 1)
+                def _single_block():
+                    bkv_sem_idx = wait_and_prefetch_bkv(0)
+                    bo_sem_idx = next_bo_sem_idx()
+                    single_block_attention(bq_idx, bq_sem_idx, bkv_sem_idx, bo_sem_idx)
+                    start_send_bo(batch_start_seq_idx, bq_idx, bo_sem_idx)
+
+                pl.when(num_bkv > 1)(multi_block)
+            else:
+                multi_block()
 
         lax.fori_loop(0, num_bq, compute_with_bq, None, unroll=False)
 
