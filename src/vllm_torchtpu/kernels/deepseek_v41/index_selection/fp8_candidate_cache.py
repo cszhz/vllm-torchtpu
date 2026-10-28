@@ -364,7 +364,7 @@ def _canonical_candidate_blocks(
         out_type=(jax.ShapeDtypeStruct((rows, columns), jnp.int32),)
         * (3 if fused else 2),
         scratch_types=(
-            pltpu.VMEM((owners, histogram_width), jnp.int32),
+            tuple(pltpu.VMEM((histogram_width,), jnp.int32) for _ in range(owners)),
             pltpu.VMEM((columns,), jnp.int32),
             pltpu.VMEM((table.shape[1],), jnp.int32),
             pltpu.VMEM((columns + lanes,), jnp.int32),
@@ -403,7 +403,7 @@ def _canonical_candidate_blocks(
             @plsc.parallel_loop(0, histogram_width, lanes, unroll=alignment // lanes)
             def clear_hist(i):
                 for owner in range(owners):
-                    hist[owner, pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
+                    hist[owner][pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
 
             @plsc.parallel_loop(0, columns + lanes, lanes)
             def clear_result(i):
@@ -428,7 +428,7 @@ def _canonical_candidate_blocks(
                         )
                     inc, mask = plsc.scan_count(keys, mask=valid)
                     plsc.addupdate_scatter(
-                        hist.at[owner],
+                        hist[owner],
                         [jnp.clip(keys, 0, histogram_width - 1)],
                         inc,
                         mask=mask,
@@ -440,9 +440,9 @@ def _canonical_candidate_blocks(
                     page_ids,
                     [jnp.minimum(logical // per_page * parts, table.shape[1] - 1)],
                 )
-                present = hist[0, pl.ds(i, lanes)] != 0
+                present = hist[0][pl.ds(i, lanes)] != 0
                 if fused:
-                    present |= hist[1, pl.ds(i, lanes)] != 0
+                    present |= hist[1][pl.ds(i, lanes)] != 0
                 valid = (
                     present
                     & (logical < blocks)
@@ -472,7 +472,7 @@ def _canonical_candidate_blocks(
                     for owner in range(2):
                         plsc.store_compressed(
                             flags.at[owner, pl.ds(count, lanes)],
-                            (hist[owner, pl.ds(i, lanes)] != 0).astype(jnp.int32),
+                            (hist[owner][pl.ds(i, lanes)] != 0).astype(jnp.int32),
                             mask=valid,
                         )
                 return count + plsc.all_reduce_population_count(valid)[0]
