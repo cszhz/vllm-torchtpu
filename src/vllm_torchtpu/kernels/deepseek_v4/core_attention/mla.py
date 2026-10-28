@@ -517,14 +517,26 @@ def _mla_ragged_paged_attention_kernel(
                     batch_start_seq_idx, bq_idx, bkv_idx, bkv_sem_idx
                 )
 
+                # A sequence whose kv fits one block keeps it resident in VMEM
+                # across its bq blocks: only its first bq block waits for it.
+                resident = jnp.logical_and(
+                    num_bkv == 1, next_seq_idx == batch_start_seq_idx
+                )
+
                 # Prefetch next bkv
-                @pl.when(next_seq_idx < end_seq_idx)
+                @pl.when(
+                    jnp.logical_and(
+                        next_seq_idx < end_seq_idx, jnp.logical_not(resident)
+                    )
+                )
                 def prefetch_next_bkv():
                     sem_ids_ref[1] = next_bkv_sem_idx
                     start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
 
                 # Wait for cur bkv
-                wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
+                @pl.when(jnp.logical_or(num_bkv > 1, bq_idx == 0))
+                def _():
+                    wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
 
                 # Load bkv into vreg. There is no need to mask out invalid k/v entries,
                 # because the score of invalid Q.K^T pairs are masked (to be zero) in
