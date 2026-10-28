@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Check contiguous-union scores against the independent paged dense path."""
+"""Check query-local scores against an independent FP32 NumPy reference."""
 
 import jax
 import jax.numpy as jnp
@@ -9,9 +9,6 @@ import pytest
 import torch
 
 from tests.kernels.deepseek_v41.test_fp8_paged_mqa_logits import _pack_fp8_cache
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_paged_mqa_logits_dense import (  # noqa: E501
-    fp8_paged_mqa_logits,
-)
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_paged_mqa_logits_sparse import (  # noqa: E501
     fp8_gathered_mqa_logits,
 )
@@ -30,7 +27,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import 
         (32768, 8192, 1, 5),
     ],
 )
-def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, count):
+def test_gathered_logits_match_fp32_and_query_masks(width, key_tile, start, count):
     if jax.default_backend() != "tpu":
         pytest.skip("Requires the TPU MQA kernels")
     rng = np.random.default_rng(821)
@@ -41,32 +38,39 @@ def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, cou
         torch.randn((layout.pages, 128, 1, 128), dtype=torch.bfloat16), layout
     )
     q = jnp.asarray(rng.normal(size=(7, 32, 128))).astype(jnp.float8_e4m3fn)
-    weights = jnp.asarray(rng.uniform(0.01, 0.1, (7, 32)), jnp.float32)
+    weights = jnp.asarray(rng.uniform(-0.1, 0.1, (7, 32)), jnp.float32)
     lengths = jnp.array([width, width - 1, width // 3, 0, 0, width - 7, width])
     offsets = jnp.array([0, 0, 2, 3, 3, 5, 7], jnp.int32)
     pages = jnp.asarray(np.stack([rng.permutation(layout.pages) for _ in range(6)]))
     gathered = cache.reshape(layout.pages, 33, 128)[pages].reshape(-1, 128)
     membership = rng.random((7, width // block)) > 0.5
     membership[6] = False
-    baseline = fp8_paged_mqa_logits(
-        q,
-        cache,
-        weights,
-        lengths,
-        pages,
-        query_start_loc=offsets,
-        max_model_len=width,
-        q_scale=jnp.ones_like(weights),
-        query_size=2,
-        cache_layout=layout,
-        query_start=jnp.int32(start),
-        query_count=count,
+    words = np.asarray(cache).reshape(layout.pages, 33, 128)
+    packed = np.ascontiguousarray(words[:, :32].transpose(0, 2, 1))
+    raw_keys = (
+        packed.view(np.uint8)
+        .reshape(-1, 128)
+        .view(jnp.float8_e4m3fn)
+        .astype(np.float32)
     )
+    scales = words[:, 32].view(np.float32).reshape(-1)
+    host_q, host_w = np.asarray(q).astype(np.float32), np.asarray(weights)
+    baseline = []
+    for row in range(start, start + count):
+        group = np.searchsorted(np.asarray(offsets)[1:], row, side="right")
+        records = (np.asarray(pages[group])[:, None] * 128 + np.arange(128)).reshape(-1)
+        products = host_q[row] @ raw_keys[records].T
+        values = (np.maximum(products, 0) * host_w[row, :, None]).sum(axis=0) * scales[
+            records
+        ]
+        baseline.append(np.where(np.arange(width) < int(lengths[row]), values, -np.inf))
+    baseline = np.asarray(baseline)
     # Per-query candidates have different orders and half the union capacity.
     slots = np.stack(
         [rng.permutation(width // block)[: width // block // 2] for _ in range(7)]
     )
     slots[0, 0] = -1
+    slots[1, 1] = slots[1, 0]
     output_slots = np.full((7, width // block), -1, np.int32)
     for row in range(7):
         for destination, source in enumerate(slots[row]):
@@ -102,4 +106,4 @@ def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, cou
     actual = np.asarray(actual)
     np.testing.assert_array_equal(np.isfinite(actual), np.isfinite(expected))
     live = np.isfinite(expected)
-    np.testing.assert_allclose(actual[live], expected[live], rtol=0.01, atol=0.01)
+    np.testing.assert_allclose(actual[live], expected[live], rtol=2e-5, atol=2e-5)
