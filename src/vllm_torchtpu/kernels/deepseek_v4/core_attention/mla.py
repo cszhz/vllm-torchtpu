@@ -23,6 +23,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+# KV pages per flash-attention block for the HCA caller. HCA compresses kv by
+# 128x, so at page_size 8 one 16-page (128-row) block holds a 16k-token context.
+HCA_KV_PAGES_PER_BLOCK = 16
 
 
 def cdiv(a, b):
