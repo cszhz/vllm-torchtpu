@@ -58,9 +58,18 @@ def _kernel(
             dst[...] = jnp.zeros(dst.shape, dst.dtype)
         _dma_rows(q, dst, q_sem.at[slot], query.count, wait, src_start=query.start)
 
+    def output_ref(pair, row):
+        return projected.at[
+            pl.ds(0, 1), pl.ds((pair * q_tile + row) * out.shape[1], out.shape[1])
+        ]
+
     def release_outputs(pair):
-        src = projected.at[pair]
-        _dma_rows(src, src, write_sem.at[pair], counts[pair], wait=True)
+        for i in range(q_tile):
+
+            @pl.when(i < counts[pair])
+            def wait(i=i):
+                src = output_ref(pair, i)
+                pltpu.make_async_copy(src, src, write_sem.at[pair, i]).wait()
 
     def copy_map(query, slot, wait=False):
         for i in range(q_tile):
@@ -136,7 +145,9 @@ def _kernel(
             )
 
         release_outputs(q_slot)
-        projected[q_slot] = jnp.full(projected.shape[1:], -jnp.inf, jnp.float32)
+        projected[
+            pl.ds(0, 1), pl.ds(q_slot * q_tile * out.shape[1], q_tile * out.shape[1])
+        ] = jnp.full((1, q_tile * out.shape[1]), -jnp.inf, jnp.float32)
         copy_map(query, q_slot)
         for i in range(2):
 
@@ -231,22 +242,26 @@ def _kernel(
                                 output_column = destination * membership_block_size
                                 page = output_column // PAGE_RECORDS * PAGE_RECORDS
                                 previous = projected[
-                                    q_slot, pl.ds(i, 1), pl.ds(page, PAGE_RECORDS)
+                                    pl.ds(0, 1),
+                                    pl.ds(
+                                        (q_slot * q_tile + i) * out.shape[1] + page,
+                                        PAGE_RECORDS,
+                                    ),
                                 ]
-                                part = scaled[
-                                    i : i + 1, start : start + membership_block_size
-                                ]
-                                repeated = jnp.tile(
-                                    part, (1, PAGE_RECORDS // membership_block_size)
-                                )
+                                shift = (output_column - start) % PAGE_RECORDS
+                                aligned = pltpu.roll(scaled[i : i + 1], shift, axis=1)
                                 active = jnp.arange(
                                     PAGE_RECORDS
                                 ) // membership_block_size == destination % (
                                     PAGE_RECORDS // membership_block_size
                                 )
                                 projected[
-                                    q_slot, pl.ds(i, 1), pl.ds(page, PAGE_RECORDS)
-                                ] = jnp.where(active[None, :], repeated, previous)
+                                    pl.ds(0, 1),
+                                    pl.ds(
+                                        (q_slot * q_tile + i) * out.shape[1] + page,
+                                        PAGE_RECORDS,
+                                    ),
+                                ] = jnp.where(active[None, :], aligned, previous)
 
             pending = {}
             for stage in range(fragments + config.issue_depth):
@@ -279,13 +294,15 @@ def _kernel(
         else:
             lax.fori_loop(0, tile_count, step_tile, None)
 
-        _dma_rows(
-            projected.at[q_slot],
-            out,
-            write_sem.at[q_slot],
-            query.count,
-            dst_start=query.start - begin,
-        )
+        for i in range(q_tile):
+
+            @pl.when(i < query.count)
+            def publish(i=i):
+                dst = out.at[pl.ds(query.start - begin + i, 1), :]
+                pltpu.make_async_copy(
+                    output_ref(q_slot, i), dst, write_sem.at[q_slot, i]
+                ).start()
+
         counts[q_slot] = query.count
 
         return (
@@ -407,7 +424,7 @@ def fp8_gathered_mqa_logits(
                 (config.key_buffers, tile // PAGE_RECORDS * PAGE_ROWS, dim), jnp.int32
             ),
             pltpu.SMEM((2,), jnp.int32),
-            pltpu.VMEM((2, q_tile, output_padded), jnp.float32),
+            pltpu.VMEM((1, 2 * q_tile * output_padded), jnp.float32),
             pltpu.SMEM((2 * q_tile * map_columns,), jnp.int32),
         ),
         tuple(
