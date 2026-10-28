@@ -134,7 +134,7 @@ def make_flat_pooled_step(
         w_idx = 0
         for k, t_len in zip(w_names, w_tuple_lens):
             t_sh = kernel.target_weight_shape(wsh[k])
-            allow_exp = k in p.dynamic_kinds
+            allow_exp = True
             if kernel.is_tupled_weight(wsh[k]):
                 w_args.append(
                     tuple(
