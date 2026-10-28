@@ -11,6 +11,7 @@ import pytest
 
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_candidate_cache import (
     candidate_membership,
+    gather_candidate_keys,
     prepare_candidates,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
@@ -97,3 +98,39 @@ def test_prepared_keys_and_membership_keep_original_token_mapping(owners, page_s
             ),
             np.asarray(read_fp8_records(banks, records, layout)),
         )
+
+
+@pytest.mark.parametrize("page_size", [8, 128])
+@pytest.mark.parametrize("bank_count", [1, 2])
+def test_gather_skips_empty_tiles_without_changing_live_slots(page_size, bank_count):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Exercises SparseCore DMA")
+    layout = PackedFP8Layout(128, page_size=page_size)
+    rng = np.random.default_rng(729)
+    pool = jnp.zeros((layout.pages * layout.page_rows, 128), jnp.int32)
+    banks = tuple(jnp.split(pool, bank_count))
+    keys = jnp.asarray(rng.normal(size=(layout.pages * page_size, 128)), jnp.bfloat16)
+    banks = write_fp8_records(banks, jnp.arange(keys.shape[0]), keys, layout)
+    physical = rng.integers(0, keys.shape[0] // 8, (3, 4096), dtype=np.int32)
+    physical[0, 129:] = -1
+    physical[1] = -1
+    physical[2, 2049:] = -1
+    offsets = jnp.array([0, 1, 1, 2], jnp.int32)
+    run = jax.jit(functools.partial(gather_candidate_keys, block=8, layout=layout))
+    # Changing occupancy also exercises buffer reuse and final partial tiles.
+    for ids in (physical, physical[:, ::-1].copy()):
+        gathered = run(banks, jnp.asarray(ids), offsets)
+        slots = np.flatnonzero(ids.reshape(-1) >= 0)
+        target = (slots[:, None] * 8 + np.arange(8)).reshape(-1)
+        source = (ids.reshape(-1)[slots, None] * 8 + np.arange(8)).reshape(-1)
+        np.testing.assert_array_equal(
+            np.asarray(
+                read_fp8_records(
+                    (gathered,),
+                    jnp.asarray(target),
+                    PackedFP8Layout(gathered.shape[0] // 33),
+                )
+            ),
+            np.asarray(read_fp8_records(banks, jnp.asarray(source), layout)),
+        )
+    run(banks, jnp.full_like(physical, -1), offsets).block_until_ready()

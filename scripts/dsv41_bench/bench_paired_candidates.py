@@ -258,11 +258,13 @@ def main():
         args.repeats,
         dimensions,
     )
-    # Padded inactive groups are deliberately unwritten; compare active groups.
-    active_pages = np.count_nonzero(np.diff(offsets)) * args.candidates * 2
-    active_rows = active_pages * args.block // 128 * 33
+    # Only valid blocks are initialized; skipped padding is never consumed.
+    per_page = 128 // min(args.block, args.page_size)
+    valid = np.asarray(physical >= 0).reshape(-1, 1, per_page)
+    valid = np.broadcast_to(valid, (valid.shape[0], 33, per_page)).reshape(-1)
     np.testing.assert_array_equal(
-        np.asarray(gathered[:active_rows]), np.asarray(prepared.keys[:active_rows])
+        np.asarray(gathered).reshape(-1, min(args.block, args.page_size))[valid],
+        np.asarray(prepared.keys).reshape(-1, min(args.block, args.page_size))[valid],
     )
     score = functools.partial(
         _score_prepared,

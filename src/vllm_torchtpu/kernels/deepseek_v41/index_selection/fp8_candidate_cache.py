@@ -508,7 +508,7 @@ def gather_candidate_keys(
     block: int,
     layout: PackedFP8Layout,
 ) -> jax.Array:
-    """Gather whole compact pages; trailing empty query groups do no DMA."""
+    """Gather live tiles into their original compact-page slots."""
     info = plsc.get_sparse_core_info()
     lanes, units = info.num_lanes, info.num_cores * info.num_subcores
     group = max(lanes, min(128, 1024 // block))
@@ -522,7 +522,10 @@ def gather_candidate_keys(
     count, per_page = physical.size, PAGE_RECORDS // block
     source_per_page = layout.page_size // block
     per_unit = pl.cdiv(count, units * group) * group
-    scratch_words = buffers * group * PAGE_ROWS * (block + len(banks)) + lanes
+    destination_width = pl.cdiv(per_unit // group, 128) * 128
+    scratch_words = (
+        buffers * group * PAGE_ROWS * (block + len(banks)) + lanes + destination_width
+    )
     metadata_rows = min(
         per_unit,
         (info.vmem_capacity_bytes // 4 - scratch_words - 4096) // group * group,
@@ -531,12 +534,26 @@ def gather_candidate_keys(
     ids = jnp.pad(
         physical.reshape(-1), (0, units * per_unit - count), constant_values=-1
     )
-    ids = ids.reshape(-1, units, group).transpose(1, 0, 2).reshape(units, per_unit)
-    ids = jnp.pad(ids, ((0, 0), (0, -per_unit % metadata_rows)), constant_values=-1)
+    tiles = ids.reshape(-1, group)
     live_rows = jnp.max(
         jnp.where(offsets[1:] > offsets[:-1], jnp.arange(physical.shape[0]) + 1, 0)
     )
-    active_steps = pl.cdiv(live_rows * physical.shape[1], units * group)
+    live_tiles = jnp.any(tiles >= 0, axis=1) & (
+        jnp.arange(tiles.shape[0]) * group < live_rows * physical.shape[1]
+    )
+    tile_count = jnp.sum(live_tiles, dtype=jnp.int32)
+    destinations = jnp.nonzero(live_tiles, size=tiles.shape[0], fill_value=-1)[0]
+    ids = jnp.where(destinations[:, None] >= 0, tiles[jnp.maximum(destinations, 0)], -1)
+    ids = ids.reshape(-1, units, group).transpose(1, 0, 2).reshape(units, per_unit)
+    destinations = destinations.reshape(-1, units).T
+    destinations = jnp.pad(
+        destinations,
+        ((0, 0), (0, destination_width - destinations.shape[1])),
+        constant_values=-1,
+    )
+    ids = jnp.pad(ids, ((0, 0), (0, -per_unit % metadata_rows)), constant_values=-1)
+
+    active_steps = pl.cdiv(tile_count, units)
     control = jnp.full((lanes,), active_steps, jnp.int32)
     span, steps = group * PAGE_ROWS, per_unit // group
     mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
@@ -548,6 +565,7 @@ def gather_candidate_keys(
         scratch_types=(
             pltpu.VMEM((metadata_rows,), jnp.int32),
             pltpu.VMEM((lanes,), jnp.int32),
+            pltpu.VMEM((destination_width,), jnp.int32),
             pltpu.VMEM((buffers, span, block), jnp.int32),
             pltpu.VMEM((buffers, len(banks), span), jnp.int32),
             pltpu.SemaphoreType.DMA,
@@ -564,9 +582,11 @@ def gather_candidate_keys(
         pool,
         physical_ref,
         control_ref,
+        destinations_ref,
         out,
         selected,
         control_vmem,
+        destination_ids,
         words,
         read_ids,
         metadata_sem,
@@ -576,6 +596,9 @@ def gather_candidate_keys(
         unit = lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
         pltpu.async_copy(control_ref, control_vmem, metadata_sem).wait()
         active = control_vmem[...][0]
+        pltpu.async_copy(
+            destinations_ref.at[unit], destination_ids, metadata_sem
+        ).wait()
         metadata = physical_ref.at[unit]
         if metadata_rows < per_unit:
             metadata = metadata.at[:metadata_rows]
@@ -639,13 +662,18 @@ def gather_candidate_keys(
 
         def write(step, wait=False):
             slot = step % buffers
-            start = (step * units + unit) * group
-            copy = pltpu.make_async_copy(
-                words.at[slot],
-                out.reshape(-1, block).at[pl.ds(start * PAGE_ROWS, span)],
-                write_sem.at[slot],
-            )
-            (copy.wait if wait else copy.start)()
+            destination = destination_ids[step]
+
+            @pl.when(destination >= 0)
+            def copy_tile():
+                copy = pltpu.make_async_copy(
+                    words.at[slot],
+                    out.reshape(-1, block).at[
+                        pl.ds(destination * group * PAGE_ROWS, span)
+                    ],
+                    write_sem.at[slot],
+                )
+                (copy.wait if wait else copy.start)()
 
         for step in range(min(distance, steps)):
             pl.when(step < active)(
@@ -675,4 +703,4 @@ def gather_candidate_keys(
                 lambda last=last: write(active - last - 1, wait=True)
             )
 
-    return gather(banks, ids, control)[: count // per_page * PAGE_ROWS]
+    return gather(banks, ids, control, destinations)[: count // per_page * PAGE_ROWS]
