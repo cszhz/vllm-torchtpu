@@ -70,9 +70,9 @@ export TPU_STREAMIDX_CHUNK_TOKENS="${TPU_STREAMIDX_CHUNK_TOKENS:-128}"
 export TPU_ROPE_CACHE_TRUNCATE="${TPU_ROPE_CACHE_TRUNCATE:-1}"
 export TPU_ROPE_CACHE_ROW_MAJOR="${TPU_ROPE_CACHE_ROW_MAJOR:-1}"
 export VLLM_TPU_FAST_TOKEN_SUBSTITUTION="${VLLM_TPU_FAST_TOKEN_SUBSTITUTION:-1}"
-# 5. SparseCore async All-Gather offload (256 KiB threshold)
-export SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES="${SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES:-262144}"
-export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }--xla_enable_async_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=262144"
+# 5. SparseCore async All-Gather offload (512 KiB threshold: keeps q_g >= 768 KiB on SparseCore while keeping 296 KiB MoE routing exchange on TensorCore ICI)
+export SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES="${SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES:-524288}"
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }--xla_enable_async_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=${SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES}"
 
 # Server configuration:
 # - max-model-len=9216: exact nominal length for 8192 input + 1024 output.
