@@ -150,6 +150,19 @@ class TestV3StateSourcePlan:
             signature.parameters["conv_state_dtype"].default is inspect.Parameter.empty
         )
 
+    def test_qk_pair_layout_rejects_fp32_conv_state(self):
+        # Two Q rows per tap, with enough conv token capacity for FP32.
+        with pytest.raises(
+            NotImplementedError,
+            match=r"use conv_state_dtype=jnp\.bfloat16 or disable qk_pair_layout",
+        ):
+            _plan(
+                conv_state_dtype=jnp.float32,
+                qk_pair_layout=True,
+                conv_dim=4 * LANES + N_V * D_V,
+                conv_ntok=32,
+            )
+
     def test_unsupported_conv_dtype_is_actionable(self):
         with pytest.raises(NotImplementedError, match="bfloat16 or float32"):
             _plan(conv_state_dtype=jnp.float16)

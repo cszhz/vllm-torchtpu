@@ -585,6 +585,11 @@ def v3_state_source(
     # 128-aligned lane concat, which needs whole rows per conv row.
     assert conv_dim % lanes == 0, (conv_dim, lanes)
     conv_dtype = jnp.dtype(conv_state_dtype)
+    if qk_pair_layout and conv_dtype != jnp.dtype(jnp.bfloat16):
+        raise NotImplementedError(
+            "qk_pair_layout requires BF16 conv state; "
+            "use conv_state_dtype=jnp.bfloat16 or disable qk_pair_layout."
+        )
     if conv_dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)):
         raise NotImplementedError(
             f"Unsupported pooled conv state dtype: {conv_dtype}; "
