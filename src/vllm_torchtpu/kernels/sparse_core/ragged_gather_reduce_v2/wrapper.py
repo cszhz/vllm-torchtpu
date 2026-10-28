@@ -72,8 +72,8 @@ def _preprocess_scalar_data(
       The kernel's index refs: ``sorted_by_validity``, each compacted row's
         source position (all valid rows first, in order); ``scatter_meta``, per
         compacted row ``2 * destination + same_as_prev``, where the destination
-        is the output row for the last row of a reduce group and the garbage
-        row otherwise; ``partition_bounds``, the [start, end) range of
+        is the output row for the last row of a reduce group and
+        ``cfg.first_garbage_row`` otherwise; ``partition_bounds``, the [start, end) range of
         compacted rows each row partition reduces (starts in the first
         ``num_simd_lanes`` words, ends in the next).
       mask: per output group, whether the group has any valid source row.
@@ -94,7 +94,7 @@ def _preprocess_scalar_data(
     next_dst = jnp.concatenate([dst[1:], no_group])
     prev_dst = jnp.concatenate([no_group, dst[:-1]])
     is_final = (slot < num_valid) & ((slot + 1 >= num_valid) | (next_dst != dst))
-    garbage_dst = cfg.padded_input_size // group_size
+    garbage_dst = cfg.first_garbage_row
     scatter_meta = jnp.where(is_final, dst, garbage_dst) * 2 + (prev_dst == dst)
 
     # Split the valid rows evenly, each boundary moved back to the first row of
@@ -234,15 +234,10 @@ def ragged_gather_reduce_v2(
         subcore_axis_name=cfg.subcore_axis_name,
     )
 
-    # The output gets one extra row: the kernel's garbage scatter destination.
     out = core_map_helper.kernel(
         functools.partial(main_kernel, cfg=cfg),
         out_type=jax.ShapeDtypeStruct(
-            (
-                cfg.padded_input_size // reduce_group_size + 1,
-                cfg.aligned_hidden_size,
-            ),
-            jnp.float32,
+            (cfg.num_output_rows, cfg.aligned_hidden_size), jnp.float32
         ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,

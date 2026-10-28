@@ -33,7 +33,7 @@ def call_kernel_pipeline(
     Every reduce group lies inside one partition's range, so a group's last row
     holds its full sum and is the group's only scatter. The range is walked in
     16-row chunks from ``start`` rounded down to a chunk boundary; rows outside
-    [start, end) are computed but routed to the garbage row.
+    [start, end) are computed but routed to the partition's garbage rows.
     """
     num_simd_lanes = cfg.sc_info.num_lanes
     bounds = refs.scratch.partition_bounds_vmem
@@ -45,6 +45,9 @@ def call_kernel_pipeline(
         start = jnp.where(row_partition_id == i, starts[i], start)
         end = jnp.where(row_partition_id == i, ends[i], end)
     first_row = start - start % num_simd_lanes
+    # Each partition owns one garbage row per lane, so no two subcores' throwaway
+    # writes land on the same HBM row.
+    garbage_start = cfg.first_garbage_row + row_partition_id * num_simd_lanes
     num_chunks = jnp.where(end > start, pl.cdiv(end - first_row, num_simd_lanes), 0)
 
     # The resident row metadata holds one window of chunks, so the chunks are run
@@ -56,6 +59,7 @@ def call_kernel_pipeline(
             refs=refs,
             start=start,
             end=end,
+            garbage_start=garbage_start,
             first_row=first_row,
             num_chunks=num_chunks,
             col_start=col_start,
@@ -70,6 +74,7 @@ def _window_kernel(
     refs: memory_ref.KernelRefs,
     start: jax.Array,
     end: jax.Array,
+    garbage_start: jax.Array,
     first_row: jax.Array,
     num_chunks: jax.Array,
     col_start: jax.Array,
@@ -126,6 +131,7 @@ def _window_kernel(
             refs=refs,
             start=start,
             end=end,
+            garbage_start=garbage_start,
             window_start=window_start,
             col_start=col_start,
             cfg=cfg,
@@ -166,6 +172,7 @@ def _col_kernel(
     refs: memory_ref.KernelRefs,
     start: jax.Array,
     end: jax.Array,
+    garbage_start: jax.Array,
     window_start: jax.Array,
     col_start: jax.Array,
     cfg: config.Config,
@@ -234,20 +241,14 @@ def _col_kernel(
         )
 
     # Each row's scatter destination: a group's last row carries the group's
-    # full sum, every other row (and every row outside [start, end)) goes to the
-    # garbage row.
-    row_ids = (
-        window_start
-        + r * num_simd_lanes
-        + jax.lax.broadcasted_iota(jnp.int32, (num_simd_lanes,), 0)
-    )
+    # full sum, every other row (and every row outside [start, end)) goes to its
+    # lane's garbage row.
+    lanes = jax.lax.broadcasted_iota(jnp.int32, (num_simd_lanes,), 0)
+    row_ids = window_start + r * num_simd_lanes + lanes
     in_range = jnp.logical_and(row_ids >= start, row_ids < end)
-    garbage_dst = refs.data.out.shape[0] - 1
-    dst_rows = jnp.where(
-        in_range,
-        jnp.bitwise_right_shift(scratch.scatter_meta_vmem[row_slice], 1),
-        garbage_dst,
-    )
+    meta_dst = jnp.bitwise_right_shift(scratch.scatter_meta_vmem[row_slice], 1)
+    is_final = jnp.logical_and(in_range, meta_dst < cfg.first_garbage_row)
+    dst_rows = jnp.where(is_final, meta_dst, garbage_start + lanes)
 
     # One indirect scatter of the 16 rows, completed within the step.
     scatter = pltpu.make_async_copy(

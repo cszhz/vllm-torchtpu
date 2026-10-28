@@ -81,6 +81,17 @@ class Config:
         return self.input_size // self.reduce_group_size
 
     @property
+    def first_garbage_row(self) -> int:
+        """First of the kernel output's throwaway rows, after the padded output."""
+        return self.padded_input_size // self.reduce_group_size
+
+    @property
+    def num_output_rows(self) -> int:
+        """Kernel output rows: the padded output, then one garbage row per lane of
+        each row partition."""
+        return self.first_garbage_row + self.num_row_partitions * self.sc_info.num_lanes
+
+    @property
     def in_dtype_bytes(self) -> int:
         return jax.dtypes.itemsize_bits(self.in_dtype) // 8
 
