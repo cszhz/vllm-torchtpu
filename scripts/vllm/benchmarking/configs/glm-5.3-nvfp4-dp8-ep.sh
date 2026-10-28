@@ -62,8 +62,9 @@ export MOE_FUSED_EP_V2_SHARDED_PLAN="${MOE_FUSED_EP_V2_SHARDED_PLAN:-1}"
 export TPU_MOE_SKIP_PADDED_TOKENS="${TPU_MOE_SKIP_PADDED_TOKENS:-1}"
 # 2. TpuDpScheduler for wave-aligned prefill/decode scheduling across DP=8 ranks
 export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
-# 3. Split-Q in-VMEM join for non-DCP sparse MLA attention + 128-token chunked gather/attention & pipelined DSA top-k
+# 3. Split-Q in-VMEM join for non-DCP sparse MLA attention + 64B packed fp8 RoPE cache + 128-token chunked gather/attention & pipelined DSA top-k
 export TPU_MLA_SPARSE_SPLIT_Q="${TPU_MLA_SPARSE_SPLIT_Q:-1}"
+export TPU_SPARSE_MLA_PACKED_ROPE="${TPU_SPARSE_MLA_PACKED_ROPE:-1}"
 export TPU_SPARSE_MLA_CHUNK_TOKENS="${TPU_SPARSE_MLA_CHUNK_TOKENS:-128}"
 export TPU_STREAMIDX_CHUNK_TOKENS="${TPU_STREAMIDX_CHUNK_TOKENS:-128}"
 # 4. Truncated row-major RoPE cache + fast device token substitution
