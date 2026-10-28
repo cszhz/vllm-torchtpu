@@ -356,14 +356,17 @@ class CorrectnessTest(parameterized.TestCase):
         np.testing.assert_allclose(out_base, out_agent, rtol=0.1, atol=0.1)
 
     @parameterized.named_parameters(
-        # Every chunk is one sequence's: all take the shared-KV path.
-        ("chunk_aligned", (256, 256)),
+        # Every chunk is one sequence's: all take the shared-KV path, the first
+        # sequence's over two row tiles.
+        ("chunk_aligned", (256, 256), (700, 0)),
         # The chunk holding the sequence boundary keeps the gather path.
-        ("chunk_mixed", (320, 192)),
+        ("chunk_mixed", (320, 192), (0, 300)),
+        # The first sequence's chunks read past SHARED_KV_MAX_ROWS and gather.
+        ("past_shared_rows", (256, 256), (1100, 0)),
     )
-    def test_shared_kv_prefill(self, seq_lens):
-        """Early-prefill tokens whose top-k is every candidate, at a page size
-        and batch that compile the shared-KV path."""
+    def test_shared_kv_prefill(self, seq_lens, firsts):
+        """Prefill tokens selecting a random top-k of their candidates, at a
+        page size and batch that compile the shared-KV path."""
         topk = 512
         num_heads = 64
         head_dim = 512
@@ -378,17 +381,17 @@ class CorrectnessTest(parameterized.TestCase):
         total_tokens = int(cu_q_lens[-1])
         assert total_tokens >= sparse_mla.SHARED_KV_MIN_TOKENS
 
-        # Token t of a sequence starting at compressed row `first` sees
-        # min(first + t // 4, topk) rows, the first ones none at all.
-        firsts = (0, 300)
+        # Token t of a sequence starting at compressed row `first` has
+        # first + t // 4 candidate rows and selects up to topk of them.
         topk_indices, kv_lens = [], []
         for n, first in zip(seq_lens, firsts):
             for t in range(n):
-                kv_len_t = min(first + t // 4, topk)
+                candidates = first + t // 4
                 row = np.full(topk, -1, np.int32)
-                row[:kv_len_t] = rng.permutation(kv_len_t)
+                selected = min(candidates, topk)
+                row[:selected] = rng.choice(candidates, selected, replace=False)
                 topk_indices.append(row)
-            kv_lens.append(min(first + (n - 1) // 4, topk))
+            kv_lens.append(first + (n - 1) // 4)
         topk_indices = jnp.array(np.stack(topk_indices))
         kv_lens = jnp.array(kv_lens, jnp.int32)
 
@@ -443,23 +446,6 @@ class CorrectnessTest(parameterized.TestCase):
             np.asarray(out_agent, np.float32),
             rtol=0.02,
             atol=0.02,
-        )
-
-    def test_selects_leading_rows(self):
-        topk_indices = jnp.array(
-            [
-                [2, 0, 1, -1],  # every candidate, shuffled
-                [0, 2, -1, -1],  # skips row 1
-                [-1, -1, -1, -1],  # no candidates
-                [1, -1, 0, -1],  # padding not a suffix
-                [3, 1, 2, 0],
-            ],
-            jnp.int32,
-        )
-        kv_lens = jnp.sum(topk_indices != -1, axis=-1)
-        np.testing.assert_array_equal(
-            sparse_mla._selects_leading_rows(topk_indices, kv_lens),
-            [True, False, True, False, True],
         )
 
 
