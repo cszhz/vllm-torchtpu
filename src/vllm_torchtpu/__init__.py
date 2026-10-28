@@ -141,6 +141,42 @@ def _patch_vllm_megakernel_prefix_hits() -> None:
     Scheduler.__init__ = init
 
 
+def _patch_vllm_prefill_sjf_queue() -> None:
+    """``K3_PREFILL_SJF=1``: a KV producer's waiting queue admits the request
+    with the fewest uncached prompt tokens first, with aging
+    (``vllm_torchtpu.core.sjf_queue``). Other engines are unchanged."""
+    from functools import wraps
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    original_init = Scheduler.__init__
+    if getattr(original_init, "_tpu_prefill_sjf_patch", False):
+        return
+
+    @wraps(original_init)
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        from vllm_torchtpu.core import sjf_queue
+
+        transfer = getattr(self.vllm_config, "kv_transfer_config", None)
+        producer = getattr(transfer, "kv_role", None) == "kv_producer"
+        if not (sjf_queue.enabled() and producer):
+            return
+        if self.waiting:
+            raise RuntimeError("K3_PREFILL_SJF: the waiting queue is not empty at init")
+        self.waiting = sjf_queue.SJFRequestQueue(
+            sjf_queue.uncached_estimator(self), sjf_queue.aging()
+        )
+        logger.info(
+            "Prefill waiting queue: shortest uncached prompt first, "
+            "aging %.0f tokens/s",
+            sjf_queue.aging(),
+        )
+
+    init._tpu_prefill_sjf_patch = True
+    Scheduler.__init__ = init
+
+
 def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     """Align Mamba prefill splits to the scheduler block size.
 
