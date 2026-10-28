@@ -77,10 +77,20 @@ class Tiles:
     dense_acc_pair: bool = False  # Unrolled / paired dense matmul accumulation
     dmm_unroll: int = 0  # Max tiles to fully unroll in dmatmul (0: never)
     rel_fetch: bool = False  # Trace-time-decoded dense refills (fetch_rel/flush_rel)
+    collective_id: int = 0  # Pallas TPU collective_id when R > 1
     # Per-module tunables (registered `Tunables` instances keyed by module name).
     modules: Mapping[str, Any] = TunablesMap()
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.collective_id, int)
+            or isinstance(self.collective_id, bool)
+            or self.collective_id < 0
+        ):
+            raise ValueError(
+                "Tiles.collective_id must be a non-negative int, "
+                f"got {self.collective_id!r}"
+            )
         if not isinstance(self.modules, TunablesMap):
             object.__setattr__(self, "modules", TunablesMap(self.modules))
 
@@ -140,6 +150,7 @@ TILE_NUMERICS: dict[str, NumericsClass] = {
     "dense_acc_pair": "approx",  # paired dense accumulation
     "dmm_unroll": "approx",  # unrolled dense matmul accumulation
     "rel_fetch": "exact",  # trace-time-decoded dense refills (scheduling)
+    "collective_id": "exact",  # Pallas TPU collective_id tag
 }
 
 
@@ -219,6 +230,7 @@ class ExecSpec:
     interpret: Any = False  # Run Pallas in CPU interpret mode (bool or InterpretParams)
     # None -> default_tiles(B, R=R), which may be refined at build time to fit VMEM
     tiles: Tiles | None = None
+    collective_id: int | None = None  # Overrides Tiles.collective_id when set
     debug: DebugOptions = DebugOptions()
     # Optional extension object for cache-specific execution settings (None when
     # using plain states without page tables; one equal to its own defaults is
@@ -226,6 +238,15 @@ class ExecSpec:
     cache: Any = None
 
     def __post_init__(self) -> None:
+        if self.collective_id is not None and (
+            not isinstance(self.collective_id, int)
+            or isinstance(self.collective_id, bool)
+            or self.collective_id < 0
+        ):
+            raise ValueError(
+                "ExecSpec.collective_id must be a non-negative int or None, "
+                f"got {self.collective_id!r}"
+            )
         cx = self.cache
         if (
             dataclasses.is_dataclass(cx)
@@ -237,6 +258,14 @@ class ExecSpec:
     @property
     def resolved_tiles(self) -> Tiles:
         return self.tiles if self.tiles is not None else default_tiles(self.B, R=self.R)
+
+    @property
+    def resolved_collective_id(self) -> int:
+        return (
+            self.collective_id
+            if self.collective_id is not None
+            else self.resolved_tiles.collective_id
+        )
 
     def resolve_tiles(self, g: Any = None) -> Tiles:
         """Same as `resolved_tiles` (`g` kept for callers; the defaults ignore it)."""
