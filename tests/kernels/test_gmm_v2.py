@@ -27,12 +27,19 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    LHS_SCALE_TRAILER_COLS,
+    PREQUANTIZED_LHS_BLOCK_SIZE,
+    PREQUANTIZED_LHS_DTYPE,
     TileSizes,
+    _decode_scale_trailer,
     apply_act_fn,
     gmm_v2,
     interleave_lane,
+    quantize_lhs_block,
+    quantize_lhs_rows,
     situ_and_mul,
 )
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import unpack_row_quads
 
 _GroupConfig = collections.namedtuple(
     "_GroupConfig", ["num_groups", "group_offset", "num_local_groups"]
@@ -462,3 +469,75 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+def _lhs_rows_to_quantize(rows: int, k: int) -> jax.Array:
+    """bf16 rows over many magnitudes, plus an all-zero row and a zero block."""
+    key_x, key_mag = jax.random.split(jax.random.key(3))
+    x = jax.random.normal(key_x, (rows, k), jnp.float32)
+    x = x * jnp.exp(jax.random.uniform(key_mag, (rows, 1), minval=-20, maxval=20))
+    x = x.at[0].set(0).at[1, :PREQUANTIZED_LHS_BLOCK_SIZE].set(0)
+    return x.astype(jnp.bfloat16)
+
+
+def test_quantize_lhs_rows_holds_the_kernel_quantization():
+    """The row quads unpack to the values and scales of the kernel's own ops."""
+    rows, k = 64, 4 * PREQUANTIZED_LHS_BLOCK_SIZE
+    x = _lhs_rows_to_quantize(rows, k)
+
+    packed = quantize_lhs_rows(x, interpret=True)
+    assert packed.shape == (rows // 4, k + LHS_SCALE_TRAILER_COLS)
+
+    dtype_max = float(jnp.finfo(PREQUANTIZED_LHS_DTYPE).max)
+    blocks = [
+        quantize_lhs_block(
+            x[:, b : b + PREQUANTIZED_LHS_BLOCK_SIZE], PREQUANTIZED_LHS_DTYPE, dtype_max
+        )
+        for b in range(0, k, PREQUANTIZED_LHS_BLOCK_SIZE)
+    ]
+    want_q = jnp.concatenate([q for q, _ in blocks], axis=1)
+    want_scale = jnp.concatenate([scale for _, scale in blocks], axis=1)
+
+    fp8_rows = jax.lax.bitcast_convert_type(
+        unpack_row_quads(packed), PREQUANTIZED_LHS_DTYPE
+    )
+    got_scale = jnp.concatenate(
+        _decode_scale_trailer(fp8_rows[:, k:], 0, len(blocks)), axis=1
+    )
+    np.testing.assert_array_equal(
+        np.asarray(fp8_rows[:, :k]).view(np.uint8), np.asarray(want_q).view(np.uint8)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(got_scale).view(np.uint16), np.asarray(want_scale).view(np.uint16)
+    )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fuse_act", [None, "silu"])
+def test_gmm_prequantized_lhs_is_bit_identical(fuse_act):
+    """A `quantize_lhs_rows` lhs gives the bf16 lhs's output, bit for bit."""
+    _require_tpu()
+    batch_size, k, n, num_groups = 768, 1024, 512, 4
+    key_w, key_s = jax.random.split(jax.random.key(4))
+    lhs = _lhs_rows_to_quantize(batch_size, k)
+    # fp4 weights in their uint8 carrier, the form that makes gmm_v2 quantize
+    # its lhs.
+    rhs = jax.random.bits(key_w, (num_groups, k // 2, n), jnp.uint8)
+    rhs_scale = jax.random.uniform(
+        key_s, (num_groups, k // PREQUANTIZED_LHS_BLOCK_SIZE, 1, n), jnp.float32
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    kwargs = dict(
+        rhs_scale=rhs_scale,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+        fuse_act=fuse_act,
+        zero_initialize=False,
+    )
+
+    want = gmm_v2(lhs, rhs, group_sizes, **kwargs)
+    got = gmm_v2(
+        quantize_lhs_rows(lhs), rhs, group_sizes, lhs_scale_trailer=True, **kwargs
+    )
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
+    )

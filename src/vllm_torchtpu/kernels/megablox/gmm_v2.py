@@ -147,6 +147,105 @@ def get_packing_factor(storage_dtype: jnp.dtype, quant_dtype: jnp.dtype | None) 
     return packing_factor
 
 
+def quantize_lhs_block(
+    block_lhs: jax.Array, lhs_q_dtype: jnp.dtype, dtype_max: float
+) -> tuple[jax.Array, jax.Array]:
+    """Row-wise quantization of one lhs quant block: (values, scale)."""
+    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
+    block_scale = block_abs_max / dtype_max
+
+    # If block_scale=0, it will cause division by zero and return either
+    # NaN or Inf. Since this can cause numeric issue when downcasting to
+    # quantized value, we convert them into 0.
+    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
+    # Convert lhs into quantized dtype.
+    block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+    return block_lhs_q, block_scale
+
+
+# A pre-quantized lhs (`quantize_lhs_rows`) is fp8 [m, k + LHS_SCALE_TRAILER_COLS]:
+# the k quantized columns, then a trailer holding each row's bf16 block scales
+# as bytes, block b's low byte in lane b and its high byte in lane
+# _TRAILER_HIGH_LANE + b.
+LHS_SCALE_TRAILER_COLS = 128
+_TRAILER_HIGH_LANE = 64
+PREQUANTIZED_LHS_DTYPE = jnp.float8_e4m3fn
+PREQUANTIZED_LHS_BLOCK_SIZE = 512
+# Rows per quantize_lhs_rows grid step.
+QUANTIZE_LHS_BLOCK_ROWS = 256
+
+
+def _encode_scale_trailer(block_scales: list[jax.Array]) -> jax.Array:
+    """bf16 [rows, 1] block scales as the int8 [rows, trailer] bytes."""
+    rows = block_scales[0].shape[0]
+    shape = (rows, LHS_SCALE_TRAILER_COLS)
+    lane = lax.broadcasted_iota(jnp.int32, shape, 1)
+    trailer = jnp.zeros(shape, jnp.int32)
+    for b, scale in enumerate(block_scales):
+        bits = lax.bitcast_convert_type(scale, jnp.int16).astype(jnp.int32) & 0xFFFF
+        trailer = jnp.where(lane == b, bits & 0xFF, trailer)
+        trailer = jnp.where(lane == _TRAILER_HIGH_LANE + b, bits >> 8, trailer)
+    return trailer.astype(jnp.int8)
+
+
+def _decode_scale_trailer(
+    trailer: jax.Array, first_block: jax.Array | int, num_blocks: int
+) -> list[jax.Array]:
+    """Inverse of `_encode_scale_trailer` for blocks [first, first + num)."""
+    t = lax.bitcast_convert_type(trailer, jnp.int8).astype(jnp.int32) & 0xFF
+    lane = lax.broadcasted_iota(jnp.int32, t.shape, 1)
+    # Each block's two byte lanes sum to its 16 scale bits, exactly in f32.
+    t = jnp.where(lane >= _TRAILER_HIGH_LANE, t << 8, t).astype(jnp.float32)
+    block_of_lane = lane & (_TRAILER_HIGH_LANE - 1)
+    scales = []
+    for b in range(num_blocks):
+        picked = jnp.where(block_of_lane == first_block + b, t, 0.0)
+        bits = jnp.sum(picked, axis=1, keepdims=True).astype(jnp.int32) << 16
+        scales.append(lax.bitcast_convert_type(bits, jnp.float32).astype(jnp.bfloat16))
+    return scales
+
+
+def _quantize_lhs_rows_kernel(x_ref, o_ref):
+    x = x_ref[...]
+    dtype_max = float(jnp.finfo(PREQUANTIZED_LHS_DTYPE).max)
+    cols, scales = [], []
+    for start in range(0, x.shape[1], PREQUANTIZED_LHS_BLOCK_SIZE):
+        q, scale = quantize_lhs_block(
+            x[:, start : start + PREQUANTIZED_LHS_BLOCK_SIZE],
+            PREQUANTIZED_LHS_DTYPE,
+            dtype_max,
+        )
+        cols.append(lax.bitcast_convert_type(q, jnp.int8))
+        scales.append(scale)
+    cols.append(_encode_scale_trailer(scales))
+    o_ref[...] = pltpu.bitcast(jnp.concatenate(cols, axis=1), jnp.int32)
+
+
+def quantize_lhs_rows(x: jax.Array, interpret: bool = False) -> jax.Array:
+    """Quantizes bf16 ``[m, k]`` the way `gmm_v2` quantizes its lhs in-kernel.
+
+    Returns int32 ``[m // 4, k + LHS_SCALE_TRAILER_COLS]``, each word holding
+    one column of four consecutive rows, row ``4i + j`` in byte ``j``: the
+    int32 view of the fp8 lhs `gmm_v2` takes with ``lhs_scale_trailer``. It
+    runs `quantize_lhs_block`, the same ops as the kernel, so the values and
+    scales are bit-identical to what the kernel would compute from ``x``.
+    """
+    rows, k = x.shape
+    assert x.dtype == jnp.bfloat16 and rows % 4 == 0, (x.dtype, rows)
+    assert k % PREQUANTIZED_LHS_BLOCK_SIZE == 0, k
+    block = min(QUANTIZE_LHS_BLOCK_ROWS, rows)
+    out_cols = k + LHS_SCALE_TRAILER_COLS
+    return pl.pallas_call(
+        _quantize_lhs_rows_kernel,
+        out_shape=jax.ShapeDtypeStruct((rows // 4, out_cols), jnp.int32),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[pl.BlockSpec((block, k), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((block // 4, out_cols), lambda i: (i, 0)),
+        interpret=interpret,
+        name="moe_quantize_lhs_rows",
+    )(x)
+
+
 # Define data classes.
 
 
@@ -407,6 +506,7 @@ def inner_kernel(
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
+    lhs_scale_trailer: bool = False,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -441,7 +541,17 @@ def inner_kernel(
         mxu_size = tpu_info.mxu_column_size
 
         # Step 1: Input pre-processing.
-        tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
+        if lhs_scale_trailer:
+            lhs_data_ref, lhs_trailer_ref = tiled_lhs_ref
+            tiled_lhs = lhs_data_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
+            blocks_per_tile_k = cfgs.tiles.tile_k // cfgs.lhs_cfgs.quant_block_size
+            lhs_block_scales = _decode_scale_trailer(
+                lhs_trailer_ref.reshape(-1, LHS_SCALE_TRAILER_COLS)[:bucket_m],
+                pl.program_id(2) * blocks_per_tile_k,
+                blocks_per_tile_k,
+            )
+        else:
+            tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
         tiled_rhs = tiled_rhs_ref.get_weight()
 
         # This should only be taken in the case where we don't requantize
@@ -522,18 +632,17 @@ def inner_kernel(
                     block_lhs = tiled_lhs[:, start_k:end_k]
                     block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
-                    # Perform lhs quantization. Note that for every block_lhs,
-                    # same computation will be performed tiles_n//mxu_size times.
-                    # But we can let compiler perform CSE and avoid recomputation.
-                    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-                    block_scale = block_abs_max / dtype_max
-
-                    # If block_scale=0, it will cause division by zero and return either
-                    # NaN or Inf. Since this can cause numeric issue when downcasting to
-                    # quantized value, we convert them into 0.
-                    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-                    # Convert lhs into quantized dtype.
-                    block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+                    if lhs_scale_trailer:
+                        block_lhs_q = block_lhs
+                        block_scale = lhs_block_scales[start_k // q_block_size]
+                    else:
+                        # Perform lhs quantization. Note that for every block_lhs,
+                        # same computation will be performed tiles_n//mxu_size
+                        # times. But we can let compiler perform CSE and avoid
+                        # recomputation.
+                        block_lhs_q, block_scale = quantize_lhs_block(
+                            block_lhs, lhs_q_dtype, dtype_max
+                        )
 
                     # Unlike unquantized path, compiler may not perform implicit type
                     # conversion due to numeric concerns. As this can cause unsupported
@@ -836,6 +945,7 @@ def kernel_main(
     semaphore_ref: jax.Array | None,  # [1]
     *,
     cfgs: GmmConfigs,
+    lhs_scale_trailer: bool = False,
 ):
     """Entry point for GMM kernel.
 
@@ -862,10 +972,14 @@ def kernel_main(
         zero_ref: Scratch memory for storing zero values used in initialization.
         semaphore_ref: Semaphore for zero initialization DMAs.
         cfgs: GmmConfigs.
+        lhs_scale_trailer: lhs is fp8 with a scale trailer (`quantize_lhs_rows`).
     """
 
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
+
+    if lhs_scale_trailer:
+        lhs_ref = lhs_ref.bitcast(PREQUANTIZED_LHS_DTYPE)
 
     if cfgs.rhs_cfgs.should_unpack:
         rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
@@ -900,17 +1014,36 @@ def kernel_main(
             up=rhs_spec,
         )
 
+    # Bounded slice requires second last dim to be aligned to the sublane size.
+    # rhs_ref uses static tiling thus reshape is not needed.
+    lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
+    if lhs_scale_trailer:
+        # The trailer is a second view of the lhs rows, at its own columns.
+        lhs_index_map = IndexMaps(metadata_ref, cfgs).lhs_index_map
+
+        def trailer_index_map(n_id, gm_id, k_id):
+            rows, _, _ = lhs_index_map(n_id, gm_id, k_id)
+            return rows, 0, cfgs.dims.size_k // LHS_SCALE_TRAILER_COLS
+
+        trailer_spec = pl.BlockSpec(
+            (
+                lhs_spec.block_shape[0],
+                cfgs.dims.size_lhs_sublane,
+                LHS_SCALE_TRAILER_COLS,
+            ),
+            trailer_index_map,
+        )
+        lhs_spec = (lhs_spec, trailer_spec)
+        lhs_in = (lhs_in, lhs_in)
+
     # Execute the inner kernel.
     pipeline_fn = pltpu.emit_pipeline(
-        functools.partial(inner_kernel, cfgs=cfgs),
+        functools.partial(inner_kernel, cfgs=cfgs, lhs_scale_trailer=lhs_scale_trailer),
         grid=(num_n, num_gm, num_k),
         in_specs=(lhs_spec, rhs_spec),
         out_specs=out_spec,
     )
 
-    # Bounded slice requires second last dim to be aligned to the sublane size.
-    # rhs_ref uses static tiling thus reshape is not needed.
-    lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
     pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
@@ -1163,10 +1296,23 @@ def make_gmm_configs(
     zero_initialize: bool,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
+    lhs_scale_trailer: bool = False,
 ):
-    """Fills the GMM config for the GMM kernel."""
+    """Fills the GMM config for the GMM kernel.
+
+    With ``lhs_scale_trailer`` the configs are those of the bf16 lhs that
+    `quantize_lhs_rows` quantized, so the tiling, and with it every
+    accumulation order, is the one that lhs gets.
+    """
 
     packing_factor = get_packing_factor(rhs.dtype, rhs_quant_dtype)
+    lhs_dtype = lhs.dtype
+    if lhs_scale_trailer:
+        assert lhs.dtype == PREQUANTIZED_LHS_DTYPE, lhs.dtype
+        lhs = jax.ShapeDtypeStruct(
+            (lhs.shape[0], lhs.shape[1] - LHS_SCALE_TRAILER_COLS), lhs.dtype
+        )
+        lhs_dtype = jnp.dtype(jnp.bfloat16)
 
     dims = validate_inputs(
         lhs,
@@ -1221,11 +1367,21 @@ def make_gmm_configs(
         # block size that is small enough to minimize memory overhead but large
         # enough to minimize compute overhead of quantization.
         quant_block_size=512,
-        dtype=lhs.dtype,
+        dtype=lhs_dtype,
     )
+    if lhs_scale_trailer and (
+        lhs_cfgs.quant_dtype != PREQUANTIZED_LHS_DTYPE
+        or lhs_cfgs.quant_block_size != PREQUANTIZED_LHS_BLOCK_SIZE
+    ):
+        raise ValueError(
+            "a pre-quantized lhs needs the kernel to quantize bf16 lhs to "
+            f"{PREQUANTIZED_LHS_DTYPE} in {PREQUANTIZED_LHS_BLOCK_SIZE}-column "
+            f"blocks, but it would use {lhs_cfgs.quant_dtype} "
+            f"in {lhs_cfgs.quant_block_size}"
+        )
 
     if out_dtype is None:
-        out_dtype = lhs.dtype
+        out_dtype = lhs_dtype
 
     if acc_dtype is None:
         if lhs_cfgs.quant_dtype is None:
@@ -1240,6 +1396,11 @@ def make_gmm_configs(
         tiles = tile_info
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+    if lhs_scale_trailer and (
+        tiles.tile_k % lhs_cfgs.quant_block_size or dims.size_k % tiles.tile_k
+    ):
+        # The kernel would quantize blocks that straddle k tiles, or padding.
+        raise ValueError(f"a pre-quantized lhs cannot take {tiles=} for {dims=}")
 
     return GmmConfigs(
         dims=dims,
@@ -1275,6 +1436,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "zero_initialize",
         "fuse_act",
         "rhs_quant_dtype",
+        "lhs_scale_trailer",
     ]
 )
 def gmm_v2(
@@ -1294,6 +1456,7 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
+    lhs_scale_trailer: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1319,6 +1482,10 @@ def gmm_v2(
         fuse_act: Activation function to fuse with GMM, None if no fusion.
         rhs_quant_dtype: Quantized dtype encoded by a pre-packed RHS carrier.
             Packed along k-axis
+        lhs_scale_trailer: lhs is int32 [size_m // 4, size_k +
+            LHS_SCALE_TRAILER_COLS], the layout `quantize_lhs_rows` returns;
+            the kernel uses its values and scales instead of quantizing a bf16
+            lhs, with the same result.
 
     Returns:
         Output of shape [size_m, size_n].
@@ -1329,11 +1496,23 @@ def gmm_v2(
     # The kernel reshapes lhs by its sublane block, so pad the rows up to it.
     # The extra rows sit past every group, so they add no work, and they are
     # sliced back off the output below.
-    size_m = lhs.shape[0]
-    size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
-    padded_size_m = align_to(size_m, size_lhs_sublane)
-    if padded_size_m != size_m:
-        lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+    if lhs_scale_trailer:
+        assert lhs.dtype == jnp.int32, lhs.dtype
+        size_m = lhs.shape[0] * 4
+        size_lhs_sublane = _get_lhs_sublane_size(PREQUANTIZED_LHS_DTYPE, size_m)
+        padded_size_m = align_to(size_m, size_lhs_sublane)
+        if padded_size_m != size_m:
+            lhs = jnp.pad(lhs, ((0, (padded_size_m - size_m) // 4), (0, 0)))
+        lhs_view = jax.ShapeDtypeStruct(
+            (padded_size_m, lhs.shape[1]), PREQUANTIZED_LHS_DTYPE
+        )
+    else:
+        size_m = lhs.shape[0]
+        size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
+        padded_size_m = align_to(size_m, size_lhs_sublane)
+        if padded_size_m != size_m:
+            lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+        lhs_view = lhs
 
     if group_offset is None:
         group_offset = jnp.array([0], dtype=jnp.int32)
@@ -1345,7 +1524,7 @@ def gmm_v2(
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
     cfgs = make_gmm_configs(
-        lhs,
+        lhs_view,
         rhs,
         rhs_scale,
         rhs_bias,
@@ -1359,6 +1538,7 @@ def gmm_v2(
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         rhs_quant_dtype=rhs_quant_dtype,
+        lhs_scale_trailer=lhs_scale_trailer,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
@@ -1416,9 +1596,13 @@ def gmm_v2(
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+    name, metadata = get_scope_name(cfgs), get_metadata(cfgs)
+    if lhs_scale_trailer:
+        name += "-lhsq"
+        metadata["lhs_scale_trailer"] = 1
 
     return pl.pallas_call(
-        functools.partial(kernel_main, cfgs=cfgs),
+        functools.partial(kernel_main, cfgs=cfgs, lhs_scale_trailer=lhs_scale_trailer),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
@@ -1437,7 +1621,7 @@ def gmm_v2(
             vmem_limit_bytes=vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
-        name=get_scope_name(cfgs),
+        name=name,
         cost_estimate=get_cost_estimate(cfgs),
-        metadata=get_metadata(cfgs),
+        metadata=metadata,
     )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]
