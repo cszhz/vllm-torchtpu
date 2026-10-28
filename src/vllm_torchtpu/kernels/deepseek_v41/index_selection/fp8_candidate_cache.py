@@ -17,6 +17,7 @@ from .tuned_block_sizes import (
     PACKED_FP8_DENSE_MIN_KEY_TILE,
     PACKED_FP8_MQA_CONFIG,
     PAGED_MQA_GATHER_CONFIG,
+    PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG,
 )
 
 
@@ -518,13 +519,26 @@ def gather_candidate_keys(
         // (group * PAGE_ROWS * (block + len(banks)) * 4 + 4096),
     )
     group, buffers = PAGED_MQA_GATHER_CONFIG.get((block, len(banks)), (group, buffers))
+    whole_pages = (
+        block == layout.page_size == 8
+        and layout.page_offset % layout.page_rows == 0
+        and layout.page_stride % layout.page_rows == 0
+        and all(bank.shape[0] % layout.page_rows == 0 for bank in banks)
+    )
+    if whole_pages:
+        group, buffers = PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG[block, len(banks)]
+    page_words = layout.page_rows * PAGE_RECORDS
+    read_span = group if whole_pages else group * PAGE_ROWS
     distance = buffers - 1
     count, per_page = physical.size, PAGE_RECORDS // block
     source_per_page = layout.page_size // block
     per_unit = pl.cdiv(count, units * group) * group
     destination_width = pl.cdiv(per_unit // group, 128) * 128
     scratch_words = (
-        buffers * group * PAGE_ROWS * (block + len(banks)) + lanes + destination_width
+        buffers * (group * PAGE_ROWS * block + read_span * len(banks))
+        + (buffers * group * page_words if whole_pages else 0)
+        + lanes
+        + destination_width
     )
     metadata_rows = min(
         per_unit,
@@ -567,10 +581,15 @@ def gather_candidate_keys(
             pltpu.VMEM((lanes,), jnp.int32),
             pltpu.VMEM((destination_width,), jnp.int32),
             pltpu.VMEM((buffers, span, block), jnp.int32),
-            pltpu.VMEM((buffers, len(banks), span), jnp.int32),
+            pltpu.VMEM((buffers, len(banks), read_span), jnp.int32),
             pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA((buffers, len(banks))),
             pltpu.SemaphoreType.DMA((buffers,)),
+        )
+        + (
+            (pltpu.VMEM((buffers, group, page_words), jnp.int32),)
+            if whole_pages
+            else ()
         ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=False, needs_layout_passes=False
@@ -592,6 +611,7 @@ def gather_candidate_keys(
         metadata_sem,
         read_sem,
         write_sem,
+        *raw_pages,
     ):
         unit = lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
         pltpu.async_copy(control_ref, control_vmem, metadata_sem).wait()
@@ -618,44 +638,67 @@ def gather_candidate_keys(
                             metadata_sem,
                         ).wait()
 
-                @plsc.parallel_loop(0, span, lanes, unroll=8)
-                def addresses(i):
-                    segment = i + jnp.arange(lanes)
-                    field = segment // per_page % PAGE_ROWS
-                    column = (
-                        segment // (PAGE_ROWS * per_page) * per_page
-                        + segment % per_page
-                    )
-                    chosen = plsc.load_gather(selected, [index * group + column])
-                    safe = jnp.maximum(chosen, 0)
-                    source = (
-                        (
+                if whole_pages:
+
+                    @plsc.parallel_loop(0, group, lanes)
+                    def page_addresses(i):
+                        chosen = selected[pl.ds(index * group + i, lanes)]
+                        source = (
                             layout.page_offset
-                            + safe // source_per_page * layout.page_stride
+                            + jnp.maximum(chosen, 0) * layout.page_stride
+                        ) // layout.page_rows
+                        bank_base = 0
+                        for bank, ref in enumerate(pool):
+                            size = ref.shape[0] // layout.page_rows
+                            valid = (
+                                (chosen >= 0)
+                                & (source >= bank_base)
+                                & (source < bank_base + size)
+                            )
+                            read_ids[slot, bank, pl.ds(i, lanes)] = jnp.where(
+                                valid, source - bank_base, -1
+                            )
+                            bank_base += size
+                else:
+
+                    @plsc.parallel_loop(0, span, lanes, unroll=8)
+                    def addresses(i):
+                        segment = i + jnp.arange(lanes)
+                        field = segment // per_page % PAGE_ROWS
+                        column = (
+                            segment // (PAGE_ROWS * per_page) * per_page
+                            + segment % per_page
                         )
-                        * per_page
-                        + field * source_per_page
-                        + safe % source_per_page
-                    )
-                    bank_base = 0
-                    for bank, ref in enumerate(pool):
-                        size = ref.shape[0] * per_page
-                        valid = (
-                            (chosen >= 0)
-                            & (source >= bank_base)
-                            & (source < bank_base + size)
+                        chosen = plsc.load_gather(selected, [index * group + column])
+                        safe = jnp.maximum(chosen, 0)
+                        source = (
+                            (
+                                layout.page_offset
+                                + safe // source_per_page * layout.page_stride
+                            )
+                            * per_page
+                            + field * source_per_page
+                            + safe % source_per_page
                         )
-                        read_ids[slot, bank, pl.ds(i, lanes)] = jnp.where(
-                            valid, source - bank_base, -1
-                        )
-                        bank_base += size
+                        bank_base = 0
+                        for bank, ref in enumerate(pool):
+                            size = ref.shape[0] * per_page
+                            valid = (
+                                (chosen >= 0)
+                                & (source >= bank_base)
+                                & (source < bank_base + size)
+                            )
+                            read_ids[slot, bank, pl.ds(i, lanes)] = jnp.where(
+                                valid, source - bank_base, -1
+                            )
+                            bank_base += size
 
             for bank, ref in enumerate(pool):
                 copy = pltpu.make_async_copy(
-                    ref.reshape(-1, block).at[
+                    ref.reshape(-1, page_words if whole_pages else block).at[
                         plsc.Indices(read_ids.at[slot, bank], ignored_value=-1)
                     ],
-                    words.at[slot],
+                    raw_pages[0].at[slot] if whole_pages else words.at[slot],
                     read_sem.at[slot, bank],
                 )
                 (copy.wait if wait else copy.start)()
@@ -686,6 +729,24 @@ def gather_candidate_keys(
             if buffers == 1:
                 read(step, slot)
             read(step, slot, wait=True)
+            if whole_pages:
+
+                @plsc.parallel_loop(0, span * block, lanes, unroll=8)
+                def repack(i):
+                    element = i + jnp.arange(lanes)
+                    segment = element // block
+                    field = segment // per_page % PAGE_ROWS
+                    column = (
+                        segment // (PAGE_ROWS * per_page) * per_page
+                        + segment % per_page
+                    )
+                    source = column * page_words + field * block + element % block
+                    words.reshape(buffers, -1)[slot, pl.ds(i, lanes)] = (
+                        plsc.load_gather(
+                            raw_pages[0].reshape(buffers, -1).at[slot], [source]
+                        )
+                    )
+
             write(step)
             if buffers == 1:
                 write(step, wait=True)
