@@ -75,7 +75,9 @@ def gdn_in(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> Any:
 
         y = stream.dmatmul("lin_in", scr["xb"], NLI)
         ybuf = scr["ybuf"]
-        ybuf[:, :NLI] = rnd(y * ctx.sm(slot, "in_s", NLI))
+        ybuf[:, :NLI] = (
+            rnd(y * ctx.sm(slot, "in_s", NLI)) if "in_s" in stream.sp.lay else rnd(y)
+        )
     return ybuf
 
 

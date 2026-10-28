@@ -329,3 +329,96 @@ def test_moe_col_chunk_h2560() -> None:
     )
     assert report.geometry.H == 640
     report.assert_passed()
+
+
+class _Bf16DenseModel(_SynthBaseModel):
+    """Synthetic hybrid model with bf16 dense projections and fp8 routed experts."""
+
+    name = "b8_bf16_dense"
+    attn = mk.GQA.bind(
+        prefix="self_attn",
+        heads="n_heads",
+        kv_heads="n_kv_heads",
+        head_dim="d_head",
+        qk_norm=True,
+        output_gate=True,
+        weight_dtypes={"att_in": "bf16", "att_out": "bf16"},
+    )
+    linear = mk.GDN.bind(
+        prefix="linear_attn",
+        k_heads="ssm_k_heads",
+        v_heads="ssm_v_heads",
+        k_dim="ssm_k_dim",
+        v_dim="ssm_v_dim",
+        conv_kernel="ssm_conv_kernel",
+        weight_dtypes={"lin_in": "bf16", "lin_out": "bf16"},
+    )
+    moe = mk.MoE.bind(
+        prefix="mlp",
+        experts="n_routed_experts",
+        top_k="top_k_experts",
+        inter="d_ff_routed",
+        shared_inter="d_ff_shared",
+        shared_gate=True,
+        weight_dtypes={"sh13": "bf16", "sh2": "bf16", "e13": "fp8_channel"},
+    )
+    schedule = mk.Schedule(
+        mixer=mk.Every(n=2, last=attn, rest=linear),
+        ffn=moe,
+        pre_norm=_SynthBaseModel.schedule.pre_norm,
+        post_norm=_SynthBaseModel.schedule.post_norm,
+    )
+
+
+def test_per_weight_dtype_policy() -> None:
+    with pytest.raises(mk.MegakernelConfigError, match="unknown weight"):
+        mk.GQAModule(weight_dtypes={"bad": "bf16"})
+    with pytest.raises(mk.MegakernelConfigError, match="must be 'fp8' or 'bf16'"):
+        mk.GDNModule(weight_dtypes={"lin_in": "int8"})
+    with pytest.raises(mk.MegakernelConfigError, match="share the same weight dtype"):
+        mk.MoEModule(weight_dtypes={"e13": "bf16", "e2": "fp8"})
+
+    g = _Bf16DenseModel.shrink(periods=1, R=2)
+    ex = mk.ExecSpec(
+        R=2,
+        B=4,
+        T=1,
+        ctx=256,
+        tiles=mk.Tiles(
+            bank=512 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32
+        ).with_modules({"gqa": {"kv_blk": 256}}),
+        interpret=True,
+        cache=mk.CacheExec(paged_kv=True, num_pages=128, pool_gather=False),
+    )
+    spec = _Bf16DenseModel.to_model_spec(g, R=2)
+    pl = mk.planner.plan(spec, ex)
+
+    # Scale smalls are dropped when dense projections are bf16 passthrough
+    for dropped in ("in_s", "out_s", "sh13_s", "sh2_s"):
+        assert dropped not in pl.smalls_layout
+    for retained in (
+        "in_norm",
+        "post_norm",
+        "qn",
+        "kn",
+        "conv",
+        "alog",
+        "dtb",
+        "gnorm",
+        "sh_gate",
+    ):
+        assert retained in pl.smalls_layout
+    for k_bf16 in ("att_in", "att_out", "lin_in", "lin_out", "sh13", "sh2"):
+        assert jnp.dtype(pl.weight_decls[k_bf16].dtype) == jnp.dtype(jnp.bfloat16)
+    for k_fp8 in ("e13", "e2"):
+        assert jnp.dtype(pl.weight_decls[k_fp8].dtype) == jnp.dtype(jnp.float8_e4m3fn)
+
+    report = mk.verify_model(
+        _Bf16DenseModel,
+        R=2,
+        B_per_T=2,
+        T_values=(1, 4),
+        hf=False,
+        approx_profiles=False,
+    )
+    report.assert_passed()
