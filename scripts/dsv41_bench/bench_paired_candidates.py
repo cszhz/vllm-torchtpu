@@ -428,7 +428,7 @@ def main():
     )
     if args.stage == "score":
 
-        def logits(q, weights, lengths, keys, canonical, membership, offsets):
+        def logits(q, weights, lengths, keys, canonical, membership, offsets, slots):
             compact_lengths = jnp.sum(
                 jnp.where(
                     canonical >= 0,
@@ -444,6 +444,7 @@ def main():
                 compact_lengths,
                 membership,
                 query_start_loc=offsets,
+                candidate_slots=slots,
                 membership_block_size=args.block,
                 max_model_len=canonical.shape[1] * args.block,
             )
@@ -459,6 +460,7 @@ def main():
                 prepared.block_ids,
                 prepared.membership,
                 prepared.offsets,
+                prepared.candidate_slots,
             ),
             root,
             args.repeats,
@@ -469,7 +471,7 @@ def main():
             lambda scores, allowed: jnp.where(
                 jnp.repeat(allowed, args.block, axis=1), scores, -jnp.inf
             ),
-            (raw_scores, prepared.membership),
+            (raw_scores, prepared.candidates >= 0),
             root,
             args.repeats,
             dimensions,
@@ -478,12 +480,12 @@ def main():
             "topk_and_token_mapping",
             functools.partial(
                 indexer_impl.streaming_topk.select_candidate_tokens,
-                k=min(args.topk, args.width, prepared.block_ids.shape[1] * args.block),
+                k=min(args.topk, args.width, prepared.candidates.shape[1] * args.block),
                 block_size=args.block,
                 unordered=True,
                 sorted_indices=False,
             ),
-            (masked_scores, prepared.block_ids),
+            (masked_scores, prepared.candidates),
             root,
             args.repeats,
             dimensions,

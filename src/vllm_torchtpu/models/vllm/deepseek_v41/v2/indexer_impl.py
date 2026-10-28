@@ -1563,6 +1563,8 @@ def initialize_fp8_indexer() -> None:
             torch.empty_like(requests),
             requests.new_empty((tokens,), dtype=torch.bool),
             requests.new_empty((tokens, count), dtype=torch.bool),
+            torch.empty_like(candidates),
+            torch.empty_like(candidates),
         )
 
     def fake_prepared(
@@ -1633,8 +1635,10 @@ def _read(
 def _score_prepared(
     q, weights, lengths, prepared, topk, block, unordered, width, *, grouped=False
 ):
-    keys, canonical, offsets, order, valid_queries, membership = prepared
-    k = min(topk, width, canonical.shape[1] * block)
+    keys, canonical, offsets, order, valid_queries, membership, candidates, slots = (
+        prepared
+    )
+    k = min(topk, width, candidates.shape[1] * block)
     lengths = jnp.where(valid_queries, jnp.clip(lengths, 0, width), 0)
     if not grouped:
         q, weights, lengths = q[order], weights[order], lengths[order]
@@ -1648,7 +1652,9 @@ def _score_prepared(
     )
     rows = q.shape[0]
     capacity = canonical.shape[1] * block
-    chunk = PACKED_FP8_PREPARED_QUERY_ROWS.get((rows, capacity, topk), rows)
+    chunk = PACKED_FP8_PREPARED_QUERY_ROWS.get(
+        (rows, candidates.shape[1] * block, topk), rows
+    )
     chunk = chunk if unordered and rows % chunk == 0 else rows
 
     def score(start, group):
@@ -1664,6 +1670,7 @@ def _score_prepared(
             compact_lengths,
             membership,
             query_start_loc=offsets,
+            candidate_slots=slots,
             membership_block_size=block,
             max_model_len=capacity,
             query_start=start,
@@ -1680,7 +1687,7 @@ def _score_prepared(
         def select(tile, scores, group):
             return streaming_topk.select_candidate_tokens(
                 scores,
-                jax.lax.dynamic_slice_in_dim(canonical, tile * chunk, chunk),
+                jax.lax.dynamic_slice_in_dim(candidates, tile * chunk, chunk),
                 k=k,
                 block_size=block,
                 unordered=True,
@@ -1701,7 +1708,7 @@ def _score_prepared(
     else:
         scores = score(jnp.int32(0), None)
         selected = streaming_topk.select_candidate_tokens(
-            scores, canonical, k=k, block_size=block, unordered=False
+            scores, candidates, k=k, block_size=block, unordered=False
         )
     return jnp.pad(
         selected if grouped else jnp.empty_like(selected).at[order].set(selected),

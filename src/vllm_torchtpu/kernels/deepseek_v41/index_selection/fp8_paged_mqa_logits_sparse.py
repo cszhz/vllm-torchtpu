@@ -36,10 +36,10 @@ def _kernel(
     membership_block_size,
 ):
     mxu_size, sublanes = info.mxu_column_size, info.num_sublanes
-    q, weights, pool, membership = inputs
+    q, weights, pool, membership, output_map = inputs
     buffers, semaphores = scratch
-    queries, keys, scores, counts = buffers
-    read_sem, write_sem, q_sem = semaphores
+    queries, keys, scores, counts, projected, maps = buffers
+    read_sem, write_sem, q_sem, map_sem = semaphores
     weights = pltpu.annotate(weights, no_store=True)
     keys = pltpu.annotate(keys, no_store=True)
     tokens, heads, dim = q.shape
@@ -47,8 +47,10 @@ def _kernel(
     end = begin + out.shape[0]
     q_tile, key_tile = config.query_tile, config.key_tile
     tile_rows = key_tile // PAGE_RECORDS * PAGE_ROWS
-    group_rows = out.shape[1] // PAGE_RECORDS * PAGE_ROWS
-    tiles, fragments = out.shape[1] // key_tile, key_tile // mxu_size
+    group_rows = pool.shape[0] // (offsets.shape[0] - 1)
+    union_width = group_rows // PAGE_ROWS * PAGE_RECORDS
+    tiles, fragments = union_width // key_tile, key_tile // mxu_size
+    map_columns = output_map.shape[1]
 
     def copy_queries(query, slot, wait=False, zero=False):
         dst = queries.at[pl.ds(slot * q_tile, q_tile)]
@@ -57,10 +59,19 @@ def _kernel(
         _dma_rows(q, dst, q_sem.at[slot], query.count, wait, src_start=query.start)
 
     def release_outputs(pair):
-        count = counts[pair]
-        for slot in (2 * pair, 2 * pair + 1)[:tiles]:
-            src = scores.at[slot]
-            _dma_rows(src, src, write_sem.at[slot], count, wait=True)
+        src = projected.at[pair]
+        _dma_rows(src, src, write_sem.at[pair], counts[pair], wait=True)
+
+    def copy_map(query, slot, wait=False):
+        for i in range(q_tile):
+
+            @pl.when(i < query.count)
+            def copy(i=i):
+                dst = maps.at[pl.ds((slot * q_tile + i) * map_columns, map_columns)]
+                dma = pltpu.make_async_copy(
+                    output_map.at[query.start + i], dst, map_sem.at[slot]
+                )
+                (dma.wait if wait else dma.start)()
 
     def key_rows_to_read(tile, limit):
         valid = jnp.minimum(key_tile, jnp.maximum(limit - tile * key_tile, 0))
@@ -85,7 +96,7 @@ def _kernel(
 
     def query_limit(query):
         limit = reduce(jnp.maximum, row_lengths(query), jnp.int32(0))
-        return jnp.minimum(limit, out.shape[1])
+        return jnp.minimum(limit, union_width)
 
     def live_tiles(query):
         return pl.cdiv(query_limit(query), key_tile)
@@ -110,11 +121,50 @@ def _kernel(
         copy_queries(following, 1 - q_slot, zero=True)
         lengths_vector = jnp.stack(row_lengths(query))
 
-        def publish(tile, wait=False, slot=None):
-            slot = output_slot(tile) if slot is None else slot
-            src, sem = scores.at[slot], write_sem.at[slot]
-            dst = out.at[:, pl.ds(tile * key_tile, key_tile)]
-            _dma_rows(src, dst, sem, query.count, wait, dst_start=query.start - begin)
+        def project(tile):
+            for i in range(q_tile):
+
+                @pl.when(i < query.count)
+                def row(i=i):
+                    def page(page_id, _):
+                        column = page_id * PAGE_RECORDS
+                        values = projected[
+                            q_slot, pl.ds(i, 1), pl.ds(column, PAGE_RECORDS)
+                        ]
+                        for block in range(PAGE_RECORDS // membership_block_size):
+                            slot = column // membership_block_size + block
+                            index = maps[(q_slot * q_tile + i) * map_columns + slot]
+                            local = index * membership_block_size - tile * key_tile
+                            safe = jnp.clip(local, 0, key_tile - membership_block_size)
+                            source = scores[
+                                output_slot(tile),
+                                pl.ds(i, 1),
+                                pl.ds(
+                                    safe // PAGE_RECORDS * PAGE_RECORDS, PAGE_RECORDS
+                                ),
+                            ]
+                            lanes = (
+                                safe % PAGE_RECORDS
+                                + jnp.arange(PAGE_RECORDS) % membership_block_size
+                            )
+                            part = jnp.take_along_axis(
+                                jnp.broadcast_to(source, (sublanes, PAGE_RECORDS)),
+                                jnp.broadcast_to(
+                                    lanes[None, :], (sublanes, PAGE_RECORDS)
+                                ),
+                                axis=1,
+                            )[:1]
+                            take = (index >= 0) & (local >= 0) & (local < key_tile)
+                            take &= (
+                                jnp.arange(PAGE_RECORDS) // membership_block_size
+                                == block
+                            )
+                            values = jnp.where(take[None, :], part, values)
+                        projected[q_slot, pl.ds(i, 1), pl.ds(column, PAGE_RECORDS)] = (
+                            values
+                        )
+
+                    lax.fori_loop(0, out.shape[1] // PAGE_RECORDS, page, None)
 
         def tile_source(future):
             first, after = future < tile_count, future - tile_count
@@ -134,6 +184,8 @@ def _kernel(
             )
 
         release_outputs(q_slot)
+        projected[q_slot] = jnp.full(projected.shape[1:], -jnp.inf, jnp.float32)
+        copy_map(query, q_slot)
         for i in range(2):
 
             @pl.when((i >= ready) & (i < tile_count + next_tiles + ahead_tiles))
@@ -142,6 +194,7 @@ def _kernel(
                 load_keys(target, owner, key_slot(i), limit)
 
         copy_queries(query, q_slot, wait=True)
+        copy_map(query, q_slot, wait=True)
 
         def emit_tile(tile):
             weight = jnp.concatenate([weights[r][:, None] for r in row_ids(query)])
@@ -230,7 +283,6 @@ def _kernel(
             count = key_rows_to_read(tile, query_limit(query))
             src = keys.at[key_slot(tile), pl.ds(0, count)]
             pltpu.make_async_copy(src, src, read_sem.at[key_slot(tile)]).wait()
-            pl.when(tile >= 2)(lambda: publish(tile - 2, wait=True))
 
             @pl.when(tile + 2 < tile_count + next_tiles + ahead_tiles)
             def prefetch():
@@ -238,29 +290,21 @@ def _kernel(
                 load_keys(target, owner, key_slot(tile + 2), limit)
 
             emit_tile(tile)
-            publish(tile)
+            project(tile)
 
         if tiles == 1:
             pl.when(tile_count > 0)(lambda: step_tile(jnp.int32(0), None))
         else:
             lax.fori_loop(0, tile_count, step_tile, None)
 
-        counts[q_slot] = jnp.where(tile_count == tiles, query.count, 0)
-
-        @pl.when(tile_count < tiles)
-        def fill_padding():
-            @pl.when(tile_count > 0)
-            def drain():
-                publish(tile_count - 1, wait=True)
-                pl.when(tile_count > 1)(lambda: publish(tile_count - 2, wait=True))
-
-            scores[output_slot(0)] = jnp.full(scores.shape[1:], -jnp.inf, jnp.float32)
-            for wait in (False, True):
-
-                def body(tile, _, wait=wait):
-                    publish(tile, wait=wait, slot=output_slot(0))
-
-                lax.fori_loop(tile_count, tiles, body, None)
+        _dma_rows(
+            projected.at[q_slot],
+            out,
+            write_sem.at[q_slot],
+            query.count,
+            dst_start=query.start - begin,
+        )
+        counts[q_slot] = query.count
 
         return (
             following,
@@ -311,6 +355,7 @@ def fp8_gathered_mqa_logits(
     block_membership: jax.Array,
     *,
     query_start_loc: jax.Array,
+    candidate_slots: jax.Array,
     max_model_len: int,
     membership_block_size: int,
     query_start: jax.Array | int = 0,
@@ -324,11 +369,13 @@ def fp8_gathered_mqa_logits(
     is per query, in union-block order. Weights already include query scales.
     DMA reads only the visible union prefix, rounded to a packed 128-token page.
     Context lengths count visible tokens in the sorted union. Returned column
-    IDs remain compact; the outer top-k maps them through canonical block IDs.
+    IDs are per-query candidate slots; the existing top-k maps them to tokens.
+    Union scores stay in VMEM. Only per-query scores are written to HBM.
     """
     rows = q.shape[0] if query_count is None else query_count
+    output_width = candidate_slots.shape[1] * membership_block_size
     if rows == 0 or max_model_len == 0:
-        return jnp.empty((rows, max_model_len), jnp.float32)
+        return jnp.full((rows, output_width), -jnp.inf, jnp.float32)
     info = cast(pltpu.TpuInfo, pltpu.get_tpu_info())
     groups = query_start_loc.shape[0] - 1
     group_rows = keys.shape[0] // groups
@@ -355,6 +402,17 @@ def fp8_gathered_mqa_logits(
         block_membership[:, :columns].astype(jnp.int32),
         ((0, 0), (0, max(0, columns - block_membership.shape[1]))),
     )
+    if PAGE_RECORDS % membership_block_size:
+        raise ValueError("Candidate block size must divide the packed page")
+    output_padded = pl.cdiv(output_width, PAGE_RECORDS) * PAGE_RECORDS
+    map_columns = (
+        pl.cdiv(output_padded // membership_block_size, info.num_lanes) * info.num_lanes
+    )
+    candidate_slots = jnp.pad(
+        candidate_slots,
+        ((0, 0), (0, map_columns - candidate_slots.shape[1])),
+        constant_values=-1,
+    )
     q_tile, heads, dim = config.query_tile, q.shape[1], q.shape[2]
     scratch = (
         (
@@ -364,10 +422,12 @@ def fp8_gathered_mqa_logits(
             ),
             pltpu.VMEM((4, q_tile, tile), jnp.float32),
             pltpu.SMEM((2,), jnp.int32),
+            pltpu.VMEM((2, q_tile, output_padded), jnp.float32),
+            pltpu.SMEM((2 * q_tile * map_columns,), jnp.int32),
         ),
         tuple(
             pltpu.SemaphoreType.DMA(shape)
-            for shape in ((config.key_buffers,), (4, q_tile), (2,))
+            for shape in ((config.key_buffers,), (2, q_tile), (2,), (2,))
         ),
     )
     hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
@@ -378,11 +438,11 @@ def fp8_gathered_mqa_logits(
             info=info,
             membership_block_size=membership_block_size,
         ),
-        out_shape=jax.ShapeDtypeStruct((rows, width), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((rows, output_padded), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             grid=(1,),
-            in_specs=((hbm, vmem, hbm, vmem),),
+            in_specs=((hbm, vmem, hbm, vmem, hbm),),
             out_specs=hbm,
             scratch_shapes=(scratch,),
         ),
@@ -396,5 +456,5 @@ def fp8_gathered_mqa_logits(
         query_start_loc,
         context_lens,
         jnp.asarray(query_start, jnp.int32),
-        (q, weights, keys, membership),
-    )[:, :max_model_len]
+        (q, weights, keys, membership, candidate_slots),
+    )[:, :output_width]

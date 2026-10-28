@@ -69,7 +69,11 @@ def _cpu_gathered_logits(q, keys, weights, lengths, membership, **kwargs):
     groups = kwargs["query_start_loc"].shape[0] - 1
     pages_per_group = keys.shape[0] // groups // PAGE_ROWS
     pages = jnp.arange(groups * pages_per_group).reshape(groups, pages_per_group)
-    return _cpu_logits(
+    slots = kwargs.pop("candidate_slots")
+    start = kwargs.get("query_start", 0)
+    count = kwargs.get("query_count", q.shape[0])
+    slots = jax.lax.dynamic_slice_in_dim(slots, start, count)
+    scores = _cpu_logits(
         q,
         keys,
         weights,
@@ -79,6 +83,12 @@ def _cpu_gathered_logits(q, keys, weights, lengths, membership, **kwargs):
         block_membership=membership,
         **kwargs,
     )
+    block = kwargs["membership_block_size"]
+    columns = (jnp.maximum(slots, 0)[..., None] * block + jnp.arange(block)).reshape(
+        count, -1
+    )
+    selected = jnp.take_along_axis(scores, columns, axis=1)
+    return jnp.where(jnp.repeat(slots >= 0, block, axis=1), selected, -jnp.inf)
 
 
 @pytest.fixture
@@ -144,6 +154,18 @@ def test_paired_gather_preserves_each_query(
         )
     )
     prepared = prepare(banks, pages, candidates, requests)
+    assert prepared.candidates.shape == candidates.shape
+    assert prepared.candidate_slots.shape == candidates.shape
+    original_select = indexer_impl.streaming_topk.select_candidate_tokens
+
+    def select_query_slots(scores, block_ids, **kwargs):
+        assert block_ids.shape[1] == candidates.shape[1]
+        assert scores.shape[1] == candidates.shape[1] * block
+        return original_select(scores, block_ids, **kwargs)
+
+    monkeypatch.setattr(
+        indexer_impl.streaming_topk, "select_candidate_tokens", select_query_slots
+    )
     np.testing.assert_array_equal(np.diff(prepared.offsets)[: len(sizes)], sizes)
     assert np.all(np.diff(prepared.offsets)[len(sizes) :] == 0)
     for row, original in enumerate(np.asarray(prepared.order)):
@@ -160,7 +182,7 @@ def test_paired_gather_preserves_each_query(
     if unordered:
         monkeypatch.setitem(
             indexer_impl.PACKED_FP8_PREPARED_QUERY_ROWS,
-            (q.shape[0], prepared.block_ids.shape[1] * block, topk),
+            (q.shape[0], prepared.candidates.shape[1] * block, topk),
             1,
         )
     actual = indexer_impl._score_prepared(

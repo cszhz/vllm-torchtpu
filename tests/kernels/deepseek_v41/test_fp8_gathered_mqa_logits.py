@@ -62,6 +62,11 @@ def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, cou
         query_start=jnp.int32(start),
         query_count=count,
     )
+    # Per-query candidates have different orders and half the union capacity.
+    slots = np.stack(
+        [rng.permutation(width // block)[: width // block // 2] for _ in range(7)]
+    )
+    slots[0, 0] = -1
     actual = fp8_gathered_mqa_logits(
         q,
         gathered,
@@ -69,6 +74,7 @@ def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, cou
         lengths,
         jnp.asarray(membership),
         query_start_loc=offsets,
+        candidate_slots=jnp.asarray(slots, jnp.int32),
         max_model_len=width,
         membership_block_size=block,
         query_start=jnp.int32(start),
@@ -77,6 +83,15 @@ def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, cou
     )
     allowed = np.repeat(membership[start : start + count], block, axis=1)
     expected = np.where(allowed, np.asarray(baseline), -np.inf)
+    selected_slots = slots[start : start + count]
+    columns = (
+        np.maximum(selected_slots, 0)[..., None] * block + np.arange(block)
+    ).reshape(count, -1)
+    expected = np.take_along_axis(expected, columns, axis=1)
+    expected = np.where(
+        np.repeat(selected_slots >= 0, block, axis=1), expected, -np.inf
+    )
+    assert actual.shape == (count, width // 2)
     actual = np.asarray(actual)
     np.testing.assert_array_equal(np.isfinite(actual), np.isfinite(expected))
     live = np.isfinite(expected)

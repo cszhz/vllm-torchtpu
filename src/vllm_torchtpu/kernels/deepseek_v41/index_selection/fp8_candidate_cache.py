@@ -26,6 +26,8 @@ class PreparedCandidates(NamedTuple):
     order: jax.Array
     valid_queries: jax.Array
     membership: jax.Array
+    candidates: jax.Array
+    candidate_slots: jax.Array
 
 
 class CandidateMetadata(NamedTuple):
@@ -35,6 +37,8 @@ class CandidateMetadata(NamedTuple):
     order: jax.Array
     valid_queries: jax.Array
     membership: jax.Array
+    candidates: jax.Array
+    candidate_slots: jax.Array
 
 
 def prepare_candidates(
@@ -125,6 +129,7 @@ def prepare_candidate_metadata(
     )
     canonical = canonical[groups]
     membership = candidate_membership(candidates, canonical, pl.cdiv(width, block))
+    slots, output_candidates = candidate_output_slots(candidates, canonical)
     # SparseCore metadata only initializes live group rows.
     physical = jnp.where(sizes[:, None] > 0, physical, -1)
     fragment = min(block, layout.page_size)
@@ -140,7 +145,33 @@ def prepare_candidate_metadata(
         order,
         (requests >= 0) & (requests < pages.shape[0]),
         membership,
+        output_candidates,
+        slots,
     )
+
+
+def candidate_output_slots(candidates, canonical):
+    """Map original per-query slots to the union; retain only the first duplicate."""
+    sentinel = jnp.iinfo(jnp.int32).max
+    sorted_union = jnp.where(canonical >= 0, canonical, sentinel)
+    slots = jax.vmap(lambda a, b: jnp.searchsorted(a, b, method="scan"))(
+        sorted_union, candidates
+    )
+    safe = jnp.minimum(slots, canonical.shape[1] - 1)
+    valid = (candidates >= 0) & (slots < canonical.shape[1])
+    valid &= jnp.take_along_axis(canonical, safe, axis=1) == candidates
+    order = jnp.argsort(candidates, axis=1, stable=True)
+    ordered = jnp.take_along_axis(candidates, order, axis=1)
+    first = jnp.concatenate(
+        (
+            jnp.ones((candidates.shape[0], 1), jnp.bool_),
+            ordered[:, 1:] != ordered[:, :-1],
+        ),
+        axis=1,
+    )
+    first = jnp.take_along_axis(first, jnp.argsort(order, axis=1), axis=1)
+    valid &= first
+    return jnp.where(valid, slots, -1), jnp.where(valid, candidates, -1)
 
 
 def candidate_membership(candidates, canonical, blocks):
