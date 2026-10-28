@@ -200,12 +200,15 @@ SHARED_KV_MIN_TOKENS = 512
 # Query tokens stacked into one matmul on the shared-KV path: 4 x 64 heads
 # fill the MXU's 256 rows.
 SHARED_KV_TOKENS_PER_MATMUL = 4
-# Cache rows per online-softmax step on the shared-KV path; a multiple of 128.
+# Cache rows per short online-softmax step on the shared-KV path; a multiple
+# of 128.
 SHARED_KV_TILE_ROWS = 512
 # Most cache rows a chunk may read and still take the shared-KV path. Its cost
 # grows with the rows read, the gather path's with top-k, so long contexts are
 # cheaper gathered.
 SHARED_KV_MAX_ROWS = 1024
+# SHARED_KV_TILE_ROWS tiles per online-softmax step while whole steps remain.
+SHARED_KV_TILES_PER_STEP = 2
 # Query tokens per grid step of `topk_row_mask`.
 ROW_MASK_TOKENS = 32
 
@@ -714,9 +717,7 @@ def _attention_kernel(
                 .astype(acc_ref.dtype)
             )
 
-        @pl.loop(0, cdiv(kv_rows, tile_rows))
-        def _(i):
-            row0 = pl.multiple_of(i * tile_rows, tile_rows)
+        def walk_tile(row0, tile_rows):
             bkv = shared_bkv_ref[pl.ds(row0, tile_rows)]
 
             def scores(g, first):
@@ -755,6 +756,19 @@ def _attention_kernel(
                     accumulate(*pending)
                 pending = current
             accumulate(*pending)
+
+        # Each step rescales acc and updates m and l once, whatever its rows,
+        # so long steps amortize that; tiles left over take short steps.
+        num_tiles = cdiv(kv_rows, tile_rows)
+        long_rows = SHARED_KV_TILES_PER_STEP * tile_rows
+
+        @pl.loop(0, num_tiles // SHARED_KV_TILES_PER_STEP)
+        def _(i):
+            walk_tile(pl.multiple_of(i * long_rows, long_rows), long_rows)
+
+        @pl.loop(num_tiles - num_tiles % SHARED_KV_TILES_PER_STEP, num_tiles)
+        def _(i):
+            walk_tile(pl.multiple_of(i * tile_rows, tile_rows), tile_rows)
 
         for g, first in enumerate(firsts):
             state = pl.ds(g * rows, rows)
