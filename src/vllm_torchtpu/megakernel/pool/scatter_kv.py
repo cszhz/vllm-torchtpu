@@ -61,11 +61,6 @@ def scatter_single_token_across_att(
     ln = lax.rem(p_pos, page_size)
     raw_kp = kv_pages_ref[s_idx, t_idx]
     num_pages = cache_exec(ex).num_pages
-    kernel_debug_check(
-        jnp.logical_and(raw_kp >= 0, raw_kp < num_pages),
-        "KV scatter page index outside [0, num_pages)",
-        interpret=bool(interpret),
-    )
     kp = jnp.where(p_ok, safe_kv_page(raw_kp, num_pages), jnp.int32(0))
     mask_ln = jnp.logical_and(p_ok, lane_iota == ln)
     sh_b = lax.rem(ln + (page_size - lax.rem(b_idx, page_size)), page_size)

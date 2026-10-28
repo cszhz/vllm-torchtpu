@@ -677,3 +677,115 @@ def test_tile_rule_context_and_legacy_callable() -> None:
         name="b8_ok_approx", numerics="approx", tiles=verify_only_approx
     )
     assert "tiles.dense_acc_pair" in mk.profile.approx_features(prof_approx)
+
+
+def test_b7_deferred_minors(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1. random_hf_weights works without probing 'NKV' on geometry
+    g_base = _SynthBaseModel.derive_geometry()
+    assert getattr(g_base, "_model_def", None) is _SynthBaseModel
+    hf_w = mk.random_hf_weights(jax.random.key(0), g_base)
+    assert "att_out" in hf_w and "lin_q" in hf_w
+
+    # 2. GDNModule.accept / gdn_accept derives taps when omitted (taps=2 and taps=3)
+    for taps in (2, 3):
+        R, ngdn, NS, T, qkv, vh, KD, VD = 2, 1, 2, 2, 16, 2, 4, 4
+        c_ckpt = jnp.arange(
+            R * ngdn * NS * (taps + T) * qkv, dtype=jnp.float32
+        ).reshape(R, ngdn, NS, taps + T, qkv)
+        r_ckpt = jnp.arange(
+            R * ngdn * NS * T * vh * KD * VD, dtype=jnp.float32
+        ).reshape(R, ngdn, NS * T * vh, KD, VD)
+        st_in = {
+            "conv": jnp.zeros((R, ngdn, NS, taps, qkv), dtype=jnp.float32),
+            "rec": jnp.zeros((R, ngdn, NS * vh, KD, VD), dtype=jnp.float32),
+        }
+        ckpts = {"conv_ckpt": c_ckpt, "rec_ckpt": r_ckpt}
+        acc = jnp.array([1, 2], dtype=jnp.int32)
+        out_auto = mk.GDNModule.accept(st_in, ckpts, acc, T=T, vh=vh)
+        out_expl = mk.GDNModule.accept(st_in, ckpts, acc, T=T, vh=vh, taps=taps)
+        np.testing.assert_array_equal(
+            np.asarray(out_auto["conv"]), np.asarray(out_expl["conv"])
+        )
+        np.testing.assert_array_equal(
+            np.asarray(out_auto["rec"]), np.asarray(out_expl["rec"])
+        )
+        assert out_auto["conv"].shape == (R, ngdn, NS, taps + T, qkv)
+
+    # 4. fused negative-pos at T > 1 sets kv_mode[s] == 0 when all tokens have p < 0
+    ex_f = mk.ExecSpec(
+        R=2,
+        B=4,
+        T=2,
+        ctx=256,
+        cache=mk.CacheExec(paged_kv=True, num_pages=64, fused_pool_io=True),
+    )
+
+    class _FakeCtx:
+        ex = ex_f
+        pos_ref = jnp.array([-1, -1, 5, 6], dtype=jnp.int32)
+        ST = {
+            "page_table": jnp.array([[3, 4], [5, 6]], dtype=jnp.int32),
+            "ckpt_indices": jnp.array([[[1, 2], [3, 4]]], dtype=jnp.int32),
+        }
+        scr = {
+            "kv_rd_pend": np.zeros((2,), dtype=np.int32),
+            "kv_wr_pend": np.zeros((2,), dtype=np.int32),
+            "kv_kp0": np.zeros((2,), dtype=np.int32),
+            "kv_mode": np.zeros((2,), dtype=np.int32),
+        }
+
+    mk.experimental.fused_pool_io.gqa_fused_init_buffers(_FakeCtx)
+    assert int(_FakeCtx.scr["kv_mode"][0]) == 0
+    assert int(_FakeCtx.scr["kv_mode"][1]) == 1
+
+    # 5. unpack_kernel_states is invoked during verify_model DirectHBM check,
+    #    and missing state key fails closed
+    called_unpack: list[str] = []
+    orig_unpack = mk.GQAModule.unpack_kernel_states
+
+    def spy_unpack(self, raw_states, g, ex):
+        called_unpack.append(self.name)
+        return orig_unpack(self, raw_states, g, ex)
+
+    monkeypatch.setattr(mk.GQAModule, "unpack_kernel_states", spy_unpack)
+    rep = mk.verify_model(
+        _SynthBaseModel, R=2, B_per_T=2, T_values=(1,), hf=False, approx_profiles=False
+    )
+    rep.assert_passed()
+    assert "gqa" in called_unpack
+
+    # Missing state key from unpack_kernel_states fails closed with "missing state key"
+    monkeypatch.setattr(
+        mk.GQAModule,
+        "unpack_kernel_states",
+        lambda self, raw_states, g, ex: {
+            "kc": orig_unpack(self, raw_states, g, ex)["kc"]
+        },
+    )
+    monkeypatch.setattr(
+        mk.verify_checks.kernel,
+        "make_step",
+        lambda mesh, spec, ex: (
+            (
+                lambda pos_m, hid_m, w_m, st_m: (
+                    hid_m,
+                    {k: v for k, v in st_m.items() if k != "vc"},
+                )
+            ),
+            {},
+        ),
+    )
+    monkeypatch.setattr(
+        mk.verify_checks.cache,
+        "make_pooled_step",
+        lambda mesh, spec, ex: (lambda pos_p, hid_p, w_p, raw_in, *a: (hid_p, raw_in)),
+    )
+    rep_missing = mk.verify_model(
+        _SynthBaseModel, R=2, B_per_T=2, T_values=(1,), hf=False, approx_profiles=False
+    )
+    assert not rep_missing.passed
+    assert any(
+        "missing state key 'vc'" in c.reason
+        for c in rep_missing.checks
+        if c.status == "failed"
+    )
