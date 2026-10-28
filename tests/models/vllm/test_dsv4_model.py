@@ -119,6 +119,8 @@ class _StubDecoderLayer(nn.Module):
         self, x, positions, input_ids=None, post_mix=None, res_mix=None, residual=None
     ):
         del positions, input_ids, post_mix, res_mix, residual
+        if x.dim() == 2:  # the chain opens on the embedding, as in the real layer
+            x = x.unsqueeze(-2).repeat(1, HC, 1)
         residual = x
         x = x * (self.idx + 2) + 1.0
         post_mix = torch.full_like(x, 0.5 * (self.idx + 1))
@@ -150,6 +152,17 @@ class _TorchRMSNorm(nn.Module):
 def _fake_collapse_head(hidden_states, hc_fn, hc_scale, hc_base, rms_norm_eps, hc_eps):
     del hc_fn, hc_scale, hc_base, rms_norm_eps, hc_eps
     return hidden_states.mean(dim=1)
+
+
+class _FakePostHeadOp:
+    """Stand-in for the fused post + hc_head op; counts through ``post_op``."""
+
+    def __init__(self, post_op):
+        self.post_op = post_op
+
+    def __call__(self, x, residual, post_mix, res_mix, hc_fn, hc_scale, hc_base):
+        settled = self.post_op(x, residual, post_mix, res_mix)
+        return _fake_collapse_head(settled, hc_fn, hc_scale, hc_base, 0.0, 0.0)
 
 
 def _tiny_hf_config():
@@ -267,7 +280,9 @@ def tiny_fc(dist_ctx, monkeypatch):
         fc = model_mod.DeepseekV4ForCausalLM(vllm_config=vllm_config, prefix="")
     # The post op is fetched lazily through ``mhc_post_op``; pre-seed the
     # instance slot it reads so no Pallas op is ever built.
-    object.__setattr__(fc.model, "_mhc_post_op_instance", _FakePostOp())
+    post_op = _FakePostOp()
+    object.__setattr__(fc.model, "_mhc_post_op_instance", post_op)
+    object.__setattr__(fc.model, "_mhc_post_head_op_instance", _FakePostHeadOp(post_op))
     fc.model.norm = _TorchRMSNorm(fc.model.rms_norm_eps)
     return fc
 

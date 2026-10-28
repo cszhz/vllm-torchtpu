@@ -29,6 +29,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -56,6 +57,8 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
     MHCOps,
     get_mhc_ops,
+    get_mhc_post_head_op,
+    get_mhc_post_head_rows_op,
     get_mhc_post_op,
 )
 from vllm_torchtpu.logger import init_logger
@@ -179,9 +182,20 @@ class DeepseekV4DecoderLayer(nn.Module):
         `x` arrives as the previous sublayer's raw output and the caller
         carries `(residual, post_mix, res_mix)` -- the recombine that output
         still owes. The chain is opened by the layer-0 attention pre, which
-        has no preceding post, and closed by the caller.
+        has no preceding post, and closed by the caller. The opening `x` is
+        the (tokens, hidden) embedding, or the (tokens, hc_mult, hidden)
+        streams a previous pipeline stage handed over.
         """
-        if residual is None:
+        ffn_seam = self.mhc_ops.fused
+        if residual is None and x.dim() == 2:
+            # Chain start on the embedding, which every stream repeats: the
+            # pre and the next seam read it once instead of hc_mult copies.
+            residual = x
+            post_mix, res_mix, x = self.mhc_ops.pre_embed(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
+            ffn_seam = self.mhc_ops.fused_embed
+        elif residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
             x, post_mix, res_mix = self.hc_pre(
@@ -201,7 +215,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self.attn_norm(x)
         x = self.attn(positions, x)
 
-        residual, post_mix, res_mix, x = self.mhc_ops.fused(
+        residual, post_mix, res_mix, x = ffn_seam(
             x,
             residual,
             post_mix,
@@ -355,6 +369,23 @@ class DeepseekV4Model(nn.Module):
         # ``DeepseekV4ForCausalLM.set_aux_hidden_state_layers`` before warmup.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
+        # Without a draft, a context-parallel layout or pooling, the runner
+        # reads only row query_start_loc[r + 1] - 1 of the output for each
+        # request r, so the head may skip the other rows.
+        parallel_config = vllm_config.parallel_config
+        self._head_samples_last_rows_only = (
+            vllm_config.speculative_config is None
+            and getattr(parallel_config, "prefill_context_parallel_size", 1) == 1
+            and getattr(vllm_config.model_config, "runner_type", "generate")
+            == "generate"
+        )
+        # The attention metadata entry whose query_start_loc the layers read.
+        last_attn = getattr(self.layers[self.end_layer - 1], "attn", None)
+        swa_cache = getattr(
+            getattr(last_attn, "mla_attn", None), "swa_cache_layer", None
+        )
+        self._head_metadata_key = getattr(swa_cache, "prefix", None)
+
     @property
     def mhc_post_op(self):
         """The op that settles the post the last decoder layer deferred.
@@ -368,6 +399,35 @@ class DeepseekV4Model(nn.Module):
             op = get_mhc_post_op()
             object.__setattr__(self, "_mhc_post_op_instance", op)
         return op
+
+    @property
+    def mhc_post_head_op(self):
+        """The last post fused with the hc_head collapse, built outside the trace."""
+        op = self.__dict__.get("_mhc_post_head_op_instance")
+        if op is None:
+            op = get_mhc_post_head_op(self.rms_norm_eps, self.hc_eps)
+            object.__setattr__(self, "_mhc_post_head_op_instance", op)
+        return op
+
+    @property
+    def mhc_post_head_rows_op(self):
+        """``mhc_post_head_op`` on the sampled rows only, built outside the trace."""
+        op = self.__dict__.get("_mhc_post_head_rows_op_instance")
+        if op is None:
+            op = get_mhc_post_head_rows_op(self.rms_norm_eps, self.hc_eps)
+            object.__setattr__(self, "_mhc_post_head_rows_op_instance", op)
+        return op
+
+    def _head_query_start_loc(self) -> torch.Tensor | None:
+        """This batch's query_start_loc, the same tensor the attention reads."""
+        if not is_forward_context_available():
+            return None
+        metadata = get_forward_context().attn_metadata
+        if isinstance(metadata, dict):
+            metadata = metadata[self._head_metadata_key]
+        if isinstance(metadata, dict):
+            return metadata.get("query_start_loc")
+        return getattr(metadata, "query_start_loc", None)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -433,7 +493,7 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            # Layer 0 opens the hc_mult streams on it.
         else:
             assert intermediate_tensors is not None
             hidden_states = typing.cast(
@@ -469,12 +529,39 @@ class DeepseekV4Model(nn.Module):
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
 
+        collapsed = False
         if post_mix is not None:
             if (
                 final_aux_recon is not None
                 and self.end_layer in self.aux_hidden_state_layers
             ):
                 hidden_states = final_aux_recon
+            elif get_pp_group().is_last_rank:
+                # Settle the deferred post and collapse the streams in one
+                # kernel, so the full residual never goes through HBM.
+                head_args = (
+                    hidden_states,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self.hc_head_fn,
+                    self.hc_head_scale,
+                    self.hc_head_base,
+                )
+                query_start_loc = (
+                    self._head_query_start_loc()
+                    if self._head_samples_last_rows_only
+                    and not self.aux_hidden_state_layers
+                    else None
+                )
+                if query_start_loc is not None:
+                    # Prefill buckets compute only the rows the runner samples.
+                    hidden_states = self.mhc_post_head_rows_op(
+                        *head_args, query_start_loc
+                    )
+                else:
+                    hidden_states = self.mhc_post_head_op(*head_args)
+                collapsed = True
             else:
                 # Fused path: settle the post the last layer deferred.
                 hidden_states = self.mhc_post_op(
@@ -484,14 +571,15 @@ class DeepseekV4Model(nn.Module):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        hidden_states = mhc_collapse_head(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-        )
+        if not collapsed:
+            hidden_states = mhc_collapse_head(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
         hidden_states = self.norm(hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states

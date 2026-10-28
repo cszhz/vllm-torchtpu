@@ -369,6 +369,59 @@ class MhcPostPallasTpuTest(parameterized.TestCase):
         )
 
 
+def _ref_collapse_head(hidden, hc_fn, hc_scale, hc_base, rms_eps, hc_eps):
+    """jnp port of the model's ``mhc_collapse_head``."""
+    flat = hidden.reshape(*hidden.shape[:-2], -1).astype(jnp.float32)
+    norm = flat * jax.lax.rsqrt(jnp.mean(flat * flat, -1, keepdims=True) + rms_eps)
+    mix = jax.lax.dot_general(
+        norm, hc_fn, (((1,), (1,)), ((), ())), precision=jax.lax.Precision.HIGHEST
+    )
+    mix = jax.nn.sigmoid(mix * hc_scale + hc_base) + hc_eps
+    out = jnp.sum(mix[..., None] * hidden.astype(jnp.float32), axis=-2)
+    return out.astype(hidden.dtype)
+
+
+@pytest.mark.tpu_test
+class MhcPostHeadPallasTpuTest(parameterized.TestCase):
+    """Post + hc_head kernel vs post then the collapse reference. Needs TPU."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.product(num_tokens=[1, 17, 128, 300], hidden_size=[256, 7168])
+    def test_matches_reference(self, num_tokens, hidden_size):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import post_kernel
+
+        rng = np.random.default_rng(9)
+        x, res, plm, crm = _make_post_inputs(rng, num_tokens, hidden_size)
+        hc_fn = jnp.asarray(
+            rng.standard_normal((HC_MULT, HC_MULT * hidden_size), dtype=np.float32)
+            * 0.02
+        )
+        hc_scale = jnp.asarray([0.8], jnp.float32)
+        hc_base = jnp.asarray(0.5 * rng.standard_normal(HC_MULT), jnp.float32)
+
+        want = _ref_collapse_head(
+            _ref_mhc_post(x, res, plm, crm, precision=jax.lax.Precision.HIGHEST),
+            hc_fn,
+            hc_scale,
+            hc_base,
+            RMS_EPS,
+            HC_PRE_EPS,
+        )
+        got = post_kernel.mhc_post_head(
+            x, res, plm, crm, hc_fn, hc_scale, hc_base, RMS_EPS, HC_PRE_EPS
+        )
+
+        self.assertEqual(got.shape, (num_tokens, hidden_size))
+        self.assertEqual(got.dtype, jnp.bfloat16)
+        np.testing.assert_allclose(
+            _to_np(got), _to_np(want), rtol=BF16_RTOL, atol=BF16_ATOL
+        )
+
+
 def _make_fused_inputs(rng, num_tokens, hidden_size):
     """x/residual/gates (post-style) plus fn/scale/base (pre-style)."""
     x, residual, post_mix, comb_mix = _make_post_inputs(rng, num_tokens, hidden_size)
@@ -468,6 +521,31 @@ class MhcFusedPostPrePallasTpuTest(parameterized.TestCase):
         want = _ref_mhc_fused_post_pre(*args)
         got = fused_fn(*args, token_block_size=token_block_size)
 
+        for g, w, tol in zip(got, want, ("bf16", "f32", "f32", "bf16")):
+            rtol, atol = (
+                (BF16_RTOL, BF16_ATOL)
+                if tol == "bf16"
+                else (FUSED_F32_RTOL, FUSED_F32_ATOL)
+            )
+            np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
+
+    @parameterized.product(num_tokens=[17, 300, 1024])
+    def test_embed_matches_repeated_residual(self, num_tokens):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        x, _, plm, crm, *rest = _fused_args(
+            np.random.default_rng(11), num_tokens, 4096
+        )
+        embed = jnp.asarray(
+            np.random.default_rng(12).standard_normal((num_tokens, 4096)),
+            dtype=jnp.bfloat16,
+        )
+        repeated = jnp.repeat(embed[:, None, :], HC_MULT, axis=1)
+
+        want = fused_post_pre_kernel.mhc_fused_post_pre(x, repeated, plm, crm, *rest)
+        got = fused_post_pre_kernel.mhc_fused_post_pre_embed(x, embed, plm, crm, *rest)
+
+        # (sum_k comb_kj) * e reassociates the recombine: f32 rounding only.
         for g, w, tol in zip(got, want, ("bf16", "f32", "f32", "bf16")):
             rtol, atol = (
                 (BF16_RTOL, BF16_ATOL)
@@ -588,6 +666,68 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         np.testing.assert_allclose(
             _to_np(got_layer), _to_np(want_layer), rtol=BF16_RTOL, atol=BF16_ATOL
         )
+
+    @parameterized.product(num_tokens=[17, 300, 1024])
+    def test_embed_matches_repeated_residual(self, num_tokens):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import pre_kernel
+
+        hidden_size = 4096
+        rng = np.random.default_rng(7)
+        _, fn, hc_scale, hc_base = _make_pre_inputs(rng, num_tokens, hidden_size)
+        embed = jnp.asarray(
+            rng.standard_normal((num_tokens, hidden_size), dtype=np.float32)
+        ).astype(jnp.bfloat16)
+        repeated = jnp.repeat(embed[:, None, :], HC_MULT, axis=1)
+        rest = (jnp.asarray(fn), jnp.asarray(hc_scale), jnp.asarray(hc_base))
+        gates = (RMS_EPS, HC_PRE_EPS, HC_SINKHORN_EPS, HC_POST_MULT_VALUE, 20)
+
+        want = pre_kernel.mhc_pre(repeated, *rest, *gates)
+        got = pre_kernel.mhc_pre_embed(embed, *rest, *gates)
+
+        # Reassociated f32 sums: equal to f32 rounding, not bit for bit.
+        for g, w, tol in zip(got, want, (F32_RTOL, F32_RTOL, BF16_RTOL)):
+            np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=tol, atol=tol)
+
+
+@pytest.mark.tpu_test
+class MhcPostHeadRowsPallasTpuTest(parameterized.TestCase):
+    """Sampled-rows post + hc_head kernel vs the full-T kernel. Needs TPU."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.parameters(
+        dict(num_tokens=512, query_lens=[3, 100, 1, 1, 200, 7]),
+        dict(num_tokens=512, query_lens=[1] * 40 + [300]),
+        dict(num_tokens=1024, query_lens=[5] * 200 + [24]),
+        dict(num_tokens=1024, query_lens=[]),
+    )
+    def test_sampled_rows_match_full_kernel(self, num_tokens, query_lens):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import post_kernel
+
+        hidden_size = 256
+        rng = np.random.default_rng(11)
+        x, res, plm, crm = _make_post_inputs(rng, num_tokens, hidden_size)
+        hc_fn = jnp.asarray(
+            rng.standard_normal((HC_MULT, HC_MULT * hidden_size), dtype=np.float32)
+            * 0.02
+        )
+        hc_scale = jnp.asarray([0.8], jnp.float32)
+        hc_base = jnp.asarray(0.5 * rng.standard_normal(HC_MULT), jnp.float32)
+        qsl = np.zeros(257, np.int32)
+        qsl[1 : len(query_lens) + 1] = np.cumsum(query_lens)
+        qsl[len(query_lens) + 1 :] = qsl[len(query_lens)]
+        args = (x, res, plm, crm, hc_fn, hc_scale, hc_base)
+
+        want = post_kernel.mhc_post_head(*args, RMS_EPS, HC_PRE_EPS)
+        got = post_kernel.mhc_post_head_rows(
+            *args, jnp.asarray(qsl), RMS_EPS, HC_PRE_EPS
+        )
+
+        rows = np.clip(qsl[1:] - 1, 0, num_tokens - 1)
+        np.testing.assert_array_equal(_to_np(got)[rows], _to_np(want)[rows])
 
 
 if __name__ == "__main__":

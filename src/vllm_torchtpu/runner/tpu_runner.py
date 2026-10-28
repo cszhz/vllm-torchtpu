@@ -5421,6 +5421,8 @@ class TPUModelRunner(GPUModelRunner):
                     for op_name in (
                         "mhc_ops",
                         "mhc_post_op",
+                        "mhc_post_head_op",
+                        "mhc_post_head_rows_op",
                         "qnorm_rope_op",
                         "project_qnorm_rope_op",
                         "kv_rope_op",
