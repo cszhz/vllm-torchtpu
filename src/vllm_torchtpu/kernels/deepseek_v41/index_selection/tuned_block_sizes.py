@@ -42,7 +42,7 @@ class PagedMQAConfig:
 
 # TPU v7, H32/D128, transposed packed FP8 pages; measured at P-state 7.
 PACKED_FP8_MQA_CONFIG = PagedMQAConfig(6, 65536, 8, 4)
-PACKED_FP8_PREPARED_MQA_CONFIG = PagedMQAConfig(2, 8192, 8, 4)
+PACKED_FP8_PREPARED_MQA_CONFIG = PagedMQAConfig(2, 32768, 8, 4)
 
 # Dense tiles follow configured decode width, capped at one 256-row H32 MXU tile.
 PACKED_FP8_MAX_QUERY_TILE = 8
@@ -89,7 +89,7 @@ PACKED_FP8_BLOCK_MAX_CONFIG = {(98816, 8): (8192, 4)}
 
 # Rolling SparseCore gather: three buffers overlap reads and writes for 8-token blocks.
 PAGED_MQA_GATHER_CONFIG = {(8, 1): (96, 3), (8, 2): (64, 3)}
-PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG = {(8, 1): (64, 2), (8, 2): (64, 2)}
+PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG = {(8, 1): (64, 3), (8, 2): (64, 3)}
 
 # Stage up to 128 touched pages, stopping at the sorted invalid-record tail.
 PACKED_FP8_WRITE_BATCH = 128
