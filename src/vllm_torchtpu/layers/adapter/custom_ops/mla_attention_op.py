@@ -591,6 +591,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
+        q_trim = envs.TPU_STREAMIDX_Q_TRIM
         shared_meta = self._shared_meta
 
         def _streamidx_topk_jax(
@@ -668,6 +669,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 chunk_tokens=chunk_tokens,
                 decode_pack=decode_pack,
                 shared_meta=shared_meta,
+                q_block_trim=q_trim,
             )
             return cache_kv, topk_indices
 
@@ -697,6 +699,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 decode_pack,
                 shared_meta,
                 kv_cache_mode,
+                q_trim,
             ),
             build_op,
         )
@@ -750,6 +753,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
+        q_trim = envs.TPU_STREAMIDX_Q_TRIM
         shared_meta = self._shared_meta
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
@@ -857,6 +861,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 small_all_gather=small_ag,
                 decode_pack=decode_pack,
                 shared_meta=shared_meta,
+                q_block_trim=q_trim,
                 **overlap,
             )
             if qb_overlap:

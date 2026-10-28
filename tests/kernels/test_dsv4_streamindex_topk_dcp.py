@@ -959,3 +959,104 @@ def test_lane_operand_is_kept_on_every_bucket(q_len):
 
     exp = jax.export.export(jax.jit(fn))(*args, ids, lanes)
     assert len(exp.module_kept_var_idx) == len(args) + 2
+
+
+# ===================================================================== #
+# Exact scoring trims (TPU_STREAMIDX_Q_TRIM)
+# ===================================================================== #
+
+_TRIM_PAGE, _TRIM_PPS, _TRIM_IL = 256, 40, 4
+
+
+def _ragged_dcp_case(dcp_size, T_list, S_list, seed=31):
+    """Several sequences at global lengths `S_list`, SAL shards per rank."""
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+        convert_cache_to_seq_along_lane,
+    )
+
+    B = len(T_list)
+    local_len = _TRIM_PAGE * _TRIM_PPS
+    rank_caches = []
+    for r in range(dcp_size):
+        local = np.zeros((B * local_len, WIDTH), np.uint8)
+        for s, S in enumerate(S_list):
+            rec = np.asarray(_global_records(S, seed=seed + s))
+            l_idx = np.arange(local_len)
+            g = np.asarray(cp_local_to_global(l_idx, r, dcp_size, _TRIM_IL))
+            ok = g < S
+            local[s * local_len + l_idx[ok]] = rec[g[ok]]
+        has = local.reshape(B * _TRIM_PPS, _TRIM_PAGE // 4, 4, WIDTH)
+        rank_caches.append(convert_cache_to_seq_along_lane(jnp.array(has), D_IDX))
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:dcp_size]), (DCP_AXIS_NAME,))
+    shards = jax.device_put(
+        jnp.concatenate(rank_caches, 0),
+        jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)),
+    )
+    n_tok = sum(T_list)
+    kq, kw = jax.random.split(jax.random.key(seed))
+    q = (jax.random.normal(kq, (n_tok, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
+        jnp.float8_e4m3fn
+    )
+    weights = jax.random.normal(kw, (n_tok, H_IDX), jnp.float32).astype(jnp.bfloat16)
+    num_decodes = 0
+    while num_decodes < B and T_list[num_decodes] == 1:
+        num_decodes += 1
+    args = (
+        q,
+        weights,
+        shards,
+        jnp.array(S_list, jnp.int32),
+        jnp.arange(B * _TRIM_PPS, dtype=jnp.int32),
+        jnp.array(np.concatenate([[0], np.cumsum(T_list)]), jnp.int32),
+        jnp.array([num_decodes, num_decodes, B], jnp.int32),
+    )
+    kwargs = dict(
+        mesh=mesh,
+        k=K,
+        compression_ratio=1,
+        dcp_size=dcp_size,
+        interleave_size=_TRIM_IL,
+        kv_layout="seq_along_lane",
+        skip_empty_decode=True,
+    )
+    return args, kwargs
+
+
+# Sequence lengths as (per-rank length L, offset o): global S = L * dcp + o,
+# so every dcp size sees the same per-rank shapes and ragged rank tails.
+# fmt: off
+_TRIM_CASES = {
+    # MTP verify requests and partial chunks in q-128 MIXED blocks.
+    "q_block_trim": dict(
+        T_list=(4, 4, 4, 100, 21, 33, 90),
+        S_list=((9000, 3), (2047, 1), (0, 9), (500, 7), (4000, 0), (300, 21),
+                (60, 2)),
+        blocks=dict(num_kv_pages_per_block=2, num_queries_per_block=128),
+        pack=False),
+}
+# fmt: on
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("merge", ["all_gather", "a2a", "hist"])
+@pytest.mark.parametrize("flag", list(_TRIM_CASES))
+def test_scoring_trims_are_bitwise_under_dcp(flag, merge, dcp_size):
+    """Each trim flag on vs off: the same rank-local top-k, slot for slot,
+    through every merge (each reads rows only up to the rank-local length)."""
+    _need_devices(dcp_size)
+    case = _TRIM_CASES[flag]
+    T_list = case["T_list"]
+    # The a2a merge splits the token axis over the ranks.
+    pad = -sum(T_list) % 8
+    T_list = T_list if not pad else T_list[:-1] + (T_list[-1] + pad,)
+    S_list = tuple(L * dcp_size + o for L, o in case["S_list"])
+    args, kwargs = _ragged_dcp_case(dcp_size, T_list, S_list)
+    kwargs.update(case["blocks"], decode_pack=case["pack"])
+    kwargs["a2a_merge"] = merge == "a2a"
+    kwargs["hist_merge"] = merge == "hist"
+
+    off = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    on = np.asarray(streamindex_topk_dcp(*args, **kwargs, **{flag: True}))
+    assert (off >= 0).sum() > 0, "vacuous: no index selected"
+    np.testing.assert_array_equal(on, off, err_msg=f"{flag} changed the top-k")

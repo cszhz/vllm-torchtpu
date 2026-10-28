@@ -187,6 +187,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = True
     TPU_STREAMIDX_DECODE_PACK: bool = True
     TPU_STREAMIDX_SHARED_META: bool = True
+    TPU_STREAMIDX_Q_TRIM: bool = False
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = True
     TPU_SC_TOPK_COOP_V2: bool = True
     TPU_SC_TOPK_COOP_MERGE: bool = True
@@ -1566,6 +1567,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # depth, 1 decoder: 21 layers x (3 schedule conds + 1 operand fusion)
     # = 190 us per step. Same operands, same result.
     "TPU_STREAMIDX_SHARED_META": env_bool("TPU_STREAMIDX_SHARED_META", default=True),
+    # StreamIdx MIXED pass (q block 128, i.e. buckets above the small-bucket
+    # cap): a q block with at most 32 real rows (an MTP verify request, a
+    # chunk's tail) scores only its first 32-token block, and with
+    # TPU_STREAMIDX_MIXED_KV_PAGES >= 4 one with at most 16 only that half.
+    # Padding rows are never copied out. Bit-identical indices and scores.
+    "TPU_STREAMIDX_Q_TRIM": env_bool("TPU_STREAMIDX_Q_TRIM", default=False),
     # KV pages per block of the StreamIndex top-k MIXED (multi-token) pass for
     # every bucket that does not take the small-bucket sizes (with
     # TPU_STREAMIDX_SMALL_BUCKET_BQ set, buckets above

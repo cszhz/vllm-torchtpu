@@ -1684,6 +1684,76 @@ def test_shared_meta_is_bitwise(T_list, S_list, cp_size, cp_rank, bkv_p, chunk):
         err_msg="shared_meta changed scores")
 
 
+# fmt: off
+_FLAG_CASES = [
+    # MTP verify requests in a q-128 MIXED bucket: 4 real rows a block.
+    pytest.param((4, 4, 4, 100), (9001, 2052, 260, 5003), 1, 0, None,
+                 id="verify_plus_chunk"),
+    # Every token-block boundary of a 128-row block, and the 16-row half.
+    pytest.param((16, 17, 33, 64, 65, 96, 97, 128, 129),
+                 (16, 3000, 9001, 64, 7777, 2052, 260, 4096, 5003), 1, 0, None,
+                 id="block_edges"),
+    pytest.param((1, 1, 4, 100, 21), (5000, 777, 9001, 260, 3021), 1, 0, None,
+                 id="decode_rows"),
+    pytest.param((4, 4, 100, 21, 33), (8 * 9000 + 3, 8 * 2047 + 1, 8 * 500, 9, 260),
+                 8, 3, None, id="dcp8_rank3"),
+    pytest.param((4, 100, 21, 33), (9, 8 * 4000, 8 * 1000 + 5, 8 * 300), 8, 5, None,
+                 id="dcp8_rank5_empty_seq"),
+    pytest.param((4, 100, 21, 131), (9001, 5003, 3021, 7000), 1, 0, 64,
+                 id="chunked"),
+    pytest.param((4, 100, 21, 131), (8 * 900 + 1, 5003, 8 * 3021, 7000), 4, 2, 128,
+                 id="dcp4_rank2_chunked"),
+]
+# fmt: on
+
+
+def _flag_bitwise(flags, tag, T_list, S_list, cp_size, cp_rank, chunk, *,
+                  bq_sz=128, bkv_p=2, decode_pack=False):
+    """Indices and scores bitwise flag-on vs flag-off, at GLM-5.2 shapes.
+
+    `tag` in the lowered HLO is the positive control: the flag must reach a
+    kernel that ran, or the comparison is vacuous.
+    """
+    B = len(T_list)
+    page_size, H_I, D = 256, 32, 128
+    pages_per_seq = 40
+    inputs = _chunk_inputs(
+        T_list, _fragmented_pages(B, pages_per_seq), page_size, H_I, D
+    )
+    kwargs = _chunk_call_kwargs(
+        inputs, T_list, S_list, 2048, 1, bq_sz, bkv_p, _SAL, chunk,
+        return_scores=True,
+    )
+    kwargs["q"] = kwargs["q"].astype(jnp.float8_e4m3fn)
+    kwargs["distribution"] = jnp.array(kwargs["distribution"], jnp.int32)
+    kwargs["decode_pack"] = decode_pack
+    if cp_size > 1:
+        kwargs.update(cp_size=cp_size, cp_rank=cp_rank, interleave_size=4)
+    if tag is not None:
+        off_hlo = streamindex_topk.lower(**kwargs).as_text()
+        on_hlo = streamindex_topk.lower(**kwargs, **flags).as_text()
+        assert tag in on_hlo and tag not in off_hlo, f"{tag} kernel not built"
+
+    off_idx, off_scores = streamindex_topk(**kwargs)
+    on_idx, on_scores = streamindex_topk(**kwargs, **flags)
+    off_idx, on_idx = np.array(off_idx), np.array(on_idx)
+    assert (off_idx[: sum(T_list)] >= 0).any(), "vacuous: no index selected"
+    np.testing.assert_array_equal(on_idx, off_idx, err_msg=f"{flags} changed indices")
+    np.testing.assert_array_equal(
+        np.array(on_scores).view(np.int32), np.array(off_scores).view(np.int32),
+        err_msg=f"{flags} changed scores")
+
+
+@pytest.mark.tpu_test
+# 2 pages: whole-block score store; 4 (TPU_STREAMIDX_MIXED_KV_PAGES): strided.
+@pytest.mark.parametrize("bkv_p", [2, 4])
+@pytest.mark.parametrize("T_list,S_list,cp_size,cp_rank,chunk", _FLAG_CASES)
+def test_q_block_trim_is_bitwise(T_list, S_list, cp_size, cp_rank, chunk, bkv_p):
+    """TPU_STREAMIDX_Q_TRIM: scoring only the real token blocks is exact."""
+    _flag_bitwise(dict(q_block_trim=True), "-qt", T_list, S_list, cp_size,
+                  cp_rank, chunk, bkv_p=bkv_p)
+
+
 def main(argv):
     del argv
 

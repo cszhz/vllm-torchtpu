@@ -222,6 +222,7 @@ def kernel(
     chunk_idx: int = 0,
     decode_pack: bool = False,
     decode_page_major: bool = False,
+    q_block_trim: bool = False,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     scores_hbm_ref = score_refs[-1]
@@ -280,6 +281,19 @@ def kernel(
         num_q_heads=num_q_heads,
         q_dtype=q_hbm_ref.dtype,
         seq_batch_size=seq_batch_size,
+    )
+
+    # TPU_STREAMIDX_Q_TRIM: a multi-token q block with at most one token block
+    # of real rows scores only that block, or (32-token FP8 blocks, <= 16 real
+    # rows) its first half, off a cache of the first 16 tokens per head.
+    # The half needs strided score stores; with whole-block stores its scores
+    # move by an ulp.
+    q_trim = q_block_trim and prefill_cfg.enabled
+    q_half_cache = (
+        q_trim
+        and prefill_cfg.bf16_reduce
+        and prefill_cfg.tok_blk == 32
+        and prefill_cfg.strided_score_store
     )
 
     # Decode under MTP (TPU_STREAMIDX_DECODE_PACK): a q block of
@@ -784,7 +798,7 @@ def kernel(
             store(masked())
 
     def blocked_prefill_step(
-        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref
+        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref, q_half_ref=None
     ):
         """Scores one (q block, kv block) step of the multi-token path.
 
@@ -798,9 +812,12 @@ def kernel(
             head, token) row order.
           wb_ref: [num_tok_blks, H, tok_blk, 128] cache of the indexer weights,
             broadcast along lanes; bf16 for FP8 queries, f32 otherwise.
+          q_half_ref: [H * tok_blk // 2, D] cache of token block 0's first half
+            in (head group, head, token) row order, or None.
         """
         bkv_idx = bkv_block(pl.program_id(0))
         tok_blk = prefill_cfg.tok_blk
+        half = tok_blk // 2
         num_tok_blks = prefill_cfg.num_tok_blks
         num_head_groups = prefill_cfg.num_head_groups
         heads_per_group = prefill_cfg.heads_per_group
@@ -826,6 +843,11 @@ def kernel(
                     q_hm_ref[pl.ds(prefill_cfg.cache_row(h, tb), tok_blk)] = q_rows[
                         h * tok_blk : (h + 1) * tok_blk
                     ]
+                    if q_half_ref is not None and tb == 0:
+                        g, hg = h % num_head_groups, h // num_head_groups
+                        q_half_ref[pl.ds((g * heads_per_group + hg) * half, half)] = (
+                            q_rows[h * tok_blk : h * tok_blk + half]
+                        )
                     wb_ref[tb, h] = jnp.broadcast_to(
                         w[t0 : t0 + tok_blk, h : h + 1], (tok_blk, 128)
                     ).astype(wb_ref.dtype)
@@ -881,12 +903,14 @@ def kernel(
                     "nd,md->nm", q_rows, keys, preferred_element_type=jnp.float32
                 )
 
-        def reduce_token_block(sts, tb):
-            """sum_h relu(st_h) * w_h over the rows of token block `tb`.
+        def reduce_token_block(sts, tb, rows=tok_blk):
+            """sum_h relu(st_h) * w_h over the first `rows` rows of token block `tb`.
 
             Args:
-              sts: per head group, the [rows_per_group, lane_chunk] q @ k block.
+              sts: per head group, the q @ k block of its cached rows.
               tb: token block index.
+              rows: leading rows of the block; fewer than `tok_blk` reads the
+                half-block cache, which holds `rows` rows per head.
             """
             acc = None
             for i in range(heads_per_group):
@@ -894,9 +918,14 @@ def kernel(
                 # MXUs, so the accumulation drains every MXU at the rate it produces
                 # results.
                 for g, st in enumerate(sts):
-                    r0 = tb * rows_per_group_tok_blk + i * tok_blk
-                    st_h = st[r0 : r0 + tok_blk]
+                    if rows < tok_blk:
+                        r0 = i * rows
+                    else:
+                        r0 = tb * rows_per_group_tok_blk + i * tok_blk
+                    st_h = st[r0 : r0 + rows]
                     w_h = wb_ref[tb, i * num_head_groups + g]
+                    if rows < tok_blk:
+                        w_h = w_h[:rows]
                     if tiles_per_chunk > 1:
                         w_h = jnp.concatenate([w_h] * tiles_per_chunk, axis=1)
                     if prefill_cfg.bf16_reduce:
@@ -919,44 +948,97 @@ def kernel(
             if prefill_cfg.strided_score_store
             else None
         )
-        chunk_scores = []
-        for c in range(num_lane_chunks):
-            keys, scales = load_chunk(c)
-            # Reload the cached rows for every chunk instead of keeping the whole q
-            # block live in registers across chunks. Each head group is its own
-            # matmul so that the groups can run on different MXUs.
-            sts = [
-                qk(q_hm_ref[pl.ds(g * rows_per_group, rows_per_group)], keys)
-                for g in range(num_head_groups)
-            ]
-            tb_scores = []
-            for tb in range(num_tok_blks):
-                acc = reduce_token_block(sts, tb) * scales
+
+        def score_block(n_blk, rows):
+            """Scores the first `n_blk` token blocks, `rows` rows of each."""
+            chunk_scores = []
+            for c in range(num_lane_chunks):
+                keys, scales = load_chunk(c)
+                # Reload the cached rows for every chunk instead of keeping the
+                # whole q block live in registers across chunks. Each head group
+                # is its own matmul so that the groups can run on different MXUs.
+                # A group's first n token blocks are a prefix of its cache rows.
+                if rows < tok_blk:
+                    group_rows = heads_per_group * rows
+                    sts = [
+                        qk(q_half_ref[pl.ds(g * group_rows, group_rows)], keys)
+                        for g in range(num_head_groups)
+                    ]
+                else:
+                    group_rows = n_blk * rows_per_group_tok_blk
+                    sts = [
+                        qk(q_hm_ref[pl.ds(g * rows_per_group, group_rows)], keys)
+                        for g in range(num_head_groups)
+                    ]
+                tb_scores = []
+                for tb in range(n_blk):
+                    acc = reduce_token_block(sts, tb, rows) * scales
+                    if scores_rows is None:
+                        tb_scores.append(acc)
+                        continue
+                    for jj in range(tiles_per_chunk):
+                        lane_tile = c * tiles_per_chunk + jj
+                        scores_rows[
+                            pl.ds(
+                                tb * tok_blk * score_pitch + lane_tile,
+                                rows,
+                                stride=score_pitch,
+                            )
+                        ] = pltpu.bitcast(acc[:, jj * 128 : (jj + 1) * 128], jnp.int32)
                 if scores_rows is None:
-                    tb_scores.append(acc)
-                    continue
-                for jj in range(tiles_per_chunk):
-                    lane_tile = c * tiles_per_chunk + jj
-                    scores_rows[
-                        pl.ds(
-                            tb * tok_blk * score_pitch + lane_tile,
-                            tok_blk,
-                            stride=score_pitch,
-                        )
-                    ] = pltpu.bitcast(acc[:, jj * 128 : (jj + 1) * 128], jnp.int32)
+                    chunk_scores.append(jnp.concatenate(tb_scores, axis=0))
+
             if scores_rows is None:
-                chunk_scores.append(jnp.concatenate(tb_scores, axis=0))
+                s_summed = jnp.concatenate(chunk_scores, axis=1)
+                n_rows = (n_blk - 1) * tok_blk + rows
+                if n_rows == bq_sz:
+                    scores_vmem[...] = pltpu.bitcast(
+                        s_summed.reshape(bq_sz, num_sublanes_bkv, 128), jnp.int32
+                    )
+                else:
+                    scores_vmem[:n_rows] = pltpu.bitcast(
+                        s_summed.reshape(n_rows, num_sublanes_bkv, 128), jnp.int32
+                    )
 
-        if scores_rows is None:
-            s_summed = jnp.concatenate(chunk_scores, axis=1)
-            scores_vmem[...] = pltpu.bitcast(
-                s_summed.reshape(bq_sz, num_sublanes_bkv, 128), jnp.int32
-            )
+        if not q_trim or (num_tok_blks == 1 and q_half_ref is None):
+            score_block(num_tok_blks, tok_blk)
+            return
 
-    def _run_all(q_hm_ref=None, wb_ref=None, q2_ref=None, w2_ref=None):
+        # Rows past the q block's sequence (or chunk) are padding and are never
+        # copied out. A q block of at most one token block of real rows (an MTP
+        # verify request, a chunk's tail) scores only that block, or its first
+        # half; the full block is tested first, so it pays one branch.
+        _, valid_rows = bref_override.token_window(
+            (None, cu_q_lens_ref, metadata_ref, start_end_seq_idx_ref),
+            pl.program_id(0),
+            scores_hbm_ref.shape[0],
+            bq_sz=bq_sz,
+            seq_batch_size=seq_batch_size,
+            chunk_idx=chunk_idx,
+        )
+        small = tok_blk if num_tok_blks > 1 else half
+        pl.when(valid_rows > small)(
+            functools.partial(score_block, num_tok_blks, tok_blk)
+        )
+
+        @pl.when(valid_rows <= small)
+        def _():
+            if num_tok_blks == 1:
+                score_block(1, half)
+                return
+            if q_half_ref is None:
+                score_block(1, tok_blk)
+                return
+            pl.when(valid_rows <= half)(functools.partial(score_block, 1, half))
+            pl.when(valid_rows > half)(functools.partial(score_block, 1, tok_blk))
+
+    def _run_all(q_hm_ref=None, wb_ref=None, q2_ref=None, w2_ref=None, q_half_ref=None):
         if prefill_cfg.enabled:
             body = functools.partial(
-                blocked_prefill_step, q_hm_ref=q_hm_ref, wb_ref=wb_ref
+                blocked_prefill_step,
+                q_hm_ref=q_hm_ref,
+                wb_ref=wb_ref,
+                q_half_ref=q_half_ref,
             )
         elif decode_pack:
             body = functools.partial(
@@ -993,7 +1075,9 @@ def kernel(
     # keeps the cached block unambiguous.
     if prefill_cfg.enabled:
         pl.run_scoped(
-            _run_all,
+            lambda q_hm, wb, *half_ref: _run_all(
+                q_hm, wb, q_half_ref=half_ref[0] if half_ref else None
+            ),
             pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),
             pltpu.VMEM(
                 (
@@ -1003,6 +1087,16 @@ def kernel(
                     128,
                 ),
                 prefill_cfg.wb_dtype,
+            ),
+            *(
+                (
+                    pltpu.VMEM(
+                        (num_q_heads * prefill_cfg.tok_blk // 2, head_dim),
+                        q_hbm_ref.dtype,
+                    ),
+                )
+                if q_half_cache
+                else ()
             ),
         )
     elif decode_pack:
@@ -1294,6 +1388,7 @@ def _effective_row_lengths(
         "decode_pack",
         "decode_page_major",
         "shared_meta",
+        "q_block_trim",
         "dcp_axis_name",
     ),
 )
@@ -1329,6 +1424,7 @@ def streamindex_topk(
     decode_pack: bool = False,
     decode_page_major: bool | None = None,
     shared_meta: bool = False,
+    q_block_trim: bool = False,
     dcp_axis_name: str | None = None,
 ) -> jax.Array | tuple[Any, ...]:  # (out, [scores,] [tied])
     """StreamIndex Top-K retrieval.
@@ -1425,6 +1521,11 @@ def streamindex_topk(
         built inside the branch that runs them, so a step with no q_len-1
         sequence (every step under MTP) builds none. Same operands bit for
         bit, so the same result.
+      q_block_trim: in the multi-token MIXED pass, a q block with at most one
+        token block (32 rows) of real rows scores only that block, and (FP8,
+        KV blocks of at least 8 lane tiles) one of at most 16 real rows only
+        its first half, off a cache of its first 16 tokens. Padding rows are
+        never copied out, so the same indices and scores bit for bit.
       dcp_axis_name: with `cp_size > 1`, inside a `shard_map` over this axis:
         each chunk's top-k is the exact top-k over every rank's shard
         (`sparsecore_topk_dcp`, which sums the radix histograms over the
@@ -1661,6 +1762,16 @@ def streamindex_topk(
             layout_tag += "-pk"
         if pack_page_major:
             layout_tag += "-pm"
+        pcfg = _BlockedPrefillConfig.create(
+            bq_sz=bq_sz,
+            bkv_sz=bkv_sz,
+            num_q_heads=num_q_heads,
+            q_dtype=q.dtype,
+            seq_batch_size=seq_batch_size,
+        )
+        q_trim = q_block_trim and case == MlaCase.MIXED
+        if q_trim and pcfg.enabled:
+            layout_tag += "-qt"
         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}{layout_tag}"
         if chunked:
             # The chunk count is part of the kernel's identity, so a sweep over chunk
@@ -1683,6 +1794,7 @@ def streamindex_topk(
                     chunk_idx=chunk_idx,
                     decode_pack=pack,
                     decode_page_major=pack_page_major,
+                    q_block_trim=q_trim,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
@@ -2082,6 +2194,7 @@ SMALL_AG_MAX_TOKENS = 8
         "small_all_gather",
         "decode_pack",
         "shared_meta",
+        "q_block_trim",
     ),
 )
 def streamindex_topk_dcp(
@@ -2121,6 +2234,7 @@ def streamindex_topk_dcp(
     small_all_gather: bool | None = None,
     decode_pack: bool = False,
     shared_meta: bool = False,
+    q_block_trim: bool = False,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -2203,6 +2317,7 @@ def streamindex_topk_dcp(
       skip_empty_decode_chunked: forwarded to `streamindex_topk`; see there.
       decode_pack: forwarded to `streamindex_topk`; see there. Same result.
       shared_meta: forwarded to `streamindex_topk`; see there. Same result.
+      q_block_trim: forwarded to `streamindex_topk`; see there. Same result.
       global_scheduling_group_id: XLA scheduling group of the cross-rank
         SparseCore merge (stage 2), which the layer's independent TensorCore
         work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
@@ -2383,6 +2498,7 @@ def streamindex_topk_dcp(
             final_sc_tie=tuple(ov_args[:1]) if pin else (),
             decode_pack=decode_pack,
             shared_meta=shared_meta,
+            q_block_trim=q_block_trim,
             dcp_axis_name=dcp_axis_name if hist_merge else None,
         )
         scores = None
