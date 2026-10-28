@@ -63,6 +63,8 @@ def main():
     ap.add_argument("--phys", action="store_true",
                     help="union ids -> physical page ids per request (VLLM_TPU_MEGAKERNEL wholephys=1)")
     ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
+    ap.add_argument("--kb", type=int, default=128, choices=(128, 512),
+                    help="pool block tokens (served compressed/main tables address 512-token blocks)")
     ap.add_argument("--key-mp", type=int, default=0,
                     help="key-stream kernel pages per DMA (VLLM_TPU_MEGAKERNEL wholekeymp=N; 4 = one block column)")
     a = ap.parse_args()
@@ -88,12 +90,14 @@ def main():
     for B in [int(b) for b in a.buckets.split(",")]:
         nreq = B // 4
         n_cols = pps  # table width (static); only the pages the contexts reach are allocated
-        n_used = -(-(a.ctx + 4 + nreq) // 128)
+        kb = a.kb  # pool block tokens: 128 (QSA kernel blocks) or 512 (served manager blocks)
+        per = 512 // kb  # pool blocks per 512-token manager block
+        n_used = -(-(a.ctx + 4 + nreq) // kb)
         # Blocks: GDN 33 layers x 4 ckpts per request, QSA main + compressed per request & layer.
         # Timing only: every QSA layer reads the same main / compressed pages of a request
         # (a 90K-token context would otherwise need 11 x 1.4K blocks per request).
         NB = 1 + nreq * (n_gdn * 4 + n_att + 2 * n_used) + 8
-        layout = Qwen38GdnPoolLayout(pool_shape=(NB * 4, 128, 1, 4, 256), pool_dtype="float8_e4m3fn")
+        layout = Qwen38GdnPoolLayout(pool_shape=(NB * per, kb, 1, 4, 256), pool_dtype="float8_e4m3fn")
         call, in_specs, out_specs, donate = build_wholestep_call(
             mesh, g, B, layout, layers, L=L, budget=a.budget, max_groups=a.max_groups,
             norm_eps=1e-6, rotary_dim=64,
@@ -127,7 +131,7 @@ def main():
         # (128 tokens): draw them from disjoint ranges of the kernel-granularity pool.
         NG = 1 + nreq * n_gdn * 4
         free_gdn = iter(rng.permutation(np.arange(1, NG)))
-        free = iter(rng.permutation(np.arange(4 * NG, 4 * NB)))
+        free = iter(rng.permutation(np.arange(per * NG, per * NB)))
         ctx = np.array([a.ctx + q for q in range(nreq)] + [0] * (16 - nreq), np.int32)
         qsl = np.array([min(q, nreq) * 4 for q in range(17)], np.int32)
         seq = ctx + np.where(np.arange(16) < nreq, 4, 0)
@@ -138,7 +142,7 @@ def main():
             for q in range(nreq):
                 ck[q] = [next(free_gdn) for _ in range(4)]
                 st[q] = ck[q, 0]
-            meta += [st, np.zeros(NB * 4, np.int32), ck, qsl, seq]
+            meta += [st, np.zeros(NB * per, np.int32), ck, qsl, seq]
         tabs = []
         main = np.zeros((16, n_cols), np.int32)
         comp = np.zeros((16, n_cols), np.int32)
@@ -157,7 +161,7 @@ def main():
         norms = [jnp.zeros((256,), jnp.bfloat16), jnp.zeros((128,), jnp.bfloat16)] * n_att
         hidden = rnd((R * B, g.NHC * g.H), jnp.bfloat16)
         pool = jax.jit(  # allocated sharded: a host-side zeros of the global pool does not fit
-            lambda: jnp.zeros((R * NB * 4, 128, 1, 4, 256), jnp.float8_e4m3fn), out_shardings=tp
+            lambda: jnp.zeros((R * NB * per, kb, 1, 4, 256), jnp.float8_e4m3fn), out_shardings=tp
         )()
         put = lambda x: jax.device_put(jnp.asarray(x), rep)  # noqa: E731
         args = [hidden, *ws, pool, *map(put, meta), *map(put, tabs), put(positions), put(qsl),
