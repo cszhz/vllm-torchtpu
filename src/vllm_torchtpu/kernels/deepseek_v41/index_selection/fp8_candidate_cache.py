@@ -126,7 +126,7 @@ def prepare_candidate_metadata(
     group_candidates = jnp.where(
         (sizes > 0)[:, None] & valid[representatives, None], group_candidates, -1
     )
-    canonical, physical = canonical_candidate_blocks(
+    canonical, physical, membership = _canonical_candidate_blocks(
         group_candidates,
         pages[owners[representatives]],
         offsets,
@@ -134,9 +134,11 @@ def prepare_candidate_metadata(
         width=width,
         cache_pages=layout.pages,
         page_size=layout.page_size,
+        per_query_count=count,
     )
     canonical = canonical[groups]
-    membership = candidate_membership(candidates, canonical, pl.cdiv(width, block))
+    if membership is None:
+        membership = candidate_membership(candidates, canonical, pl.cdiv(width, block))
     # SparseCore metadata only initializes live group rows.
     physical = jnp.where(sizes[:, None] > 0, physical, -1)
     fragment = min(block, layout.page_size)
@@ -258,18 +260,55 @@ def canonical_candidate_blocks(
     cache_pages: int,
     page_size: int = PAGE_RECORDS,
 ) -> tuple[jax.Array, jax.Array]:
+    """Sort, deduplicate and resolve candidate rows."""
+    canonical, physical, _ = _canonical_candidate_blocks(
+        candidates,
+        table,
+        offsets,
+        block=block,
+        width=width,
+        cache_pages=cache_pages,
+        page_size=page_size,
+    )
+    return canonical, physical
+
+
+def _canonical_candidate_blocks(
+    candidates: jax.Array,
+    table: jax.Array,
+    offsets: jax.Array,
+    *,
+    block: int,
+    width: int,
+    cache_pages: int,
+    page_size: int = PAGE_RECORDS,
+    per_query_count: int = 0,
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Sort, deduplicate and resolve request rows through the last live group."""
     blocks = pl.cdiv(width, block)
+    fused = per_query_count > 0
+    owners = 2 if fused else 1
     # Keep half of subcore VMEM free for compiler temporaries and alignment.
     scratch_words = (
-        pl.cdiv(blocks, 128)
+        owners * pl.cdiv(blocks, 128)
         + pl.cdiv(table.shape[1], 128)
-        + 3 * pl.cdiv(candidates.shape[1], 128)
+        + (5 if fused else 3) * pl.cdiv(candidates.shape[1], 128)
+        + (pl.cdiv(offsets.shape[0], 128) if fused else 0)
         + 3
     ) * 128
     if jax.default_backend() != "tpu" or (
         scratch_words * 4 > plsc.get_sparse_core_info().vmem_capacity_bytes // 2
     ):
+        if fused and jax.default_backend() == "tpu":
+            return _canonical_candidate_blocks(
+                candidates,
+                table,
+                offsets,
+                block=block,
+                width=width,
+                cache_pages=cache_pages,
+                page_size=page_size,
+            )
         physical = resolve_candidate_blocks(
             candidates,
             table,
@@ -290,13 +329,14 @@ def canonical_candidate_blocks(
         unique = jnp.diff(canonical, axis=-1, prepend=-1) != 0
         canonical = jnp.sort(jnp.where(unique, canonical, blocks), axis=-1)
         canonical = jnp.where(canonical < blocks, canonical, -1)
-        return canonical, resolve_candidate_blocks(
+        physical = resolve_candidate_blocks(
             canonical,
             table,
             sparse_block_kv=block,
             cache_pages=cache_pages,
             page_size=page_size,
         )
+        return canonical, physical, None
 
     info = plsc.get_sparse_core_info()
     lanes, units = info.num_lanes, info.num_cores * info.num_subcores
@@ -309,39 +349,49 @@ def canonical_candidate_blocks(
         table, ((0, 0), (0, -table.shape[1] % alignment)), constant_values=-1
     )
     live = jnp.max(jnp.where(offsets[1:] > offsets[:-1], jnp.arange(1, rows + 1), 0))
-    control = jnp.full((lanes,), live, jnp.int32)
+    control = jnp.full((alignment,), live, jnp.int32)
+    if fused:
+        control = jnp.concatenate(
+            (
+                control,
+                jnp.pad(offsets, (0, -offsets.shape[0] % alignment)),
+            )
+        )
     per_page, parts = max(1, page_size // block), max(1, block // page_size)
     mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
 
     @pl.kernel(
-        out_type=(jax.ShapeDtypeStruct((rows, columns), jnp.int32),) * 2,
+        out_type=(jax.ShapeDtypeStruct((rows, columns), jnp.int32),)
+        * (3 if fused else 2),
         scratch_types=(
-            pltpu.VMEM((histogram_width,), jnp.int32),
+            pltpu.VMEM((owners, histogram_width), jnp.int32),
             pltpu.VMEM((columns,), jnp.int32),
             pltpu.VMEM((table.shape[1],), jnp.int32),
             pltpu.VMEM((columns + lanes,), jnp.int32),
             pltpu.VMEM((columns + lanes,), jnp.int32),
-            pltpu.VMEM((lanes,), jnp.int32),
+            pltpu.VMEM(control.shape, jnp.int32),
             pltpu.SemaphoreType.DMA((4,)),
-        ),
+        )
+        + ((pltpu.VMEM((2, columns + lanes), jnp.int32),) if fused else ()),
         mesh=mesh,
         compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
         name="paged_mqa_candidate_metadata",
     )
-    def prepare(
-        src,
-        pages,
-        control_ref,
-        canonical,
-        physical,
-        hist,
-        ids,
-        page_ids,
-        logical_ids,
-        physical_ids,
-        active,
-        sem,
-    ):
+    def prepare(src, pages, control_ref, canonical, physical, *refs):
+        if fused:
+            (
+                membership_out,
+                hist,
+                ids,
+                page_ids,
+                logical_ids,
+                physical_ids,
+                active,
+                sem,
+                flags,
+            ) = refs
+        else:
+            hist, ids, page_ids, logical_ids, physical_ids, active, sem = refs
         pltpu.async_copy(control_ref, active, sem.at[0]).wait()
         unit = lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
 
@@ -352,12 +402,16 @@ def canonical_candidate_blocks(
 
             @plsc.parallel_loop(0, histogram_width, lanes, unroll=alignment // lanes)
             def clear_hist(i):
-                hist[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
+                for owner in range(owners):
+                    hist[owner, pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
 
             @plsc.parallel_loop(0, columns + lanes, lanes)
             def clear_result(i):
                 logical_ids[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
                 physical_ids[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
+                if fused:
+                    for owner in range(2):
+                        flags[owner, pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
 
             read_ids.wait()
             read_pages.wait()
@@ -365,10 +419,20 @@ def canonical_candidate_blocks(
             @plsc.parallel_loop(0, columns, lanes, unroll=alignment // lanes)
             def scatter(i):
                 keys = ids[pl.ds(i, lanes)]
-                inc, mask = plsc.scan_count(keys, mask=(keys >= 0) & (keys < blocks))
-                plsc.addupdate_scatter(
-                    hist, [jnp.clip(keys, 0, histogram_width - 1)], inc, mask=mask
-                )
+                for owner in range(owners):
+                    valid = (keys >= 0) & (keys < blocks)
+                    if fused:
+                        position = i + jnp.arange(lanes)
+                        valid &= (position >= owner * per_query_count) & (
+                            position < (owner + 1) * per_query_count
+                        )
+                    inc, mask = plsc.scan_count(keys, mask=valid)
+                    plsc.addupdate_scatter(
+                        hist.at[owner],
+                        [jnp.clip(keys, 0, histogram_width - 1)],
+                        inc,
+                        mask=mask,
+                    )
 
             def compact(i, count):
                 logical = i + jnp.arange(lanes)
@@ -376,8 +440,11 @@ def canonical_candidate_blocks(
                     page_ids,
                     [jnp.minimum(logical // per_page * parts, table.shape[1] - 1)],
                 )
+                present = hist[0, pl.ds(i, lanes)] != 0
+                if fused:
+                    present |= hist[1, pl.ds(i, lanes)] != 0
                 valid = (
-                    (hist[pl.ds(i, lanes)] != 0)
+                    present
                     & (logical < blocks)
                     & (logical * block < table.shape[1] * page_size)
                     & (page >= 0)
@@ -401,6 +468,13 @@ def canonical_candidate_blocks(
                     page * per_page + logical % per_page,
                     mask=valid,
                 )
+                if fused:
+                    for owner in range(2):
+                        plsc.store_compressed(
+                            flags.at[owner, pl.ds(count, lanes)],
+                            (hist[owner, pl.ds(i, lanes)] != 0).astype(jnp.int32),
+                            mask=valid,
+                        )
                 return count + plsc.all_reduce_population_count(valid)[0]
 
             loop = cast(
@@ -424,8 +498,26 @@ def canonical_candidate_blocks(
             )
             copy_ids.wait()
             copy_physical.wait()
+            if fused:
+                query = plsc.load_gather(
+                    active, [jnp.full((lanes,), alignment + row_id, jnp.int32)]
+                )[0]
+                end = plsc.load_gather(
+                    active, [jnp.full((lanes,), alignment + row_id + 1, jnp.int32)]
+                )[0]
+                pltpu.async_copy(
+                    flags.at[0, :columns], membership_out.at[query], sem.at[0]
+                ).wait()
 
-    canonical, physical = prepare(candidates, table, control)
+                @pl.when(end - query == 2)
+                def second_query():
+                    pltpu.async_copy(
+                        flags.at[1, :columns], membership_out.at[query + 1], sem.at[1]
+                    ).wait()
+
+    result = prepare(candidates, table, control)
+    canonical, physical = result[:2]
+    membership = result[2][:, :count] != 0 if fused else None
     canonical, physical = canonical[:, :count], physical[:, :count]
     if parts > 1:
         physical = resolve_candidate_blocks(
@@ -435,7 +527,7 @@ def canonical_candidate_blocks(
             cache_pages=cache_pages,
             page_size=page_size,
         )
-    return canonical, physical
+    return canonical, physical, membership
 
 
 def _resolve_blocks_sc(blocks, table, block, cache_pages, page_size):
