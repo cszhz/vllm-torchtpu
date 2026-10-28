@@ -1492,9 +1492,6 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        # Add head dim of 1 to k_pe
-        k_pe = k_pe.unsqueeze(1)
-
         if self.rotary_emb is not None:
             if (
                 q_pe.dtype == torch.bfloat16
@@ -1515,11 +1512,20 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     q_pe.dtype,
                     q_pe.device,
                 )
-                cos2 = torch.matmul(cos, r_mat).unsqueeze(-2)
-                sin2 = torch.matmul(sin, r_mat).unsqueeze(-2)
+                cos2_2d = torch.matmul(cos, r_mat)
+                sin2_2d = torch.matmul(sin, r_mat)
+                cos2 = cos2_2d.unsqueeze(-2)
+                sin2 = sin2_2d.unsqueeze(-2)
                 q_pe = q_pe * cos2 + torch.matmul(q_pe, p_mat) * sin2
-                k_pe = k_pe * cos2 + torch.matmul(k_pe, p_mat) * sin2
+                if q_pe.shape[0] > 64:
+                    k_pe = (
+                        k_pe * cos2_2d + torch.matmul(k_pe, p_mat) * sin2_2d
+                    ).unsqueeze(1)
+                else:
+                    k_pe = k_pe.unsqueeze(1)
+                    k_pe = k_pe * cos2 + torch.matmul(k_pe, p_mat) * sin2
             else:
+                k_pe = k_pe.unsqueeze(1)
                 q_pe_dtype = q_pe.dtype
                 k_pe_dtype = k_pe.dtype
                 q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -1528,6 +1534,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 # cache dtype, and queries should remain in the activation dtype.
                 q_pe = q_pe.to(dtype=q_pe_dtype)
                 k_pe = k_pe.to(dtype=k_pe_dtype)
+        else:
+            k_pe = k_pe.unsqueeze(1)
 
         topk_indices = None
         if self.is_sparse:

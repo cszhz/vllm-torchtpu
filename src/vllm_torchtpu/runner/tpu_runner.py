@@ -4439,13 +4439,26 @@ class TPUModelRunner(GPUModelRunner):
 
     def _greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
         """argmax logits, only used when `all_greedy` is True."""
-        dummy = torch.empty((1, 1), dtype=logits.dtype, device=logits.device)
+        key = (logits.device, logits.dtype)
+        dummies = getattr(self, "_greedy_sample_dummies", None)
+        if dummies is None:
+            dummies = {}
+            self._greedy_sample_dummies = dummies
+        entry = dummies.get(key)
+        if entry is None:
+            entry = (
+                torch.empty((1, 1), dtype=logits.dtype, device=logits.device),
+                torch.empty((1, 1), dtype=torch.int32, device=logits.device),
+                torch.empty((1, 1), dtype=torch.float32, device=logits.device),
+            )
+            dummies[key] = entry
+        dummy, dummy_top_k, dummy_top_p = entry
         return self.sample_from_logits_func(
             logits,
             dummy,
             dummy,
-            torch.empty((1, 1), dtype=torch.int32, device=logits.device),
-            torch.empty((1, 1), dtype=torch.float32, device=logits.device),
+            dummy_top_k,
+            dummy_top_p,
             all_greedy=True,
         )
 
@@ -6126,16 +6139,19 @@ class TPUModelRunner(GPUModelRunner):
                 if blocks := self._topk_candidate_blocks():
                     variants.append((False, blocks, True))
                 for all_greedy, topk_candidates, apply_topk_topp in variants:
-                    out = self.sample_from_logits_func(
-                        dummy_logits,
-                        dummy_temperatures,
-                        dummy_u,
-                        dummy_top_k,
-                        dummy_top_p,
-                        all_greedy=all_greedy,
-                        topk_candidates=topk_candidates,
-                        apply_topk_topp=apply_topk_topp,
-                    )
+                    if all_greedy:
+                        out = self._greedy_sample(dummy_logits)
+                    else:
+                        out = self.sample_from_logits_func(
+                            dummy_logits,
+                            dummy_temperatures,
+                            dummy_u,
+                            dummy_top_k,
+                            dummy_top_p,
+                            all_greedy=all_greedy,
+                            topk_candidates=topk_candidates,
+                            apply_topk_topp=apply_topk_topp,
+                        )
                     synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
