@@ -42,7 +42,7 @@ class PagedMQAConfig:
 
 # TPU v7, H32/D128, transposed packed FP8 pages; measured at P-state 7.
 PACKED_FP8_MQA_CONFIG = PagedMQAConfig(6, 65536, 8, 4)
-PACKED_FP8_PREPARED_MQA_CONFIG = PagedMQAConfig(2, 32768, 8, 4)
+PACKED_FP8_PREPARED_MQA_CONFIG = PagedMQAConfig(2, 32768, 4, 4)
 
 # Dense tiles follow configured decode width, capped at one 256-row H32 MXU tile.
 PACKED_FP8_MAX_QUERY_TILE = 8
@@ -74,7 +74,7 @@ PACKED_FP8_INDEXER_QUERY_ROWS = {
 }
 
 # (queries, compact columns, topk): query rows for prepared-candidate pipelines.
-PACKED_FP8_PREPARED_QUERY_ROWS = {(288, 16384, 512): 96}
+PACKED_FP8_PREPARED_QUERY_ROWS = {(288, width, 512): 96 for width in (16384, 32768)}
 
 # Exact streaming selection after dense scoring; measured at 288 x 98304, P7.
 PACKED_FP8_DENSE_TOPK_THRESHOLD = 2048

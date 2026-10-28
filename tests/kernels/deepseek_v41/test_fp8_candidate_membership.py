@@ -86,7 +86,8 @@ def test_prepared_keys_and_membership_keep_original_token_mapping(owners, page_s
         if not len(live):
             continue
         compact = (live[:, None] * block + np.arange(block)).reshape(-1)
-        compact_records = prepared.pages[group, compact // 128] * 128 + compact % 128
+        group_capacity = prepared.keys.shape[0] // (len(offsets) - 1) // 33 * 128
+        compact_records = group * group_capacity + compact
         logical = (canonical[live, None] * block + np.arange(block)).reshape(-1)
         records = (
             pages[owners[original], logical // page_size] * page_size

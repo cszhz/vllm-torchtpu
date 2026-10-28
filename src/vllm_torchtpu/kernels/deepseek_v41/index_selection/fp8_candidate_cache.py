@@ -14,8 +14,6 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from .packed_fp8_cache import PAGE_RECORDS, PAGE_ROWS, PackedFP8Layout
 from .tuned_block_sizes import (
-    PACKED_FP8_DENSE_MIN_KEY_TILE,
-    PACKED_FP8_MQA_CONFIG,
     PAGED_MQA_GATHER_CONFIG,
     PAGED_MQA_WHOLE_PAGE_GATHER_CONFIG,
 )
@@ -26,7 +24,6 @@ class PreparedCandidates(NamedTuple):
     block_ids: jax.Array
     offsets: jax.Array
     order: jax.Array
-    pages: jax.Array
     valid_queries: jax.Array
     membership: jax.Array
 
@@ -36,17 +33,8 @@ class CandidateMetadata(NamedTuple):
     block_ids: jax.Array
     offsets: jax.Array
     order: jax.Array
-    pages: jax.Array
     valid_queries: jax.Array
     membership: jax.Array
-
-
-def compact_table_width(capacity: int) -> int:
-    tile = min(
-        PACKED_FP8_MQA_CONFIG.key_tile,
-        max(PACKED_FP8_DENSE_MIN_KEY_TILE, 1 << (capacity - 1).bit_length()),
-    )
-    return max(128, (capacity + tile - 1) // tile * tile // PAGE_RECORDS)
 
 
 def prepare_candidates(
@@ -145,21 +133,11 @@ def prepare_candidate_metadata(
     physical = jnp.pad(
         physical, ((0, 0), (0, padded - physical.shape[1])), constant_values=-1
     )
-    compact_pages = jnp.arange(tokens * padded // per_page, dtype=jnp.int32).reshape(
-        tokens, -1
-    )
-    table_width = compact_table_width(group_candidates.shape[1] * block)
-    compact_pages = jnp.pad(
-        compact_pages,
-        ((0, 0), (0, table_width - compact_pages.shape[1])),
-        constant_values=-1,
-    )
     return CandidateMetadata(
         physical,
         canonical,
         offsets,
         order,
-        compact_pages,
         (requests >= 0) & (requests < pages.shape[0]),
         membership,
     )

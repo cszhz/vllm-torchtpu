@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_paged_mqa_logits import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_paged_mqa_logits_dense import (  # noqa: E501
     fp8_paged_mqa_logits,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
@@ -142,46 +142,3 @@ def test_fp8_paged_mqa_logits_vllm_accuracy(
     diff = 1 - 2 * (x * y).sum() / denominator
     record_property("calc_diff", diff.item())
     assert diff < 1e-3, f"{diff=}"
-
-
-@pytest.mark.parametrize("key_tile,start,count", [(4096, 0, 5), (8192, 1, 3)])
-def test_paged_logits_apply_per_query_membership_inside_kernel(key_tile, start, count):
-    if jax.default_backend() != "tpu":
-        pytest.skip("Requires the TPU paged MQA kernel")
-    rng = np.random.default_rng(821)
-    torch.manual_seed(821)
-    width, block = 8192, 8
-    layout = PackedFP8Layout(width // 128)
-    cache = _pack_fp8_cache(
-        torch.randn((layout.pages, 128, 1, 128), dtype=torch.bfloat16), layout
-    )
-    q = jnp.asarray(rng.normal(size=(5, 32, 128))).astype(jnp.float8_e4m3fn)
-    weights = jnp.asarray(rng.uniform(0.01, 0.1, (5, 32)), jnp.float32)
-    lengths = jnp.array([8192, 6143, 4096, 0, 5000], jnp.int32)
-    pages = jnp.asarray(np.stack([rng.permutation(layout.pages) for _ in range(3)]))
-    membership = rng.random((5, width // block)) > 0.5
-    membership[4] = False
-    kwargs = dict(
-        query_start_loc=jnp.array([0, 2, 3, 5], jnp.int32),
-        max_model_len=width,
-        q_scale=jnp.ones_like(weights),
-        query_size=2,
-        cache_layout=layout,
-        query_start=jnp.int32(start),
-        query_count=count,
-        key_tile=key_tile,
-    )
-    baseline = fp8_paged_mqa_logits(q, cache, weights, lengths, pages, **kwargs)
-    masked = fp8_paged_mqa_logits(
-        q,
-        cache,
-        weights,
-        lengths,
-        pages,
-        **kwargs,
-        block_membership=jnp.asarray(membership),
-        membership_block_size=block,
-    )
-    allowed = np.repeat(membership[start : start + count], block, axis=1)
-    expected = np.where(allowed, np.asarray(baseline), -np.inf)
-    np.testing.assert_allclose(np.asarray(masked), expected, rtol=1e-5, atol=1e-5)

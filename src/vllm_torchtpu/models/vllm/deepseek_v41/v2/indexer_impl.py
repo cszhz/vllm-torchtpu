@@ -29,11 +29,13 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_candidate_cache import (
     PreparedCandidates,
-    compact_table_width,
     prepare_candidates,
 )
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_paged_mqa_logits import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_paged_mqa_logits_dense import (  # noqa: E501
     fp8_paged_mqa_logits,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_paged_mqa_logits_sparse import (  # noqa: E501
+    fp8_gathered_mqa_logits,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
     PAGE_RECORDS,
@@ -46,7 +48,6 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import
     PACKED_FP8_DENSE_TOPK_THRESHOLD,
     PACKED_FP8_INDEXER_QUERY_ROWS,
     PACKED_FP8_MQA_CONFIG,
-    PACKED_FP8_PREPARED_MQA_CONFIG,
     PACKED_FP8_PREPARED_QUERY_ROWS,
     paged_mqa_key_tile,
 )
@@ -1560,7 +1561,6 @@ def initialize_fp8_indexer() -> None:
             candidates.new_empty((tokens, count)),
             requests.new_empty((groups + 1,)),
             torch.empty_like(requests),
-            page_table.new_empty((groups, compact_table_width(count * block))),
             requests.new_empty((tokens,), dtype=torch.bool),
             requests.new_empty((tokens, count), dtype=torch.bool),
         )
@@ -1633,7 +1633,7 @@ def _read(
 def _score_prepared(
     q, weights, lengths, prepared, topk, block, unordered, width, *, grouped=False
 ):
-    keys, canonical, offsets, order, pages, valid_queries, membership = prepared
+    keys, canonical, offsets, order, valid_queries, membership = prepared
     k = min(topk, width, canonical.shape[1] * block)
     lengths = jnp.where(valid_queries, jnp.clip(lengths, 0, width), 0)
     if not grouped:
@@ -1653,22 +1653,19 @@ def _score_prepared(
 
     def score(start, group):
         scorer = (
-            fp8_paged_mqa_logits.__wrapped__ if chunk < rows else fp8_paged_mqa_logits
+            fp8_gathered_mqa_logits.__wrapped__
+            if chunk < rows
+            else fp8_gathered_mqa_logits
         )
         scores = scorer(
             q,
             keys,
             weights.astype(jnp.float32),
             compact_lengths,
-            pages,
+            membership,
             query_start_loc=offsets,
-            query_size=min(rows, PACKED_FP8_PREPARED_MQA_CONFIG.query_tile),
-            key_tile=PACKED_FP8_PREPARED_MQA_CONFIG.key_tile,
-            block_membership=membership,
             membership_block_size=block,
             max_model_len=capacity,
-            q_scale=jnp.ones_like(weights, dtype=jnp.float32),
-            cache_layout=PackedFP8Layout(keys.shape[0] // PAGE_ROWS),
             query_start=start,
             query_count=chunk,
         )

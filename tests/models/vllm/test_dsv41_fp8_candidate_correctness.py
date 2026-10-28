@@ -65,11 +65,28 @@ def _cpu_logits(q, keys, weights, lengths, pages, **kwargs):
     return jnp.where(allowed, scores, -jnp.inf)
 
 
+def _cpu_gathered_logits(q, keys, weights, lengths, membership, **kwargs):
+    groups = kwargs["query_start_loc"].shape[0] - 1
+    pages_per_group = keys.shape[0] // groups // PAGE_ROWS
+    pages = jnp.arange(groups * pages_per_group).reshape(groups, pages_per_group)
+    return _cpu_logits(
+        q,
+        keys,
+        weights,
+        lengths,
+        pages,
+        cache_layout=PackedFP8Layout(groups * pages_per_group),
+        block_membership=membership,
+        **kwargs,
+    )
+
+
 @pytest.fixture
 def cpu_kernels(monkeypatch):
     monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
     monkeypatch.setattr(fp8_candidate_cache, "gather_candidate_keys", _cpu_gather)
     monkeypatch.setattr(indexer_impl, "fp8_paged_mqa_logits", _cpu_logits)
+    monkeypatch.setattr(indexer_impl, "fp8_gathered_mqa_logits", _cpu_gathered_logits)
     with jax.default_device(jax.devices("cpu")[0]):
         yield
 

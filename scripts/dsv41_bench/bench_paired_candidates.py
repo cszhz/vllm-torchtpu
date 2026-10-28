@@ -428,7 +428,7 @@ def main():
     )
     if args.stage == "score":
 
-        def logits(q, weights, lengths, keys, canonical, pages, offsets):
+        def logits(q, weights, lengths, keys, canonical, membership, offsets):
             compact_lengths = jnp.sum(
                 jnp.where(
                     canonical >= 0,
@@ -437,22 +437,15 @@ def main():
                 ),
                 axis=1,
             )
-            return indexer_impl.fp8_paged_mqa_logits(
+            return indexer_impl.fp8_gathered_mqa_logits(
                 q,
                 keys,
                 weights.astype(jnp.float32),
                 compact_lengths,
-                pages,
+                membership,
                 query_start_loc=offsets,
-                query_size=min(
-                    q.shape[0], indexer_impl.PACKED_FP8_PREPARED_MQA_CONFIG.query_tile
-                ),
-                key_tile=indexer_impl.PACKED_FP8_PREPARED_MQA_CONFIG.key_tile,
+                membership_block_size=args.block,
                 max_model_len=canonical.shape[1] * args.block,
-                q_scale=jnp.ones_like(weights, dtype=jnp.float32),
-                cache_layout=PackedFP8Layout(keys.shape[0] // 33),
-                query_start=jnp.int32(0),
-                query_count=q.shape[0],
             )
 
         raw_scores = measure(
@@ -464,7 +457,7 @@ def main():
                 lengths,
                 prepared.keys,
                 prepared.block_ids,
-                prepared.pages,
+                prepared.membership,
                 prepared.offsets,
             ),
             root,
