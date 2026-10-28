@@ -404,7 +404,9 @@ class DcpAttention:
         self.page_rows = self.page_tokens // self.packing
         self.native = workspace.pages.ndim == 3  # native_pages
         self.span = workspace.pages.shape[1] // (self.page_tokens if self.native else self.page_rows)
-        self.folds = staged_folds(batch, heads, sequence_rows, cache.dtype)
+        # Staged folds need native page buffers (a sub-call over a workspace
+        # laid out for another shape may lack them).
+        self.folds = staged_folds(batch, heads, sequence_rows, cache.dtype) if self.native else 1
         self.fold_tokens = self.span * self.page_tokens // self.folds
         self.probability_hilo, self.skip = probability_hilo, set(skip)
         rank = jax.lax.axis_index("tp")

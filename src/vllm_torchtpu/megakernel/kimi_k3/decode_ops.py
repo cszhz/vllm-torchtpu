@@ -798,17 +798,269 @@ class DecodeOps:
         self._adopt(conv, recurrent, pools)
         return sharded, aux, decisions
 
-    def _build_verify_metadata(self, control, requests):
-        """Keep the verifier within Torch's 64-operand limit."""
-        key = ("verify_metadata", control.key(), requests)
+    def _build_verify_mixed(
+        self,
+        aux_layers: tuple[int, ...],
+        requests: int,
+        plain: int,
+        control,
+        synthetic_rates=None,
+        sampled: bool = False,
+    ) -> Any:
+        """A mixed attention-DP launch: ``requests`` speculative verifies of
+        four rows (plan rows 0..requests-1, operand as for
+        :meth:`_build_verify_batched`) and ``plain`` one-row decode requests
+        (plan rows requests..requests+plain-1, read from the control) in one
+        kernel call. Each DP group holds its share of both: its verify rows,
+        then its plain rows (kernel ``mixed_plain_rows``). Returns the verify
+        rows' logits and aux states (for the drafter) and decisions, the plain
+        rows' tokens ``[plain, VERIFY_ROWS]`` (column 0) and the control with
+        the plain rows advanced, the committed KDA banks and the pools."""
+        key = (
+            "verify_mixed",
+            aux_layers,
+            requests,
+            plain,
+            control.key(),
+            synthetic_rates,
+            sampled,
+        )
+        if key in self._ops:
+            return self._ops[key]
+        from vllm_torchtpu.megakernel.kimi_k3 import sampling
+
+        dp = self.attention_dp
+        rows_per = 4
+        verify_rows = requests * rows_per
+        rows = verify_rows + plain
+        if dp < 2 or requests % dp or plain % dp:
+            raise ValueError(
+                "K3 decode: the mixed launch needs attention DP and whole group shares"
+            )
+        share, plain_share = requests // dp, plain // dp
+        group_rows = rows // dp
+        paged, names = self.paged, self.names
+        count = len(names)
+        options = decode_options(rows)
+        options["defer_kda_commit"] = True
+        options.update(
+            sequence_rows=rows_per,
+            mixed_plain_rows=plain_share,
+            aux_hidden_layers=tuple(aux_layers),
+        )
+        pool_map, owner_table = self.pool_map, self.owner_table
+        pools = len(self.unified_pools)
+        width = self.VERIFY_ROWS
+        # Row r of the operands (verify request i: rows 4i..4i+3, then plain
+        # request j: row 4 requests + j) on group row k of group g.
+        group_order = np.concatenate(
+            [
+                np.concatenate(
+                    (
+                        g * share * rows_per + np.arange(share * rows_per),
+                        verify_rows + g * plain_share + np.arange(plain_share),
+                    )
+                )
+                for g in range(dp)
+            ]
+        )
+        placed = dp_group_rows(rows, dp)
+        order = np.empty(rows, np.int64)  # kernel row b holds operand row order[b]
+        order[placed] = group_order
+        back = np.empty(rows, np.int64)  # operand row r is kernel row back[r]
+        back[group_order] = placed
+
+        def body(*args):
+            weights = {name: args[i][0] for i, name in enumerate(names)}
+            conv, recurrent = args[count][0], args[count + 1][0]
+            pool = args[count + 2 : count + 2 + pools]
+            (packet,) = args[count + 2 + pools :]
+            # The control rides in the packet (Torch ops take at most 64 operands).
+            packet, state = packet[: -control.size], packet[-control.size :]
+            ids, plan, modes = self._unpack_verify_metadata(packet, control, requests)
+            old_conv, old_recurrent = conv, recurrent
+            tokens_v = ids[:verify_rows]
+            positions_v = ids[verify_rows : 2 * verify_rows]
+            slots_v = ids[2 * verify_rows : 3 * verify_rows]
+            tables_v = jnp.repeat(
+                ids[4 * verify_rows :].reshape(requests, -1), rows_per, axis=0
+            )
+            slot, token, position, row, plan_all, tables = control.inputs(
+                state, requests + plain
+            )
+            slot_p, token_p, position_p, row_p = (
+                slot[requests:],
+                token[requests:],
+                position[requests:],
+                row[requests:],
+            )
+            plan_p, tables_p = plan_all[requests:], tables[requests:]
+            operands = (
+                jnp.concatenate((tokens_v, token_p)),
+                jnp.concatenate((positions_v, position_p)),
+                jnp.concatenate((tables_v, tables_p)),
+                jnp.concatenate((slots_v, control.state_slot(slot_p, row_p))),
+            )
+            operands = tuple(operand[order] for operand in operands)
+            logits, aux, conv, recurrent, pool = paged.decode_paged(
+                weights,
+                conv,
+                recurrent,
+                pool,
+                *operands,
+                batch_size=rows,
+                layers=NUM_LAYERS,
+                dcp_pool_map=pool_map,
+                dcp_owner_table=owner_table,
+                **options,
+            )
+            logits, aux = logits[back], aux[:, back]
+            logits_v, aux_v, logits_p = (
+                logits[:verify_rows],
+                aux[:, :verify_rows],
+                logits[verify_rows:],
+            )
+            decisions = sampling.verify_acceptance(
+                logits_v,
+                tokens_v.reshape(requests, rows_per),
+                positions_v.reshape(requests, rows_per)[:, 0],
+                modes,
+                control.sampling(plan),
+                synthetic_rates=synthetic_rates,
+                single=False,
+            )
+            chosen = sampling.greedy(logits_p)
+            if sampled:
+                temperature, top_p, top_k, seed = control.sampling(plan_p)
+                draws = sampling.sample_rows(
+                    logits_p,
+                    jnp.where(temperature > 0, temperature, 1.0),
+                    top_p,
+                    top_k,
+                    seed,
+                    position_p,
+                )
+                chosen = jnp.where(temperature > 0, draws, chosen)
+            # Commit this group's accepted verify post-states and its plain
+            # rows' post-states (post-state row k G + q: held shard k of
+            # group row q) to its bank entries (see _finish_verify).
+            bank = old_conv.shape[0] // dp
+            group = jax.lax.axis_index(AXIS) // (TP_SIZE // dp)
+            own_v = jax.lax.dynamic_slice_in_dim(
+                slots_v.reshape(requests, rows_per)[:, 0], group * share, share
+            )
+            accepted = jax.lax.dynamic_slice_in_dim(
+                decisions[:, 0], group * share, share
+            )
+            own_p = jax.lax.dynamic_slice_in_dim(
+                slot_p, group * plain_share, plain_share
+            )
+            source = jnp.concatenate(
+                (
+                    jnp.arange(share) * rows_per
+                    + jnp.where(own_v == 0, rows_per - 1, accepted),
+                    share * rows_per + jnp.arange(plain_share),
+                )
+            )
+            own = jnp.concatenate((own_v, own_p))
+            local = jnp.where(own == 0, 0, own - group * (bank - 1))
+            sources = jnp.concatenate([source + k * group_rows for k in range(dp)])
+            targets = jnp.concatenate([local + k * bank for k in range(dp)])
+            conv, recurrent = self.paged._commit_kda_states(
+                old_conv, old_recurrent, conv, recurrent, targets, source_rows=sources
+            )
+            # The plain rows' next tokens and positions; their resets clear.
+            state = state.at[slot_p].set(chosen)
+            state = state.at[control.slots + slot_p].set(position_p + 1)
+            state = state.at[2 * control.slots + slot_p].set(row_p)
+            resets = (
+                control.plan_start
+                + (requests + jnp.arange(plain)) * control.FIELDS
+                + control.RESET
+            )
+            state = state.at[resets].set(jnp.where(slot_p != 0, 0, state[resets]))
+            emitted = jnp.full((plain, width), -1, jnp.int32).at[:, 0].set(chosen)
+            return (
+                logits_v[None],
+                aux_v,
+                decisions,
+                emitted,
+                state,
+                conv[None],
+                recurrent[None],
+                *pool,
+            )
+
+        in_specs = (P(AXIS),) * (count + 2 + pools) + (P(),)
+        out_specs = (P(AXIS), P(), P(), P(), P(), P(AXIS), P(AXIS)) + (P(AXIS),) * pools
+        export_key = repr(
+            (
+                "verify_mixed",
+                requests,
+                plain,
+                NUM_LAYERS,
+                names,
+                sorted(options.items()),
+                control.key(),
+                synthetic_rates,
+                sampled,
+                pool_map,
+                owner_table,
+            )
+        )
+        self._ops[key] = register_op(
+            f"pallas::k3_decode_verify_mixed{requests}x4_{plain}",
+            self.mesh,
+            body,
+            in_specs,
+            out_specs,
+            donate_argnums=tuple(range(count, count + 2 + pools)),
+            export_key=export_key,
+        )
+        return self._ops[key]
+
+    def verify_mixed(
+        self,
+        ids,
+        aux_layers,
+        requests,
+        plain,
+        control,
+        state,
+        modes,
+        synthetic_rates=None,
+        sampled=False,
+    ):
+        """Mixed verify + plain launch (:meth:`_build_verify_mixed`); returns
+        ``(logits, aux, decisions, plain tokens, state)``."""
+        (packet,) = self._build_verify_metadata(control, requests, with_control=True)(
+            ids, state, modes
+        )
+        op = self._build_verify_mixed(
+            tuple(aux_layers), requests, plain, control, synthetic_rates, sampled
+        )
+        sharded, aux, decisions, emitted, state, conv, recurrent, *pools = self._run(
+            op, requests * 4 + plain, *self._operands(), packet
+        )
+        self._adopt(conv, recurrent, pools)
+        return sharded, aux, decisions, emitted, state
+
+    def _build_verify_metadata(self, control, requests, with_control=False):
+        """Keep the verifier within Torch's 64-operand limit (``with_control``:
+        the control state appended, for the mixed launch)."""
+        key = ("verify_metadata", control.key(), requests, with_control)
         if key not in self._ops:
 
             def body(ids, state, modes):
                 plan, _ = control.fields(state, requests)
-                return (jnp.concatenate((ids, plan.reshape(-1), modes)),)
+                parts = (ids, plan.reshape(-1), modes) + (
+                    (state,) if with_control else ()
+                )
+                return (jnp.concatenate(parts),)
 
+            suffix = "_control" if with_control else ""
             self._ops[key] = register_op(
-                f"pallas::k3_verify_metadata_{requests}",
+                f"pallas::k3_verify_metadata_{requests}{suffix}",
                 self.mesh,
                 body,
                 (P(), P(), P()),

@@ -63,6 +63,10 @@ class KernelConfig:
     mla_flash_ktile: int = 2048
     # Attention DP verify: MLA attend sub-calls of whole sequences (0/1: one call).
     mla_dp_split: int = 0
+    # Mixed launch "verify:plain:low:high" (attention DP, with a draft): at
+    # low..high decoding requests, one kernel call holds ``verify`` 4-row
+    # speculative verifies and ``plain`` one-row decode requests ("": off).
+    mixed_launch: str = ""
     # Prefix keys in mla_flash_ktile tiles and a whole-window query tile under
     # mla_flash_qtile rows (False: the window's key tile, as before).
     mla_flash_prefix_tiles: bool = True

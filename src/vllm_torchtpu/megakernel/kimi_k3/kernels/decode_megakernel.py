@@ -4052,7 +4052,11 @@ class KdaStateStream:
     """
 
     def __init__(self, history_hbm, state_hbm, history_output_hbm, state_output_hbm,
-                 history_buffers, state_buffers, read_semaphores, write_semaphores, *, chunk, chunks, slots=None, sequence_rows=1):
+                 history_buffers, state_buffers, read_semaphores, write_semaphores, *, chunk, chunks, slots=None, sequence_rows=1,
+                 plain_rows=None):
+        # ``plain_rows`` (mixed verify): ``(period, first)``: rows ``first ..
+        # period`` of every ``period`` rows are one-row sequences.
+        self.plain_rows = plain_rows
         self.history_hbm, self.state_hbm = history_hbm, state_hbm
         self.history_output_hbm, self.state_output_hbm = history_output_hbm, state_output_hbm
         self.history_buffers, self.state_buffers = history_buffers, state_buffers
@@ -4076,7 +4080,7 @@ class KdaStateStream:
                     (self.history_hbm, self.history_buffers),
                     (self.state_hbm, self.state_buffers),
                 ))
-                for row in range(0, self.chunk, self.sequence_rows)
+                for row in range(0, self.chunk, self._sequence_rows(index))
             )
         return (
             tpu.make_async_copy(self.history_hbm.at[rows], self.history_buffers.at[slot],
@@ -4084,6 +4088,13 @@ class KdaStateStream:
             tpu.make_async_copy(self.state_hbm.at[rows], self.state_buffers.at[slot],
                                 self.read_semaphores.at[slot, 1]),
         )
+
+    def _sequence_rows(self, index):
+        if self.plain_rows is not None:
+            period, first = self.plain_rows
+            if index * self.chunk % period >= first:
+                return 1
+        return self.sequence_rows
 
     def _writes(self, index):
         rows, slot = pl.ds(index * self.chunk, self.chunk), index % self.buffer_count
@@ -4290,6 +4301,7 @@ def kda(
     stage_projections: bool = False,
     projected_rows=None,
     first_call: bool | None = None,
+    plain_from: int | None = None,
 ) -> None:
     """Execute one Kimi Delta Attention layer inside a Pallas program.
 
@@ -4307,6 +4319,8 @@ def kda(
     (rolled over a state stream's tiles). ``projected_rows`` ([batch, 1664]
     BF16) is the caller's input projection for the DP2 B2/B4 shard swap, which
     passes a traced ``shard_index`` and ``first_call``.
+    ``plain_from`` (mixed verify): rows from it on are one-row sequences; the
+    rows before it are ``sequence_rows``-row sequences.
     """
     streams = streams or {}
     first_shard = shard_index in (None, 0) if first_call is None else first_call
@@ -4340,6 +4354,10 @@ def kda(
         )
     if batch_size % sequence_rows:
         raise ValueError("sequence_rows must divide the KDA batch")
+    if plain_from is not None and (
+            sequence_rows == 1 or state_stream is None or plain_from % state_stream.chunk
+            or plain_from % sequence_rows):
+        raise ValueError("Mixed KDA rows need streamed state with whole chunks of each kind")
     if synchronize_devices:
         collectives32.barrier()
         communication_workspace.reduction_phase[0] = 0
@@ -4507,51 +4525,51 @@ def kda(
                 jnp.exp(weights.exp_log_decay_rate[...])[None]
                 * (raw_recurrent_gate + weights.time_step_bias[...][None])
             )
-        if sequence_rows == 1:
-            def recurrence(rows, history_ref=None, state_ref=None):
-                # ``history_ref``/``state_ref``: a streamed chunk's buffers
-                # (updated in place), else the whole-batch state refs.
-                convolution_history = (
-                    convolution_history_ref[rows, :, :, :head_count]
-                    if history_ref is None
-                    else history_ref[:, :, :, :head_count]
+        def recurrence(rows, history_ref=None, state_ref=None):
+            # ``history_ref``/``state_ref``: a streamed chunk's buffers
+            # (updated in place), else the whole-batch state refs.
+            convolution_history = (
+                convolution_history_ref[rows, :, :, :head_count]
+                if history_ref is None
+                else history_ref[:, :, :, :head_count]
+            )
+            recurrent_state = (
+                recurrent_state_ref[rows] if state_ref is None else state_ref[...]
+            ).astype(jnp.float32)
+            convolution_window = jnp.concatenate(
+                (convolution_history, queries_keys_values[rows][:, None]), axis=1
+            )
+            filtered_queries_keys_values = jax.nn.silu(
+                jnp.sum(
+                    convolution_window.astype(jnp.float32)
+                    * weights.convolution_filter[...].astype(jnp.float32)[None],
+                    axis=1,
                 )
-                recurrent_state = (
-                    recurrent_state_ref[rows] if state_ref is None else state_ref[...]
-                ).astype(jnp.float32)
-                convolution_window = jnp.concatenate(
-                    (convolution_history, queries_keys_values[rows][:, None]), axis=1
-                )
-                filtered_queries_keys_values = jax.nn.silu(
-                    jnp.sum(
-                        convolution_window.astype(jnp.float32)
-                        * weights.convolution_filter[...].astype(jnp.float32)[None],
-                        axis=1,
-                    )
-                ).astype(jnp.bfloat16)
-                query, key, value = (
-                    filtered_queries_keys_values[:, 0].astype(jnp.float32),
-                    filtered_queries_keys_values[:, 1].astype(jnp.float32),
-                    filtered_queries_keys_values[:, 2].astype(jnp.float32),
-                )
-                query *= (
-                    jax.lax.rsqrt(jnp.sum(query * query, axis=-1, keepdims=True) + 1e-6)
-                    * channels_per_head**-0.5
-                )
-                key *= jax.lax.rsqrt(jnp.sum(key * key, axis=-1, keepdims=True) + 1e-6)
-                next_recurrent_state = recurrent_state * jnp.exp(decay[rows])[..., None]
-                predicted_value = jnp.sum(key[..., None] * next_recurrent_state, axis=2)
-                state_update = jax.nn.sigmoid(update_rate[rows]) * (value - predicted_value)
-                next_recurrent_state += key[..., None] * state_update[..., None, :]
-                attended_rows = jnp.sum(query[..., None] * next_recurrent_state, axis=2)
-                if history_ref is None:
-                    updated_convolution_history_ref[rows, :, :, :head_count] = convolution_window[:, 1:]
-                    updated_recurrent_state_ref[rows] = next_recurrent_state.astype(updated_recurrent_state_ref.dtype)
-                else:
-                    history_ref[:, :, :, :head_count] = convolution_window[:, 1:]
-                    state_ref[...] = next_recurrent_state.astype(state_ref.dtype)
-                return attended_rows
+            ).astype(jnp.bfloat16)
+            query, key, value = (
+                filtered_queries_keys_values[:, 0].astype(jnp.float32),
+                filtered_queries_keys_values[:, 1].astype(jnp.float32),
+                filtered_queries_keys_values[:, 2].astype(jnp.float32),
+            )
+            query *= (
+                jax.lax.rsqrt(jnp.sum(query * query, axis=-1, keepdims=True) + 1e-6)
+                * channels_per_head**-0.5
+            )
+            key *= jax.lax.rsqrt(jnp.sum(key * key, axis=-1, keepdims=True) + 1e-6)
+            next_recurrent_state = recurrent_state * jnp.exp(decay[rows])[..., None]
+            predicted_value = jnp.sum(key[..., None] * next_recurrent_state, axis=2)
+            state_update = jax.nn.sigmoid(update_rate[rows]) * (value - predicted_value)
+            next_recurrent_state += key[..., None] * state_update[..., None, :]
+            attended_rows = jnp.sum(query[..., None] * next_recurrent_state, axis=2)
+            if history_ref is None:
+                updated_convolution_history_ref[rows, :, :, :head_count] = convolution_window[:, 1:]
+                updated_recurrent_state_ref[rows] = next_recurrent_state.astype(updated_recurrent_state_ref.dtype)
+            else:
+                history_ref[:, :, :, :head_count] = convolution_window[:, 1:]
+                state_ref[...] = next_recurrent_state.astype(state_ref.dtype)
+            return attended_rows
 
+        if sequence_rows == 1:
             _phase_end(kda_scope.pop())
             kda_scope.append(_phase_start("q4_kda_recurrence"))
             if batch_size <= 8:
@@ -4672,6 +4690,13 @@ def kda(
                     @pl.when(communication_workspace.reduction_phase[0] >= 0)
                     def run_sequence_chunk(index=index, base=base):
                         history_chunk, state_chunk = state_stream.acquire(index)
+                        if plain_from is not None and base >= plain_from:
+                            # One-row sequences: the decode recurrence.
+                            attended_vmem[base : base + chunk] = recurrence(
+                                slice(base, base + chunk), history_chunk, state_chunk
+                            )
+                            state_stream.release(index)
+                            return
                         rows = []
                         for local in range(0, chunk, sequence_rows):
                             def store(offset, history, state, local=local):
@@ -5225,8 +5250,8 @@ def mla_dcp_shards(
         if len(splits) > 1:
             attention.force_chunked = mla_dcp.chunked(rows)
             if chunk_rows is not None:
-                attention.ring_chunks = rows // chunk_rows
-                attention.ring_offset = first // chunk_rows
+                attention.ring_chunks = sum(part[1] for part in splits) // chunk_rows
+                attention.ring_offset = sum(part[1] for part in splits[:index]) // chunk_rows
         return attention
 
     dcp_attention = split_attention(0)
@@ -6781,6 +6806,7 @@ def stack(
     sequence_parallel_pre_attention: bool = False,
     gate_first_kda_projection: bool = True,
     sequence_rows: int = 1,
+    mixed_plain_rows: int = 0,
     aux_hidden_layers: tuple[int, ...] = (),
     aux_capture: Literal["layer", "attention", "mixture_input"] = "layer",
     include_layer_zero: bool = False,
@@ -6969,6 +6995,15 @@ def stack(
     if batch_size % commit_rows:
         raise ValueError("mla_commit_tile_size must divide the batch")
     group_rows = batch_size // attention_dp
+    # Mixed verify: each DP group's last ``mixed_plain_rows`` rows are one-row
+    # sequences (plain decode rows), the rows before them verify sequences.
+    plain_from = group_rows - mixed_plain_rows if mixed_plain_rows else None
+    if plain_from is not None and not (
+            attention_dp == 2 and sequence_rows == 4 and batch_size > 16
+            and 0 < plain_from < group_rows and plain_from % _kda_row_chunk(batch_size, attention_dp) == 0
+            and _verify_chunk(plain_from, 6, sequence_rows) is not None
+            and mixed_plain_rows % VERIFY_CHUNK == 0):
+        raise ValueError("mixed_plain_rows: attention DP2 verify above B16 with whole KDA chunks of each kind")
     # Each local row owner holds tokens_per_pair rows; group d attends r of them.
     group_rows_per_pair = group_rows // sp_owners
     # The residual-stream rows a rank holds under DP row ownership: its own r,
@@ -8332,6 +8367,7 @@ def stack(
                                 chunks=attention_dp * chunks_per_shard,
                                 slots=slots_ref if slot_reads else None,
                                 sequence_rows=sequence_rows,
+                                plain_rows=None if plain_from is None else (group_rows, plain_from),
                             )
                             shared_state_stream.prime()
                         for shard in range(attention_dp):
@@ -8355,6 +8391,7 @@ def stack(
                                     chunks=chunks_per_shard,
                                     slots=slots_ref.at[rows] if slot_reads else None,
                                     sequence_rows=sequence_rows,
+                                    plain_rows=None if plain_from is None else (group_rows, plain_from),
                                 )
                                 state_stream.prime()
                             else:
@@ -8400,6 +8437,7 @@ def stack(
                                 gate_features_vmem=dp_compressed_vmem,
                                 stage_projections=attention_schedule in ("auto", "overlap"),
                                 state_stream=state_stream,
+                                plain_from=plain_from,
                             )
                         if shared_state_stream is not None:
                             # All KDA consumers have finished. The final three
@@ -8616,7 +8654,8 @@ def stack(
                             ),
                             epsilon=eps,
                             sequence_rows=sequence_rows,
-                            splits=_attention_splits(group_rows, sequence_rows),
+                            splits=(_attention_splits(group_rows, sequence_rows) if plain_from is None
+                                    else ((0, plain_from, sequence_rows), (plain_from, group_rows - plain_from, 1))),
                         )
                     else:
                         mla(
@@ -9728,6 +9767,7 @@ def decode_local(
     gate_first_kda_projection: bool | None = None,
     batched_decoder_boundaries: bool | None = None,
     sequence_rows: int = 1,
+    mixed_plain_rows: int = 0,
     aux_hidden_layers: tuple[int, ...] = (),
     aux_capture: Literal["layer", "attention", "mixture_input"] = "layer",
     state_row=None,
@@ -9853,6 +9893,7 @@ def decode_local(
             sequence_parallel_pre_attention=sequence_parallel_pre_attention,
             gate_first_kda_projection=gate_first_kda_projection,
             sequence_rows=sequence_rows,
+            mixed_plain_rows=mixed_plain_rows,
             aux_hidden_layers=aux_hidden_layers,
             aux_capture=aux_capture,
             include_layer_zero=True,

@@ -40,6 +40,7 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.bridge import hbm, materialize, register_global_op
 from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
+from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
 from vllm_torchtpu.megakernel.kimi_k3.decode_ops import (
     GREEDY,
     Control,
@@ -153,6 +154,7 @@ class KimiDecoder:
         self._fresh: dict[str, int] = {}
         self._mode_rows: dict[tuple[int, ...], torch.Tensor] = {}
         self._pads: list[Any] = []  # draft states of padding groups
+        self._mixed_verify: set[str] = set()  # the last mixed step's verify requests
         self._compiled_layout: tuple | None = None
         self._zero: torch.Tensor | None = None
         self._modes: dict[int, torch.Tensor] = {}
@@ -711,7 +713,12 @@ class KimiDecoder:
             # masked (the verify ops do not mask), its drafts unused.
             k = 0
         compiled = self._spec_batch(len(decoding), k + 1, groups) if k else 0
-        if self.spec_alone and len(decoding) == 1 and k == self.WIDTH - 1:
+        mixed = self._mixed_shape(len(decoding), groups) if mask is None else None
+        if mixed is not None:
+            emitted, placed = self._speculate_mixed(
+                decoding, entries, tables, sampled, groups, *mixed
+            )
+        elif self.spec_alone and len(decoding) == 1 and k == self.WIDTH - 1:
             emitted = self._speculate(decoding[0][1], entries, tables, sampled)
         elif compiled and (
             len(decoding) == 1 or any(r.scheduled > 1 for _, r in decoding)
@@ -825,6 +832,99 @@ class KimiDecoder:
             self.device_plan = self.layout.consumed(self.device_plan, 1)
         self._fresh[request.req_id] = self.WIDTH
         return emitted
+
+    def _mixed_shape(self, requests: int, groups: list[int]) -> tuple[int, int] | None:
+        """``(verify requests, plain requests)`` of the mixed launch
+        (KernelConfig.mixed_launch) for ``requests`` decoding requests of DP
+        ``groups``, or None."""
+        spec = kernel_config.active().mixed_launch
+        if not spec or self.draft is None or self.groups < 2:
+            return None
+        verify, plain, low, high = (int(v) for v in spec.split(":"))
+        if not low <= requests <= high:
+            return None
+        per_group = (verify + plain) // self.groups
+        if max(groups.count(g) for g in range(self.groups)) > per_group:
+            return None
+        return verify, plain
+
+    def _speculate_mixed(
+        self, decoding, entries, tables, sampled: bool, groups, verify: int, plain: int
+    ) -> tuple[torch.Tensor, list[int]]:
+        """One mixed step (``DecodeOps.verify_mixed``): per DP group, up to
+        ``verify / dp`` requests verify four rows (requests that verified last
+        step first, so the set stays stable and their drafts follow them),
+        the rest decode one row. Plan rows: the verify requests group-major
+        (rows ``g verify / dp ..``), then the plain ones (``verify + g plain /
+        dp ..``). The drafter runs for the verify requests only."""
+        assert self.draft is not None and self.layout is not None
+        self._park_single()
+        k, dp = 4, self.groups
+        share, plain_share = verify // dp, plain // dp
+        members: list[list[int]] = [[] for _ in range(dp)]
+        for i, group in enumerate(groups):
+            members[group].append(i)
+        rows = [0] * len(decoding)
+        verifying: set[str] = set()
+        for group, indices in enumerate(members):
+            ranked = sorted(
+                indices,
+                key=lambda i: (decoding[i][1].req_id not in self._mixed_verify, i),
+            )
+            for n, i in enumerate(ranked):
+                if n < share:
+                    rows[i] = group * share + n
+                    verifying.add(decoding[i][1].req_id)
+                else:
+                    rows[i] = verify + group * plain_share + n - share
+        total = verify + plain
+        placed_entries = [(0, True, 0, 0, GREEDY)] * total
+        placed_tables = [np.zeros(self.layout.pages, np.int32)] * total
+        for row, entry, table in zip(rows, entries, tables, strict=True):
+            placed_entries[row], placed_tables[row] = entry, table
+        self._sync_plan(placed_entries, placed_tables)
+        states: list[Any] = [None] * verify
+        modes = [0] * verify
+        for row, (_, r) in zip(rows, decoding, strict=True):
+            if row < verify:
+                states[row] = self._take_state(r.req_id)
+                modes[row] = int(self._fresh.get(r.req_id, 0) >= k and r.scheduled >= k)
+        padding = [row for row in range(verify) if states[row] is None]
+        for row in padding:
+            states[row] = (
+                self._pads.pop() if self._pads else self.draft.new_state(self._zero)
+            )
+        modes_t = self._modes_for(tuple(modes))
+        (ids,) = self._enter_batched(verify, k)(
+            self.control, *(s.vector for s in states), modes_t
+        )
+        sharded, aux, decisions, emitted_plain, self.control = self.ops.verify_mixed(
+            ids,
+            self.draft.aux_layers,
+            verify,
+            plain,
+            self.layout,
+            self.control,
+            modes_t,
+            self.draft._synthetic_rates(k - 1),
+            sampled,
+        )
+        states, emitted, self.control = self.draft.step_batched(
+            states, aux, sharded, ids, self.control, decisions, self.layout, k
+        )
+        for row, (_, request) in zip(rows, decoding, strict=True):
+            if row < verify:
+                self._drafts[request.req_id] = states[row]
+                self._fresh[request.req_id] = k
+            else:
+                # Its drafts no longer follow its next token.
+                self._fresh.pop(request.req_id, None)
+        self._pads.extend(states[row] for row in padding)
+        self._mixed_verify = verifying
+        if self.device_plan is not None:
+            self.device_plan = self.layout.consumed(self.device_plan, total)
+        self.stats["mixed"] = self.stats.get("mixed", 0) + 1
+        return torch.cat((emitted, emitted_plain)), rows
 
     def _speculate_batched(
         self, decoding, entries, tables, sampled: bool, compiled: int, groups
