@@ -20,10 +20,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_candidate_cache import (
+    PreparedCandidates,
     candidate_membership,
     gather_candidate_keys,
+    prepare_candidate_metadata,
     prepare_candidates,
-    resolve_candidate_blocks,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
     PackedFP8Layout,
@@ -112,6 +113,7 @@ def main():
     parser.add_argument("--overlap", type=float, default=0.7)
     parser.add_argument("--repeats", type=int, default=15)
     parser.add_argument("--gather-sweep", action="store_true")
+    parser.add_argument("--stage", choices=("all", "prepare", "gather"), default="all")
     args = parser.parse_args()
     if not 0 <= args.overlap <= 1 or args.width % args.page_size:
         raise ValueError("Use overlap in [0,1] and a page-aligned width")
@@ -166,6 +168,64 @@ def main():
             )
             candidate_rows.append(np.concatenate((common, extra)))
     candidates = jnp.asarray(np.array(candidate_rows), jnp.int32)
+    metadata = measure(
+        "prepare_metadata",
+        functools.partial(
+            prepare_candidate_metadata,
+            layout=layout,
+            block=args.block,
+            width=args.width,
+            grouped=True,
+        ),
+        (pages, candidates, owners),
+        root,
+        args.repeats,
+        dimensions,
+    )
+    expected = np.stack(
+        [
+            np.isin(row, original) & (row >= 0)
+            for row, original in zip(
+                np.asarray(metadata.block_ids), np.asarray(candidates), strict=True
+            )
+        ]
+    )
+    np.testing.assert_array_equal(np.asarray(metadata.membership), expected)
+    host_ids = np.asarray(metadata.block_ids)
+    host_physical = np.asarray(metadata.physical)
+    host_candidates = np.asarray(candidates)
+    host_pages = np.asarray(pages)
+    pair_size = 2 if args.queries_per_request % 2 == 0 else 1
+    group = 0
+    fragment = min(args.block, args.page_size)
+    for request in range(args.requests):
+        for first in range(0, args.queries_per_request, pair_size):
+            row = request * args.queries_per_request + first
+            union = np.unique(host_candidates[row : row + pair_size])
+            for query in range(row, row + pair_size):
+                np.testing.assert_array_equal(
+                    host_ids[query][host_ids[query] >= 0], union
+                )
+            logical = (
+                union[:, None] * args.block
+                + np.arange(max(1, args.block // args.page_size)) * fragment
+            ).reshape(-1)
+            expected_physical = (
+                host_pages[request, logical // args.page_size]
+                * (args.page_size // fragment)
+                + logical % args.page_size // fragment
+            )
+            np.testing.assert_array_equal(
+                host_physical[group][host_physical[group] >= 0], expected_physical
+            )
+            group += 1
+    if args.stage == "prepare":
+        (root / "correctness.json").write_text(
+            json.dumps(
+                {"membership_numpy": "passed", "union_and_physical_numpy": "passed"}
+            )
+        )
+        return
     # Generate on device to keep host memory bounded. Split at a page boundary.
     keys = jax.random.normal(
         jax.random.key(826), (layout.pages * layout.page_size, 128), jnp.bfloat16
@@ -199,54 +259,45 @@ def main():
         width=args.width,
         grouped=True,
     )
-    prepared = measure(
-        "prepare",
-        prepare,
-        (banks, pages, candidates, owners),
-        root,
-        args.repeats,
-        dimensions,
-    )
-    expected = np.stack(
-        [
-            np.isin(row, original) & (row >= 0)
-            for row, original in zip(
-                np.asarray(prepared.block_ids), np.asarray(candidates), strict=True
+    if args.stage == "all":
+        prepared = measure(
+            "prepare",
+            prepare,
+            (banks, pages, candidates, owners),
+            root,
+            args.repeats,
+            dimensions,
+        )
+        expected = np.stack(
+            [
+                np.isin(row, original) & (row >= 0)
+                for row, original in zip(
+                    np.asarray(prepared.block_ids), np.asarray(candidates), strict=True
+                )
+            ]
+        )
+        np.testing.assert_array_equal(np.asarray(prepared.membership), expected)
+        for method in ("scan", "sort"):
+            actual = measure(
+                "membership_" + method,
+                functools.partial(membership, method=method),
+                (candidates, prepared.block_ids),
+                root,
+                args.repeats,
+                dimensions,
             )
-        ]
-    )
-    np.testing.assert_array_equal(np.asarray(prepared.membership), expected)
-    for method in ("scan", "sort"):
+            np.testing.assert_array_equal(np.asarray(actual), expected)
         actual = measure(
-            "membership_" + method,
-            functools.partial(membership, method=method),
+            "membership_histogram",
+            functools.partial(candidate_membership, blocks=args.width // args.block),
             (candidates, prepared.block_ids),
             root,
             args.repeats,
             dimensions,
         )
         np.testing.assert_array_equal(np.asarray(actual), expected)
-    actual = measure(
-        "membership_histogram",
-        functools.partial(candidate_membership, blocks=args.width // args.block),
-        (candidates, prepared.block_ids),
-        root,
-        args.repeats,
-        dimensions,
-    )
-    np.testing.assert_array_equal(np.asarray(actual), expected)
-    # Replay the real gather with resolved physical IDs from the same union.
-    offsets = np.asarray(prepared.offsets)
-    reps = np.minimum(offsets[:-1], tokens - 1)
-    group_ids = prepared.block_ids[reps]
-    group_ids = jnp.where(jnp.asarray(np.diff(offsets) > 0)[:, None], group_ids, -1)
-    physical = resolve_candidate_blocks(
-        group_ids,
-        pages[owners[reps]],
-        sparse_block_kv=args.block,
-        cache_pages=layout.pages,
-        page_size=layout.page_size,
-    )
+    offsets = np.asarray(metadata.offsets)
+    physical = metadata.physical
     gathered = measure(
         "gather",
         functools.partial(
@@ -254,7 +305,7 @@ def main():
             block=min(args.block, args.page_size),
             layout=layout,
         ),
-        (banks, physical, prepared.offsets),
+        (banks, physical, metadata.offsets),
         root,
         args.repeats,
         dimensions,
@@ -263,10 +314,33 @@ def main():
     per_page = 128 // min(args.block, args.page_size)
     valid = np.asarray(physical >= 0).reshape(-1, 1, per_page)
     valid = np.broadcast_to(valid, (valid.shape[0], 33, per_page)).reshape(-1)
-    np.testing.assert_array_equal(
-        np.asarray(gathered).reshape(-1, min(args.block, args.page_size))[valid],
-        np.asarray(prepared.keys).reshape(-1, min(args.block, args.page_size))[valid],
-    )
+    if args.stage == "all":
+        np.testing.assert_array_equal(
+            np.asarray(gathered).reshape(-1, min(args.block, args.page_size))[valid],
+            np.asarray(prepared.keys).reshape(-1, min(args.block, args.page_size))[
+                valid
+            ],
+        )
+    else:
+        # Read original cache records directly; no second gather as an oracle.
+        slots = np.flatnonzero(np.asarray(physical).reshape(-1) >= 0)[::97]
+        fragment = min(args.block, args.page_size)
+        target = (slots[:, None] * fragment + np.arange(fragment)).reshape(-1)
+        source = (
+            np.asarray(physical).reshape(-1)[slots, None] * fragment
+            + np.arange(fragment)
+        ).reshape(-1)
+        np.testing.assert_array_equal(
+            np.asarray(
+                read_fp8_records(
+                    (gathered,),
+                    jnp.asarray(target),
+                    PackedFP8Layout(gathered.shape[0] // 33),
+                )
+            ),
+            np.asarray(read_fp8_records(banks, jnp.asarray(source), layout)),
+        )
+        prepared = PreparedCandidates(gathered, *metadata[1:])
     if args.gather_sweep:
         from jax.experimental.pallas import tpu_sc as plsc
 
@@ -295,7 +369,7 @@ def main():
                     functools.partial(
                         gather_candidate_keys, block=key[0], layout=layout
                     ),
-                    (banks, physical, prepared.offsets),
+                    (banks, physical, metadata.offsets),
                     root,
                     args.repeats,
                     dimensions,
@@ -324,6 +398,16 @@ def main():
             indent=2,
         )
     )
+    if args.stage == "gather":
+        (root / "correctness.json").write_text(
+            json.dumps(
+                {
+                    "membership_numpy": "passed",
+                    "sampled_gather_readback": "passed",
+                }
+            )
+        )
+        return
     score = functools.partial(
         _score_prepared,
         topk=args.topk,

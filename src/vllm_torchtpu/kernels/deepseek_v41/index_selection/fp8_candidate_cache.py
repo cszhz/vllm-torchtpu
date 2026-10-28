@@ -31,6 +31,16 @@ class PreparedCandidates(NamedTuple):
     membership: jax.Array
 
 
+class CandidateMetadata(NamedTuple):
+    physical: jax.Array
+    block_ids: jax.Array
+    offsets: jax.Array
+    order: jax.Array
+    pages: jax.Array
+    valid_queries: jax.Array
+    membership: jax.Array
+
+
 def compact_table_width(capacity: int) -> int:
     tile = min(
         PACKED_FP8_MQA_CONFIG.key_tile,
@@ -50,6 +60,30 @@ def prepare_candidates(
     *,
     grouped: bool = False,
 ) -> PreparedCandidates:
+    """Prepare candidate metadata and gather its compact key pages."""
+    metadata = prepare_candidate_metadata(
+        pages, candidates, requests, layout, block, width, grouped=grouped
+    )
+    keys = gather_candidate_keys(
+        banks,
+        metadata.physical,
+        metadata.offsets,
+        block=min(block, layout.page_size),
+        layout=layout,
+    )
+    return PreparedCandidates(keys, *metadata[1:])
+
+
+def prepare_candidate_metadata(
+    pages: jax.Array,
+    candidates: jax.Array,
+    requests: jax.Array,
+    layout: PackedFP8Layout,
+    block: int,
+    width: int,
+    *,
+    grouped: bool = False,
+) -> CandidateMetadata:
     """Share gathered keys between adjacent queries of even-sized requests.
 
     As in vLLM v0.31.1rc0's attention/dsa/sparse_mqa_logits.py, candidates
@@ -109,9 +143,6 @@ def prepare_candidates(
     physical = jnp.pad(
         physical, ((0, 0), (0, padded - physical.shape[1])), constant_values=-1
     )
-    keys = gather_candidate_keys(
-        banks, physical, offsets, block=fragment, layout=layout
-    )
     compact_pages = jnp.arange(tokens * padded // per_page, dtype=jnp.int32).reshape(
         tokens, -1
     )
@@ -121,8 +152,8 @@ def prepare_candidates(
         ((0, 0), (0, table_width - compact_pages.shape[1])),
         constant_values=-1,
     )
-    return PreparedCandidates(
-        keys,
+    return CandidateMetadata(
+        physical,
         canonical,
         offsets,
         order,
@@ -734,21 +765,22 @@ def gather_candidate_keys(
             read(step, slot, wait=True)
             if whole_pages:
 
-                @plsc.parallel_loop(0, span * block, lanes, unroll=8)
-                def repack(i):
-                    element = i + jnp.arange(lanes)
-                    segment = element // block
-                    field = segment // per_page % PAGE_ROWS
-                    column = (
-                        segment // (PAGE_ROWS * per_page) * per_page
-                        + segment % per_page
-                    )
-                    source = column * page_words + field * block + element % block
-                    words.reshape(buffers, -1)[slot, pl.ds(i, lanes)] = (
-                        plsc.load_gather(
+                @pl.loop(0, group // per_page)
+                def repack_page(compact_page):
+                    @plsc.parallel_loop(0, PAGE_ROWS * PAGE_RECORDS, lanes, unroll=8)
+                    def repack(i):
+                        element = i + jnp.arange(lanes)
+                        field = element // PAGE_RECORDS
+                        column = (
+                            compact_page * per_page + element % PAGE_RECORDS // block
+                        )
+                        source = column * page_words + field * block + element % block
+                        words.reshape(buffers, -1)[
+                            slot,
+                            pl.ds(compact_page * PAGE_ROWS * PAGE_RECORDS + i, lanes),
+                        ] = plsc.load_gather(
                             raw_pages[0].reshape(buffers, -1).at[slot], [source]
                         )
-                    )
 
             write(step)
             if buffers == 1:
