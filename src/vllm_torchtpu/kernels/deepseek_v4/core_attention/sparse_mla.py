@@ -376,7 +376,7 @@ def _attention_kernel(
     def flash_attention_step1_qk_softmax(
         q,  # [bq_sz * num_q_heads, head_dim]
         kv,  # [bkv_sz, head_dim] <- Correspond to data from bkv_*_x2_ref
-        kv_len,  # scalar
+        kv_len,  # scalar, or None when every row is valid
         swa_m,  # [bq_sz * num_q_heads],
         swa_l,  # [bq_sz * num_q_heads],
         attention_sinks,  # [num_q_heads]
@@ -390,8 +390,9 @@ def _attention_kernel(
         # Follow FlashAttention-2 forward pass.
         s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
         s *= sm_scale
-        k_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
-        s = jnp.where(k_span < kv_len, s, jnp.finfo(s.dtype).min)
+        if kv_len is not None:
+            k_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+            s = jnp.where(k_span < kv_len, s, jnp.finfo(s.dtype).min)
 
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = swa_m
@@ -642,7 +643,7 @@ def _attention_kernel(
                 (pad_rows, head_dim), shared_bkv_ref.dtype
             )
 
-    def load_bkv(bkv_sem_idx, batch_idx):
+    def load_bkv(bkv_sem_idx, batch_idx, mask_rows):
         bkv_nope = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx][...]
         # The gather nope is (4, 128) u8, reshape it to (1, 512) u8.
         bkv_nope = bkv_nope.reshape(bkv_sz, -1)
@@ -666,9 +667,10 @@ def _attention_kernel(
         # decodes to NaN.
         # We need to mask out the data by the actual kv_len to avoid NaN propagting
         # to the downstream computation.
-        kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        bkv = jnp.where(k_span < kv_len, bkv, 0)
+        if mask_rows:
+            kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
     def load_swa_output(bq_sem_idx, batch_idx):
@@ -809,13 +811,6 @@ def _attention_kernel(
         sem_ids_ref[1] = lax.select(bo_sem_idx == 0, 1, 0)
         attention_sinks = attention_sinks_ref[...][..., None]
 
-        prev_p = None
-        prev_bkv = None
-        prev_exp_m_diff = None
-        prev_l = None
-        prev_swa_acc = None
-        prev_out = None
-
         # Wait for cur blocks if not ready yet
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
         wait_fetch_swa_batch(batch_start_seq_idx, bi_sem_idx)
@@ -830,8 +825,29 @@ def _attention_kernel(
             start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
             return
 
+        # A token whose top-k is full (kv_len == bkv_sz) reads no padding
+        # rows, so a batch of such tokens skips the kv_len masks.
+        full = kv_lens_ref[batch_start_seq_idx] >= bkv_sz
+        for t in range(1, batch_size):
+            full &= kv_lens_ref[batch_start_seq_idx + t] >= bkv_sz
+
+        @pl.when(full)
+        def _():
+            process_gathered_batch(bi_sem_idx, bo_sem_idx, attention_sinks, False)
+
+        @pl.when(jnp.logical_not(full))
+        def _():
+            process_gathered_batch(bi_sem_idx, bo_sem_idx, attention_sinks, True)
+
+    def process_gathered_batch(bi_sem_idx, bo_sem_idx, attention_sinks, mask_rows):
+        prev_p = None
+        prev_bkv = None
+        prev_exp_m_diff = None
+        prev_l = None
+        prev_swa_acc = None
+        prev_out = None
         for batch_idx in range(batch_size):
-            bkv = load_bkv(bi_sem_idx, batch_idx)
+            bkv = load_bkv(bi_sem_idx, batch_idx, mask_rows)
             bq = load_bq(bi_sem_idx, batch_idx)
 
             if prev_out is not None:
@@ -846,7 +862,7 @@ def _attention_kernel(
             p, exp_m_diff, l_total = flash_attention_step1_qk_softmax(
                 bq,
                 bkv,
-                kv_lens_ref[batch_start_seq_idx + batch_idx],
+                kv_lens_ref[batch_start_seq_idx + batch_idx] if mask_rows else None,
                 swa_m,
                 swa_l,
                 attention_sinks,
