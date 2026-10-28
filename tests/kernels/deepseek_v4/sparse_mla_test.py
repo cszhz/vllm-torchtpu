@@ -449,7 +449,6 @@ class CorrectnessTest(parameterized.TestCase):
         topk_indices = jnp.array(
             [
                 [2, 0, 1, -1],  # every candidate, shuffled
-                [0, 1, 1, -1],  # duplicate
                 [0, 2, -1, -1],  # skips row 1
                 [-1, -1, -1, -1],  # no candidates
                 [1, -1, 0, -1],  # padding not a suffix
@@ -460,7 +459,7 @@ class CorrectnessTest(parameterized.TestCase):
         kv_lens = jnp.sum(topk_indices != -1, axis=-1)
         np.testing.assert_array_equal(
             sparse_mla._selects_leading_rows(topk_indices, kv_lens),
-            [True, False, False, True, False, True],
+            [True, False, True, False, True],
         )
 
 

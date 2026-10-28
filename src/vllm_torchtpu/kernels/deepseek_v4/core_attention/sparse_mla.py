@@ -203,28 +203,17 @@ SHARED_KV_TOKENS_PER_MATMUL = 4
 
 
 def _selects_leading_rows(topk_indices: jax.Array, kv_lens: jax.Array) -> jax.Array:
-    """Whether each token's top-k is exactly {0, ..., kv_len - 1}, in any
-    order, then -1 padding: the top-k of a token with at most k candidates.
+    """Whether each token's top-k is {0, ..., kv_len - 1}, in any order, then
+    -1 padding: the top-k of a token with at most k candidates.
 
-    Attention over those gathered rows is attention over the first kv_len rows
-    of the token's cache. Duplicates fail the test, so they keep the gather.
+    Top-k positions are distinct (`streamindex_topk`), so kv_len of them in
+    [0, kv_len) are exactly those rows, and attention over the gathered rows
+    is attention over the first kv_len rows of the token's cache.
     """
     slot = lax.broadcasted_iota(jnp.int32, topk_indices.shape, 1)
     in_prefix = slot < kv_lens[:, None]
     in_range = (topk_indices >= 0) & (topk_indices < kv_lens[:, None])
-    well_formed = jnp.all(jnp.where(in_prefix, in_range, topk_indices == -1), axis=-1)
-    # kv_len values in [0, kv_len) are distinct iff their bitset has kv_len
-    # bits set.
-    topk = topk_indices.shape[-1]
-    word = lax.broadcasted_iota(jnp.int32, (1, cdiv(topk, 32), 1), 1)
-    bits = jnp.where(
-        in_prefix[:, None, :] & (topk_indices[:, None, :] >> 5 == word),
-        jnp.left_shift(jnp.int32(1), topk_indices[:, None, :] & 31),
-        0,
-    )
-    bitset = lax.reduce(bits, jnp.int32(0), lax.bitwise_or, (2,))
-    distinct = jnp.sum(lax.population_count(bitset), axis=-1) == kv_lens
-    return well_formed & distinct
+    return jnp.all(jnp.where(in_prefix, in_range, topk_indices == -1), axis=-1)
 
 
 def _attention_kernel(
@@ -855,7 +844,7 @@ def sparse_ragged_paged_attention(
         `csa_cache_layout`).
       cache_kv_rope: the current kv cache for rope, 32 words per token.
       topk_indices: for each query token, the indices of the top k key tokens to
-        attend to.
+        attend to: distinct positions, then -1 padding.
       page_indices: flattened page indices look-up table by (seq_id, page_id).
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
         kv_lens, only the first num_seqs+1 values are valid.
