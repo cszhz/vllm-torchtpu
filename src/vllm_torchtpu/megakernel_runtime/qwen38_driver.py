@@ -657,6 +657,11 @@ class Qwen38SegmentDriver:
             from . import qwen38_wholestep_call
 
             qwen38_wholestep_call.UNION_ATTN = True
+        cklanes = _parse_int(raw, "wholecklanes")
+        if cklanes:
+            from . import qwen38_wholestep_call
+
+            qwen38_wholestep_call.CK_LANES = cklanes
         if _parse_flag(raw, "wholephys", False):
             from . import qwen38_wholestep_call
 

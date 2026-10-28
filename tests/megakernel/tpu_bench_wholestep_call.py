@@ -63,10 +63,13 @@ def main():
     ap.add_argument("--phys", action="store_true",
                     help="union ids -> physical page ids per request (VLLM_TPU_MEGAKERNEL wholephys=1)")
     ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
+    ap.add_argument("--ck-lanes", type=int, default=0,
+                    help="lanes of each FP8 key-carrier row the key stream reads (0: all; 128: the real ones)")
     a = ap.parse_args()
     _apply_removals(a.remove)
     wsc.SHARD_INDEX, wsc.UNION_ATTN, wsc.LOOP_REQUESTS = a.shard, a.union, a.loop
     wsc.UNION_PHYS = a.phys
+    wsc.CK_LANES = a.ck_lanes
     if a.slots:
         from vllm_torchtpu.megakernel.wholestep import qsa_full_b
 
@@ -165,6 +168,11 @@ def main():
         jax.block_until_ready(res)
         print(f"B={B} first call (compile+run) {time.time() - t0:.1f} s, finite "
               f"{float(jnp.isfinite(res.astype(jnp.float32)).mean()):.4f}", flush=True)
+        # Bit-level fingerprint of the first call's output (same inputs every arm): equal digests across
+        # arms that claim bit-identical results (e.g. --ck-lanes 128 vs 256).
+        import hashlib
+
+        print(f"B={B} first-call digest {hashlib.md5(np.asarray(res).tobytes()).hexdigest()}", flush=True)
         ts = []
         for _ in range(a.iters):
             args[1 + len(ws)] = pool

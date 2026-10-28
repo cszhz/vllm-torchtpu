@@ -430,8 +430,9 @@ def test_step_with_served_key_layout_matches_contiguous():
     pps = d["mtab"].shape[1]
     outs = []
     # contiguous keys; served layout per kernel page; per manager page (4 kernel pages here,
-    # 13 served) reading only the 128 real lanes.
-    arms = (("", 0, 0), ("bf16", 0, 0), ("bf16", 4, 128))
+    # 13 served) reading only the 128 real lanes; per kernel page reading only the real lanes
+    # (the served whole-step path: no manager pages, `wholecklanes=128`).
+    arms = (("", 0, 0), ("bf16", 0, 0), ("bf16", 4, 128), ("bf16", 0, 128))
     for carrier, mp, lanes in arms:
         dd = wi.add_carrier(17, d, mp=mp) if carrier else d
         idx = dict(max_groups=maxg, pages_per_seq=pps, carrier=carrier, chunk_pages=32,

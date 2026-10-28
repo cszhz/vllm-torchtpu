@@ -61,6 +61,9 @@ LOOP_REQUESTS = False
 # `...,wholephys=1` (with `wholeunion=1`): union ids -> physical micro-page ids in one vector pass
 # per request, so each attention copy issues from one SMEM load (same addresses; RPAd's recipe).
 UNION_PHYS = False
+# `...,wholecklanes=128`: the key stream reads only the 128 real lanes of each 256-lane FP8 carrier row
+# (`QSAFullIndexedBlock.ck_lanes`; half the key bytes, same scores). 0 = all lanes.
+CK_LANES = 0
 
 
 def union_stats_on() -> bool:
@@ -71,7 +74,7 @@ def indexed_options() -> dict:
     """The served indexer options (`LONG_CONTEXT`, the request-sharded selection, union attention)."""
     return dict(
         LONG_CONTEXT, shard_index=SHARD_INDEX, union_attn=UNION_ATTN, union_stats=union_stats_on(),
-        loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS,
+        loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS, ck_lanes=CK_LANES,
     )
 
 
