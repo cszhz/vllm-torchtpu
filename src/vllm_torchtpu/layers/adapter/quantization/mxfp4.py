@@ -234,9 +234,11 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         """Whether apply routes this rank's tokens and then runs the DP collectives."""
         return enable_pipelined_collective_and_compute()
 
-    # Whether those collectives gather activations as packed row pairs; set
-    # only where process_weights_after_loading prebuilds for it.
+    # Whether those collectives gather activations as packed row pairs, or
+    # as fp8 rows the first matmul reads; set only where
+    # process_weights_after_loading prebuilds for it.
     packs_gathered_rows = False
+    quantizes_gathered_rows = False
 
     def __init__(self, moe: FusedMoEConfig):
         # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion)
@@ -368,7 +370,9 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         }
         if self._gathers_routed_tokens():
             return pipelined_fused_moe_gmm(
-                **kwargs, pack_gathered_rows=self.packs_gathered_rows
+                **kwargs,
+                pack_gathered_rows=self.packs_gathered_rows,
+                quantize_gathered_rows=self.quantizes_gathered_rows,
             )
 
         return fused_moe_gmm(**kwargs)
@@ -386,6 +390,10 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
     rhs_quant_dtype = jnp.float4_e2m1fn
     packs_gathered_rows = True
+    # The fp4 weights reach gmm_v2 as uint8 carriers, so it quantizes the
+    # gathered rows to fp8 itself; quantizing before the gather moves half the
+    # bytes for the same matmul input.
+    quantizes_gathered_rows = True
 
     @property
     def supports_internal_mk(self) -> bool:
@@ -721,6 +729,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
             rhs_quant_dtype=jnp.float4_e2m1fn,
             pack_gathered_rows=self.packs_gathered_rows,
+            quantize_gathered_rows=self.quantizes_gathered_rows,
         )
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)

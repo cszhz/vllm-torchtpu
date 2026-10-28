@@ -23,7 +23,11 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
-from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    LHS_SCALE_TRAILER_COLS,
+    get_packing_factor,
+    gmm_v2,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -41,8 +45,10 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     token_block_alignment,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import (
+    pack_row_quads,
     ragged_gather_v2,
     unpack_row_pairs,
+    unpack_row_quads,
 )
 from vllm_torchtpu.logger import init_logger
 
@@ -198,6 +204,7 @@ def gmm_wrapper(
     fuse_act=None,
     preferred_element_type=None,
     rhs_quant_dtype=None,
+    lhs_scale_trailer=False,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -218,6 +225,7 @@ def gmm_wrapper(
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
         rhs_quant_dtype=rhs_quant_dtype,
+        lhs_scale_trailer=lhs_scale_trailer,
     )
 
 
@@ -382,7 +390,11 @@ def prepare_routed_gmm_inputs(
             token_indices_sorted = token_indices_flat[sorted_indices]
 
     if use_ep and use_sparse_core:
-        if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
+        onehot_permute = token_indices_sorted.shape[0] <= onehot_moe_permute_threshold
+        if onehot_permute and hidden_states_local.dtype == jnp.int8:
+            # Quantized rows carry their scales as bytes: copy them exactly.
+            x = pack_row_quads(hidden_states_local[token_indices_sorted])
+        elif onehot_permute:
             # Use one-hot matmul for permutation, which can be faster
             # for small batch size
             onehot = jax.nn.one_hot(
@@ -402,7 +414,10 @@ def prepare_routed_gmm_inputs(
                 jnp.array([0], dtype=jnp.int32),
                 valid_count[None],
                 out_dtype=hidden_states_local.dtype,
+                packed_out=hidden_states_local.dtype == jnp.int8,
             )
+    elif hidden_states_local.dtype == jnp.int8:
+        x = pack_row_quads(hidden_states_local[token_indices_sorted])
     else:
         x = hidden_states_local[token_indices_sorted]
     return (
@@ -436,14 +451,18 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    lhs_scale_trailer: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
+    ``lhs_scale_trailer``: ``x`` holds bf16 rows pre-quantized for gmm_v2
+    (`gmm_v2.quantize_lhs_rows`); the output is bf16.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
+    out_dtype = jnp.bfloat16 if lhs_scale_trailer else x.dtype
 
     gmm1_res = gmm_wrapper(
         x,
@@ -455,6 +474,7 @@ def moe_gmm(
         zero_initialize=False,
         fuse_act=activation,
         rhs_quant_dtype=rhs_quant_dtype,
+        lhs_scale_trailer=lhs_scale_trailer,
     )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
@@ -470,7 +490,7 @@ def moe_gmm(
         group_sizes,
         group_offset,
         zero_initialize=False,
-        preferred_element_type=x.dtype,
+        preferred_element_type=out_dtype,
         rhs_quant_dtype=rhs_quant_dtype,
     )
     # The destination-major kernel packs source indices into 20 bits and
@@ -516,7 +536,7 @@ def moe_gmm(
                     topk_weights_flat,
                     valid_mask_flat,
                     reduce_group_size=topk,
-                ).astype(x.dtype)
+                ).astype(out_dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
@@ -552,7 +572,7 @@ def moe_gmm(
                     topk_weights_sorted,
                     valid_count,
                     num_tokens=num_tokens,
-                ).astype(x.dtype)
+                ).astype(out_dtype)
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
@@ -567,21 +587,21 @@ def moe_gmm(
             combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
                 axis=1
             )
-            return (combine @ gmm2_res).astype(x.dtype)
+            return (combine @ gmm2_res).astype(out_dtype)
         return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,
             topk_weights_flat,
             valid_mask_flat,
             reduce_group_size=topk,
-        ).astype(x.dtype)
+        ).astype(out_dtype)
 
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape((num_tokens, topk, gmm2_res.shape[-1]))
     token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights, axis=-1)
     token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
-    return token_topk_hidden.sum(axis=1).astype(x.dtype)
+    return token_topk_hidden.sum(axis=1).astype(out_dtype)
 
 
 @functools.partial(
@@ -595,6 +615,7 @@ def moe_gmm(
         "rhs_quant_dtype",
         "skip_padded_tokens",
         "hidden_packed",
+        "hidden_quantized",
     ),
 )
 def fused_moe_func(
@@ -616,11 +637,14 @@ def fused_moe_func(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
     hidden_packed: bool = False,
+    hidden_quantized: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
     ``hidden_packed`` says ``hidden_states`` holds bf16 rows as
-    `ragged_gather_v2.pack_row_pairs` int32.
+    `ragged_gather_v2.pack_row_pairs` int32. ``hidden_quantized`` says it holds
+    them as `gmm_v2.quantize_lhs_rows` int32, which the first matmul takes in
+    place of quantizing the bf16 rows itself, for the same result.
 
     For linear EP placement, ``experts_start`` is the first global expert id
     owned by this shard, passed as a 0-d int32 array (real traced data, not a
@@ -646,6 +670,10 @@ def fused_moe_func(
         # read this unpacked view, which is dead code when none of them runs.
         packed_hidden_states = hidden_states
         hidden_states = unpack_row_pairs(hidden_states, jnp.bfloat16)
+    if hidden_quantized:
+        # As above; this view's rows are the int8 bytes of the fp8 rows.
+        packed_hidden_states = hidden_states
+        hidden_states = unpack_row_quads(hidden_states)
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
     # expected by gmm_v2.
@@ -655,6 +683,10 @@ def fused_moe_func(
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
     num_tokens, hidden_size = hidden_states.shape
+    act_dtype = hidden_states.dtype
+    if hidden_quantized:
+        hidden_size -= LHS_SCALE_TRAILER_COLS
+        act_dtype = jnp.dtype(jnp.bfloat16)
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
@@ -669,7 +701,7 @@ def fused_moe_func(
     # Pin topk_weights to hidden_states.dtype so the EP mask, GMM
     # reduce, and `where` propagate in BF16 — some custom_routing_fn
     # callers return FP32 weights and would otherwise promote downstream.
-    topk_weights = topk_weights.astype(hidden_states.dtype)
+    topk_weights = topk_weights.astype(act_dtype)
 
     if use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
         # The one-hot permute and unpermute are matmuls across all tokens, and
@@ -687,7 +719,9 @@ def fused_moe_func(
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
-    if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
+    # The dense-expert kernel reads bf16 rows.
+    dense_expert = not hidden_quantized and 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD
+    if dense_expert and can_use_dense_expert(
         hidden_states,
         w1,
         w2,
@@ -723,7 +757,12 @@ def fused_moe_func(
         skip_padded_tokens=skip_padded_tokens,
         packed_hidden_states_local=packed_hidden_states,
     )
-    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    if hidden_quantized:
+        # x stays the int32 row quads gmm_v2 reads the fp8 rows through.
+        if padded_hidden_size != hidden_size:
+            raise ValueError("quantized rows cannot be padded to the weights")
+    else:
+        x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
         w1,
@@ -744,5 +783,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        lhs_scale_trailer=hidden_quantized,
     )
     return x[:num_tokens, :hidden_size]

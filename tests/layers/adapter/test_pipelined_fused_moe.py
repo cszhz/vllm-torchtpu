@@ -517,6 +517,65 @@ def test_fp8_all_gather_off_leaves_the_gather_in_full_width():
     assert torch.equal(out, hidden_states)
 
 
+def test_quantize_gathered_rows_gathers_the_quantized_row_quads():
+    """The rows cross as the int32 quads the first matmul reads, and the
+    kernel call is told so in place of the packed bf16 handoff."""
+    group = _MockCollectiveGroup(world_size=4, rank=0)
+    seq_len, hidden_dim, topk = 64, 512, 2
+    hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
+    quads = torch.zeros(seq_len // 4, hidden_dim + 128, dtype=torch.int32)
+    calls = []
+
+    def mock_kernel_fn(**kwargs):
+        calls.append(kwargs)
+        return torch.zeros(seq_len * 4, hidden_dim, dtype=torch.bfloat16)
+
+    with (
+        patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0),
+        patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", False),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_pcp_group",
+            return_value=None,
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_dp_group",
+            return_value=group,
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.quantize_hidden_rows",
+            return_value=quads,
+        ) as quantize,
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.fused_moe_gmm",
+            side_effect=mock_kernel_fn,
+        ),
+    ):
+        out = pipelined_fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=torch.empty(0),
+            w2=torch.empty(0),
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=torch.ones(seq_len, topk, dtype=torch.bfloat16) / topk,
+            topk_ids=torch.zeros(seq_len, topk, dtype=torch.int32),
+            experts_start=None,
+            topk=topk,
+            activation="silu",
+            pack_gathered_rows=True,
+            quantize_gathered_rows=True,
+        )
+
+    quantize.assert_called_once_with(hidden_states)
+    gathers = [(c[1], c[2]) for c in group.call_log if c[0] == "all_gather"]
+    assert gathers[0] == (quads.shape, torch.int32)
+    assert calls[0]["hidden_quantized"] is True
+    assert calls[0]["hidden_packed"] is False
+    assert calls[0]["hidden_states"].shape == (seq_len, hidden_dim + 128)
+    assert out.shape == (seq_len, hidden_dim)
+
+
 class TestMoEForwardPrecisionBranches:
     """Tests protecting apply_monolithic call paths and signature parity across all MoE
     precision methods."""
@@ -530,7 +589,8 @@ class TestMoEForwardPrecisionBranches:
         """
         # The packed-activation handoff: the wrapper decides to pack before its
         # gather, and tells the kernel call its input is packed.
-        fused_only, pipelined_only = {"hidden_packed"}, {"pack_gathered_rows"}
+        fused_only = {"hidden_packed", "hidden_quantized"}
+        pipelined_only = {"pack_gathered_rows", "quantize_gathered_rows"}
         sig_fused = inspect.signature(fused_moe_gmm)
         sig_pipelined = inspect.signature(pipelined_fused_moe_gmm)
 

@@ -22,6 +22,10 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    LHS_SCALE_TRAILER_COLS,
+    quantize_lhs_rows,
+)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import pack_row_pairs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -32,8 +36,11 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 )
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool, bool], Callable] = {}
+_fused_moe_kernel_cache: dict[
+    tuple[int, str, bool, Any, bool, bool, bool], Callable
+] = {}
 _pack_row_pairs_op = None
+_quantize_rows_op = None
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -160,6 +167,7 @@ def _build_fused_moe_custom_op(
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
     hidden_packed: bool = False,
+    hidden_quantized: bool = False,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -185,6 +193,7 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         hidden_packed=hidden_packed,
+        hidden_quantized=hidden_quantized,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -202,9 +211,21 @@ def _build_fused_moe_custom_op(
             (ids.shape[0], hidden_states.shape[1]), dtype=torch.bfloat16
         )
 
-    fused_moe_kernel_impl.register_fake(
-        _fake_fused_moe_packed if hidden_packed else _fake_fused_moe
-    )
+    def _fake_fused_moe_quantized(
+        hidden_states, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias, _weights, ids, *a
+    ):
+        # One row per routed token, without the scale trailer.
+        return hidden_states.new_empty(
+            (ids.shape[0], hidden_states.shape[1] - LHS_SCALE_TRAILER_COLS),
+            dtype=torch.bfloat16,
+        )
+
+    if hidden_quantized:
+        fused_moe_kernel_impl.register_fake(_fake_fused_moe_quantized)
+    else:
+        fused_moe_kernel_impl.register_fake(
+            _fake_fused_moe_packed if hidden_packed else _fake_fused_moe
+        )
 
     cache_key = (
         topk,
@@ -213,6 +234,7 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype,
         skip_padded_tokens,
         hidden_packed,
+        hidden_quantized,
     )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
@@ -226,6 +248,7 @@ def _get_fused_moe_custom_op(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
     hidden_packed: bool = False,
+    hidden_quantized: bool = False,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
@@ -236,6 +259,7 @@ def _get_fused_moe_custom_op(
         rhs_quant_dtype,
         skip_padded_tokens,
         hidden_packed,
+        hidden_quantized,
     )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
@@ -247,6 +271,7 @@ def _get_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         hidden_packed=hidden_packed,
+        hidden_quantized=hidden_quantized,
     )
 
 
@@ -269,6 +294,31 @@ def pack_hidden_rows(hidden_states: torch.Tensor) -> torch.Tensor:
     return _get_pack_row_pairs_op()(hidden_states)
 
 
+def _get_quantize_rows_op() -> Callable:
+    global _quantize_rows_op
+    if _quantize_rows_op is None:
+        _quantize_rows_op = pallas.jax_op(
+            "pallas::moe_quantize_lhs_rows", quantize_lhs_rows
+        )
+        _quantize_rows_op.register_fake(
+            lambda x: x.new_empty(
+                (x.shape[0] // 4, x.shape[1] + LHS_SCALE_TRAILER_COLS),
+                dtype=torch.int32,
+            )
+        )
+    return _quantize_rows_op
+
+
+def quantize_hidden_rows(hidden_states: torch.Tensor) -> torch.Tensor:
+    """bf16 ``[n, h]`` quantized to the fp8 rows the MoE's first matmul reads.
+
+    Exactly the values and scales that matmul computes from the bf16 rows
+    (`gmm_v2.quantize_lhs_rows`), at half their bytes, as int32 row quads that
+    a collective and the dispatch move in their native tiling.
+    """
+    return _get_quantize_rows_op()(hidden_states)
+
+
 def prebuild_fused_moe_kernel(
     *,
     topk: int,
@@ -277,10 +327,12 @@ def prebuild_fused_moe_kernel(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
     pack_gathered_rows: bool = False,
+    quantize_gathered_rows: bool = False,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing.
 
-    ``pack_gathered_rows`` also builds what `pack_hidden_rows` callers use.
+    ``pack_gathered_rows`` also builds what `pack_hidden_rows` callers use,
+    ``quantize_gathered_rows`` what `quantize_hidden_rows` callers use.
     """
     for hidden_packed in (False, True) if pack_gathered_rows else (False,):
         _get_fused_moe_custom_op(
@@ -293,6 +345,16 @@ def prebuild_fused_moe_kernel(
         )
     if pack_gathered_rows:
         _get_pack_row_pairs_op()
+    if quantize_gathered_rows:
+        _get_fused_moe_custom_op(
+            topk=topk,
+            activation=activation,
+            use_ep=use_ep,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+            hidden_quantized=True,
+        )
+        _get_quantize_rows_op()
 
 
 def fused_moe_gmm(
@@ -311,10 +373,12 @@ def fused_moe_gmm(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
     hidden_packed: bool = False,
+    hidden_quantized: bool = False,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
     ``hidden_packed``: ``hidden_states`` comes from `pack_hidden_rows`.
+    ``hidden_quantized``: ``hidden_states`` comes from `quantize_hidden_rows`.
 
     ``experts_start`` is the first global expert id owned by this shard under
     linear EP placement (or ``None`` for non-EP) -- see
@@ -334,6 +398,7 @@ def fused_moe_gmm(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         hidden_packed=hidden_packed,
+        hidden_quantized=hidden_quantized,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
