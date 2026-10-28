@@ -10,11 +10,51 @@ import torch
 
 from tests.kernels.deepseek_v41.test_fp8_paged_mqa_logits import _pack_fp8_cache
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_paged_mqa_logits_sparse import (  # noqa: E501
+    _query_scores,
     fp8_gathered_mqa_logits,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
     PackedFP8Layout,
 )
+
+
+@pytest.mark.parametrize("count", [17, 2048])
+def test_query_slot_projection_preserves_all_blocks(count):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Requires the SparseCore projection")
+    rng = np.random.default_rng(829)
+    single = np.arange(6 * 4096, dtype=np.float32).reshape(6, 32, 128)
+    pairs = np.arange(6 * 2 * 4096, dtype=np.float32).reshape(6, 2, 32, 128)
+    pairs += 100000
+    # Two tiles per group; the third row is a single and the fourth is empty.
+    control = np.array(
+        [[0, 0, 1, 8192], [0, 1, 1, 8192], [2, 0, 0, 8192], [4, 0, 1, 0]],
+        dtype=np.int32,
+    )
+    slots = rng.integers(0, 1024, size=(4, count), dtype=np.int32)
+    slots[:, 2::5] = -1
+    expected = []
+    for row, (base, member, paired, length) in enumerate(control):
+        token = np.maximum(slots[row], 0)[:, None] * 8 + np.arange(8)
+        tile = base + token // 4096
+        column = token % 4096
+        values = (
+            pairs.reshape(6, 2, 4096)[tile, member, column]
+            if paired
+            else single.reshape(6, 4096)[tile, column]
+        )
+        expected.append(
+            np.where((slots[row, :, None] >= 0) & (token < length), values, -np.inf)
+        )
+    actual = jax.jit(lambda a, b, c, d: _query_scores(a, b, c, d, block=8))(
+        jnp.asarray(single),
+        jnp.asarray(pairs),
+        jnp.asarray(slots),
+        jnp.pad(jnp.asarray(control), ((0, 0), (0, 124))),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual), np.asarray(expected).reshape(4, -1)
+    )
 
 
 @pytest.mark.parametrize(

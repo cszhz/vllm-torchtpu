@@ -81,7 +81,7 @@ def _query_scores(single, pairs, slots, control, *, block):
         scratch_types=(
             pltpu.VMEM((padded,), jnp.int32),
             pltpu.VMEM((128,), jnp.int32),
-            pltpu.VMEM((2, group, block), jnp.int32),
+            pltpu.VMEM((2, group * block // PAGE_RECORDS, PAGE_RECORDS), jnp.int32),
             pltpu.SemaphoreType.DMA((6,)),
         ),
         mesh=mesh,
@@ -115,17 +115,6 @@ def _query_scores(single, pairs, slots, control, *, block):
 
             def read(step, wait=False):
                 slot = step % 2
-                if not wait:
-
-                    @plsc.parallel_loop(0, group, lanes, unroll=4)
-                    def clear(i):
-                        row_ids = i + jnp.arange(lanes)
-                        for field in range(block):
-                            plsc.store_scatter(
-                                values.at[slot],
-                                [row_ids, jnp.full((lanes,), field, jnp.int32)],
-                                jnp.full((lanes,), -8388608, jnp.int32),
-                            )
 
                 def transfer(src):
                     copy = pltpu.make_async_copy(
@@ -134,7 +123,7 @@ def _query_scores(single, pairs, slots, control, *, block):
                                 indices.at[pl.ds(step * group, group)], ignored_value=-1
                             )
                         ],
-                        values.at[slot],
+                        values.at[slot].reshape(group, block),
                         sem.at[2 + slot],
                     )
                     (copy.wait if wait else copy.start)()
@@ -149,8 +138,11 @@ def _query_scores(single, pairs, slots, control, *, block):
 
             def write(step, wait=False):
                 slot = step % 2
-                target = out.reshape(-1, block).at[
-                    pl.ds(row_id * padded + step * group, group)
+                target = out.at[
+                    pl.ds(
+                        (row_id * padded + step * group) * block // PAGE_RECORDS,
+                        group * block // PAGE_RECORDS,
+                    )
                 ]
                 copy = pltpu.make_async_copy(values.at[slot], target, sem.at[4 + slot])
                 (copy.wait if wait else copy.start)()
@@ -165,6 +157,22 @@ def _query_scores(single, pairs, slots, control, *, block):
                     read(step + 1)
 
                 read(step, wait=True)
+
+                # Indexed DMA packs 8-score blocks without VMEM row padding.
+                # Keep the allocation and contiguous output DMA 128 words wide.
+                @plsc.parallel_loop(0, group * block, lanes, unroll=4)
+                def mask_invalid(i):
+                    element = i + jnp.arange(lanes)
+                    address = plsc.load_gather(
+                        indices, [step * group + element // block]
+                    )
+                    plsc.store_scatter(
+                        values.at[step % 2],
+                        [element // PAGE_RECORDS, element % PAGE_RECORDS],
+                        jnp.full((lanes,), -8388608, jnp.int32),
+                        mask=address < 0,
+                    )
+
                 write(step)
 
             for last in range(max(0, steps - 2), steps):
