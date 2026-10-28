@@ -40,6 +40,7 @@ def compile_all_ranges(monkeypatch):
     # ranks_per_host() also reads LOCAL_WORLD_SIZE; keep a launcher's value
     # (torchrun, CI) from changing which rank owns which range.
     monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
+    monkeypatch.delenv("TPU_LOCAL_RANK_OFFSET", raising=False)
     monkeypatch.setattr(
         piecewise_backend, "create_concrete_args", lambda graph, size: [size]
     )
@@ -76,6 +77,8 @@ def _compile(
     local_rank,
     ranks_per_host=8,
     disable_cache=False,
+    dp_size=1,
+    dp_size_local=1,
 ):
     """(range end, peer wait in seconds) per compile, in order."""
     _host(monkeypatch, ranks_per_host)
@@ -103,6 +106,11 @@ def _compile(
             is_encoder=False,
         ),
         compilation_config=None,
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                data_parallel_size=dp_size, data_parallel_size_local=dp_size_local
+            )
+        ),
         piecewise_compile_index=0,
         total_piecewise_compiles=1,
         _log_compile_start=lambda compile_range: None,
@@ -195,30 +203,140 @@ def test_peer_replay_off_compiles_every_range_without_waiting(
         assert sorted(end for end, _ in calls) == SIZES
 
 
+def _host_owners(compile_all_ranges, monkeypatch, local_ranks, **kwargs):
+    """Every range a rank compiled without waiting, for each rank present."""
+    return {
+        r: _owned(_compile(compile_all_ranges, monkeypatch, r, **kwargs))
+        for r in local_ranks
+    }
+
+
+def _assert_one_owner_each(owners):
+    """The ranks present own every range exactly once between them, so no
+    rank waits on a slot no process holds."""
+    owned = [end for ends in owners.values() for end in ends]
+    assert sorted(owned) == SIZES
+
+
+def _assert_opted_out(compile_all_ranges, monkeypatch, local_ranks, **kwargs):
+    for r in local_ranks:
+        calls = _compile(compile_all_ranges, monkeypatch, r, **kwargs)
+        assert all(wait == 0.0 for _, wait in calls)
+        assert sorted(end for end, _ in calls) == SIZES
+
+
 def test_dp_ranks_use_local_world_size_for_host_splitting(
     compile_all_ranges, monkeypatch
 ):
-    """Under DP > 1 with TP=1, get_world_group().world_size // nodes is 1 per DP
-    engine while LOCAL_WORLD_SIZE reflects all 8 workers sharing the host."""
+    """Single-host DP8 x TP1 (+EP): each DP engine is its own world group of
+    one rank, so the host's 8 engines split the ranges between them."""
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
-    owned = [
-        _owned(_compile(compile_all_ranges, monkeypatch, r, ranks_per_host=1))
-        for r in range(8)
+    owners = _host_owners(
+        compile_all_ranges,
+        monkeypatch,
+        range(8),
+        ranks_per_host=1,
+        dp_size=8,
+        dp_size_local=8,
+    )
+    assert list(owners.values()) == [
+        [4096],
+        [2048],
+        [1024],
+        [512],
+        [256],
+        [128],
+        [64],
+        [32, 16],
     ]
-    assert owned == [[4096], [2048], [1024], [512], [256], [128], [64], [32, 16]]
+
+
+@pytest.mark.parametrize(
+    "local_world, dp_size_local",
+    [
+        (16, 8),  # multiprocess: LOCAL_WORLD_SIZE is the global slice width
+        (8, 16),  # Ray without --data-parallel-size-local
+    ],
+)
+def test_multi_host_dp_counts_only_this_hosts_engines(
+    compile_all_ranges, monkeypatch, local_world, dp_size_local
+):
+    """Multi-host DP16 x TP1 + EP, 8 engines per host: whichever of
+    LOCAL_WORLD_SIZE and data_parallel_size_local overstates the host, the 8
+    engines present own every range."""
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", str(local_world))
+    owners = _host_owners(
+        compile_all_ranges,
+        monkeypatch,
+        range(8),
+        ranks_per_host=1,
+        dp_size=16,
+        dp_size_local=dp_size_local,
+    )
+    _assert_one_owner_each(owners)
+
+
+def test_dense_dp_engines_compile_alone(compile_all_ranges, monkeypatch):
+    """Dense DP (no EP): the replicas are independent engines with
+    data_parallel_size collapsed to 1, all bound to LOCAL_RANK=0 even when
+    LOCAL_WORLD_SIZE=8. None of them waits on slots 1..7."""
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    _assert_opted_out(
+        compile_all_ranges, monkeypatch, [0] * 8, ranks_per_host=1, dp_size=1
+    )
 
 
 def test_multi_rank_engines_do_not_split_across_dp_groups(
     compile_all_ranges, monkeypatch
 ):
-    """With more than one rank per engine (e.g. DP2 x TP4 on one host), ranges
-    are split within the engine only, whatever LOCAL_WORLD_SIZE says."""
+    """DP2 x TP4: each engine's 4 ranks split the ranges among themselves,
+    whatever LOCAL_WORLD_SIZE says."""
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
-    owned = [
-        _owned(_compile(compile_all_ranges, monkeypatch, r, ranks_per_host=4))
-        for r in range(4)
-    ]
-    assert sorted(end for ends in owned for end in ends) == sorted(SIZES)
+    _assert_one_owner_each(
+        _host_owners(compile_all_ranges, monkeypatch, range(4), ranks_per_host=4)
+    )
+
+
+def test_second_tp_group_maps_onto_its_engines_slots(compile_all_ranges, monkeypatch):
+    """DP2 x TP4 + EP: the second engine's ranks have LOCAL_RANK 4..7 but
+    slots 0..3 in their own engine, so they own its ranges (they used to own
+    none and replay nothing)."""
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    first = _host_owners(compile_all_ranges, monkeypatch, range(4), ranks_per_host=4)
+    second = _host_owners(
+        compile_all_ranges, monkeypatch, range(4, 8), ranks_per_host=4
+    )
+    _assert_one_owner_each(second)
+    assert list(second.values()) == list(first.values())
+
+
+def test_local_rank_offset_is_taken_off(compile_all_ranges, monkeypatch):
+    """TPU_LOCAL_RANK_OFFSET=4 with 4 single-rank DP engines: the binding
+    sets LOCAL_RANK 4..7 and LOCAL_WORLD_SIZE 8; the engines are slots 0..3."""
+    monkeypatch.setenv("TPU_LOCAL_RANK_OFFSET", "4")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    owners = _host_owners(
+        compile_all_ranges,
+        monkeypatch,
+        range(4, 8),
+        ranks_per_host=1,
+        dp_size=4,
+        dp_size_local=4,
+    )
+    _assert_one_owner_each(owners)
+
+
+def test_a_slot_outside_the_host_opts_out(compile_all_ranges, monkeypatch):
+    """A rank whose slot falls outside the host count waits on no one."""
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    _assert_opted_out(
+        compile_all_ranges,
+        monkeypatch,
+        [9],
+        ranks_per_host=1,
+        dp_size=16,
+        dp_size_local=8,
+    )
 
 
 def test_peer_replay_is_ignored_with_the_compile_cache_disabled(

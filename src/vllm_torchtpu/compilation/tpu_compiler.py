@@ -614,6 +614,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         `fingerprint` is `_graph_fingerprint(graph)` taken before the backend
         ran, as a peer replaying this artifact computes it.
         """
+        tmp_path = f"{path}.{os.getpid()}.tmp"
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             payload = TpuCompilationHandle(
@@ -626,9 +627,8 @@ class TpuCompilerAdaptor(CompilerInterface):
             # Write-then-rename: a crash or a full disk partway through
             # pickling a 400 MB entry would otherwise leave a truncated file
             # that the next run reads back as a corrupt artifact.
-            # PID-unique, like _link_artifact: two writers of the same path
-            # must not interleave into one temp file.
-            tmp_path = f"{path}.{os.getpid()}.tmp"
+            # The temp name is PID-unique, like _link_artifact's: two writers
+            # of the same path must not interleave into one temp file.
             with open(tmp_path, "wb") as f:
                 pickle.dump(payload, f)
             os.replace(tmp_path, path)
@@ -638,6 +638,8 @@ class TpuCompilerAdaptor(CompilerInterface):
             # Non-fatal by design: a failed save costs a recompile next run,
             # which is strictly better than persisting something unloadable.
             logger.warning("[TpuCompilerAdaptor] Failed to save artifact: %s", e)
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
             return False
 
     def _replay(
