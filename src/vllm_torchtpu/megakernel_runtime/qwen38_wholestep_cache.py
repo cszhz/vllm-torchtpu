@@ -33,6 +33,7 @@ import jax.numpy as jnp
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
+    main_slot_rows,
     qsa_cache_writes,
     write_compressed,
     write_main_cache,
@@ -50,6 +51,9 @@ class QSALayerCache:
     main_slot: int = -1
     k_scale: float = 1.0
     v_scale: float = 1.0
+    # Cache group of the paired main KV pages (`Qwen4ExpQSA.main_cache_name`): layers with the
+    # same group and slots 0 / 1 share every main page and are written as whole rows together.
+    main_group: str = ""
 
 
 def wholestep_qsa_writes(
@@ -126,8 +130,9 @@ def _batched_writes(pool, rows, norms, tables, layers, positions, trig, starts, 
                     compress_ratio, norm_eps, rotary_dim):
     """`qsa_cache_writes`' unfused sequence for all layers at once.
 
-    Each layer's main K/V and compressed keys still go through their own writer (paired /
-    packed slots of shared pages need the stock writers' read-modify-write), but the ring
+    Main K/V of paired layers that are both here is written as whole rows in one call (both
+    head pairs are new, so no read-modify-write); compressed keys keep their per-layer writer
+    (packed slots need its read-modify-write). The ring
     rows (one page per layer and request, disjoint) are read and written by one call each,
     and the indexer update runs once over a stacked layer axis. No layer reads what another
     layer writes in a step, so the pool ends with the stock per-layer bytes.
@@ -137,12 +142,31 @@ def _batched_writes(pool, rows, norms, tables, layers, positions, trig, starts, 
     slots = jnp.where(active, jnp.arange(nreq, dtype=jnp.int32), -1)
     req, logical, valid = _token_metadata(len(positions), starts, context, slots)
     fp8 = pool.dtype == jnp.float8_e4m3fn
+    packed, pages = [], []
     for (key, value, _), (nk, _), (_, main, _), lay in zip(rows, norms, tables, layers, strict=True):
         k, v = produce_kv(key, value, nk, positions, trig, norm_eps, rotary_dim)
-        page = jnp.where(valid, main[req, logical // pool.shape[1]], len(pool))
-        packed = pack_rows(k, v, fp8=fp8, k_scale=lay.k_scale, v_scale=lay.v_scale)
-        slot_kw = {"slot": lay.main_slot} if lay.main_slot >= 0 else {}
-        pool = write_main_cache(pool, packed, page, logical, valid, **slot_kw)
+        pages.append(jnp.where(valid, main[req, logical // pool.shape[1]], len(pool)))
+        packed.append(pack_rows(k, v, fp8=fp8, k_scale=lay.k_scale, v_scale=lay.v_scale))
+    # Paired main pages whose both layers are here: one whole-row write of both head pairs (no
+    # read-modify-write); all such pairs (disjoint page groups) in one writer call. A layer
+    # whose partner is outside the kernel keeps the paired writer.
+    partner = {(lay.main_group, lay.main_slot): o for o, lay in enumerate(layers) if lay.main_group}
+    whole_rows, whole_pages, single = [], [], []
+    for o, lay in enumerate(layers):
+        b = partner.get((lay.main_group, 1)) if lay.main_group and lay.main_slot == 0 else None
+        if b is not None:
+            mine = (jnp.arange(packed[o].shape[-2]) // 2 == 0)[:, None]
+            whole_rows.append(jnp.where(mine, packed[o], main_slot_rows(packed[b], 1)))
+            whole_pages.append(pages[o])
+        elif not (lay.main_group and lay.main_slot == 1 and (lay.main_group, 0) in partner):
+            single.append(o)
+    if whole_rows:
+        n = len(whole_rows)
+        pool = write_main_cache(pool, jnp.concatenate(whole_rows), jnp.concatenate(whole_pages),
+                                jnp.tile(logical, n), jnp.tile(valid, n))
+    for o in single:
+        slot_kw = {"slot": layers[o].main_slot} if layers[o].main_slot >= 0 else {}
+        pool = write_main_cache(pool, packed[o], pages[o], logical, valid, **slot_kw)
     raw = jnp.stack([r[2] for r in rows])
     ring_rows = math.ceil(compress_ratio / 8) * 8
     ids = jnp.concatenate([t[0] for t in tables])

@@ -50,6 +50,7 @@ def qsa_layer_cache(attn: Any) -> QSALayerCache:
         main_slot=int(kw.get("main_slot", -1)),
         k_scale=float(scales[0]),
         v_scale=float(scales[1]),
+        main_group=str(getattr(attn, "main_cache_name", "")) if kw.get("main_slot", -1) >= 0 else "",
     )
 
 

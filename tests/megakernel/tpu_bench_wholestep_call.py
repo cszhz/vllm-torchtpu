@@ -80,7 +80,10 @@ def main():
     L = a.L
     n_att = max(1, L // 4)
     n_gdn = L - n_att
-    layers = [QSALayerCache(compressed_slot=o % 2, main_slot=(o + 1) % 2) for o in range(n_att)]
+    # Served pairing: consecutive QSA layers share main pages (slots 0 / 1); the last one's
+    # partner (layer 47) is outside the kernel.
+    layers = [QSALayerCache(compressed_slot=o % 2, main_slot=(o + 1) % 2, main_group=f"m{o // 2}")
+              for o in range(n_att)]
     pps = a.max_groups * 4 // 128
     for B in [int(b) for b in a.buckets.split(",")]:
         nreq = B // 4
