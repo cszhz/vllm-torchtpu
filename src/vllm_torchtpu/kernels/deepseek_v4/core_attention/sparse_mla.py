@@ -273,10 +273,11 @@ def _attention_kernel(
     # [max_num_seqs]; with `shared_kv`, one past the last cache row each
     # token's top-k selects.
     kv_lens_ref,
-    # [3] (start_seq_idx, end_seq_idx, num_valid_tokens); with `shared_kv`,
-    # then the rows the launch reads and (page_0, page_1, ...): the sequence's
-    # first pages.
-    start_end_seq_idx_ref,
+    # Flat launch table; from offset launch_offset_ref[0]: (start_seq_idx,
+    # end_seq_idx, num_valid_tokens) and, with `shared_kv`, the rows the
+    # launch reads and (page_0, page_1, ...): the sequence's first pages.
+    launch_ref,
+    launch_offset_ref,  # [1]; an operand, so launches share one kernel
     sem_ids_ref,  # [2] (bi_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [2] seq_idx_start of the in-flight bo DMA per bo sem
     # Input
@@ -361,9 +362,10 @@ def _attention_kernel(
     assert head_dim % 128 == 0
     assert num_q_heads % q_packing == 0
 
-    start_seq_idx = start_end_seq_idx_ref[0]
-    end_seq_idx = start_end_seq_idx_ref[1]
-    num_valid_tokens = start_end_seq_idx_ref[2]
+    launch_offset = launch_offset_ref[0]
+    start_seq_idx = launch_ref[launch_offset]
+    end_seq_idx = launch_ref[launch_offset + 1]
+    num_valid_tokens = launch_ref[launch_offset + 2]
 
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
@@ -571,10 +573,10 @@ def _attention_kernel(
     def load_shared_kv():
         num_pages, page_size, _ = bkv_nope_x2_ref.shape
         # The most rows any valid query token of the launch reads.
-        kv_rows = start_end_seq_idx_ref[3]
+        kv_rows = launch_ref[launch_offset + 3]
 
         def page_copies(p):
-            page = start_end_seq_idx_ref[4 + p]
+            page = launch_ref[launch_offset + 4 + p]
             return (
                 pltpu.make_async_copy(
                     cache_kv_nope_hbm_ref.at[page],
@@ -1036,21 +1038,21 @@ def sparse_ragged_paged_attention(
         swa_accumution: jax.Array,  # bf16[max_num_tokens, num_q_heads, head_dim]
         swa_l: jax.Array,  # float32[max_num_tokens, num_l_heads]
         swa_m: jax.Array,  # float32[max_num_tokens, num_l_heads]
-        start_seq_idx: int,
-        end_seq_idx: jax.Array,  # i32
-        num_valid_tokens: jax.Array,  # i32
+        # i32: the launch's entry of `launch` starts at `launch_offset`
+        # (`_attention_kernel`).
+        launch: jax.Array,
+        launch_offset: int,
+        num_steps: jax.Array,  # i32: grid steps of `kernel_batch_size` tokens
         kernel_batch_size: int,
         # With these, cache_kv_* are the whole caches, kv_lens bounds each
         # token's selected rows, and every token attends over the rows of
-        # these pages its mask selects (`_attention_kernel`).
-        # i32[1 + shared_pages]: the rows the launch reads, then the pages.
-        shared_kv_launch: jax.Array | None = None,
+        # the first `shared_pages` pages its mask selects.
+        shared_pages: int = 0,
         row_mask: jax.Array | None = None,  # i32[max_num_tokens, mask_cols]
     ):
         batch_size = kernel_batch_size
-        shared_kv = shared_kv_launch is not None
-        end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
-        grid = (cdiv(end_seq_idx - start_seq_idx, batch_size),)
+        shared_kv = row_mask is not None
+        grid = (num_steps,)
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.VMEM),  # attention_sinks
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
@@ -1065,7 +1067,6 @@ def sparse_ragged_paged_attention(
 
         if shared_kv:
             in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # row_mask
-            shared_pages = shared_kv_launch.shape[0] - 1
             mask_cols = row_mask.shape[1]
             _, page_size, lanes = cache_kv_nope.shape
             bkv_nope_double_buf = pltpu.VMEM(
@@ -1130,12 +1131,10 @@ def sparse_ragged_paged_attention(
             *extra_scratch,
         ]
 
-        launch = [start_seq_idx, end_seq_idx, num_valid_tokens]
-        if shared_kv:
-            launch += [*shared_kv_launch]
         scalar_prefetches = (
             kv_lens,
-            jnp.array(launch, jnp.int32),
+            launch,
+            jnp.full((1,), launch_offset, jnp.int32),
             # (bi_sem_idx, bo_sem_idx)
             jnp.zeros((2,), jnp.int32),
             # seq_idx_start of the in-flight bo DMA per bo sem; -1 = none.
@@ -1172,7 +1171,8 @@ def sparse_ragged_paged_attention(
                 ),
                 out_shape=jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
                 input_output_aliases={
-                    5: 0,  # Alias output activation with q
+                    # Alias output activation with q
+                    len(scalar_prefetches) + 1: 0,
                 },
                 name=scope_name,
             )
@@ -1240,26 +1240,53 @@ def sparse_ragged_paged_attention(
     )
     num_valid_tokens = cu_q_lens[distribution[2]]
     if shared_kv_path:
-        # Every chunk's decision in one pass, not a few small ops per chunk.
+        # Every chunk's decision, and the scalars of both its launches, in
+        # one pass: per-launch scalar ops cost more than the empty launch.
+        chunk = gather_and_attention_chunk_size
+        kernel_batch_size = _largest_divisor(chunk, attention_kernel_batch_size)
+
         def by_chunk(x):
-            return x.reshape(num_chunks, gather_and_attention_chunk_size)
+            return x.reshape(num_chunks, chunk)
 
         is_valid = jnp.arange(q.shape[0]) < num_valid_tokens
         # One past the last row each valid token selects (top-k pads with -1).
         kv_rows = jnp.where(is_valid, jnp.max(topk_indices, axis=-1) + 1, 0)
         is_valid = by_chunk(is_valid)
         chunk_rows = jnp.max(by_chunk(kv_rows), axis=1)
-        chunk_seqs = seq_ids_segment[::gather_and_attention_chunk_size]
+        chunk_seqs = seq_ids_segment[::chunk]
         one_seq = jnp.all(
             ~is_valid | (by_chunk(seq_ids_segment) == chunk_seqs[:, None]), axis=1
         )
         chunk_shared = is_valid[:, 0] & one_seq & (chunk_rows <= shared_rows)
-        # One small table, (use_shared, rows, pages...) per chunk, so its
-        # per-chunk scalars cost one copy to scalar memory, not one per value.
-        shared_kv_table = jnp.concatenate(
+        starts = jnp.arange(num_chunks, dtype=jnp.int32) * chunk
+        # Each launch walks whole batches up to the chunk's last valid token.
+        batch_ends = starts + align_to(
+            jnp.clip(num_valid_tokens - starts, 0, chunk), kernel_batch_size
+        )
+        gather_ends = jnp.where(chunk_shared, starts, batch_ends)
+        shared_ends = jnp.where(chunk_shared, batch_ends, starts)
+        launch_steps = (
+            jnp.stack([gather_ends, shared_ends], axis=1) - starts[:, None]
+        ) // kernel_batch_size
+        valid_tokens = jnp.broadcast_to(num_valid_tokens, starts.shape)
+        # One row per chunk: its gather launch's entry (start, end, valid
+        # tokens), then its shared-KV launch's, which adds the rows it reads
+        # and the sequence's first pages. Every launch reads the whole table,
+        # so no launch needs scalar ops of its own.
+        launches = jnp.concatenate(
             [
-                chunk_shared[:, None],
-                chunk_rows[:, None],
+                jnp.stack(
+                    [
+                        starts,
+                        gather_ends,
+                        valid_tokens,
+                        starts,
+                        shared_ends,
+                        valid_tokens,
+                        chunk_rows,
+                    ],
+                    axis=1,
+                ),
                 page_indices[
                     chunk_seqs[:, None] * pages_per_seq + jnp.arange(shared_pages)
                 ],
@@ -1267,12 +1294,11 @@ def sparse_ragged_paged_attention(
             axis=1,
             dtype=jnp.int32,
         )
+        launch_width = launches.shape[1]
+        launches = launches.reshape(-1)
         row_mask = topk_row_mask(
             topk_indices,
-            jnp.repeat(
-                chunk_shared.astype(jnp.int32),
-                gather_and_attention_chunk_size // ROW_MASK_TOKENS,
-            ),
+            jnp.repeat(chunk_shared.astype(jnp.int32), chunk // ROW_MASK_TOKENS),
             shared_rows,
             align_to(shared_pages * page_size, SHARED_KV_TILE_ROWS),
         )
@@ -1283,27 +1309,42 @@ def sparse_ragged_paged_attention(
         chunk_size = end_pos - start_pos
         indices = gather_indices[start_pos * topk : end_pos * topk]
 
-        # Batching
-        kernel_batch_size = _largest_divisor(chunk_size, attention_kernel_batch_size)
-        assert chunk_size % kernel_batch_size == 0
-        # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
-        # steps, so `batch_end - start_pos` MUST be a multiple of
-        # `kernel_batch_size`.
-        batch_end = start_pos + (
-            cdiv(
+        if shared_kv_path:
+            num_valid_indices = launch_steps[i, 0] * kernel_batch_size * topk
+            gather_launch = dict(
+                launch=launches,
+                launch_offset=i * launch_width,
+                num_steps=launch_steps[i, 0],
+            )
+        else:
+            # Batching
+            kernel_batch_size = _largest_divisor(
+                chunk_size, attention_kernel_batch_size
+            )
+            assert chunk_size % kernel_batch_size == 0
+            # The kernel grid walks [start_pos, batch_end) in
+            # `kernel_batch_size` steps, so `batch_end - start_pos` MUST be a
+            # multiple of `kernel_batch_size`.
+            num_steps = cdiv(
                 jnp.maximum(
                     0,
                     jnp.minimum(
-                        cu_q_lens[distribution[2]],
+                        num_valid_tokens,
                         end_pos,
                     )
                     - start_pos,
                 ),
                 kernel_batch_size,
             )
-            * kernel_batch_size
-        )
-        num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
+            batch_end = start_pos + num_steps * kernel_batch_size
+            num_valid_indices = num_steps * kernel_batch_size * topk
+            gather_launch = dict(
+                launch=jnp.array(
+                    [start_pos, batch_end, num_valid_tokens], jnp.int32
+                ),
+                launch_offset=0,
+                num_steps=num_steps,
+            )
 
         # For prefilling of short sequences (or early in the sequence), there are
         # very few number of KVs in the sequence, so different qs' selected topk
@@ -1314,12 +1355,6 @@ def sparse_ragged_paged_attention(
         # based on their lengths. For the sequences-segment below certain length,
         # we use a different kernel (dense attention and mask), for the rest of
         # sequences, we use this gather-and-attention kernel.
-        gather_end = batch_end
-        if shared_kv_path:
-            use_shared = shared_kv_table[i, 0] != 0
-            num_valid_indices = jnp.where(use_shared, 0, num_valid_indices)
-            gather_end = jnp.where(use_shared, start_pos, batch_end)
-
         gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
             cache_kv_nope,
             cache_kv_rope,
@@ -1339,10 +1374,8 @@ def sparse_ragged_paged_attention(
             swa_accumution,
             swa_l,
             swa_m,
-            start_seq_idx=start_pos,
-            end_seq_idx=gather_end,
-            num_valid_tokens=num_valid_tokens,
             kernel_batch_size=kernel_batch_size,
+            **gather_launch,
         )
         if shared_kv_path:
             q = run_mla_kernel(
@@ -1354,11 +1387,11 @@ def sparse_ragged_paged_attention(
                 swa_accumution,
                 swa_l,
                 swa_m,
-                start_seq_idx=start_pos,
-                end_seq_idx=jnp.where(use_shared, batch_end, start_pos),
-                num_valid_tokens=num_valid_tokens,
+                launch=launches,
+                launch_offset=i * launch_width + 3,
+                num_steps=launch_steps[i, 1],
                 kernel_batch_size=kernel_batch_size,
-                shared_kv_launch=shared_kv_table[i, 1:],
+                shared_pages=shared_pages,
                 row_mask=row_mask,
             )
     return prepare_outputs(
