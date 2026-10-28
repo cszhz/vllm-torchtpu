@@ -21,6 +21,10 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import config, memory_ref
 
+# Unroll of the accumulation column loop: amortizes the scalar register rotation
+# of the software-pipelined loop.
+COL_LOOP_UNROLL = 2
+
 
 def call_kernel_pipeline(
     row_partition_id: jax.Array,
@@ -300,7 +304,9 @@ def _col_kernel(
     same_as_prev = jnp.bitwise_and(meta_slice, memory_ref.META_SAME_AS_PREV)
 
     def reduce_rows(slot_out_vmem: jax.Ref):
-        @plsc.parallel_loop(0, cfg.col_chunk_size, step=num_simd_lanes)
+        @plsc.parallel_loop(
+            0, cfg.col_chunk_size, step=num_simd_lanes, unroll=COL_LOOP_UNROLL
+        )
         def col_loop(col_compute_offset: jax.Array):
             col_slice = pl.ds(col_compute_offset, num_simd_lanes)
             # Running sum, seeded by the carry from the previous chunk.
