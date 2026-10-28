@@ -27,6 +27,10 @@ from .params import GDNParams
 from .states import rec_chunk
 
 
+def gate_act(gate: str) -> Any:
+    return {"silu": jax.nn.silu, "sigmoid": jax.nn.sigmoid}[gate]
+
+
 def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
     """Gated delta rule on key-major `recb [B * vh, KD, VD]` (`GCH=False`)."""
     ex = ctx.ex
@@ -35,6 +39,7 @@ def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
     kh, vh, KD, VD = gp.kh, gp.vh, gp.KD, gp.VD
     QKV, Z, BA, A_OFF = gp.QKV, gp.Z, gp.BA, gp.A_OFF
     l2_eps = gp.l2_eps
+    g_act = gate_act(gp.gate)
     recb, sb = scr["recb"], scr["sbuf"]
     alog = ctx.sm(slot, "alog")[0, :vh]
     dtb = ctx.sm(slot, "dtb")[0, :vh]
@@ -76,7 +81,7 @@ def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
         val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
         val = (gnw[None, :] * val.astype(BF16)).astype(F32)
         zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-        scr["mix"][b, :Z] = rnd(val * jax.nn.silu(zz)).reshape(Z)
+        scr["mix"][b, :Z] = rnd(val * g_act(zz)).reshape(Z)
 
 
 def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
@@ -93,6 +98,7 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
         gp.BA_PAD,
     )
     l2_eps = gp.l2_eps
+    g_act = gate_act(gp.gate)
     CB, NF, TR, NCH, NRB = gp.CB, gp.NF, gp.TR, gp.NCH, gp.NRB
     recb, sb, ybuf = scr["recb"], scr["sbuf"], scr["ybuf"]
     alog = ctx.sm(slot, "alog")[0, :vh]
@@ -167,7 +173,7 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
             val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
             val = (gnw[None, :] * val.astype(BF16)).astype(F32)
             zz = zc[bb].reshape(vh, VD)
-            row = rnd(val * jax.nn.silu(zz)).reshape(1, Z)
+            row = rnd(val * g_act(zz)).reshape(1, Z)
             blk = jnp.where(row_i == bb, row, blk)
         scr["mix"][pl.ds(r0, n_pad), 0:Z] = blk
 

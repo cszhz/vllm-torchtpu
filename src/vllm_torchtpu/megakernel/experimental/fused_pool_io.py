@@ -917,7 +917,10 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                         )
                         val = (gnw[None, :] * val.astype(BF16)).astype(F32)
                         zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-                        scr["mix"][b, :Z] = rnd(val * jax.nn.silu(zz)).reshape(Z)
+                        g_act = {"silu": jax.nn.silu, "sigmoid": jax.nn.sigmoid}[
+                            gp.gate
+                        ]
+                        scr["mix"][b, :Z] = rnd(val * g_act(zz)).reshape(Z)
 
                         if interpret:
                             u32_out = pltpu.bitcast(s_bf16.reshape(vh * KD, VD), U32)

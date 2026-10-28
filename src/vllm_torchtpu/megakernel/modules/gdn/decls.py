@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from ...decls import (
@@ -31,6 +32,8 @@ from ...decls import (
 from ...errors import MegakernelConfigError
 from ...ops import BF16, F32, FP8
 from .params import gdn_lin_in_layout
+
+GDN_GATE_ACTS: frozenset[str] = frozenset({"silu", "sigmoid"})
 
 GDN_PARAM_NAMES: frozenset[str] = frozenset(
     {
@@ -64,6 +67,7 @@ GDN_GEOMETRY_FIELDS: dict[str, tuple[str, Any]] = {
     "conv_kernel": ("linear_conv_kernel_dim", 4),
     "eps": ("rms_norm_eps", 1e-6),
     "gdn_l2_eps": ("gdn_l2_eps", 1e-6),
+    "gate": ("gdn_gate", "silu"),
 }
 
 GDN_FIELD_ALIASES: dict[str, str] = {
@@ -79,7 +83,12 @@ GDN_FIELD_ALIASES: dict[str, str] = {
     "linear_value_head_dim": "v_dim",
     "linear_conv_kernel_dim": "conv_kernel",
     "rms_norm_eps": "eps",
+    "gdn_gate": "gate",
+    "linear_gate_act": "gate",
+    "linear_attn_gate_act": "gate",
 }
+
+GDN_OPTIONS: dict[str, Any] = {"gate": None}
 
 GDN_GEOMETRY_METHODS: dict[str, Any] = {
     "kh": lambda g, R: gdn_lin_in_layout(g, R).kh,
@@ -100,11 +109,29 @@ def _check_conv_kernel(conv_kernel: int) -> int:
     return conv_kernel
 
 
+def validate_gdn_gate(gate: Any) -> str:
+    if not isinstance(gate, str) or gate not in GDN_GATE_ACTS:
+        raise MegakernelConfigError(
+            f"GDNModule gate must be one of {sorted(GDN_GATE_ACTS)}, got {gate!r}"
+        )
+    return gate
+
+
+def validate_gdn_options(options: Mapping[str, Any]) -> None:
+    gate = options.get("gate")
+    if gate is not None:
+        validate_gdn_gate(gate)
+
+
 def resolve_gdn_binding(
     cls: Any, binding: ModuleBinding, resolved: ResolvedModuleGeometry
 ) -> ResolvedModuleGeometry:
     vals = dict(resolved.values)
+    opts = {k: v for k, v in binding.options.items() if v is not None}
     conv_k = _check_conv_kernel(int(vals.get("conv_kernel", 4)))
+    raw_gate = opts.get("gate", vals.get("gate", "silu"))
+    gate = validate_gdn_gate(raw_gate)
+    opts["gate"] = gate
     vals.update(
         {
             "H": int(vals["hidden"]),
@@ -116,10 +143,12 @@ def resolve_gdn_binding(
             "conv_taps": conv_k - 1,
             "eps": float(vals["eps"]),
             "gdn_l2_eps": float(vals["gdn_l2_eps"]),
+            "gate": gate,
+            "gdn_gate": gate,
         }
     )
     return ResolvedModuleGeometry(
-        cls, binding.prefix, vals, binding.options, binding.rename, binding.transforms
+        cls, binding.prefix, vals, opts, binding.rename, binding.transforms
     )
 
 
