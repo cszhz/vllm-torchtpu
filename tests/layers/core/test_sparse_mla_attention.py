@@ -576,6 +576,123 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         )
         self._check(output, expected, valid)
 
+    @parameterized.named_parameters(
+        dict(testcase_name="joined_q", split_q=False),
+        dict(testcase_name="split_q", split_q=True),
+    )
+    def test_packed_rope_matches_padded(self, split_q):
+        """TPU_SPARSE_MLA_PACKED_ROPE through `sparse_mla_attention`: a
+        prefill then a decode step on the 576 B/token cache give bit-identical
+        outputs to the padded 640 B/token cache (same fp8 bytes, just packed),
+        the same nope cache, and the same rope bytes per token."""
+        self._require_tpu()
+        packed_spec = SparseMLAKVCacheSpec.create(
+            KVCacheType.ROPE,
+            KVCacheLayout.SPARSECORE,
+            TOTAL_PAGES,
+            PAGE_SIZE,
+            ROPE_DIM,
+            KV_PACKING,
+            packed_rope=True,
+        )
+        self.assertEqual(packed_spec.shape, (TOTAL_PAGES, PAGE_SIZE // 8, 128))
+        prior_lens, topk = [24, 40], 128
+        num_seqs = len(prior_lens)
+        mesh = self._make_mesh()
+        block_tables = self._block_tables(num_seqs)
+
+        kv_c_rows, k_pe_rows, positions = [], [], []
+        for q_len in prior_lens:
+            kv_c, k_pe = self._random_latents(q_len)
+            kv_c_rows.append(_quantize_fp8(kv_c, self.k_scale))
+            k_pe_rows.append(_quantize_fp8(k_pe, self.k_scale))
+            positions.extend(range(q_len))
+        total = sum(prior_lens)
+        prefill = dict(
+            ql_nope_q_pe=self._random_queries(total),
+            kv_c=jnp.concatenate(kv_c_rows),
+            k_pe=jnp.concatenate(k_pe_rows),
+            topk_rows=_causal_topk(positions, topk),
+            seq_lens=prior_lens,
+            query_start_loc=np.concatenate([[0], np.cumsum(prior_lens)]),
+            distribution=[0, num_seqs, num_seqs],
+        )
+        num_tokens = TOKEN_PAD
+        pad = num_tokens - num_seqs
+        kv_c_new, k_pe_new = self._random_latents(num_seqs)
+        decode = dict(
+            ql_nope_q_pe=self._random_queries(num_tokens),
+            kv_c=jnp.concatenate(
+                [
+                    _quantize_fp8(kv_c_new, self.k_scale),
+                    jnp.zeros((pad, LKV_DIM), jnp.float8_e4m3fn),
+                ]
+            ),
+            k_pe=jnp.concatenate(
+                [
+                    _quantize_fp8(k_pe_new, self.k_scale),
+                    jnp.zeros((pad, ROPE_DIM), jnp.float8_e4m3fn),
+                ]
+            ),
+            topk_rows=np.concatenate(
+                [_causal_topk(prior_lens, topk), _causal_topk([0] * pad, topk)]
+            ),
+            seq_lens=[n + 1 for n in prior_lens],
+            query_start_loc=list(range(num_seqs + 1)),
+            distribution=[num_seqs, num_seqs, num_seqs],
+        )
+
+        def run(rope_spec):
+            kv_cache = _empty_pair(NOPE_SC_SPEC, rope_spec)
+            outputs = []
+            for step in (prefill, decode):
+                ql_nope, q_pe = step["ql_nope_q_pe"]
+                kv_cache, output = self._call(
+                    kv_cache,
+                    ql_nope,
+                    q_pe,
+                    step["kv_c"],
+                    step["k_pe"],
+                    step["topk_rows"],
+                    step["seq_lens"],
+                    step["query_start_loc"],
+                    step["distribution"],
+                    block_tables,
+                    mesh,
+                    force_sparse=True,
+                    nope_spec=NOPE_SC_SPEC,
+                    rope_spec=rope_spec,
+                )
+                outputs.append(np.asarray(output))
+            return kv_cache, outputs
+
+        with mock.patch.dict(
+            os.environ, {"TPU_MLA_SPARSE_SPLIT_Q": "1" if split_q else "0"}
+        ):
+            padded_cache, padded_out = run(ROPE_SC_SPEC)
+            packed_cache, packed_out = run(packed_spec)
+
+        for step, (a, b) in enumerate(zip(padded_out, packed_out)):
+            np.testing.assert_array_equal(b, a, err_msg=f"step {step} output")
+        np.testing.assert_array_equal(
+            np.asarray(packed_cache[0]), np.asarray(padded_cache[0])
+        )
+        self.assertEqual(2 * packed_cache[1].nbytes, padded_cache[1].nbytes)
+
+        def rope_tokens(words, token_words):
+            # Word `w` byte `b` of a token holds its byte `b * token_words + w`
+            # (`pack_tokens`); a padded token's bytes past 64 are dropped.
+            u8 = np.asarray(words).reshape(-1, token_words).view(np.uint8)
+            tokens = u8.reshape(-1, token_words, 4).transpose(0, 2, 1)
+            return tokens.reshape(-1, 4 * token_words)[:, :ROPE_DIM]
+
+        np.testing.assert_array_equal(
+            rope_tokens(packed_cache[1], 16), rope_tokens(padded_cache[1], 32)
+        )
+        # The decode step attended to real context on both caches.
+        self.assertTrue(np.isfinite(packed_out[1][:num_seqs]).all())
+        self.assertTrue(np.abs(packed_out[1][:num_seqs]).max() > 0)
+
 
 @pytest.mark.tpu_test
 class SparseMlaAttentionDcpValidationTest(parameterized.TestCase):

@@ -126,6 +126,16 @@ class SparseMLAScatterTest(parameterized.TestCase):
             )
             for name, cache_type, layout, head_dim in _LIVE_SPECS
         }
+        # TPU_SPARSE_MLA_PACKED_ROPE: 64 bytes per token, eight to a row.
+        specs["rope_sc_packed"] = SparseMLAKVCacheSpec.create(
+            KVCacheType.ROPE,
+            KVCacheLayout.SPARSECORE,
+            num_pages,
+            page_size,
+            ROPE_DIM,
+            KV_PACKING,
+            packed_rope=True,
+        )
         page, slot = kv_cache_utils.get_page_and_slot(
             num_tokens,
             jnp.asarray(seq_lens),
@@ -208,6 +218,13 @@ class SparseMLAScatterTest(parameterized.TestCase):
     def test_scatter_rope_sc(self, num_seqs, tokens_per_seq, max_seq_len, num_pages):
         inp = self._generate_inputs(num_seqs, tokens_per_seq, max_seq_len, num_pages)
         self._check_scatter(inp, "rope_sc", inp["k_pe"], inp["k_pe_u8"])
+
+    @parameterized.named_parameters(*_SCENARIOS)
+    def test_scatter_rope_sc_packed(
+        self, num_seqs, tokens_per_seq, max_seq_len, num_pages
+    ):
+        inp = self._generate_inputs(num_seqs, tokens_per_seq, max_seq_len, num_pages)
+        self._check_scatter(inp, "rope_sc_packed", inp["k_pe"], inp["k_pe_u8"])
 
     def test_nope_sparsecore_is_byte_identical_to_tensorcore(self):
         """`pack_tokens` reproduces the TC sublane fold, so the two nope
@@ -350,6 +367,49 @@ class SparseMLAScatterTest(parameterized.TestCase):
                 np.asarray(w),
                 err_msg=f"{name} cache differs from the jnp writer",
             )
+
+    @parameterized.named_parameters(*_SCENARIOS)
+    def test_update_packed_rope_matches_the_jnp_writer(
+        self, num_seqs, tokens_per_seq, max_seq_len, num_pages
+    ):
+        """TPU_SPARSE_MLA_PACKED_ROPE through `update_sparse_mla_kv_cache`:
+        the fused SparseCore pair writer (`scatter_pair_rows`) DMAs 16-word
+        rope tokens, eight to a cache row, and lands the same bytes as the jnp
+        writer and as the padded cache's tokens."""
+        inp = self._generate_inputs(num_seqs, tokens_per_seq, max_seq_len, num_pages)
+        nope_spec = inp["specs"]["nope_sc"]
+        caches = {}
+        for key in ("rope_sc", "rope_sc_packed"):
+            rope_spec = inp["specs"][key]
+            args = (
+                inp["caches"]["nope_sc"],
+                inp["caches"][key],
+                inp["kv_c_normed"],
+                inp["k_pe"],
+                inp["seq_lens"],
+                inp["block_tables"],
+                inp["query_start_loc"],
+            )
+            got = kv_cache_utils.update_sparse_mla_kv_cache(
+                *args, nope_spec=nope_spec, rope_spec=rope_spec
+            )
+            want = kv_cache_utils.update_sparse_mla_kv_cache_jax(
+                *args, nope_spec=nope_spec, rope_spec=rope_spec
+            )
+            for name, g, w in zip(("nope", "rope"), got, want):
+                np.testing.assert_array_equal(
+                    np.asarray(g),
+                    np.asarray(w),
+                    err_msg=f"{key}: {name} cache differs from the jnp writer",
+                )
+            caches[key] = got[1]
+        packed, padded = inp["specs"]["rope_sc_packed"], inp["specs"]["rope_sc"]
+        self.assertEqual(2 * caches["rope_sc_packed"].nbytes, caches["rope_sc"].nbytes)
+        # Same token bytes, half the rows: the padded tail is simply gone.
+        np.testing.assert_array_equal(
+            _decode_rows(caches["rope_sc_packed"], packed),
+            _decode_rows(caches["rope_sc"], padded)[:, :ROPE_DIM],
+        )
 
     @parameterized.named_parameters(
         dict(

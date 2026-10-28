@@ -967,6 +967,7 @@ def sparse_mla_attention(
         )
     cache_layout = nope_spec.layout.value
     chunk_kwargs = sparse_mla_chunk_kwargs()
+    packed_rope_kwargs = {"packed_rope": True} if rope_spec.packed_rope else {}
 
     def _sparse_mla_ragged_paged_attention(
         ql_nope,
@@ -1029,6 +1030,7 @@ def sparse_mla_attention(
             cache_layout=cache_layout,
             **chunk_kwargs,
             **split_kwargs,
+            **packed_rope_kwargs,
         )
 
         lkv_dim = ql_nope.shape[-1]
@@ -1169,6 +1171,7 @@ def sparse_mla_attention_dcp(
             f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
         )
     cache_layout = nope_spec.layout.value
+    packed_rope_kwargs = {"packed_rope": True} if rope_spec.packed_rope else {}
 
     def _local(
         ql_nope,
@@ -1249,6 +1252,7 @@ def sparse_mla_attention_dcp(
             topk_cap=topk_cap,
             **chunk_kwargs,
             **split_kwargs,
+            **packed_rope_kwargs,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
