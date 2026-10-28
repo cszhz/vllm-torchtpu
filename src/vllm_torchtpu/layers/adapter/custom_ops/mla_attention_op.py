@@ -606,6 +606,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         no_step_mask = envs.TPU_STREAMIDX_NO_STEP_MASK
         chunk4 = envs.TPU_STREAMIDX_CHUNK4
         shared_meta = self._shared_meta
+        sc_by_length = envs.TPU_SC_TOPK_BY_LENGTH
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -684,6 +685,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 shared_meta=shared_meta,
                 q_block_trim=q_trim,
                 drop_step_mask=no_step_mask,
+                sc_topk_by_length=sc_by_length,
             )
             return cache_kv, topk_indices
 
@@ -716,6 +718,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 q_trim,
                 no_step_mask,
                 chunk4,
+                sc_by_length,
             ),
             build_op,
         )
@@ -773,6 +776,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         no_step_mask = envs.TPU_STREAMIDX_NO_STEP_MASK
         chunk4 = envs.TPU_STREAMIDX_CHUNK4
         shared_meta = self._shared_meta
+        sc_by_length = envs.TPU_SC_TOPK_BY_LENGTH
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
             global_group = register_indexer_layer(self.k_cache.prefix)
@@ -881,6 +885,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 shared_meta=shared_meta,
                 q_block_trim=q_trim,
                 drop_step_mask=no_step_mask,
+                sc_topk_by_length=sc_by_length,
                 **overlap,
             )
             if qb_overlap:

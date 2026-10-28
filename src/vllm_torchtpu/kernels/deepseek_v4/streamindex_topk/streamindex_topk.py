@@ -1400,6 +1400,7 @@ def _effective_row_lengths(
         "q_block_trim",
         "drop_step_mask",
         "dcp_axis_name",
+        "sc_topk_by_length",
     ),
 )
 def streamindex_topk(
@@ -1437,6 +1438,7 @@ def streamindex_topk(
     q_block_trim: bool = False,
     drop_step_mask: bool = False,
     dcp_axis_name: str | None = None,
+    sc_topk_by_length: bool | None = None,
 ) -> jax.Array | tuple[Any, ...]:  # (out, [scores,] [tied])
     """StreamIndex Top-K retrieval.
 
@@ -1547,6 +1549,8 @@ def streamindex_topk(
         ranks), and the result is this rank's share of it, as rank-local
         positions packed into a prefix and `-1` padded. No merge is needed
         afterwards. Needs `return_scores=False`.
+      sc_topk_by_length: `sparsecore_topk(by_length=...)`; None reads
+        TPU_SC_TOPK_BY_LENGTH. Same indices and scores.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -2112,6 +2116,7 @@ def streamindex_topk(
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=True,
+                    by_length=sc_topk_by_length,
                 )
                 topk_scores_list.append(chunk_topk_scores)
             else:
@@ -2122,6 +2127,7 @@ def streamindex_topk(
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=False,
+                    by_length=sc_topk_by_length,
                 )
             topk_idxs.append(chunk_topk_idxs)
 
@@ -2214,6 +2220,7 @@ SMALL_AG_MAX_TOKENS = 8
         "shared_meta",
         "q_block_trim",
         "drop_step_mask",
+        "sc_topk_by_length",
     ),
 )
 def streamindex_topk_dcp(
@@ -2255,6 +2262,7 @@ def streamindex_topk_dcp(
     shared_meta: bool = False,
     q_block_trim: bool = False,
     drop_step_mask: bool = False,
+    sc_topk_by_length: bool | None = None,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -2339,6 +2347,8 @@ def streamindex_topk_dcp(
       shared_meta: forwarded to `streamindex_topk`; see there. Same result.
       q_block_trim: forwarded to `streamindex_topk`; see there. Same result.
       drop_step_mask: forwarded to `streamindex_topk`; see there. Same result.
+      sc_topk_by_length: `sparsecore_topk(by_length=...)` for the local top-k
+        and the all-to-all merge's stage 2. Same result.
       global_scheduling_group_id: XLA scheduling group of the cross-rank
         SparseCore merge (stage 2), which the layer's independent TensorCore
         work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
@@ -2522,6 +2532,7 @@ def streamindex_topk_dcp(
             q_block_trim=q_block_trim,
             drop_step_mask=drop_step_mask,
             dcp_axis_name=dcp_axis_name if hist_merge else None,
+            sc_topk_by_length=sc_topk_by_length,
         )
         scores = None
         if pin:
@@ -2578,6 +2589,7 @@ def streamindex_topk_dcp(
                     (scores.shape[0],), scores.shape[1], dtype=jnp.int32
                 ),
                 write_empty_rows=True,
+                by_length=sc_topk_by_length,
             )
             # Stage 3. Every rank's merged block back, in token order: [T, k]
             # slots. A slot names its source rank and that rank's own list, so

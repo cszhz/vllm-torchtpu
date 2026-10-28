@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = True
     TPU_SC_TOPK_COOP_V2: bool = True
     TPU_SC_TOPK_COOP_MERGE: bool = True
+    TPU_SC_TOPK_BY_LENGTH: bool = False
     TPU_DCP_INDEXER_SMALL_AG: bool = True
     TPU_INDEXER_TOPK_SHARED_READ: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
@@ -1619,6 +1620,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # subcore walking all dcp * k scores; only the subcore holding this rank's
     # segment emits. T > 16 keeps the one-subcore merge. Bitwise identical.
     "TPU_SC_TOPK_COOP_MERGE": env_bool("TPU_SC_TOPK_COOP_MERGE", default=True),
+    # `sparsecore_topk` at P > 1 with >= 32 rows (n > 64K words): select each
+    # row that fits one subcore's buffer (~120K words) whole on that subcore,
+    # fetched up to its own length (`sparsecore_topk._sc_topk_by_length`);
+    # only longer rows take the cooperative call, a select merges the two.
+    # Same index and key arrays, order included, so the DCP merges see the
+    # same candidate lists. Fewer rows keep the cooperative split.
+    "TPU_SC_TOPK_BY_LENGTH": env_bool("TPU_SC_TOPK_BY_LENGTH", default=False),
     # With TPU_SC_TOPK_DCP_MERGE_FLAT's flat path, buckets T <= 8
     # (streamindex_topk.SMALL_AG_MAX_TOKENS): the DCP
     # indexer's candidate all-gather (dcp x T * k int32 words) as one Pallas

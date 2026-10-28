@@ -266,9 +266,9 @@ def _need_devices(dcp_size):
         pytest.skip(f"needs {dcp_size} devices, have {n}")
 
 
-def _dcp_case(dcp_size, seed, q_len=Q_LEN):
+def _dcp_case(dcp_size, seed, q_len=Q_LEN, kv_len=KV_LEN, seq_len=None):
     """Records plus the positional args and kwargs of one sharded DCP call."""
-    rec = _global_records(KV_LEN)
+    rec = _global_records(kv_len)
     kq, kw = jax.random.split(jax.random.key(seed))
     q = (jax.random.normal(kq, (q_len, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
         jnp.float8_e4m3fn
@@ -277,7 +277,7 @@ def _dcp_case(dcp_size, seed, q_len=Q_LEN):
 
     # interleave_size=1: global position g lives on rank g % dcp_size at local
     # index g // dcp_size, so the shards are a strided de-interleave.
-    vpages = KV_LEN // (PAGE_SIZE * dcp_size)
+    vpages = kv_len // (PAGE_SIZE * dcp_size)
     shards = jnp.concatenate(
         [
             rec[r::dcp_size].reshape(vpages, PAGE_SIZE // 4, 4, WIDTH)
@@ -292,7 +292,7 @@ def _dcp_case(dcp_size, seed, q_len=Q_LEN):
         q,
         weights,
         shards,
-        jnp.array([KV_LEN], jnp.int32),
+        jnp.array([seq_len or kv_len], jnp.int32),
         jnp.arange(vpages, dtype=jnp.int32),
         jnp.array([0, q_len], jnp.int32),
         jnp.array([0, 0, 1], jnp.int32),
@@ -768,6 +768,37 @@ def test_flat_merge_matches_padded(dcp_size, q_len):
     _, args, kwargs = _dcp_case(dcp_size, 41, q_len=q_len)
     want = np.asarray(streamindex_topk_dcp(*args, **kwargs, flat_merge=False))
     got = np.asarray(streamindex_topk_dcp(*args, **kwargs, flat_merge=True))
+    np.testing.assert_array_equal(got, want)
+    assert (want >= 0).any()
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize(
+    "dcp_size,kv_len,seq_len",
+    [
+        (2, 3 << 16, None),
+        (4, 3 << 17, None),
+        (8, 1 << 20, None),
+        (8, 1 << 20, 100 << 10),
+        (8, KV_LEN, None),
+    ],
+    ids=["dcp2-96k", "dcp4-96k", "dcp8-128k", "dcp8-128k-short", "dcp8-4k"],
+)
+@pytest.mark.parametrize("q_len", [16, 64, 256])
+@pytest.mark.parametrize("merge", ["all_gather", "a2a"])
+def test_sc_topk_by_length_matches_default(dcp_size, kv_len, seq_len, q_len, merge):
+    """TPU_SC_TOPK_BY_LENGTH on vs off, byte for byte: the merges read the
+    local lists by slot, so their order must not move. Per-rank rows of 96K
+    words fit the by-length buffer; 128K ones (1M over DCP 8) take the
+    cooperative call, a 100K context over a 1M table the by-length one."""
+    _need_devices(dcp_size)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(
+        dcp_size, 43, q_len=q_len, kv_len=kv_len, seq_len=seq_len
+    )
+    kwargs["a2a_merge"] = merge == "a2a"
+    want = np.asarray(streamindex_topk_dcp(*args, **kwargs, sc_topk_by_length=False))
+    got = np.asarray(streamindex_topk_dcp(*args, **kwargs, sc_topk_by_length=True))
     np.testing.assert_array_equal(got, want)
     assert (want >= 0).any()
 
