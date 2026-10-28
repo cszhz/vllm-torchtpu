@@ -642,6 +642,27 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
             _to_np(got_layer), _to_np(want_layer), rtol=BF16_RTOL, atol=BF16_ATOL
         )
 
+    @parameterized.product(num_tokens=[17, 300, 1024])
+    def test_embed_matches_repeated_residual(self, num_tokens):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import pre_kernel
+
+        hidden_size = 4096
+        rng = np.random.default_rng(7)
+        _, fn, hc_scale, hc_base = _make_pre_inputs(rng, num_tokens, hidden_size)
+        embed = jnp.asarray(
+            rng.standard_normal((num_tokens, hidden_size), dtype=np.float32)
+        ).astype(jnp.bfloat16)
+        repeated = jnp.repeat(embed[:, None, :], HC_MULT, axis=1)
+        rest = (jnp.asarray(fn), jnp.asarray(hc_scale), jnp.asarray(hc_base))
+        gates = (RMS_EPS, HC_PRE_EPS, HC_SINKHORN_EPS, HC_POST_MULT_VALUE, 20)
+
+        want = pre_kernel.mhc_pre(repeated, *rest, *gates)
+        got = pre_kernel.mhc_pre_embed(embed, *rest, *gates)
+
+        # Reassociated f32 sums: equal to f32 rounding, not bit for bit.
+        for g, w, tol in zip(got, want, (F32_RTOL, F32_RTOL, BF16_RTOL)):
+            np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=tol, atol=tol)
+
 
 @pytest.mark.tpu_test
 class MhcPostHeadRowsPallasTpuTest(parameterized.TestCase):

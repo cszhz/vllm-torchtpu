@@ -116,8 +116,15 @@ def stack_fn_chunks_into(fn_ref, out_ref, lanes: int = 1024) -> None:
 
     f32 -> bf16 casts round to nearest even, as ``split_fn3``'s
     reduce_precision does, and each remainder is exact, so the chunks match.
+
+    When ``out_ref`` is narrower than fn, fn's column blocks of its width
+    are summed in f32 first (left to right): ``x @ chunks.T`` is then
+    ``concat([x] * n) @ fn.T`` up to f32 rounding of the summed weights.
     """
-    rows, cols = fn_ref.shape
+    rows = fn_ref.shape[0]
+    cols = out_ref.shape[1]
+    n_sum = fn_ref.shape[1] // cols
+    assert fn_ref.shape[1] == n_sum * cols, (fn_ref.shape, out_ref.shape)
     n_chunks = out_ref.shape[0] // rows
     lanes = min(lanes, cols)
     assert cols % lanes == 0, (cols, lanes)
@@ -125,6 +132,9 @@ def stack_fn_chunks_into(fn_ref, out_ref, lanes: int = 1024) -> None:
     def body(c, carry):
         sl = pl.ds(pl.multiple_of(c * lanes, lanes), lanes)
         rem = fn_ref[:, sl]
+        for s in range(1, n_sum):
+            start = pl.multiple_of(s * cols + c * lanes, lanes)
+            rem = rem + fn_ref[:, pl.ds(start, lanes)]
         for k in range(n_chunks):
             part = rem.astype(jnp.bfloat16)
             out_ref[k * rows : (k + 1) * rows, sl] = part

@@ -90,6 +90,32 @@ def _mhc_pre_jax(
     )
 
 
+def _mhc_pre_embed_jax(
+    embed: jax.Array,
+    fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``_mhc_pre_jax`` of ``embed`` repeated into every stream."""
+    return pre_kernel.mhc_pre_embed(
+        embed,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+
+
 def _mhc_post_jax(
     x: jax.Array,
     residual: jax.Array,
@@ -210,6 +236,12 @@ def _fake_pre_outputs(
 def _fake_mhc_pre(residual, fn, hc_scale, hc_base, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return _fake_pre_outputs(residual)
+
+
+def _fake_mhc_pre_embed(embed, fn, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    hc_mult = fn.shape[1] // embed.shape[-1]
+    return _fake_pre_outputs(embed.unsqueeze(-2).expand(*embed.shape[:-1], hc_mult, -1))
 
 
 def _fake_mhc_post(x, residual, post_layer_mix, comb_res_mix, *args, **kwargs):
@@ -394,6 +426,41 @@ def _mhc_fused_post_pre_op(
     return op
 
 
+def _mhc_pre_embed_op(
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+):
+    op_name = "pallas::deepseek_v4_mhc_pre_embed_v1" + _gate_suffix(
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    )
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(
+                _mhc_pre_embed_jax,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_repeat=sinkhorn_repeat,
+            ),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # embed
+                P(),  # fn
+                P(),  # hc_scale
+                P(),  # hc_base
+            ),
+        )
+        op.register_fake(_fake_mhc_pre_embed)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
 class MHCOps(NamedTuple):
     """The three registered mHC ops for one set of gate constants.
 
@@ -410,11 +477,15 @@ class MHCOps(NamedTuple):
     ``fused(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base)``
         residual_cur -- the ``post`` output -- then ``pre``'s three outputs
         computed from it.
+    ``pre_embed(embed, fn, hc_scale, hc_base)``
+        ``pre`` of a residual that repeats the (..., hidden_size) embedding
+        in every stream (the chain start), reading the embedding once.
     """
 
     pre: Any
     fused: Any
     post: Any
+    pre_embed: Any
 
 
 def get_mhc_ops(
@@ -440,4 +511,7 @@ def get_mhc_ops(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         ),
         post=get_mhc_post_op(),
+        pre_embed=_mhc_pre_embed_op(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        ),
     )

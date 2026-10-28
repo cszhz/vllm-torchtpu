@@ -182,9 +182,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         `x` arrives as the previous sublayer's raw output and the caller
         carries `(residual, post_mix, res_mix)` -- the recombine that output
         still owes. The chain is opened by the layer-0 attention pre, which
-        has no preceding post, and closed by the caller.
+        has no preceding post, and closed by the caller. The opening `x` is
+        the (tokens, hidden) embedding, or the (tokens, hc_mult, hidden)
+        streams a previous pipeline stage handed over.
         """
-        if residual is None:
+        if residual is None and x.dim() == 2:
+            # Chain start on the embedding, which every stream repeats: the
+            # pre reads it once instead of hc_mult copies.
+            residual = x.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            post_mix, res_mix, x = self.mhc_ops.pre_embed(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
+        elif residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
             x, post_mix, res_mix = self.hc_pre(
@@ -482,7 +491,7 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            # Layer 0 opens the hc_mult streams on it.
         else:
             assert intermediate_tensors is not None
             hidden_states = typing.cast(
