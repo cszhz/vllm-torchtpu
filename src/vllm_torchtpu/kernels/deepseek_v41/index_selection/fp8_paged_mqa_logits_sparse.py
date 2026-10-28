@@ -189,17 +189,23 @@ def _kernel(
                         // info.num_lanes
                         * info.num_lanes
                     )
-                    local_flags = jnp.stack(
-                        [
-                            membership[
-                                r,
-                                pl.ds(
-                                    pl.multiple_of(first_flag, info.num_lanes),
-                                    info.num_lanes,
-                                ),
-                            ]
-                            for r in row_ids(query)
+
+                    def flags_for_row(row, first_flag):
+                        flags = membership[
+                            pl.ds(row // sublanes * sublanes, sublanes),
+                            pl.ds(first_flag, info.num_lanes),
                         ]
+                        return jnp.sum(
+                            jnp.where(
+                                jnp.arange(sublanes)[:, None] == row % sublanes,
+                                flags,
+                                0,
+                            ),
+                            axis=0,
+                        )
+
+                    local_flags = jnp.stack(
+                        [flags_for_row(r, first_flag) for r in row_ids(query)]
                     )
                     allowed = (
                         jnp.take_along_axis(
@@ -374,7 +380,13 @@ def fp8_gathered_mqa_logits(
     columns = pl.cdiv(width // membership_block_size, info.num_lanes) * info.num_lanes
     membership = jnp.pad(
         block_membership[:, :columns].astype(jnp.int32),
-        ((0, 0), (0, max(0, columns - block_membership.shape[1]))),
+        (
+            (
+                0,
+                pl.cdiv(q.shape[0], info.num_sublanes) * info.num_sublanes - q.shape[0],
+            ),
+            (0, max(0, columns - block_membership.shape[1])),
+        ),
     )
     q_tile, heads, dim = config.query_tile, q.shape[1], q.shape[2]
     scratch = (

@@ -42,7 +42,7 @@ def test_gathered_logits_match_dense_and_query_masks(width, key_tile, start, cou
     )
     q = jnp.asarray(rng.normal(size=(7, 32, 128))).astype(jnp.float8_e4m3fn)
     weights = jnp.asarray(rng.uniform(0.01, 0.1, (7, 32)), jnp.float32)
-    lengths = jnp.array([width, width - 1, width // 2, 0, 0, width - 7, width])
+    lengths = jnp.array([width, width - 1, width // 3, 0, 0, width - 7, width])
     offsets = jnp.array([0, 0, 2, 3, 3, 5, 7], jnp.int32)
     pages = jnp.asarray(np.stack([rng.permutation(layout.pages) for _ in range(6)]))
     gathered = cache.reshape(layout.pages, 33, 128)[pages].reshape(-1, 128)
