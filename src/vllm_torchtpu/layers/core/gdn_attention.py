@@ -442,12 +442,13 @@ def _derive_pcp_ragged_exchange_descriptors(
 
 def _validate_pcp_ragged_exchange_layout_support() -> None:
     generation = pltpu.get_tpu_info().generation
+    # TPU7x and TPU8i share the 8x128 tiling this explicit layout assumes.
     # TODO: Validate this explicit tiled layout on TPU v4/v5e/v6 and relax
     # this guard once compile and numerical coverage exists for those targets.
-    if generation != 7:
+    if generation not in (7, 8):
         raise NotImplementedError(
             "GDN PCP ragged exchange layout is only validated on TPU "
-            f"generation 7, got generation {generation}."
+            f"generations 7 and 8, got generation {generation}."
         )
 
 

@@ -437,16 +437,19 @@ def test_derive_pcp_ragged_exchange_descriptors_reconstructs_reorder(
     assert int(sizes.sum()) == int(lengths.sum())
 
 
-def test_pcp_ragged_exchange_layout_accepts_tpu_generation_7(monkeypatch):
+@pytest.mark.parametrize("generation", (7, 8))
+def test_pcp_ragged_exchange_layout_accepts_validated_tpu_generation(
+    monkeypatch, generation
+):
     monkeypatch.setattr(
         "vllm_torchtpu.layers.core.gdn_attention.pltpu.get_tpu_info",
-        lambda: SimpleNamespace(generation=7),
+        lambda: SimpleNamespace(generation=generation),
     )
 
     _validate_pcp_ragged_exchange_layout_support()
 
 
-@pytest.mark.parametrize("generation", (4, 5, 6, 8))
+@pytest.mark.parametrize("generation", (4, 5, 6))
 def test_pcp_ragged_exchange_layout_rejects_unvalidated_tpu_generation(
     monkeypatch, generation
 ):
@@ -457,7 +460,7 @@ def test_pcp_ragged_exchange_layout_rejects_unvalidated_tpu_generation(
 
     with pytest.raises(
         NotImplementedError,
-        match="only validated on TPU generation 7",
+        match="only validated on TPU generations 7 and 8",
     ):
         _validate_pcp_ragged_exchange_layout_support()
 
