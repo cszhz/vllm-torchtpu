@@ -20,6 +20,22 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import config
 
+# scatter_meta fields per compacted row: flags, a 5-bit row source, and the
+# row's output pair in the remaining high bits.
+META_SAME_AS_PREV = 1
+META_PAIR_FINAL = 2
+# The row's token is the high (odd) half of its pair.
+META_IS_ODD = 4
+META_SRC_SHIFT = 3
+META_SRC_MASK = 31
+META_PAIR_SHIFT = 8
+# Row sources: 0..15 a row of the chunk, else the low carry, a zero row, none.
+# A pair-final row's source is its pair's low half; the last row of a chunk
+# that ends inside a pair names the row to keep as that pair's low carry.
+SRC_CARRY = 16
+SRC_ZERO = 17
+SRC_NONE = 31
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -28,6 +44,7 @@ class IndexRef:
     indices: Any
     sorted_by_validity: Any
     scatter_meta: Any
+    sort_order: Any
 
 
 @jax.tree_util.register_dataclass
@@ -48,6 +65,10 @@ class ScratchRef:
     src_indices_vmem: Any
     tw_f32_vmem: Any
     out_vmem: Any
+    packed_vmem: Any
+    pair_smem: Any
+    zero_vmem: Any
+    zero_ids_vmem: Any
     sem: Any
 
     @classmethod
@@ -55,7 +76,7 @@ class ScratchRef:
         num_simd_lanes = cfg.sc_info.num_lanes
         window_vmem = pltpu.VMEM((cfg.window_size,), jnp.int32)
         return cls(
-            partition_bounds_vmem=pltpu.VMEM((2 * num_simd_lanes,), jnp.int32),
+            partition_bounds_vmem=pltpu.VMEM((4 * num_simd_lanes,), jnp.int32),
             prev_iter_last_row_vmem=pltpu.VMEM(
                 (cfg.num_col_chunks, cfg.col_chunk_size), jnp.float32
             ),
@@ -63,10 +84,21 @@ class ScratchRef:
             scatter_meta_vmem=window_vmem,
             src_indices_vmem=window_vmem,
             tw_f32_vmem=pltpu.VMEM((cfg.window_size,), jnp.float32),
-            # Double-buffered so a step's scatters drain under the next step.
-            out_vmem=pltpu.VMEM((2, num_simd_lanes, cfg.col_chunk_size), jnp.float32),
-            # recv, scatter slot 0, scatter slot 1, row-metadata gather.
-            sem=pltpu.SemaphoreType.DMA((4,)),
+            # Each chunk row's reduced value, then the low carries, a zero row.
+            out_vmem=pltpu.VMEM(
+                (cfg.num_reduced_rows, cfg.col_chunk_size), jnp.float32
+            ),
+            # The output words of a step's pair writes.
+            packed_vmem=pltpu.VMEM((num_simd_lanes, cfg.col_chunk_size), jnp.uint32),
+            # A step's pair writes (see kernel._SINGLE_ROW), then those in flight.
+            pair_smem=pltpu.SMEM((6 * num_simd_lanes + 1,), jnp.int32),
+            zero_vmem=pltpu.VMEM((num_simd_lanes, cfg.zero_cols), jnp.uint32),
+            zero_ids_vmem=pltpu.VMEM(
+                (config.ZERO_ID_WINDOW_CHUNKS * num_simd_lanes,), jnp.int32
+            ),
+            # recv, pair writes, empty-pair id gather, row-metadata gather,
+            # empty-pair zero scatter.
+            sem=pltpu.SemaphoreType.DMA((5,)),
         )
 
 

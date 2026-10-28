@@ -25,6 +25,14 @@ def _align_to(a, b):
     return pl.cdiv(a, b) * b
 
 
+# Column width of each empty-pair zero scatter (capped at col_size): wider means
+# fewer scatters but a larger zero source to clear per call.
+ZERO_SCATTER_COLS = 512
+
+# 16-id chunks of empty-pair ids staged per round of zero scatters.
+ZERO_ID_WINDOW_CHUNKS = 16
+
+
 class _CostModelConstants:
     # Limit on the number of outer loop pipeline iterations. Too many iterations
     # cause high cumulative pipeline overhead (e.g., from frequent pipeline
@@ -81,15 +89,34 @@ class Config:
         return self.input_size // self.reduce_group_size
 
     @property
-    def first_garbage_row(self) -> int:
-        """First of the kernel output's throwaway rows, after the padded output."""
+    def padded_output_size(self) -> int:
         return self.padded_input_size // self.reduce_group_size
 
     @property
-    def num_output_rows(self) -> int:
-        """Kernel output rows: the padded output, then one garbage row per lane of
-        each row partition."""
-        return self.first_garbage_row + self.num_row_partitions * self.sc_info.num_lanes
+    def num_pairs(self) -> int:
+        """Output rows viewed as 32-bit words: a bf16 output packs tokens
+        2q and 2q+1 into word row q (a "pair"); for float32 a pair is one token."""
+        return self.padded_output_size >> self.row_shift
+
+    @property
+    def carry_row(self) -> int:
+        """First low-carry row of out_vmem, after the chunk's rows."""
+        return self.sc_info.num_lanes
+
+    @property
+    def zero_row(self) -> int:
+        return self.carry_row + self.num_col_chunks
+
+    @property
+    def num_reduced_rows(self) -> int:
+        return self.zero_row + 1
+
+    @property
+    def zero_cols(self) -> int:
+        """Width of the zero source the empty-pair scatters read."""
+        cols = min(ZERO_SCATTER_COLS, self.col_size)
+        assert self.col_size % cols == 0, (self.col_size, cols)
+        return cols
 
     @property
     def in_dtype_bytes(self) -> int:
@@ -97,7 +124,8 @@ class Config:
 
     @property
     def padded_input_size(self) -> int:
-        align_val = self.num_row_partitions * self.reduce_group_size
+        # An even number of groups: a bf16 output packs two groups per 32-bit row.
+        align_val = 2 * self.num_row_partitions * self.reduce_group_size
         return _align_to(self.input_size, align_val)
 
     @property
@@ -119,7 +147,8 @@ class Config:
     def max_rows_per_partition(self) -> int:
         """Most compacted rows a row partition reads, alignment lead included."""
         num_simd_lanes = self.sc_info.num_lanes
-        return self.row_partition_size + self.reduce_group_size + num_simd_lanes - 2
+        # Boundaries snap back to a pair start: up to two groups of lead.
+        return self.row_partition_size + 2 * self.reduce_group_size + num_simd_lanes - 2
 
     @property
     def max_window(self) -> int:
@@ -133,12 +162,17 @@ class Config:
         words_per_subcore = self.sc_info.vmem_capacity_bytes // 4
         num_simd_lanes = self.sc_info.num_lanes
         # Input-size-independent resident scratch (32-bit words): prev-row carry
-        # (col_size), the double-buffered column gather and scatter source
-        # (4*lanes*col_chunk) and the partition bounds (2*lanes).
+        # (col_size), the double-buffered column gather (2*lanes*col_chunk), the
+        # reduced rows and the packed pair words ((reduced+lanes)*col_chunk), the
+        # partition bounds (4*lanes), the zero source (lanes*zero_cols) and the
+        # staged empty-pair ids.
         fixed = (
             self.col_size
-            + 4 * num_simd_lanes * self.col_chunk_size
-            + 2 * num_simd_lanes
+            + 2 * num_simd_lanes * self.col_chunk_size
+            + (self.num_reduced_rows + num_simd_lanes) * self.col_chunk_size
+            + 4 * num_simd_lanes
+            + num_simd_lanes * self.zero_cols
+            + ZERO_ID_WINDOW_CHUNKS * num_simd_lanes
         )
         # Four resident words per row: sort slot, packed scatter metadata, source
         # row index and top-k weight.

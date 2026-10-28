@@ -30,25 +30,37 @@ def call_kernel_pipeline(
 ):
     """Reduces this row partition's compacted rows [start, end) in one flat pipeline.
 
-    Every reduce group lies inside one partition's range, so a group's last row
-    holds its full sum and is the group's only scatter. The range is walked in
+    Every output pair lies inside one partition's range, so a pair's last row
+    carries its final value and is the pair's only write. The range is walked in
     16-row chunks from ``start`` rounded down to a chunk boundary; rows outside
-    [start, end) are computed but routed to the partition's garbage rows.
+    [start, end) are computed but not written. The partition's empty pairs are
+    zeroed by scatters issued first, which drain under the pipeline.
     """
     num_simd_lanes = cfg.sc_info.num_lanes
     bounds = refs.scratch.partition_bounds_vmem
-    starts = bounds[pl.ds(0, num_simd_lanes)]
-    ends = bounds[pl.ds(num_simd_lanes, num_simd_lanes)]
-    start = jnp.array(0, jnp.int32)
-    end = jnp.array(0, jnp.int32)
+    fields = [bounds[pl.ds(k * num_simd_lanes, num_simd_lanes)] for k in range(4)]
+    start, end, zero_start, zero_end = [jnp.array(0, jnp.int32)] * 4
     for i in range(cfg.num_row_partitions):
-        start = jnp.where(row_partition_id == i, starts[i], start)
-        end = jnp.where(row_partition_id == i, ends[i], end)
+        is_mine = row_partition_id == i
+        start = jnp.where(is_mine, fields[0][i], start)
+        end = jnp.where(is_mine, fields[1][i], end)
+        zero_start = jnp.where(is_mine, fields[2][i], zero_start)
+        zero_end = jnp.where(is_mine, fields[3][i], zero_end)
     first_row = start - start % num_simd_lanes
-    # Each partition owns one garbage row per lane, so no two subcores' throwaway
-    # writes land on the same HBM row.
-    garbage_start = cfg.first_garbage_row + row_partition_id * num_simd_lanes
     num_chunks = jnp.where(end > start, pl.cdiv(end - first_row, num_simd_lanes), 0)
+
+    num_zero_scatters = _start_zero_pair_scatters(
+        zero_start, zero_end, refs, col_start, cfg
+    )
+
+    # The zero row stands in for a pair's missing half.
+    @plsc.parallel_loop(0, cfg.col_chunk_size, step=num_simd_lanes)
+    def _(col):
+        refs.scratch.out_vmem[cfg.zero_row, pl.ds(col, num_simd_lanes)] = jnp.zeros(
+            (num_simd_lanes,), jnp.float32
+        )
+
+    refs.scratch.pair_smem[_PENDING_WRITES] = 0
 
     # The resident row metadata holds one window of chunks, so the chunks are run
     # one window at a time; the window count follows the partition's row count.
@@ -59,13 +71,114 @@ def call_kernel_pipeline(
             refs=refs,
             start=start,
             end=end,
-            garbage_start=garbage_start,
             first_row=first_row,
             num_chunks=num_chunks,
             col_start=col_start,
             cfg=cfg,
         )
     )
+
+    _wait_pair_writes(refs, cfg)
+
+    @pl.loop(0, num_zero_scatters)
+    def _(_):
+        _zero_pair_scatter(
+            jnp.zeros((num_simd_lanes,), jnp.int32), 0, refs, col_start, cfg
+        ).wait()
+
+
+# pair_smem layout: per step, 16-entry lists of single-token pair writes (row,
+# shift, pair) and two-token pair writes (low row, high row, pair), then the
+# number of pair writes in flight.
+_SINGLE_ROW, _SINGLE_SHIFT, _SINGLE_PAIR, _BOTH_LOW, _BOTH_HIGH, _BOTH_PAIR = (
+    16 * k for k in range(6)
+)
+_PENDING_WRITES = 96
+
+
+def _out_words(refs: memory_ref.KernelRefs) -> jax.Ref:
+    """The output as 32-bit word rows (one row per pair, see Config)."""
+    return refs.data.out.bitcast(jnp.uint32)
+
+
+def _zero_pair_scatter(
+    pairs: jax.Array,
+    piece: int | jax.Array,
+    refs: memory_ref.KernelRefs,
+    col_start: jax.Array,
+    cfg: config.Config,
+):
+    cols = pl.ds(col_start + piece * cfg.zero_cols, cfg.zero_cols)
+    return pltpu.make_async_copy(
+        refs.scratch.zero_vmem,
+        _out_words(refs).at[pairs, cols],
+        refs.scratch.sem.at[4],
+    )
+
+
+def _start_zero_pair_scatters(
+    zero_start: jax.Array,
+    zero_end: jax.Array,
+    refs: memory_ref.KernelRefs,
+    col_start: jax.Array,
+    cfg: config.Config,
+) -> jax.Array:
+    """Starts zero scatters over this partition's columns of its empty pairs,
+    ``sort_order[zero_start:zero_end] - num_rows``, 16 pairs per scatter.
+
+    Lanes past ``zero_end`` repeat their chunk's first pair (an idempotent zero
+    write). Returns the number of scatters started.
+    """
+    num_simd_lanes = cfg.sc_info.num_lanes
+    scratch = refs.scratch
+    ids_sem = scratch.sem.at[2]
+    window_chunks = config.ZERO_ID_WINDOW_CHUNKS
+    num_pieces = cfg.col_size // cfg.zero_cols
+    lanes = jax.lax.broadcasted_iota(jnp.int32, (num_simd_lanes,), 0)
+    num_zero_chunks = jnp.where(
+        zero_end > zero_start, pl.cdiv(zero_end - zero_start, num_simd_lanes), 0
+    )
+
+    @plsc.parallel_loop(0, cfg.zero_cols, step=num_simd_lanes)
+    def _(col):
+        for row in range(num_simd_lanes):
+            scratch.zero_vmem[row, pl.ds(col, num_simd_lanes)] = jnp.zeros(
+                (num_simd_lanes,), jnp.uint32
+            )
+
+    def ids_gather(chunk, window_chunk):
+        chunk_start = zero_start + chunk * num_simd_lanes
+        positions = chunk_start + lanes
+        positions = jnp.where(positions < zero_end, positions, chunk_start)
+        return pltpu.make_async_copy(
+            refs.index.sort_order.at[positions],
+            scratch.zero_ids_vmem.at[
+                pl.ds(window_chunk * num_simd_lanes, num_simd_lanes)
+            ],
+            ids_sem,
+        )
+
+    @pl.loop(0, pl.cdiv(num_zero_chunks, window_chunks))
+    def _(window):
+        first = window * window_chunks
+        count = jnp.minimum(window_chunks, num_zero_chunks - first)
+
+        @pl.loop(0, count)
+        def _(k):
+            ids_gather(first + k, k).start()
+
+        @pl.loop(0, count)
+        def _(k):
+            ids_gather(first + k, k).wait()
+
+        @pl.loop(0, count)
+        def _(k):
+            ids = scratch.zero_ids_vmem[pl.ds(k * num_simd_lanes, num_simd_lanes)]
+            pairs = ids - cfg.padded_input_size
+            for piece in range(num_pieces):
+                _zero_pair_scatter(pairs, piece, refs, col_start, cfg).start()
+
+    return num_zero_chunks * num_pieces
 
 
 def _window_kernel(
@@ -74,7 +187,6 @@ def _window_kernel(
     refs: memory_ref.KernelRefs,
     start: jax.Array,
     end: jax.Array,
-    garbage_start: jax.Array,
     first_row: jax.Array,
     num_chunks: jax.Array,
     col_start: jax.Array,
@@ -131,7 +243,6 @@ def _window_kernel(
             refs=refs,
             start=start,
             end=end,
-            garbage_start=garbage_start,
             window_start=window_start,
             col_start=col_start,
             cfg=cfg,
@@ -172,16 +283,12 @@ def _col_kernel(
     refs: memory_ref.KernelRefs,
     start: jax.Array,
     end: jax.Array,
-    garbage_start: jax.Array,
     window_start: jax.Array,
     col_start: jax.Array,
     cfg: config.Config,
 ):
     r = pl.program_id(0)
     c = pl.program_id(1)
-    step = r * cfg.num_col_chunks + c
-    slot = step % 2
-    col_hbm_start = col_start + c * cfg.col_chunk_size
     num_simd_lanes = cfg.sc_info.num_lanes
     scratch = refs.scratch
     out_vmem = scratch.out_vmem
@@ -190,7 +297,7 @@ def _col_kernel(
     tw_slice = scratch.tw_f32_vmem[row_slice]
     src_idx_slice = scratch.src_indices_vmem[row_slice]
     meta_slice = scratch.scatter_meta_vmem[row_slice]
-    same_as_prev = jnp.bitwise_and(meta_slice, 1)
+    same_as_prev = jnp.bitwise_and(meta_slice, memory_ref.META_SAME_AS_PREV)
 
     def reduce_rows(slot_out_vmem: jax.Ref):
         @plsc.parallel_loop(0, cfg.col_chunk_size, step=num_simd_lanes)
@@ -226,35 +333,159 @@ def _col_kernel(
                 )
                 previous_accumulated_data = accumulated_data
 
-                # The output buffer stays float32: a bfloat16 output would be
-                # (16, 128)-tiled and the per-row scatter below writes a single
-                # row at an arbitrary, non-tile-aligned destination, which is only
-                # legal for 32-bit elements. The cast happens in the wrapper.
                 slot_out_vmem[row_src, col_slice] = accumulated_data
                 if row_src == num_simd_lanes - 1:
                     scratch.prev_iter_last_row_vmem[c, col_slice] = accumulated_data
 
-    # A static slot keeps the out_vmem address out of the loop's scalar registers.
-    for static_slot in range(2):
-        pl.when(slot == static_slot)(
-            functools.partial(reduce_rows, out_vmem.at[static_slot])
-        )
+    # The chunk's rows are consumed within the step (the pair writes read
+    # packed_vmem), so one set of rows suffices.
+    reduce_rows(out_vmem.at[pl.ds(0, num_simd_lanes)])
 
-    # Each row's scatter destination: a group's last row carries the group's
-    # full sum, every other row (and every row outside [start, end)) goes to its
-    # lane's garbage row.
+    # Each pair whose last row is in this chunk and in [start, end) is packed into
+    # a row of packed_vmem: a pair with one token from that token's row, from the
+    # top; a pair with both from its two halves' rows, from the bottom.
     lanes = jax.lax.broadcasted_iota(jnp.int32, (num_simd_lanes,), 0)
     row_ids = window_start + r * num_simd_lanes + lanes
     in_range = jnp.logical_and(row_ids >= start, row_ids < end)
-    meta_dst = jnp.bitwise_right_shift(scratch.scatter_meta_vmem[row_slice], 1)
-    is_final = jnp.logical_and(in_range, meta_dst < cfg.first_garbage_row)
-    dst_rows = jnp.where(is_final, meta_dst, garbage_start + lanes)
+    is_pair_final = jnp.bitwise_and(meta_slice, memory_ref.META_PAIR_FINAL)
+    writes = jnp.where(in_range, is_pair_final, 0)
+    pair_smem = scratch.pair_smem
+    num_single = jnp.array(0, jnp.int32)
+    num_both = jnp.array(0, jnp.int32)
+    for i in range(num_simd_lanes):
+        meta = meta_slice[i]
+        src = jnp.bitwise_and(
+            jnp.right_shift(meta, memory_ref.META_SRC_SHIFT), memory_ref.META_SRC_MASK
+        )
+        is_odd = jnp.bitwise_and(meta, memory_ref.META_IS_ODD) != 0
+        has_both = jnp.logical_and(is_odd, src != memory_ref.SRC_ZERO)
+        write = writes[i] != 0
+        pair = jnp.right_shift(meta, memory_ref.META_PAIR_SHIFT)
+        # Single: the row and the shift that puts its half in place.
+        pair_smem[_SINGLE_ROW + num_single] = i
+        pair_smem[_SINGLE_SHIFT + num_single] = jnp.where(is_odd, 16, 0)
+        pair_smem[_SINGLE_PAIR + num_single] = pair
+        # Both: the low half's row (the high half is this row).
+        low_row = jnp.where(src == memory_ref.SRC_CARRY, cfg.carry_row + c, src)
+        pair_smem[_BOTH_LOW + num_both] = low_row
+        pair_smem[_BOTH_HIGH + num_both] = i
+        pair_smem[_BOTH_PAIR + num_both] = pair
+        num_single += jnp.logical_and(write, jnp.logical_not(has_both)).astype(
+            jnp.int32
+        )
+        num_both += jnp.logical_and(write, has_both).astype(jnp.int32)
 
-    # One indirect scatter of the 16 rows, completed within the step.
-    scatter = pltpu.make_async_copy(
-        out_vmem.at[slot],
-        refs.data.out.at[dst_rows, pl.ds(col_hbm_start, cfg.col_chunk_size)],
-        scratch.sem.at[1 + slot],
+    # The previous step's writes read packed_vmem; they drained under this
+    # step's reduction.
+    _wait_pair_writes(refs, cfg)
+    pair_smem[_PENDING_WRITES] = num_single + num_both
+
+    tiles = cfg.col_chunk_size // cfg.tpu_info.num_lanes
+
+    @_flat_tile_loop(num_single, tiles, cfg)
+    def _(k, col_slice):
+        value = out_vmem[pair_smem[_SINGLE_ROW + k], col_slice]
+        if cfg.in_dtype == jnp.bfloat16:
+            # The convert rounds to nearest even, as XLA's f32->bf16 does.
+            word = plsc.pack(
+                value, jnp.zeros_like(value), format=plsc.PackFormat.INTERLEAVED
+            )
+            word = jnp.left_shift(
+                plsc.bitcast(word, jnp.uint32), pair_smem[_SINGLE_SHIFT + k]
+            )
+        else:
+            word = plsc.bitcast(value, jnp.uint32)
+        scratch.packed_vmem[k, col_slice] = word
+
+    if cfg.in_dtype == jnp.bfloat16:
+
+        @_flat_tile_loop(num_both, tiles, cfg)
+        def _(k, col_slice):
+            word = plsc.pack(
+                out_vmem[pair_smem[_BOTH_LOW + k], col_slice],
+                out_vmem[pair_smem[_BOTH_HIGH + k], col_slice],
+                format=plsc.PackFormat.INTERLEAVED,
+            )
+            scratch.packed_vmem[num_simd_lanes - 1 - k, col_slice] = plsc.bitcast(
+                word, jnp.uint32
+            )
+
+    out_words = _out_words(refs)
+    cols = pl.ds(col_start + c * cfg.col_chunk_size, cfg.col_chunk_size)
+
+    @pl.loop(0, num_single)
+    def _(k):
+        _pair_write(k, pair_smem[_SINGLE_PAIR + k], out_words, cols, refs).start()
+
+    @pl.loop(0, num_both)
+    def _(k):
+        _pair_write(
+            num_simd_lanes - 1 - k, pair_smem[_BOTH_PAIR + k], out_words, cols, refs
+        ).start()
+
+    # A chunk that ends inside a pair keeps the pair's low half for the next
+    # chunk (after the writes above have read the previous one).
+    last = meta_slice[num_simd_lanes - 1]
+    carry_src = jnp.bitwise_and(
+        jnp.right_shift(last, memory_ref.META_SRC_SHIFT), memory_ref.META_SRC_MASK
     )
-    scatter.start()
-    scatter.wait()
+    keeps_carry = jnp.logical_and(
+        jnp.bitwise_and(last, memory_ref.META_PAIR_FINAL) == 0,
+        carry_src < num_simd_lanes,
+    )
+
+    @pl.when(keeps_carry)
+    def _():
+        @_tile_col_loop(cfg)
+        def _(col_slice):
+            out_vmem[cfg.carry_row + c, col_slice] = out_vmem[carry_src, col_slice]
+
+
+def _flat_tile_loop(count: jax.Array, tiles: int, cfg: config.Config):
+    """Runs ``body(k, col_slice)`` over k < count and a column chunk as one
+    software-pipelined loop, 16 lanes at a time (see _tile_col_loop)."""
+    num_simd_lanes = cfg.sc_info.num_lanes
+    lanes_per_tile = cfg.tpu_info.num_lanes
+
+    def decorator(body):
+        @plsc.parallel_loop(0, count * tiles)
+        def _(t):
+            k = t // tiles
+            tile_col = (t % tiles) * lanes_per_tile
+            for j in range(0, lanes_per_tile, num_simd_lanes):
+                body(k, pl.ds(tile_col + j, num_simd_lanes))
+
+    return decorator
+
+
+def _tile_col_loop(cfg: config.Config):
+    """Runs ``body(col_slice)`` over a column chunk, 16 lanes at a time.
+
+    One (8, 128) VMEM tile column per iteration keeps the in-tile offsets static,
+    so a row's address is computed once per tile, not per 16 lanes.
+    """
+    num_simd_lanes = cfg.sc_info.num_lanes
+    lanes_per_tile = cfg.tpu_info.num_lanes
+
+    def decorator(body):
+        @plsc.parallel_loop(0, cfg.col_chunk_size, step=lanes_per_tile)
+        def _(tile_col):
+            for j in range(0, lanes_per_tile, num_simd_lanes):
+                body(pl.ds(tile_col + j, num_simd_lanes))
+
+    return decorator
+
+
+def _pair_write(k, pair, out_words, cols, refs: memory_ref.KernelRefs):
+    return pltpu.make_async_copy(
+        refs.scratch.packed_vmem.at[k], out_words.at[pair, cols], refs.scratch.sem.at[1]
+    )
+
+
+def _wait_pair_writes(refs: memory_ref.KernelRefs, cfg: config.Config):
+    """Waits for the pair writes in flight (all one column chunk wide)."""
+    cols = pl.ds(0, cfg.col_chunk_size)
+
+    @pl.loop(0, refs.scratch.pair_smem[_PENDING_WRITES])
+    def _(_):
+        _pair_write(0, 0, _out_words(refs), cols, refs).wait()
