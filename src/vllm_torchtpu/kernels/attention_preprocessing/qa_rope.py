@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E501  (diagnostic branch, not for merge)
 """Q-A/KV projection, both RMSNorms and SWA RoPE for integration into the model.
 
 Replaces ``_fused_wqa_wkv_gemm`` -> ``_split_qkv_and_norm`` -> the SWA
@@ -53,7 +54,7 @@ def native_rms_norm(values, gamma, eps):
     return (normalized * gamma.astype(jnp.float32)).astype(jnp.bfloat16)
 
 
-def _qa_rope_kernel(
+def _qa_rope_kernel_inner(
     x_ref,
     weight_hbm,
     scale_ref,
@@ -86,10 +87,12 @@ def _qa_rope_kernel(
     # pipelined x / rope_rows / output copies never queue behind it.
     @pl.when(tile == 0)
     def _():
-        for c in range(chunks):
-            weight_copy(c).start(priority=1)
+        with jax.named_scope("attr_a/weight_start"):
+            for c in range(chunks):
+                weight_copy(c).start(priority=1)
 
-    encoded, row_scale = _quantize_rows(x_ref[...])
+    with jax.named_scope("attr_a/x_quantize"):
+        encoded, row_scale = _quantize_rows(x_ref[...])
 
     def project(columns, product):
         projected = product * row_scale * scale_ref[columns][None, :]
@@ -103,36 +106,44 @@ def _qa_rope_kernel(
     def _():
         for c in range(chunks):
             columns = pl.ds(c * chunk, chunk)
-            weight_copy(c).wait()
-            project(
-                columns,
-                jnp.dot(
+            with jax.named_scope("attr_a/weight_wait"):
+                weight_copy(c).wait()
+            with jax.named_scope("attr_a/matmul"):
+                product = jnp.dot(
                     encoded, weight_ref[:, columns], preferred_element_type=jnp.float32
-                ),
-            )
+                )
+            with jax.named_scope("attr_a/scale_round"):
+                project(columns, product)
 
     @pl.when(tile != 0)
     def _():
-        project(
-            pl.ds(0, width),
-            jnp.dot(encoded, weight_ref[...], preferred_element_type=jnp.float32),
-        )
+        with jax.named_scope("attr_a/matmul"):
+            product = jnp.dot(
+                encoded, weight_ref[...], preferred_element_type=jnp.float32
+            )
+        with jax.named_scope("attr_a/scale_round"):
+            project(pl.ds(0, width), product)
 
     kv_start = rank if emit_qr else 0
     if emit_qr:
-        qr_out_ref[...] = native_rms_norm(
-            projected_ref[:, :rank], gamma_qr_ref[...][None, :], eps
+        with jax.named_scope("attr_a/qr_norm"):
+            qr_out_ref[...] = native_rms_norm(
+                projected_ref[:, :rank], gamma_qr_ref[...][None, :], eps
+            )
+    with jax.named_scope("attr_a/kv_norm"):
+        kv = native_rms_norm(
+            projected_ref[:, kv_start:], gamma_kv_ref[...][None, :], eps
         )
-    kv = native_rms_norm(projected_ref[:, kv_start:], gamma_kv_ref[...][None, :], eps)
     if not rotate_kv:
         kv_out_ref[...] = kv
         return
-    if kv_out_ref.shape[-1] > _LANE:
-        kv_out_ref[:, :-_LANE] = kv[:, :-_LANE]
-    cos, sin = rope_gather.coefficients(rope_rows_ref[...])
-    tail = kv[:, -_LANE:].astype(jnp.float32)
-    partner = _lane_gather(tail, jnp.arange(_LANE) ^ 1)
-    kv_out_ref[:, -_LANE:] = (tail * cos + partner * sin).astype(jnp.bfloat16)
+    with jax.named_scope("attr_a/kv_rope_store"):
+        if kv_out_ref.shape[-1] > _LANE:
+            kv_out_ref[:, :-_LANE] = kv[:, :-_LANE]
+        cos, sin = rope_gather.coefficients(rope_rows_ref[...])
+        tail = kv[:, -_LANE:].astype(jnp.float32)
+        partner = _lane_gather(tail, jnp.arange(_LANE) ^ 1)
+        kv_out_ref[:, -_LANE:] = (tail * cos + partner * sin).astype(jnp.bfloat16)
 
 
 def _largest_divisor(n, cap, multiple):
@@ -318,3 +329,8 @@ def supported(x, weight, weight_scale, gamma_qr, gamma_kv, rope_rows):
     except ValueError:
         return False
     return True
+
+
+def _qa_rope_kernel(*args, **kwargs):
+    with jax.named_scope("attr_a/body"):
+        return _qa_rope_kernel_inner(*args, **kwargs)

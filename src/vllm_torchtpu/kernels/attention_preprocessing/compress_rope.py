@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E501  (diagnostic branch, not for merge)
 """V4.1 compressor for integration: projection, pooling, RMSNorm, RoPE, CSA2.
 
 Same arithmetic as ``compress_serial._compress_kernel``. Differences:
@@ -50,7 +51,7 @@ _POOL_LANES = 128  # INT32 words per pool row (512 bytes)
 _RECORD_ROWS = 2 * _DIM // _POOL_LANES  # pool rows per FP32 ratio-2 record
 
 
-def _compress_rope_kernel(*refs, eps, ratio, tb, chunk, banks):
+def _compress_rope_kernel_inner(*refs, eps, ratio, tb, chunk, banks):
     refs = list(refs)
     # Ratio-2-only refs; ratio 1 never reads them.
     unused: Any = None
@@ -118,29 +119,34 @@ def _compress_rope_kernel(*refs, eps, ratio, tb, chunk, banks):
         def body(i, carry):
             row, record, slot = table[2 * i] - first_row, table[2 * i + 1], i - start
             if not read:
-                for c in range(_RECORD_ROWS):
-                    move_piece(stage, slot, row, c, read)
-            if banks == 1:
-                record_copy(
-                    stage, slot, pools[0], record * _RECORD_ROWS, read, sem
-                ).start()
-            else:
-                lo_records = pools[0].shape[0] // _RECORD_ROWS
-                in_hi = record >= lo_records
+                with jax.named_scope("attr_c/ring_write_stage"):
+                    for c in range(_RECORD_ROWS):
+                        move_piece(stage, slot, row, c, read)
+            with jax.named_scope(
+                "attr_c/ring_%s_start" % ("read" if read else "write")
+            ):
+                if banks == 1:
+                    record_copy(
+                        stage, slot, pools[0], record * _RECORD_ROWS, read, sem
+                    ).start()
+                else:
+                    lo_records = pools[0].shape[0] // _RECORD_ROWS
+                    in_hi = record >= lo_records
 
-                @pl.when(~in_hi)
-                def _():
-                    base = record * _RECORD_ROWS
-                    record_copy(stage, slot, pools[0], base, read, sem).start()
+                    @pl.when(~in_hi)
+                    def _():
+                        base = record * _RECORD_ROWS
+                        record_copy(stage, slot, pools[0], base, read, sem).start()
 
-                @pl.when(in_hi)
-                def _():
-                    base = (record - lo_records) * _RECORD_ROWS
-                    record_copy(stage, slot, pools[1], base, read, sem).start()
+                    @pl.when(in_hi)
+                    def _():
+                        base = (record - lo_records) * _RECORD_ROWS
+                        record_copy(stage, slot, pools[1], base, read, sem).start()
 
             return carry
 
-        jax.lax.fori_loop(start, offsets[tile + 1], body, 0)
+        with jax.named_scope("attr_c/ring_%s_loop" % ("read" if read else "write")):
+            jax.lax.fori_loop(start, offsets[tile + 1], body, 0)
 
     def ring_wait(offsets, stage, sem, read):
         """Wait for every record DMA of this tile (equal 4 KiB transfers)."""
@@ -149,7 +155,8 @@ def _compress_rope_kernel(*refs, eps, ratio, tb, chunk, banks):
             record_copy(stage, 0, pools[0], 0, read, sem).wait()
             return carry
 
-        jax.lax.fori_loop(offsets[tile], offsets[tile + 1], body, 0)
+        with jax.named_scope("attr_c/ring_%s_wait" % ("read" if read else "write")):
+            jax.lax.fori_loop(offsets[tile], offsets[tile + 1], body, 0)
 
     def unstage_reads():
         start = read_offsets[tile]
@@ -160,7 +167,8 @@ def _compress_rope_kernel(*refs, eps, ratio, tb, chunk, banks):
                 move_piece(read_stage, slot, row, c, True)
             return carry
 
-        jax.lax.fori_loop(start, read_offsets[tile + 1], body, 0)
+        with jax.named_scope("attr_c/ring_read_unstage"):
+            jax.lax.fori_loop(start, read_offsets[tile + 1], body, 0)
 
     if ratio == 2:
         ring_start(read_table, read_offsets, read_stage, ring_sems.at[0], True)
@@ -169,8 +177,9 @@ def _compress_rope_kernel(*refs, eps, ratio, tb, chunk, banks):
     # (priority 0) never queue behind it.
     @pl.when(tile == 0)
     def _():
-        for c in range(chunks):
-            weight_copy(c).start(priority=1)
+        with jax.named_scope("attr_c/weight_start"):
+            for c in range(chunks):
+                weight_copy(c).start(priority=1)
 
     if ratio == 2:
         # Row 7 holds the previous tile's last row; rows 8.. hold this tile, so
@@ -191,17 +200,22 @@ def _compress_rope_kernel(*refs, eps, ratio, tb, chunk, banks):
     @pl.when(tile == 0)
     def _():
         for c in range(chunks):
-            weight_copy(c).wait()
+            with jax.named_scope("attr_c/weight_wait"):
+                weight_copy(c).wait()
             columns = pl.ds(c * chunk, chunk)
-            product_ref[:, columns] = jnp.dot(
-                x_ref[...], weight_ref[:, columns], preferred_element_type=jnp.float32
-            )
+            with jax.named_scope("attr_c/matmul"):
+                product_ref[:, columns] = jnp.dot(
+                    x_ref[...],
+                    weight_ref[:, columns],
+                    preferred_element_type=jnp.float32,
+                )
 
     @pl.when(tile != 0)
     def _():
-        product_ref[...] = jnp.dot(
-            x_ref[...], weight_ref[...], preferred_element_type=jnp.float32
-        )
+        with jax.named_scope("attr_c/matmul"):
+            product_ref[...] = jnp.dot(
+                x_ref[...], weight_ref[...], preferred_element_type=jnp.float32
+            )
 
     if ratio == 2:
         # A request's ring read lands before any of its writes are issued: the
@@ -211,40 +225,44 @@ def _compress_rope_kernel(*refs, eps, ratio, tb, chunk, banks):
         ring_start(write_table, write_offsets, write_stage, ring_sems.at[1], False)
     product = product_ref[...]
     if ratio == 2:
-        in_chunk = shifted_ref[pl.ds(7, tb), :]
-        # Rows without a predecessor in the chunk or a ring read are never
-        # valid (the caller's contract), so their unread rows are discarded.
-        previous = jnp.where(has_prev_ref[...] != 0, in_chunk, previous_ref[...])
-        score_prev, score_cur = previous[:, _DIM:], product[:, _DIM:]
-        peak = jnp.maximum(score_prev, score_cur)
-        e_prev = jnp.exp(score_prev - peak)
-        e_cur = jnp.exp(score_cur - peak)
-        total = e_prev + e_cur
-        values = previous[:, :_DIM] * (e_prev / total) + product[:, :_DIM] * (
-            e_cur / total
-        )
+        with jax.named_scope("attr_c/pooling"):
+            in_chunk = shifted_ref[pl.ds(7, tb), :]
+            # Rows without a predecessor in the chunk or a ring read are never
+            # valid (the caller's contract), so their unread rows are discarded.
+            previous = jnp.where(has_prev_ref[...] != 0, in_chunk, previous_ref[...])
+            score_prev, score_cur = previous[:, _DIM:], product[:, _DIM:]
+            peak = jnp.maximum(score_prev, score_cur)
+            e_prev = jnp.exp(score_prev - peak)
+            e_cur = jnp.exp(score_cur - peak)
+            total = e_prev + e_cur
+            values = previous[:, :_DIM] * (e_prev / total) + product[:, :_DIM] * (
+                e_cur / total
+            )
     else:
         values = product
-    inv_rms = jax.lax.rsqrt(jnp.mean(values * values, axis=-1, keepdims=True) + eps)
-    latent = (values * inv_rms * gamma_ref[...].astype(jnp.float32)[None, :]).astype(
-        jnp.bfloat16
-    )
-    valid = valid_ref[...] != 0
-    latent = jnp.where(valid, latent, jnp.zeros_like(latent))
-    latent_out_ref[...] = latent
-    cos, sin = rope_gather.coefficients(rope_rows_ref[...])
-    tail = latent[:, -_LANE:].astype(jnp.float32)
-    partner = _lane_gather(tail, jnp.arange(_LANE) ^ 1)
-    rotated_tail = (tail * cos + partner * sin).astype(jnp.bfloat16)
-    # Invalid rows have zero latents, but 0*sin can be -0.0 depending on the
-    # row's angle; force +0 so their (never published) words are 0.
-    rotated_tail = jnp.where(valid, rotated_tail, 0)
-    rotated = jnp.concatenate((latent[:, :-_LANE], rotated_tail), axis=-1).astype(
-        jnp.float32
-    )
-    words, scales = _encode_csa2(rotated)
-    words_out_ref[...] = words
-    scales_out_ref[...] = scales
+    with jax.named_scope("attr_c/rmsnorm"):
+        inv_rms = jax.lax.rsqrt(jnp.mean(values * values, axis=-1, keepdims=True) + eps)
+        latent = (
+            values * inv_rms * gamma_ref[...].astype(jnp.float32)[None, :]
+        ).astype(jnp.bfloat16)
+        valid = valid_ref[...] != 0
+        latent = jnp.where(valid, latent, jnp.zeros_like(latent))
+        latent_out_ref[...] = latent
+    with jax.named_scope("attr_c/rope"):
+        cos, sin = rope_gather.coefficients(rope_rows_ref[...])
+        tail = latent[:, -_LANE:].astype(jnp.float32)
+        partner = _lane_gather(tail, jnp.arange(_LANE) ^ 1)
+        rotated_tail = (tail * cos + partner * sin).astype(jnp.bfloat16)
+        # Invalid rows have zero latents, but 0*sin can be -0.0 depending on the
+        # row's angle; force +0 so their (never published) words are 0.
+        rotated_tail = jnp.where(valid, rotated_tail, 0)
+        rotated = jnp.concatenate((latent[:, :-_LANE], rotated_tail), axis=-1).astype(
+            jnp.float32
+        )
+    with jax.named_scope("attr_c/encode"):
+        words, scales = _encode_csa2(rotated)
+        words_out_ref[...] = words
+        scales_out_ref[...] = scales
     if ratio == 2:
         # The next tile overwrites the write stage.
         ring_wait(write_offsets, write_stage, ring_sems.at[1], False)
@@ -491,3 +509,8 @@ def supported(x, weight, gamma, rope_rows, ratio) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _compress_rope_kernel(*args, **kwargs):
+    with jax.named_scope("attr_c/body"):
+        return _compress_rope_kernel_inner(*args, **kwargs)

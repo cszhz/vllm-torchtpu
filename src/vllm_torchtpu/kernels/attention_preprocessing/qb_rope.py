@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E501  (diagnostic branch, not for merge)
 """Q-B projection and interleaved RoPE for integration into the model.
 
 Same pipeline and numerics as ``qb_overlap3``. RoPE input is the per-step
@@ -38,7 +39,7 @@ from vllm_torchtpu.kernels.attention_preprocessing.tuned_block_sizes import (
 _ROW_ALIGN = 32
 
 
-def _qb_rope_kernel(
+def _qb_rope_kernel_inner(
     qr_ref,
     weight_hbm,
     scale_ref,
@@ -96,7 +97,8 @@ def _qb_rope_kernel(
         def issue(pair, _):
             weight_copy(0, pair).start(priority=1)
 
-        jax.lax.fori_loop(0, pairs, issue, None)
+        with jax.named_scope("attr_b/weight_issue_prologue"):
+            jax.lax.fori_loop(0, pairs, issue, None)
 
     @pl.when(window == 0)
     def prepare_rows():
@@ -108,10 +110,12 @@ def _qb_rope_kernel(
             encoded_ref[cached, :] = encoded
             row_scale_ref[cached, :] = scale
 
-        jax.lax.fori_loop(0, tb // quant_fragment, quantize_fragment, None)
-        cos_lanes, sin_lanes = rope_gather.coefficients(rope_rows_ref[...])
-        coeff_ref[0, pl.ds(token_start, tb), :] = cos_lanes
-        coeff_ref[1, pl.ds(token_start, tb), :] = sin_lanes
+        with jax.named_scope("attr_b/prepare_quant"):
+            jax.lax.fori_loop(0, tb // quant_fragment, quantize_fragment, None)
+        with jax.named_scope("attr_b/prepare_coeff"):
+            cos_lanes, sin_lanes = rope_gather.coefficients(rope_rows_ref[...])
+            coeff_ref[0, pl.ds(token_start, tb), :] = cos_lanes
+            coeff_ref[1, pl.ds(token_start, tb), :] = sin_lanes
 
     def copy(g):
         """Output DMA of global pair g (dst address only matters for start)."""
@@ -129,7 +133,8 @@ def _qb_rope_kernel(
 
             @pl.when(g - slots >= 0)
             def _(g=g):
-                copy(g - slots).wait()
+                with jax.named_scope("attr_b/reclaim_wait"):
+                    copy(g - slots).wait()
 
     def matmul(pair, parity):
         """FP32 products of this step's head pair into its parity buffer."""
@@ -139,18 +144,21 @@ def _qb_rope_kernel(
         def _():
             @pl.when(window + 1 < windows)
             def _():
-                weight_copy(window + 1, pair).start(priority=1)
+                with jax.named_scope("attr_b/weight_next_start"):
+                    weight_copy(window + 1, pair).start(priority=1)
 
-            weight_copy(window, pair).wait()
+            with jax.named_scope("attr_b/weight_wait"):
+                weight_copy(window, pair).wait()
 
         tokens = pl.ds(token_start, tb)
         weights = weight_ref.at[window % 2, pair]
-        for half in range(2):
-            products[parity][half] = jnp.dot(
-                encoded_ref[tokens, :],
-                weights[:, pl.ds(half * head_dim, head_dim)],
-                preferred_element_type=jnp.float32,
-            )
+        with jax.named_scope("attr_b/matmul_pair"):
+            for half in range(2):
+                products[parity][half] = jnp.dot(
+                    encoded_ref[tokens, :],
+                    weights[:, pl.ds(half * head_dim, head_dim)],
+                    preferred_element_type=jnp.float32,
+                )
 
     def post(g, parity):
         """Scale, round, rotate and pack global pair g, then start its DMA."""
@@ -161,41 +169,46 @@ def _qb_rope_kernel(
         head0 = ((t // tiles) * pairs + q) * 2
         slot = g % slots
         source = products[parity]
-        for f in range(tb // post_fragment):
-            local = pl.ds(f * post_fragment, post_fragment)
-            tokens = pl.ds(rows0 + f * post_fragment, post_fragment)
-            halves = []
-            for half in range(2):
-                columns = pl.ds(
-                    pl.multiple_of((head0 + half) * head_dim, head_dim), head_dim
+        with jax.named_scope("attr_b/post_pair"):
+            for f in range(tb // post_fragment):
+                local = pl.ds(f * post_fragment, post_fragment)
+                tokens = pl.ds(rows0 + f * post_fragment, post_fragment)
+                halves = []
+                for half in range(2):
+                    columns = pl.ds(
+                        pl.multiple_of((head0 + half) * head_dim, head_dim), head_dim
+                    )
+                    projected = source[half, local, :] * row_scale_ref[tokens, :]
+                    projected = (projected * scale_ref[columns][None, :]).astype(
+                        jnp.bfloat16
+                    )
+                    tail = projected[:, -_LANE:].astype(jnp.float32)
+                    partner = _lane_gather(tail, jnp.arange(_LANE) ^ 1)
+                    rotated = (
+                        tail * coeff_ref[0, tokens, :]
+                        + partner * coeff_ref[1, tokens, :]
+                    ).astype(jnp.bfloat16)
+                    halves.append(
+                        (
+                            projected[:, :-_LANE].astype(jnp.float32),
+                            rotated.astype(jnp.float32),
+                        )
+                    )
+                (low_plain, low_tail), (high_plain, high_tail) = halves
+                # Values are already BF16-rounded, so the FP32->BF16 pack is exact.
+                obuf_ref[slot, local, pl.ds(0, tail_start)] = pltpu.pack_elementwise(
+                    [low_plain, high_plain], packed_dtype=jnp.bfloat16
                 )
-                projected = source[half, local, :] * row_scale_ref[tokens, :]
-                projected = (projected * scale_ref[columns][None, :]).astype(
-                    jnp.bfloat16
-                )
-                tail = projected[:, -_LANE:].astype(jnp.float32)
-                partner = _lane_gather(tail, jnp.arange(_LANE) ^ 1)
-                rotated = (
-                    tail * coeff_ref[0, tokens, :] + partner * coeff_ref[1, tokens, :]
-                ).astype(jnp.bfloat16)
-                halves.append(
-                    (
-                        projected[:, :-_LANE].astype(jnp.float32),
-                        rotated.astype(jnp.float32),
+                obuf_ref[slot, local, pl.ds(tail_start, _LANE)] = (
+                    pltpu.pack_elementwise(
+                        [low_tail, high_tail], packed_dtype=jnp.bfloat16
                     )
                 )
-            (low_plain, low_tail), (high_plain, high_tail) = halves
-            # Values are already BF16-rounded, so the FP32->BF16 pack is exact.
-            obuf_ref[slot, local, pl.ds(0, tail_start)] = pltpu.pack_elementwise(
-                [low_plain, high_plain], packed_dtype=jnp.bfloat16
-            )
-            obuf_ref[slot, local, pl.ds(tail_start, _LANE)] = pltpu.pack_elementwise(
-                [low_tail, high_tail], packed_dtype=jnp.bfloat16
-            )
 
         @pl.when(valid)
         def _():
-            copy(g).start()
+            with jax.named_scope("attr_b/out_copy_start"):
+                copy(g).start()
 
     first = step * pairs  # global index of this step's pair 0
 
@@ -221,8 +234,9 @@ def _qb_rope_kernel(
     def finish():
         reclaim(last)
         post(last, 1)
-        for back in range(slots):
-            copy(last - back).wait()
+        with jax.named_scope("attr_b/finish_drain"):
+            for back in range(slots):
+                copy(last - back).wait()
 
 
 def vmem_bytes(config: QBRopeConfig, segment, rank, heads, head_dim=512):
@@ -459,3 +473,8 @@ def supported(qr, weight, weight_scale, rope_rows, head_dim=512) -> bool:
     except ValueError:
         return False
     return weight.shape[1] % head_dim == 0 and (weight.shape[1] // head_dim) % 4 == 0
+
+
+def _qb_rope_kernel(*args, **kwargs):
+    with jax.named_scope("attr_b/body"):
+        return _qb_rope_kernel_inner(*args, **kwargs)
