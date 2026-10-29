@@ -26,7 +26,7 @@
 
 ### 1.1 vllm-torchtpu
 
-- 仓库：`https://github.com/cszhz/vllm-torchtpu`，分支 **`pd/dsv41-1p1d`**（本地 `/zzlfs/temu/src/vllm-torchtpu-cszhz`）。
+- 仓库：`https://github.com/cszhz/vllm-torchtpu`，分支 **`cszhz/dsv41-1p1d`**（本地 `/zzlfs/temu/src/vllm-torchtpu-cszhz`）。
 - 基于上游 `vllm-project/vllm-torchtpu` 的 `epic/dsv41`（6a1ebddb7）。**所有改动只在 cszhz fork 上，不要推上游**
   （本地 clone 的 upstream push URL 已设成 `DISABLED-do-not-push-to-vllm-project`）。
 - P、D 用同一份代码，以 editable 方式装进 venv。
