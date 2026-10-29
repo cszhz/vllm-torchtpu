@@ -199,6 +199,36 @@ python3 pd_timeline.py <proxy.log> <prefill.log> <decode.log> [req_id 前缀]   
 python3 transfer_stats.py ...                                                           # KV 传输耗时统计
 ```
 
+### 4.4 P 的 prefill 吞吐（TPS）
+
+**测什么**：P 满载时每秒能算多少个新 token。只测 P，不经过 proxy 和 D。
+
+**P 怎么起**：用和线上 P 相同的配置（chunk 2048、编译桶 `[128,256,2048]`、DP8/EP8、不开 async），但不挂 KV 传输，最好起在一台单独的机器上，不影响线上 P/D。下面用的是 sjd1：
+
+```bash
+ssh zzl-tpu7x-slice-mig-sjd1 "cd /zzlfs/temu && NO_KV_TRANSFER=1 setsid nohup bash /zzlfs/temu/scripts/start_1p1d_epic.sh prefill \
+    > /zzlfs/temu/logs/sjd1-prefill-\$(date +%m%d-%H%M).log 2>&1 < /dev/null &"
+# 机器上要先有 /tmp/dsv41-tokenizer；等日志出现 "Application startup complete"（约 15 分钟）
+# 对比 async 时再加 ASYNC_SCHED=1
+```
+
+**怎么测**（`tps_bench.py`）：
+
+```bash
+cd /zzlfs/temu/scripts
+OUT=/zzlfs/temu/results/tps-$(date +%m%d-%H%M).jsonl
+PY=/zzlfs/temu/.venv-epic/bin/python
+# B：新 token 长度扫描，8 并发（每个 rank 一条）
+$PY -I tps_bench.py --url http://10.128.0.176:8100 --tag scan --cached 32768 --new 32768 65536 172032 262144 --conc 8 --out $OUT
+# A：持续满载，每个 rank 排 2 条、3 条
+$PY -I tps_bench.py --url http://10.128.0.176:8100 --tag sustained --cached 32768 --new 172032 --conc 16 24 --out $OUT
+```
+
+- 每个 rank 先预热同一个 32k 前缀；每条请求的新 token 取自然代码文本（`tools/tpot_corpus_ids.json`），各用不同的偏移，互不命中缓存；第 i 条通过 `X-data-parallel-rank` 固定到 rank `i % 8`。
+- 请求直接发 token id（不含 API server 分词），`max_tokens=1`。
+- **TPS = 新 token 总数 ÷ 墙钟时间**（从第一条发出到最后一条完成）。每组先跑 1 轮预热（不计入），再跑 `--rounds`（默认 2）轮正式。
+- 每轮从 P 的 metrics 记录 `cache_hit_tokens`，**正式轮的命中必须正好等于 前缀长度 × 并发数**，多了就说明新 token 命中了缓存，这一轮作废。脚本每次运行用随机起点生成偏移，同一个服务上重复跑也不会撞上。
+
 ---
 
 ## 5. 改动与效果（按收益排序）
@@ -288,7 +318,25 @@ python3 transfer_stats.py ...                                                   
 
 \* 用 out_len 3072（out_len 1024 时拉满窗口太短）。总体是 Temu 的 1.3–6.0 倍；长 cache、大 batch 差距最大。
 
-### 6.3 如何复现某一组数字
+### 6.3 P 的 prefill 吞吐上限（tok/s；`results/tps-sjd1-1029-1600.jsonl`，方法见 4.4）
+
+32k 缓存前缀，每组 2 轮正式。整机 = 4 芯片 / 8 个 rank。
+
+| 组 | 场景 | 不开 async | 开 async |
+|---|---|---|---|
+| 新 token 长度扫描（8 并发） | 32k | 15.8–16.1 万 | — |
+| | **64k** | **17.7–17.8 万** | 16.9 万 |
+| | 168k | 17.3 万 | 17.4 万 |
+| | 256k | 17.2 万 | — |
+| 持续满载（168k 新 token） | 16 并发（每个 rank 2 条） | 17.0–17.4 万 | 17.2–17.4 万 |
+| | 24 并发（每个 rank 3 条） | 16.8–17.0 万 | — |
+
+- **当前配置下 P 的 prefill 吞吐上限约为整机 17.5 万 tok/s，每芯片约 4.4 万 tok/s**，条件是 8 个 rank 各有一条长请求（新 token ≥64k、缓存上下文中等长度）。
+- 新 token 超过 64k 不再提升；每个 rank 多排请求没有用（每个 rank 每步的预算固定是 2048 个 token）；P 开 async 对吞吐没有帮助。
+- 单请求（1P）时只有一个 rank 在算，约 1.9 万 tok/s。
+- profile（32k+168k 1P，每步约 105ms 设备时间）：MoE（20 个 encoder 层）44.5ms（42%），CSA 注意力 12.8ms，indexer top-k 8.7ms，量化融合 6.4ms，all-gather 5.1ms；host 侧空隙约 4%。
+
+### 6.4 如何复现某一组数字
 
 1. 按第 1、2 节准备代码和 venv。6.1、6.2 的数字是在 a233edf04 之前测的（用 32842f3d7 加上 d8e22db82 的内存回收改动即可复现）；a233edf04 只降低 TTFT 中 D 这一跳的开销，不影响 Prefill 和 TPOT。
 2. 按第 3 节的配置启动 P、D、proxy（proxy 的 `PROXY_ALIGN_MS`、`PROXY_RENDER_CACHE_MB` 都不设，即关闭）。
@@ -306,6 +354,8 @@ python3 transfer_stats.py ...                                                   
 - 首次遇到新的形状（batch / 长度）时会临时编译，那一轮的数字会偏大；要先预热，或者重跑确认。
 - TPOT 512k bs256 偶发 proxy→P 的 `httpx.ReadError`（500），根因未查清，`tpot_bench.py` 会自动重试 3 次。
 - ssh 远程起后台进程时用 `ssh -n -f ... > /dev/null 2>&1`，否则管道会卡住。
+- **测吞吐时新 token 命中缓存会让数字虚高**（曾出现一轮 230 万 tok/s）：同一个服务上重复跑，如果请求内容和之前一样，P 的前缀缓存会直接命中。要核对每轮的 `cache_hit_tokens`（见 4.4）。
+- 在 sjd1 上直接跑 JAX/Pallas 脚本时，要先设好 TPU 环境变量（`/zzlfs/temu/tools/sc_repro/env.sh`，和启动脚本里的一样），否则 JAX 初始化会卡住。
 
 ---
 
