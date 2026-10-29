@@ -51,8 +51,8 @@
 
 - 问题：`GetBlockChunks` 每个 block 扫描整个 schedule，复杂度 O(n²)，557k token 传一次要 27.9s。修复后 0.95s（再加上前缀命中跳过之后，实际只要 30–40ms）。
 - PR：**google/tpu-sync#1382**（cszhz/tpu-sync 分支 `fix/getblockchunks-entry-index-main`，基于 main）。
-- **部署实际用的版本**：nightly 1012（e3f6f4fc）+ 同一修复 = 分支 `fix/getblockchunks-on-nightly-1012`（3e5d3c35），
-  本地 `/zzlfs/temu/src/tpu-sync-1012`。原因：main 的 Python API 和 PyPI 上的 `tpu-sync-torch==0.0.1.dev20261012084241` 对不上，而且 main 需要 libibverbs。
+- **部署实际用的版本**：nightly 1012（e3f6f4fc）+ 同一修复 = `https://github.com/cszhz/tpu-sync` 分支
+  `fix/getblockchunks-on-nightly-1012`（3e5d3c35），本地 `/zzlfs/temu/src/tpu-sync-1012`。原因：main 的 Python API 和 PyPI 上的 `tpu-sync-torch==0.0.1.dev20261012084241` 对不上，而且 main 需要 libibverbs。
 
 ---
 
@@ -81,6 +81,8 @@ $UV pip install --python /zzlfs/temu/.venv-epic/bin/python --no-deps -e /zzlfs/t
 ### 2.2 编译并替换 tpu-sync 的 .so（在 sjd1 上编）
 
 ```bash
+# 取代码（共享盘上已有的话跳过）
+git clone -b fix/getblockchunks-on-nightly-1012 https://github.com/cszhz/tpu-sync.git /zzlfs/temu/src/tpu-sync-1012
 # sjd1：需要 clang-18（libibverbs-dev 已装）
 cat /zzlfs/temu/src/build-tpusync-1012.sh      # 内容如下
 #   cd /zzlfs/temu/src/tpu-sync-1012
@@ -319,4 +321,4 @@ python3 transfer_stats.py ...                                                   
 | 传输 | 35–66ms | — |
 | KV 到齐 → 第一个 token | ~173ms | 检测→调度→前向 53ms + draft 42ms，待分析 |
 
-其他候选：4P 对齐窗口的效果验证；动态投机 token 数；空步剩余约 20ms；共享前缀注意力 kernel；tpu-sync nightly-1012 修复分支推送到 cszhz。
+其他候选：4P 对齐窗口的效果验证；动态投机 token 数；空步剩余约 20ms；共享前缀注意力 kernel；
