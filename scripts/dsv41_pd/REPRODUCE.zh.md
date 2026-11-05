@@ -119,6 +119,22 @@ cp $D $T/_tpu_raiden_torch_2_13_0.so
 
 原文件备份在 `/zzlfs/temu/tools/*-epic.py.orig`。
 
+### 2.4 已知问题（换到新主机时）
+
+2026-11-04/05 在一组新的 tpu7x-16 MIG 主机（`tpuv7-mig-*`）上用 epic/dsv41 `42c35ec61` 起
+DP8/DP16 时遇到，按出现顺序：
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 建 DP 组时 `DistBackendError: File name too long` | GCE 主机名正好 64 字符，gloo 用 `HOST_NAME_MAX` 大小的缓冲读 `gethostname()`，放不下结尾的 `\0`；`GLOO_SOCKET_IFNAME` 不影响 vLLM 这条 `ProcessGroupGloo(store, rank, size)` 路径 | `sudo hostname $(hostname -s)`（重启或 guest agent 会改回去，启动脚本里每次检查） |
+| 编译时 `TPU_RECLAIM_COMPILE_MEMORY requires Linux with glibc malloc` | 不是别的分配器抢先加载：Ubuntu 的 `/usr/bin/python3.12`（以及 uv 的 python-build-standalone）是非 PIE 可执行文件，`dlsym(RTLD_DEFAULT,"malloc")` 解析到可执行文件里的 PLT 规范地址，`host_memory.py` 的 `dladdr` 比较就判定失败；实际 malloc 仍是 glibc | 用 PIE 的 Python 建 venv（`--enable-shared --enable-optimizations --with-lto` 自编 CPython，与 CI 的 `python:3.12-slim` 一致）后可以开；否则只能关 |
+| 关掉 `TPU_RECLAIM_COMPILE_MEMORY` 后，单机 DP8 启动编译阶段被 OOM killer 杀（`program continuator has halted unexpectedly` / `cancelled`） | 8 个 worker 同时编译，每个峰值约 95 GB anon + 24 GB shmem，编完不归还，8×~120 GB 逼近 944 GB 主机内存；之前能起来是峰值没撞在一起 | PIE Python + `TPU_RECLAIM_COMPILE_MEMORY=1`（开启后整个启动过程主机最低可用内存约 160 GB）；同时清理 `/dev/shm` 里不用的缓存 |
+| 编译期 `No space left on device` | 根盘只有 8.7 GB，8 个 worker 往 `$TMPDIR` 写约 5 GB torchinductor 缓存 | `TMPDIR` 放 `/dev/shm`（tmpfs 473 GB） |
+| `Failed to acquire a TPU device node '/dev/vfio/N'` | 上一轮的 `VLLM::Worker` 孤儿进程还占着设备 | 启动前 `sudo lsof /dev/vfio/*` 检查并按 PID 清掉（`stop_vllm_local.sh` 同理） |
+
+同一组主机上，P 侧编译档位 `[128,2048]` → `[128,256,2048]` 的单机 DP8 cached-extend（96K+16K，C8）
+复测：tail 步 256.6→184.5 ms，整轮 810→724 ms（-10.6%），middle 步不变，与本手册 P 的默认配置一致。
+
 ---
 
 ## 3. 启动
