@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash 1P1D（vllm-torchtpu，Stage-3 Raiden）复现手册
 
-更新：2026-10-29。本文档覆盖：代码版本、环境搭建、启动、测试方法、全部改动及其效果、当前结果、踩过的坑、进行中的工作。
+更新：2026-11-05（新主机复测 6.1 / 6.2，Temu 对比数据换成 11-02 版本；10-29 及之前的内容和结果保留）。本文档覆盖：代码版本、环境搭建、启动、测试方法、全部改动及其效果、当前结果、踩过的坑、进行中的工作。
 称呼约定：**GCP** = 我们的部署；**Temu** = 客户内部数据（对比基准）。
 
 ---
@@ -13,6 +13,8 @@
 | D（decode） | zzl-tpu7x-slice-mig-clsk | 10.128.0.177:8200 | 同上 |
 | proxy | 与 P 同机 | 10.128.0.175:8000 | 客户端只打这个端口 |
 | 编译 / 单测机 | zzl-tpu7x-slice-mig-sjd1 | 10.128.0.176 | 编 tpu-sync、跑 pytest（**不要在 P/D 上跑 pytest，会占 TPU**） |
+| P（2026-11-05 复测） | tpuv7-mig-g45q | 10.128.0.145:8100（proxy :8000） | 新的一组 tpu7x-16 MIG 主机（同一个 slice 的 worker 0），配置同上 |
+| D（2026-11-05 复测） | tpuv7-mig-pqs0 | 10.128.0.28:8200 | 同一个 slice 的 worker 1 |
 
 - 每个 DP rank 是半颗 v7x（2 个 TensorCore）。EP 下 8 个 DP rank 同步（lockstep）前进，空闲 rank 每步跑 dummy forward。
 - 模型：`gs://zzl-bucket/models/DeepSeek-V4.1-Flash`（runai streamer 直接从 GCS 加载）。
@@ -46,6 +48,9 @@
 | a233edf04 | Stage-3 DSv4：P 端 KV 登记加速（span 缓存 + 预建 wire 元组）、sliding-window trim 加速；诊断计时与 `TPU_STAGE3_PROFILE` 开关（默认关） |
 | d8e22db82 | 加载权重时回收 host 内存（`_device_sync` 里 sync + `gc.collect()` + `malloc_trim`，`flush_all` 后清空 pool）；没有这项时加载阶段 host 内存可能不够 |
 | （"scripts/dsv41_pd: reproduction guide…"） | 本文档、`pd_timeline.py`、proxy 对齐窗口 / 分词缓存、`restart_epic.sh` 透传诊断变量 |
+| 6cb686ef4 | `tps_bench.py` 和 4.4 / 6.3 节（P 的 prefill 吞吐） |
+| 1dc6984ac | 2.4 节（新主机的已知问题）；修正 `TPU_RECLAIM_COMPILE_MEMORY` 注释 |
+| （"scripts/dsv41_pd: rerun 6.1/6.2 on new hosts; hosts and URLs overridable"） | 主机 / 地址可用环境变量覆盖（默认值不变）；6.1 / 6.2 新主机复测结果 |
 
 ### 1.2 tpu-sync（KV 传输）
 
@@ -165,6 +170,21 @@ ssh zzl-tpu7x-slice-mig-2z6z 'setsid nohup bash /zzlfs/temu/scripts/start_proxy.
   诊断用：`VLLM_LOGGING_PREFIX='%(created).3f '`（日志带毫秒级时间戳，`pd_timeline.py` 依赖它）、`TPU_DUMMY_STEP_TIMING=1`、`TPU_STAGE3_PROFILE=1`。
 - proxy 环境变量：`PROXY_TOKENIZER`（默认 `/tmp/dsv41-tokenizer`，本地分词）、`PROXY_TOKENIZER_PROCS`（默认 8）、
   `PROXY_ALIGN_MS`（默认 0=关，见 5.2）、`PROXY_RENDER_CACHE_MB`（默认 0=关，见 5.2）。
+
+**换主机时**（2026-11-05 复测用的命令）：主机名、地址都可以用环境变量覆盖，默认值仍是原部署。
+根分区小的机器要把 `TMPDIR`、`VLLM_CACHE_ROOT` 放到 `/dev/shm`（`restart_epic.sh` 会透传这两个变量），并先按 2.4 节改短主机名、拷 tokenizer。
+
+```bash
+cd /zzlfs/temu/scripts
+export P_HOST=10.128.0.145 D_HOST=10.128.0.28 TMPDIR=/dev/shm/epic-tmp VLLM_CACHE_ROOT=/dev/shm/epic-vllm-cache
+ROLES=prefill bash restart_epic.sh
+ROLES=decode ASYNC_SCHED=1 MAX_NUM_SEQS=32 DECODE_COMPILE_SIZES='[16,48,96,192,2048]' bash restart_epic.sh
+P_ADDR=10.128.0.145 D_ADDR=10.128.0.28 bash wait_ready.sh      # 两边日志时间戳不同时按上面的说明 ln -sf
+ssh -n -f 10.128.0.145 'PREFILL_HOST=10.128.0.145 DECODE_HOST=10.128.0.28 setsid nohup bash /zzlfs/temu/scripts/start_proxy.sh \
+    > /zzlfs/temu/logs/proxy-$(date +%m%d-%H%M).log 2>&1 < /dev/null &'
+# 测试脚本的地址：
+export PROXY_URL=http://10.128.0.145:8000 PREFILL_METRICS_URL=http://10.128.0.145:8100/metrics D_METRICS_URL=http://10.128.0.28:8200/metrics
+```
 
 **冒烟测试**
 
@@ -299,6 +319,29 @@ $PY -I tps_bench.py --url http://10.128.0.176:8100 --tag sustained --cached 3276
 
 ### 6.1 Prefill / TTFT（秒，格式 Prefill / TTFT，倍数 = GCP ÷ Temu）
 
+2026-11-05 新主机复测（g45q / pqs0，代码 54e98d673 = 1dc6984ac + 6cb686ef4，配置同第 3 节，proxy 的对齐窗口和分词缓存都关）。
+GCP：`results/table-new-hosts-1105-1647.{jsonl,log}`；Temu：2026-11-02 内部数据（`results/temu-1102.md`）。8P / 16P 本轮没有重测。
+
+| 场景 | GCP 1P | Temu 1P | 1P 倍数 | GCP 4P | Temu 4P | 4P 倍数 | 旧 GCP 1P（10-28） | 旧 GCP 4P（10-29） |
+|---|---|---|---|---|---|---|---|---|
+| 1k+1k | 0.227 / 0.307 | 0.036 / 0.065 | 6.3× / 4.7× | 0.192 / 0.395 | 0.051 / 0.124 | 3.8× / 3.2× | 0.213 / 0.317 | 0.161 / 0.383 |
+| 8k+4k | 0.432 / 0.565 | 0.055 / 0.092 | 7.9× / 6.1× | 0.465 / 0.682 | 0.113 / 0.315 | 4.1× / 2.2× | 0.419 / 0.583 | 0.383 / 0.651 |
+| 32k+16k | 1.033 / 1.223 | 0.143 / 0.197 | 7.2× / 6.2× | 0.990 / 1.267 | 0.156 / 0.511 | 6.3× / 2.5× | 1.069 / 1.286 | 0.978 / 1.280 |
+| 64k+32k | 1.885 / 2.146 | 0.144 / 0.220 | 13.1× / 9.8× | 1.765 / 2.133 | 0.144 / 0.609 | 12.3× / 3.5× | 1.912 / 2.240 | 1.770 / 2.182 |
+| 168k+32k | 2.043 / 2.413 | 0.148 / 0.277 | 13.8× / 8.7× | 1.944 / 2.440 | 0.149 / 0.641 | 13.0× / 3.8× | 2.069 / 2.504 | 1.926 / 2.496 |
+| 32k+168k | 9.139 / 9.785 | 0.726 / 0.859 | 12.6× / 11.4× | 8.408 / 9.297 | 0.747 / 2.823 | 11.3× / 3.3× | 9.172 / 9.893 | 8.372 / 9.296 |
+| 64k+64k | 3.598 / 3.937 | 0.263 / 0.358 | 13.7× / 11.0× | 3.335 / 3.797 | 0.265 / 1.073 | 12.6× / 3.5× | 3.595 / 4.032 | 3.298 / 3.801 |
+| 256k+32k | 2.194 / 2.664 | 0.154 / 0.319 | 14.2× / 8.4× | 2.174 / 2.841 | 0.156 / 0.684 | 13.9× / 4.2× | 2.189 / 2.784 | 2.069 / 3.008 |
+| 512k+32k | 2.634 / 3.388 | 0.176 / 0.452 | 15.0× / 7.5× | 2.711 / 3.938 | 0.176 / 0.810 | 15.4× / 4.9× | 2.628 / 3.508 | 2.858 / 4.259 |
+| 768k+32k | 3.010 / 4.083 | 0.200 / 0.597 | 15.0× / 6.8× | 2.900 / 4.532 | 0.202 / 0.952 | 14.4× / 4.8× | 2.997 / 4.227 | 3.401 / 5.261 |
+| 32k+768k | 48.400 / 50.985 | 3.792 / 4.186 | 12.8× / 12.2× | 45.156 / 48.122 | 3.882 / 13.198 | 11.6× / 3.6× | 48.466 / 50.967 | 45.273 / 48.958 |
+
+- 和旧主机比：1P 的 Prefill 都在 ±3% 以内，TTFT 普遍快 2–5%（本轮代码含 a233edf04，旧表在它之前测）；4P 长场景 TTFT 改善更明显
+  （512k+32k 4.259→3.938s，768k+32k 5.261→4.532s）。1k / 8k 的 4P Prefill 慢约 20%（绝对差 30–80ms，短场景单次波动大）。
+- Temu 11-02 比 10 月的数据快，所以倍数比旧表大：1P Prefill 6.3–15.0×，4P TTFT 2.2–4.9×。
+
+#### 6.1.1 旧主机结果（2026-10-28/29，2z6z / clsk，Temu 为 10 月数据）
+
 1P：`results/table-epic-1028-2309`；4P/8P：`results/table-4p8p-1029-0059`；16P（前 5 个场景）：`results/table-16p-1029-0333`。
 
 | 场景 | GCP 1P | Temu 1P | 1P 倍数 | GCP 4P | Temu 4P | 4P 倍数 | GCP 8P | GCP 16P |
@@ -317,7 +360,30 @@ $PY -I tps_bench.py --url http://10.128.0.176:8100 --tag sustained --cached 3276
 
 最新单点（2026-10-29，含反分词器修复与空闲 rank 修复）：512k+32k 1P 约 3.40–3.45s。
 
-### 6.2 TPOT（ms，格式 CLI / Server，倍数按 CLI 算；`results/tpot-final-1029.md`）
+### 6.2 TPOT（ms，格式 CLI / Server，倍数按 CLI 算）
+
+2026-11-05 新主机复测（同 6.1 的部署；`results/tpot-new-hosts-1105-1748.{jsonl,log}`，默认参数 out_len 1024）；Temu：2026-11-02 内部数据。
+
+| bs | 引擎 | 1k | 16k | 32k | 64k | 128k | 256k | 512k | 768k |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | GCP | 4.91/5.02 | 4.68/4.61 | 4.94/4.78 | 5.40/5.35 | 5.97/5.95 | 6.30/6.35 | 7.74/7.81 | 9.16/9.22 |
+| 1 | Temu | 2.22 | 2.24 | 2.24 | 2.22 | 2.25 | 2.25 | 2.24 | 2.26 |
+| 16 | GCP | 5.23/5.14 | 5.15/5.07 | 5.27/5.04 | 5.42/5.26 | 5.85/5.74 | 6.56/6.39 | 7.72/7.58 | 8.66/8.64 |
+| 16 | Temu | 3.10 | 3.14 | 3.15 | 3.15 | 3.15 | 3.15 | 3.19 | 3.21 |
+| 64 | GCP | 7.43/7.38 | 8.28/8.08 | 9.18/8.80 | 10.99/10.65 | 8.68/8.37 | 10.27/10.21 | 14.52/13.73 | 19.07/18.31 |
+| 64 | Temu | 4.33 | 4.35 | 4.35 | 4.34 | 4.35 | 4.38 | 4.49 | 4.56 |
+| 128 | GCP | 9.93/9.73 | 12.47/12.25 | 15.06/14.87 | 19.18/18.74 | 14.51/14.15 | 21.03/20.55 | 31.27/30.38 | 44.47/43.89 |
+| 128 | Temu | 5.21 | 5.22 | 5.18 | 5.20 | 5.25 | 5.35 | 5.51 | 5.68 |
+| 256 | GCP | 14.60/14.19 | 15.04/14.62 | 15.28/14.75 | 16.86/16.33 | 19.32/18.51 | 24.97/24.88 | —‡ | OOM† |
+| 256 | Temu | 7.30 | 7.38 | 7.33 | 7.41 | 7.50 | 7.64 | 7.97 | 8.27 |
+
+
+- 总体是 Temu 的 1.6–7.8 倍（按 CLI）；DSpark 平均接受长度 4.36–5.09。长 cache、大 batch 差距最大（768k bs128 44.5 vs 5.7ms）。
+- 和旧主机（6.2.1）基本一致，bs1 / bs16 在 1k–512k 范围内相差 ±10% 以内。
+- ‡ 512k bs256：out_len 1024 时"拼满窗口"不足 1s（-0.46s），旧表用 out_len 3072 补测，本轮没有补测。
+- † 768k bs256：两次 HTTP 500 后 D 被 OOM killer 杀掉（见第 7 节）。本轮按原配置运行（`TPU_RECLAIM_COMPILE_MEMORY=0`），D 启动后主机只剩约 37 GB 可用。
+
+#### 6.2.1 旧主机结果（2026-10-29，`results/tpot-final-1029.md`，Temu 为 10 月数据）
 
 | bs | 引擎 | 1k | 16k | 32k | 64k | 128k | 256k | 512k | 768k |
 |---|---|---|---|---|---|---|---|---|---|
@@ -372,6 +438,7 @@ $PY -I tps_bench.py --url http://10.128.0.176:8100 --tag sustained --cached 3276
 - ssh 远程起后台进程时用 `ssh -n -f ... > /dev/null 2>&1`，否则管道会卡住。
 - **测吞吐时新 token 命中缓存会让数字虚高**（曾出现一轮 230 万 tok/s）：同一个服务上重复跑，如果请求内容和之前一样，P 的前缀缓存会直接命中。要核对每轮的 `cache_hit_tokens`（见 4.4）。
 - 在 sjd1 上直接跑 JAX/Pallas 脚本时，要先设好 TPU 环境变量（`/zzlfs/temu/tools/sc_repro/env.sh`，和启动脚本里的一样），否则 JAX 初始化会卡住。
+- **新主机（944 GB 内存）上 D 的主机内存不够跑 768k bs256**（2026-11-05）：`TPU_RECLAIM_COMPILE_MEMORY=0` 时 D 编译完只剩约 37 GB 可用，P 约 140 GB；跑 TPOT 768k bs256 时 D 的 worker 共享内存涨到每个 150 GB 以上，先返回 HTTP 500，随后 worker 被 OOM killer 杀、整个 D 退出。长时间测试后 P 的可用内存也会从约 140 GB 降到约 74 GB。要跑这一格，需要 PIE Python + `TPU_RECLAIM_COMPILE_MEMORY=1`（2.4 节）或更大内存的机器。
 
 ---
 
