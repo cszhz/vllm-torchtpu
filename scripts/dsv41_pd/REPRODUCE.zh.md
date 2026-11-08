@@ -13,7 +13,7 @@
 | TTFT 4P | 0.40 – 48.1 s | 0.12 – 13.2 s | 2.2 – 4.9× |
 | TTFT 8P | 0.39 – 49.0 s | — | — |
 | TPOT（bs 1–256，cache 1k–768k） | 4.7 – 44.5 ms | 2.2 – 8.3 ms | 1.6 – 7.8× |
-| P 的 prefill 吞吐上限 | 整机约 17.2 万 tok/s，每芯片约 4.3 万 | — | — |
+| P 的 prefill 吞吐上限（DVFS 7） | 整机约 17.7 万 tok/s，每芯片约 4.4 万 | — | — |
 
 ---
 
@@ -129,10 +129,10 @@ cp $D $T/_tpu_raiden_torch_2_13_0.so
 ```bash
 cd /zzlfs/temu/scripts
 export P_HOST=10.128.0.145 D_HOST=10.128.0.28 TMPDIR=/dev/shm/epic-tmp VLLM_CACHE_ROOT=/dev/shm/epic-vllm-cache
-# P：默认配置（不开 async、compile [128,256,2048]、4 个 API server、起步等待 40ms）
+# P：默认配置（async、compile [128,256,2048]、4 个 API server、起步等待 40ms）；第 5 节的结果是 P 关 async（ASYNC_SCHED=0）时测的
 ROLES=prefill bash restart_epic.sh
 # D：async + MAX_NUM_SEQS=32 + compile [16,48,96,192,2048]（起步等待默认 20ms）
-ROLES=decode ASYNC_SCHED=1 MAX_NUM_SEQS=32 DECODE_COMPILE_SIZES='[16,48,96,192,2048]' bash restart_epic.sh
+ROLES=decode MAX_NUM_SEQS=32 DECODE_COMPILE_SIZES='[16,48,96,192,2048]' bash restart_epic.sh
 # 等两边 /health 返回 200，并检查日志里有没有致命错误；冷启动约 30–45 分钟（有编译缓存时更短）
 P_ADDR=10.128.0.145 D_ADDR=10.128.0.28 bash wait_ready.sh
 # proxy（在 P 那台上）
@@ -150,7 +150,7 @@ export PROXY_URL=http://10.128.0.145:8000 PREFILL_METRICS_URL=http://10.128.0.14
   --enable-prefix-caching --swa-bounded-replay --engram-config '{"cpu_offload":true}'
   --additional-config '{"deepseek_v41":{"execution":"ced","moe":"fused_ep_w4a8"}}'
   --speculative-config dspark K=5 --max-num-batched-tokens 2048`，KV connector 为 `TPURaidenConnector`。
-- 可调环境变量：`ASYNC_SCHED`、`MAX_NUM_SEQS`、`PREFILL_COMPILE_SIZES`、`DECODE_COMPILE_SIZES`、`API_SERVERS`、
+- 可调环境变量：`ASYNC_SCHED`（默认 1 = `--async-scheduling`，P、D 都开；0 = 关）、`DVFS_P_STATE`（默认 7，见 5.5）、`MAX_NUM_SEQS`、`PREFILL_COMPILE_SIZES`、`DECODE_COMPILE_SIZES`、`API_SERVERS`、
   `VLLM_DP_WAVE_START_DELAY_MS`、`TP_SIZE`/`DP_SIZE`、`NO_KV_TRANSFER`、`KV_BYTES`、`EXTRA_ARGS`。
   诊断用：`VLLM_LOGGING_PREFIX='%(created).3f '`（日志带毫秒级时间戳，`pd_timeline.py` 依赖它）、`TPU_DUMMY_STEP_TIMING=1`、`TPU_STAGE3_PROFILE=1`。
 - proxy 环境变量：`PROXY_TOKENIZER`（默认 `/tmp/dsv41-tokenizer`，本地分词）、`PROXY_TOKENIZER_PROCS`（默认 8）、
@@ -204,14 +204,14 @@ bash quick_set.sh                                                               
 
 **测什么**：P 满载时每秒能算多少个新 token。只测 P，不经过 proxy 和 D。
 
-**P 怎么起**：用和线上 P 相同的配置（chunk 2048、编译桶 `[128,256,2048]`、DP8/EP8、不开 async），但不挂 KV 传输。
+**P 怎么起**：用和线上 P 相同的配置（chunk 2048、编译桶 `[128,256,2048]`、DP8/EP8），但不挂 KV 传输。5.3 / 5.5 的结果是 P 关 async（`ASYNC_SCHED=0`）时测的。
 最好起在一台单独的机器上（原部署用 sjd1）；只有两台机器时，可以先停掉 PD 再在 P 那台上起，
 也可以不重启、直接测 PD 里正在运行的 P（`--url http://<P>:8100`，不要和其他测试同时跑；5.3 节就是这样测的，没有开 async 的对比）：
 
 ```bash
 ssh -n -f <host> "cd /zzlfs/temu && TMPDIR=/dev/shm/epic-tmp VLLM_CACHE_ROOT=/dev/shm/epic-vllm-cache NO_KV_TRANSFER=1 \
     setsid nohup bash /zzlfs/temu/scripts/start_1p1d_epic.sh prefill > /zzlfs/temu/logs/tps-prefill-\$(date +%m%d-%H%M).log 2>&1 < /dev/null &"
-# 机器上要先有 /tmp/dsv41-tokenizer；等日志出现 "Application startup complete"。对比 async 时再加 ASYNC_SCHED=1
+# 机器上要先有 /tmp/dsv41-tokenizer；等日志出现 "Application startup complete"。复现第 5 节的数字时加 ASYNC_SCHED=0
 ```
 
 **怎么测**（`tps_bench.py`）：
@@ -290,23 +290,23 @@ python3 transfer_stats.py ...                                                   
 - ‡ 512k bs256：out_len 1024 时"拼满窗口"不足 1s（-0.46s），旧表用 out_len 3072 补测，本轮没有补测。
 - † 768k bs256：两次 HTTP 500 后 D 被 OOM killer 杀掉（第 7 节）。
 
-### 5.3 P 的 prefill 吞吐上限（tok/s；`results/tps-new-hosts-1106-0224.{jsonl,log}`，方法见 4.3）
+### 5.3 P 的 prefill 吞吐上限（tok/s；方法见 4.3）
 
-直接测 PD 里正在运行的 P（10.128.0.145:8100，挂着 KV connector；请求不带 PD 传输参数，不触发 KV 登记 / 传输），没有另起
-`NO_KV_TRANSFER=1` 的 P，所以没有开 async 的对比。32k 缓存前缀，每组 1 轮预热 + 2 轮正式，所有正式轮的 `cache_hit_tokens` 都正好等于 前缀 × 并发。
+2026-11-06 在 g45q 上单独起的 P（`NO_KV_TRANSFER=1`、`ASYNC_SCHED=0`、DVFS 7，刚启动），和旧主机 sjd1 的测法一致；
+`results/tps-dvfs7-1106-1635.jsonl`。32k 缓存前缀，每组 1 轮预热 + 3 轮正式，所有正式轮的 `cache_hit_tokens` 都正好等于 前缀 × 并发。
 
-| 组 | 场景 | 整机 tok/s | 每芯片 tok/s | 旧主机（sjd1，不开 async） |
+| 组 | 场景 | 整机 tok/s | 每芯片 tok/s | 旧主机（sjd1） |
 |---|---|---|---|---|
-| 新 token 长度扫描（8 并发） | 32k | 16.4–16.5 万 | 4.11 万 | 15.8–16.1 万 |
-| | 64k | 16.4–16.7 万 | 4.11–4.17 万 | 17.7–17.8 万 |
-| | **168k** | **17.1–17.2 万** | **4.27–4.30 万** | 17.3 万 |
-| | 256k | 16.6–16.9 万 | 4.16–4.23 万 | 17.2 万 |
-| 持续满载（168k 新 token） | 16 并发（每个 rank 2 条） | 17.2 万 | 4.29–4.30 万 | 17.0–17.4 万 |
-| | 24 并发（每个 rank 3 条） | 16.6–17.1 万 | 4.15–4.27 万 | 16.8–17.0 万 |
+| 新 token 长度扫描（8 并发） | 32k | 16.1–16.4 万 | 4.03–4.10 万 | 15.8–16.1 万 |
+| | **64k** | **17.7 万** | **4.43 万** | 17.7–17.8 万 |
+| | 168k | 17.3 万 | 4.31–4.33 万 | 17.3 万 |
+| | 256k | 17.1–17.2 万 | 4.28–4.29 万 | 17.2 万 |
+| 持续满载（168k 新 token） | 16 并发（每个 rank 2 条） | 16.9–17.4 万 | 4.23–4.34 万 | 17.0–17.4 万 |
+| | 24 并发（每个 rank 3 条） | 16.5–17.4 万 | 4.13–4.34 万 | 16.8–17.0 万 |
 
-- **新主机上 P 的 prefill 吞吐上限约为整机 17.2 万 tok/s，每芯片约 4.3 万 tok/s**，和旧主机（17.5 万 / 4.4 万）基本一致；
-  旧主机上 64k 最高，这里 64k 低约 6%、168k 最高，可能和挂着 KV connector 有关，没有单独验证。
-- 新 token ≥168k 不再提升；每个 rank 多排请求没有用（每个 rank 每步的预算固定是 2048 个 token）。
+- **P 的 prefill 吞吐上限约为整机 17.7 万 tok/s，每芯片约 4.4 万 tok/s**，和旧主机一致。新 token ≥64k 不再提升；每个 rank 多排请求没有用（每步预算固定 2048 token）。
+- 直接测 PD 里正在运行的 P（挂着 KV connector、已连续跑了几个小时；`results/tps-new-hosts-1106-0224.jsonl`）时低 1–6%：
+  32k 16.4–16.5 万、64k 16.4–16.7 万、168k 17.1–17.2 万、256k 16.6–16.9 万、16 并发 17.2 万、24 并发 16.6–17.1 万。
 
 ### 5.4 如何复现某一组数字
 
@@ -314,6 +314,21 @@ python3 transfer_stats.py ...                                                   
 2. 按第 2.4 节准备机器，按第 3 节启动 P、D、proxy（`PROXY_ALIGN_MS`、`PROXY_RENDER_CACHE_MB` 都不设）。
 3. 按第 4 节跑对应脚本，结果写进 `results/*.jsonl`，汇总行在同名 `.log` 里（`== ... (median): Prefill x / TTFT y`）。
 4. 附录 B 的旧主机数字是在 a233edf04 之前测的（32842f3d7 + d8e22db82 的内存回收改动即可复现）；a233edf04 只降低 TTFT 中 D 这一跳的开销，不影响 Prefill 和 TPOT。
+
+### 5.5 DVFS 档位（`--xla_tpu_dvfs_p_state` 7 vs 3）
+
+同 5.3 的单独 P（`NO_KV_TRANSFER=1`、`ASYNC_SCHED=0`），只改 `DVFS_P_STATE`；`results/tps-dvfs{7,3}-1106-*.jsonl`，每组 3 轮正式，取中位数。
+
+| 场景 | DVFS 7 | DVFS 3 | 变化 |
+|---|---|---|---|
+| 32k 新 token，8 并发 | 16.24 万 | 14.77 万 | −9.1% |
+| 64k，8 并发 | 17.74 万 | 16.18 万 | −8.7% |
+| 168k，8 并发 | 17.26 万 | 15.84 万 | −8.2% |
+| 256k，8 并发 | 17.10 万 | 15.64 万 | −8.6% |
+| 168k，16 并发 | 16.96 万 | 15.83 万 | −6.7% |
+| 168k，24 并发 | 16.97 万 | 15.47 万 | −8.8% |
+
+- DVFS 3 的 prefill 吞吐比 7 低 7–9%；引擎初始化（profile + KV 分配 + 预热）459s → 1095s。默认保持 7。详细报告见 `cszhz/tpu-misc`。
 
 ---
 
@@ -330,7 +345,7 @@ python3 transfer_stats.py ...                                                   
 6. **proxy 只分词一次**：本地切块并行分词（只在"字母 空格 字母"处切，保证拼接结果和整段分词一致）+ 进程池 + orjson；P、D 不再各分词一次（557k token 每次约 2.7s）。
 7. **4P 对齐**：DP wave 起步等待（P 40ms / D 20ms）、4 个 API server、orjson 解析、proxy 进程池。512k+32k 4P TTFT 7.0→约 4.0–4.5s。
 8. **空闲 EP-DP rank 复用全零 dummy block table**（4250476f6）：bs1 TPOT 降低约一半。
-9. **D 开 async scheduling**（P 不开）：TPOT 降低 10–46%；P 开了对 TTFT 没有帮助。
+9. **D 开 async scheduling**：TPOT 降低 10–46%；P 开了对 TTFT 没有帮助（2026-10 的结论）。2026-11-08 起脚本默认 P、D 都开 async。
 
 ### 6.2 D 这一跳的控制路径优化（2026-10-29，已部署）
 
