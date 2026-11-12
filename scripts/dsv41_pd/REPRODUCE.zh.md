@@ -28,7 +28,7 @@
 | D（decode） | zzl-tpu7x-slice-mig-hl-6g41 | 10.128.0.156:8200 | 同上 |
 | proxy | 与 P 同机 | 10.128.0.100:8000 | 客户端只打这个端口 |
 
-- 上一套主机（5.2–5.6 的结果）：P = tpuv7-mig-g45q（10.128.0.145），D = tpuv7-mig-pqs0（10.128.0.28）。
+- 上一套主机（5.2–5.5 的结果）：P = tpuv7-mig-g45q（10.128.0.145），D = tpuv7-mig-pqs0（10.128.0.28）。
 - 原部署（附录 B 的结果）：P = zzl-tpu7x-slice-mig-2z6z（10.128.0.175），D = …-clsk（10.128.0.177），
   另有编译 / 单测机 …-sjd1（10.128.0.176，**不要在 P/D 上跑 pytest，会占 TPU**）。脚本里的默认地址仍是原部署，新主机用环境变量覆盖（第 3 节）。
 - 每个 DP rank 是一颗 v7x 芯片的一个 TensorCore（每颗芯片 2 个），device `2k`、`2k+1` 在同一颗芯片上；DP rank 和 device 的对应在每次启动时分配，不一定按顺序。
@@ -147,7 +147,7 @@ cp $D $T/_tpu_raiden_torch_2_13_0.so
 ```bash
 cd /zzlfs/temu/scripts
 export P_HOST=10.128.0.100 D_HOST=10.128.0.156 TMPDIR=/dev/shm/epic-tmp VLLM_CACHE_ROOT=/dev/shm/epic-vllm-cache
-# P：默认配置（async、compile [128,256,2048]、4 个 API server、起步等待 40ms）；5.2–5.6 的结果是 P 关 async（ASYNC_SCHED=0）时测的
+# P：默认配置（async、compile [128,256,2048]、4 个 API server、起步等待 40ms）；5.2–5.4 的 P 关 async（ASYNC_SCHED=0）
 ROLES=prefill bash restart_epic.sh
 # D：async + MAX_NUM_SEQS=32 + compile [16,48,96,192,2048]（起步等待默认 20ms）。不设时脚本默认 16 / [16,96,128,2048]，TPOT 和表不可比（4.2）
 ROLES=decode MAX_NUM_SEQS=32 DECODE_COMPILE_SIZES='[16,48,96,192,2048]' bash restart_epic.sh
@@ -171,7 +171,7 @@ export PROXY_URL=http://10.128.0.100:8000 PREFILL_METRICS_URL=http://10.128.0.10
   --enable-prefix-caching --swa-bounded-replay --engram-config '{"cpu_offload":true}'
   --additional-config '{"deepseek_v41":{"execution":"ced","moe":"fused_ep_w4a8"}}'
   --speculative-config dspark K=5 --max-num-batched-tokens 2048`，KV connector 为 `TPURaidenConnector`。
-- 可调环境变量：`ASYNC_SCHED`（默认 1 = `--async-scheduling`，P、D 都开；0 = 关）、`DVFS_P_STATE`（默认 7，见 5.6）、`MAX_NUM_SEQS`、`PREFILL_COMPILE_SIZES`、`DECODE_COMPILE_SIZES`、`API_SERVERS`、
+- 可调环境变量：`ASYNC_SCHED`（默认 1 = `--async-scheduling`，P、D 都开；0 = 关）、`DVFS_P_STATE`（默认 7）、`MAX_NUM_SEQS`、`PREFILL_COMPILE_SIZES`、`DECODE_COMPILE_SIZES`、`API_SERVERS`、
   `VLLM_DP_WAVE_START_DELAY_MS`、`TP_SIZE`/`DP_SIZE`、`NO_KV_TRANSFER`、`KV_BYTES`、`EXTRA_ARGS`。
   诊断用：`VLLM_LOGGING_PREFIX='%(created).3f '`（日志带毫秒级时间戳，`pd_timeline.py` 依赖它）、`TPU_DUMMY_STEP_TIMING=1`、`TPU_STAGE3_PROFILE=1`。
 - proxy 环境变量：`PROXY_TOKENIZER`（默认 `/tmp/dsv41-tokenizer`，本地分词）、`PROXY_TOKENIZER_PROCS`（默认 8）、
@@ -237,14 +237,14 @@ bash quick_set.sh                                                               
 
 **测什么**：P 满载时每秒能算多少个新 token。只测 P，不经过 proxy 和 D。
 
-**P 怎么起**：用和线上 P 相同的配置（chunk 2048、编译桶 `[128,256,2048]`、DP8/EP8），但不挂 KV 传输。5.4 / 5.6 的结果是 P 关 async（`ASYNC_SCHED=0`）时测的。
+**P 怎么起**：用和线上 P 相同的配置（chunk 2048、编译桶 `[128,256,2048]`、DP8/EP8），但不挂 KV 传输。5.4 的结果是 P 关 async（`ASYNC_SCHED=0`）时测的。
 最好起在一台单独的机器上（原部署用 sjd1）；只有两台机器时，可以先停掉 PD 再在 P 那台上起，
 也可以不重启、直接测 PD 里正在运行的 P（`--url http://<P>:8100`，不要和其他测试同时跑；5.1 和 5.4 最后一段就是这样测的，没有开 async 的对比）：
 
 ```bash
 ssh -n -f <host> "cd /zzlfs/temu && TMPDIR=/dev/shm/epic-tmp VLLM_CACHE_ROOT=/dev/shm/epic-vllm-cache NO_KV_TRANSFER=1 \
     setsid nohup bash /zzlfs/temu/scripts/start_1p1d_epic.sh prefill > /zzlfs/temu/logs/tps-prefill-\$(date +%m%d-%H%M).log 2>&1 < /dev/null &"
-# 机器上要先有 /tmp/dsv41-tokenizer；等日志出现 "Application startup complete"。复现 5.4 / 5.6 的数字时加 ASYNC_SCHED=0
+# 机器上要先有 /tmp/dsv41-tokenizer；等日志出现 "Application startup complete"。复现 5.4 的数字时加 ASYNC_SCHED=0
 ```
 
 **怎么测**（`tps_bench.py`）：
@@ -264,7 +264,25 @@ $PY -I tps_bench.py --url http://<host>:8100 --tag sustained --cached 32768 --ne
 - **TPS = 新 token 总数 ÷ 墙钟时间**（从第一条发出到最后一条完成）。每组先跑 1 轮预热（不计入），再跑 `--rounds`（默认 2）轮正式。
 - 每轮从 P 的 metrics 记录 `cache_hit_tokens`，**正式轮的命中必须正好等于 前缀长度 × 并发数**，多了就说明新 token 命中了缓存，这一轮作废。脚本每次运行用随机起点生成偏移，同一个服务上重复跑也不会撞上。
 
-### 4.4 单请求时间线 / 耗时分解
+### 4.4 InferenceX AgentX（aiperf，真实 Claude Code 会话回放）
+
+```bash
+# aiperf 用 GitHub main（0.13.0 正式版没有 --scenario）；数据集 semianalysisai/cc-traces-weka-062126 首次运行时自动下载
+uv venv -p /usr/bin/python3.12 /zzlfs/temu/.venv-aiperf && uv pip install --python /zzlfs/temu/.venv-aiperf/bin/python git+https://github.com/ai-dynamo/aiperf
+# proxy 必须开会话亲和（见下），再跑
+ssh -n -f <P> 'PROXY_SESSION_AFFINITY_DP=8 PREFILL_HOST=<P> DECODE_HOST=<D> setsid nohup bash start_proxy.sh > proxy.log 2>&1 < /dev/null &'
+CONC=256 DURATION=3600 TAG=base bash run_agentx.sh      # 结果和每 30s 的 P/D /metrics 在 results/agentx-c<CONC>-<TAG>-<时间>/
+```
+
+- `--scenario inferencex-agentx-mvp` 锁定：ignore_eos、流式、`--cache-bust first_turn_prefix`、轮间延迟按 trace 回放（只截系统空闲间隔到 10s）、至少 900s。
+  `--concurrency` 是**会话数**，同时在跑的请求只有其中一部分。
+- aiperf 构造数据集约 5 分钟，`run_agentx.sh` 把 `AIPERF_DATASET_CONFIGURATION_TIMEOUT` 调到 1800s（默认 300s 不够）；数据写到 `/tmp/aiperf_mmap_*`（根分区），跑完删掉。
+- **会话亲和**（`PROXY_SESSION_AFFINITY_DP=<dp>`）：前缀缓存按 DP rank 存，不开时同一会话的后续轮次落到别的 rank，P 命中率只有 26%、TTFT P50 84s。
+  proxy 用 system prompt 和第一条用户消息的开头做会话 key；新会话分到估计 prefill 工作量最少的 rank，老会话留在原 rank，
+  除非在原 rank 等待的代价超过"最闲 rank 重算整个上下文"的 `PROXY_AFFINITY_MIGRATE_FACTOR` 倍（默认 3，0 = 不迁移）；`PROXY_AFFINITY_BALANCE=0` 退回 hash % dp。
+- 流式响应的 Content-Type 必须是 `text/event-stream`（aiperf 按它选解析器），proxy 已修。
+
+### 4.5 单请求时间线 / 耗时分解
 
 ```bash
 /zzlfs/temu/.venv/bin/python -I d_breakdown.py --cached 524288 --new 32768 --rounds 3   # D 端 vLLM 指标分解
@@ -322,7 +340,7 @@ python3 transfer_stats.py ...                                                   
 
 - 和 TTFT 一致：new 段短时更快，new 段很长时略慢。
 
-### 5.2–5.6 2026-11-05/06：合并前（主机 g45q / pqs0）
+### 5.2–5.5 2026-11-05/06：合并前（主机 g45q / pqs0）
 
 配置同第 3 节，proxy 的对齐窗口和分词缓存都关；代码 54e98d673（= 1dc6984ac + 6cb686ef4）。Temu 为 2026-11-02 内部数据（`results/temu-1102.md`）。
 
@@ -396,20 +414,22 @@ python3 transfer_stats.py ...                                                   
 3. 按第 4 节跑对应脚本，结果写进 `results/*.jsonl`，汇总行在同名 `.log` 里（`== ... (median): Prefill x / TTFT y`）。
 4. 附录 B 的旧主机数字是在 a233edf04 之前测的（32842f3d7 + d8e22db82 的内存回收改动即可复现）；a233edf04 只降低 TTFT 中 D 这一跳的开销，不影响 Prefill 和 TPOT。
 
-### 5.6 DVFS 档位（`--xla_tpu_dvfs_p_state` 7 vs 3）
+### 5.6 AgentX（2026-11-12，hl-2lxt / hl-6g41，合并后代码）
 
-同 5.4 的单独 P（`NO_KV_TRANSFER=1`、`ASYNC_SCHED=0`），只改 `DVFS_P_STATE`；`results/tps-dvfs{7,3}-1106-*.jsonl`，每组 3 轮正式，取中位数。
+`results/agentx-c*-{base,affinity,sweep-balanced,sweep-swafix}-1112-*`。P 生产配置，D `MAX_NUM_SEQS=64` + `[16,48,96,192,384,2048]`（c256 两轮 3600s 时 D 为 32 / `[16,48,96,192,2048]`、P 关 async）。
 
-| 场景 | DVFS 7 | DVFS 3 | 变化 |
-|---|---|---|---|
-| 32k 新 token，8 并发 | 16.24 万 | 14.77 万 | −9.1% |
-| 64k，8 并发 | 17.74 万 | 16.18 万 | −8.7% |
-| 168k，8 并发 | 17.26 万 | 15.84 万 | −8.2% |
-| 256k，8 并发 | 17.10 万 | 15.64 万 | −8.6% |
-| 168k，16 并发 | 16.96 万 | 15.83 万 | −6.7% |
-| 168k，24 并发 | 16.97 万 | 15.47 万 | −8.8% |
+| 运行 | 时长 | req/s | 输出 tok/s | TTFT P50 / P90 | ITL P50 | P 命中率 |
+|---|---|---|---|---|---|---|
+| c256 无亲和 | 3600s | 1.63 | 1,636 | 84.5 / 135 s | 11.3 ms | 26% |
+| c256 hash 亲和 | 3600s | 3.75 | 3,713 | 2.33 / 7.9 s | 17.4 ms | 73.5% |
+| c256 负载感知亲和 | 900s | 5.04 | 4,282 | 2.29 / 6.5 s | 16.4 ms | 86.8% |
+| c512 负载感知亲和 | 900s | **5.51** | **4,360** | 5.7 / 36 s | 39.8 ms | 75.3% |
+| c768 负载感知亲和 | 900s | 4.50 | 3,854 | 44 / 115 s | 41.0 ms | — |
+| 参考（客户提供，c256） | 3600s | 5.22 | 5,218 | 0.22 / 0.48 s | 4.83 ms | 理论 97% |
 
-- DVFS 3 的 prefill 吞吐比 7 低 7–9%；引擎初始化（profile + KV 分配 + 预热）459s → 1095s。默认保持 7。详细报告见 `cszhz/tpu-misc`。
+- 峰值在 c512 附近；c768 时 P 8 个 rank 全忙、平均排队 261，D 只跑 146 个请求、KV 28%：这个负载下 **P 是瓶颈**（每个会话第一轮整段 prefill，单 rank 算）。
+- ITL 随 D 并发上升（69 → 175 个请求：16 → 40 ms），DSpark 接受长度约 3.0（greedy bench 约 4.9）。
+- c512 起曾反复崩溃：P 的 SWA 私有池耗尽（见第 7 节），已修。
 
 ---
 
@@ -485,6 +505,11 @@ python3 transfer_stats.py ...                                                   
   超过 944 GB，可用内存降到 15 GB。删掉不再用的 `torch_compile_cache/<hash>`（2.4）后正常。`df /dev/shm` 比 `du` 大时，差额是已删除但仍被进程打开的文件（`lsof +L1`）。
 - 换配置启动时建议盯着可用内存（`free -g` 的 available），低于 20 GB 就停掉；停的时候要确认 `VLLM::Worker` 都退出了，第一次 `stop_vllm_local.sh` 偶尔停不干净。
 - **合并前 TPOT 768k bs256 时 D 被 OOM killer 杀**（2026-11-05）的问题，合并后没有再出现（这一格现在在 proxy→P 就失败，见 4.2）。
+
+- **P 在 AgentX c512 下崩溃：`DeepSeek-V4.1 SWA pool exhausted: ... needs N pages, M free of 241`**（2026-11-12）。SWA 私有池按 `max_num_seqs` 个运行中请求定容量，
+  但 PD 下 P 做完 prefill 的请求要留着窗口页等 D 拉走，D 跟不上时积压越来越多；原代码页不够直接抛异常，引擎退出、其余引擎随后报 gloo `Connection closed by peer`
+  （看起来像 worker 被杀，其实第一现场是某个 EngineCore 的这条异常）。已修：KV connector 下按 `4 × max_num_seqs` 预留待传请求的窗口页（`TPU_DSV41_SWA_HELD_SEQS` 可调），
+  超出时延后分配而不是退出（`TPU_DSV41_SWA_EXHAUSTED_RAISE=1` 恢复报错）。
 
 **磁盘与路径**
 
