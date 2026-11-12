@@ -1,19 +1,20 @@
 # DeepSeek-V4.1-Flash 1P1D（vllm-torchtpu，Stage-3 Raiden）复现手册
 
-更新：2026-11-06。称呼约定：**GCP** = 我们的部署；**Temu** = 客户内部数据（对比基准，当前用 2026-11-02 版本）。
+更新：2026-11-12。称呼约定：**GCP** = 我们的部署；**Temu** = 客户内部数据（对比基准，当前用 2026-11-02 版本）。
 
 ## 最新结果一览
 
-2026-11-05/06 在新主机（g45q / pqs0）上按本手册复测，代码 `cszhz/dsv41-1p1d`。详细表格见第 5 节，旧主机结果见附录 B。
+2026-11-11 在主机 hl-2lxt / hl-6g41 上复测，代码是合并了 epic/dsv41 ef2599d3d 之后的 `cszhz/dsv41-1p1d`（4082db4a2），FP8 Index-K。
+本轮只测了 8P TTFT、TPOT、TPS，1P / 4P 没有重测。详细表格见 5.1；11-05/06 的结果（合并前）见 5.2–5.6，旧主机见附录 B。
 
-| 指标 | GCP | Temu（11-02） | 倍数（GCP ÷ Temu） |
+| 指标 | GCP 11-11（合并后） | GCP 11-05/06（合并前） | Temu（11-02） |
 |---|---|---|---|
-| Prefill 1P（1k+1k … 32k+768k） | 0.23 – 48.4 s | 0.036 – 3.79 s | 6.3 – 15.0× |
-| TTFT 1P | 0.31 – 51.0 s | 0.065 – 4.19 s | 4.7 – 12.2× |
-| TTFT 4P | 0.40 – 48.1 s | 0.12 – 13.2 s | 2.2 – 4.9× |
-| TTFT 8P | 0.39 – 49.0 s | — | — |
-| TPOT（bs 1–256，cache 1k–768k） | 4.7 – 44.5 ms | 2.2 – 8.3 ms | 1.6 – 7.8× |
-| P 的 prefill 吞吐上限（DVFS 7） | 整机约 17.7 万 tok/s，每芯片约 4.4 万 | — | — |
+| TTFT 8P（1k+1k … 32k+768k） | 0.37 – 45.2 s | 0.39 – 49.0 s | — |
+| TPOT（bs 1–256，cache 1k–768k，CLI） | 3.9 – 9.0 ms | 4.7 – 44.5 ms | 2.2 – 8.3 ms |
+| P 的 prefill 吞吐（PD 里的 P，8 并发） | 16.5 – 19.1 万 tok/s | 16.4 – 17.2 万 tok/s | — |
+
+- 合并后 TPOT 基本不随 cache 长度增长（bs64 在 1k–768k 都是 5.2–5.7 ms），是 Temu 的约 1.0–2.2 倍（合并前 1.6–7.8 倍）。
+- TTFT 8P 11 个场景里 10 个更快（最多快 17%），168k+32k 慢 2%。
 
 ---
 
@@ -23,26 +24,33 @@
 
 | 角色 | 主机 | 地址 | 说明 |
 |---|---|---|---|
-| P（prefill） | tpuv7-mig-g45q | 10.128.0.145:8100 | 一台 4 芯片 v7x，DP8 / TP1 / EP8（tpu7x-16 slice 的 worker 0） |
-| D（decode） | tpuv7-mig-pqs0 | 10.128.0.28:8200 | 同上（worker 1） |
-| proxy | 与 P 同机 | 10.128.0.145:8000 | 客户端只打这个端口 |
+| P（prefill） | zzl-tpu7x-slice-mig-hl-2lxt | 10.128.0.100:8100 | 一台 4 芯片 v7x，DP8 / TP1 / EP8 |
+| D（decode） | zzl-tpu7x-slice-mig-hl-6g41 | 10.128.0.156:8200 | 同上 |
+| proxy | 与 P 同机 | 10.128.0.100:8000 | 客户端只打这个端口 |
 
+- 上一套主机（5.2–5.6 的结果）：P = tpuv7-mig-g45q（10.128.0.145），D = tpuv7-mig-pqs0（10.128.0.28）。
 - 原部署（附录 B 的结果）：P = zzl-tpu7x-slice-mig-2z6z（10.128.0.175），D = …-clsk（10.128.0.177），
   另有编译 / 单测机 …-sjd1（10.128.0.176，**不要在 P/D 上跑 pytest，会占 TPU**）。脚本里的默认地址仍是原部署，新主机用环境变量覆盖（第 3 节）。
-- 每个 DP rank 是半颗 v7x（2 个 TensorCore）。EP 下 8 个 DP rank 同步（lockstep）前进，空闲 rank 每步跑 dummy forward。
+- 每个 DP rank 是一颗 v7x 芯片的一个 TensorCore（每颗芯片 2 个），device `2k`、`2k+1` 在同一颗芯片上；DP rank 和 device 的对应在每次启动时分配，不一定按顺序。
+  EP 下 8 个 DP rank 同步（lockstep）前进，空闲 rank 每步跑 dummy forward。
 - 模型：`gs://zzl-bucket/models/DeepSeek-V4.1-Flash`（runai streamer 直接从 GCS 加载）。
 - 共享盘 `/zzlfs` 所有机器都挂载，下文路径都在共享盘上。
 
 ### 1.2 代码版本
 
 - vllm-torchtpu：`https://github.com/cszhz/vllm-torchtpu`，分支 **`cszhz/dsv41-1p1d`**（本地 `/zzlfs/temu/src/vllm-torchtpu-cszhz`），
-  基于上游 `vllm-project/vllm-torchtpu` 的 `epic/dsv41`（6a1ebddb7）。**所有改动只在 cszhz fork 上，不要推上游**
-  （本地 clone 的 upstream push URL 已设成 `DISABLED-do-not-push-to-vllm-project`）。提交列表见附录 A。
+  2026-11-11 合并了上游 `vllm-project/vllm-torchtpu` 的 `epic/dsv41`（ef2599d3d，合并提交 f6693c749），之前基于 6a1ebddb7。
+  **所有改动只在 cszhz fork 上，不要推上游**（本地 clone 的 upstream push URL 已设成 `DISABLED-do-not-push-to-vllm-project`）。提交列表见附录 A。
 - P、D 用同一份代码，以 editable 方式装进 venv。
-- tpu-sync（KV 传输）：`GetBlockChunks` 原来每个 block 扫描整个 schedule（O(n²)），557k token 传一次要 27.9s，修复后 0.95s
-  （再加上前缀命中跳过，实际只要 30–40ms）。PR **google/tpu-sync#1382**（cszhz/tpu-sync 分支 `fix/getblockchunks-entry-index-main`，基于 main）。
-  **部署实际用的版本**：nightly 1012（e3f6f4fc）+ 同一修复 = cszhz/tpu-sync 分支 `fix/getblockchunks-on-nightly-1012`（3e5d3c35），
-  本地 `/zzlfs/temu/src/tpu-sync-1012`。原因：main 的 Python API 和 PyPI 上的 `tpu-sync-torch==0.0.1.dev20261012084241` 对不上，而且 main 需要 libibverbs。
+- tpu-sync（KV 传输）：
+  - **部署实际用的版本**：PyPI nightly `tpu-sync-torch==0.0.1.dev20261031081414`（对应 main 1523b07d，已包含 `GetBlockChunks` O(n²) 修复，
+    原 PR google/tpu-sync#1382）+ "允许各 storage 块数不同"的修改 = cszhz/tpu-sync 分支 **`per-layer-major-dim-on-1031`**（f2fa4536），
+    本地 `/zzlfs/temu/src/tpu-sync-1031`。编法见 2.2。
+  - 为什么必须自己编：合并后的 epic/dsv41 把 SWA 放进了窗口大小的私有池（每个 rank 241 页，主池约 52 万页），
+    原版 tpu-sync 要求所有 storage 块数相同，启动时报 `Layer N has major dimension ... but layer 0 has ...`；
+    另外 host 镜像按最大的 storage 分配会 OOM、传输时 staging 槽位越界（`Chunk out of bounds`）、块 id 越界检查不分组（`local block id N is out of range for pool M`）。
+  - 上游 PR：**google/tpu-sync#1527**（cszhz/tpu-sync 分支 `pool-heterogeneous-block-counts`，基于 main d2d9d37b）。
+    main 在 47e9f200 已经修了 staging 和 host 镜像大小两处，PR 只含另外 3 处。
 
 ---
 
@@ -51,7 +59,7 @@
 ### 2.1 venv（`/zzlfs/temu/.venv-epic`）
 
 epic/dsv41 需要 jax 0.11.2（旧 venv 缺 `pltpu.ACC`），所以单独建一个新 venv。依赖清单见 `scripts/dsv41_pd/requirements-epic.txt`
-（torch 2.13.0、torch-tpu 0.2.0、jax/jaxlib 0.11.2、libtpu 0.0.50、vLLM v0.31.1rc0 = e37e51dd、tpu-sync-torch dev20261012、runai-model-streamer[gcs]、xxhash）。
+（torch 2.13.0、torch-tpu 0.2.0、jax/jaxlib 0.11.2、libtpu 0.0.50、vLLM v0.31.1rc0 = e37e51dd、tpu-sync-torch dev20261031、runai-model-streamer[gcs]、xxhash）。
 
 ```bash
 UV=/zzlfs/.tools/pyenv/bin/uv
@@ -69,30 +77,38 @@ $UV pip install --python /zzlfs/temu/.venv-epic/bin/python --no-deps -e /zzlfs/t
 - 这个 venv 建在非 PIE 的 `/usr/bin/python3.12` 上，所以 `TPU_RECLAIM_COMPILE_MEMORY` 只能关（见第 7 节）。
 - 旧的 `/zzlfs/temu/.venv` 留给旧 PD 部署；benchmark 客户端脚本仍用 `.venv/bin/python` 跑（只需要 httpx）。
 
-### 2.2 编译并替换 tpu-sync 的 .so（在 sjd1 上编）
+### 2.2 编译并替换 tpu-sync 的 .so
+
+venv 里先装 PyPI 的 `tpu-sync-torch==0.0.1.dev20261031081414`（Python 层用它的），再把 C++ 扩展换成自己编的。
+编译机需要 clang-18（P 那台 hl-2lxt 上就能编，约 10 分钟；不要和正在跑的服务抢 CPU 时编）。
 
 ```bash
 # 取代码（共享盘上已有的话跳过）
-git clone -b fix/getblockchunks-on-nightly-1012 https://github.com/cszhz/tpu-sync.git /zzlfs/temu/src/tpu-sync-1012
-# sjd1：需要 clang-18（libibverbs-dev 已装）
-cat /zzlfs/temu/src/build-tpusync-1012.sh      # 内容如下
-#   cd /zzlfs/temu/src/tpu-sync-1012
+git clone -b per-layer-major-dim-on-1031 https://github.com/cszhz/tpu-sync.git /zzlfs/temu/src/tpu-sync-1031
+cat /zzlfs/temu/src/build-tpusync-1031.sh      # 内容如下
+#   cd /zzlfs/temu/src/tpu-sync-1031
 #   SP=/zzlfs/temu/.venv-epic/lib/python3.12/site-packages
 #   export CC=/usr/bin/clang-18 CXX=/usr/bin/clang++-18
 #   export PATH=/zzlfs/temu/tools/nopip:$PATH TORCH_SOURCE=$SP TORCH_TPU_SOURCE=$SP
 #   bash build.sh torch
-ssh zzl-tpu7x-slice-mig-sjd1 bash /zzlfs/temu/src/build-tpusync-1012.sh
+bash /zzlfs/temu/src/build-tpusync-1031.sh
 
-# 产物改 NEEDED 后放进 venv（原 .so 备份为 .pypi-1012）
-D=/zzlfs/temu/tools/tpu_sync_epic/_tpu_raiden_torch_2_13_0.so
-cp /zzlfs/temu/src/tpu-sync-1012/tpu_sync/frameworks/torch/_tpu_raiden_torch.so $D
-patchelf --replace-needed libpywrap_torch_tpu_common.so libpywrap_2_13_0_common.so $D
+# 产物改 NEEDED 后放进 venv（原 .so 备份为 .pypi-1031）
+D=/zzlfs/temu/tools/tpu_sync_epic/_tpu_raiden_torch_2_13_0-1031-perlayer.so
+cp /zzlfs/temu/src/tpu-sync-1031/tpu_sync/frameworks/torch/_tpu_raiden_torch.so $D
+patchelf --add-needed libpywrap_2_13_0_common.so $D
+patchelf --remove-needed libpywrap_torch_tpu_common.so $D
 T=/zzlfs/temu/.venv-epic/lib/python3.12/site-packages/tpu_sync/frameworks/torch
-cp $T/_tpu_raiden_torch_2_13_0.so $T/_tpu_raiden_torch_2_13_0.so.pypi-1012   # 只做一次
+cp $T/_tpu_raiden_torch_2_13_0.so $T/_tpu_raiden_torch_2_13_0.so.pypi-1031   # 只做一次
 cp $D $T/_tpu_raiden_torch_2_13_0.so
+# 检查能加载（直接 import 模块名会失败，这是正常的）
+/zzlfs/temu/.venv-epic/bin/python -c "from tpu_sync.api.torch import kv_cache_manager as k; k._torch_impl(); print('ok')"
 ```
 
-（`/zzlfs/temu/tools/nopip/python3` 是一个包装，用来阻止 build.sh 调用 pip 去改 venv。）
+- `/zzlfs/temu/tools/nopip/python3` 是一个包装，用来阻止 build.sh 调用 pip 去改 venv。
+- 不替换 .so 时，合并后的代码启动阶段就会失败（1.2 里的几个报错）。
+- 跑 tpu-sync 的 C++ 单测：把 `build.sh` 的 `build` 换成 `test`、目标换成测试目标即可（参考 `/zzlfs/temu/src/tpusync-test.sh`），例如
+  `//tpu_sync/kv_cache:reshard_receive_session_test`。
 
 ### 2.3 第三方包运行时补丁（必做，可重复执行）
 
@@ -117,6 +133,8 @@ cp $D $T/_tpu_raiden_torch_2_13_0.so
 - 主机名短于 64 字符：`sudo hostname $(hostname -s)`（GCE 主机名正好 64 字符时 gloo 会报错，重启或 guest agent 会改回去）。
 - 根分区小（新主机只有 8.7 GB）时：`TMPDIR`、`VLLM_CACHE_ROOT` 放到 `/dev/shm`（第 3 节的命令已包含）。
 - `/dev/shm` 里不用的缓存会直接占主机内存，启动前清掉（`stop_vllm_local.sh` 会清 `psm_*` 和超过 30G 的 `torch_tpu_cache`）。
+  `VLLM_CACHE_ROOT/torch_compile_cache/<hash>/` 每换一种配置（Index-K dtype、compile_sizes…）多一份 23–36 GB，不会自动清，
+  换配置前把不再用的 hash 目录删掉（对应关系可以在启动日志里 grep `torch_compile_cache/<hash>` 查到）。内存账见第 7 节。
 - 各条原因见第 7 节。
 
 ---
@@ -128,19 +146,22 @@ cp $D $T/_tpu_raiden_torch_2_13_0.so
 
 ```bash
 cd /zzlfs/temu/scripts
-export P_HOST=10.128.0.145 D_HOST=10.128.0.28 TMPDIR=/dev/shm/epic-tmp VLLM_CACHE_ROOT=/dev/shm/epic-vllm-cache
-# P：默认配置（async、compile [128,256,2048]、4 个 API server、起步等待 40ms）；第 5 节的结果是 P 关 async（ASYNC_SCHED=0）时测的
+export P_HOST=10.128.0.100 D_HOST=10.128.0.156 TMPDIR=/dev/shm/epic-tmp VLLM_CACHE_ROOT=/dev/shm/epic-vllm-cache
+# P：默认配置（async、compile [128,256,2048]、4 个 API server、起步等待 40ms）；5.2–5.6 的结果是 P 关 async（ASYNC_SCHED=0）时测的
 ROLES=prefill bash restart_epic.sh
-# D：async + MAX_NUM_SEQS=32 + compile [16,48,96,192,2048]（起步等待默认 20ms）
+# D：async + MAX_NUM_SEQS=32 + compile [16,48,96,192,2048]（起步等待默认 20ms）。不设时脚本默认 16 / [16,96,128,2048]，TPOT 和表不可比（4.2）
 ROLES=decode MAX_NUM_SEQS=32 DECODE_COMPILE_SIZES='[16,48,96,192,2048]' bash restart_epic.sh
-# 等两边 /health 返回 200，并检查日志里有没有致命错误；冷启动约 30–45 分钟（有编译缓存时更短）
-P_ADDR=10.128.0.145 D_ADDR=10.128.0.28 bash wait_ready.sh
+# 等两边 /health 返回 200，并检查日志里有没有致命错误；冷启动约 30–45 分钟（有编译缓存时约 12–15 分钟）
+P_ADDR=10.128.0.100 D_ADDR=10.128.0.156 bash wait_ready.sh
 # proxy（在 P 那台上）
-ssh -n -f 10.128.0.145 'PREFILL_HOST=10.128.0.145 DECODE_HOST=10.128.0.28 setsid nohup bash /zzlfs/temu/scripts/start_proxy.sh \
+ssh -n -f 10.128.0.100 'PREFILL_HOST=10.128.0.100 DECODE_HOST=10.128.0.156 setsid nohup bash /zzlfs/temu/scripts/start_proxy.sh \
     > /zzlfs/temu/logs/proxy-$(date +%m%d-%H%M).log 2>&1 < /dev/null &'
 # 测试脚本用的地址
-export PROXY_URL=http://10.128.0.145:8000 PREFILL_METRICS_URL=http://10.128.0.145:8100/metrics D_METRICS_URL=http://10.128.0.28:8200/metrics
+export PROXY_URL=http://10.128.0.100:8000 PREFILL_METRICS_URL=http://10.128.0.100:8100/metrics D_METRICS_URL=http://10.128.0.156:8200/metrics
 ```
+
+- Index-K 默认 FP8（`start_1p1d_epic.sh` 里写死 `--attention-config '{"indexer_kv_dtype":"fp8"}'`），合并后 FP8 已能正常传输。
+  需要 BF16 时用 `EXTRA_ARGS='--attention-config {"indexer_kv_dtype":"bf16"}'` 覆盖（追加在最后，后者生效）。
 
 - `restart_epic.sh` 通过 ssh 在对应主机上先执行 `stop_vllm_local.sh`（连残留 worker 一起停，等 `/dev/vfio` 释放；根分区超过 75% 时清缓存），
   再启动 `start_1p1d_epic.sh <role>`，并把 `TMPDIR`、`VLLM_CACHE_ROOT` 和下面的可调变量透传过去。
@@ -150,7 +171,7 @@ export PROXY_URL=http://10.128.0.145:8000 PREFILL_METRICS_URL=http://10.128.0.14
   --enable-prefix-caching --swa-bounded-replay --engram-config '{"cpu_offload":true}'
   --additional-config '{"deepseek_v41":{"execution":"ced","moe":"fused_ep_w4a8"}}'
   --speculative-config dspark K=5 --max-num-batched-tokens 2048`，KV connector 为 `TPURaidenConnector`。
-- 可调环境变量：`ASYNC_SCHED`（默认 1 = `--async-scheduling`，P、D 都开；0 = 关）、`DVFS_P_STATE`（默认 7，见 5.5）、`MAX_NUM_SEQS`、`PREFILL_COMPILE_SIZES`、`DECODE_COMPILE_SIZES`、`API_SERVERS`、
+- 可调环境变量：`ASYNC_SCHED`（默认 1 = `--async-scheduling`，P、D 都开；0 = 关）、`DVFS_P_STATE`（默认 7，见 5.6）、`MAX_NUM_SEQS`、`PREFILL_COMPILE_SIZES`、`DECODE_COMPILE_SIZES`、`API_SERVERS`、
   `VLLM_DP_WAVE_START_DELAY_MS`、`TP_SIZE`/`DP_SIZE`、`NO_KV_TRANSFER`、`KV_BYTES`、`EXTRA_ARGS`。
   诊断用：`VLLM_LOGGING_PREFIX='%(created).3f '`（日志带毫秒级时间戳，`pd_timeline.py` 依赖它）、`TPU_DUMMY_STEP_TIMING=1`、`TPU_STAGE3_PROFILE=1`。
 - proxy 环境变量：`PROXY_TOKENIZER`（默认 `/tmp/dsv41-tokenizer`，本地分词）、`PROXY_TOKENIZER_PROCS`（默认 8）、
@@ -161,8 +182,14 @@ export PROXY_URL=http://10.128.0.145:8000 PREFILL_METRICS_URL=http://10.128.0.14
 ```bash
 curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v41","prompt":"The capital of France is","max_tokens":16,"temperature":0}'
-/zzlfs/temu/.venv/bin/python -I /zzlfs/temu/scripts/pd_logprob_check.py --tokens 3000 20000   # PD 与直接打 D 的首 token logprob 对比
+/zzlfs/temu/.venv-epic/bin/python -I /zzlfs/temu/scripts/pd_logprob_check.py --proxy $PROXY_URL --direct http://10.128.0.156:8200 \
+    --tokens 3000 20000 100000 --offset 1000000      # PD 与直接打 D 的首 token logprob 对比（含 D 前缀命中 pd_hit）
+/zzlfs/temu/.venv-epic/bin/python -I /zzlfs/temu/scripts/local_hit_control.py --direct http://10.128.0.156:8200 --offset 3000000
+                                                   # 对照：不走 PD，D 本地前缀命中 vs 另一个 rank 从头算（噪声下限）
 ```
+
+- logprob 检查的语料约 1489 万字符，`--offset` 加上各档长度不能超出（超出时脚本会断言失败；旧版本会静默只发问题，所有用例都"完全一致"）。
+- 2026-11-11（FP8 Index-K）：pd 0.125–0.5、pd_hit 0.5–0.625，对照组 local_hit 0.125–0.75，同一量级，PD 没有引入额外误差。
 
 **停止**：`bash /zzlfs/temu/scripts/stop_vllm_local.sh`（在 P、D 各执行一次）；proxy 按 PID 停：`kill $(pgrep -f 'oy_proxy_serv[e]r')`。
 调用 `stop_vllm_local.sh` 的命令行里不要出现 `VLLM::`、`.venv/bin/vllm serve` 这些字样，否则会连调用者的 shell 一起停掉。
@@ -199,19 +226,25 @@ bash quick_set.sh                                                               
   - **CLI** = 每条请求在窗口内的平均 token 间隔，再对请求取平均。
   - **Server** = D 的 `inter_token_latency_seconds_sum` 增量 ÷ `generation_tokens_total` 增量（投机解码一步可能出多个 token）。
 - 同时记录 DSpark 的平均接受长度（约 4.3–5.8）。
+- **D 的 compile_sizes 要和 bs 对齐**：每个 rank 每步的行数 = 每 rank 请求数 × 6（DSpark K=5 + 1），不足时补到下一个 bucket。
+  bs 1/16/64/128/256 在 8 个 rank 上对应 6/12/48/96/192 行，所以用 `[16,48,96,192,2048]` + `MAX_NUM_SEQS=32`（第 3 节）。
+  脚本默认的 `[16,96,128,2048]` + 16 会让 bs64 补到 96 行（实测 TPOT 7.41 vs 5.32 ms）、bs256 超过并发上限。
+- 合并后 decode 变快，长 cache 的大 batch（128k bs256、256k–768k bs128）在 out_len 1024 时"拼满窗口"为负，
+  用 `--caches ... --bss ... --out-len 4096` 补测。注意 out_len 越长接受长度越高（约 4.7→5.4），TPOT 偏低 10–15%。
+- 512k / 768k bs256 在合并前后都失败：proxy→P 的 HTTP 连接断开（500 / `RemoteProtocolError`），P、D 本身正常，是接入层扛不住 256 条超长 prompt 同时到达。
 
 ### 4.3 P 的 prefill 吞吐（TPS）
 
 **测什么**：P 满载时每秒能算多少个新 token。只测 P，不经过 proxy 和 D。
 
-**P 怎么起**：用和线上 P 相同的配置（chunk 2048、编译桶 `[128,256,2048]`、DP8/EP8），但不挂 KV 传输。5.3 / 5.5 的结果是 P 关 async（`ASYNC_SCHED=0`）时测的。
+**P 怎么起**：用和线上 P 相同的配置（chunk 2048、编译桶 `[128,256,2048]`、DP8/EP8），但不挂 KV 传输。5.4 / 5.6 的结果是 P 关 async（`ASYNC_SCHED=0`）时测的。
 最好起在一台单独的机器上（原部署用 sjd1）；只有两台机器时，可以先停掉 PD 再在 P 那台上起，
-也可以不重启、直接测 PD 里正在运行的 P（`--url http://<P>:8100`，不要和其他测试同时跑；5.3 节就是这样测的，没有开 async 的对比）：
+也可以不重启、直接测 PD 里正在运行的 P（`--url http://<P>:8100`，不要和其他测试同时跑；5.1 和 5.4 最后一段就是这样测的，没有开 async 的对比）：
 
 ```bash
 ssh -n -f <host> "cd /zzlfs/temu && TMPDIR=/dev/shm/epic-tmp VLLM_CACHE_ROOT=/dev/shm/epic-vllm-cache NO_KV_TRANSFER=1 \
     setsid nohup bash /zzlfs/temu/scripts/start_1p1d_epic.sh prefill > /zzlfs/temu/logs/tps-prefill-\$(date +%m%d-%H%M).log 2>&1 < /dev/null &"
-# 机器上要先有 /tmp/dsv41-tokenizer；等日志出现 "Application startup complete"。复现第 5 节的数字时加 ASYNC_SCHED=0
+# 机器上要先有 /tmp/dsv41-tokenizer；等日志出现 "Application startup complete"。复现 5.4 / 5.6 的数字时加 ASYNC_SCHED=0
 ```
 
 **怎么测**（`tps_bench.py`）：
@@ -241,11 +274,59 @@ python3 transfer_stats.py ...                                                   
 
 ---
 
-## 5. 结果（2026-11-05/06，新主机 g45q / pqs0）
+## 5. 结果
+
+### 5.1 2026-11-11：合并 epic/dsv41 之后（主机 hl-2lxt / hl-6g41）
+
+代码 `cszhz/dsv41-1p1d` 4082db4a2（合并 ef2599d3d + 附录 A 的 3 个提交），tpu-sync 用 2.2 的 `per-layer-major-dim-on-1031`，FP8 Index-K，P、D 都开 async。
+参数和 5.2–5.4 完全相同，"合并前"一列就是 5.2–5.4 的数字。
+
+**TTFT 8P**（秒，格式 Prefill / TTFT；`results/table-merge-8p-1111-1134.{jsonl,log}`；D 为脚本默认的 16 / `[16,96,128,2048]`，不影响 TTFT）
+
+| 场景 | 合并后 | 合并前（5.2 的 8P） | TTFT 变化 |
+|---|---|---|---|
+| 1k+1k | 0.199 / 0.366 | 0.180 / 0.385 | −5% |
+| 8k+4k | 0.462 / 0.674 | 0.487 / 0.720 | −6% |
+| 32k+16k | 0.916 / 1.197 | 0.991 / 1.300 | −8% |
+| 64k+32k | 1.632 / 2.003 | 1.794 / 2.245 | −11% |
+| 168k+32k | 2.145 / 2.745 | 2.043 / 2.699 | +2% |
+| 32k+168k | 8.455 / 9.362 | 8.597 / 9.621 | −3% |
+| 64k+64k | 3.186 / 3.831 | 3.417 / 3.970 | −4% |
+| 256k+32k | 2.313 / 3.030 | 2.217 / 3.082 | −2% |
+| 512k+32k | 2.409 / 3.521 | 2.707 / 4.183 | −16% |
+| 768k+32k | 2.776 / 4.348 | 3.185 / 5.237 | −17% |
+| 32k+768k | 42.187 / 45.224 | 45.536 / 49.021 | −8% |
+
+**TPOT**（ms，CLI；`results/tpot-merge-seqs32-1111-1455.{jsonl,log}`，D 按第 3 节 `MAX_NUM_SEQS=32` + `[16,48,96,192,2048]`，和 5.3 相同；括号内为合并前）
+
+| bs | 1k | 16k | 32k | 64k | 128k | 256k | 512k | 768k |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 4.01 (4.91) | 4.17 (4.68) | 4.89 (4.94) | 4.46 (5.40) | 3.91 (5.97) | 5.03 (6.30) | 4.73 (7.74) | 4.54 (9.16) |
+| 16 | 4.54 (5.23) | 4.59 (5.15) | 4.58 (5.27) | 4.66 (5.42) | 4.82 (5.85) | 4.70 (6.56) | 4.76 (7.72) | 4.81 (8.66) |
+| 64 | 5.32 (7.43) | 5.28 (8.28) | 5.32 (9.18) | 5.44 (10.99) | 5.22 (8.68) | 5.50 (10.27) | 5.32 (14.52) | 5.67 (19.07) |
+| 128 | 6.03 (9.93) | 5.80 (12.47) | 5.66 (15.06) | 5.70 (19.18) | 5.96 (14.51) | 5.27\* (21.03) | 5.43\* (31.27) | 5.81\* (44.47) |
+| 256 | 8.97 (14.60) | 8.45 (15.04) | 8.37 (15.28) | 7.53 (16.86) | 7.44\* (19.32) | 7.63\* (24.97) | —‡ | —‡ |
+
+- 全部持平或更快：小 batch 快 1–50%，大 batch / 长 cache 快 40–70%；TPOT 基本不再随 cache 长度增长。DSpark 接受长度 4.0–5.1（合并前 4.4–5.1）。
+- \* out_len 4096 补测（`results/tpot-merge-seqs32-out4k-1111-1510.*`）；out_len 1024 时"拼满窗口"为负（decode 变快，第一条请求在最后一条拿到首 token 前就生成完了）。接受长度约 5.4–5.5，TPOT 偏低 10–15%，只能粗比。
+- ‡ 3 次都是 proxy→P 连接断开（4.2），合并前也失败。
+
+**P 的 prefill 吞吐**（tok/s，直接测 PD 里的 P，8 并发，cached 32k；`results/tps-merge-1111-1134.jsonl`；合并前对应 5.4 最后一段）
+
+| 新 token | 合并后 | 合并前（PD 里的 P） | 变化 |
+|---|---|---|---|
+| 32k | 19.0–19.1 万 | 16.4–16.5 万 | +16% |
+| 64k | 17.6 万 | 16.4–16.7 万 | +6% |
+| 168k | 16.6–17.4 万 | 17.1–17.2 万 | −3% |
+| 256k | 16.5–16.8 万 | 16.6–16.9 万 | −1% |
+
+- 和 TTFT 一致：new 段短时更快，new 段很长时略慢。
+
+### 5.2–5.6 2026-11-05/06：合并前（主机 g45q / pqs0）
 
 配置同第 3 节，proxy 的对齐窗口和分词缓存都关；代码 54e98d673（= 1dc6984ac + 6cb686ef4）。Temu 为 2026-11-02 内部数据（`results/temu-1102.md`）。
 
-### 5.1 Prefill / TTFT（秒，格式 Prefill / TTFT，倍数 = GCP ÷ Temu）
+### 5.2 Prefill / TTFT（秒，格式 Prefill / TTFT，倍数 = GCP ÷ Temu）
 
 1P / 4P：`results/table-new-hosts-1105-1647.{jsonl,log}`；8P：`results/table-new-hosts-8p-1106-0106.{jsonl,log}`（2026-11-06，重启后同配置）。Temu 没有 8P 数据。
 
@@ -268,7 +349,7 @@ python3 transfer_stats.py ...                                                   
 - 8P 和旧主机比：短场景一致，256k 以上前缀的场景快 5–10%（512k+32k 4.650→4.183s，768k+32k 5.688→5.237s）。
 - Temu 11-02 比 10 月的数据快，所以倍数比旧表大。
 
-### 5.2 TPOT（ms，格式 CLI / Server，倍数按 CLI 算）
+### 5.3 TPOT（ms，格式 CLI / Server，倍数按 CLI 算）
 
 `results/tpot-new-hosts-1105-1748.{jsonl,log}`，默认参数 out_len 1024。
 
@@ -290,7 +371,7 @@ python3 transfer_stats.py ...                                                   
 - ‡ 512k bs256：out_len 1024 时"拼满窗口"不足 1s（-0.46s），旧表用 out_len 3072 补测，本轮没有补测。
 - † 768k bs256：两次 HTTP 500 后 D 被 OOM killer 杀掉（第 7 节）。
 
-### 5.3 P 的 prefill 吞吐上限（tok/s；方法见 4.3）
+### 5.4 P 的 prefill 吞吐上限（tok/s；方法见 4.3）
 
 2026-11-06 在 g45q 上单独起的 P（`NO_KV_TRANSFER=1`、`ASYNC_SCHED=0`、DVFS 7，刚启动），和旧主机 sjd1 的测法一致；
 `results/tps-dvfs7-1106-1635.jsonl`。32k 缓存前缀，每组 1 轮预热 + 3 轮正式，所有正式轮的 `cache_hit_tokens` 都正好等于 前缀 × 并发。
@@ -308,16 +389,16 @@ python3 transfer_stats.py ...                                                   
 - 直接测 PD 里正在运行的 P（挂着 KV connector、已连续跑了几个小时；`results/tps-new-hosts-1106-0224.jsonl`）时低 1–6%：
   32k 16.4–16.5 万、64k 16.4–16.7 万、168k 17.1–17.2 万、256k 16.6–16.9 万、16 并发 17.2 万、24 并发 16.6–17.1 万。
 
-### 5.4 如何复现某一组数字
+### 5.5 如何复现某一组数字
 
 1. 按第 1、2 节准备代码和 venv，checkout 第 5 节注明的提交。
 2. 按第 2.4 节准备机器，按第 3 节启动 P、D、proxy（`PROXY_ALIGN_MS`、`PROXY_RENDER_CACHE_MB` 都不设）。
 3. 按第 4 节跑对应脚本，结果写进 `results/*.jsonl`，汇总行在同名 `.log` 里（`== ... (median): Prefill x / TTFT y`）。
 4. 附录 B 的旧主机数字是在 a233edf04 之前测的（32842f3d7 + d8e22db82 的内存回收改动即可复现）；a233edf04 只降低 TTFT 中 D 这一跳的开销，不影响 Prefill 和 TPOT。
 
-### 5.5 DVFS 档位（`--xla_tpu_dvfs_p_state` 7 vs 3）
+### 5.6 DVFS 档位（`--xla_tpu_dvfs_p_state` 7 vs 3）
 
-同 5.3 的单独 P（`NO_KV_TRANSFER=1`、`ASYNC_SCHED=0`），只改 `DVFS_P_STATE`；`results/tps-dvfs{7,3}-1106-*.jsonl`，每组 3 轮正式，取中位数。
+同 5.4 的单独 P（`NO_KV_TRANSFER=1`、`ASYNC_SCHED=0`），只改 `DVFS_P_STATE`；`results/tps-dvfs{7,3}-1106-*.jsonl`，每组 3 轮正式，取中位数。
 
 | 场景 | DVFS 7 | DVFS 3 | 变化 |
 |---|---|---|---|
@@ -346,6 +427,12 @@ python3 transfer_stats.py ...                                                   
 7. **4P 对齐**：DP wave 起步等待（P 40ms / D 20ms）、4 个 API server、orjson 解析、proxy 进程池。512k+32k 4P TTFT 7.0→约 4.0–4.5s。
 8. **空闲 EP-DP rank 复用全零 dummy block table**（4250476f6）：bs1 TPOT 降低约一半。
 9. **D 开 async scheduling**：TPOT 降低 10–46%；P 开了对 TTFT 没有帮助（2026-10 的结论）。2026-11-08 起脚本默认 P、D 都开 async。
+10. **合并 epic/dsv41 ef2599d3d**（2026-11-11，5.1）：TPOT 不再随 cache 长度增长（大 batch / 长 cache 快 40–70%），TTFT 8P 最多快 17%。
+    合并带来的 SWA 私有池、packed FP8 Index-K、45 个 KV storage 需要配套：
+    - tpu-sync 允许各 storage 块数不同（2.2，上游 PR google/tpu-sync#1527）；
+    - manifest / layout 校验支持 SWA 私有池整页传输、FP8 Index-K 整页传输，块数按 KV cache group 校验（c96b3269e）；
+    - LIFO 释放补丁按 `block.pool` 分流（dc4f44ee0）：KV connector 的延迟释放会把 SWA 私有池的块一起交给共享池，
+      原补丁把它们塞进共享池的空闲队列，下一个请求就拿到重复的块 id（`dst_device_block_ids ... must not contain duplicates`）。上游 epic/dsv41 也有这个问题，只在 PD 下触发。
 
 ### 6.2 D 这一跳的控制路径优化（2026-10-29，已部署）
 
@@ -393,6 +480,11 @@ python3 transfer_stats.py ...                                                   
 - **D 跑不了 TPOT 768k bs256**（2026-11-05）：D 的 worker 共享内存涨到每个 150 GB 以上，先返回 HTTP 500，随后 worker 被 OOM killer 杀、整个 D 退出。
   长时间测试后 P 的可用内存也会从约 140 GB 降到约 74 GB。要跑这一格需要 PIE Python + 回收，或更大内存的机器。
 - 进程被杀时 `/dev/shm/psm_*` 不会回收，`/dev/shm/torch_tpu_cache` 只增不减，都直接占主机内存；`stop_vllm_local.sh` 会清。
+- **D 换新 compile_sizes 编译时差点 OOM**（2026-11-11，hl-6g41）：内存账是 8 个 worker 编译期峰值约 640 GB（每个 76–109 GB）
+  + Engram CPU offload 共享表 189 GB（`/dev/shm/vllm_engram_*`，2 × 94 GB）+ `/dev/shm` 编译缓存 242 GB（`epic-vllm-cache` 136 G + `torch_tpu_cache` 106 G），
+  超过 944 GB，可用内存降到 15 GB。删掉不再用的 `torch_compile_cache/<hash>`（2.4）后正常。`df /dev/shm` 比 `du` 大时，差额是已删除但仍被进程打开的文件（`lsof +L1`）。
+- 换配置启动时建议盯着可用内存（`free -g` 的 available），低于 20 GB 就停掉；停的时候要确认 `VLLM::Worker` 都退出了，第一次 `stop_vllm_local.sh` 偶尔停不干净。
+- **合并前 TPOT 768k bs256 时 D 被 OOM killer 杀**（2026-11-05）的问题，合并后没有再出现（这一格现在在 proxy→P 就失败，见 4.2）。
 
 **磁盘与路径**
 
@@ -413,7 +505,9 @@ python3 transfer_stats.py ...                                                   
 
 - `wait_ready.sh` 以 HTTP 状态码判断就绪（`curl -w ok` 会误判）。
 - 首次遇到新的形状（batch / 长度）时会临时编译，那一轮的数字会偏大；要先预热，或者重跑确认。
-- TPOT 512k bs256 偶发 proxy→P 的 `httpx.ReadError`（500），根因未查清，`tpot_bench.py` 会自动重试 3 次。
+- TPOT 512k / 768k bs256 时 proxy→P 的 `httpx.ReadError`（500）或 `RemoteProtocolError`，P、D 日志里没有报错；`tpot_bench.py` 会自动重试 3 次，合并前后都过不了。
+- TPOT 的"拼满窗口"为负（`full-batch window shorter than 1 s`）不是服务出错，是 decode 比 P 把所有请求送进来更快，加大 `--out-len` 补测（4.2）。
+- logprob 检查的 `--offset` 超出语料长度会让 prompt 只剩问题（见第 3 节冒烟测试下方）；当前脚本已加断言。
 - **测吞吐时新 token 命中缓存会让数字虚高**（曾出现一轮 230 万 tok/s）：同一个服务上重复跑，如果请求内容和之前一样，P 的前缀缓存会直接命中。要核对每轮的 `cache_hit_tokens`（见 4.3）。
 - 在 sjd1 上直接跑 JAX/Pallas 脚本时，要先设好 TPU 环境变量（`/zzlfs/temu/tools/sc_repro/env.sh`，和启动脚本里的一样），否则 JAX 初始化会卡住。
 
@@ -433,9 +527,14 @@ python3 transfer_stats.py ...                                                   
 
 其他候选：4P 对齐窗口的效果验证；动态投机 token 数；空步剩余约 20ms；共享前缀注意力 kernel；venv 换 PIE Python 以打开编译内存回收。
 
+2026-11-12 新增（来自和 B200 的对比表，见对话记录）：
+- 生产采样（temperature 1.0、top_p 0.95）下 DSpark 的接受长度没有测过；按 TPOT 反推只有约 1.2–1.5（greedy 时约 4.9），是低并发 ITL 比 bench 慢约 3 倍的主要嫌疑。用 `tpot_bench.py` 加采样参数实测。
+- 每个请求独立长上下文（不共享前缀）时 D 的 KV 容量：c=64 起吞吐下降、ITL 翻倍，怀疑抢占；需要记录 KV 使用率和 `num_preemptions`。
+- 编译缓存从 `/dev/shm` 挪到本地 NVMe（根分区约 206 GB 空闲），避免每换一次配置就多占 23–36 GB 内存。
+
 ---
 
-## 附录 A. 提交列表（在 epic/dsv41 6a1ebddb7 之上）
+## 附录 A. 提交列表（合并前的提交在 epic/dsv41 6a1ebddb7 之上，11-11 合并到 ef2599d3d）
 
 | 提交 | 内容 |
 |---|---|
@@ -453,7 +552,13 @@ python3 transfer_stats.py ...                                                   
 | 6cb686ef4 | `tps_bench.py` 和 TPS 测试方法 / 结果 |
 | 1dc6984ac | 新主机的已知问题；修正 `TPU_RECLAIM_COMPILE_MEMORY` 注释 |
 | 2289534bc | 主机 / 地址可用环境变量覆盖（默认值不变）；新主机复测 1P / 4P、TPOT |
-| （本次）reorganize REPRODUCE.zh.md; new-host 8P and TPS | 重新整理本文档结构；新主机 8P、TPS 结果 |
+| 058073801 | 重新整理本文档结构；新主机 8P、TPS 结果 |
+| df88c0c57 | 脚本默认 P、D 都开 async；`DVFS_P_STATE`；TPS 与 DVFS 结果 |
+| f6693c749 | 合并上游 epic/dsv41 ef2599d3d（SWA 私有池、packed FP8 Index-K 等）；indexer_cache 去掉"禁止 kv_transfer"的检查随合并移植 |
+| dc4f44ee0 | LIFO free-block 补丁按 `block.pool` 把块还给所属的池（修 PD 下重复块 id）；`tests/test_block_pool_lifo_free.py` |
+| c96b3269e | Raiden manifest：SWA 私有池整页传输、packed FP8 Index-K 整页传输、块数按 KV cache group 校验；layout 校验放宽；新增 3 个测试 |
+| 4082db4a2 | `pd_logprob_check.py` 语料越界断言；新增 `local_hit_control.py` |
+| （本次） | 本文档更新到 11-11 合并后的状态 |
 
 ---
 
