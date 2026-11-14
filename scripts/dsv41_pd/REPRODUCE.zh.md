@@ -1,19 +1,19 @@
 # DeepSeek-V4.1-Flash 1P1D（vllm-torchtpu，Stage-3 Raiden）复现手册
 
-更新：2026-11-12。称呼约定：**GCP** = 我们的部署；**Temu** = 客户内部数据（对比基准，当前用 2026-11-02 版本）。
+更新：2026-11-12。称呼约定：**GCP** = 我们的部署；**Baseline** = 客户内部数据（对比基准，当前用 2026-11-02 版本）。
 
 ## 最新结果一览
 
 2026-11-11 在主机 hl-2lxt / hl-6g41 上复测，代码是合并了 epic/dsv41 ef2599d3d 之后的 `cszhz/dsv41-1p1d`（4082db4a2），FP8 Index-K。
 本轮只测了 8P TTFT、TPOT、TPS，1P / 4P 没有重测。详细表格见 5.1；11-05/06 的结果（合并前）见 5.2–5.6，旧主机见附录 B。
 
-| 指标 | GCP 11-11（合并后） | GCP 11-05/06（合并前） | Temu（11-02） |
+| 指标 | GCP 11-11（合并后） | GCP 11-05/06（合并前） | Baseline（11-02） |
 |---|---|---|---|
 | TTFT 8P（1k+1k … 32k+768k） | 0.37 – 45.2 s | 0.39 – 49.0 s | — |
 | TPOT（bs 1–256，cache 1k–768k，CLI） | 3.9 – 9.0 ms | 4.7 – 44.5 ms | 2.2 – 8.3 ms |
 | P 的 prefill 吞吐（PD 里的 P，8 并发） | 16.5 – 19.1 万 tok/s | 16.4 – 17.2 万 tok/s | — |
 
-- 合并后 TPOT 基本不随 cache 长度增长（bs64 在 1k–768k 都是 5.2–5.7 ms），是 Temu 的约 1.0–2.2 倍（合并前 1.6–7.8 倍）。
+- 合并后 TPOT 基本不随 cache 长度增长（bs64 在 1k–768k 都是 5.2–5.7 ms），是 Baseline 的约 1.0–2.2 倍（合并前 1.6–7.8 倍）。
 - TTFT 8P 11 个场景里 10 个更快（最多快 17%），168k+32k 慢 2%。
 
 ---
@@ -38,14 +38,14 @@
 
 ### 1.2 代码版本
 
-- vllm-torchtpu：`https://github.com/cszhz/vllm-torchtpu`，分支 **`cszhz/dsv41-1p1d`**（本地 `/zzlfs/temu/src/vllm-torchtpu-cszhz`），
+- vllm-torchtpu：`https://github.com/cszhz/vllm-torchtpu`，分支 **`cszhz/dsv41-1p1d`**（本地 `/zzlfs/baseline/src/vllm-torchtpu-cszhz`），
   2026-11-11 合并了上游 `vllm-project/vllm-torchtpu` 的 `epic/dsv41`（ef2599d3d，合并提交 f6693c749），之前基于 6a1ebddb7。
   **所有改动只在 cszhz fork 上，不要推上游**（本地 clone 的 upstream push URL 已设成 `DISABLED-do-not-push-to-vllm-project`）。提交列表见附录 A。
 - P、D 用同一份代码，以 editable 方式装进 venv。
 - tpu-sync（KV 传输）：
   - **部署实际用的版本**：PyPI nightly `tpu-sync-torch==0.0.1.dev20261031081414`（对应 main 1523b07d，已包含 `GetBlockChunks` O(n²) 修复，
     原 PR google/tpu-sync#1382）+ "允许各 storage 块数不同"的修改 = cszhz/tpu-sync 分支 **`per-layer-major-dim-on-1031`**（f2fa4536），
-    本地 `/zzlfs/temu/src/tpu-sync-1031`。编法见 2.2。
+    本地 `/zzlfs/baseline/src/tpu-sync-1031`。编法见 2.2。
   - 为什么必须自己编：合并后的 epic/dsv41 把 SWA 放进了窗口大小的私有池（每个 rank 241 页，主池约 52 万页），
     原版 tpu-sync 要求所有 storage 块数相同，启动时报 `Layer N has major dimension ... but layer 0 has ...`；
     另外 host 镜像按最大的 storage 分配会 OOM、传输时 staging 槽位越界（`Chunk out of bounds`）、块 id 越界检查不分组（`local block id N is out of range for pool M`）。
@@ -56,26 +56,26 @@
 
 ## 2. 环境搭建
 
-### 2.1 venv（`/zzlfs/temu/.venv-epic`）
+### 2.1 venv（`/zzlfs/baseline/.venv-epic`）
 
 epic/dsv41 需要 jax 0.11.2（旧 venv 缺 `pltpu.ACC`），所以单独建一个新 venv。依赖清单见 `scripts/dsv41_pd/requirements-epic.txt`
 （torch 2.13.0、torch-tpu 0.2.0、jax/jaxlib 0.11.2、libtpu 0.0.50、vLLM v0.31.1rc0 = e37e51dd、tpu-sync-torch dev20261031、runai-model-streamer[gcs]、xxhash）。
 
 ```bash
 UV=/zzlfs/.tools/pyenv/bin/uv
-$UV venv -q -p /usr/bin/python3.12 /zzlfs/temu/.venv-epic
+$UV venv -q -p /usr/bin/python3.12 /zzlfs/baseline/.venv-epic
 # vLLM 用 empty 目标构建（TPU 插件由 vllm_torchtpu 提供）；torch 走 CPU wheel 源
-(cd /tmp && VLLM_TARGET_DEVICE=empty CC=gcc CXX=g++ $UV pip install --python /zzlfs/temu/.venv-epic/bin/python \
+(cd /tmp && VLLM_TARGET_DEVICE=empty CC=gcc CXX=g++ $UV pip install --python /zzlfs/baseline/.venv-epic/bin/python \
     --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cpu \
-    -r /zzlfs/temu/src/vllm-torchtpu-cszhz/scripts/dsv41_pd/requirements-epic.txt)
-$UV pip install --python /zzlfs/temu/.venv-epic/bin/python orjson
+    -r /zzlfs/baseline/src/vllm-torchtpu-cszhz/scripts/dsv41_pd/requirements-epic.txt)
+$UV pip install --python /zzlfs/baseline/.venv-epic/bin/python orjson
 # vllm_torchtpu 以 editable 方式指向 cszhz 这份代码
-$UV pip install --python /zzlfs/temu/.venv-epic/bin/python --no-deps -e /zzlfs/temu/src/vllm-torchtpu-cszhz
+$UV pip install --python /zzlfs/baseline/.venv-epic/bin/python --no-deps -e /zzlfs/baseline/src/vllm-torchtpu-cszhz
 ```
 
 - torch-tpu 的私有源（registry）返回 403，所以改用 PyPI 上的 torch-tpu 0.2.0 正式版（pyproject 里写的是 0.2.0rc1）。
 - 这个 venv 建在非 PIE 的 `/usr/bin/python3.12` 上，所以 `TPU_RECLAIM_COMPILE_MEMORY` 只能关（见第 7 节）。
-- 旧的 `/zzlfs/temu/.venv` 留给旧 PD 部署；benchmark 客户端脚本仍用 `.venv/bin/python` 跑（只需要 httpx）。
+- 旧的 `/zzlfs/baseline/.venv` 留给旧 PD 部署；benchmark 客户端脚本仍用 `.venv/bin/python` 跑（只需要 httpx）。
 
 ### 2.2 编译并替换 tpu-sync 的 .so
 
@@ -84,36 +84,36 @@ venv 里先装 PyPI 的 `tpu-sync-torch==0.0.1.dev20261031081414`（Python 层�
 
 ```bash
 # 取代码（共享盘上已有的话跳过）
-git clone -b per-layer-major-dim-on-1031 https://github.com/cszhz/tpu-sync.git /zzlfs/temu/src/tpu-sync-1031
-cat /zzlfs/temu/src/build-tpusync-1031.sh      # 内容如下
-#   cd /zzlfs/temu/src/tpu-sync-1031
-#   SP=/zzlfs/temu/.venv-epic/lib/python3.12/site-packages
+git clone -b per-layer-major-dim-on-1031 https://github.com/cszhz/tpu-sync.git /zzlfs/baseline/src/tpu-sync-1031
+cat /zzlfs/baseline/src/build-tpusync-1031.sh      # 内容如下
+#   cd /zzlfs/baseline/src/tpu-sync-1031
+#   SP=/zzlfs/baseline/.venv-epic/lib/python3.12/site-packages
 #   export CC=/usr/bin/clang-18 CXX=/usr/bin/clang++-18
-#   export PATH=/zzlfs/temu/tools/nopip:$PATH TORCH_SOURCE=$SP TORCH_TPU_SOURCE=$SP
+#   export PATH=/zzlfs/baseline/tools/nopip:$PATH TORCH_SOURCE=$SP TORCH_TPU_SOURCE=$SP
 #   bash build.sh torch
-bash /zzlfs/temu/src/build-tpusync-1031.sh
+bash /zzlfs/baseline/src/build-tpusync-1031.sh
 
 # 产物改 NEEDED 后放进 venv（原 .so 备份为 .pypi-1031）
-D=/zzlfs/temu/tools/tpu_sync_epic/_tpu_raiden_torch_2_13_0-1031-perlayer.so
-cp /zzlfs/temu/src/tpu-sync-1031/tpu_sync/frameworks/torch/_tpu_raiden_torch.so $D
+D=/zzlfs/baseline/tools/tpu_sync_epic/_tpu_raiden_torch_2_13_0-1031-perlayer.so
+cp /zzlfs/baseline/src/tpu-sync-1031/tpu_sync/frameworks/torch/_tpu_raiden_torch.so $D
 patchelf --add-needed libpywrap_2_13_0_common.so $D
 patchelf --remove-needed libpywrap_torch_tpu_common.so $D
-T=/zzlfs/temu/.venv-epic/lib/python3.12/site-packages/tpu_sync/frameworks/torch
+T=/zzlfs/baseline/.venv-epic/lib/python3.12/site-packages/tpu_sync/frameworks/torch
 cp $T/_tpu_raiden_torch_2_13_0.so $T/_tpu_raiden_torch_2_13_0.so.pypi-1031   # 只做一次
 cp $D $T/_tpu_raiden_torch_2_13_0.so
 # 检查能加载（直接 import 模块名会失败，这是正常的）
-/zzlfs/temu/.venv-epic/bin/python -c "from tpu_sync.api.torch import kv_cache_manager as k; k._torch_impl(); print('ok')"
+/zzlfs/baseline/.venv-epic/bin/python -c "from tpu_sync.api.torch import kv_cache_manager as k; k._torch_impl(); print('ok')"
 ```
 
-- `/zzlfs/temu/tools/nopip/python3` 是一个包装，用来阻止 build.sh 调用 pip 去改 venv。
+- `/zzlfs/baseline/tools/nopip/python3` 是一个包装，用来阻止 build.sh 调用 pip 去改 venv。
 - 不替换 .so 时，合并后的代码启动阶段就会失败（1.2 里的几个报错）。
-- 跑 tpu-sync 的 C++ 单测：把 `build.sh` 的 `build` 换成 `test`、目标换成测试目标即可（参考 `/zzlfs/temu/src/tpusync-test.sh`），例如
+- 跑 tpu-sync 的 C++ 单测：把 `build.sh` 的 `build` 换成 `test`、目标换成测试目标即可（参考 `/zzlfs/baseline/src/tpusync-test.sh`），例如
   `//tpu_sync/kv_cache:reshard_receive_session_test`。
 
 ### 2.3 第三方包运行时补丁（必做，可重复执行）
 
 ```bash
-/zzlfs/temu/.venv-epic/bin/python /zzlfs/temu/src/vllm-torchtpu-cszhz/scripts/dsv41_pd/apply_venv_patches.py
+/zzlfs/baseline/.venv-epic/bin/python /zzlfs/baseline/src/vllm-torchtpu-cszhz/scripts/dsv41_pd/apply_venv_patches.py
 ```
 
 | 节 | 改动 | 原因 / 效果 |
@@ -124,7 +124,7 @@ cp $D $T/_tpu_raiden_torch_2_13_0.so
 | §6 | DP busy loop：`VLLM_DP_WAVE_START_DELAY_MS`，新 wave 开始时先等一会再收一次请求 | 让几乎同时到达、分散在不同 rank 的请求赶上同一个 lockstep 步（4P 对齐） |
 | §7 | starlette `Request.json` 优先用 orjson | 10^6 个 token id 的请求体解析更快 |
 
-原文件备份在 `/zzlfs/temu/tools/*-epic.py.orig`。
+原文件备份在 `/zzlfs/baseline/tools/*-epic.py.orig`。
 
 ### 2.4 每台机器的准备（换主机时逐项检查）
 
@@ -141,11 +141,11 @@ cp $D $T/_tpu_raiden_torch_2_13_0.so
 
 ## 3. 启动与停止
 
-脚本都在 `scripts/dsv41_pd/`（部署时用的是 `/zzlfs/temu/scripts/` 下的同名副本，内容一致）。下面是新主机的命令；
+脚本都在 `scripts/dsv41_pd/`（部署时用的是 `/zzlfs/baseline/scripts/` 下的同名副本，内容一致）。下面是新主机的命令；
 不设 `P_HOST` / `D_HOST` / `P_ADDR` / `D_ADDR` / `PREFILL_HOST` / `DECODE_HOST` 时就是原部署的默认值。
 
 ```bash
-cd /zzlfs/temu/scripts
+cd /zzlfs/baseline/scripts
 export P_HOST=10.128.0.100 D_HOST=10.128.0.156 TMPDIR=/dev/shm/epic-tmp VLLM_CACHE_ROOT=/dev/shm/epic-vllm-cache
 # P：默认配置（async、compile [128,256,2048]、4 个 API server、起步等待 40ms）；5.2–5.4 的 P 关 async（ASYNC_SCHED=0）
 ROLES=prefill bash restart_epic.sh
@@ -154,8 +154,8 @@ ROLES=decode MAX_NUM_SEQS=32 DECODE_COMPILE_SIZES='[16,48,96,192,2048]' bash res
 # 等两边 /health 返回 200，并检查日志里有没有致命错误；冷启动约 30–45 分钟（有编译缓存时约 12–15 分钟）
 P_ADDR=10.128.0.100 D_ADDR=10.128.0.156 bash wait_ready.sh
 # proxy（在 P 那台上）
-ssh -n -f 10.128.0.100 'PREFILL_HOST=10.128.0.100 DECODE_HOST=10.128.0.156 setsid nohup bash /zzlfs/temu/scripts/start_proxy.sh \
-    > /zzlfs/temu/logs/proxy-$(date +%m%d-%H%M).log 2>&1 < /dev/null &'
+ssh -n -f 10.128.0.100 'PREFILL_HOST=10.128.0.100 DECODE_HOST=10.128.0.156 setsid nohup bash /zzlfs/baseline/scripts/start_proxy.sh \
+    > /zzlfs/baseline/logs/proxy-$(date +%m%d-%H%M).log 2>&1 < /dev/null &'
 # 测试脚本用的地址
 export PROXY_URL=http://10.128.0.100:8000 PREFILL_METRICS_URL=http://10.128.0.100:8100/metrics D_METRICS_URL=http://10.128.0.156:8200/metrics
 ```
@@ -165,7 +165,7 @@ export PROXY_URL=http://10.128.0.100:8000 PREFILL_METRICS_URL=http://10.128.0.10
 
 - `restart_epic.sh` 通过 ssh 在对应主机上先执行 `stop_vllm_local.sh`（连残留 worker 一起停，等 `/dev/vfio` 释放；根分区超过 75% 时清缓存），
   再启动 `start_1p1d_epic.sh <role>`，并把 `TMPDIR`、`VLLM_CACHE_ROOT` 和下面的可调变量透传过去。
-  日志写到 `/zzlfs/temu/logs/{prefill,decode}-epic-<MMDD-HHMM>.log`，时间戳记录在 `/tmp/epic_T`。
+  日志写到 `/zzlfs/baseline/logs/{prefill,decode}-epic-<MMDD-HHMM>.log`，时间戳记录在 `/tmp/epic_T`。
   P、D 分两次启动且跨了分钟时，`wait_ready.sh` 会找不到另一边的日志：用 `ln -sf` 把那边的日志链接成同名。
 - `start_1p1d_epic.sh` 的关键参数：`--data-parallel-size 8 --enable-expert-parallel --kv-cache-dtype fp8 --block-size 16
   --enable-prefix-caching --swa-bounded-replay --engram-config '{"cpu_offload":true}'
@@ -182,28 +182,28 @@ export PROXY_URL=http://10.128.0.100:8000 PREFILL_METRICS_URL=http://10.128.0.10
 ```bash
 curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v41","prompt":"The capital of France is","max_tokens":16,"temperature":0}'
-/zzlfs/temu/.venv-epic/bin/python -I /zzlfs/temu/scripts/pd_logprob_check.py --proxy $PROXY_URL --direct http://10.128.0.156:8200 \
+/zzlfs/baseline/.venv-epic/bin/python -I /zzlfs/baseline/scripts/pd_logprob_check.py --proxy $PROXY_URL --direct http://10.128.0.156:8200 \
     --tokens 3000 20000 100000 --offset 1000000      # PD 与直接打 D 的首 token logprob 对比（含 D 前缀命中 pd_hit）
-/zzlfs/temu/.venv-epic/bin/python -I /zzlfs/temu/scripts/local_hit_control.py --direct http://10.128.0.156:8200 --offset 3000000
+/zzlfs/baseline/.venv-epic/bin/python -I /zzlfs/baseline/scripts/local_hit_control.py --direct http://10.128.0.156:8200 --offset 3000000
                                                    # 对照：不走 PD，D 本地前缀命中 vs 另一个 rank 从头算（噪声下限）
 ```
 
 - logprob 检查的语料约 1489 万字符，`--offset` 加上各档长度不能超出（超出时脚本会断言失败；旧版本会静默只发问题，所有用例都"完全一致"）。
 - 2026-11-11（FP8 Index-K）：pd 0.125–0.5、pd_hit 0.5–0.625，对照组 local_hit 0.125–0.75，同一量级，PD 没有引入额外误差。
 
-**停止**：`bash /zzlfs/temu/scripts/stop_vllm_local.sh`（在 P、D 各执行一次）；proxy 按 PID 停：`kill $(pgrep -f 'oy_proxy_serv[e]r')`。
+**停止**：`bash /zzlfs/baseline/scripts/stop_vllm_local.sh`（在 P、D 各执行一次）；proxy 按 PID 停：`kill $(pgrep -f 'oy_proxy_serv[e]r')`。
 调用 `stop_vllm_local.sh` 的命令行里不要出现 `VLLM::`、`.venv/bin/vllm serve` 这些字样，否则会连调用者的 shell 一起停掉。
 
 ---
 
 ## 4. 测试方法
 
-客户端统一打 proxy（:8000），用 `/zzlfs/temu/.venv/bin/python -I` 运行。
+客户端统一打 proxy（:8000），用 `/zzlfs/baseline/.venv/bin/python -I` 运行。
 
 ### 4.1 Prefill / TTFT 表（cached + new）
 
 ```bash
-OUT=/zzlfs/temu/results/table-$(date +%m%d-%H%M).jsonl PIN=distinct bash run_table.sh        # 11 个场景 × 1P、4P
+OUT=/zzlfs/baseline/results/table-$(date +%m%d-%H%M).jsonl PIN=distinct bash run_table.sh        # 11 个场景 × 1P、4P
 CONCS="8" bash run_table.sh                                                                 # 8P
 ONLY="1024:1024 524288:32768" bash run_table.sh                                             # 只跑部分场景
 bash quick_set.sh                                                                           # 快速对比子集
@@ -217,11 +217,11 @@ bash quick_set.sh                                                               
 ### 4.2 TPOT 表
 
 ```bash
-/zzlfs/temu/.venv/bin/python -I tpot_bench.py --out /zzlfs/temu/results/tpot-$(date +%m%d-%H%M).jsonl
+/zzlfs/baseline/.venv/bin/python -I tpot_bench.py --out /zzlfs/baseline/results/tpot-$(date +%m%d-%H%M).jsonl
 # 默认 cache 1k…768k × bs 1/16/64/128/256，out_len 1024；512k/768k bs256 拉满窗口太短时加 --out-len 3072
 ```
 
-- 所有请求共享一个长度为 cache 的前缀，各自再接 128 个不同的 token，ignore_eos，temperature 0。语料是代码文本（`/zzlfs/temu/tools/tpot_corpus_ids.json`）。
+- 所有请求共享一个长度为 cache 的前缀，各自再接 128 个不同的 token，ignore_eos，temperature 0。语料是代码文本（`/zzlfs/baseline/tools/tpot_corpus_ids.json`）。
 - 只统计"batch 拼满"的窗口：从所有请求都收到第一个 token，到第一个请求收到最后一个 token。
   - **CLI** = 每条请求在窗口内的平均 token 间隔，再对请求取平均。
   - **Server** = D 的 `inter_token_latency_seconds_sum` 增量 ÷ `generation_tokens_total` 增量（投机解码一步可能出多个 token）。
@@ -242,17 +242,17 @@ bash quick_set.sh                                                               
 也可以不重启、直接测 PD 里正在运行的 P（`--url http://<P>:8100`，不要和其他测试同时跑；5.1 和 5.4 最后一段就是这样测的，没有开 async 的对比）：
 
 ```bash
-ssh -n -f <host> "cd /zzlfs/temu && TMPDIR=/dev/shm/epic-tmp VLLM_CACHE_ROOT=/dev/shm/epic-vllm-cache NO_KV_TRANSFER=1 \
-    setsid nohup bash /zzlfs/temu/scripts/start_1p1d_epic.sh prefill > /zzlfs/temu/logs/tps-prefill-\$(date +%m%d-%H%M).log 2>&1 < /dev/null &"
+ssh -n -f <host> "cd /zzlfs/baseline && TMPDIR=/dev/shm/epic-tmp VLLM_CACHE_ROOT=/dev/shm/epic-vllm-cache NO_KV_TRANSFER=1 \
+    setsid nohup bash /zzlfs/baseline/scripts/start_1p1d_epic.sh prefill > /zzlfs/baseline/logs/tps-prefill-\$(date +%m%d-%H%M).log 2>&1 < /dev/null &"
 # 机器上要先有 /tmp/dsv41-tokenizer；等日志出现 "Application startup complete"。复现 5.4 的数字时加 ASYNC_SCHED=0
 ```
 
 **怎么测**（`tps_bench.py`）：
 
 ```bash
-cd /zzlfs/temu/scripts
-OUT=/zzlfs/temu/results/tps-$(date +%m%d-%H%M).jsonl
-PY=/zzlfs/temu/.venv-epic/bin/python
+cd /zzlfs/baseline/scripts
+OUT=/zzlfs/baseline/results/tps-$(date +%m%d-%H%M).jsonl
+PY=/zzlfs/baseline/.venv-epic/bin/python
 # 新 token 长度扫描，8 并发（每个 rank 一条）
 $PY -I tps_bench.py --url http://<host>:8100 --tag scan --cached 32768 --new 32768 65536 172032 262144 --conc 8 --out $OUT
 # 持续满载，每个 rank 排 2 条、3 条
@@ -268,7 +268,7 @@ $PY -I tps_bench.py --url http://<host>:8100 --tag sustained --cached 32768 --ne
 
 ```bash
 # aiperf 用 GitHub main（0.13.0 正式版没有 --scenario）；数据集 semianalysisai/cc-traces-weka-062126 首次运行时自动下载
-uv venv -p /usr/bin/python3.12 /zzlfs/temu/.venv-aiperf && uv pip install --python /zzlfs/temu/.venv-aiperf/bin/python git+https://github.com/ai-dynamo/aiperf
+uv venv -p /usr/bin/python3.12 /zzlfs/baseline/.venv-aiperf && uv pip install --python /zzlfs/baseline/.venv-aiperf/bin/python git+https://github.com/ai-dynamo/aiperf
 # proxy 必须开会话亲和（见下），再跑
 ssh -n -f <P> 'PROXY_SESSION_AFFINITY_DP=8 PREFILL_HOST=<P> DECODE_HOST=<D> setsid nohup bash start_proxy.sh > proxy.log 2>&1 < /dev/null &'
 CONC=256 DURATION=3600 TAG=base bash run_agentx.sh      # 结果和每 30s 的 P/D /metrics 在 results/agentx-c<CONC>-<TAG>-<时间>/
@@ -285,7 +285,7 @@ CONC=256 DURATION=3600 TAG=base bash run_agentx.sh      # 结果和每 30s 的 P
 ### 4.5 单请求时间线 / 耗时分解
 
 ```bash
-/zzlfs/temu/.venv/bin/python -I d_breakdown.py --cached 524288 --new 32768 --rounds 3   # D 端 vLLM 指标分解
+/zzlfs/baseline/.venv/bin/python -I d_breakdown.py --cached 524288 --new 32768 --rounds 3   # D 端 vLLM 指标分解
 python3 pd_timeline.py <proxy.log> <prefill.log> <decode.log> [req_id 前缀]             # 毫秒级跨机时间线（需 VLLM_LOGGING_PREFIX）
 python3 transfer_stats.py ...                                                           # KV 传输耗时统计
 ```
@@ -342,13 +342,13 @@ python3 transfer_stats.py ...                                                   
 
 ### 5.2–5.5 2026-11-05/06：合并前（主机 g45q / pqs0）
 
-配置同第 3 节，proxy 的对齐窗口和分词缓存都关；代码 54e98d673（= 1dc6984ac + 6cb686ef4）。Temu 为 2026-11-02 内部数据（`results/temu-1102.md`）。
+配置同第 3 节，proxy 的对齐窗口和分词缓存都关；代码 54e98d673（= 1dc6984ac + 6cb686ef4）。Baseline 为 2026-11-02 内部数据（`results/baseline-1102.md`）。
 
-### 5.2 Prefill / TTFT（秒，格式 Prefill / TTFT，倍数 = GCP ÷ Temu）
+### 5.2 Prefill / TTFT（秒，格式 Prefill / TTFT，倍数 = GCP ÷ Baseline）
 
-1P / 4P：`results/table-new-hosts-1105-1647.{jsonl,log}`；8P：`results/table-new-hosts-8p-1106-0106.{jsonl,log}`（2026-11-06，重启后同配置）。Temu 没有 8P 数据。
+1P / 4P：`results/table-new-hosts-1105-1647.{jsonl,log}`；8P：`results/table-new-hosts-8p-1106-0106.{jsonl,log}`（2026-11-06，重启后同配置）。Baseline 没有 8P 数据。
 
-| 场景 | GCP 1P | Temu 1P | 1P 倍数 | GCP 4P | Temu 4P | 4P 倍数 | GCP 8P |
+| 场景 | GCP 1P | Baseline 1P | 1P 倍数 | GCP 4P | Baseline 4P | 4P 倍数 | GCP 8P |
 |---|---|---|---|---|---|---|---|
 | 1k+1k | 0.227 / 0.307 | 0.036 / 0.065 | 6.3× / 4.7× | 0.192 / 0.395 | 0.051 / 0.124 | 3.8× / 3.2× | 0.180 / 0.385 |
 | 8k+4k | 0.432 / 0.565 | 0.055 / 0.092 | 7.9× / 6.1× | 0.465 / 0.682 | 0.113 / 0.315 | 4.1× / 2.2× | 0.487 / 0.720 |
@@ -365,7 +365,7 @@ python3 transfer_stats.py ...                                                   
 - 和旧主机（附录 B.1）比：1P 的 Prefill 都在 ±3% 以内，TTFT 普遍快 2–5%（本轮代码含 a233edf04，旧表在它之前测）；
   4P 长场景 TTFT 改善更明显（512k+32k 4.259→3.938s，768k+32k 5.261→4.532s）。1k / 8k 的 4P Prefill 慢约 20%（绝对差 30–80ms，短场景单次波动大）。
 - 8P 和旧主机比：短场景一致，256k 以上前缀的场景快 5–10%（512k+32k 4.650→4.183s，768k+32k 5.688→5.237s）。
-- Temu 11-02 比 10 月的数据快，所以倍数比旧表大。
+- Baseline 11-02 比 10 月的数据快，所以倍数比旧表大。
 
 ### 5.3 TPOT（ms，格式 CLI / Server，倍数按 CLI 算）
 
@@ -374,17 +374,17 @@ python3 transfer_stats.py ...                                                   
 | bs | 引擎 | 1k | 16k | 32k | 64k | 128k | 256k | 512k | 768k |
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | GCP | 4.91/5.02 | 4.68/4.61 | 4.94/4.78 | 5.40/5.35 | 5.97/5.95 | 6.30/6.35 | 7.74/7.81 | 9.16/9.22 |
-| 1 | Temu | 2.22 | 2.24 | 2.24 | 2.22 | 2.25 | 2.25 | 2.24 | 2.26 |
+| 1 | Baseline | 2.22 | 2.24 | 2.24 | 2.22 | 2.25 | 2.25 | 2.24 | 2.26 |
 | 16 | GCP | 5.23/5.14 | 5.15/5.07 | 5.27/5.04 | 5.42/5.26 | 5.85/5.74 | 6.56/6.39 | 7.72/7.58 | 8.66/8.64 |
-| 16 | Temu | 3.10 | 3.14 | 3.15 | 3.15 | 3.15 | 3.15 | 3.19 | 3.21 |
+| 16 | Baseline | 3.10 | 3.14 | 3.15 | 3.15 | 3.15 | 3.15 | 3.19 | 3.21 |
 | 64 | GCP | 7.43/7.38 | 8.28/8.08 | 9.18/8.80 | 10.99/10.65 | 8.68/8.37 | 10.27/10.21 | 14.52/13.73 | 19.07/18.31 |
-| 64 | Temu | 4.33 | 4.35 | 4.35 | 4.34 | 4.35 | 4.38 | 4.49 | 4.56 |
+| 64 | Baseline | 4.33 | 4.35 | 4.35 | 4.34 | 4.35 | 4.38 | 4.49 | 4.56 |
 | 128 | GCP | 9.93/9.73 | 12.47/12.25 | 15.06/14.87 | 19.18/18.74 | 14.51/14.15 | 21.03/20.55 | 31.27/30.38 | 44.47/43.89 |
-| 128 | Temu | 5.21 | 5.22 | 5.18 | 5.20 | 5.25 | 5.35 | 5.51 | 5.68 |
+| 128 | Baseline | 5.21 | 5.22 | 5.18 | 5.20 | 5.25 | 5.35 | 5.51 | 5.68 |
 | 256 | GCP | 14.60/14.19 | 15.04/14.62 | 15.28/14.75 | 16.86/16.33 | 19.32/18.51 | 24.97/24.88 | —‡ | OOM† |
-| 256 | Temu | 7.30 | 7.38 | 7.33 | 7.41 | 7.50 | 7.64 | 7.97 | 8.27 |
+| 256 | Baseline | 7.30 | 7.38 | 7.33 | 7.41 | 7.50 | 7.64 | 7.97 | 8.27 |
 
-- 总体是 Temu 的 1.6–7.8 倍（按 CLI）；DSpark 平均接受长度 4.36–5.09。长 cache、大 batch 差距最大（768k bs128 44.5 vs 5.7ms）。
+- 总体是 Baseline 的 1.6–7.8 倍（按 CLI）；DSpark 平均接受长度 4.36–5.09。长 cache、大 batch 差距最大（768k bs128 44.5 vs 5.7ms）。
 - 和旧主机（附录 B.2）基本一致，bs1 / bs16 在 1k–512k 范围内相差 ±10% 以内。
 - ‡ 512k bs256：out_len 1024 时"拼满窗口"不足 1s（-0.46s），旧表用 out_len 3072 补测，本轮没有补测。
 - † 768k bs256：两次 HTTP 500 后 D 被 OOM killer 杀掉（第 7 节）。
@@ -534,7 +534,7 @@ python3 transfer_stats.py ...                                                   
 - TPOT 的"拼满窗口"为负（`full-batch window shorter than 1 s`）不是服务出错，是 decode 比 P 把所有请求送进来更快，加大 `--out-len` 补测（4.2）。
 - logprob 检查的 `--offset` 超出语料长度会让 prompt 只剩问题（见第 3 节冒烟测试下方）；当前脚本已加断言。
 - **测吞吐时新 token 命中缓存会让数字虚高**（曾出现一轮 230 万 tok/s）：同一个服务上重复跑，如果请求内容和之前一样，P 的前缀缓存会直接命中。要核对每轮的 `cache_hit_tokens`（见 4.3）。
-- 在 sjd1 上直接跑 JAX/Pallas 脚本时，要先设好 TPU 环境变量（`/zzlfs/temu/tools/sc_repro/env.sh`，和启动脚本里的一样），否则 JAX 初始化会卡住。
+- 在 sjd1 上直接跑 JAX/Pallas 脚本时，要先设好 TPU 环境变量（`/zzlfs/baseline/tools/sc_repro/env.sh`，和启动脚本里的一样），否则 JAX 初始化会卡住。
 
 ---
 
@@ -587,13 +587,13 @@ python3 transfer_stats.py ...                                                   
 
 ---
 
-## 附录 B. 旧主机结果（2026-10-28/29，2z6z / clsk，Temu 为 10 月数据）
+## 附录 B. 旧主机结果（2026-10-28/29，2z6z / clsk，Baseline 为 10 月数据）
 
 ### B.1 Prefill / TTFT（秒）
 
 1P：`results/table-epic-1028-2309`；4P/8P：`results/table-4p8p-1029-0059`；16P（前 5 个场景）：`results/table-16p-1029-0333`。
 
-| 场景 | GCP 1P | Temu 1P | 1P 倍数 | GCP 4P | Temu 4P | 4P 倍数 | GCP 8P | GCP 16P |
+| 场景 | GCP 1P | Baseline 1P | 1P 倍数 | GCP 4P | Baseline 4P | 4P 倍数 | GCP 8P | GCP 16P |
 |---|---|---|---|---|---|---|---|---|
 | 1k+1k | 0.213 / 0.317 | 0.039 / 0.090 | 5.5× / 3.5× | 0.161 / 0.383 | 0.060 / 0.140 | 2.7× / 2.7× | 0.185 / 0.406 | 0.219 / 0.438 |
 | 8k+4k | 0.419 / 0.583 | 0.171 / 0.258 | 2.5× / 2.3× | 0.383 / 0.651 | 0.173 / 0.520 | 2.2× / 1.3× | 0.469 / 0.744 | 0.500 / 0.835 |
@@ -614,17 +614,17 @@ python3 transfer_stats.py ...                                                   
 | bs | 引擎 | 1k | 16k | 32k | 64k | 128k | 256k | 512k | 768k |
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | GCP | 5.24/5.29 | 4.87/4.74 | 4.54/4.35 | 5.74/5.63 | 5.27/5.22 | 6.30/6.20 | 7.96/8.06 | 7.68/7.54 |
-| 1 | Temu | 2.81 | 2.77 | 2.76 | 2.76 | 2.80 | 2.76 | 2.80 | 2.81 |
+| 1 | Baseline | 2.81 | 2.77 | 2.76 | 2.76 | 2.80 | 2.76 | 2.80 | 2.81 |
 | 16 | GCP | 5.24/5.17 | 5.06/4.82 | 5.33/5.10 | 5.67/5.43 | 5.80/5.69 | 6.15/5.89 | 7.62/7.51 | 8.57/8.75 |
-| 16 | Temu | 3.52 | 3.51 | 3.50 | 3.56 | 3.52 | 3.56 | 3.62 | 3.72 |
+| 16 | Baseline | 3.52 | 3.51 | 3.50 | 3.56 | 3.52 | 3.56 | 3.62 | 3.72 |
 | 64 | GCP | 7.21/7.05 | 8.16/8.05 | 9.49/9.21 | 10.57/10.42 | 8.36/8.13 | 10.40/10.09 | 14.10/13.92 | 19.50/19.22 |
-| 64 | Temu | 5.39 | 5.41 | 5.40 | 5.41 | 5.41 | 5.39 | 5.59 | 5.81 |
+| 64 | Baseline | 5.39 | 5.41 | 5.40 | 5.41 | 5.41 | 5.39 | 5.59 | 5.81 |
 | 128 | GCP | 9.66/9.44 | 12.50/12.30 | 14.70/14.29 | 18.66/18.31 | 14.43/13.99 | 21.54/21.19 | 31.32/30.11 | 45.11/44.69 |
-| 128 | Temu | 6.60 | 6.64 | 6.61 | 6.65 | 6.70 | 6.82 | 7.16 | 7.53 |
+| 128 | Baseline | 6.60 | 6.64 | 6.61 | 6.65 | 6.70 | 6.82 | 7.16 | 7.53 |
 | 256 | GCP | 14.51/13.97 | 12.82/12.65* | 15.68/14.78 | 16.34/15.84 | 18.31/17.51 | 23.63/22.83 | 21.72/21.35* | 27.87/27.18* |
-| 256 | Temu | 9.56 | 9.60 | 9.58 | 9.61 | 9.92 | 10.05 | 10.69 | 11.28 |
+| 256 | Baseline | 9.56 | 9.60 | 9.58 | 9.61 | 9.92 | 10.05 | 10.69 | 11.28 |
 
-\* 用 out_len 3072（out_len 1024 时拉满窗口太短）。总体是 Temu 的 1.3–6.0 倍。
+\* 用 out_len 3072（out_len 1024 时拉满窗口太短）。总体是 Baseline 的 1.3–6.0 倍。
 
 ### B.3 P 的 prefill 吞吐上限（tok/s；sjd1，`results/tps-sjd1-1029-1600.jsonl`）
 
