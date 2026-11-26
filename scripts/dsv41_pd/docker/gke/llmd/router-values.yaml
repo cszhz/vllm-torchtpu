@@ -1,0 +1,76 @@
+# llm-d router (standalone: EPP + Envoy, chart llm-d-router-standalone v1.0.0) for the dsv41-pd 1P1D on GKE,
+# DP-rank aware and routed like the toy proxy. Deployed by llmd_up.sh; results and the tuning history in ../README.md.
+#
+# Endpoints: every P and D pod exposes one port per DP rank (8110-8117).
+#   P: dp_rank_shim.py --reuse-prompt-ids in front of vLLM :8100 (port i pins X-data-parallel-rank: i).
+#   D: llm-d sidecar (data-parallel mode) -> dp_rank_shim.py --decode-router :8310-8317 -> vLLM :8300.
+# Prefill (EPP): the toy proxy's prefix routing - the P rank holding the longest cached prefix, at any match ratio
+#   (affinityThreshold 0.05 instead of the default 0.80, which sent 16% of AgentX turns to the least-loaded rank),
+#   never moved off it for load (TTFT load gate off = PROXY_PREFIX_MIGRATE_FACTOR 0; the gate fired on 6% of
+#   decisions), load breaking ties (prefix-cache-scorer 10 : token-load-scorer 1). New sessions match nowhere and go
+#   to the least-loaded rank.
+# Decode: the D rank is picked by the D shim (the toy proxy's PROXY_DECODE_ROUTING: longest-prefix rank unless it runs
+#   more than 2 streams above the idlest). EPP's weighted prefix + load score cannot express that threshold; this
+#   profile only spreads requests over the sidecar's ports.
+router:
+  modelServers:
+    matchLabels:
+      llm-d.ai/guide: pd-disaggregation
+    targetPorts:
+      - number: 8110
+      - number: 8111
+      - number: 8112
+      - number: 8113
+      - number: 8114
+      - number: 8115
+      - number: 8116
+      - number: 8117
+  epp:
+    replicas: 1
+    pluginsConfigFile: "pd-config.yaml"
+    pluginsCustomConfig:
+      pd-config.yaml: |
+        apiVersion: llm-d.ai/v1
+        kind: EndpointPickerConfig
+        plugins:
+        - type: always-disagg-pd-decider
+        - type: disagg-profile-handler
+          parameters:
+            deciders:
+              prefill: always-disagg-pd-decider
+        - type: prefill-filter
+        - type: decode-filter
+        - type: approx-prefix-cache-producer
+          parameters:
+            # vLLM --block-size 256 (dsv41-pd image default); AgentX contexts reach ~10^6 tokens
+            blockSizeTokens: 256
+            maxPrefixTokensToMatch: 1048576
+            autoTune: false
+            # one endpoint = one rank: ~8.9M tokens of P KV per rank / 256
+            lruCapacityPerServer: 35000
+        - type: inflight-load-producer
+        - type: prefix-cache-affinity-filter
+          parameters:
+            affinityThreshold: 0.05
+            maxTTFTPenaltyMs: 0
+            # guide default (H200 reference); re-calibrate for v7x DSv4.1 per rank
+            peakPrefillThroughput: 33821
+        - type: token-load-scorer
+        - type: active-request-scorer
+        - type: prefix-cache-scorer
+        - type: max-score-picker
+        schedulingProfiles:
+        - name: prefill
+          plugins:
+          - pluginRef: prefill-filter
+          - pluginRef: prefix-cache-affinity-filter
+          - pluginRef: prefix-cache-scorer
+            weight: 10
+          - pluginRef: token-load-scorer
+            weight: 1
+          - pluginRef: max-score-picker
+        - name: decode
+          plugins:
+          - pluginRef: decode-filter
+          - pluginRef: active-request-scorer
+          - pluginRef: max-score-picker

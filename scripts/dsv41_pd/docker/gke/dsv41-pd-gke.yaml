@@ -1,0 +1,159 @@
+# DeepSeek-V4.1-Flash 1P1D on GKE (zzl-tpu-gke) from the dsv41-pd image — the `docker run` commands of
+# ../README.md translated to pods:
+#   --privileged                -> securityContext.privileged (/dev/vfio)
+#   --net=host                  -> hostNetwork (start_1p1d_epic.sh takes the IP from `hostname -I`; Raiden ports)
+#   --ipc=host                  -> hostIPC (/dev/shm: Engram DP-shared tables ~190 GB, KV transfer buffers)
+#   -v /var/tmp/dsv41-cache:/cache -> hostPath, so a re-created pod reuses the 20-45 GB compile cache
+#   --ulimit memlock/nofile     -> containerd defaults on these nodes are already unlimited / 1048576
+# D serves on :8300, not the image default :8200: GKE nodes run `otelsvc` on 127.0.0.1:8200-8203 in the host network
+# namespace (first boot 2026-11-26: "OSError: [Errno 98] Address already in use"). EXTRA_ARGS is appended to
+# `vllm serve`, so --port 8300 overrides the script's --port 8200; the proxy follows via DECODE_PORT.
+#
+# Placement (2026-11-26):
+#   P  (+ proxy container, as in the README "proxy usually on the P host"): node pool v7x4 (one 2x2x1 node, not DWS,
+#      but SPOT: preempted 5 times on 2026-11-25). Hence a Deployment (re-created on the replacement node) and the
+#      compile cache on NFS (/zzlfs/temu/gke-dsv41-cache/p) instead of the node's disk, so a re-created P boots from
+#      cache (~20 min) instead of cold (~50 min). TMPDIR stays on the container's local disk.
+#      Fallback to a 2x2x2 host while v7x4 is gone: dsv41-pd-fallback.yaml (GKE Warden allows one topology per pod).
+#   D: node pool zzl-np-tpuv7-4q (2x2x1, DWS). Its placeholder pod (zzl-tpuv7-4q-job, priority 0) is preempted via
+#      PriorityClass zzl-tpu-workload (priorityclass.yaml in this directory); the
+#      placeholder Job recreates its pod, which stays Pending until this D pod is deleted.
+#
+#   bash deploy_gke.sh            # apply, wait for P/D/proxy, smoke
+#   kubectl delete -f dsv41-pd-gke.yaml
+---
+# D is reached by name: a hostNetwork pod's endpoint is its node IP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsv41-d
+  namespace: default
+spec:
+  clusterIP: None
+  selector: {app: dsv41-pd, role: decode}
+  ports:
+    - {name: http, port: 8300, targetPort: 8300}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsv41-proxy
+  namespace: default
+spec:
+  selector: {app: dsv41-pd, role: prefill}
+  ports:
+    - {name: http, port: 8000, targetPort: 8000}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsv41-p
+  namespace: default
+spec:
+  clusterIP: None
+  selector: {app: dsv41-pd, role: prefill}
+  ports:
+    - {name: http, port: 8100, targetPort: 8100}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsv41-p
+  namespace: default
+  labels: {app: dsv41-pd, role: prefill}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}        # never two P pods asking for the node's 4 chips
+  selector:
+    matchLabels: {app: dsv41-pd, role: prefill}
+  template:
+    metadata:
+      labels: {app: dsv41-pd, role: prefill}
+    spec:
+      priorityClassName: zzl-tpu-workload-high
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: cloud.google.com/gke-nodepool, operator: In, values: [v7x4]}
+                  - {key: cloud.google.com/gke-tpu-accelerator, operator: In, values: [tpu7x]}
+                  # GKE Warden (tpu-accelerator-topology-constraints): exactly one topology value per TPU pod, so the
+                  # 2x2x2 fallback is a separate Deployment (dsv41-pd-fallback.yaml), not a second value here
+                  - {key: cloud.google.com/gke-tpu-topology, operator: In, values: ["2x2x1"]}
+      tolerations:
+        - {key: google.com/tpu, operator: Exists, effect: NoSchedule}
+        - {key: cloud.google.com/gke-queued, operator: Equal, value: "true", effect: NoSchedule}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: prefill
+          image: us-central1-docker.pkg.dev/tpu-launchpad-playground/zzl-images/dsv41-pd:4b0fb058d
+          args: ["prefill"]
+          securityContext: {privileged: true}
+          resources:
+            limits: {google.com/tpu: "4"}
+            requests: {google.com/tpu: "4"}
+          readinessProbe:
+            httpGet: {path: /health, port: 8100}
+            periodSeconds: 15
+          env:
+            - {name: VLLM_CACHE_ROOT, value: /cache/vllm}
+            - {name: TMPDIR, value: /tmp/dsv41-tmp}
+          volumeMounts:
+            - {name: cache, mountPath: /cache}
+        - name: proxy
+          image: us-central1-docker.pkg.dev/tpu-launchpad-playground/zzl-images/dsv41-pd:4b0fb058d
+          args: ["proxy"]
+          env:
+            - name: PREFILL_HOST
+              valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+            - {name: DECODE_HOST, value: dsv41-d.default.svc.cluster.local}
+            - {name: DECODE_PORT, value: "8300"}
+          readinessProbe:
+            httpGet: {path: /healthcheck, port: 8000}
+            periodSeconds: 15
+      volumes:
+        - name: cache
+          nfs: {server: 10.128.0.30, path: /zzlfs/temu/gke-dsv41-cache/p}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dsv41-d
+  namespace: default
+  labels: {app: dsv41-pd, role: decode}
+spec:
+  restartPolicy: Never
+  priorityClassName: zzl-tpu-workload
+  hostNetwork: true
+  hostIPC: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    cloud.google.com/gke-nodepool: zzl-np-tpuv7-4q
+    cloud.google.com/gke-tpu-accelerator: tpu7x
+    cloud.google.com/gke-tpu-topology: 2x2x1
+  tolerations:
+    - {key: google.com/tpu, operator: Exists, effect: NoSchedule}
+    - {key: cloud.google.com/gke-queued, operator: Equal, value: "true", effect: NoSchedule}
+  terminationGracePeriodSeconds: 60
+  containers:
+    - name: decode
+      image: us-central1-docker.pkg.dev/tpu-launchpad-playground/zzl-images/dsv41-pd:4b0fb058d
+      args: ["decode"]
+      env:
+        - {name: EXTRA_ARGS, value: "--port 8300"}
+      securityContext: {privileged: true}
+      resources:
+        limits: {google.com/tpu: "4"}
+        requests: {google.com/tpu: "4"}
+      readinessProbe:
+        httpGet: {path: /health, port: 8300}
+        periodSeconds: 15
+      volumeMounts:
+        - {name: cache, mountPath: /cache}
+  volumes:
+    - name: cache
+      hostPath: {path: /var/tmp/dsv41-cache, type: DirectoryOrCreate}

@@ -1,0 +1,142 @@
+# Fallback P on a zzl-np-tpuv7-8 (2x2x2) host, for when the Spot v7x4 node of dsv41-pd-gke.yaml is preempted.
+# Same pod as dsv41-p (labels app=dsv41-pd,role=prefill, so the dsv41-p / dsv41-proxy Services follow it) except the
+# node pool and topology: GKE Warden allows exactly one gke-tpu-topology value per TPU pod, so one Deployment cannot
+# cover both pools. P runs single-host on the 2x2x2 host (start_1p1d_epic.sh pins 2x2x1 / host bounds 1,1,1), with the
+# same NFS compile cache.
+#
+# At PriorityClass zzl-tpu-workload-high (1100) it preempts what runs there at 1000: the GLM AgentX Job, which then
+# fails as a whole (backoffLimit 0); the placeholder takes the other 2x2x2 host back. P does not move back by itself.
+#
+# dsv41-p-failover (below) watches the v7x4 pool: no Ready node for FAILOVER_AFTER_S -> scale dsv41-p to 0 and this
+# Deployment to 1, once (it does not fail back). Manual fail back:
+#   kubectl scale deploy/dsv41-p-fallback --replicas=0 && kubectl scale deploy/dsv41-p --replicas=1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsv41-p-fallback
+  namespace: default
+  labels: {app: dsv41-pd, role: prefill}
+spec:
+  replicas: 0                       # scaled to 1 by dsv41-p-failover when the Spot v7x4 node is gone
+  strategy: {type: Recreate}        # never two P pods asking for the node's 4 chips
+  selector:
+    matchLabels: {app: dsv41-pd, role: prefill}
+  template:
+    metadata:
+      labels: {app: dsv41-pd, role: prefill}
+    spec:
+      priorityClassName: zzl-tpu-workload-high
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: cloud.google.com/gke-nodepool, operator: In, values: [zzl-np-tpuv7-8]}
+                  - {key: cloud.google.com/gke-tpu-accelerator, operator: In, values: [tpu7x]}
+                  - {key: cloud.google.com/gke-tpu-topology, operator: In, values: ["2x2x2"]}
+      tolerations:
+        - {key: google.com/tpu, operator: Exists, effect: NoSchedule}
+        - {key: cloud.google.com/gke-queued, operator: Equal, value: "true", effect: NoSchedule}
+        - {key: cloud.google.com/gke-queued, operator: Equal, value: "true", effect: NoSchedule}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: prefill
+          image: us-central1-docker.pkg.dev/tpu-launchpad-playground/zzl-images/dsv41-pd:4b0fb058d
+          args: ["prefill"]
+          securityContext: {privileged: true}
+          resources:
+            limits: {google.com/tpu: "4"}
+            requests: {google.com/tpu: "4"}
+          readinessProbe:
+            httpGet: {path: /health, port: 8100}
+            periodSeconds: 15
+          env:
+            - {name: VLLM_CACHE_ROOT, value: /cache/vllm}
+            - {name: TMPDIR, value: /tmp/dsv41-tmp}
+          volumeMounts:
+            - {name: cache, mountPath: /cache}
+        - name: proxy
+          image: us-central1-docker.pkg.dev/tpu-launchpad-playground/zzl-images/dsv41-pd:4b0fb058d
+          args: ["proxy"]
+          env:
+            - name: PREFILL_HOST
+              valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+            - {name: DECODE_HOST, value: dsv41-d.default.svc.cluster.local}
+            - {name: DECODE_PORT, value: "8300"}
+          readinessProbe:
+            httpGet: {path: /healthcheck, port: 8000}
+            periodSeconds: 15
+      volumes:
+        - name: cache
+          nfs: {server: 10.128.0.30, path: /zzlfs/temu/gke-dsv41-cache/p}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: dsv41-p-failover, namespace: default}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: dsv41-p-failover-nodes}
+rules:
+  - {apiGroups: [""], resources: [nodes], verbs: [get, list]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: dsv41-p-failover-nodes}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: dsv41-p-failover-nodes}
+subjects: [{kind: ServiceAccount, name: dsv41-p-failover, namespace: default}]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: dsv41-p-failover, namespace: default}
+rules:
+  - {apiGroups: [apps], resources: [deployments, deployments/scale], verbs: [get, list, patch, update]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: dsv41-p-failover, namespace: default}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: dsv41-p-failover}
+subjects: [{kind: ServiceAccount, name: dsv41-p-failover, namespace: default}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: dsv41-p-failover, namespace: default, labels: {app: dsv41-p-failover}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: dsv41-p-failover}}
+  template:
+    metadata: {labels: {app: dsv41-p-failover}}
+    spec:
+      serviceAccountName: dsv41-p-failover
+      nodeSelector: {cloud.google.com/gke-nodepool: default-pool}
+      containers:
+        - name: watch
+          image: bitnami/kubectl:latest
+          env:
+            - {name: FAILOVER_AFTER_S, value: "180"}
+          command: ["bash", "-c"]
+          args:
+            - |
+              gone_since=""
+              while true; do
+                if [ "$(kubectl get deploy dsv41-p-fallback -o jsonpath='{.spec.replicas}')" != "0" ]; then
+                  echo "$(date -u +%FT%TZ) fallback active; nothing to do"; sleep 300; continue
+                fi
+                ready=$(kubectl get nodes -l cloud.google.com/gke-nodepool=v7x4 \
+                  -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' | grep -c True)
+                if [ "$ready" -gt 0 ]; then
+                  gone_since=""
+                else
+                  [ -z "$gone_since" ] && { gone_since=$(date +%s); echo "$(date -u +%FT%TZ) no Ready v7x4 node"; }
+                  if [ $(( $(date +%s) - gone_since )) -ge "$FAILOVER_AFTER_S" ]; then
+                    echo "$(date -u +%FT%TZ) v7x4 gone for ${FAILOVER_AFTER_S}s: failing P over to 2x2x2"
+                    kubectl scale deploy/dsv41-p --replicas=0 && kubectl scale deploy/dsv41-p-fallback --replicas=1
+                  fi
+                fi
+                sleep 30
+              done
+          resources: {requests: {cpu: 10m, memory: 32Mi}}

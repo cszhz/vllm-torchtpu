@@ -1,0 +1,22 @@
+# 用来抢占 zzl-tpu-gke 上 DWS 占位 pod（priority 0）的优先级。
+# 占位 pod 被抢占后由它的 Job 重建并 Pending；高优先级的 workload 删除后，占位 pod 自动调度回原节点，DWS 容量不丢。
+# 前提：占位 Job 的 backoffLimit 足够大（被抢占的 pod 计入失败次数），见 deploy_glm_k8s.sh。
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: zzl-tpu-workload
+value: 1000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "TPU workloads that preempt the zzl DWS placeholder pods (priority 0) on zzl-tpu-gke."
+---
+# P of the dsv41-pd 1P1D: above zzl-tpu-workload (GLM), so when the Spot v7x4 node is preempted the re-created P
+# falls back to a 2x2x2 host by preempting a GLM pod there (dsv41-pd-gke.yaml).
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: zzl-tpu-workload-high
+value: 1100
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "dsv41-pd P: preferred on the Spot v7x4 node, falls back to a zzl-np-tpuv7-8 (2x2x2) host."

@@ -63,3 +63,8 @@ P_IP=10.128.0.62 D_IP=10.128.0.39 BENCH=1 bash scripts/dsv41_pd/docker/test_imag
 ```
 
 基础镜像是 `ubuntu:24.04`：venv 基于它自带的 python3.12 3.12.3 构建，自编的 tpu-sync 需要 glibc 2.38。构建机需要是 Ubuntu 24.04，并且有上面这些 venv。
+
+## GKE
+
+`gke/`：同一镜像部署到 GKE 集群 `zzl-tpu-gke`（P 在 Spot 节点、可自动切到 2x2x2；D 抢占 DWS 占位 pod），
+以及按 DP rank 路由、与 toy proxy 性能对齐的 llm-d 入口。见 `gke/README.md`。
